@@ -4,8 +4,9 @@ import io.github.kubyk01.domain.inspector.ClassInfo;
 import io.github.kubyk01.domain.inspector.FieldInfo;
 import io.github.kubyk01.domain.inspector.InspectionResult;
 import io.github.kubyk01.domain.inspector.MethodInfo;
+import io.github.kubyk01.port.primary.AnalyzerPort;
 import io.github.kubyk01.port.primary.InspectorPort;
-import lombok.RequiredArgsConstructor;
+import lombok.AllArgsConstructor;
 import picocli.CommandLine;
 import picocli.CommandLine.Command;
 import reactor.core.publisher.Mono;
@@ -13,23 +14,23 @@ import reactor.core.publisher.Mono;
 import java.io.File;
 import java.nio.file.Path;
 
-@RequiredArgsConstructor
+@AllArgsConstructor
 @Command(name = "jnative", mixinStandardHelpOptions = true, version = "0.1")
 public class CLI implements Runnable {
 
     private final InspectorPort inspector;
+    private final AnalyzerPort analyzer;
 
     @Override
     public void run() {
-        System.err.println("Please specify a subcommand: inspect");
+        System.err.println("Please specify a subcommand: inspect or analyze");
         new CommandLine(this).usage(System.err);
     }
 
     @Command(name = "inspect", description = "Inspect a JAR or CLASS file")
     public void inspect(
         @CommandLine.Parameters(index = "0", description = "Path to JAR or CLASS file") File file,
-        @CommandLine.Option(names = "--bytecode", description = "Show bytecode instructions") boolean showBytecode
-    ) {
+        @CommandLine.Option(names = "--bytecode", description = "Show bytecode instructions") boolean showBytecode) {
         Path path = file.toPath();
         String fileName = path.getFileName().toString().toLowerCase();
         Mono<InspectionResult> resultMono;
@@ -83,5 +84,31 @@ public class CLI implements Runnable {
             }
             System.out.println();
         }
+    }
+
+    @Command(name = "analyze", description = "Perform dependency resolution and reachability analysis")
+    public void analyze(
+        @CommandLine.Parameters(index = "0", description = "Path to JAR or directory containing .class files") File file,
+        @CommandLine.Option(names = "--entry", description = "Entry point class (fully qualified)", defaultValue = "com.example.Main") String entryClass,
+        @CommandLine.Option(names = "--method", description = "Entry method name", defaultValue = "main") String entryMethod,
+        @CommandLine.Option(names = "--descriptor", description = "Method descriptor", defaultValue = "([Ljava/lang/String;)V") String descriptor,
+        @CommandLine.Option(names = "--classes", description = "Show user classes and methods") boolean showClasses,
+        @CommandLine.Option(names = "--alias", description = "Show alias analysis") boolean showAlias,
+        @CommandLine.Option(names = "--escape", description = "Show escape analysis") boolean showEscape,
+        @CommandLine.Option(names = "--lifetime", description = "Show lifetime analysis") boolean showLifetime,
+        @CommandLine.Option(names = "--destructor", description = "Show destructor insertion") boolean showDestructor,
+        @CommandLine.Option(names = "--all", description = "Show all analysis stages (default if none specified)") boolean showAll) {
+
+        // If no flag is given, show everything (including classes)
+        boolean anyFlag = showClasses || showAlias || showEscape || showLifetime || showDestructor || showAll;
+        if (!anyFlag) {
+            showClasses = showAlias = showEscape = showLifetime = showDestructor = true;
+        } else if (showAll) {
+            showClasses = showAlias = showEscape = showLifetime = showDestructor = true;
+        }
+
+        Path path = file.toPath();
+        analyzer.analyze(path, entryClass, entryMethod, descriptor,
+                         showClasses, showAlias, showEscape, showLifetime, showDestructor);
     }
 }

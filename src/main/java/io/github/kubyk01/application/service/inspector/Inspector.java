@@ -1,4 +1,4 @@
-package io.github.kubyk01.application.service.Inspector;
+package io.github.kubyk01.application.service.inspector;
 
 import io.github.kubyk01.domain.inspector.ClassInfo;
 import io.github.kubyk01.domain.inspector.FieldInfo;

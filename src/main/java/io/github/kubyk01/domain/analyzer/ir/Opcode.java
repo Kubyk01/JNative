@@ -1,0 +1,23 @@
+package io.github.kubyk01.domain.analyzer.ir;
+
+public enum Opcode {
+    ADD, SUB, MUL, DIV, REM,
+    EQ, NE, LT, LE, GT, GE,
+    AND, OR, XOR, SHL, SHR, USHR,
+    CAST,
+    LOAD, STORE,
+    GET_FIELD, PUT_FIELD,
+    GET_STATIC, PUT_STATIC,
+    CALL, VIRTUAL_CALL, INTERFACE_CALL, STATIC_CALL, SPECIAL_CALL,
+    NEW, NEW_ARRAY, MULTI_NEW_ARRAY,
+    FREE,
+    BRANCH, COND_BRANCH,
+    RETURN,
+    THROW,
+    MONITOR_ENTER, MONITOR_EXIT,
+    INSTANCEOF, CHECKCAST,
+    ARRAYLENGTH,
+    ALOAD, ASTORE,
+    NOP,
+    PHI
+}
