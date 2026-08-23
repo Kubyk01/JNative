@@ -39,6 +39,9 @@ import java.util.stream.Collectors;
 @Slf4j
 public class Analyzer implements AnalyzerPort {
 
+    private static final String RUNTIME_RESOURCE_PATH = "jnative_runtime.c";
+    private static final String NATIVE_BASE_PATH = "jnative/";
+
     @Override
     public void analyze(Path path, String entryClass, String entryMethod, String entryDescriptor,
                         boolean showClasses, boolean showAlias, boolean showEscape,
@@ -62,6 +65,14 @@ public class Analyzer implements AnalyzerPort {
 
         Set<String> allClasses = analysis.getReachableClasses();
         Set<MethodReference> allMethods = analysis.getReachableMethods();
+
+        // Collect used system classes that have native C implementations
+        Set<String> usedSystemClasses = new HashSet<>();
+        for (String cls : allClasses) {
+            if (isSystemClassName(cls) && hasNativeSupport(cls)) {
+                usedSystemClasses.add(cls);
+            }
+        }
 
         // If includeSystem is false, filter to output only user classes and methods
         Set<String> classesToShow;
@@ -265,7 +276,7 @@ public class Analyzer implements AnalyzerPort {
         if (!noCompile) {
             Path exePath = outputFile != null ? Paths.get(outputFile) : Paths.get("a.out");
             try {
-                compileAndLink(llPath, exePath);
+                compileAndLink(llPath, exePath, usedSystemClasses);
                 System.out.println("Native executable built successfully: " + exePath.toAbsolutePath());
             } catch (IOException | InterruptedException e) {
                 log.error("Failed to build native executable", e);
@@ -276,70 +287,118 @@ public class Analyzer implements AnalyzerPort {
         }
     }
 
-    private void compileAndLink(Path llPath, Path exePath) throws IOException, InterruptedException {
-        // Determine which compiler to use (clang preferred, fallback to gcc)
-        String compiler = "clang";
+    private void compileAndLink(Path llPath, Path exePath, Set<String> usedSystemClasses)
+            throws IOException, InterruptedException {
+        // Create a temporary directory for all intermediate files
+        Path tempDir = Files.createTempDirectory("jnative_build_");
+        tempDir.toFile().deleteOnExit();
+
         try {
-            Process p = new ProcessBuilder(compiler, "--version").start();
-            if (p.waitFor() != 0) {
+            String compiler = "clang";
+            try {
+                Process p = new ProcessBuilder(compiler, "--version").start();
+                if (p.waitFor() != 0) compiler = "gcc";
+            } catch (IOException e) {
                 compiler = "gcc";
             }
-        } catch (IOException e) {
-            compiler = "gcc";
+
+            // 1. Compile the main runtime
+            Path runtimeC = extractRuntimeSource(tempDir);
+            Path runtimeObj = tempDir.resolve("jnative_runtime.o");
+            compileCSource(compiler, runtimeC, runtimeObj);
+
+            // 2. Compile additional C files for system classes
+            List<Path> extraSources = extractSystemNativeSources(usedSystemClasses, tempDir);
+            List<Path> extraObjs = new ArrayList<>();
+            for (Path src : extraSources) {
+                String objName = src.getFileName().toString().replaceAll("\\.c$", ".o");
+                Path obj = tempDir.resolve(objName);
+                compileCSource(compiler, src, obj);
+                extraObjs.add(obj);
+            }
+
+            // 3. Compile LLVM IR into an object file
+            Path objPath = tempDir.resolve(exePath.getFileName().toString() + ".o");
+            ProcessBuilder pb = new ProcessBuilder(compiler, "-c", "-O2", llPath.toString(), "-o", objPath.toString());
+            pb.inheritIO();
+            int exit = pb.start().waitFor();
+            if (exit != 0) throw new RuntimeException("Compilation failed with exit code " + exit);
+
+            // 4. Link all object files
+            List<String> linkCmd = new ArrayList<>();
+            linkCmd.add(compiler);
+            linkCmd.add(objPath.toString());
+            linkCmd.add(runtimeObj.toString());
+            for (Path obj : extraObjs) linkCmd.add(obj.toString());
+            linkCmd.add("-o");
+            linkCmd.add(exePath.toString());
+            linkCmd.add("-lpthread");
+            pb = new ProcessBuilder(linkCmd);
+            pb.inheritIO();
+            exit = pb.start().waitFor();
+            if (exit != 0) throw new RuntimeException("Linking failed with exit code " + exit);
+
+        } finally {
+            // Recursively delete the entire temporary directory (including all files)
+            Files.walk(tempDir)
+                 .sorted(Comparator.reverseOrder())
+                 .forEach(p -> { try { Files.deleteIfExists(p); } catch (IOException ignored) {} });
         }
+    }
 
-        // Object file name: same as executable but with .o extension
-        String objName = exePath.getFileName().toString() + ".o";
-        Path objPath = exePath.resolveSibling(objName);
-
-        // 0. Extract the C runtime (monitors etc.) from resources and compile it to an object file
-        Path runtimeC = extractRuntimeSource();
-        Path runtimeObj = exePath.resolveSibling("jnative_runtime.o");
-        List<String> compileRuntimeCmd = Arrays.asList(compiler, "-c", "-O2", runtimeC.toString(), "-o", runtimeObj.toString());
-        ProcessBuilder pb = new ProcessBuilder(compileRuntimeCmd);
+    private void compileCSource(String compiler, Path src, Path obj) throws IOException, InterruptedException {
+        ProcessBuilder pb = new ProcessBuilder(compiler, "-c", "-O2", src.toString(), "-o", obj.toString());
         pb.inheritIO();
         int exit = pb.start().waitFor();
-        if (exit != 0) {
-            throw new RuntimeException("Runtime compilation failed with exit code " + exit);
-        }
-
-        // 1. Compile LLVM IR to object file
-        List<String> compileCmd = Arrays.asList(compiler, "-c", "-O2", llPath.toString(), "-o", objPath.toString());
-        pb = new ProcessBuilder(compileCmd);
-        pb.inheritIO();
-        exit = pb.start().waitFor();
-        if (exit != 0) {
-            throw new RuntimeException("Compilation failed with exit code " + exit);
-        }
-
-        // 2. Link both object files with standard libraries
-        List<String> linkCmd = Arrays.asList(compiler, objPath.toString(), runtimeObj.toString(),
-            "-o", exePath.toString(), "-lpthread");
-        pb = new ProcessBuilder(linkCmd);
-        pb.inheritIO();
-        exit = pb.start().waitFor();
-        if (exit != 0) {
-            throw new RuntimeException("Linking failed with exit code " + exit);
-        }
-
-        // Clean up temporary files
-        Files.deleteIfExists(objPath);
-        Files.deleteIfExists(runtimeObj);
+        if (exit != 0) throw new RuntimeException("Compilation of " + src + " failed with exit code " + exit);
     }
 
     /**
-     * Extracts jnative_runtime.c from JAR resources into a temporary file,
-     * so that it can be compiled together with the generated LLVM IR.
+     * Returns the resource path of the native C implementation for the given class,
+     * or null if there is no mapping for its package.
      */
-    private Path extractRuntimeSource() throws IOException {
-        Path runtimeC = Files.createTempFile("jnative_runtime", ".c");
-        try (InputStream in = getClass().getResourceAsStream("/native/jnative_runtime.c")) {
+    private String getNativeResourcePath(String className) {
+        if (!className.startsWith("java/")) {
+            return null;
+        }
+        String subPath = className.substring("java/".length());
+        return NATIVE_BASE_PATH + subPath + ".c";
+    }
+
+    private boolean hasNativeSupport(String className) {
+        String path = getNativeResourcePath(className);
+        if (path == null) return false;
+        try (InputStream is = Thread.currentThread().getContextClassLoader().getResourceAsStream(path)) {
+            return is != null;
+        } catch (IOException e) {
+            return false;
+        }
+    }
+
+    private List<Path> extractSystemNativeSources(Set<String> usedClasses, Path tempDir) throws IOException {
+        List<Path> extracted = new ArrayList<>();
+        for (String cls : usedClasses) {
+            if (!hasNativeSupport(cls)) continue;
+            String resourcePath = getNativeResourcePath(cls);
+            try (InputStream in = Thread.currentThread().getContextClassLoader().getResourceAsStream(resourcePath)) {
+                if (in == null) continue;
+                String fileName = cls.replace('/', '_') + ".c";
+                Path tempFile = tempDir.resolve("jnative_" + fileName);
+                Files.copy(in, tempFile, StandardCopyOption.REPLACE_EXISTING);
+                extracted.add(tempFile);
+            }
+        }
+        return extracted;
+    }
+
+    private Path extractRuntimeSource(Path tempDir) throws IOException {
+        Path runtimeC = tempDir.resolve("jnative_runtime.c");
+        try (InputStream in = Thread.currentThread().getContextClassLoader().getResourceAsStream(RUNTIME_RESOURCE_PATH)) {
             if (in == null) {
-                throw new IOException("jnative_runtime.c not found in resources (/native/jnative_runtime.c)");
+                throw new IOException("jnative_runtime.c not found in resources (" + RUNTIME_RESOURCE_PATH + ")");
             }
             Files.copy(in, runtimeC, StandardCopyOption.REPLACE_EXISTING);
         }
-        runtimeC.toFile().deleteOnExit();
         return runtimeC;
     }
 

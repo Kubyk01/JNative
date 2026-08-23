@@ -4,8 +4,11 @@ import io.github.kubyk01.application.service.analyzer.dependencyresolver.Depende
 import io.github.kubyk01.domain.analyzer.aliasanalysis.AliasAnalysisResult;
 import io.github.kubyk01.domain.analyzer.ir.Function;
 import io.github.kubyk01.domain.analyzer.ir.Module;
+import io.github.kubyk01.domain.analyzer.ir.Parameter;
 import io.github.kubyk01.domain.analyzer.reflection.ReflectInfo;
 import lombok.extern.slf4j.Slf4j;
+
+import java.util.List;
 
 @Slf4j
 public class LlvmGenerator {
@@ -17,6 +20,7 @@ public class LlvmGenerator {
 
     private final LlvmGlobalEmitter globalEmitter;
     private final LlvmFunctionEmitter functionEmitter;
+    private final LlvmTypeMapper typeMapper;
 
     public LlvmGenerator(Module module, DependencyResolver resolver,
                          AliasAnalysisResult aliasResult,
@@ -29,6 +33,7 @@ public class LlvmGenerator {
         // Initialize manually: a field initializer runs before constructor
         // assignments and would capture null dependencies
         LlvmTypeMapper typeMapper = new LlvmTypeMapper();
+        this.typeMapper = typeMapper;
         this.globalEmitter = new LlvmGlobalEmitter(module, resolver, aliasResult, typeMapper, reflectInfo);
         this.functionEmitter = new LlvmFunctionEmitter(module, typeMapper, globalEmitter);
     }
@@ -48,7 +53,12 @@ public class LlvmGenerator {
 
         // Function definitions
         for (Function func : module.getFunctions()) {
-            if (func.getEntryBlock() == null) continue;
+            if (func.getEntryBlock() == null) {
+                // Native/external methods have no IR body: their implementation
+                // is provided by the runtime C sources, so only declare them
+                sb.append(emitDeclaration(func));
+                continue;
+            }
             sb.append(functionEmitter.emitFunction(func));
         }
 
@@ -130,6 +140,19 @@ public class LlvmGenerator {
                     ret i8* %base_array
                 }
                 """;
+    }
+
+    private String emitDeclaration(Function func) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("declare ").append(typeMapper.toLlvmType(func.getReturnType()))
+            .append(" @").append(func.getName()).append("(");
+        List<Parameter> params = func.getParameters();
+        for (int i = 0; i < params.size(); i++) {
+            if (i > 0) sb.append(", ");
+            sb.append(typeMapper.toLlvmType(params.get(i).getType()));
+        }
+        sb.append(")\n\n");
+        return sb.toString();
     }
 
     private String generateMain() {
