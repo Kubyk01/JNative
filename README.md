@@ -4,7 +4,7 @@
 
 ## Idea
 
-JNative compiles JAR and CLASS files directly into native executables without a JVM or garbage collector. The key insight: for many application patterns, object lifetimes can be determined statically, allowing us to manage memory deterministically—like in Rust—but on top of Java/Kotlin/Scala bytecode.
+JNative compiles JAR and CLASS files directly into native executables without a JVM or garbage collector. The key insight: for many application patterns, object lifetimes can be determined statically, allowing us to manage memory deterministically -like in Rust- but on top of Java/Kotlin/Scala bytecode.
 
 **The core idea:**
 
