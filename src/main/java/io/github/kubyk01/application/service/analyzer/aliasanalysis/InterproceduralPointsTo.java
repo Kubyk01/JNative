@@ -12,7 +12,6 @@ import io.github.kubyk01.domain.analyzer.ir.Module;
 import io.github.kubyk01.domain.analyzer.ir.Opcode;
 import io.github.kubyk01.domain.analyzer.ir.Parameter;
 import io.github.kubyk01.domain.analyzer.ir.Terminator;
-import io.github.kubyk01.domain.analyzer.ir.Type;
 import io.github.kubyk01.domain.analyzer.ir.Value;
 import lombok.extern.slf4j.Slf4j;
 
@@ -78,7 +77,7 @@ public class InterproceduralPointsTo {
                 processInstruction(inst, func);
             }
             Terminator term = block.getTerminator();
-            if (term != null) processTerminator(term, func);
+            if (term != null) processTerminator();
         }
     }
 
@@ -122,6 +121,36 @@ public class InterproceduralPointsTo {
                     } else {
                         for (AllocationSite site : basePts.getSites()) {
                             graph.mergeFieldPointsTo(site, field, rhsPts);
+                        }
+                    }
+                }
+                break;
+            }
+            case ALOAD: {
+                // array load: result = array[index]  (operands: array, index)
+                if (inst.getOperands().size() >= 2) {
+                    Value array = inst.getOperands().getFirst();
+                    Value result = inst.getResult();
+                    if (result != null) {
+                        PointsToSet arrayPts = graph.get(array);
+                        PointsToSet elemPts = graph.getFieldPointsToForSites(arrayPts, "[]");
+                        changed |= graph.merge(result, elemPts);
+                    }
+                }
+                break;
+            }
+            case ASTORE: {
+                // array store: array[index] = value  (operands: array, index, value)
+                if (inst.getOperands().size() >= 3) {
+                    Value array = inst.getOperands().get(0);
+                    Value value = inst.getOperands().get(2);
+                    PointsToSet arrayPts = graph.get(array);
+                    PointsToSet valuePts = graph.get(value);
+                    if (arrayPts.isEmpty()) {
+                        graph.mergeArrayElementPointsTo(AllocationSite.UNKNOWN, valuePts);
+                    } else {
+                        for (AllocationSite site : arrayPts.getSites()) {
+                            graph.mergeArrayElementPointsTo(site, valuePts);
                         }
                     }
                 }
@@ -238,7 +267,7 @@ public class InterproceduralPointsTo {
         }
     }
 
-    private void processTerminator(Terminator term, Function func) {
+    private void processTerminator() {
         // terminator instructions do not change points-to
     }
 
@@ -252,7 +281,7 @@ public class InterproceduralPointsTo {
         int fieldIdx = (inst.getOpcode() == Opcode.GET_STATIC || inst.getOpcode() == Opcode.PUT_STATIC) ? 0 : 1;
         if (inst.getOperands().size() > fieldIdx) {
             Value v = inst.getOperands().get(fieldIdx);
-            if (v instanceof Constant c && c.getType() == Type.REFERENCE) {
+            if (v instanceof Constant c && c.getType().isReference()) {
                 return c.getValue().toString(); // full name, e.g. "java/lang/System.out"
             }
         }
@@ -262,7 +291,7 @@ public class InterproceduralPointsTo {
     private String extractCalleeName(Instruction inst) {
         if (!inst.getOperands().isEmpty()) {
             Value v = inst.getOperands().getFirst();
-            if (v instanceof Constant c && c.getType() == Type.REFERENCE) {
+            if (v instanceof Constant c && c.getType().isReference()) {
                 return c.getValue().toString();
             }
         }

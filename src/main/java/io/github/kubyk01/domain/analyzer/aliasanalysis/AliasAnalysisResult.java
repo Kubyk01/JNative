@@ -8,9 +8,11 @@ import java.util.Map;
 @Getter
 public class AliasAnalysisResult {
     private final PointsToGraph graph;
+    private final Map<String, FunctionSummary> functionSummaries;
 
-    public AliasAnalysisResult(PointsToGraph graph) {
+    public AliasAnalysisResult(PointsToGraph graph, Map<String, FunctionSummary> functionSummaries) {
         this.graph = graph;
+        this.functionSummaries = functionSummaries;
     }
 
     public PointsToSet getPointsTo(Value v) {
@@ -21,18 +23,7 @@ public class AliasAnalysisResult {
         return graph.mayAlias(a, b);
     }
 
-    public boolean isUnique(Value v) {
-        return graph.isUnique(v);
-    }
-
-    public AllocationSite getUniqueSite(Value v) {
-        return graph.getUniqueSite(v);
-    }
-
     // --- new methods for fields ---
-    public PointsToSet getFieldPointsTo(AllocationSite site, String field) {
-        return graph.getFieldPointsTo(site, field);
-    }
 
     public PointsToSet getFieldPointsToForSites(PointsToSet sites, String field) {
         return graph.getFieldPointsToForSites(sites, field);

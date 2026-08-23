@@ -23,7 +23,7 @@ public class TryCatchHandler {
             BasicBlock endBlock = labelToBlock.get(info.end);
             BasicBlock handlerBlock = labelToBlock.get(info.handler);
             if (startBlock == null || endBlock == null || handlerBlock == null) continue;
-            List<BasicBlock> tryBlocks = getBlocksBetween(startBlock, endBlock);
+            List<BasicBlock> tryBlocks = GraphUtils.getBlocksBetween(startBlock, endBlock);
             for (BasicBlock b : tryBlocks) {
                 // addSuccessor updates both sides of the edge; the duplicate guard
                 // is required for multi-catch (one handler for several ranges)
@@ -32,26 +32,6 @@ public class TryCatchHandler {
                 }
             }
         }
-    }
-
-    private List<BasicBlock> getBlocksBetween(BasicBlock start, BasicBlock end) {
-        List<BasicBlock> result = new ArrayList<>();
-        Queue<BasicBlock> queue = new LinkedList<>();
-        Set<BasicBlock> visited = new HashSet<>();
-        queue.add(start);
-        visited.add(start);
-        while (!queue.isEmpty()) {
-            BasicBlock b = queue.poll();
-            result.add(b);
-            if (b == end) break;
-            for (BasicBlock succ : b.getSuccessors()) {
-                if (!visited.contains(succ)) {
-                    visited.add(succ);
-                    queue.add(succ);
-                }
-            }
-        }
-        return result;
     }
 
     private static class TryCatchInfo {

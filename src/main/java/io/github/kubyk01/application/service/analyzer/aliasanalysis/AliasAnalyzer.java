@@ -22,6 +22,6 @@ public class AliasAnalyzer {
         InterproceduralPointsTo interproc = new InterproceduralPointsTo(module, summaries);
         PointsToGraph graph = interproc.analyze();
 
-        return new AliasAnalysisResult(graph);
+        return new AliasAnalysisResult(graph, summaries);
     }
 }

@@ -12,7 +12,7 @@ public class IrBuilder {
     private Function currentFunction;
     @Setter
     private BasicBlock currentBlock;
-    private List<Temporary> temporaries = new ArrayList<>();
+    private final List<Temporary> temporaries = new ArrayList<>();
 
     public BasicBlock currentBlock() { return currentBlock; }
 
@@ -101,7 +101,22 @@ public class IrBuilder {
     }
 
     private Type inferResultType(Opcode op, Value[] operands) {
-        if (operands.length > 0) {
+        if (op == Opcode.INSTANCEOF) {
+            return Type.BOOLEAN;
+        }
+        if (op == Opcode.CHECKCAST) {
+            // result type is the target type from the constant
+            if (operands.length > 1 && operands[1] instanceof Constant) {
+                Constant c = (Constant) operands[1];
+                if (c.getType().isReference()) {
+                    return Type.reference(c.getValue().toString());
+                }
+            }
+            // fallback
+            return operands.length > 0 ? operands[0].getType() : Type.UNKNOWN;
+        }
+        // remaining operations as before
+        if (operands.length > 0 && operands[0] != null) {
             return operands[0].getType();
         }
         return Type.UNKNOWN;

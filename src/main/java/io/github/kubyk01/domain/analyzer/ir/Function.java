@@ -16,6 +16,8 @@ public class Function {
     private BasicBlock entryBlock;
     @Setter
     private Module module;
+    @Setter
+    private List<TryCatchRange> tryCatchRanges = new ArrayList<>();
 
     public Function(String name, Type returnType) {
         this.name = name;

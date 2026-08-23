@@ -14,7 +14,8 @@ public class BasicBlock {
     @Setter
     private Function function;
     private List<BasicBlock> predecessors = new ArrayList<>();
-    private List<BasicBlock> successors = new ArrayList<>();
+    private final List<BasicBlock> successors = new ArrayList<>();
+    private final List<BasicBlock> exceptionalSuccessors = new ArrayList<>();
 
     public BasicBlock(String label) {
         this.label = label;
@@ -33,6 +34,25 @@ public class BasicBlock {
     public void addSuccessor(BasicBlock block) {
         successors.add(block);
         block.predecessors.add(this);
+    }
+
+    public void addExceptionalSuccessor(BasicBlock block) {
+        // Duplicate guard is required for multi-catch (one handler for several
+        // ranges and several throwing instructions in the same block)
+        if (!exceptionalSuccessors.contains(block)) {
+            exceptionalSuccessors.add(block);
+            block.predecessors.add(this); // also add as a predecessor
+        }
+    }
+
+    /**
+     * Returns the union of normal and exceptional successors.
+     * Overrides the Lombok-generated getter for the {@code successors} field.
+     */
+    public List<BasicBlock> getSuccessors() {
+        List<BasicBlock> all = new ArrayList<>(successors);
+        all.addAll(exceptionalSuccessors);
+        return all;
     }
 
     @Override

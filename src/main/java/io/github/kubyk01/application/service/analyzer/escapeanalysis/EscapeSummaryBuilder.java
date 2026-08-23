@@ -1,6 +1,8 @@
 package io.github.kubyk01.application.service.analyzer.escapeanalysis;
 
+import io.github.kubyk01.application.service.analyzer.dependencyresolver.DependencyResolver;
 import io.github.kubyk01.domain.analyzer.aliasanalysis.AliasAnalysisResult;
+import io.github.kubyk01.domain.analyzer.dependencyresolver.FieldNode;
 import io.github.kubyk01.domain.analyzer.escapeanalysis.EscapeSummary;
 import io.github.kubyk01.domain.analyzer.ir.BasicBlock;
 import io.github.kubyk01.domain.analyzer.ir.Constant;
@@ -14,6 +16,7 @@ import io.github.kubyk01.domain.analyzer.ir.Terminator;
 import io.github.kubyk01.domain.analyzer.ir.Type;
 import io.github.kubyk01.domain.analyzer.ir.Value;
 import lombok.extern.slf4j.Slf4j;
+import org.objectweb.asm.Opcodes;
 
 import java.util.*;
 
@@ -22,11 +25,14 @@ public class EscapeSummaryBuilder {
 
     private final Module module;
     private final AliasAnalysisResult aliasResult;
+    private final DependencyResolver resolver;
     private final Map<String, EscapeSummary> summaries = new HashMap<>();
+    private final Map<Value, Value> valueOrigin = new HashMap<>();
 
-    public EscapeSummaryBuilder(Module module, AliasAnalysisResult aliasResult) {
+    public EscapeSummaryBuilder(Module module, AliasAnalysisResult aliasResult, DependencyResolver resolver) {
         this.module = module;
         this.aliasResult = aliasResult;
+        this.resolver = resolver;
     }
 
     public Map<String, EscapeSummary> build() {
@@ -52,12 +58,14 @@ public class EscapeSummaryBuilder {
         Set<String> fieldsEscaped = new HashSet<>();
         boolean[] flags = new boolean[3]; // returnsObject, escapesGlobally, createsThread
 
-        // Use aliasResult to determine parameter aliases
         Map<Integer, Set<Integer>> paramAliases = computeParamAliases(func);
+
+        // Clear origin map for this function
+        valueOrigin.clear();
 
         for (BasicBlock block : func.getBlocks()) {
             for (Instruction inst : block.getInstructions()) {
-                processInstruction(inst, func, paramAliases, paramsEscaped, paramsReturned, fieldsEscaped, flags);
+                processInstruction(inst, paramAliases, paramsEscaped, paramsReturned, fieldsEscaped, flags);
             }
             Terminator term = block.getTerminator();
             if (term != null) {
@@ -66,18 +74,17 @@ public class EscapeSummaryBuilder {
         }
 
         return EscapeSummary.builder()
-                .paramsEscaped(paramsEscaped)
-                .paramsReturned(paramsReturned)
-                .fieldsEscaped(fieldsEscaped)
-                .returnsObject(flags[0])
-                .escapesGlobally(flags[1])
-                .createsThread(flags[2])
-                .build();
+            .paramsEscaped(paramsEscaped)
+            .paramsReturned(paramsReturned)
+            .fieldsEscaped(fieldsEscaped)
+            .returnsObject(flags[0])
+            .escapesGlobally(flags[1])
+            .createsThread(flags[2])
+            .build();
     }
 
     private Map<Integer, Set<Integer>> computeParamAliases(Function func) {
         Map<Integer, Set<Integer>> aliases = new HashMap<>();
-        // If two parameters may point to the same object, they are considered aliases
         for (int i = 0; i < func.getParameters().size(); i++) {
             for (int j = i + 1; j < func.getParameters().size(); j++) {
                 Parameter p1 = func.getParameters().get(i);
@@ -91,7 +98,7 @@ public class EscapeSummaryBuilder {
         return aliases;
     }
 
-    private void processInstruction(Instruction inst, Function func,
+    private void processInstruction(Instruction inst,
                                     Map<Integer, Set<Integer>> paramAliases,
                                     Set<Integer> paramsEscaped, Set<Integer> paramsReturned,
                                     Set<String> fieldsEscaped, boolean[] flags) {
@@ -101,20 +108,67 @@ public class EscapeSummaryBuilder {
                 if (inst.getOperands().size() >= 3) {
                     Value base = inst.getOperands().get(0);
                     Value rhs = inst.getOperands().get(2);
-                    // If base is a parameter, it escapes (holds a reference)
-                    if (base instanceof Parameter p) {
+                    String[] ownerAndField = extractFieldOwnerAndName(inst);
+                    String owner = ownerAndField[0];
+                    String fieldName = ownerAndField[1];
+
+                    // Check if field is volatile
+                    if (isVolatileField(owner, fieldName)) {
+                        // volatile field makes base and rhs globally visible
+                        if (base instanceof Parameter p) {
+                            paramsEscaped.add(p.getIndex());
+                            addAliases(p.getIndex(), paramAliases, paramsEscaped);
+                        }
+                        if (rhs instanceof Parameter p) {
+                            paramsEscaped.add(p.getIndex());
+                            addAliases(p.getIndex(), paramAliases, paramsEscaped);
+                        }
+                        flags[1] = true; // escapesGlobally
+                    } else {
+                        // Normal field handling (existing logic)
+                        if (base instanceof Parameter p) {
+                            paramsEscaped.add(p.getIndex());
+                            addAliases(p.getIndex(), paramAliases, paramsEscaped);
+                        }
+                        if (rhs instanceof Parameter p) {
+                            paramsEscaped.add(p.getIndex());
+                            addAliases(p.getIndex(), paramAliases, paramsEscaped);
+                        }
+                        Object fieldNameObj = inst.getOperands().get(1);
+                        if (fieldNameObj instanceof Constant c) {
+                            fieldsEscaped.add(c.getValue().toString());
+                        }
+                    }
+                }
+                break;
+            }
+            case GET_FIELD: {
+                if (inst.getOperands().size() >= 2) {
+                    Value base = inst.getOperands().getFirst();
+                    String[] ownerAndField = extractFieldOwnerAndName(inst);
+                    String owner = ownerAndField[0];
+                    String fieldName = ownerAndField[1];
+
+                    // Check if field is volatile
+                    if (isVolatileField(owner, fieldName)) {
+                        // Accessing volatile field makes base globally visible
+                        if (base instanceof Parameter p) {
+                            paramsEscaped.add(p.getIndex());
+                            addAliases(p.getIndex(), paramAliases, paramsEscaped);
+                        }
+                        flags[1] = true; // escapesGlobally
+                    }
+                }
+                break;
+            }
+            case MONITOR_ENTER:
+            case MONITOR_EXIT: {
+                if (!inst.getOperands().isEmpty()) {
+                    Value obj = inst.getOperands().getFirst();
+                    if (obj instanceof Parameter p) {
                         paramsEscaped.add(p.getIndex());
                         addAliases(p.getIndex(), paramAliases, paramsEscaped);
-                    }
-                    // If rhs is a parameter, it escapes because it is stored into a field
-                    if (rhs instanceof Parameter p) {
-                        paramsEscaped.add(p.getIndex());
-                        addAliases(p.getIndex(), paramAliases, paramsEscaped);
-                    }
-                    // The field escapes
-                    Object fieldName = inst.getOperands().get(1);
-                    if (fieldName instanceof Constant c) {
-                        fieldsEscaped.add(c.getValue().toString());
+                        flags[1] = true; // synchronizing on object makes it globally visible
                     }
                 }
                 break;
@@ -127,6 +181,38 @@ public class EscapeSummaryBuilder {
                         addAliases(p.getIndex(), paramAliases, paramsEscaped);
                     }
                     flags[1] = true; // escapesGlobally
+                }
+                break;
+            }
+            case ALOAD: {
+                // array load: result = array[index]
+                if (inst.getOperands().size() >= 2) {
+                    Value array = inst.getOperands().getFirst();
+                    Value result = inst.getResult();
+                    if (result != null) {
+                        // Remember that 'result' originates from 'array'
+                        valueOrigin.put(result, array);
+                    }
+                    // Reading from array does not cause escape by itself.
+                    // If the result is returned, it will be handled in processTerminator.
+                }
+                break;
+            }
+            case ASTORE: {
+                // array store: array[index] = value
+                if (inst.getOperands().size() >= 3) {
+                    Value array = inst.getOperands().get(0);
+                    Value value = inst.getOperands().get(2);
+                    if (array instanceof Parameter p) {
+                        paramsEscaped.add(p.getIndex());
+                        addAliases(p.getIndex(), paramAliases, paramsEscaped);
+                    }
+                    if (value instanceof Parameter p) {
+                        paramsEscaped.add(p.getIndex());
+                        addAliases(p.getIndex(), paramAliases, paramsEscaped);
+                    }
+                    // The array element field escapes
+                    fieldsEscaped.add("[]");
                 }
                 break;
             }
@@ -150,13 +236,11 @@ public class EscapeSummaryBuilder {
         String calleeName = extractCalleeName(callInst);
         if (calleeName == null) return;
 
-        // Check whether the call creates a thread
         if (calleeName.startsWith("java/util/concurrent/ExecutorService.submit") ||
             calleeName.startsWith("java/util/concurrent/ForkJoinPool.submit") ||
             calleeName.startsWith("java/util/concurrent/CompletableFuture.supplyAsync") ||
             calleeName.startsWith("java/lang/Thread.start()V")) {
-            flags[2] = true; // createsThread
-            // Arguments (Runnable, Callable) are passed to the thread – they escape
+            flags[2] = true;
             List<Value> args = getCallArguments(callInst);
             for (Value arg : args) {
                 if (arg instanceof Parameter p) {
@@ -169,7 +253,6 @@ public class EscapeSummaryBuilder {
 
         EscapeSummary calleeSum = summaries.get(calleeName);
         if (calleeSum == null) {
-            // External call without a summary - conservatively mark all arguments as HEAP (i.e. escaping)
             List<Value> args = getCallArguments(callInst);
             for (Value arg : args) {
                 if (arg instanceof Parameter p) {
@@ -177,20 +260,13 @@ public class EscapeSummaryBuilder {
                     addAliases(p.getIndex(), paramAliases, paramsEscaped);
                 }
             }
-            // If an object is returned, assume it escapes too (conservatively)
             Value ret = callInst.getResult();
             if (ret != null && ret.getType() != Type.VOID) {
-                flags[0] = true; // returnsObject
-                // If a parameter is returned, it escapes as well
-                if (ret instanceof Parameter p) {
-                    paramsEscaped.add(p.getIndex());
-                    addAliases(p.getIndex(), paramAliases, paramsEscaped);
-                }
+                flags[0] = true;
             }
             return;
         }
 
-        // Apply the known summary
         List<Value> args = getCallArguments(callInst);
         for (int i = 0; i < args.size(); i++) {
             Value arg = args.get(i);
@@ -226,9 +302,44 @@ public class EscapeSummaryBuilder {
                     paramsReturned.add(p.getIndex());
                     addAliases(p.getIndex(), paramAliases, paramsEscaped);
                     addAliases(p.getIndex(), paramAliases, paramsReturned);
+                } else {
+                    // Check if retVal originates from an array load
+                    Value origin = valueOrigin.get(retVal);
+                    if (origin instanceof Parameter p) {
+                        // Returning an element of a parameter array means the parameter's contents may be returned.
+                        // Conservatively mark the parameter as returned.
+                        paramsReturned.add(p.getIndex());
+                        addAliases(p.getIndex(), paramAliases, paramsReturned);
+                    }
                 }
             }
         }
+    }
+
+    private String[] extractFieldOwnerAndName(Instruction inst) {
+        String full = extractFieldName(inst);
+        int dot = full.lastIndexOf('.');
+        if (dot > 0) {
+            return new String[]{full.substring(0, dot), full.substring(dot + 1)};
+        }
+        return new String[]{"", full};
+    }
+
+    private String extractFieldName(Instruction inst) {
+        int fieldIdx = (inst.getOpcode() == Opcode.GET_STATIC || inst.getOpcode() == Opcode.PUT_STATIC) ? 0 : 1;
+        if (inst.getOperands().size() > fieldIdx) {
+            Value v = inst.getOperands().get(fieldIdx);
+            if (v instanceof Constant c && c.getType().isReference()) {
+                return c.getValue().toString();
+            }
+        }
+        return "unknown";
+    }
+
+    private boolean isVolatileField(String owner, String fieldName) {
+        if (owner == null || owner.isEmpty() || fieldName == null || fieldName.isEmpty()) return false;
+        FieldNode field = resolver.getField(owner, fieldName);
+        return field != null && (field.getAccess() & Opcodes.ACC_VOLATILE) != 0;
     }
 
     private void addAliases(int paramIndex, Map<Integer, Set<Integer>> aliases, Set<Integer> set) {
@@ -241,7 +352,7 @@ public class EscapeSummaryBuilder {
     private String extractCalleeName(Instruction inst) {
         if (!inst.getOperands().isEmpty()) {
             Value v = inst.getOperands().getFirst();
-            if (v instanceof Constant c && c.getType() == Type.REFERENCE) {
+            if (v instanceof Constant c && c.getType().isReference()) {
                 return c.getValue().toString();
             }
         }

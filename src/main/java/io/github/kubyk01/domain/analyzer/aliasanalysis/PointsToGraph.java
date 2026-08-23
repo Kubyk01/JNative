@@ -78,6 +78,15 @@ public class PointsToGraph {
         return result;
     }
 
+    // ---- convenience methods for arrays ----
+    public PointsToSet getArrayElementPointsTo(AllocationSite site) {
+        return getFieldPointsTo(site, "[]");
+    }
+
+    public void mergeArrayElementPointsTo(AllocationSite site, PointsToSet pts) {
+        mergeFieldPointsTo(site, "[]", pts);
+    }
+
     // ---- static fields ----
     public PointsToSet getStaticFieldPointsTo(String field) {
         return staticFieldPointsTo.computeIfAbsent(field, k -> new PointsToSet());
@@ -96,33 +105,4 @@ public class PointsToGraph {
         return get(a).intersects(get(b));
     }
 
-    public boolean isUnique(Value v) {
-        return get(v).getSites().size() == 1;
-    }
-
-    public AllocationSite getUniqueSite(Value v) {
-        PointsToSet pts = get(v);
-        if (pts.getSites().size() == 1) {
-            return pts.getSites().iterator().next();
-        }
-        return null;
-    }
-
-    // ---- graph merging (for interprocedural analysis) ----
-    public void mergeGraph(PointsToGraph other) {
-        for (Map.Entry<Value, PointsToSet> e : other.nodeToPointsTo.entrySet()) {
-            this.merge(e.getKey(), e.getValue());
-        }
-        for (Map.Entry<AllocationSite, Map<String, PointsToSet>> e : other.fieldPointsTo.entrySet()) {
-            for (Map.Entry<String, PointsToSet> fe : e.getValue().entrySet()) {
-                this.mergeFieldPointsTo(e.getKey(), fe.getKey(), fe.getValue());
-            }
-        }
-        for (Map.Entry<String, PointsToSet> e : other.staticFieldPointsTo.entrySet()) {
-            this.mergeStaticFieldPointsTo(e.getKey(), e.getValue());
-        }
-        for (Map.Entry<AllocationSite, Value> e : other.allocationSiteToValue.entrySet()) {
-            this.allocationSiteToValue.putIfAbsent(e.getKey(), e.getValue());
-        }
-    }
 }

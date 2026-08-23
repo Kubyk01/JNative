@@ -12,7 +12,11 @@ import picocli.CommandLine.Command;
 import reactor.core.publisher.Mono;
 
 import java.io.File;
+import java.io.IOException;
 import java.nio.file.Path;
+import java.util.jar.Attributes;
+import java.util.jar.JarFile;
+import java.util.jar.Manifest;
 
 @AllArgsConstructor
 @Command(name = "jnative", mixinStandardHelpOptions = true, version = "0.1")
@@ -89,7 +93,7 @@ public class CLI implements Runnable {
     @Command(name = "analyze", description = "Perform dependency resolution and reachability analysis")
     public void analyze(
         @CommandLine.Parameters(index = "0", description = "Path to JAR or directory containing .class files") File file,
-        @CommandLine.Option(names = "--entry", description = "Entry point class (fully qualified)", defaultValue = "com.example.Main") String entryClass,
+        @CommandLine.Option(names = "--entry", description = "Entry point class (fully qualified)") String entryClass,
         @CommandLine.Option(names = "--method", description = "Entry method name", defaultValue = "main") String entryMethod,
         @CommandLine.Option(names = "--descriptor", description = "Method descriptor", defaultValue = "([Ljava/lang/String;)V") String descriptor,
         @CommandLine.Option(names = "--classes", description = "Show user classes and methods") boolean showClasses,
@@ -97,7 +101,32 @@ public class CLI implements Runnable {
         @CommandLine.Option(names = "--escape", description = "Show escape analysis") boolean showEscape,
         @CommandLine.Option(names = "--lifetime", description = "Show lifetime analysis") boolean showLifetime,
         @CommandLine.Option(names = "--destructor", description = "Show destructor insertion") boolean showDestructor,
-        @CommandLine.Option(names = "--all", description = "Show all analysis stages (default if none specified)") boolean showAll) {
+        @CommandLine.Option(names = "--all", description = "Show all analysis stages (default if none specified)") boolean showAll,
+        @CommandLine.Option(names = "--output", description = "Output executable file name (default: a.out)") String outputFile,
+        @CommandLine.Option(names = "--no-compile", description = "Do not compile to native executable") boolean noCompile,
+        @CommandLine.Option(names = "--include-system", description = "Include system/library classes in output") boolean includeSystem,
+        @CommandLine.Option(names = "--debug-name", description = "Debug only this class or method (shows only matching items)") String debugName) {
+
+        // If entryClass is not provided, try to read from JAR manifest
+        if (entryClass == null && file.isFile() && file.getName().toLowerCase().endsWith(".jar")) {
+            try (JarFile jar = new JarFile(file)) {
+                Manifest manifest = jar.getManifest();
+                if (manifest != null) {
+                    Attributes mainAttrs = manifest.getMainAttributes();
+                    String mainClass = mainAttrs.getValue("Main-Class");
+                    if (mainClass != null && !mainClass.isEmpty()) {
+                        entryClass = mainClass.replace('.', '/'); // convert to internal format
+                    }
+                }
+            } catch (IOException e) {
+                System.err.println("Failed to read manifest from JAR: " + e.getMessage());
+            }
+        }
+
+        if (entryClass == null) {
+            System.err.println("Error: entry class not specified and could not be determined from manifest.");
+            return;
+        }
 
         // If no flag is given, show everything (including classes)
         boolean anyFlag = showClasses || showAlias || showEscape || showLifetime || showDestructor || showAll;
@@ -109,6 +138,7 @@ public class CLI implements Runnable {
 
         Path path = file.toPath();
         analyzer.analyze(path, entryClass, entryMethod, descriptor,
-                         showClasses, showAlias, showEscape, showLifetime, showDestructor);
+            showClasses, showAlias, showEscape, showLifetime, showDestructor,
+            outputFile, noCompile, includeSystem, debugName);
     }
 }

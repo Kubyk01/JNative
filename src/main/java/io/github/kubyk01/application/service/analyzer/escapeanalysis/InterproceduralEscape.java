@@ -1,5 +1,6 @@
 package io.github.kubyk01.application.service.analyzer.escapeanalysis;
 
+import io.github.kubyk01.application.service.analyzer.dependencyresolver.DependencyResolver;
 import io.github.kubyk01.domain.analyzer.aliasanalysis.AliasAnalysisResult;
 import io.github.kubyk01.domain.analyzer.aliasanalysis.AllocationSite;
 import io.github.kubyk01.domain.analyzer.aliasanalysis.PointsToSet;
@@ -20,13 +21,15 @@ public class InterproceduralEscape {
     private final Module module;
     private final AliasAnalysisResult aliasResult;
     private final Map<String, EscapeSummary> summaries;
+    private final DependencyResolver resolver;
     private final Map<AllocationSite, EscapeStatus> globalStatus = new HashMap<>();
 
     public InterproceduralEscape(Module module, AliasAnalysisResult aliasResult,
-                                 Map<String, EscapeSummary> summaries) {
+                                 Map<String, EscapeSummary> summaries, DependencyResolver resolver) {
         this.module = module;
         this.aliasResult = aliasResult;
         this.summaries = summaries;
+        this.resolver = resolver;
     }
 
     public Map<AllocationSite, EscapeStatus> analyze() {
@@ -49,7 +52,7 @@ public class InterproceduralEscape {
             changed = false;
             for (Function func : module.getFunctions()) {
                 if (func.getEntryBlock() == null) continue;
-                IntraproceduralEscape intra = new IntraproceduralEscape(func, aliasResult, summaries);
+                IntraproceduralEscape intra = new IntraproceduralEscape(func, aliasResult, summaries, resolver);
                 Map<AllocationSite, EscapeStatus> localStatus = intra.analyze();
                 for (Map.Entry<AllocationSite, EscapeStatus> entry : localStatus.entrySet()) {
                     EscapeStatus old = globalStatus.getOrDefault(entry.getKey(), EscapeStatus.STACK);

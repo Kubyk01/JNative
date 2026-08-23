@@ -5,6 +5,10 @@ import io.github.kubyk01.domain.analyzer.ir.Function;
 
 import java.util.*;
 
+/**
+ * Fixed version of DominatorTree that takes exceptional edges into account.
+ * DFS now visits all successors, including exceptional ones.
+ */
 public class DominatorTree {
     private final Map<BasicBlock, BasicBlock> idom = new HashMap<>();
     private final Map<BasicBlock, List<BasicBlock>> children = new HashMap<>();
@@ -21,7 +25,26 @@ public class DominatorTree {
         List<BasicBlock> vertex = new ArrayList<>();
         Map<BasicBlock, Integer> dfsNum = new HashMap<>();
         Map<BasicBlock, BasicBlock> parent = new HashMap<>();
-        dfs(entry, vertex, dfsNum, parent);
+
+        // Iterative DFS visiting ALL successors (including exceptional)
+        Deque<BasicBlock> stack = new ArrayDeque<>();
+        stack.push(entry);
+        while (!stack.isEmpty()) {
+            BasicBlock w = stack.pop();
+            if (dfsNum.containsKey(w)) continue;
+            dfsNum.put(w, vertex.size());
+            vertex.add(w);
+            // Use getSuccessors() instead of getNormalSuccessors()
+            List<BasicBlock> succs = w.getSuccessors();
+            // Reverse order to preserve determinism
+            for (int i = succs.size() - 1; i >= 0; i--) {
+                BasicBlock s = succs.get(i);
+                if (!dfsNum.containsKey(s)) {
+                    parent.put(s, w);
+                    stack.push(s);
+                }
+            }
+        }
 
         int n = vertex.size();
         if (n == 0) return;
@@ -95,26 +118,6 @@ public class DominatorTree {
         computeDominanceFrontiers(vertex);
     }
 
-    private void dfs(BasicBlock start, List<BasicBlock> vertex,
-                     Map<BasicBlock, Integer> dfsNum, Map<BasicBlock, BasicBlock> parent) {
-        Deque<BasicBlock> stack = new ArrayDeque<>();
-        stack.push(start);
-        while (!stack.isEmpty()) {
-            BasicBlock w = stack.pop();
-            if (dfsNum.containsKey(w)) continue;
-            dfsNum.put(w, vertex.size());
-            vertex.add(w);
-            List<BasicBlock> succs = w.getSuccessors();
-            for (int i = succs.size() - 1; i >= 0; i--) {
-                BasicBlock s = succs.get(i);
-                if (!dfsNum.containsKey(s)) {
-                    parent.put(s, w);
-                    stack.push(s);
-                }
-            }
-        }
-    }
-
     private int eval(int v, int[] semi, int[] ancestor, int[] label) {
         if (ancestor[v] == -1) {
             return v;
@@ -160,10 +163,6 @@ public class DominatorTree {
                 }
             }
         }
-    }
-
-    public BasicBlock getImmediateDominator(BasicBlock block) {
-        return idom.get(block);
     }
 
     public List<BasicBlock> getChildren(BasicBlock block) {

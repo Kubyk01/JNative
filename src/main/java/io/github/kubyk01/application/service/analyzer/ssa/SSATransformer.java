@@ -198,6 +198,7 @@ public class SSATransformer {
             case ThrowTerminator tt -> tt.setException(resolve(tt.getException()));
             case LookupSwitchTerminator lst -> lst.setKey(resolve(lst.getKey()));
             case TableSwitchTerminator tst -> tst.setKey(resolve(tst.getKey()));
+            case IndirectBranchTerminator ibt -> ibt.setTargetBlock(resolve(ibt.getTargetBlock()));
             case null, default -> {
             }
         }
@@ -306,6 +307,8 @@ public class SSATransformer {
             if (lst.getKey() == oldVal) lst.setKey(newVal);
         } else if (term instanceof TableSwitchTerminator tst) {
             if (tst.getKey() == oldVal) tst.setKey(newVal);
+        } else if (term instanceof IndirectBranchTerminator ibt) {
+            if (ibt.getTargetBlock() == oldVal) ibt.setTargetBlock(newVal);
         }
     }
 

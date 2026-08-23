@@ -1,6 +1,7 @@
 package io.github.kubyk01.application.service.analyzer.dependencyresolver;
 
 import io.github.kubyk01.application.service.analyzer.reachabilityanalysis.ReachabilityMetadataParser;
+import io.github.kubyk01.application.service.analyzer.ssa.TypeResolver;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.ClassNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.FieldNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.MethodNode;
@@ -30,6 +31,50 @@ public class DependencyResolver {
     private final Set<String> missingClasses = new HashSet<>();
     @Getter
     private final ReachabilityMetadata metadata = ReachabilityMetadata.builder().build();
+
+    @Getter
+    private boolean systemFsInitialized = false;
+
+    /**
+     * Lazily loads a single system class from the JDK by its internal name.
+     * If the class is not found in the JDK, an external stub is created.
+     */
+    public synchronized void loadSystemClass(String internalName) {
+        if (classMap.containsKey(internalName)) {
+            return;
+        }
+
+        byte[] bytes = null;
+
+        try {
+            InputStream is = ClassLoader.getSystemResourceAsStream(internalName + ".class");
+            if (is != null) {
+                bytes = is.readAllBytes();
+                is.close();
+            } else {
+                log.debug("Class {} not found via system ClassLoader, trying fallback (if any)", internalName);
+            }
+        } catch (IOException e) {
+            log.warn("Failed to load system class {}: {}", internalName, e.getMessage());
+        }
+
+        if (bytes != null) {
+            try {
+                parseClassBytes(internalName, bytes);
+                return;
+            } catch (IOException e) {
+                log.warn("Failed to parse system class {}: {}", internalName, e.getMessage());
+            }
+        }
+
+        log.debug("System class {} not loaded with bytecode, marked external", internalName);
+        ClassNode stub = ClassNode.builder()
+            .name(internalName)
+            .superName("java/lang/Object")
+            .isExternal(true)
+            .build();
+        classMap.put(internalName, stub);
+    }
 
     public void scan(Path path) throws IOException {
         if (Files.isDirectory(path)) {
@@ -77,7 +122,7 @@ public class DependencyResolver {
         try {
             ReachabilityMetadata part = ReachabilityMetadataParser.parse(is, fileName);
             metadata.merge(part);
-        } catch (IOException e) {
+        } catch (Exception e) {
             log.warn("Failed to parse metadata stream: {}", fileName, e);
         }
     }
@@ -85,67 +130,85 @@ public class DependencyResolver {
     private void parseClassFile(Path classFile) {
         try (InputStream is = Files.newInputStream(classFile)) {
             parseClassStream(is);
-        } catch (IOException e) {
+        } catch (Exception e) {
             log.error("Failed to parse class file: {}", classFile, e);
         }
     }
 
     private void parseClassStream(InputStream is) throws IOException {
-        // 1. Read all bytes first
-        byte[] bytes = is.readAllBytes();
-        ClassReader reader = new ClassReader(bytes);
+        try {
+            byte[] bytes = is.readAllBytes();
+            ClassReader reader = new ClassReader(bytes);
 
-        ClassNode.ClassNodeBuilder builder = ClassNode.builder();
-        final String[] currentClassName = {null};
-        final List<FieldNode> fields = new ArrayList<>();
-        final List<MethodNode> methods = new ArrayList<>();
+            ClassNode.ClassNodeBuilder builder = ClassNode.builder();
+            final String[] currentClassName = {null};
+            final List<FieldNode> fields = new ArrayList<>();
+            final List<MethodNode> methods = new ArrayList<>();
 
-        reader.accept(new ClassVisitor(Opcodes.ASM9) {
-            @Override
-            public void visit(int version, int access, String name, String signature,
-                              String superName, String[] interfaces) {
-                currentClassName[0] = name;
-                builder.name(name)
-                    .superName(superName)
-                    .interfaces(interfaces != null ? Arrays.asList(interfaces) : Collections.emptyList())
-                    .access(access)
-                    .isInterface((access & Opcodes.ACC_INTERFACE) != 0)
-                    .isExternal(false);
+            try {
+                reader.accept(new ClassVisitor(Opcodes.ASM9) {
+                    @Override
+                    public void visit(int version, int access, String name, String signature,
+                                      String superName, String[] interfaces) {
+                        currentClassName[0] = name;
+                        builder.name(name)
+                            .superName(superName)
+                            .interfaces(interfaces != null ? Arrays.asList(interfaces) : Collections.emptyList())
+                            .access(access)
+                            .isInterface((access & Opcodes.ACC_INTERFACE) != 0)
+                            .isExternal(false);
+                    }
+
+                    @Override
+                    public FieldVisitor visitField(int access, String name, String descriptor,
+                                                   String signature, Object value) {
+                        fields.add(FieldNode.builder()
+                            .name(name)
+                            .descriptor(descriptor)
+                            .type(io.github.kubyk01.domain.analyzer.ir.Type.fromDescriptor(descriptor))
+                            .access(access)
+                            .build());
+                        return null;
+                    }
+
+                    @Override
+                    public MethodVisitor visitMethod(int access, String name, String descriptor,
+                                                     String signature, String[] exceptions) {
+                        MethodNode.MethodNodeBuilder mb = MethodNode.builder()
+                            .name(name)
+                            .descriptor(descriptor)
+                            .returnType(TypeResolver.descToReturnType(descriptor))
+                            .parameterTypes(TypeResolver.descToParamTypes(descriptor))
+                            .access(access)
+                            .isAbstract((access & Opcodes.ACC_ABSTRACT) != 0)
+                            .isNative((access & Opcodes.ACC_NATIVE) != 0)
+                            .isStatic((access & Opcodes.ACC_STATIC) != 0);
+                        if (exceptions != null) {
+                            mb.exceptions(Arrays.asList(exceptions));
+                        }
+                        methods.add(mb.build());
+                        return null;
+                    }
+                }, ClassReader.SKIP_CODE | ClassReader.SKIP_DEBUG);
+            } catch (Exception e) {
+                System.err.println("ERROR during reader.accept for class " + currentClassName[0] + ": " + e);
+                e.printStackTrace();
+                throw e;
             }
 
-            @Override
-            public FieldVisitor visitField(int access, String name, String descriptor,
-                                           String signature, Object value) {
-                fields.add(FieldNode.builder()
-                    .name(name)
-                    .descriptor(descriptor)
-                    .access(access)
-                    .build());
-                return null;
+            ClassNode classNode = builder.fields(fields).methods(methods).build();
+            String name = currentClassName[0];
+            if (name == null) {
+                System.err.println("ERROR: currentClassName is null, class not processed");
+                return;
             }
-
-            @Override
-            public MethodVisitor visitMethod(int access, String name, String descriptor,
-                                             String signature, String[] exceptions) {
-                MethodNode.MethodNodeBuilder mb = MethodNode.builder()
-                    .name(name)
-                    .descriptor(descriptor)
-                    .access(access)
-                    .isAbstract((access & Opcodes.ACC_ABSTRACT) != 0)
-                    .isNative((access & Opcodes.ACC_NATIVE) != 0)
-                    .isStatic((access & Opcodes.ACC_STATIC) != 0);
-                if (exceptions != null) {
-                    mb.exceptions(Arrays.asList(exceptions));
-                }
-                methods.add(mb.build());
-                return null;
-            }
-        }, ClassReader.SKIP_CODE | ClassReader.SKIP_DEBUG);
-
-        ClassNode classNode = builder.fields(fields).methods(methods).build();
-        String name = currentClassName[0];
-        classMap.put(name, classNode);
-        classBytes.put(name, bytes);   // 2. Store the bytecode
+            classMap.put(name, classNode);
+            classBytes.put(name, bytes);
+        } catch (Exception e) {
+            System.err.println("ERROR in parseClassStream: " + e.getMessage());
+            e.printStackTrace();
+            throw new IOException("Failed to parse class", e);
+        }
     }
 
     private void buildSubclassIndex() {
@@ -163,6 +226,11 @@ public class DependencyResolver {
         ClassNode node = classMap.get(internalName);
         if (node != null) return node;
 
+        // Try to lazily load the system class from the JDK
+        loadSystemClass(internalName);
+        node = classMap.get(internalName);
+        if (node != null) return node;
+
         if (!missingClasses.contains(internalName)) {
             missingClasses.add(internalName);
             log.warn("Class not found in input: {} – treated as external", internalName);
@@ -177,8 +245,98 @@ public class DependencyResolver {
     }
 
     /**
-     * Returns the raw bytecode of a class, or null if not available.
+     * Parses class bytes and stores the information, but does NOT recursively load
+     * the superclass and interfaces. They will be loaded lazily via getClassNode
+     * when needed.
      */
+    private void parseClassBytes(String internalName, byte[] bytes) throws IOException {
+        ClassReader reader = new ClassReader(bytes);
+
+        ClassNode.ClassNodeBuilder builder = ClassNode.builder();
+        final String[] currentClassName = {null};
+        final List<FieldNode> fields = new ArrayList<>();
+        final List<MethodNode> methods = new ArrayList<>();
+
+        try {
+            reader.accept(new ClassVisitor(Opcodes.ASM9) {
+                @Override
+                public void visit(int version, int access, String name, String signature,
+                                  String superName, String[] interfaces) {
+                    currentClassName[0] = name;
+                    builder.name(name)
+                        .superName(superName)
+                        .interfaces(interfaces != null ? Arrays.asList(interfaces) : Collections.emptyList())
+                        .access(access)
+                        .isInterface((access & Opcodes.ACC_INTERFACE) != 0)
+                        .isExternal(false);
+                }
+
+                @Override
+                public FieldVisitor visitField(int access, String name, String descriptor,
+                                               String signature, Object value) {
+                    fields.add(FieldNode.builder()
+                        .name(name)
+                        .descriptor(descriptor)
+                        .type(io.github.kubyk01.domain.analyzer.ir.Type.fromDescriptor(descriptor))
+                        .access(access)
+                        .build());
+                    return null;
+                }
+
+                @Override
+                public MethodVisitor visitMethod(int access, String name, String descriptor,
+                                                 String signature, String[] exceptions) {
+                    MethodNode.MethodNodeBuilder mb = MethodNode.builder()
+                        .name(name)
+                        .descriptor(descriptor)
+                        .returnType(TypeResolver.descToReturnType(descriptor))
+                        .parameterTypes(TypeResolver.descToParamTypes(descriptor))
+                        .access(access)
+                        .isAbstract((access & Opcodes.ACC_ABSTRACT) != 0)
+                        .isNative((access & Opcodes.ACC_NATIVE) != 0)
+                        .isStatic((access & Opcodes.ACC_STATIC) != 0);
+                    if (exceptions != null) {
+                        mb.exceptions(Arrays.asList(exceptions));
+                    }
+                    methods.add(mb.build());
+                    return null;
+                }
+            }, ClassReader.SKIP_CODE | ClassReader.SKIP_DEBUG);
+        } catch (Exception e) {
+            throw new IOException("Failed to parse class " + internalName, e);
+        }
+
+        ClassNode classNode = builder.fields(fields).methods(methods).build();
+        String name = currentClassName[0];
+        if (name == null) {
+            throw new IOException("Class name not found");
+        }
+
+        // Register the class (before recursion, to avoid cycles)
+        classMap.put(name, classNode);
+        classBytes.put(name, bytes);
+
+        // Update the subclass index (for the current class)
+        if (classNode.getSuperName() != null && !classNode.getSuperName().equals("java/lang/Object")) {
+            subclasses.computeIfAbsent(classNode.getSuperName(), k -> new HashSet<>()).add(name);
+        }
+        for (String iface : classNode.getInterfaces()) {
+            subclasses.computeIfAbsent(iface, k -> new HashSet<>()).add(name);
+        }
+
+        // REMOVED recursive calls to loadSystemClass for the superclass and interfaces.
+        // They will be loaded lazily via getClassNode when needed.
+    }
+
+    public FieldNode getField(String className, String fieldName) {
+        ClassNode cn = classMap.get(className);
+        if (cn == null) return null;
+        for (FieldNode f : cn.getFields()) {
+            if (f.getName().equals(fieldName)) return f;
+        }
+        return null;
+    }
+
     public byte[] getClassBytes(String internalName) {
         return classBytes.get(internalName);
     }

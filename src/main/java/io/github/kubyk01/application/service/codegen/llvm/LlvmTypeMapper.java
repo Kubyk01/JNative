@@ -5,25 +5,23 @@ import io.github.kubyk01.domain.analyzer.ir.Type;
 public class LlvmTypeMapper {
 
     public String toLlvmType(Type type) {
-        return switch (type) {
-            case VOID -> "void";
-            case BOOLEAN -> "i1";
-            case BYTE -> "i8";
-            case SHORT, CHAR -> "i16";
-            case INT -> "i32";
-            case LONG -> "i64";
-            case FLOAT -> "float";
-            case DOUBLE -> "double";
-            case REFERENCE, ARRAY, NULL -> "i8*";
-            default -> "i8*";
-        };
+        if (type.isVoid()) return "void";
+        if (type.isPrimitive()) {
+            if (type == Type.BOOLEAN) return "i1";
+            if (type == Type.BYTE) return "i8";
+            if (type == Type.SHORT || type == Type.CHAR) return "i16";
+            if (type == Type.INT) return "i32";
+            if (type == Type.LONG) return "i64";
+            if (type == Type.FLOAT) return "float";
+            if (type == Type.DOUBLE) return "double";
+        }
+        if (type.isReference() || type.isArray() || type.isNull() || type.isBlock()) {
+            return "i8*";
+        }
+        return "i8*"; // fallback
     }
 
     public String toLlvmStruct(String className) {
         return "%struct." + className.replace('/', '_').replace('.', '_');
-    }
-
-    public String toLlvmPtr(String inner) {
-        return inner + "*";
     }
 }

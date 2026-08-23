@@ -10,26 +10,7 @@ public final class TypeResolver {
     private TypeResolver() {}
 
     public static Type descToIrType(String desc) {
-        if (desc.length() == 1) {
-            return switch (desc.charAt(0)) {
-                case 'Z' -> Type.BOOLEAN;
-                case 'B' -> Type.BYTE;
-                case 'S' -> Type.SHORT;
-                case 'C' -> Type.CHAR;
-                case 'I' -> Type.INT;
-                case 'J' -> Type.LONG;
-                case 'F' -> Type.FLOAT;
-                case 'D' -> Type.DOUBLE;
-                case 'V' -> Type.VOID;
-                default -> Type.REFERENCE;
-            };
-        } else if (desc.startsWith("L")) {
-            return Type.REFERENCE;
-        } else if (desc.startsWith("[")) {
-            return Type.ARRAY;
-        } else {
-            return Type.UNKNOWN;
-        }
+        return Type.fromDescriptor(desc);
     }
 
     public static List<Type> descToParamTypes(String desc) {
@@ -39,13 +20,24 @@ public final class TypeResolver {
             char c = desc.charAt(i);
             if (c == ')') break;
             if (c == 'L') {
-                params.add(Type.REFERENCE);
-                i = desc.indexOf(';', i) + 1;
+                int end = desc.indexOf(';', i);
+                String name = desc.substring(i + 1, end);
+                params.add(Type.reference(name));
+                i = end + 1;
             } else if (c == '[') {
-                params.add(Type.ARRAY);
-                i++;
+                int start = i;
+                while (i < desc.length() && desc.charAt(i) == '[') i++;
+                int end;
+                if (i < desc.length() && desc.charAt(i) == 'L') {
+                    end = desc.indexOf(';', i) + 1;
+                } else {
+                    end = i + 1;
+                }
+                String sub = desc.substring(start, end);
+                params.add(Type.array(sub));
+                i = end;
             } else {
-                params.add(descToIrType("" + c));
+                params.add(Type.fromDescriptor(String.valueOf(c)));
                 i++;
             }
         }

@@ -2,12 +2,14 @@ package io.github.kubyk01.application.service.analyzer.ssa;
 
 import io.github.kubyk01.application.service.analyzer.dependencyresolver.DependencyResolver;
 import io.github.kubyk01.application.service.analyzer.reachabilityanalysis.ReachabilityAnalysis;
+import io.github.kubyk01.application.service.codegen.llvm.LlvmRuntime;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.ClassNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.MethodNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.MethodReference;
 import io.github.kubyk01.domain.analyzer.ir.Function;
 import io.github.kubyk01.domain.analyzer.ir.IrBuilder;
 import io.github.kubyk01.domain.analyzer.ir.Module;
+import io.github.kubyk01.domain.analyzer.ir.Parameter;
 import io.github.kubyk01.domain.analyzer.ir.Type;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -16,7 +18,9 @@ import org.objectweb.asm.ClassVisitor;
 import org.objectweb.asm.MethodVisitor;
 import org.objectweb.asm.Opcodes;
 
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 @Slf4j
@@ -36,21 +40,38 @@ public class BytecodeToIr {
     }
 
     private void translateMethod(MethodReference methodRef) {
+        MethodNode methodNode = null;
         try {
             String owner = methodRef.getOwner();
             String name = methodRef.getName();
             String desc = methodRef.getDescriptor();
 
             ClassNode classNode = resolver.getClassNode(owner);
+            methodNode = findMethod(classNode, name, desc);
+            boolean isStatic = methodNode != null && methodNode.isStatic();
+
             if (classNode.isExternal()) {
-                Function func = createExternalFunction(methodRef);
+                // For external or abstract methods, we use the same logic.
+                Function func = createExternalFunction(methodRef, isStatic);
                 functionMap.put(methodRef, func);
                 return;
             }
 
-            MethodNode methodNode = findMethod(classNode, name, desc);
-            if (methodNode == null || methodNode.isAbstract() || methodNode.isNative()) {
-                Function func = createExternalFunction(methodRef);
+            if (methodNode != null && methodNode.isNative()) {
+                // Native method: declare the function with the __jnative_ prefix,
+                // the implementation is provided by the runtime (jnative_runtime.c)
+                String nativeName = "__jnative_" + LlvmRuntime.mangleMethod(owner, name, desc);
+                Function func = new Function(nativeName, methodNode.getReturnType());
+                for (Type paramType : methodNode.getParameterTypes()) {
+                    func.addParameter(new Parameter(paramType, func.getParameters().size()));
+                }
+                builder.getModule().addFunction(func);
+                functionMap.put(methodRef, func);
+                return;
+            }
+
+            if (methodNode == null || methodNode.isAbstract()) {
+                Function func = createExternalFunction(methodRef, isStatic);
                 functionMap.put(methodRef, func);
                 return;
             }
@@ -62,7 +83,7 @@ public class BytecodeToIr {
             }
 
             ClassReader reader = new ClassReader(bytes);
-            MethodTranslator translator = new MethodTranslator(methodRef, methodNode.isStatic(), builder);
+            MethodTranslator translator = new MethodTranslator(methodRef, methodNode.isStatic(), builder, resolver);
             reader.accept(new ClassVisitor(Opcodes.ASM9) {
                 @Override
                 public MethodVisitor visitMethod(int access, String mName, String mDesc,
@@ -80,7 +101,8 @@ public class BytecodeToIr {
             }
         } catch (Exception e) {
             log.warn("Failed to translate method: {} - {}", methodRef, e.getMessage());
-            Function func = createExternalFunction(methodRef);
+            boolean isStatic = methodNode != null && methodNode.isStatic();
+            Function func = createExternalFunction(methodRef, isStatic);
             functionMap.put(methodRef, func);
         }
     }
@@ -100,8 +122,20 @@ public class BytecodeToIr {
         return null;
     }
 
-    private Function createExternalFunction(MethodReference ref) {
-        Function func = new Function(ref.toString(), Type.UNKNOWN);
+    private Function createExternalFunction(MethodReference ref, boolean isStatic) {
+        Type retType = TypeResolver.descToReturnType(ref.getDescriptor());
+        List<Type> paramTypes = TypeResolver.descToParamTypes(ref.getDescriptor());
+        List<Type> allParams = new ArrayList<>();
+        if (!isStatic) {
+            // Instance method: receiver is the first parameter
+            allParams.add(Type.reference(ref.getOwner()));
+        }
+        allParams.addAll(paramTypes);
+        String mangledName = LlvmRuntime.mangleMethod(ref.getOwner(), ref.getName(), ref.getDescriptor());
+        Function func = new Function(mangledName, retType);
+        for (int i = 0; i < allParams.size(); i++) {
+            func.addParameter(new Parameter(allParams.get(i), i));
+        }
         builder.getModule().addFunction(func);
         return func;
     }

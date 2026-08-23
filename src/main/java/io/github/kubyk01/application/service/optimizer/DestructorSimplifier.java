@@ -6,6 +6,7 @@ import io.github.kubyk01.domain.analyzer.ir.*;
 import io.github.kubyk01.domain.analyzer.ir.Module;
 import io.github.kubyk01.domain.analyzer.lifetime.DestructionPoint;
 import io.github.kubyk01.domain.analyzer.lifetime.LifetimeAnalysisResult;
+import lombok.Getter;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 
@@ -16,8 +17,10 @@ import java.util.*;
 public class DestructorSimplifier {
 
     private final Module module;
+    @Getter
     private final AliasAnalysisResult aliasResult;
     private final LifetimeAnalysisResult lifetimeResult;
+    @Getter
     private final Map<AllocationSite, Value> siteToValue;
     private final boolean enableSimplification;
     private final boolean enableInlining;
@@ -51,7 +54,7 @@ public class DestructorSimplifier {
         // Build the destructor call graph from destruction points and the shutdown function
         Set<Function> called = new HashSet<>();
         for (Map.Entry<AllocationSite, Set<DestructionPoint>> entry : lifetimeResult.getDestructionPoints().entrySet()) {
-            String type = entry.getKey().getType();
+            Type type = entry.getKey().getType();
             Function dtor = module.getFunction(destructorName(type));
             if (dtor != null) called.add(dtor);
         }
@@ -79,8 +82,7 @@ public class DestructorSimplifier {
                     Value callee = inst.getOperands().getFirst();
                     if (callee instanceof Constant c) {
                         Object val = c.getValue();
-                        if (val instanceof String) {
-                            String name = (String) val;
+                        if (val instanceof String name) {
                             Function called = module.getFunction(name);
                             if (called != null && (called.getName().startsWith("__destruct_") || called.getName().startsWith("__destruct_array_"))) {
                                 if (accumulator.add(called)) {
@@ -186,11 +188,12 @@ public class DestructorSimplifier {
         // Not removing them for now.
     }
 
-    private String destructorName(String type) {
-        if (type.startsWith("[")) {
-            return "__destruct_array_" + type.replace('/', '_').replace('[', '_').replace(';', '_');
-        } else {
-            return "__destruct_" + type.replace('/', '_').replace('.', '_');
+    private String destructorName(Type type) {
+        if (type.isArray()) {
+            return "__destruct_array_" + type.toString().replace('/', '_').replace('[', '_').replace(';', '_');
+        } else if (type.isReference()) {
+            return "__destruct_" + type.getClassName().replace('/', '_').replace('.', '_');
         }
+        return "__destruct_unknown";
     }
 }

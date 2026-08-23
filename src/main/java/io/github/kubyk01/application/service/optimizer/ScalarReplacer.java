@@ -17,8 +17,8 @@ import io.github.kubyk01.domain.analyzer.ir.ReturnTerminator;
 import io.github.kubyk01.domain.analyzer.ir.TableSwitchTerminator;
 import io.github.kubyk01.domain.analyzer.ir.Terminator;
 import io.github.kubyk01.domain.analyzer.ir.ThrowTerminator;
-import io.github.kubyk01.domain.analyzer.ir.Type;
 import io.github.kubyk01.domain.analyzer.ir.Value;
+import lombok.Getter;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 
@@ -41,6 +41,7 @@ public class ScalarReplacer {
     private final Module module;
     private final AliasAnalysisResult aliasResult;
     private final EscapeAnalysisResult escapeResult;
+    @Getter
     private final Map<AllocationSite, Value> siteToValue;
 
     // Mapping AllocationSite -> set of fields (fieldName -> current value)
@@ -58,7 +59,7 @@ public class ScalarReplacer {
                 List<Instruction> instructions = block.getInstructions();
                 List<Instruction> newInstructions = new ArrayList<>();
                 for (Instruction inst : instructions) {
-                    if (processInstruction(inst, block, candidates, newInstructions)) {
+                    if (processInstruction(inst, candidates)) {
                         // Instruction processed (replaced or removed)
                     } else {
                         newInstructions.add(inst);
@@ -123,9 +124,8 @@ public class ScalarReplacer {
         return false;
     }
 
-    private boolean processInstruction(Instruction inst, BasicBlock block,
-                                        Set<AllocationSite> candidates,
-                                        List<Instruction> newInstructions) {
+    private boolean processInstruction(Instruction inst,
+                                       Set<AllocationSite> candidates) {
         Opcode op = inst.getOpcode();
         if (op == Opcode.NEW || op == Opcode.NEW_ARRAY || op == Opcode.MULTI_NEW_ARRAY) {
             Value result = inst.getResult();
@@ -190,7 +190,7 @@ public class ScalarReplacer {
     private String extractFieldName(Instruction inst) {
         if (inst.getOperands().size() >= 2) {
             Value v = inst.getOperands().get(1);
-            if (v instanceof Constant c && c.getType() == Type.REFERENCE) {
+            if (v instanceof Constant c && c.getType().isReference()) {
                 String val = c.getValue().toString();
                 int dot = val.lastIndexOf('.');
                 return dot >= 0 ? val.substring(dot + 1) : val;

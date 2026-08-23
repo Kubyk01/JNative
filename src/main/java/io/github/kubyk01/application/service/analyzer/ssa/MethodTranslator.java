@@ -1,5 +1,7 @@
 package io.github.kubyk01.application.service.analyzer.ssa;
 
+import io.github.kubyk01.application.service.analyzer.dependencyresolver.DependencyResolver;
+import io.github.kubyk01.application.service.codegen.llvm.LlvmRuntime;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.MethodReference;
 import io.github.kubyk01.domain.analyzer.ir.*;
 import lombok.Getter;
@@ -20,27 +22,39 @@ public class MethodTranslator extends MethodVisitor {
     private final Map<Label, BasicBlock> labelToBlock = new HashMap<>();
     private final TryCatchHandler tryCatchHandler;
     private final InstructionHandlers handlers;
+    private final List<TryCatchRange> tryCatchRanges = new ArrayList<>();
+    // local index -> return blocks of all JSR instructions whose address is stored in that variable
+    private final Map<Integer, Set<BasicBlock>> jsrReturnBlocks = new HashMap<>();
+    private final List<IndirectBranchTerminator> indirectBranches = new ArrayList<>();
 
     @Getter
     private Function currentFunction;
     private BasicBlock currentBlock;
 
-    public MethodTranslator(MethodReference methodRef, boolean isStatic, IrBuilder builder) {
+    public MethodTranslator(MethodReference methodRef, boolean isStatic,
+                            IrBuilder builder, DependencyResolver resolver) {
         super(Opcodes.ASM9);
         this.methodRef = methodRef;
         this.isStatic = isStatic;
         this.builder = builder;
         this.frame = new StackFrame(builder);
         this.tryCatchHandler = new TryCatchHandler(labelToBlock);
-        this.handlers = new InstructionHandlers(builder, frame, this);
+        this.handlers = new InstructionHandlers(builder, frame, resolver);
     }
 
     @Override
     public void visitCode() {
         Type returnType = TypeResolver.descToReturnType(methodRef.getDescriptor());
         List<Type> paramTypes = TypeResolver.descToParamTypes(methodRef.getDescriptor());
-        currentFunction = builder.createFunction(methodRef.toString(), returnType, paramTypes);
+        List<Type> allParamTypes = new ArrayList<>();
+        if (!isStatic) {
+            allParamTypes.add(Type.reference(methodRef.getOwner())); // receiver
+        }
+        allParamTypes.addAll(paramTypes);
+        String mangledName = LlvmRuntime.mangleMethod(methodRef.getOwner(), methodRef.getName(), methodRef.getDescriptor());
+        currentFunction = builder.createFunction(mangledName, returnType, allParamTypes);
 
+        // Map locals: param 0 is receiver (if non-static), then descriptor params
         int paramIndex = 0;
         if (!isStatic) {
             if (!currentFunction.getParameters().isEmpty()) {
@@ -84,40 +98,40 @@ public class MethodTranslator extends MethodVisitor {
             case Opcodes.DCONST_0 -> handlers.pushDouble(0.0);
             case Opcodes.DCONST_1 -> handlers.pushDouble(1.0);
 
-            case Opcodes.IADD -> handlers.binaryOp(Opcode.ADD, Type.INT);
-            case Opcodes.ISUB -> handlers.binaryOp(Opcode.SUB, Type.INT);
-            case Opcodes.IMUL -> handlers.binaryOp(Opcode.MUL, Type.INT);
-            case Opcodes.IDIV -> handlers.binaryOp(Opcode.DIV, Type.INT);
-            case Opcodes.IREM -> handlers.binaryOp(Opcode.REM, Type.INT);
+            case Opcodes.IADD -> handlers.binaryOp(Opcode.ADD);
+            case Opcodes.ISUB -> handlers.binaryOp(Opcode.SUB);
+            case Opcodes.IMUL -> handlers.binaryOp(Opcode.MUL);
+            case Opcodes.IDIV -> handlers.binaryOp(Opcode.DIV);
+            case Opcodes.IREM -> handlers.binaryOp(Opcode.REM);
             case Opcodes.INEG -> handlers.unaryNeg(Type.INT);
             case Opcodes.ISHL, Opcodes.ISHR, Opcodes.IUSHR -> handlers.shiftOp();
-            case Opcodes.IAND -> handlers.binaryOp(Opcode.AND, Type.INT);
-            case Opcodes.IOR -> handlers.binaryOp(Opcode.OR, Type.INT);
-            case Opcodes.IXOR -> handlers.binaryOp(Opcode.XOR, Type.INT);
+            case Opcodes.IAND -> handlers.binaryOp(Opcode.AND);
+            case Opcodes.IOR -> handlers.binaryOp(Opcode.OR);
+            case Opcodes.IXOR -> handlers.binaryOp(Opcode.XOR);
 
-            case Opcodes.LADD -> handlers.binaryOp(Opcode.ADD, Type.LONG);
-            case Opcodes.LSUB -> handlers.binaryOp(Opcode.SUB, Type.LONG);
-            case Opcodes.LMUL -> handlers.binaryOp(Opcode.MUL, Type.LONG);
-            case Opcodes.LDIV -> handlers.binaryOp(Opcode.DIV, Type.LONG);
-            case Opcodes.LREM -> handlers.binaryOp(Opcode.REM, Type.LONG);
+            case Opcodes.LADD -> handlers.binaryOp(Opcode.ADD);
+            case Opcodes.LSUB -> handlers.binaryOp(Opcode.SUB);
+            case Opcodes.LMUL -> handlers.binaryOp(Opcode.MUL);
+            case Opcodes.LDIV -> handlers.binaryOp(Opcode.DIV);
+            case Opcodes.LREM -> handlers.binaryOp(Opcode.REM);
             case Opcodes.LNEG -> handlers.unaryNeg(Type.LONG);
             case Opcodes.LSHL, Opcodes.LSHR, Opcodes.LUSHR -> handlers.shiftOp();
-            case Opcodes.LAND -> handlers.binaryOp(Opcode.AND, Type.LONG);
-            case Opcodes.LOR -> handlers.binaryOp(Opcode.OR, Type.LONG);
-            case Opcodes.LXOR -> handlers.binaryOp(Opcode.XOR, Type.LONG);
+            case Opcodes.LAND -> handlers.binaryOp(Opcode.AND);
+            case Opcodes.LOR -> handlers.binaryOp(Opcode.OR);
+            case Opcodes.LXOR -> handlers.binaryOp(Opcode.XOR);
 
-            case Opcodes.FADD -> handlers.binaryOp(Opcode.ADD, Type.FLOAT);
-            case Opcodes.FSUB -> handlers.binaryOp(Opcode.SUB, Type.FLOAT);
-            case Opcodes.FMUL -> handlers.binaryOp(Opcode.MUL, Type.FLOAT);
-            case Opcodes.FDIV -> handlers.binaryOp(Opcode.DIV, Type.FLOAT);
-            case Opcodes.FREM -> handlers.binaryOp(Opcode.REM, Type.FLOAT);
+            case Opcodes.FADD -> handlers.binaryOp(Opcode.ADD);
+            case Opcodes.FSUB -> handlers.binaryOp(Opcode.SUB);
+            case Opcodes.FMUL -> handlers.binaryOp(Opcode.MUL);
+            case Opcodes.FDIV -> handlers.binaryOp(Opcode.DIV);
+            case Opcodes.FREM -> handlers.binaryOp(Opcode.REM);
             case Opcodes.FNEG -> handlers.unaryNeg(Type.FLOAT);
 
-            case Opcodes.DADD -> handlers.binaryOp(Opcode.ADD, Type.DOUBLE);
-            case Opcodes.DSUB -> handlers.binaryOp(Opcode.SUB, Type.DOUBLE);
-            case Opcodes.DMUL -> handlers.binaryOp(Opcode.MUL, Type.DOUBLE);
-            case Opcodes.DDIV -> handlers.binaryOp(Opcode.DIV, Type.DOUBLE);
-            case Opcodes.DREM -> handlers.binaryOp(Opcode.REM, Type.DOUBLE);
+            case Opcodes.DADD -> handlers.binaryOp(Opcode.ADD);
+            case Opcodes.DSUB -> handlers.binaryOp(Opcode.SUB);
+            case Opcodes.DMUL -> handlers.binaryOp(Opcode.MUL);
+            case Opcodes.DDIV -> handlers.binaryOp(Opcode.DIV);
+            case Opcodes.DREM -> handlers.binaryOp(Opcode.REM);
             case Opcodes.DNEG -> handlers.unaryNeg(Type.DOUBLE);
 
             case Opcodes.LCMP, Opcodes.FCMPL, Opcodes.FCMPG, Opcodes.DCMPL, Opcodes.DCMPG -> handlers.cmpOp();
@@ -186,8 +200,26 @@ public class MethodTranslator extends MethodVisitor {
                 Value val = frame.pop();
                 Instruction store = builder.createStore(val, var);
                 frame.setLocal(var, store.getResult());
+                // JSR return address: link the local variable to the return block,
+                // so the INDIRECT_BRANCH targets for RET can be filled in later
+                if (val instanceof Temporary t
+                        && t.getDefiningInstruction() != null
+                        && t.getDefiningInstruction().getOpcode() == Opcode.JSR
+                        && !t.getDefiningInstruction().getOperands().isEmpty()
+                        && t.getDefiningInstruction().getOperands().getFirst() instanceof Constant c
+                        && c.getType() == Type.BLOCK
+                        && c.getValue() instanceof BasicBlock returnBlock) {
+                    jsrReturnBlocks.computeIfAbsent(var, k -> new HashSet<>()).add(returnBlock);
+                }
             }
-            case Opcodes.RET -> { /* ignore */ }
+            case Opcodes.RET -> {
+                // Return from subroutine: indirect branch using the address from a local variable
+                Instruction load = builder.createLoad(var, Type.BLOCK);
+                IndirectBranchTerminator indirect = new IndirectBranchTerminator(load.getResult());
+                builder.currentBlock().setTerminator(indirect);
+                // Possible targets are filled in visitEnd (all JSR instructions are known by then)
+                indirectBranches.add(indirect);
+            }
             default -> log.warn("Unhandled var insn: {} {}", opcode, var);
         }
     }
@@ -216,7 +248,7 @@ public class MethodTranslator extends MethodVisitor {
 
     @Override
     public void visitMethodInsn(int opcode, String owner, String name, String desc, boolean isInterface) {
-        handlers.callMethod(opcode, owner, name, desc, isInterface);
+        handlers.callMethod(opcode, owner, name, desc);
     }
 
     @Override
@@ -255,7 +287,30 @@ public class MethodTranslator extends MethodVisitor {
                 BasicBlock next = createNextBlock();
                 builder.createCondBranch(cmp.getResult(), target, next);
             }
-            case Opcodes.JSR -> { /* ignore */ }
+            case Opcodes.JSR -> {
+                // Subroutine: JSR pushes the return address onto the stack and jumps to the subroutine.
+                BasicBlock current = builder.currentBlock();
+                // Return point – the block for instructions following the JSR
+                BasicBlock returnBlock = createNextBlock();
+                BasicBlock targetBlock = getOrCreateBlock(label);
+
+                Instruction jsrInst = new Instruction(Opcode.JSR);
+                // The operand is the return block (the returned address)
+                jsrInst.addOperand(new Constant(Type.BLOCK, returnBlock));
+                Temporary blockVal = builder.newTemporary(Type.BLOCK);
+                jsrInst.setResult(blockVal);
+                blockVal.setDefiningInstruction(jsrInst);
+                current.addInstruction(jsrInst);
+                // In bytecode JSR pushes the address onto the stack (usually followed by ASTORE)
+                frame.push(blockVal);
+
+                // Branching to the subroutine terminates the current block
+                current.setTerminator(new BranchTerminator(targetBlock));
+
+                // Subsequent instructions (e.g. ASTORE of the address) go into the return block
+                builder.setCurrentBlock(returnBlock);
+                currentBlock = returnBlock;
+            }
             default -> log.warn("Unhandled jump insn: {}", opcode);
         }
     }
@@ -283,8 +338,8 @@ public class MethodTranslator extends MethodVisitor {
             case Long l -> handlers.pushLong(l);
             case Float f -> handlers.pushFloat(f);
             case Double d -> handlers.pushDouble(d);
-            case String s -> frame.push(new Constant(Type.REFERENCE, s));
-            case org.objectweb.asm.Type asmType -> frame.push(new Constant(Type.REFERENCE, asmType.getInternalName()));
+            case String s -> frame.push(new Constant(Type.reference("java/lang/String"), s));
+            case org.objectweb.asm.Type asmType -> frame.push(new Constant(Type.reference(asmType.getInternalName()), asmType.getInternalName()));
             case null, default -> frame.push(new Constant(Type.UNKNOWN, value));
         }
     }
@@ -296,6 +351,7 @@ public class MethodTranslator extends MethodVisitor {
 
     @Override
     public void visitTryCatchBlock(Label start, Label end, Label handler, String type) {
+        tryCatchRanges.add(new TryCatchRange(start, end, handler, type));
         tryCatchHandler.addTryCatch(start, end, handler, type);
     }
 
@@ -304,7 +360,7 @@ public class MethodTranslator extends MethodVisitor {
         String sb = "invokedynamic:" + name + desc +
             " bsm=" + bsm.getOwner() + "." + bsm.getName() + bsm.getDesc();
         Instruction call = new Instruction(Opcode.CALL);
-        call.addOperand(new Constant(Type.REFERENCE, sb));
+        call.addOperand(new Constant(Type.reference(sb), sb));
         List<Type> paramTypes = TypeResolver.descToParamTypes(desc);
         int paramCount = paramTypes.size();
         List<Value> args = frame.popArgs(paramCount);
@@ -312,7 +368,7 @@ public class MethodTranslator extends MethodVisitor {
             call.addOperand(arg);
         }
         Type retType = TypeResolver.descToReturnType(desc);
-        if (retType != Type.VOID) {
+        if (!retType.isVoid()) {
             Temporary tmp = builder.newTemporary(retType);
             call.setResult(tmp);
             tmp.setDefiningInstruction(call);
@@ -331,8 +387,54 @@ public class MethodTranslator extends MethodVisitor {
         if (currentBlock != null && currentBlock.getTerminator() == null) {
             handlers.returnVoid();
         }
+        // Fill in the possible INDIRECT_BRANCH targets: all JSR instructions have been processed,
+        // so the set of return blocks for each local variable is complete
+        for (IndirectBranchTerminator ibt : indirectBranches) {
+            int var = -1;
+            if (ibt.getTargetBlock() instanceof Temporary t
+                    && t.getDefiningInstruction() != null) {
+                var = t.getDefiningInstruction().getLocalIndex();
+            }
+            if (var >= 0) {
+                ibt.getPossibleTargets().addAll(
+                        jsrReturnBlocks.getOrDefault(var, Collections.emptySet()));
+            }
+        }
         tryCatchHandler.handle();
+        // Store the try-ranges in the function for LLVM generation
+        currentFunction.setTryCatchRanges(tryCatchRanges);
+        // Add exceptional edges
+        addExceptionalEdges();
     }
+
+    private void addExceptionalEdges() {
+        // For each range, find the blocks it covers and add exceptional edges
+        for (TryCatchRange range : tryCatchRanges) {
+            BasicBlock startBlock = labelToBlock.get(range.start);
+            BasicBlock endBlock = labelToBlock.get(range.end);
+            BasicBlock handlerBlock = labelToBlock.get(range.handler);
+            if (startBlock == null || endBlock == null || handlerBlock == null) continue;
+            // Find all blocks between start and end (inclusive)
+            List<BasicBlock> blocksInRange = GraphUtils.getBlocksBetween(startBlock, endBlock);
+            for (BasicBlock block : blocksInRange) {
+                // For every instruction that can throw an exception,
+                // add an exceptional edge to the handler block
+                for (Instruction inst : block.getInstructions()) {
+                    if (inst.canThrow()) {
+                        block.addExceptionalSuccessor(handlerBlock);
+                    }
+                }
+                // Terminator instructions can also throw exceptions (e.g. THROW)
+                Terminator term = block.getTerminator();
+                if (term != null && term.canThrow()) {
+                    block.addExceptionalSuccessor(handlerBlock);
+                }
+            }
+        }
+    }
+
+    // The helper class for storing the range was moved to
+    // io.github.kubyk01.domain.analyzer.ir.TryCatchRange
 
     private BasicBlock getOrCreateBlock(Label label) {
         return labelToBlock.computeIfAbsent(label,
@@ -349,7 +451,7 @@ public class MethodTranslator extends MethodVisitor {
             case Opcodes.LLOAD -> Type.LONG;
             case Opcodes.FLOAD -> Type.FLOAT;
             case Opcodes.DLOAD -> Type.DOUBLE;
-            case Opcodes.ALOAD -> Type.REFERENCE;
+            case Opcodes.ALOAD -> Type.reference("java/lang/Object");
             default -> Type.UNKNOWN;
         };
     }

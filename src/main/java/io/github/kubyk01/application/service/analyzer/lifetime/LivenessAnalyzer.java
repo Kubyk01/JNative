@@ -2,12 +2,15 @@ package io.github.kubyk01.application.service.analyzer.lifetime;
 
 import io.github.kubyk01.domain.analyzer.aliasanalysis.AliasAnalysisResult;
 import io.github.kubyk01.domain.analyzer.aliasanalysis.AllocationSite;
+import io.github.kubyk01.domain.analyzer.aliasanalysis.FunctionSummary;
 import io.github.kubyk01.domain.analyzer.ir.BasicBlock;
 import io.github.kubyk01.domain.analyzer.ir.CondBranchTerminator;
+import io.github.kubyk01.domain.analyzer.ir.Constant;
 import io.github.kubyk01.domain.analyzer.ir.Function;
 import io.github.kubyk01.domain.analyzer.ir.Instruction;
 import io.github.kubyk01.domain.analyzer.ir.LookupSwitchTerminator;
 import io.github.kubyk01.domain.analyzer.ir.Module;
+import io.github.kubyk01.domain.analyzer.ir.Opcode;
 import io.github.kubyk01.domain.analyzer.ir.ReturnTerminator;
 import io.github.kubyk01.domain.analyzer.ir.TableSwitchTerminator;
 import io.github.kubyk01.domain.analyzer.ir.Terminator;
@@ -15,10 +18,12 @@ import io.github.kubyk01.domain.analyzer.ir.ThrowTerminator;
 import io.github.kubyk01.domain.analyzer.ir.Value;
 import lombok.RequiredArgsConstructor;
 
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
@@ -38,6 +43,7 @@ public class LivenessAnalyzer {
 
     private final Module module;
     private final AliasAnalysisResult aliasResult;
+    private final Map<String, FunctionSummary> summaries;
 
     // Points-to cache per Value (identity semantics, same as PointsToGraph)
     private final Map<Value, Set<AllocationSite>> pointsToCache = new HashMap<>();
@@ -61,20 +67,25 @@ public class LivenessAnalyzer {
         // For O(1) site filtering
         Set<AllocationSite> allowed = new HashSet<>(allSites);
 
-        // 1. Collect the use-set for each block
+        // 1. Collect the use- and def-sets for each block
         Map<BasicBlock, Set<AllocationSite>> use = new HashMap<>();
+        Map<BasicBlock, Set<AllocationSite>> def = new HashMap<>();
         for (Function func : module.getFunctions()) {
             if (func.getEntryBlock() == null) continue;
             for (BasicBlock block : func.getBlocks()) {
                 Set<AllocationSite> blockUse = new HashSet<>();
+                Set<AllocationSite> blockDef = new HashSet<>();
                 for (Instruction inst : block.getInstructions()) {
                     blockUse.addAll(getAllocationSitesUsed(inst, allowed));
+                    blockDef.addAll(getAllocationSitesDef(inst, allowed));
                 }
                 Terminator term = block.getTerminator();
                 if (term != null) {
                     blockUse.addAll(getAllocationSitesUsed(term, allowed));
+                    // Terminators do not destroy objects (THROW transfers control without destroying)
                 }
                 use.put(block, blockUse);
+                def.put(block, blockDef);
             }
         }
 
@@ -106,10 +117,11 @@ public class LivenessAnalyzer {
                         changed = true;
                     }
 
-                    // liveIn[B] = use[B] ∪ liveOut[B]
-                    // def[B] is empty: an allocation site is never redefined
+                    // liveIn[B] = use[B] ∪ (liveOut[B] - def[B])
                     Set<AllocationSite> newLiveIn = new HashSet<>(use.get(block));
-                    newLiveIn.addAll(liveOutGlobal.get(block));
+                    Set<AllocationSite> liveOutMinusDef = new HashSet<>(liveOutGlobal.get(block));
+                    liveOutMinusDef.removeAll(def.get(block));
+                    newLiveIn.addAll(liveOutMinusDef);
                     if (!newLiveIn.equals(liveInGlobal.get(block))) {
                         liveInGlobal.put(block, newLiveIn);
                         changed = true;
@@ -133,6 +145,40 @@ public class LivenessAnalyzer {
     public Set<AllocationSite> getLiveOut(BasicBlock block) {
         return liveOutGlobal != null ? liveOutGlobal.getOrDefault(block, Collections.emptySet())
                                      : Collections.emptySet();
+    }
+
+    /**
+     * Sites killed (destroyed) by the instruction: FREE or a call to a function
+     * whose summary reports the corresponding parameter as destroyed.
+     */
+    private Set<AllocationSite> getAllocationSitesDef(Instruction inst, Set<AllocationSite> allowed) {
+        Set<AllocationSite> result = new HashSet<>();
+        Opcode op = inst.getOpcode();
+        if (op == Opcode.FREE) {
+            if (!inst.getOperands().isEmpty()) {
+                Value obj = inst.getOperands().getFirst();
+                for (AllocationSite site : getPointsTo(obj)) {
+                    if (allowed.contains(site)) result.add(site);
+                }
+            }
+        } else if (op == Opcode.CALL || op == Opcode.VIRTUAL_CALL || op == Opcode.INTERFACE_CALL ||
+                   op == Opcode.STATIC_CALL || op == Opcode.SPECIAL_CALL) {
+            String calleeName = extractCalleeName(inst);
+            if (calleeName == null) return result;
+            FunctionSummary summary = summaries.get(calleeName);
+            if (summary == null) return result;
+            // Arguments start at index 1 (0 is the function name)
+            List<Value> args = getCallArguments(inst);
+            for (int i = 0; i < args.size(); i++) {
+                if (summary.getParamsDestroyed().contains(i)) {
+                    Value arg = args.get(i);
+                    for (AllocationSite site : getPointsTo(arg)) {
+                        if (allowed.contains(site)) result.add(site);
+                    }
+                }
+            }
+        }
+        return result;
     }
 
     private Set<AllocationSite> getAllocationSitesUsed(Instruction inst, Set<AllocationSite> allowed) {
@@ -170,5 +216,25 @@ public class LivenessAnalyzer {
             }
         }
         return result;
+    }
+
+    private String extractCalleeName(Instruction inst) {
+        if (!inst.getOperands().isEmpty()) {
+            Value v = inst.getOperands().getFirst();
+            if (v instanceof Constant c && c.getType().isReference()) {
+                return c.getValue().toString();
+            }
+        }
+        return null;
+    }
+
+    private List<Value> getCallArguments(Instruction inst) {
+        List<Value> args = new ArrayList<>();
+        boolean skipFirst = true;
+        for (Value op : inst.getOperands()) {
+            if (skipFirst) { skipFirst = false; continue; }
+            args.add(op);
+        }
+        return args;
     }
 }

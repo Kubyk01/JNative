@@ -70,6 +70,7 @@ public class SummaryBuilder {
         Set<Integer> paramsWritten = new HashSet<>();
         Set<Integer> paramsEscaped = new HashSet<>();
         Set<Integer> paramsReturned = new HashSet<>();
+        Set<Integer> paramsDestroyed = new HashSet<>();
         Set<String> fieldsRead = new HashSet<>();
         Set<String> fieldsWritten = new HashSet<>();
         // flags: [returnsObject, readsStaticFields, writesStaticFields, escapesGlobally]
@@ -85,7 +86,8 @@ public class SummaryBuilder {
                 processInstruction(inst, func, localPointsTo, paramPointsTo,
                         paramsRead, paramsWritten, paramsEscaped, paramsReturned,
                         fieldsRead, fieldsWritten, flags,
-                        returnedAllocations, paramsFieldWrites, staticFieldWrites);
+                    paramsFieldWrites, staticFieldWrites,
+                        paramsDestroyed);
             }
             Terminator term = block.getTerminator();
             if (term != null) {
@@ -99,6 +101,7 @@ public class SummaryBuilder {
                 .paramsWritten(paramsWritten)
                 .paramsEscaped(paramsEscaped)
                 .paramsReturned(paramsReturned)
+                .paramsDestroyed(paramsDestroyed)
                 .fieldsRead(fieldsRead)
                 .fieldsWritten(fieldsWritten)
                 .returnsObject(flags[0])
@@ -118,9 +121,9 @@ public class SummaryBuilder {
                                     Set<Integer> paramsEscaped, Set<Integer> paramsReturned,
                                     Set<String> fieldsRead, Set<String> fieldsWritten,
                                     boolean[] flags,
-                                    Set<AllocationSite> returnedAllocations,
                                     Map<Integer, Map<String, Set<AllocationSite>>> paramsFieldWrites,
-                                    Map<String, Set<AllocationSite>> staticFieldWrites) {
+                                    Map<String, Set<AllocationSite>> staticFieldWrites,
+                                    Set<Integer> paramsDestroyed) {
         Opcode op = inst.getOpcode();
         switch (op) {
             case LOAD: {
@@ -178,6 +181,52 @@ public class SummaryBuilder {
                 }
                 break;
             }
+            case ALOAD: {
+                // array load: result = array[index]
+                if (inst.getOperands().size() >= 2) {
+                    Value array = inst.getOperands().getFirst();
+                    Value result = inst.getResult();
+                    if (result != null) {
+                        // We don't have precise field points-to for arrays in summary,
+                        // so we conservatively assume the result can point to any allocation site
+                        // that may be stored in this array. Since we don't track per-element
+                        // points-to in localPointsTo, we use UNKNOWN.
+                        Set<AllocationSite> pts = new HashSet<>();
+                        pts.add(AllocationSite.UNKNOWN);
+                        localPointsTo.put(result, pts);
+                        // Also mark that the function reads array elements (field "[]")
+                        fieldsRead.add("[]");
+                    }
+                    // If the array is a parameter, mark it as read
+                    if (array instanceof Parameter p) {
+                        paramsRead.add(p.getIndex());
+                    }
+                }
+                break;
+            }
+            case ASTORE: {
+                // Writing to an array element: similar to PUT_FIELD
+                if (inst.getOperands().size() >= 3) {
+                    Value array = inst.getOperands().get(0);
+                    Value value = inst.getOperands().get(2);
+                    Set<AllocationSite> valuePts = localPointsTo.getOrDefault(value, new HashSet<>());
+                    if (array instanceof Parameter p) {
+                        int pidx = p.getIndex();
+                        paramsWritten.add(pidx);
+                        paramsEscaped.add(pidx);
+                        // Store valuePts as written to field "[]" of this parameter
+                        Map<String, Set<AllocationSite>> fieldMap =
+                                paramsFieldWrites.computeIfAbsent(pidx, k -> new HashMap<>());
+                        fieldMap.computeIfAbsent("[]", k -> new HashSet<>()).addAll(valuePts);
+                    }
+                    if (value instanceof Parameter p) {
+                        paramsEscaped.add(p.getIndex());
+                    }
+                    // Also mark that we write to a field (array element)
+                    fieldsWritten.add("[]");
+                }
+                break;
+            }
             case GET_STATIC: {
                 flags[1] = true; // readsStaticFields
                 break;
@@ -201,7 +250,7 @@ public class SummaryBuilder {
             case SPECIAL_CALL: {
                 processCall(inst, localPointsTo,
                         paramsRead, paramsWritten, paramsEscaped, paramsReturned,
-                        flags, paramsFieldWrites, staticFieldWrites);
+                        flags, paramsFieldWrites, staticFieldWrites, paramsDestroyed);
                 break;
             }
             default:
@@ -215,9 +264,22 @@ public class SummaryBuilder {
                              Set<Integer> paramsEscaped, Set<Integer> paramsReturned,
                              boolean[] flags,
                              Map<Integer, Map<String, Set<AllocationSite>>> paramsFieldWrites,
-                             Map<String, Set<AllocationSite>> staticFieldWrites) {
+                             Map<String, Set<AllocationSite>> staticFieldWrites,
+                             Set<Integer> paramsDestroyed) {
         String calleeName = extractCalleeName(callInst);
         if (calleeName == null) return;
+
+        // If this is a direct destructor call
+        if (calleeName.startsWith("__destruct_")) {
+            List<Value> args = getCallArguments(callInst);
+            if (!args.isEmpty()) {
+                Value arg = args.getFirst();
+                if (arg instanceof Parameter p) {
+                    paramsDestroyed.add(p.getIndex());
+                }
+            }
+            return;
+        }
 
         FunctionSummary calleeSum = summaries.get(calleeName);
         if (calleeSum == null) {
@@ -247,6 +309,9 @@ public class SummaryBuilder {
             }
             if (calleeSum.getParamsReturned().contains(i)) {
                 if (arg instanceof Parameter p) paramsReturned.add(p.getIndex());
+            }
+            if (calleeSum.getParamsDestroyed().contains(i)) {
+                if (arg instanceof Parameter p) paramsDestroyed.add(p.getIndex());
             }
         }
 
@@ -328,7 +393,7 @@ public class SummaryBuilder {
         int fieldIdx = (inst.getOpcode() == Opcode.GET_STATIC || inst.getOpcode() == Opcode.PUT_STATIC) ? 0 : 1;
         if (inst.getOperands().size() > fieldIdx) {
             Value v = inst.getOperands().get(fieldIdx);
-            if (v instanceof Constant c && c.getType() == Type.REFERENCE) {
+            if (v instanceof Constant c && c.getType().isReference()) {
                 return c.getValue().toString(); // full name, e.g. "java/lang/System.out"
             }
         }
@@ -338,7 +403,7 @@ public class SummaryBuilder {
     private String extractCalleeName(Instruction inst) {
         if (!inst.getOperands().isEmpty()) {
             Value v = inst.getOperands().getFirst();
-            if (v instanceof Constant c && c.getType() == Type.REFERENCE) {
+            if (v instanceof Constant c && c.getType().isReference()) {
                 return c.getValue().toString();
             }
         }

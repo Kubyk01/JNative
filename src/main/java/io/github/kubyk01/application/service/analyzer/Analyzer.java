@@ -11,6 +11,7 @@ import io.github.kubyk01.application.service.codegen.llvm.LlvmGenerator;
 import io.github.kubyk01.application.service.optimizer.Optimizer;
 import io.github.kubyk01.domain.analyzer.aliasanalysis.AliasAnalysisResult;
 import io.github.kubyk01.domain.analyzer.aliasanalysis.AllocationSite;
+import io.github.kubyk01.domain.analyzer.aliasanalysis.FunctionSummary;
 import io.github.kubyk01.domain.analyzer.aliasanalysis.PointsToSet;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.MethodReference;
 import io.github.kubyk01.domain.analyzer.escapeanalysis.EscapeAnalysisResult;
@@ -20,16 +21,19 @@ import io.github.kubyk01.domain.analyzer.ir.Instruction;
 import io.github.kubyk01.domain.analyzer.ir.Module;
 import io.github.kubyk01.domain.analyzer.ir.BasicBlock;
 import io.github.kubyk01.domain.analyzer.ir.Opcode;
+import io.github.kubyk01.domain.analyzer.ir.Type;
 import io.github.kubyk01.domain.analyzer.lifetime.DestructionPoint;
 import io.github.kubyk01.domain.analyzer.lifetime.LifetimeAnalysisResult;
 import io.github.kubyk01.port.primary.AnalyzerPort;
 import lombok.extern.slf4j.Slf4j;
 
 import java.io.IOException;
+import java.io.InputStream;
+import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.Comparator;
-import java.util.Map;
-import java.util.Set;
+import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
+import java.util.*;
 import java.util.stream.Collectors;
 
 @Slf4j
@@ -37,12 +41,16 @@ public class Analyzer implements AnalyzerPort {
 
     @Override
     public void analyze(Path path, String entryClass, String entryMethod, String entryDescriptor,
-                        boolean showClasses, boolean showAlias, boolean showEscape, boolean showLifetime, boolean showDestructor) {
+                        boolean showClasses, boolean showAlias, boolean showEscape,
+                        boolean showLifetime, boolean showDestructor,
+                        String outputFile, boolean noCompile,
+                        boolean includeSystem, String debugName) {
         DependencyResolver resolver = new DependencyResolver();
         try {
             resolver.scan(path);
         } catch (IOException e) {
             log.error("Failed to scan path: {}", path, e);
+            System.out.println("Crash!!" + e.getMessage());
             return;
         }
 
@@ -55,21 +63,36 @@ public class Analyzer implements AnalyzerPort {
         Set<String> allClasses = analysis.getReachableClasses();
         Set<MethodReference> allMethods = analysis.getReachableMethods();
 
-        // Filter to output only user classes and methods
-        Set<String> userClasses = allClasses.stream()
-            .filter(c -> !isSystemClassName(c))
-            .collect(Collectors.toSet());
+        // If includeSystem is false, filter to output only user classes and methods
+        Set<String> classesToShow;
+        Set<MethodReference> methodsToShow;
+        if (includeSystem) {
+            classesToShow = allClasses;
+            methodsToShow = allMethods;
+        } else {
+            classesToShow = allClasses.stream()
+                .filter(c -> !isSystemClassName(c))
+                .collect(Collectors.toSet());
 
-        Set<MethodReference> userMethods = allMethods.stream()
-            .filter(m -> !isSystemClass(m.getOwner() + "." + m.getName()))
-            .collect(Collectors.toSet());
+            methodsToShow = allMethods.stream()
+                .filter(m -> !isSystemClass(m.getOwner() + "." + m.getName()))
+                .collect(Collectors.toSet());
+        }
 
         if (showClasses) {
-            System.out.println("\nUser classes (" + userClasses.size() + "):");
-            userClasses.stream().sorted().forEach(c -> System.out.println("  " + c));
+            // filter classes/methods by debug name
+            Set<String> filteredClasses = classesToShow.stream()
+                .filter(c -> matchesDebug(debugName, c))
+                .collect(Collectors.toSet());
+            Set<MethodReference> filteredMethods = methodsToShow.stream()
+                .filter(m -> matchesDebug(debugName, m.getOwner()) || matchesDebug(debugName, m.getName()))
+                .collect(Collectors.toSet());
 
-            System.out.println("\nUser methods (" + userMethods.size() + "):");
-            userMethods.stream()
+            System.out.println("\nClasses (" + filteredClasses.size() + "):");
+            filteredClasses.stream().sorted().forEach(c -> System.out.println("  " + c));
+
+            System.out.println("\nMethods (" + filteredMethods.size() + "):");
+            filteredMethods.stream()
                 .sorted(Comparator.comparing(MethodReference::getOwner)
                     .thenComparing(MethodReference::getName))
                 .forEach(m -> System.out.println("  " + m));
@@ -87,6 +110,35 @@ public class Analyzer implements AnalyzerPort {
             ssaTransformer.transform(func);
         }
 
+        // --- Static initializers (<clinit>) must be processed first ---
+        // Extract all <clinit> functions from the module
+        List<Function> clinitFunctions = new ArrayList<>();
+        for (Function func : module.getFunctions()) {
+            if (func.getName().endsWith(".<clinit>()V")) { // name format from BytecodeToIr
+                clinitFunctions.add(func);
+            }
+        }
+
+        if (!clinitFunctions.isEmpty()) {
+            System.out.println("Processing " + clinitFunctions.size() + " static initializers (<clinit>) first...");
+
+            // Build a temporary module containing only <clinit> functions
+            Module clinitModule = new Module();
+            for (Function func : clinitFunctions) {
+                clinitModule.addFunction(func);
+            }
+
+            // Run alias and escape analysis on clinitModule to propagate static field initializations
+            AliasAnalyzer clinitAlias = new AliasAnalyzer(clinitModule);
+            clinitAlias.analyze();
+
+            // Now merge the results into the main alias result later, but we need a full result.
+            // Better: we run the main alias analysis, but we can force processing of <clinit> first.
+            // The existing AliasAnalyzer will process all functions anyway, but we can separate.
+            // Since the main analysis also processes them, we could just rely on fixed-point,
+            // but to be explicit we can run them first and then the rest.
+        }
+
         // --- Alias Analysis (always runs, output optional) ---
         AliasAnalyzer aliasAnalyzer = new AliasAnalyzer(module);
         AliasAnalysisResult aliasResult = aliasAnalyzer.analyze();
@@ -95,7 +147,8 @@ public class Analyzer implements AnalyzerPort {
             System.out.println("\n--- Alias Analysis ---");
             System.out.println("Alias analysis complete.");
             for (Function func : module.getFunctions()) {
-                if (!isUserFunction(func)) continue;
+                if (!includeSystem && !isUserFunction(func)) continue;
+                if (!matchesDebug(debugName, func)) continue;
                 for (BasicBlock block : func.getBlocks()) {
                     for (Instruction inst : block.getInstructions()) {
                         if (inst.getResult() != null) {
@@ -110,20 +163,22 @@ public class Analyzer implements AnalyzerPort {
         }
 
         // --- Escape Analysis (always runs, output optional) ---
-        EscapeAnalyzer escapeAnalyzer = new EscapeAnalyzer(module, aliasResult);
+        EscapeAnalyzer escapeAnalyzer = new EscapeAnalyzer(module, aliasResult, resolver);
         EscapeAnalysisResult escapeResult = escapeAnalyzer.analyze();
 
         if (showEscape) {
             System.out.println("\n--- Escape Analysis ---");
             System.out.println("Escape analysis complete.");
             for (Function func : module.getFunctions()) {
-                if (!isUserFunction(func)) continue;
+                if (!includeSystem && !isUserFunction(func)) continue;
+                if (!matchesDebug(debugName, func)) continue;
                 for (BasicBlock block : func.getBlocks()) {
                     for (Instruction inst : block.getInstructions()) {
                         if (isAllocation(inst.getOpcode()) && inst.getResult() != null) {
                             PointsToSet pts = aliasResult.getPointsTo(inst.getResult());
                             for (AllocationSite site : pts.getSites()) {
-                                if (!isUserAllocationSite(site)) continue;
+                                if (!includeSystem && !isUserAllocationSite(site)) continue;
+                                if (!matchesDebug(debugName, site)) continue;
                                 EscapeStatus status = escapeResult.getSiteStatus(site);
                                 System.out.println("  " + site + " -> " + status);
                             }
@@ -134,26 +189,30 @@ public class Analyzer implements AnalyzerPort {
         }
 
         // --- Lifetime Analysis (always runs, output optional) ---
-        LifetimeAnalyzer lifetimeAnalyzer = new LifetimeAnalyzer(module, aliasResult, escapeResult);
+        Map<String, FunctionSummary> summaries = aliasResult.getFunctionSummaries();
+        LifetimeAnalyzer lifetimeAnalyzer = new LifetimeAnalyzer(module, aliasResult, escapeResult, summaries);
         LifetimeAnalysisResult lifetimeResult = lifetimeAnalyzer.analyze(aliasResult.getAllocationSiteToValue());
 
         if (showLifetime) {
             System.out.println("\n--- Lifetime Analysis ---");
-            System.out.println("Destruction points (user objects only):");
+            System.out.println(includeSystem
+                ? "Destruction points:"
+                : "Destruction points (user objects only):");
             for (Map.Entry<AllocationSite, Set<DestructionPoint>> entry : lifetimeResult.getDestructionPoints().entrySet()) {
                 AllocationSite site = entry.getKey();
-                if (!isUserAllocationSite(site)) continue;
+                if (!includeSystem && !isUserAllocationSite(site)) continue;
+                if (!matchesDebug(debugName, site)) continue;
                 System.out.println("  " + site + " -> " + entry.getValue());
             }
             if (!lifetimeResult.getUnresolved().isEmpty()) {
                 System.out.print("  Unresolved (cyclic or uncertain): ");
                 boolean first = true;
                 for (AllocationSite site : lifetimeResult.getUnresolved()) {
-                    if (isUserAllocationSite(site)) {
-                        if (!first) System.out.print(", ");
-                        System.out.print(site);
-                        first = false;
-                    }
+                    if (!includeSystem && !isUserAllocationSite(site)) continue;
+                    if (!matchesDebug(debugName, site)) continue;
+                    if (!first) System.out.print(", ");
+                    System.out.print(site);
+                    first = false;
                 }
                 System.out.println();
             }
@@ -165,11 +224,11 @@ public class Analyzer implements AnalyzerPort {
         inserter.insert();
 
         // --- Optimization ---
-        boolean optimize = true; // can be moved to parameters
+        boolean optimize = true;
         if (optimize) {
             System.out.println("\n--- Running Optimizations ---");
             Optimizer optimizer = new Optimizer(module, aliasResult, escapeResult, lifetimeResult,
-                    aliasResult.getAllocationSiteToValue());
+                aliasResult.getAllocationSiteToValue());
             optimizer.setEnableScalarReplacement(true);
             optimizer.setEnableDestructorSimplification(true);
             optimizer.setEnableDestructorInlining(true);
@@ -179,11 +238,12 @@ public class Analyzer implements AnalyzerPort {
 
         // --- LLVM IR Generation ---
         System.out.println("\n--- Generating LLVM IR ---");
-        LlvmGenerator llvmGen = new LlvmGenerator(module, resolver, aliasResult, escapeResult,
-                entryClass, entryMethod, entryDescriptor);
+        LlvmGenerator llvmGen = new LlvmGenerator(module, resolver, aliasResult,
+            entryClass, entryMethod, entryDescriptor, analysis.getReflectInfo());
         String llvmIR = llvmGen.generate();
+        Path llPath = Paths.get("output.ll");
         try {
-            java.nio.file.Files.write(java.nio.file.Paths.get("output.ll"), llvmIR.getBytes());
+            Files.write(llPath, llvmIR.getBytes());
             System.out.println("LLVM IR written to output.ll");
         } catch (IOException e) {
             log.error("Failed to write LLVM IR", e);
@@ -191,13 +251,111 @@ public class Analyzer implements AnalyzerPort {
 
         if (showDestructor) {
             System.out.println("\n--- Destructor Insertion ---");
-            System.out.println("--- After destructor insertion (user functions only) ---");
+            System.out.println(includeSystem
+                ? "--- After destructor insertion (all functions) ---"
+                : "--- After destructor insertion (user functions only) ---");
             for (Function func : module.getFunctions()) {
-                if (isUserFunction(func)) {
-                    System.out.println(func);
-                }
+                if (!includeSystem && !isUserFunction(func)) continue;
+                if (!matchesDebug(debugName, func)) continue;
+                System.out.println(func);
             }
         }
+
+        // --- Compile and link to native executable ---
+        if (!noCompile) {
+            Path exePath = outputFile != null ? Paths.get(outputFile) : Paths.get("a.out");
+            try {
+                compileAndLink(llPath, exePath);
+                System.out.println("Native executable built successfully: " + exePath.toAbsolutePath());
+            } catch (IOException | InterruptedException e) {
+                log.error("Failed to build native executable", e);
+                System.err.println("Build failed: " + e.getMessage());
+            }
+        } else {
+            System.out.println("Skipping native compilation (--no-compile specified)");
+        }
+    }
+
+    private void compileAndLink(Path llPath, Path exePath) throws IOException, InterruptedException {
+        // Determine which compiler to use (clang preferred, fallback to gcc)
+        String compiler = "clang";
+        try {
+            Process p = new ProcessBuilder(compiler, "--version").start();
+            if (p.waitFor() != 0) {
+                compiler = "gcc";
+            }
+        } catch (IOException e) {
+            compiler = "gcc";
+        }
+
+        // Object file name: same as executable but with .o extension
+        String objName = exePath.getFileName().toString() + ".o";
+        Path objPath = exePath.resolveSibling(objName);
+
+        // 0. Extract the C runtime (monitors etc.) from resources and compile it to an object file
+        Path runtimeC = extractRuntimeSource();
+        Path runtimeObj = exePath.resolveSibling("jnative_runtime.o");
+        List<String> compileRuntimeCmd = Arrays.asList(compiler, "-c", "-O2", runtimeC.toString(), "-o", runtimeObj.toString());
+        ProcessBuilder pb = new ProcessBuilder(compileRuntimeCmd);
+        pb.inheritIO();
+        int exit = pb.start().waitFor();
+        if (exit != 0) {
+            throw new RuntimeException("Runtime compilation failed with exit code " + exit);
+        }
+
+        // 1. Compile LLVM IR to object file
+        List<String> compileCmd = Arrays.asList(compiler, "-c", "-O2", llPath.toString(), "-o", objPath.toString());
+        pb = new ProcessBuilder(compileCmd);
+        pb.inheritIO();
+        exit = pb.start().waitFor();
+        if (exit != 0) {
+            throw new RuntimeException("Compilation failed with exit code " + exit);
+        }
+
+        // 2. Link both object files with standard libraries
+        List<String> linkCmd = Arrays.asList(compiler, objPath.toString(), runtimeObj.toString(),
+            "-o", exePath.toString(), "-lpthread");
+        pb = new ProcessBuilder(linkCmd);
+        pb.inheritIO();
+        exit = pb.start().waitFor();
+        if (exit != 0) {
+            throw new RuntimeException("Linking failed with exit code " + exit);
+        }
+
+        // Clean up temporary files
+        Files.deleteIfExists(objPath);
+        Files.deleteIfExists(runtimeObj);
+    }
+
+    /**
+     * Extracts jnative_runtime.c from JAR resources into a temporary file,
+     * so that it can be compiled together with the generated LLVM IR.
+     */
+    private Path extractRuntimeSource() throws IOException {
+        Path runtimeC = Files.createTempFile("jnative_runtime", ".c");
+        try (InputStream in = getClass().getResourceAsStream("/native/jnative_runtime.c")) {
+            if (in == null) {
+                throw new IOException("jnative_runtime.c not found in resources (/native/jnative_runtime.c)");
+            }
+            Files.copy(in, runtimeC, StandardCopyOption.REPLACE_EXISTING);
+        }
+        runtimeC.toFile().deleteOnExit();
+        return runtimeC;
+    }
+
+    private static boolean matchesDebug(String debugName, String name) {
+        if (debugName == null) return true;
+        return name != null && name.contains(debugName);
+    }
+
+    private static boolean matchesDebug(String debugName, Function func) {
+        if (debugName == null) return true;
+        return func != null && func.getName() != null && func.getName().contains(debugName);
+    }
+
+    private static boolean matchesDebug(String debugName, AllocationSite site) {
+        if (debugName == null) return true;
+        return site != null && site.getMethodName() != null && site.getMethodName().contains(debugName);
     }
 
     private static boolean isAllocation(Opcode op) {
@@ -239,15 +397,21 @@ public class Analyzer implements AnalyzerPort {
     }
 
     private static boolean isUserAllocationSite(AllocationSite site) {
-        String type = site.getType();
-        if (type == null || type.isEmpty()) {
+        Type type = site.getType();
+        if (type == null || type.isUnknown()) {
             return false;
         }
-
-        if (type.startsWith("array") || type.startsWith("multiarray") ||
-            type.equals("unknown") || type.equals("<unknown>")) {
+        if (type.isArray()) {
+            Type elem = type.getElementType();
+            if (elem.isPrimitive()) return false;
+            if (elem.isReference()) {
+                return !isSystemClassName(elem.getClassName());
+            }
             return false;
         }
-        return !isSystemClassName(type);
+        if (type.isReference()) {
+            return !isSystemClassName(type.getClassName());
+        }
+        return false;
     }
 }

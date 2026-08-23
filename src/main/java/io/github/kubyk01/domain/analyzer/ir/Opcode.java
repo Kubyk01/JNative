@@ -18,6 +18,7 @@ public enum Opcode {
     INSTANCEOF, CHECKCAST,
     ARRAYLENGTH,
     ALOAD, ASTORE,
+    JSR, INDIRECT_BRANCH,
     NOP,
     PHI
 }

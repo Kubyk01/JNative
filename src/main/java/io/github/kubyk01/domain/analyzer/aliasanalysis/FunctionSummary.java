@@ -16,6 +16,8 @@ public class FunctionSummary {
     @Builder.Default
     private Set<Integer> paramsReturned = new HashSet<>();
     @Builder.Default
+    private Set<Integer> paramsDestroyed = new HashSet<>();
+    @Builder.Default
     private Set<String> fieldsRead = new HashSet<>();
     @Builder.Default
     private Set<String> fieldsWritten = new HashSet<>();
@@ -36,6 +38,7 @@ public class FunctionSummary {
         paramsWritten.addAll(other.paramsWritten);
         paramsEscaped.addAll(other.paramsEscaped);
         paramsReturned.addAll(other.paramsReturned);
+        paramsDestroyed.addAll(other.paramsDestroyed);
         fieldsRead.addAll(other.fieldsRead);
         fieldsWritten.addAll(other.fieldsWritten);
         returnedAllocations.addAll(other.returnedAllocations);

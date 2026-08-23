@@ -1,38 +1,22 @@
 package io.github.kubyk01.application.service.analyzer;
 
 import io.github.kubyk01.application.service.analyzer.dependencyresolver.DependencyResolver;
+import io.github.kubyk01.application.service.codegen.llvm.LlvmRuntime;
 import io.github.kubyk01.domain.analyzer.aliasanalysis.AliasAnalysisResult;
 import io.github.kubyk01.domain.analyzer.aliasanalysis.AllocationSite;
 import io.github.kubyk01.domain.analyzer.aliasanalysis.PointsToGraph;
 import io.github.kubyk01.domain.analyzer.aliasanalysis.PointsToSet;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.ClassNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.FieldNode;
-import io.github.kubyk01.domain.analyzer.ir.BasicBlock;
-import io.github.kubyk01.domain.analyzer.ir.BranchTerminator;
-import io.github.kubyk01.domain.analyzer.ir.CondBranchTerminator;
-import io.github.kubyk01.domain.analyzer.ir.Constant;
-import io.github.kubyk01.domain.analyzer.ir.Function;
-import io.github.kubyk01.domain.analyzer.ir.Instruction;
+import io.github.kubyk01.domain.analyzer.ir.*;
 import io.github.kubyk01.domain.analyzer.ir.Module;
-import io.github.kubyk01.domain.analyzer.ir.Opcode;
-import io.github.kubyk01.domain.analyzer.ir.Parameter;
-import io.github.kubyk01.domain.analyzer.ir.ReturnTerminator;
-import io.github.kubyk01.domain.analyzer.ir.Temporary;
-import io.github.kubyk01.domain.analyzer.ir.Type;
-import io.github.kubyk01.domain.analyzer.ir.Value;
 import io.github.kubyk01.domain.analyzer.lifetime.DestructionPoint;
 import io.github.kubyk01.domain.analyzer.lifetime.LifetimeAnalysisResult;
+import lombok.Getter;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 
-import java.util.ArrayDeque;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.Queue;
-import java.util.Set;
+import java.util.*;
 
 @Slf4j
 @RequiredArgsConstructor
@@ -41,43 +25,49 @@ public class DestructorInserter {
     private final Module module;
     private final DependencyResolver resolver;
     private final LifetimeAnalysisResult lifetimeResult;
+    @Getter
     private final Map<AllocationSite, Value> siteToValue;
     private final AliasAnalysisResult aliasResult;
 
     public void insert() {
         // 1. Collect classes and array types encountered at destruction points
-        Set<String> classNames = new HashSet<>();
+        Set<Type> classTypes = new HashSet<>();
         for (AllocationSite site : lifetimeResult.getDestructionPoints().keySet()) {
-            String type = site.getType();
-            if (isManagedClass(type)) {
-                classNames.add(type);
+            Type type = site.getType();
+            if (isManagedType(type)) {
+                classTypes.add(type);
             }
         }
 
         // 2. Generate destructors, including reference field types and array types (transitively)
         Map<String, Function> destructorMap = new HashMap<>();
-        Queue<String> worklist = new ArrayDeque<>(classNames);
-        Set<String> processed = new HashSet<>();
+        Queue<Type> worklist = new ArrayDeque<>(classTypes);
+        Set<Type> processed = new HashSet<>();
         while (!worklist.isEmpty()) {
-            String className = worklist.poll();
-            if (!processed.add(className)) continue;
-            Function dtor = createDestructor(className);
+            Type type = worklist.poll();
+            if (!processed.add(type)) continue;
+            Function dtor = createDestructor(type);
             if (dtor == null) continue;
-            destructorMap.put(className, dtor);
+            destructorMap.put(type.toString(), dtor);
 
             // If this is a class, add reference fields and array fields
-            if (!isArrayType(className)) {
+            if (!isArrayType(type)) {
+                String className = type.getClassName();
                 ClassNode classNode = resolver.getClassNode(className);
                 for (FieldNode field : classNode.getFields()) {
-                    String fieldDesc = field.getDescriptor();
-                    // If the field is a reference array or an object
-                    if (fieldDesc.startsWith("L") || fieldDesc.startsWith("[")) {
-                        String fieldType = fieldDesc.startsWith("[")
-                                ? fieldDesc  // keep the array descriptor
-                                : extractClassName(fieldDesc);
-                        if (isManagedClass(fieldType)) {
+                    Type fieldType = field.getType();
+                    if (fieldType.isReference() || fieldType.isArray()) {
+                        if (isManagedType(fieldType)) {
                             worklist.add(fieldType);
                         }
+                    }
+                }
+                // Also add superclass to worklist if it is managed
+                String superName = classNode.getSuperName();
+                if (superName != null && !superName.equals("java/lang/Object")) {
+                    Type superType = Type.reference(superName);
+                    if (isManagedType(superType)) {
+                        worklist.add(superType);
                     }
                 }
             }
@@ -86,9 +76,9 @@ public class DestructorInserter {
         // 3. Insert destructor calls at destruction points
         int inserted = 0;
         for (Map.Entry<AllocationSite, Set<DestructionPoint>> entry
-                : lifetimeResult.getDestructionPoints().entrySet()) {
+            : lifetimeResult.getDestructionPoints().entrySet()) {
             AllocationSite site = entry.getKey();
-            Function dtor = destructorMap.get(site.getType());
+            Function dtor = destructorMap.get(site.getType().toString());
             if (dtor == null) continue;
             for (DestructionPoint dp : entry.getValue()) {
                 insertDestructorCall(dp, dtor);
@@ -96,20 +86,16 @@ public class DestructorInserter {
             }
         }
         log.info("Destructor insertion: {} destructors generated, {} calls inserted",
-                destructorMap.size(), inserted);
+            destructorMap.size(), inserted);
 
         // After inserting regular destructors, create the shutdown function
         createShutdownFunction();
     }
 
-    /**
-     * Creates the __jnative_shutdown function that destroys all objects stored
-     * in static fields. Registration via atexit is performed at the code generation stage.
-     */
-    private Function createShutdownFunction() {
-        String funcName = "__jnative_shutdown";
+    private void createShutdownFunction() {
+        String funcName = LlvmRuntime.mangleFunction("__jnative_shutdown");
         Function existing = module.getFunction(funcName);
-        if (existing != null) return existing;
+        if (existing != null) return;
 
         Function func = new Function(funcName, Type.VOID);
         module.addFunction(func);
@@ -124,24 +110,21 @@ public class DestructorInserter {
         Set<AllocationSite> processedSites = new HashSet<>();
 
         for (Map.Entry<String, PointsToSet> entryStatic : staticFields.entrySet()) {
-            String fieldName = entryStatic.getKey(); // full field name
+            String fieldName = entryStatic.getKey();
             PointsToSet pts = entryStatic.getValue();
             for (AllocationSite site : pts.getSites()) {
                 if (processedSites.contains(site)) continue;
-                // Check whether a destructor exists for the site's type
                 Function dtor = findDestructor(site.getType());
                 if (dtor == null) continue;
                 processedSites.add(site);
 
-                // Load the value from the static field
                 Instruction getStatic = new Instruction(Opcode.GET_STATIC);
-                getStatic.addOperand(new Constant(Type.REFERENCE, fieldName));
-                Temporary staticVal = new Temporary(Type.REFERENCE);
+                getStatic.addOperand(new Constant(Type.reference(fieldName), fieldName));
+                Temporary staticVal = new Temporary(Type.reference("java/lang/Object"));
                 getStatic.setResult(staticVal);
                 staticVal.setDefiningInstruction(getStatic);
                 current.addInstruction(getStatic);
 
-                // Null check
                 Constant nullConst = new Constant(Type.NULL, null);
                 Instruction isNull = new Instruction(Opcode.EQ);
                 isNull.addOperand(staticVal);
@@ -162,9 +145,8 @@ public class DestructorInserter {
                 current.addSuccessor(skipBlock);
                 current.addSuccessor(callBlock);
 
-                // Destructor call
                 Instruction callDtor = new Instruction(Opcode.STATIC_CALL);
-                callDtor.addOperand(new Constant(Type.REFERENCE, dtor.getName()));
+                callDtor.addOperand(new Constant(Type.reference(dtor.getName()), dtor.getName()));
                 callDtor.addOperand(staticVal);
                 callBlock.addInstruction(callDtor);
                 callBlock.setTerminator(new BranchTerminator(skipBlock));
@@ -174,74 +156,56 @@ public class DestructorInserter {
             }
         }
 
-        // Return from the function
         current.setTerminator(new ReturnTerminator(null));
-        return func;
     }
 
-    // ---- Helper methods for working with types ----
-
-    private boolean isManagedClass(String type) {
+    private boolean isManagedType(Type type) {
         if (type == null) return false;
-        if (isArrayType(type)) {
-            // Arrays are managed only if their element type is a reference type
-            String elementType = getArrayElementType(type);
-            return !isPrimitiveType(elementType) && isManagedClass(elementType);
+        if (type.isArray()) {
+            Type base = getBaseElementType(type);
+            if (base.isPrimitive()) return false;
+            return isManagedType(base);
         }
-        return !type.startsWith("array")
-                && !type.startsWith("multiarray")
-                && !type.equals("unknown")
-                && !type.equals("<unknown>");
-    }
-
-    private boolean isArrayType(String type) {
-        return type != null && type.startsWith("[");
-    }
-
-    private boolean isPrimitiveType(String type) {
-        return type.length() == 1 && "ZBCSIFJD".indexOf(type.charAt(0)) >= 0;
-    }
-
-    /**
-     * Extracts the element type from an array descriptor.
-     * Reference elements are normalized to the internal class name,
-     * so that destructor names match those used for regular classes.
-     * Example: "[Ljava/lang/String;" -> "java/lang/String", "[[I" -> "[I"
-     */
-    private String getArrayElementType(String descriptor) {
-        if (!descriptor.startsWith("[")) return descriptor;
-        String inner = descriptor.substring(1);
-        if (inner.startsWith("L") && inner.endsWith(";")) {
-            return inner.substring(1, inner.length() - 1); // reference type
+        if (type.isReference()) {
+            String className = type.getClassName();
+            ClassNode cn = resolver.getClassNode(className);
+            if (cn != null && cn.isExternal()) return false;
+            return !className.equals("java/lang/Object");
         }
-        // primitive or another array level
+        return false;
+    }
+
+    private Type getBaseElementType(Type type) {
+        if (!type.isArray()) return type;
+        Type inner = type.getElementType();
+        while (inner.isArray()) {
+            inner = inner.getElementType();
+        }
         return inner;
     }
 
-    /**
-     * Extracts the internal class name from an object descriptor.
-     * For example: "Ljava/lang/String;" -> "java/lang/String"
-     */
-    private String extractClassName(String descriptor) {
-        if (descriptor.startsWith("L") && descriptor.endsWith(";")) {
-            return descriptor.substring(1, descriptor.length() - 1);
+    private boolean isArrayType(Type type) {
+        return type != null && type.isArray();
+    }
+
+    private String destructorName(Type type) {
+        if (type.isArray()) {
+            return "__destruct_array_" + type.toString().replace('/', '_').replace('[', '_').replace(';', '_');
+        } else if (type.isReference()) {
+            return "__destruct_" + type.getClassName().replace('/', '_').replace('.', '_');
+        }
+        return "__destruct_unknown";
+    }
+
+    private Function createDestructor(Type type) {
+        if (type.isArray()) {
+            return createArrayDestructor(type);
+        } else if (type.isReference()) {
+            return createClassDestructor(type.getClassName());
         }
         return null;
     }
 
-    // ---- Destructor creation ----
-
-    private Function createDestructor(String type) {
-        if (isArrayType(type)) {
-            return createArrayDestructor(type);
-        } else {
-            return createClassDestructor(type);
-        }
-    }
-
-    /**
-     * Creates a destructor for a class.
-     */
     private Function createClassDestructor(String className) {
         ClassNode classNode = resolver.getClassNode(className);
         if (classNode.isExternal()) {
@@ -249,7 +213,7 @@ public class DestructorInserter {
             return null;
         }
 
-        String funcName = destructorName(className);
+        String funcName = destructorName(Type.reference(className));
         Function existing = module.getFunction(funcName);
         if (existing != null) {
             return existing;
@@ -257,14 +221,13 @@ public class DestructorInserter {
 
         Function func = new Function(funcName, Type.VOID);
         module.addFunction(func);
-        Parameter thisParam = new Parameter(Type.REFERENCE, 0);
+        Parameter thisParam = new Parameter(Type.reference(className), 0);
         func.addParameter(thisParam);
 
         BasicBlock entry = new BasicBlock(funcName + "_entry");
         func.addBlock(entry);
         func.setEntryBlock(entry);
 
-        // if (this == null) return;
         Constant nullConst = new Constant(Type.NULL, null);
         Instruction cmp = new Instruction(Opcode.EQ);
         cmp.addOperand(thisParam);
@@ -287,24 +250,18 @@ public class DestructorInserter {
 
         BasicBlock current = bodyBlock;
 
-        // Process reference fields and array fields
         for (FieldNode field : collectReferenceFields(classNode)) {
-            String fieldDesc = field.getDescriptor();
-            String fieldType = fieldDesc.startsWith("[")
-                    ? fieldDesc
-                    : extractClassName(fieldDesc);
-            if (!isManagedClass(fieldType)) continue;
+            Type fieldType = field.getType();
+            if (!isManagedType(fieldType)) continue;
 
-            // Field load: fieldValue = this.field
             Instruction getField = new Instruction(Opcode.GET_FIELD);
             getField.addOperand(thisParam);
-            getField.addOperand(new Constant(Type.REFERENCE, className + "." + field.getName()));
-            Temporary fieldValue = new Temporary(Type.REFERENCE);
+            getField.addOperand(new Constant(Type.reference(className + "." + field.getName()), className + "." + field.getName()));
+            Temporary fieldValue = new Temporary(fieldType);
             getField.setResult(fieldValue);
             fieldValue.setDefiningInstruction(getField);
             current.addInstruction(getField);
 
-            // if (fieldValue == null) skip
             Instruction isNull = new Instruction(Opcode.EQ);
             isNull.addOperand(fieldValue);
             isNull.addOperand(nullConst);
@@ -322,11 +279,10 @@ public class DestructorInserter {
             current.addSuccessor(skipBlock);
             current.addSuccessor(callBlock);
 
-            // Call the destructor for the field
             Function fieldDtor = findDestructor(fieldType);
             if (fieldDtor != null) {
                 Instruction callDtor = new Instruction(Opcode.STATIC_CALL);
-                callDtor.addOperand(new Constant(Type.REFERENCE, fieldDtor.getName()));
+                callDtor.addOperand(new Constant(Type.reference(fieldDtor.getName()), fieldDtor.getName()));
                 callDtor.addOperand(fieldValue);
                 callBlock.addInstruction(callDtor);
             }
@@ -336,7 +292,20 @@ public class DestructorInserter {
             current = skipBlock;
         }
 
-        // free(this); return;
+        String superName = classNode.getSuperName();
+        if (superName != null && !superName.equals("java/lang/Object")) {
+            Type superType = Type.reference(superName);
+            if (isManagedType(superType)) {
+                Function superDtor = findDestructor(superType);
+                if (superDtor != null) {
+                    Instruction callSuper = new Instruction(Opcode.STATIC_CALL);
+                    callSuper.addOperand(new Constant(Type.reference(superDtor.getName()), superDtor.getName()));
+                    callSuper.addOperand(thisParam);
+                    current.addInstruction(callSuper);
+                }
+            }
+        }
+
         Instruction freeInst = new Instruction(Opcode.FREE);
         freeInst.addOperand(thisParam);
         current.addInstruction(freeInst);
@@ -345,35 +314,23 @@ public class DestructorInserter {
         return func;
     }
 
-    /**
-     * Creates a destructor for an array.
-     * @param arrayDescriptor the array descriptor, e.g. "[Ljava/lang/String;" or "[[I"
-     * @return the destructor function, or null if the array holds primitives
-     */
-    private Function createArrayDestructor(String arrayDescriptor) {
-        String elementType = getArrayElementType(arrayDescriptor);
-        if (isPrimitiveType(elementType)) {
-            // Primitive arrays do not require a destructor
-            return null;
+    private Function createArrayDestructor(Type arrayType) {
+        Type elementType = arrayType.getElementType();
+        Type baseType = getBaseElementType(arrayType);
+
+        if (baseType.isPrimitive()) {
+            return createTrivialArrayDestructor(arrayType);
         }
 
-        String funcName = destructorName(arrayDescriptor);
+        boolean elementManaged = isManagedType(elementType);
+        String funcName = destructorName(arrayType);
         Function existing = module.getFunction(funcName);
-        if (existing != null) {
-            return existing;
-        }
+        if (existing != null) return existing;
 
         Function func = new Function(funcName, Type.VOID);
         module.addFunction(func);
-        Parameter arrParam = new Parameter(Type.REFERENCE, 0);
+        Parameter arrParam = new Parameter(arrayType, 0);
         func.addParameter(arrParam);
-
-        // Blocks:
-        // entry: null check -> return or body
-        // body: get length, initialize i=0
-        // loop_cond: check i < length
-        // loop_body: load element, null check, call destructor, increment i
-        // loop_end: return
 
         BasicBlock entry = new BasicBlock(funcName + "_entry");
         func.addBlock(entry);
@@ -386,7 +343,6 @@ public class DestructorInserter {
         BasicBlock bodyBlock = new BasicBlock(funcName + "_body");
         func.addBlock(bodyBlock);
 
-        // Check arr == null
         Constant nullConst = new Constant(Type.NULL, null);
         Instruction cmpNull = new Instruction(Opcode.EQ);
         cmpNull.addOperand(arrParam);
@@ -400,12 +356,7 @@ public class DestructorInserter {
         entry.addSuccessor(returnBlock);
         entry.addSuccessor(bodyBlock);
 
-        // Make sure the element has a destructor (recursively).
-        // The function is already registered in the module, so cycles like
-        // A[] -> Node -> A[] do not lead to duplicate creation.
-        Function elementDtor = findDestructor(elementType);
-        if (elementDtor == null) {
-            // Elements are external/unmanaged - free(this) is enough for the array
+        if (!elementManaged) {
             Instruction freeInst = new Instruction(Opcode.FREE);
             freeInst.addOperand(arrParam);
             bodyBlock.addInstruction(freeInst);
@@ -413,7 +364,15 @@ public class DestructorInserter {
             return func;
         }
 
-        // In body: length = arr.length
+        Function elementDtor = findDestructor(elementType);
+        if (elementDtor == null) {
+            Instruction freeInst = new Instruction(Opcode.FREE);
+            freeInst.addOperand(arrParam);
+            bodyBlock.addInstruction(freeInst);
+            bodyBlock.setTerminator(new ReturnTerminator(null));
+            return func;
+        }
+
         Instruction lenInst = new Instruction(Opcode.ARRAYLENGTH);
         lenInst.addOperand(arrParam);
         Temporary lenTmp = new Temporary(Type.INT);
@@ -421,23 +380,20 @@ public class DestructorInserter {
         lenTmp.setDefiningInstruction(lenInst);
         bodyBlock.addInstruction(lenInst);
 
-        // i = 0
         Temporary iTmp = new Temporary(Type.INT);
         Constant zero = new Constant(Type.INT, 0);
         Instruction storeI = new Instruction(Opcode.STORE);
         storeI.addOperand(zero);
-        storeI.setLocalIndex(0); // use local 0 for i
+        storeI.setLocalIndex(0);
         storeI.setResult(iTmp);
         iTmp.setDefiningInstruction(storeI);
         bodyBlock.addInstruction(storeI);
 
-        // Jump to the loop condition
         BasicBlock loopCondBlock = new BasicBlock(funcName + "_loop_cond");
         func.addBlock(loopCondBlock);
         bodyBlock.setTerminator(new BranchTerminator(loopCondBlock));
         bodyBlock.addSuccessor(loopCondBlock);
 
-        // Loop condition: i < length
         Instruction loadI = new Instruction(Opcode.LOAD);
         loadI.setLocalIndex(0);
         Temporary iLoaded = new Temporary(Type.INT);
@@ -459,16 +415,14 @@ public class DestructorInserter {
         loopCondBlock.addSuccessor(loopBodyBlock);
         loopCondBlock.addSuccessor(returnBlock);
 
-        // Loop body: element = arr[i]
         Instruction loadElement = new Instruction(Opcode.ALOAD);
         loadElement.addOperand(arrParam);
         loadElement.addOperand(iLoaded);
-        Temporary elementTmp = new Temporary(Type.REFERENCE);
+        Temporary elementTmp = new Temporary(Type.reference("java/lang/Object"));
         loadElement.setResult(elementTmp);
         elementTmp.setDefiningInstruction(loadElement);
         loopBodyBlock.addInstruction(loadElement);
 
-        // Check element != null
         Instruction cmpElemNull = new Instruction(Opcode.NE);
         cmpElemNull.addOperand(elementTmp);
         cmpElemNull.addOperand(nullConst);
@@ -486,15 +440,13 @@ public class DestructorInserter {
         loopBodyBlock.addSuccessor(callElemBlock);
         loopBodyBlock.addSuccessor(skipElemBlock);
 
-        // Element destructor call
         Instruction callElemDtor = new Instruction(Opcode.STATIC_CALL);
-        callElemDtor.addOperand(new Constant(Type.REFERENCE, elementDtor.getName()));
+        callElemDtor.addOperand(new Constant(Type.reference(elementDtor.getName()), elementDtor.getName()));
         callElemDtor.addOperand(elementTmp);
         callElemBlock.addInstruction(callElemDtor);
         callElemBlock.setTerminator(new BranchTerminator(skipElemBlock));
         callElemBlock.addSuccessor(skipElemBlock);
 
-        // i = i + 1
         Constant one = new Constant(Type.INT, 1);
         Instruction addI = new Instruction(Opcode.ADD);
         addI.addOperand(iLoaded);
@@ -504,7 +456,6 @@ public class DestructorInserter {
         iNext.setDefiningInstruction(addI);
         skipElemBlock.addInstruction(addI);
 
-        // store iNext into local[0]
         Instruction storeINext = new Instruction(Opcode.STORE);
         storeINext.addOperand(iNext);
         storeINext.setLocalIndex(0);
@@ -513,38 +464,71 @@ public class DestructorInserter {
         storeResult.setDefiningInstruction(storeINext);
         skipElemBlock.addInstruction(storeINext);
 
-        // Jump back to the loop condition
         skipElemBlock.setTerminator(new BranchTerminator(loopCondBlock));
         skipElemBlock.addSuccessor(loopCondBlock);
+
+        Instruction freeSelf = new Instruction(Opcode.FREE);
+        freeSelf.addOperand(arrParam);
+        returnBlock.getInstructions().clear();
+        returnBlock.addInstruction(freeSelf);
+        returnBlock.setTerminator(new ReturnTerminator(null));
 
         return func;
     }
 
-    private String destructorName(String type) {
-        if (type.startsWith("[")) {
-            // For arrays, generate a name based on the descriptor
-            return "__destruct_array_" + type.replace('/', '_').replace('[', '_').replace(';', '_');
-        } else {
-            return "__destruct_" + type.replace('/', '_').replace('.', '_');
-        }
+    private Function createTrivialArrayDestructor(Type arrayType) {
+        String funcName = destructorName(arrayType);
+        Function existing = module.getFunction(funcName);
+        if (existing != null) return existing;
+
+        Function func = new Function(funcName, Type.VOID);
+        module.addFunction(func);
+        Parameter arrParam = new Parameter(arrayType, 0);
+        func.addParameter(arrParam);
+
+        BasicBlock entry = new BasicBlock(funcName + "_entry");
+        func.addBlock(entry);
+        func.setEntryBlock(entry);
+
+        Constant nullConst = new Constant(Type.NULL, null);
+        Instruction cmpNull = new Instruction(Opcode.EQ);
+        cmpNull.addOperand(arrParam);
+        cmpNull.addOperand(nullConst);
+        Temporary cmpNullResult = new Temporary(Type.BOOLEAN);
+        cmpNull.setResult(cmpNullResult);
+        cmpNullResult.setDefiningInstruction(cmpNull);
+        entry.addInstruction(cmpNull);
+
+        BasicBlock returnBlock = new BasicBlock(funcName + "_return");
+        func.addBlock(returnBlock);
+        returnBlock.setTerminator(new ReturnTerminator(null));
+
+        BasicBlock bodyBlock = new BasicBlock(funcName + "_body");
+        func.addBlock(bodyBlock);
+        Instruction freeInst = new Instruction(Opcode.FREE);
+        freeInst.addOperand(arrParam);
+        bodyBlock.addInstruction(freeInst);
+        bodyBlock.setTerminator(new ReturnTerminator(null));
+
+        entry.setTerminator(new CondBranchTerminator(cmpNullResult, returnBlock, bodyBlock));
+        entry.addSuccessor(returnBlock);
+        entry.addSuccessor(bodyBlock);
+
+        return func;
     }
 
-    /**
-     * Finds or creates a destructor for the given type.
-     */
-    private Function findDestructor(String type) {
-        Function existing = module.getFunction(destructorName(type));
+    private Function findDestructor(Type type) {
+        String name = destructorName(type);
+        Function existing = module.getFunction(name);
         if (existing != null) return existing;
-        // Recursive creation
         return createDestructor(type);
     }
 
     private List<FieldNode> collectReferenceFields(ClassNode classNode) {
         List<FieldNode> refFields = new ArrayList<>();
         for (FieldNode field : classNode.getFields()) {
-            String desc = field.getDescriptor();
-            // Object fields or arrays
-            if (desc.startsWith("L") || desc.startsWith("[")) {
+            Type ft = field.getType();
+            if (ft.isReference() || ft.isArray()) {
                 refFields.add(field);
             }
         }
@@ -557,7 +541,7 @@ public class DestructorInserter {
         Value objRef = dp.getObjectRef();
 
         Instruction call = new Instruction(Opcode.STATIC_CALL);
-        call.addOperand(new Constant(Type.REFERENCE, dtor.getName()));
+        call.addOperand(new Constant(Type.reference(dtor.getName()), dtor.getName()));
         call.addOperand(objRef);
 
         if (before != null) {
@@ -570,4 +554,5 @@ public class DestructorInserter {
         }
         block.addInstruction(call);
     }
+
 }
