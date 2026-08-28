@@ -105,7 +105,8 @@ public class CLI implements Runnable {
         @CommandLine.Option(names = "--output", description = "Output executable file name (default: a.out)") String outputFile,
         @CommandLine.Option(names = "--no-compile", description = "Do not compile to native executable") boolean noCompile,
         @CommandLine.Option(names = "--include-system", description = "Include system/library classes in output") boolean includeSystem,
-        @CommandLine.Option(names = "--debug-name", description = "Debug only this class or method (shows only matching items)") String debugName) {
+        @CommandLine.Option(names = "--debug-name", description = "Debug only this class or method (shows only matching items)") String debugName,
+        @CommandLine.Option(names = "--classes-graph", description = "Show call graph from entry point") boolean showClassesGraph) {
 
         // If entryClass is not provided, try to read from JAR manifest
         if (entryClass == null && file.isFile() && file.getName().toLowerCase().endsWith(".jar")) {
@@ -129,7 +130,7 @@ public class CLI implements Runnable {
         }
 
         // If no flag is given, show everything (including classes)
-        boolean anyFlag = showClasses || showAlias || showEscape || showLifetime || showDestructor || showAll;
+        boolean anyFlag = showClasses || showAlias || showEscape || showLifetime || showDestructor || showClassesGraph || showAll;
         if (!anyFlag) {
             showClasses = showAlias = showEscape = showLifetime = showDestructor = true;
         } else if (showAll) {
@@ -139,6 +140,6 @@ public class CLI implements Runnable {
         Path path = file.toPath();
         analyzer.analyze(path, entryClass, entryMethod, descriptor,
             showClasses, showAlias, showEscape, showLifetime, showDestructor,
-            outputFile, noCompile, includeSystem, debugName);
+            outputFile, noCompile, includeSystem, debugName, showClassesGraph);
     }
 }

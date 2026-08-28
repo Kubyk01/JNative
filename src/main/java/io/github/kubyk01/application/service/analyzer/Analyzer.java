@@ -34,6 +34,7 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
 import java.util.*;
+import java.util.function.Predicate;
 import java.util.stream.Collectors;
 
 @Slf4j
@@ -47,7 +48,8 @@ public class Analyzer implements AnalyzerPort {
                         boolean showClasses, boolean showAlias, boolean showEscape,
                         boolean showLifetime, boolean showDestructor,
                         String outputFile, boolean noCompile,
-                        boolean includeSystem, String debugName) {
+                        boolean includeSystem, String debugName,
+                        boolean showClassesGraph) {
         DependencyResolver resolver = new DependencyResolver();
         try {
             resolver.scan(path);
@@ -88,6 +90,20 @@ public class Analyzer implements AnalyzerPort {
             methodsToShow = allMethods.stream()
                 .filter(m -> !isSystemClass(m.getOwner() + "." + m.getName()))
                 .collect(Collectors.toSet());
+        }
+
+        if (showClassesGraph) {
+            Set<String> filteredClasses = classesToShow.stream()
+                .filter(c -> matchesDebug(debugName, c))
+                .collect(Collectors.toSet());
+            Set<MethodReference> filteredMethods = methodsToShow.stream()
+                .filter(m -> matchesDebug(debugName, m.getOwner()) || matchesDebug(debugName, m.getName()))
+                .collect(Collectors.toSet());
+
+            System.out.println("\nClasses (" + filteredClasses.size() + "):");
+            System.out.println("\nMethods (" + filteredMethods.size() + "):");
+
+            printCallGraph(analysis, entryClass, entryMethod, entryDescriptor, includeSystem, debugName);
         }
 
         if (showClasses) {
@@ -284,6 +300,39 @@ public class Analyzer implements AnalyzerPort {
             }
         } else {
             System.out.println("Skipping native compilation (--no-compile specified)");
+        }
+    }
+
+    private void printCallGraph(ReachabilityAnalysis analysis, String entryClass,
+                                String entryMethod, String entryDescriptor,
+                                boolean includeSystem, String debugName) {
+        MethodReference entry = new MethodReference(entryClass.replace('.', '/'), entryMethod, entryDescriptor);
+        Map<MethodReference, Set<MethodReference>> graph = analysis.getCallGraph();
+        Set<MethodReference> visited = new HashSet<>();
+        Predicate<MethodReference> filter = mr -> {
+            if (!includeSystem && isSystemClassName(mr.getOwner())) return false;
+            return debugName == null || mr.toString().contains(debugName);
+        };
+        System.out.println("\nCall graph from entry:");
+        printMethodTree(entry, graph, filter, visited, 0);
+    }
+
+    private void printMethodTree(MethodReference method, Map<MethodReference, Set<MethodReference>> graph,
+                                 Predicate<MethodReference> filter, Set<MethodReference> visited, int depth) {
+        if (!filter.test(method)) return;
+        String indent = "  ".repeat(depth);
+        System.out.println(indent + method);
+        if (!visited.add(method)) {
+            System.out.println(indent + "  (already visited)");
+            return;
+        }
+        Set<MethodReference> callees = graph.get(method);
+        if (callees != null) {
+            for (MethodReference callee : callees) {
+                if (filter.test(callee)) {
+                    printMethodTree(callee, graph, filter, visited, depth + 1);
+                }
+            }
         }
     }
 

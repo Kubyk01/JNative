@@ -7,5 +7,6 @@ public interface AnalyzerPort {
                  boolean showClasses, boolean showAlias, boolean showEscape,
                  boolean showLifetime, boolean showDestructor,
                  String outputFile, boolean noCompile,
-                 boolean includeSystem, String debugName);
+                 boolean includeSystem, String debugName,
+                 boolean showClassesGraph);
 }

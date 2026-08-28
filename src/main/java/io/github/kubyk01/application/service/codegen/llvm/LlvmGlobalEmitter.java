@@ -147,9 +147,20 @@ public class LlvmGlobalEmitter {
             String owner = fullName.substring(0, dot);
             String fieldName = fullName.substring(dot + 1);
             Type fieldType = getFieldType(owner, fieldName);
-            if (fieldType == null) fieldType = Type.UNKNOWN;
+            if (fieldType == null) {
+                fieldType = Type.UNKNOWN;
+            }
             String llvmType = typeMapper.toLlvmType(fieldType);
-            String init = fieldType.isReference() || fieldType.isArray() || fieldType.isNull() ? "null" : "0";
+
+            String init;
+            if (fieldType.isReference() || fieldType.isArray() || fieldType.isNull() || fieldType.isUnknown()) {
+                init = "null";
+            } else if (fieldType == Type.FLOAT || fieldType == Type.DOUBLE) {
+                init = "0.0";
+            } else {
+                init = "0";
+            }
+
             String globalName = "gv_" + fullName.replace('.', '_').replace('/', '_');
             sb.append("@").append(globalName).append(" = global ").append(llvmType)
                 .append(" ").append(init).append(", align 8\n");
@@ -572,30 +583,72 @@ public class LlvmGlobalEmitter {
         sb.append("define i8* @").append(adaptorName).append("(i8* %obj, i8** %args) {\n");
 
         List<String> argLoads = new ArrayList<>();
+
         for (int i = 0; i < paramTypes.size(); i++) {
             Type pt = paramTypes.get(i);
             String ptLlvm = typeMapper.toLlvmType(pt);
+
             String addr = "%arg" + i + "_addr";
-            String ptr = "%arg" + i + "_ptr";
             String val = "%arg" + i + "_val";
-            sb.append("  ").append(addr).append(" = getelementptr i8*, i8** %args, i32 ").append(i).append("\n");
-            sb.append("  ").append(ptr).append(" = bitcast i8* ").append(addr).append(" to ").append(ptLlvm).append("*\n");
-            sb.append("  ").append(val).append(" = load ").append(ptLlvm).append(", ").append(ptLlvm).append("* ").append(ptr).append("\n");
+
+            sb.append("  ")
+                .append(addr)
+                .append(" = getelementptr i8*, i8** %args, i32 ")
+                .append(i)
+                .append("\n");
+
+            if (pt.isReference() || pt.isArray() || pt.isNull() || pt.isBlock()) {
+                sb.append("  ")
+                    .append(val)
+                    .append(" = load i8*, i8** ")
+                    .append(addr)
+                    .append("\n");
+            } else {
+                String ptr = "%arg" + i + "_ptr";
+
+                sb.append("  ")
+                    .append(ptr)
+                    .append(" = bitcast i8** ")
+                    .append(addr)
+                    .append(" to ")
+                    .append(ptLlvm)
+                    .append("*\n");
+
+                sb.append("  ")
+                    .append(val)
+                    .append(" = load ")
+                    .append(ptLlvm)
+                    .append(", ")
+                    .append(ptLlvm)
+                    .append("* ")
+                    .append(ptr)
+                    .append("\n");
+            }
+
             argLoads.add(val);
         }
 
-        // Build argument list
+        // Build LLVM call arguments, including their types.
         StringBuilder argsCsv = new StringBuilder();
         boolean firstArg = true;
+
         if (!isStatic) {
             argsCsv.append("i8* %obj");
             firstArg = false;
         }
-        for (String a : argLoads) {
-            if (!firstArg) argsCsv.append(", ");
-            argsCsv.append(a);
+
+        for (int i = 0; i < argLoads.size(); i++) {
+            if (!firstArg) {
+                argsCsv.append(", ");
+            }
+
+            argsCsv.append(typeMapper.toLlvmType(paramTypes.get(i)))
+                .append(" ")
+                .append(argLoads.get(i));
+
             firstArg = false;
         }
+
         String retLlvm = typeMapper.toLlvmType(retType);
         if (retType.isVoid()) {
             sb.append("  call void @").append(origFuncName).append("(").append(argsCsv).append(")\n");
@@ -643,15 +696,21 @@ public class LlvmGlobalEmitter {
             Type pt = paramTypes.get(i);
             String ptLlvm = typeMapper.toLlvmType(pt);
             String addr = "%arg" + i + "_addr";
-            String ptr = "%arg" + i + "_ptr";
             String val = "%arg" + i + "_val";
             sb.append("  ").append(addr).append(" = getelementptr i8*, i8** %args, i32 ").append(i).append("\n");
-            sb.append("  ").append(ptr).append(" = bitcast i8* ").append(addr).append(" to ").append(ptLlvm).append("*\n");
-            sb.append("  ").append(val).append(" = load ").append(ptLlvm).append(", ").append(ptLlvm).append("* ").append(ptr).append("\n");
+
+            // Analogous correct load
+            if (pt.isReference() || pt.isArray() || pt.isNull() || pt.isBlock()) {
+                sb.append("  ").append(val).append(" = load i8*, i8** ").append(addr).append("\n");
+            } else {
+                String ptr = "%arg" + i + "_ptr";
+                sb.append("  ").append(ptr).append(" = bitcast i8** ").append(addr).append(" to ").append(ptLlvm).append("*\n");
+                sb.append("  ").append(val).append(" = load ").append(ptLlvm).append(", ").append(ptLlvm).append("* ").append(ptr).append("\n");
+            }
             argLoads.add(val);
         }
 
-        // Build argument list: prepend %obj as first argument
+        // Build argument list: prepend %obj
         StringBuilder argsCsv = new StringBuilder();
         argsCsv.append("i8* %obj");
         for (String a : argLoads) {

@@ -13,9 +13,13 @@ public class Module {
     private final Map<String, Function> functionMap = new HashMap<>();
 
     public void addFunction(Function func) {
-        functions.add(func);
-        functionMap.put(func.getName(), func);
-        func.setModule(this);
+        if (!functionMap.containsKey(func.getName())) {
+            functions.add(func);
+            functionMap.put(func.getName(), func);
+            func.setModule(this);
+        } else {
+            // Ignore duplicate function entries by name.
+        }
     }
 
     public Function getFunction(String name) {

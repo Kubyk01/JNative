@@ -3,10 +3,10 @@
 #include <stdint.h>
 #include <setjmp.h>
 #include <stdio.h>
-#include <string.h>      // for memcpy
+#include <string.h>
 
 // ---------------------------------------------------------------------------
-// Forward declarations for exception throwing functions (used before definition)
+// Forward declarations for exception throwing functions
 // ---------------------------------------------------------------------------
 __attribute__((noreturn)) void __jnative_throw_exception(void* exc);
 __attribute__((noreturn)) void __jnative_throw_null_pointer_exception(void);
@@ -237,6 +237,34 @@ void* __jnative_create_string_array(int argc, char** argv) {
         }
     }
     return array;
+}
+
+// ---------------------------------------------------------------------------
+// Multi-dimensional array creation (moved from LLVM to C)
+// ---------------------------------------------------------------------------
+
+static void* create_multi_array_rec(const char* desc, int last_dim, int* sizes,
+                                    int current_dim, int elem_size) {
+    int is_last = (current_dim == last_dim);
+    int length = sizes[current_dim];
+    int total_size = 4 + length * (is_last ? elem_size : sizeof(void*));
+    void* array = malloc(total_size);
+    if (!array) return NULL;
+    *(int*)array = length; // store length in header
+
+    if (!is_last) {
+        void** slots = (void**)((char*)array + 4);
+        for (int i = 0; i < length; i++) {
+            slots[i] = create_multi_array_rec(desc, last_dim, sizes, current_dim + 1, elem_size);
+        }
+    }
+    return array;
+}
+
+void* __jnative_new_multi_array(const char* desc, int dims, int* sizes, int elem_size) {
+    if (dims <= 0 || sizes == NULL) return NULL;
+    int last_dim = dims - 1;
+    return create_multi_array_rec(desc, last_dim, sizes, 0, elem_size);
 }
 
 // ---------------------------------------------------------------------------
