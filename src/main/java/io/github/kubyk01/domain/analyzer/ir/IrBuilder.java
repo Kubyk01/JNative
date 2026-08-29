@@ -100,26 +100,53 @@ public class IrBuilder {
         };
     }
 
-    private Type inferResultType(Opcode op, Value[] operands) {
-        if (op == Opcode.INSTANCEOF) {
-            return Type.BOOLEAN;
-        }
-        if (op == Opcode.CHECKCAST) {
-            // result type is the target type from the constant
-            if (operands.length > 1 && operands[1] instanceof Constant) {
-                Constant c = (Constant) operands[1];
-                if (c.getType().isReference()) {
-                    return Type.reference(c.getValue().toString());
+    private Type inferResultType(Opcode op, Value... operands) {
+        return switch (op) {
+            case INSTANCEOF -> Type.BOOLEAN;
+            case CHECKCAST -> {
+                if (operands.length > 1 && operands[1] instanceof Constant c) {
+                    if (c.getType().isReference()) {
+                        yield Type.reference(c.getValue().toString());
+                    }
                 }
+                yield operands.length > 0 ? operands[0].getType() : Type.UNKNOWN;
             }
-            // fallback
-            return operands.length > 0 ? operands[0].getType() : Type.UNKNOWN;
-        }
-        // remaining operations as before
-        if (operands.length > 0 && operands[0] != null) {
-            return operands[0].getType();
-        }
-        return Type.UNKNOWN;
+            case ARRAYLENGTH -> Type.INT;
+            case ALOAD -> {
+                if (operands.length > 0 && operands[0].getType().isArray()) {
+                    yield operands[0].getType().getElementType();
+                }
+                yield Type.UNKNOWN;
+            }
+            case NEW -> {
+                if (operands.length > 0 && operands[0] instanceof Constant) {
+                    String className = ((Constant) operands[0]).getValue().toString();
+                    yield Type.reference(className);
+                }
+                yield Type.UNKNOWN;
+            }
+            case NEW_ARRAY -> {
+                if (operands.length >= 2 && operands[1] instanceof Constant) {
+                    String elemTypeName = ((Constant) operands[1]).getValue().toString();
+                    Type elemType = Type.fromDescriptor(elemTypeName); // handles "int", "java/lang/String", etc.
+                    yield Type.array(elemType);
+                }
+                yield Type.UNKNOWN;
+            }
+            case MULTI_NEW_ARRAY -> {
+                if (operands.length > 0 && operands[0] instanceof Constant) {
+                    String desc = ((Constant) operands[0]).getValue().toString();
+                    yield Type.array(desc);
+                }
+                yield Type.UNKNOWN;
+            }
+            default -> {
+                if (operands.length > 0 && operands[0] != null) {
+                    yield operands[0].getType();
+                }
+                yield Type.UNKNOWN;
+            }
+        };
     }
 
     public Terminator createBranch(BasicBlock target) {
