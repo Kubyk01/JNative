@@ -309,6 +309,7 @@ public class LlvmFunctionEmitter {
                 Value right = inst.getOperands().get(1);
                 Type resType = inst.getResult().getType();
 
+                // Division/remainder by zero check (only for int/long)
                 if ((op == Opcode.DIV || op == Opcode.REM) && !ranges.isEmpty()) {
                     Type lt = left.getType();
                     if (lt == Type.INT || lt == Type.LONG) {
@@ -316,34 +317,50 @@ public class LlvmFunctionEmitter {
                     }
                 }
 
-                // For bitwise ops, ensure operands are integers; if any pointer, convert to i64.
                 boolean leftIsPtr = left.getType().isReference() || left.getType().isArray() || left.getType().isNull() || left.getType().isBlock();
                 boolean rightIsPtr = right.getType().isReference() || right.getType().isArray() || right.getType().isNull() || right.getType().isBlock();
                 boolean isBitwise = (op == Opcode.AND || op == Opcode.OR || op == Opcode.XOR || op == Opcode.SHL || op == Opcode.SHR || op == Opcode.USHR);
+                boolean anyPtr = leftIsPtr || rightIsPtr || resType.isReference() || resType.isArray() || resType.isNull() || resType.isBlock();
 
+                // Bitwise operations involving pointers: convert to i64, perform bitwise op, cast back
                 if (isBitwise && (leftIsPtr || rightIsPtr)) {
-                    // Convert both to i64, perform operation, then cast result to resType (which should be integer)
-                    Type intType = Type.LONG; // use i64 for pointer arithmetic
+                    Type intType = Type.LONG;
                     String lInt = castValueToType(sb, getLlvmValue(left), left.getType(), intType);
                     String rInt = castValueToType(sb, getLlvmValue(right), right.getType(), intType);
-                    String llvmOp = mapArithOp(op);
+                    String llvmOp = mapArithOp(op, Type.LONG);
                     String tmp = newAux("bitwise_int");
                     sb.append("  ").append(tmp).append(" = ").append(llvmOp)
                         .append(" ").append(typeMapper.toLlvmType(intType))
                         .append(" ").append(lInt).append(", ").append(rInt).append("\n");
-                    // Cast the integer result to the result type (if pointer, cast back to pointer)
                     String finalVal = castValueToType(sb, tmp, intType, resType);
                     if (resultName != null) {
                         valueMapper.setValue(inst.getResult(), finalVal);
                     }
-                } else {
-                    String l = castValueToType(sb, getLlvmValue(left), left.getType(), resType);
-                    String r = castValueToType(sb, getLlvmValue(right), right.getType(), resType);
-                    String llvmOp = mapArithOp(op);
-                    sb.append("  ").append(resultName).append(" = ").append(llvmOp)
-                        .append(" ").append(typeMapper.toLlvmType(resType))
-                        .append(" ").append(l).append(", ").append(r).append("\n");
+                    break;
                 }
+
+                // Non‑bitwise arithmetic with pointers: convert both to i64, perform op, cast back
+                if (!isBitwise && anyPtr) {
+                    String lInt = castValueToType(sb, getLlvmValue(left), left.getType(), Type.LONG);
+                    String rInt = castValueToType(sb, getLlvmValue(right), right.getType(), Type.LONG);
+                    String llvmOp = mapArithOp(op, Type.LONG);
+                    String tmp = newAux("ptr_arith");
+                    sb.append("  ").append(tmp).append(" = ").append(llvmOp)
+                        .append(" i64 ").append(lInt).append(", ").append(rInt).append("\n");
+                    String finalVal = castValueToType(sb, tmp, Type.LONG, resType);
+                    if (resultName != null) {
+                        valueMapper.setValue(inst.getResult(), finalVal);
+                    }
+                    break;
+                }
+
+                // Normal arithmetic (both operands are integers or floats)
+                String l = castValueToType(sb, getLlvmValue(left), left.getType(), resType);
+                String r = castValueToType(sb, getLlvmValue(right), right.getType(), resType);
+                String llvmOp = mapArithOp(op, resType);
+                sb.append("  ").append(resultName).append(" = ").append(llvmOp)
+                    .append(" ").append(typeMapper.toLlvmType(resType))
+                    .append(" ").append(l).append(", ").append(r).append("\n");
                 break;
             }
             case EQ: case NE: case LT: case LE: case GT: case GE: {
@@ -358,31 +375,46 @@ public class LlvmFunctionEmitter {
                 boolean rightIsPtr = rightType.isReference() || rightType.isArray() || rightType.isNull() || rightType.isBlock();
 
                 // Replace integer 0 with null for pointer comparisons
-                if (leftIsPtr && "0".equals(r)) {
-                    r = "null";
-                }
-                if (rightIsPtr && "0".equals(l)) {
-                    l = "null";
-                }
+                if (leftIsPtr && "0".equals(r)) { r = "null"; }
+                if (rightIsPtr && "0".equals(l)) { l = "null"; }
 
                 // Handle mixed pointer/integer comparison: cast both to i64
                 if ((leftIsPtr && !rightIsPtr) || (!leftIsPtr && rightIsPtr)) {
                     l = castValueToType(sb, l, leftType, Type.LONG);
                     r = castValueToType(sb, r, rightType, Type.LONG);
-                    String cmpOp = mapCmpOp(op);
-                    sb.append("  ").append(resultName).append(" = icmp ").append(cmpOp)
-                        .append(" i64 ").append(l).append(", ").append(r).append("\n");
-                    break;
+                    leftType = Type.LONG;
+                } else if (!leftIsPtr && !rightIsPtr) {
+                    // Both are non-pointers
+                    boolean leftIsFloat = leftType == Type.FLOAT || leftType == Type.DOUBLE;
+                    boolean rightIsFloat = rightType == Type.FLOAT || rightType == Type.DOUBLE;
+                    boolean leftIsInt = isIntegerType(leftType);
+                    boolean rightIsInt = isIntegerType(rightType);
+
+                    if ((leftIsFloat && rightIsInt) || (leftIsInt && rightIsFloat)) {
+                        // Convert integer to float
+                        if (leftIsInt && rightIsFloat) {
+                            l = castValueToType(sb, l, leftType, rightType);
+                            leftType = rightType;
+                        } else if (leftIsFloat && rightIsInt) {
+                            r = castValueToType(sb, r, rightType, leftType);
+                            // leftType remains float
+                        }
+                    } else if (leftIsInt && rightIsInt) {
+                        // Both integers: promote to i64 to unify types
+                        l = castValueToType(sb, l, leftType, Type.LONG);
+                        r = castValueToType(sb, r, rightType, Type.LONG);
+                        leftType = Type.LONG;
+                    } else if (!leftType.equals(rightType)) {
+                        // Fallback: cast right to left type
+                        r = castValueToType(sb, r, rightType, leftType);
+                    }
                 }
 
-                // Both are either pointers or non‑pointers; if both non‑pointers and types differ,
-                // cast right operand to left type (original logic).
-                if (!leftType.equals(rightType) && !leftIsPtr && !rightIsPtr) {
-                    r = castValueToType(sb, r, rightType, leftType);
-                }
-
-                String cmpOp = mapCmpOp(op);
-                sb.append("  ").append(resultName).append(" = icmp ").append(cmpOp)
+                boolean isFloat = leftType == Type.FLOAT || leftType == Type.DOUBLE;
+                String instr = isFloat ? "fcmp" : "icmp";
+                String pred = mapCmpOp(op, isFloat);
+                sb.append("  ").append(resultName).append(" = ").append(instr)
+                    .append(" ").append(pred)
                     .append(" ").append(typeMapper.toLlvmType(leftType))
                     .append(" ").append(l).append(", ").append(r).append("\n");
                 break;
@@ -540,10 +572,43 @@ public class LlvmFunctionEmitter {
             }
 
             case STATIC_CALL:
-            case SPECIAL_CALL:
             case CALL: {
                 String calleeName = extractCalleeName(inst);
                 if (calleeName == null) break;
+                Function calleeFunc = module.getFunction(calleeName);
+                String mangledCallee;
+                if (calleeFunc != null) {
+                    String funcName = calleeFunc.getName();
+                    if (funcName.startsWith("__jnative_") || funcName.startsWith("__destruct_")) {
+                        mangledCallee = funcName;
+                    } else {
+                        mangledCallee = LlvmRuntime.mangleFunction(funcName);
+                    }
+                } else {
+                    String nativeCandidate = "__jnative_" + LlvmRuntime.mangleCallable(calleeName);
+                    if (module.getFunction(nativeCandidate) != null) {
+                        mangledCallee = nativeCandidate;
+                    } else {
+                        mangledCallee = LlvmRuntime.mangleCallable(calleeName);
+                    }
+                }
+                List<Value> args = getCallArguments(inst);
+                StringBuilder argList = new StringBuilder();
+                for (int i = 0; i < args.size(); i++) {
+                    if (i > 0) argList.append(", ");
+                    argList.append(typeMapper.toLlvmType(args.get(i).getType()))
+                        .append(" ").append(getLlvmValue(args.get(i)));
+                }
+                Type retType = inst.getResult() != null ? inst.getResult().getType() : Type.VOID;
+                emitCall(sb, retType, resultName, "@" + mangledCallee, argList.toString(), ranges);
+                break;
+            }
+            case SPECIAL_CALL: {
+                if (inst.getOperands().size() < 2) break;
+                Value receiver = inst.getOperands().get(0);
+                Value calleeConst = inst.getOperands().get(1);
+                if (!(calleeConst instanceof Constant)) break;
+                String calleeName = ((Constant) calleeConst).getValue().toString();
                 Function calleeFunc = module.getFunction(calleeName);
                 String mangledCallee;
                 if (calleeFunc != null) {
@@ -559,7 +624,11 @@ public class LlvmFunctionEmitter {
                         mangledCallee = LlvmRuntime.mangleCallable(calleeName);
                     }
                 }
-                List<Value> args = getCallArguments(inst);
+                List<Value> args = new ArrayList<>();
+                args.add(receiver);
+                for (int i = 2; i < inst.getOperands().size(); i++) {
+                    args.add(inst.getOperands().get(i));
+                }
                 StringBuilder argList = new StringBuilder();
                 for (int i = 0; i < args.size(); i++) {
                     if (i > 0) argList.append(", ");
@@ -1032,7 +1101,9 @@ public class LlvmFunctionEmitter {
                 key = tst.getKey();
                 defaultTarget = tst.getDefaultTarget();
             }
-            sb.append("  switch i32 ").append(getLlvmValue(key)).append(", label %")
+            String keyRef = getLlvmValue(key);
+            String keyI32 = castValueToType(sb, keyRef, key.getType(), Type.INT);
+            sb.append("  switch i32 ").append(keyI32).append(", label %")
                 .append(llvmLabel(defaultTarget)).append(" [\n");
             if (term instanceof LookupSwitchTerminator lst) {
                 for (int i = 0; i < lst.getKeys().length; i++) {
@@ -1068,15 +1139,16 @@ public class LlvmFunctionEmitter {
 
     // ----- Helper methods -----
 
-    private String mapArithOp(Opcode op) {
+    private String mapArithOp(Opcode op, Type type) {
+        boolean isFloat = type == Type.FLOAT || type == Type.DOUBLE;
         return switch (op) {
-            case ADD -> "add";
-            case SUB -> "sub";
-            case MUL -> "mul";
-            case DIV -> "sdiv";
-            case REM -> "srem";
+            case ADD -> isFloat ? "fadd" : "add";
+            case SUB -> isFloat ? "fsub" : "sub";
+            case MUL -> isFloat ? "fmul" : "mul";
+            case DIV -> isFloat ? "fdiv" : "sdiv";
+            case REM -> isFloat ? "frem" : "srem";
             case AND -> "and";
-            case OR -> "or";
+            case OR  -> "or";
             case XOR -> "xor";
             case SHL -> "shl";
             case SHR -> "ashr";
@@ -1085,16 +1157,28 @@ public class LlvmFunctionEmitter {
         };
     }
 
-    private String mapCmpOp(Opcode op) {
-        return switch (op) {
-            case EQ -> "eq";
-            case NE -> "ne";
-            case LT -> "slt";
-            case LE -> "sle";
-            case GT -> "sgt";
-            case GE -> "sge";
-            default -> "eq";
-        };
+    private String mapCmpOp(Opcode op, boolean isFloat) {
+        if (isFloat) {
+            return switch (op) {
+                case EQ -> "oeq";
+                case NE -> "one";
+                case LT -> "olt";
+                case LE -> "ole";
+                case GT -> "ogt";
+                case GE -> "oge";
+                default -> "oeq";
+            };
+        } else {
+            return switch (op) {
+                case EQ -> "eq";
+                case NE -> "ne";
+                case LT -> "slt";
+                case LE -> "sle";
+                case GT -> "sgt";
+                case GE -> "sge";
+                default -> "eq";
+            };
+        }
     }
 
     private String getCastOp(Type src, Type dest) {
@@ -1243,11 +1327,22 @@ public class LlvmFunctionEmitter {
         Object val = c.getValue();
         if (val == null) return "null";
         Type type = c.getType();
-        if (type == Type.INT) return val.toString();
-        if (type == Type.LONG) return val.toString();
-        if (type == Type.FLOAT) return val.toString() + "f";
-        if (type == Type.DOUBLE) return val.toString();
-        if (type == Type.BOOLEAN) return ((Boolean) val) ? "true" : "false";
+
+        if (type == Type.INT) {
+            return val.toString();
+        }
+        if (type == Type.LONG) {
+            return val.toString();
+        }
+        if (type == Type.FLOAT || type == Type.DOUBLE) {
+            double d = ((Number) val).doubleValue();
+            String s = Double.toString(d);
+            s = s.replace('E', 'e');
+            return s;
+        }
+        if (type == Type.BOOLEAN) {
+            return ((Boolean) val) ? "true" : "false";
+        }
         return "null";
     }
 
