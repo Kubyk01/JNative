@@ -1,4 +1,4 @@
-package io.github.kubyk01.domain.analyzer.ir;
+package io.github.kubyk01.domain.ir;
 
 public class UndefinedValue extends Value {
     public UndefinedValue(Type type) {

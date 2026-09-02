@@ -1,6 +1,6 @@
 package io.github.kubyk01.application.service.codegen.llvm;
 
-import io.github.kubyk01.domain.analyzer.ir.Value;
+import io.github.kubyk01.domain.ir.Value;
 import java.util.HashMap;
 import java.util.Map;
 

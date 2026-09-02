@@ -1,4 +1,4 @@
-package io.github.kubyk01.domain.analyzer.ir;
+package io.github.kubyk01.domain.ir;
 
 import lombok.Getter;
 import lombok.Setter;

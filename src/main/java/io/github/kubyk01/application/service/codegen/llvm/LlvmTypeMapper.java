@@ -1,6 +1,6 @@
 package io.github.kubyk01.application.service.codegen.llvm;
 
-import io.github.kubyk01.domain.analyzer.ir.Type;
+import io.github.kubyk01.domain.ir.Type;
 
 public class LlvmTypeMapper {
 

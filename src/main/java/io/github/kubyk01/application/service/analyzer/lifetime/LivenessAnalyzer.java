@@ -3,19 +3,19 @@ package io.github.kubyk01.application.service.analyzer.lifetime;
 import io.github.kubyk01.domain.analyzer.aliasanalysis.AliasAnalysisResult;
 import io.github.kubyk01.domain.analyzer.aliasanalysis.AllocationSite;
 import io.github.kubyk01.domain.analyzer.aliasanalysis.FunctionSummary;
-import io.github.kubyk01.domain.analyzer.ir.BasicBlock;
-import io.github.kubyk01.domain.analyzer.ir.CondBranchTerminator;
-import io.github.kubyk01.domain.analyzer.ir.Constant;
-import io.github.kubyk01.domain.analyzer.ir.Function;
-import io.github.kubyk01.domain.analyzer.ir.Instruction;
-import io.github.kubyk01.domain.analyzer.ir.LookupSwitchTerminator;
-import io.github.kubyk01.domain.analyzer.ir.Module;
-import io.github.kubyk01.domain.analyzer.ir.Opcode;
-import io.github.kubyk01.domain.analyzer.ir.ReturnTerminator;
-import io.github.kubyk01.domain.analyzer.ir.TableSwitchTerminator;
-import io.github.kubyk01.domain.analyzer.ir.Terminator;
-import io.github.kubyk01.domain.analyzer.ir.ThrowTerminator;
-import io.github.kubyk01.domain.analyzer.ir.Value;
+import io.github.kubyk01.domain.ir.BasicBlock;
+import io.github.kubyk01.domain.ir.CondBranchTerminator;
+import io.github.kubyk01.domain.ir.Constant;
+import io.github.kubyk01.domain.ir.Function;
+import io.github.kubyk01.domain.ir.Instruction;
+import io.github.kubyk01.domain.ir.LookupSwitchTerminator;
+import io.github.kubyk01.domain.ir.Module;
+import io.github.kubyk01.domain.ir.Opcode;
+import io.github.kubyk01.domain.ir.ReturnTerminator;
+import io.github.kubyk01.domain.ir.TableSwitchTerminator;
+import io.github.kubyk01.domain.ir.Terminator;
+import io.github.kubyk01.domain.ir.ThrowTerminator;
+import io.github.kubyk01.domain.ir.Value;
 import lombok.RequiredArgsConstructor;
 
 import java.util.ArrayList;
@@ -32,7 +32,7 @@ import java.util.Set;
  * Instead of per-block boolean flags, sets of live sites are used,
  * which reduces the analysis to a single fixed-point iteration for all sites at once
  * instead of O(N * B) when analyzing each site separately.
- *
+ * <p>
  * Optimizations:
  * - points-to sets of values are cached (the graph is already stable after alias analysis);
  * - a single data-flow pass for all sites;

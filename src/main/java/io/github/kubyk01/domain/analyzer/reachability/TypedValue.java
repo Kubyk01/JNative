@@ -1,9 +1,9 @@
 package io.github.kubyk01.domain.analyzer.reachability;
 
-import io.github.kubyk01.domain.analyzer.ir.Type;
+import io.github.kubyk01.domain.ir.Type;
 import lombok.Getter;
 
-import static io.github.kubyk01.domain.analyzer.ir.Type.*;
+import static io.github.kubyk01.domain.ir.Type.reference;
 
 @Getter
 public final class TypedValue {

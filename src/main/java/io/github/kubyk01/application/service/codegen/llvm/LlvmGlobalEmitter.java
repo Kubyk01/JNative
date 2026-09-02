@@ -9,16 +9,16 @@ import io.github.kubyk01.domain.analyzer.dependencyresolver.FieldNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.FieldReference;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.MethodNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.MethodReference;
-import io.github.kubyk01.domain.analyzer.ir.BasicBlock;
-import io.github.kubyk01.domain.analyzer.ir.Constant;
-import io.github.kubyk01.domain.analyzer.ir.Function;
-import io.github.kubyk01.domain.analyzer.ir.Instruction;
-import io.github.kubyk01.domain.analyzer.ir.Module;
-import io.github.kubyk01.domain.analyzer.ir.Opcode;
-import io.github.kubyk01.domain.analyzer.ir.Type;
-import io.github.kubyk01.domain.analyzer.ir.Value;
 import io.github.kubyk01.domain.analyzer.reflection.ReflectClassInfo;
 import io.github.kubyk01.domain.analyzer.reflection.ReflectInfo;
+import io.github.kubyk01.domain.ir.BasicBlock;
+import io.github.kubyk01.domain.ir.Constant;
+import io.github.kubyk01.domain.ir.Function;
+import io.github.kubyk01.domain.ir.Instruction;
+import io.github.kubyk01.domain.ir.Module;
+import io.github.kubyk01.domain.ir.Opcode;
+import io.github.kubyk01.domain.ir.Type;
+import io.github.kubyk01.domain.ir.Value;
 import lombok.Getter;
 import lombok.RequiredArgsConstructor;
 import org.objectweb.asm.Opcodes;
@@ -28,10 +28,13 @@ import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+
+import static io.github.kubyk01.util.LlvmUtil.getElementSizeOfType;
 
 @RequiredArgsConstructor
 public class LlvmGlobalEmitter {
@@ -46,14 +49,61 @@ public class LlvmGlobalEmitter {
     private final Map<String, Integer> fieldOffsets = new HashMap<>();
     private final Set<String> emittedStringConstants = new HashSet<>();
 
-    // --- vtable support ---
     private final Map<String, Integer> methodIndex = new HashMap<>();
     private final Map<String, String> vtableNames = new HashMap<>();
     @Getter
     private int totalMethods = 0;
 
-    // --- type info support ---
     private final Map<String, String> typeInfoNames = new HashMap<>();
+
+    private final Map<String, String> extraStructs = new LinkedHashMap<>();
+    private final Map<String, String> extraVtables = new LinkedHashMap<>();
+
+    public void addExtraStruct(String name, String definition) {
+        extraStructs.put(name, definition);
+    }
+
+    public void addExtraVtable(String name, String content) {
+        extraVtables.put(name, content);
+    }
+
+    public String registerLambdaStruct(String lambdaId, List<Type> capturedTypes) {
+        if (extraStructs.containsKey("%struct.lambda_" + lambdaId)) {
+            return "%struct.lambda_" + lambdaId;
+        }
+        StringBuilder fields = new StringBuilder("{ i8*");
+        for (Type t : capturedTypes) {
+            fields.append(", ").append(typeMapper.toLlvmType(t));
+        }
+        fields.append(" }");
+        String structName = "%struct.lambda_" + lambdaId;
+        String definition = structName + " = type " + fields;
+        extraStructs.put(structName, definition);
+        return structName;
+    }
+
+    public String registerLambdaVtable(String lambdaId, String adaptorName) {
+        String vtableName = "@vtable_lambda_" + lambdaId;
+        if (extraVtables.containsKey(vtableName)) {
+            return vtableName;
+        }
+        String content = vtableName + " = constant [1 x i8*] [i8* bitcast ("
+            + "void (i8*, ...)* @" + adaptorName + " to i8*)]";
+        extraVtables.put(vtableName, content);
+        return vtableName;
+    }
+
+    public void emitExtraStructs(StringBuilder sb) {
+        for (Map.Entry<String, String> e : extraStructs.entrySet()) {
+            sb.append(e.getValue()).append("\n");
+        }
+    }
+
+    public void emitExtraVtables(StringBuilder sb) {
+        for (Map.Entry<String, String> e : extraVtables.entrySet()) {
+            sb.append(e.getValue()).append("\n");
+        }
+    }
 
     public String generateGlobals() {
         return generateStructs() +
@@ -96,7 +146,6 @@ public class LlvmGlobalEmitter {
     private String generateStructs() {
         StringBuilder sb = new StringBuilder();
 
-        // Define java/lang/Object only if not already defined (e.g., by loop below)
         String objStruct = typeMapper.toLlvmStruct("java/lang/Object");
         if (!structNames.containsKey("java/lang/Object")) {
             sb.append(objStruct).append(" = type { }\n");
@@ -107,7 +156,6 @@ public class LlvmGlobalEmitter {
         for (ClassNode cls : allClasses) {
             if (cls.isExternal()) continue;
             String structName = typeMapper.toLlvmStruct(cls.getName());
-            // Skip if this class already has a struct definition (e.g., Object)
             if (structNames.containsKey(cls.getName())) continue;
 
             sb.append(structName).append(" = type { ");
@@ -207,10 +255,6 @@ public class LlvmGlobalEmitter {
 
     public static final int OBJECT_HEADER_SIZE = 8;
 
-    /**
-     * Determines whether the class is a system one (JDK or a library)
-     * for which vtables are not generated.
-     */
     private boolean isSystemClass(String name) {
         return name.startsWith("java/") || name.startsWith("javax/") || name.startsWith("sun/") ||
             name.startsWith("jdk/") || name.startsWith("org/objectweb/asm/") || name.startsWith("picocli/") ||
@@ -373,10 +417,6 @@ public class LlvmGlobalEmitter {
         return vtableNames.get(className);
     }
 
-    // ------------------------------------------------------------------
-    // --------------------- Reflection data support --------------------
-    // ------------------------------------------------------------------
-
     private String generateReflectionData() {
         if (reflectInfo == null || reflectInfo.getAllClasses().isEmpty()) {
             return "; No reflection data\n";
@@ -412,10 +452,9 @@ public class LlvmGlobalEmitter {
 
             int objectSize = OBJECT_HEADER_SIZE;
             for (FieldNode f : collectAllFields(classNode)) {
-                objectSize += sizeOfType(f.getType());
+                objectSize += getElementSizeOfType(f.getType());
             }
 
-            // --- Methods ---
             List<MethodReference> sortedMethods = new ArrayList<>(info.getMethods());
             sortedMethods.sort(Comparator.comparing(MethodReference::toString));
             List<String> methodPtrs = new ArrayList<>();
@@ -447,7 +486,6 @@ public class LlvmGlobalEmitter {
             String methodsArray = "@refmethods_" + cleanClassName;
             appendNullTerminatedPtrArray(sb, methodsArray, methodPtrs);
 
-            // --- Fields ---
             List<FieldReference> sortedFields = new ArrayList<>(info.getFields());
             sortedFields.sort(Comparator.comparing(FieldReference::toString));
             List<String> fieldPtrs = new ArrayList<>();
@@ -476,7 +514,6 @@ public class LlvmGlobalEmitter {
             String fieldsArray = "@reffields_" + cleanClassName;
             appendNullTerminatedPtrArray(sb, fieldsArray, fieldPtrs);
 
-            // --- Constructors ---
             List<MethodReference> sortedCtors = new ArrayList<>(info.getConstructors());
             sortedCtors.sort(Comparator.comparing(MethodReference::toString));
             List<String> ctorPtrs = new ArrayList<>();
@@ -506,7 +543,6 @@ public class LlvmGlobalEmitter {
             String ctorsArray = "@refctors_" + cleanClassName;
             appendNullTerminatedPtrArray(sb, ctorsArray, ctorPtrs);
 
-            // --- Superclass and interfaces ---
             String superClassPtr = "null";
             if (info.getSuperName() != null && !info.getSuperName().equals("java/lang/Object")) {
                 String superVar = classVarNames.get(info.getSuperName());
@@ -526,7 +562,6 @@ public class LlvmGlobalEmitter {
             }
             sb.append("%ReflectionClass* null]\n");
 
-            // --- The class itself ---
             sb.append(classVarName).append(" = constant %ReflectionClass { i8* ")
                 .append(ensureStringConstant(strConsts, className))
                 .append(", %ReflectionClass* ").append(superClassPtr)
@@ -575,7 +610,6 @@ public class LlvmGlobalEmitter {
         List<Type> paramTypes = TypeResolver.descToParamTypes(desc);
         Type retType = TypeResolver.descToReturnType(desc);
 
-        // Determine if method is static
         MethodNode mn = findMethod(resolver.getClassNode(className), methodName, desc);
         boolean isStatic = mn != null && mn.isStatic();
 
@@ -628,7 +662,6 @@ public class LlvmGlobalEmitter {
             argLoads.add(val);
         }
 
-        // Build LLVM call arguments, including their types.
         StringBuilder argsCsv = new StringBuilder();
         boolean firstArg = true;
 
@@ -660,7 +693,7 @@ public class LlvmGlobalEmitter {
                 sb.append("  %ret_ptr = bitcast ").append(retLlvm).append(" %result to i8*\n");
                 sb.append("  ret i8* %ret_ptr\n");
             } else {
-                sb.append("  %mem = call i8* @malloc(i64 ").append(sizeOfType(retType)).append(")\n");
+                sb.append("  %mem = call i8* @malloc(i64 ").append(getElementSizeOfType(retType)).append(")\n");
                 sb.append("  %cast = bitcast i8* %mem to ").append(retLlvm).append("*\n");
                 sb.append("  store ").append(retLlvm).append(" %result, ").append(retLlvm).append("* %cast\n");
                 sb.append("  ret i8* %mem\n");
@@ -699,7 +732,6 @@ public class LlvmGlobalEmitter {
             String val = "%arg" + i + "_val";
             sb.append("  ").append(addr).append(" = getelementptr i8*, i8** %args, i32 ").append(i).append("\n");
 
-            // Analogous correct load
             if (pt.isReference() || pt.isArray() || pt.isNull() || pt.isBlock()) {
                 sb.append("  ").append(val).append(" = load i8*, i8** ").append(addr).append("\n");
             } else {
@@ -710,7 +742,6 @@ public class LlvmGlobalEmitter {
             argLoads.add(val);
         }
 
-        // Build argument list: prepend %obj
         StringBuilder argsCsv = new StringBuilder();
         argsCsv.append("i8* %obj");
         for (String a : argLoads) {
@@ -722,14 +753,6 @@ public class LlvmGlobalEmitter {
         sb.append("  ret i8* %obj\n");
         sb.append("}\n\n");
         return sb.toString();
-    }
-
-    private int sizeOfType(Type type) {
-        if (type == Type.BOOLEAN || type == Type.BYTE) return 1;
-        if (type == Type.SHORT || type == Type.CHAR) return 2;
-        if (type == Type.INT || type == Type.FLOAT) return 4;
-        if (type == Type.LONG || type == Type.DOUBLE) return 8;
-        return 8;
     }
 
     private MethodNode findMethod(ClassNode classNode, String name, String descriptor) {

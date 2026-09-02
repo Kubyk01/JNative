@@ -1,4 +1,4 @@
-package io.github.kubyk01.domain.analyzer.ir;
+package io.github.kubyk01.domain.ir;
 
 import lombok.Getter;
 import lombok.Setter;
@@ -8,11 +8,11 @@ import java.util.List;
 
 @Setter
 @Getter
-public class ThrowTerminator extends Terminator {
-    private Value exception;
+public class ReturnTerminator extends Terminator {
+    private Value value;
 
-    public ThrowTerminator(Value exception) {
-        this.exception = exception;
+    public ReturnTerminator(Value value) {
+        this.value = value;
     }
 
     @Override
@@ -20,6 +20,7 @@ public class ThrowTerminator extends Terminator {
 
     @Override
     public String toString() {
-        return "THROW " + exception;
+        if (value == null) return "RETURN void";
+        return "RETURN " + value;
     }
 }

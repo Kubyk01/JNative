@@ -1,4 +1,4 @@
-package io.github.kubyk01.domain.analyzer.ir;
+package io.github.kubyk01.domain.ir;
 
 import lombok.Getter;
 import lombok.Setter;
@@ -8,13 +8,21 @@ import java.util.List;
 
 public class IrBuilder {
     @Getter
-    private final Module module = new Module();
+    private Module module;
     private Function currentFunction;
     @Setter
     private BasicBlock currentBlock;
     private final List<Temporary> temporaries = new ArrayList<>();
 
     public BasicBlock currentBlock() { return currentBlock; }
+
+    public IrBuilder() {
+        this.module = new Module();
+    }
+
+    public IrBuilder(Module module) {
+        this.module = module;
+    }
 
     public Function createFunction(String name, Type returnType, List<Type> paramTypes) {
         Function func = new Function(name, returnType);

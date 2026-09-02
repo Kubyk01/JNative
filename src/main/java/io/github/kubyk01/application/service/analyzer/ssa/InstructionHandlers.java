@@ -2,7 +2,13 @@ package io.github.kubyk01.application.service.analyzer.ssa;
 
 import io.github.kubyk01.application.service.analyzer.dependencyresolver.DependencyResolver;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.FieldNode;
-import io.github.kubyk01.domain.analyzer.ir.*;
+import io.github.kubyk01.domain.ir.Constant;
+import io.github.kubyk01.domain.ir.Instruction;
+import io.github.kubyk01.domain.ir.IrBuilder;
+import io.github.kubyk01.domain.ir.Opcode;
+import io.github.kubyk01.domain.ir.Temporary;
+import io.github.kubyk01.domain.ir.Type;
+import io.github.kubyk01.domain.ir.Value;
 import org.objectweb.asm.Opcodes;
 
 import java.util.ArrayList;

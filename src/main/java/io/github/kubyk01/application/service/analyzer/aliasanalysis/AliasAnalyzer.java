@@ -3,7 +3,7 @@ package io.github.kubyk01.application.service.analyzer.aliasanalysis;
 import io.github.kubyk01.domain.analyzer.aliasanalysis.AliasAnalysisResult;
 import io.github.kubyk01.domain.analyzer.aliasanalysis.FunctionSummary;
 import io.github.kubyk01.domain.analyzer.aliasanalysis.PointsToGraph;
-import io.github.kubyk01.domain.analyzer.ir.Module;
+import io.github.kubyk01.domain.ir.Module;
 
 import java.util.Map;
 

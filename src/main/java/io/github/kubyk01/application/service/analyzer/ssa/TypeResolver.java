@@ -1,6 +1,6 @@
 package io.github.kubyk01.application.service.analyzer.ssa;
 
-import io.github.kubyk01.domain.analyzer.ir.Type;
+import io.github.kubyk01.domain.ir.Type;
 
 import java.util.ArrayList;
 import java.util.List;

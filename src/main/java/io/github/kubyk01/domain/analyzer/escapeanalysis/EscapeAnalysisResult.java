@@ -1,7 +1,7 @@
 package io.github.kubyk01.domain.analyzer.escapeanalysis;
 
 import io.github.kubyk01.domain.analyzer.aliasanalysis.AllocationSite;
-import io.github.kubyk01.domain.analyzer.ir.Value;
+import io.github.kubyk01.domain.ir.Value;
 
 import java.util.HashMap;
 import java.util.Map;

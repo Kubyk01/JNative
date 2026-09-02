@@ -1,8 +1,8 @@
 package io.github.kubyk01.domain.analyzer.lifetime;
 
-import io.github.kubyk01.domain.analyzer.ir.BasicBlock;
-import io.github.kubyk01.domain.analyzer.ir.Instruction;
-import io.github.kubyk01.domain.analyzer.ir.Value;
+import io.github.kubyk01.domain.ir.BasicBlock;
+import io.github.kubyk01.domain.ir.Instruction;
+import io.github.kubyk01.domain.ir.Value;
 
 /**
  * Destructor insertion point.

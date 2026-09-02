@@ -6,6 +6,7 @@ import io.github.kubyk01.domain.analyzer.dependencyresolver.ClassNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.FieldNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.MethodNode;
 import io.github.kubyk01.domain.analyzer.reachability.ReachabilityMetadata;
+import io.github.kubyk01.domain.ir.Type;
 import lombok.Getter;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -165,7 +166,7 @@ public class DependencyResolver {
                         fields.add(FieldNode.builder()
                             .name(name)
                             .descriptor(descriptor)
-                            .type(io.github.kubyk01.domain.analyzer.ir.Type.fromDescriptor(descriptor))
+                            .type(Type.fromDescriptor(descriptor))
                             .access(access)
                             .build());
                         return null;
@@ -277,7 +278,7 @@ public class DependencyResolver {
                     fields.add(FieldNode.builder()
                         .name(name)
                         .descriptor(descriptor)
-                        .type(io.github.kubyk01.domain.analyzer.ir.Type.fromDescriptor(descriptor))
+                        .type(Type.fromDescriptor(descriptor))
                         .access(access)
                         .build());
                     return null;

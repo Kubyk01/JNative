@@ -1,7 +1,7 @@
 package io.github.kubyk01.application.service.analyzer.ssa;
 
-import io.github.kubyk01.domain.analyzer.ir.BasicBlock;
-import io.github.kubyk01.domain.analyzer.ir.Function;
+import io.github.kubyk01.domain.ir.BasicBlock;
+import io.github.kubyk01.domain.ir.Function;
 
 import java.util.*;
 

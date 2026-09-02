@@ -1,9 +1,9 @@
 package io.github.kubyk01.domain.analyzer.aliasanalysis;
 
-import io.github.kubyk01.domain.analyzer.ir.Constant;
-import io.github.kubyk01.domain.analyzer.ir.Instruction;
-import io.github.kubyk01.domain.analyzer.ir.Opcode;
-import io.github.kubyk01.domain.analyzer.ir.Type;
+import io.github.kubyk01.domain.ir.Constant;
+import io.github.kubyk01.domain.ir.Instruction;
+import io.github.kubyk01.domain.ir.Opcode;
+import io.github.kubyk01.domain.ir.Type;
 import lombok.Value;
 
 @Value

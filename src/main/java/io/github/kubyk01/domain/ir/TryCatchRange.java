@@ -1,4 +1,4 @@
-package io.github.kubyk01.domain.analyzer.ir;
+package io.github.kubyk01.domain.ir;
 
 import org.objectweb.asm.Label;
 

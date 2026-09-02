@@ -201,11 +201,7 @@ public class ReachabilityAnalysis {
         MethodBytecodeVisitor visitor = new MethodBytecodeVisitor(
             resolver,
             reachableClasses,
-            reachableMethods,
-            worklist,
-            callGraph,
             reflectInfo,
-            userReachableMethods,
             this,
             currentMethod,
             reachableFromUser,

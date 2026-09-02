@@ -1,14 +1,39 @@
-/* path: src/main/java/io/github/kubyk01/application/service/codegen/llvm/LlvmFunctionEmitter.java */
-
 package io.github.kubyk01.application.service.codegen.llvm;
 
 import io.github.kubyk01.application.service.analyzer.ssa.GraphUtils;
-import io.github.kubyk01.domain.analyzer.ir.*;
-import io.github.kubyk01.domain.analyzer.ir.Module;
+import io.github.kubyk01.application.service.analyzer.ssa.TypeResolver;
+import io.github.kubyk01.domain.ir.BasicBlock;
+import io.github.kubyk01.domain.ir.BranchTerminator;
+import io.github.kubyk01.domain.ir.CondBranchTerminator;
+import io.github.kubyk01.domain.ir.Constant;
+import io.github.kubyk01.domain.ir.Function;
+import io.github.kubyk01.domain.ir.IndirectBranchTerminator;
+import io.github.kubyk01.domain.ir.Instruction;
+import io.github.kubyk01.domain.ir.InvokeDynamicInfo;
+import io.github.kubyk01.domain.ir.LookupSwitchTerminator;
+import io.github.kubyk01.domain.ir.Module;
+import io.github.kubyk01.domain.ir.Opcode;
+import io.github.kubyk01.domain.ir.Parameter;
+import io.github.kubyk01.domain.ir.ResolvedCall;
+import io.github.kubyk01.domain.ir.ReturnTerminator;
+import io.github.kubyk01.domain.ir.TableSwitchTerminator;
+import io.github.kubyk01.domain.ir.Terminator;
+import io.github.kubyk01.domain.ir.ThrowTerminator;
+import io.github.kubyk01.domain.ir.TryCatchRange;
+import io.github.kubyk01.domain.ir.Type;
+import io.github.kubyk01.domain.ir.Value;
 import lombok.RequiredArgsConstructor;
 
 import java.util.*;
 import java.util.function.Consumer;
+
+import static io.github.kubyk01.util.LlvmUtil.extractCalleeName;
+import static io.github.kubyk01.util.LlvmUtil.extractClassName;
+import static io.github.kubyk01.util.LlvmUtil.extractFieldName;
+import static io.github.kubyk01.util.LlvmUtil.extractTypeName;
+import static io.github.kubyk01.util.LlvmUtil.getCallArguments;
+import static io.github.kubyk01.util.LlvmUtil.inferLocalType;
+import static io.github.kubyk01.util.LlvmUtil.getElementSizeOfType;
 
 @RequiredArgsConstructor
 public class LlvmFunctionEmitter {
@@ -216,19 +241,6 @@ public class LlvmFunctionEmitter {
         sb.append(throwBlk).append(":\n");
         emitThrowHelper(sb, "@__jnative_throw_array_index_out_of_bounds", ranges);
         sb.append(cont).append(":\n");
-    }
-
-    private int getElementSize(Type elemType) {
-        if (elemType.isPrimitive()) {
-            if (elemType == Type.BOOLEAN || elemType == Type.BYTE) return 1;
-            if (elemType == Type.SHORT || elemType == Type.CHAR) return 2;
-            if (elemType == Type.INT || elemType == Type.FLOAT) return 4;
-            if (elemType == Type.LONG || elemType == Type.DOUBLE) return 8;
-        }
-        if (elemType.isReference() || elemType.isArray()) {
-            return 8;
-        }
-        return 8;
     }
 
     private int getBaseElementSize(String desc) {
@@ -527,10 +539,13 @@ public class LlvmFunctionEmitter {
                     int parenIdx = sig.indexOf('(');
                     String mName = parenIdx > 0 ? sig.substring(0, parenIdx) : sig;
                     String mDesc = parenIdx > 0 ? sig.substring(parenIdx) : "";
+
+                    ensureFunctionDeclared(owner, mName, mDesc);
+
                     String funcName = LlvmRuntime.mangleMethod(owner, mName, mDesc);
                     StringBuilder argList = new StringBuilder();
                     for (int i = 0; i < operands.size(); i++) {
-                        if (i == 1) continue;
+                        if (i == 1) continue; // skip the callee constant
                         if (!argList.isEmpty()) argList.append(", ");
                         argList.append(typeMapper.toLlvmType(operands.get(i).getType()))
                             .append(" ").append(getLlvmValue(operands.get(i)));
@@ -575,23 +590,34 @@ public class LlvmFunctionEmitter {
             case CALL: {
                 String calleeName = extractCalleeName(inst);
                 if (calleeName == null) break;
+
                 Function calleeFunc = module.getFunction(calleeName);
                 String mangledCallee;
                 if (calleeFunc != null) {
-                    String funcName = calleeFunc.getName();
-                    if (funcName.startsWith("__jnative_") || funcName.startsWith("__destruct_")) {
-                        mangledCallee = funcName;
-                    } else {
-                        mangledCallee = LlvmRuntime.mangleFunction(funcName);
-                    }
+                    // Function already exists in the module — use its name directly
+                    mangledCallee = calleeFunc.getName();
                 } else {
+                    // Try to find a native implementation (with __jnative_ prefix)
                     String nativeCandidate = "__jnative_" + LlvmRuntime.mangleCallable(calleeName);
                     if (module.getFunction(nativeCandidate) != null) {
                         mangledCallee = nativeCandidate;
                     } else {
+                        // Ensure the function is declared before calling it
+                        int dotIdx = calleeName.lastIndexOf('.');
+                        int parenIdx = calleeName.indexOf('(');
+                        if (dotIdx > 0 && parenIdx > dotIdx) {
+                            String owner = calleeName.substring(0, dotIdx);
+                            String methodPart = calleeName.substring(dotIdx + 1);
+                            int localParenIdx = parenIdx - dotIdx - 1;
+                            String methodName = methodPart.substring(0, localParenIdx);
+                            String descriptor = methodPart.substring(localParenIdx);
+                            ensureFunctionDeclared(owner, methodName, descriptor);
+                        }
+                        // Perform standard mangling
                         mangledCallee = LlvmRuntime.mangleCallable(calleeName);
                     }
                 }
+
                 List<Value> args = getCallArguments(inst);
                 StringBuilder argList = new StringBuilder();
                 for (int i = 0; i < args.size(); i++) {
@@ -603,12 +629,14 @@ public class LlvmFunctionEmitter {
                 emitCall(sb, retType, resultName, "@" + mangledCallee, argList.toString(), ranges);
                 break;
             }
+
             case SPECIAL_CALL: {
                 if (inst.getOperands().size() < 2) break;
                 Value receiver = inst.getOperands().get(0);
                 Value calleeConst = inst.getOperands().get(1);
                 if (!(calleeConst instanceof Constant)) break;
                 String calleeName = ((Constant) calleeConst).getValue().toString();
+
                 Function calleeFunc = module.getFunction(calleeName);
                 String mangledCallee;
                 if (calleeFunc != null) {
@@ -621,9 +649,21 @@ public class LlvmFunctionEmitter {
                     if (module.getFunction(nativeCandidate) != null) {
                         mangledCallee = nativeCandidate;
                     } else {
+                        // Ensure the function is declared
+                        int dotIdx = calleeName.lastIndexOf('.');
+                        int parenIdx = calleeName.indexOf('(');
+                        if (dotIdx > 0 && parenIdx > dotIdx) {
+                            String owner = calleeName.substring(0, dotIdx);
+                            String methodPart = calleeName.substring(dotIdx + 1);
+                            int localParenIdx = parenIdx - dotIdx - 1;
+                            String methodName = methodPart.substring(0, localParenIdx);
+                            String descriptor = methodPart.substring(localParenIdx);
+                            ensureFunctionDeclared(owner, methodName, descriptor);
+                        }
                         mangledCallee = LlvmRuntime.mangleCallable(calleeName);
                     }
                 }
+
                 List<Value> args = new ArrayList<>();
                 args.add(receiver);
                 for (int i = 2; i < inst.getOperands().size(); i++) {
@@ -670,7 +710,7 @@ public class LlvmFunctionEmitter {
                 Value elemTypeConst = inst.getOperands().get(1);
                 if (!(elemTypeConst instanceof Constant)) break;
                 Type elemType = elemTypeFromConst(((Constant) elemTypeConst).getValue().toString());
-                int elemSize = getElementSize(elemType);
+                int elemSize = getElementSizeOfType(elemType);
                 String sizeRef = getLlvmValue(sizeVal);
                 String totalSize = newAux("total_size");
                 sb.append("  ").append(totalSize).append(" = mul i32 ")
@@ -838,7 +878,7 @@ public class LlvmFunctionEmitter {
                 emitNullCheck(sb, arr, ranges);
                 emitBoundsCheck(sb, arr, idxI32, ranges);
                 Type elemType = inst.getResult().getType();
-                int elemSize = getElementSize(elemType);
+                int elemSize = getElementSizeOfType(elemType);
                 String offset = newAux("offset");
                 sb.append("  ").append(offset).append(" = mul i32 ")
                     .append(idxI32).append(", ").append(elemSize).append("\n");
@@ -871,7 +911,7 @@ public class LlvmFunctionEmitter {
                 emitNullCheck(sb, arr, ranges);
                 emitBoundsCheck(sb, arr, idxI32, ranges);
                 Type elemType = val.getType();
-                int elemSize = getElementSize(elemType);
+                int elemSize = getElementSizeOfType(elemType);
                 String offset = newAux("offset");
                 sb.append("  ").append(offset).append(" = mul i32 ")
                     .append(idxI32).append(", ").append(elemSize).append("\n");
@@ -908,10 +948,106 @@ public class LlvmFunctionEmitter {
                 break;
             }
 
+            case INVOKEDYNAMIC: {
+                InvokeDynamicInfo dynInfo = (InvokeDynamicInfo) inst.getInvokedynamicData();
+                ResolvedCall call = dynInfo.resolvedCall();
+                if (call == null) {
+                    sb.append("  ; unresolved invokedynamic\n");
+                    // If the result is unused - do nothing,
+                    // otherwise map it to null (valid LLVM constant)
+                    if (inst.getResult() != null) {
+                        valueMapper.setValue(inst.getResult(), "null");
+                    }
+                    break;
+                }
+                switch (call.getType()) {
+                    case LAMBDA:
+                        emitLambdaCreation(sb, inst, call, resultName);
+                        break;
+                    case CONCAT:
+                        emitConcatCall(sb, inst, resultName);
+                        break;
+                    default:
+                        sb.append("  ; unsupported invokedynamic type: ").append(call.getType()).append("\n");
+                        if (inst.getResult() != null) {
+                            valueMapper.setValue(inst.getResult(), "null");
+                        }
+                        break;
+                }
+                break;
+            }
+
             default:
                 sb.append("  ; unsupported opcode: ").append(op).append("\n");
         }
         return sb.toString();
+    }
+
+    // ----- Lambda / invokedynamic helpers -----
+
+    private void emitLambdaCreation(StringBuilder sb, Instruction inst, ResolvedCall call, String resultName) {
+        String lambdaId = call.getLambdaStructName();
+        List<Value> captured = inst.getOperands();
+        List<Type> capturedTypes = call.getCapturedTypes();
+
+        String structName = globalEmitter.registerLambdaStruct(lambdaId, capturedTypes);
+        String adaptorName = "adaptor_" + lambdaId;
+        String vtableName = globalEmitter.registerLambdaVtable(lambdaId, adaptorName);
+
+        // Memory allocation
+        String allocSize = newAux("lambda_alloc_size");
+        sb.append("  ").append(allocSize).append(" = call i64 @llvm.objectsize.i64.p0i8(i8* null, i1 true)\n");
+        String alloc = newAux("lambda_alloc");
+        sb.append("  ").append(alloc).append(" = call i8* @malloc(i64 ").append(allocSize).append(")\n");
+
+        String objPtr;
+        // If the result is unused, still create the object (but it may be optimized)
+        objPtr = Objects.requireNonNullElseGet(resultName, () -> newAux("lambda_obj"));
+        sb.append("  ").append(objPtr).append(" = bitcast i8* ").append(alloc)
+            .append(" to ").append(structName).append("*\n");
+
+        // Set vtable (first field)
+        String vtablePtr = newAux("vtable_ptr");
+        sb.append("  ").append(vtablePtr).append(" = bitcast [1 x i8*]* ").append(vtableName).append(" to i8*\n");
+        String objVtable = newAux("obj_vtable_slot");
+        sb.append("  ").append(objVtable).append(" = bitcast ").append(structName)
+            .append("* ").append(objPtr).append(" to i8**\n");
+        sb.append("  store i8* ").append(vtablePtr).append(", i8** ").append(objVtable).append("\n");
+
+        // Fill captured fields (offset 8 - after vtable)
+        int offset = 8;
+        for (Value cap : captured) {
+            String fieldLlvm = typeMapper.toLlvmType(cap.getType());
+            String fieldPtr = newAux("cap_ptr");
+            sb.append("  ").append(fieldPtr).append(" = getelementptr i8, i8* ").append(alloc)
+                .append(", i64 ").append(offset).append("\n");
+            String castPtr = newAux("cap_cast");
+            sb.append("  ").append(castPtr).append(" = bitcast i8* ").append(fieldPtr)
+                .append(" to ").append(fieldLlvm).append("*\n");
+            sb.append("  store ").append(fieldLlvm).append(" ").append(getLlvmValue(cap))
+                .append(", ").append(fieldLlvm).append("* ").append(castPtr).append("\n");
+            offset += getElementSizeOfType(cap.getType());
+        }
+
+        if (inst.getResult() != null && resultName != null) {
+            valueMapper.setValue(inst.getResult(), objPtr);
+        }
+    }
+
+    private void emitConcatCall(StringBuilder sb, Instruction inst, String resultName) {
+        List<Value> args = inst.getOperands();
+        sb.append("  %concat_result = call i8* @__jnative_concat_strings(i32 ").append(args.size());
+        for (Value arg : args) {
+            sb.append(", ").append(typeMapper.toLlvmType(arg.getType()))
+                .append(" ").append(getLlvmValue(arg));
+        }
+        sb.append(")\n");
+        if (inst.getResult() != null && resultName != null) {
+            String casted = newAux("concat_cast");
+            sb.append("  ").append(casted).append(" = bitcast i8* %concat_result to ")
+                .append(typeMapper.toLlvmType(inst.getResult().getType())).append("\n");
+            valueMapper.setValue(inst.getResult(), casted);
+        }
     }
 
     private void emitCall(StringBuilder sb, Type retType, String resultName,
@@ -1248,57 +1384,6 @@ public class LlvmFunctionEmitter {
         return 0;
     }
 
-    private String extractFieldName(Instruction inst) {
-        int fieldIdx = (inst.getOpcode() == Opcode.GET_STATIC || inst.getOpcode() == Opcode.PUT_STATIC) ? 0 : 1;
-        if (inst.getOperands().size() > fieldIdx) {
-            Value v = inst.getOperands().get(fieldIdx);
-            if (v instanceof Constant c && c.getType().isReference()) {
-                return c.getValue().toString();
-            }
-        }
-        return "unknown";
-    }
-
-    private String extractCalleeName(Instruction inst) {
-        if (!inst.getOperands().isEmpty()) {
-            Value v = inst.getOperands().getFirst();
-            if (v instanceof Constant c && c.getType().isReference()) {
-                return c.getValue().toString();
-            }
-        }
-        return null;
-    }
-
-    private String extractTypeName(Instruction inst) {
-        for (Value v : inst.getOperands()) {
-            if (v instanceof Constant c && c.getType().isReference()) {
-                return c.getValue().toString();
-            }
-        }
-        return "java/lang/Object";
-    }
-
-    private String extractClassName(Value v) {
-        if (v.getType().isReference()) {
-            return v.getType().getClassName();
-        } else if (v.getType().isArray()) {
-            Type elem = v.getType().getElementType();
-            if (elem.isReference()) return elem.getClassName();
-            else return "java/lang/Object";
-        }
-        return "java/lang/Object";
-    }
-
-    private List<Value> getCallArguments(Instruction inst) {
-        List<Value> args = new ArrayList<>();
-        boolean skipFirst = true;
-        for (Value op : inst.getOperands()) {
-            if (skipFirst) { skipFirst = false; continue; }
-            args.add(op);
-        }
-        return args;
-    }
-
     private String getDefaultValue(Type type) {
         if (type.isReference() || type.isArray() || type.isNull() || type.isBlock()) {
             return "null";
@@ -1421,19 +1506,28 @@ public class LlvmFunctionEmitter {
         return castName;
     }
 
-    private Type inferLocalType(Function func, int idx) {
-        for (Parameter p : func.getParameters()) {
-            if (p.getIndex() == idx) return p.getType();
+    private void ensureFunctionDeclared(String owner, String methodName, String descriptor) {
+        // Build the full callable name as it appears in the IR constant
+        String fullName = owner + "." + methodName + descriptor;
+        // Use the same mangling as the call site (fallback path)
+        String mangled = LlvmRuntime.mangleMethod(owner, methodName, descriptor);
+        if (module.getFunction(mangled) != null) {
+            return; // already declared
         }
-        for (BasicBlock block : func.getBlocks()) {
-            for (Instruction inst : block.getInstructions()) {
-                if (inst.getOpcode() == Opcode.STORE && inst.getLocalIndex() == idx) {
-                    if (!inst.getOperands().isEmpty()) {
-                        return inst.getOperands().getFirst().getType();
-                    }
-                }
-            }
+
+        Type retType = TypeResolver.descToReturnType(descriptor);
+        List<Type> paramTypes = TypeResolver.descToParamTypes(descriptor);
+
+        // For non-static methods, the first parameter is the receiver (this)
+        List<Type> allParams = new ArrayList<>();
+        allParams.add(Type.reference(owner));
+        allParams.addAll(paramTypes);
+
+        Function func = new Function(mangled, retType);
+        for (int i = 0; i < allParams.size(); i++) {
+            func.addParameter(new Parameter(allParams.get(i), i));
         }
-        return Type.UNKNOWN;
+        // Adding a function without an entry block creates an external declaration
+        module.addFunction(func);
     }
 }

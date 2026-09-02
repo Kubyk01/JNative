@@ -315,3 +315,32 @@ void* __jnative_new_instance(struct ReflectionConstructor* ctor, void** args) {
     adaptor_t adaptor = (adaptor_t)ctor->adaptor;
     return adaptor(args);
 }
+
+// ---------------------------------------------------------------------------
+// String concatenation for invokedynamic (StringConcatFactory)
+// ---------------------------------------------------------------------------
+
+#include <stdarg.h>
+
+void* __jnative_concat_strings(int count, ...) {
+    va_list args;
+    va_start(args, count);
+    size_t total_len = 1; /* trailing NUL */
+    for (int i = 0; i < count; i++) {
+        char* s = va_arg(args, char*);
+        if (s) total_len += strlen(s);
+    }
+    va_end(args);
+
+    char* result = malloc(total_len);
+    if (!result) return NULL;
+    result[0] = '\0';
+
+    va_start(args, count);
+    for (int i = 0; i < count; i++) {
+        char* s = va_arg(args, char*);
+        if (s) strcat(result, s);
+    }
+    va_end(args);
+    return result;
+}

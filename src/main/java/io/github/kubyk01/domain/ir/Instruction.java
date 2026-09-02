@@ -1,4 +1,4 @@
-package io.github.kubyk01.domain.analyzer.ir;
+package io.github.kubyk01.domain.ir;
 
 import lombok.Getter;
 import lombok.Setter;
@@ -17,6 +17,8 @@ public class Instruction {
     private BasicBlock parent;
     @Setter
     private int localIndex = -1;
+    @Setter
+    private Object invokedynamicData;
 
     public Instruction(Opcode opcode) {
         this.opcode = opcode;

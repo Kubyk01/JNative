@@ -1,6 +1,6 @@
 package io.github.kubyk01.domain.analyzer.dependencyresolver;
 
-import io.github.kubyk01.domain.analyzer.ir.Type;
+import io.github.kubyk01.domain.ir.Type;
 import lombok.Builder;
 import lombok.Data;
 

@@ -8,10 +8,21 @@ import io.github.kubyk01.domain.analyzer.aliasanalysis.PointsToGraph;
 import io.github.kubyk01.domain.analyzer.aliasanalysis.PointsToSet;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.ClassNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.FieldNode;
-import io.github.kubyk01.domain.analyzer.ir.*;
-import io.github.kubyk01.domain.analyzer.ir.Module;
+import io.github.kubyk01.domain.ir.BasicBlock;
+import io.github.kubyk01.domain.ir.BranchTerminator;
+import io.github.kubyk01.domain.ir.CondBranchTerminator;
+import io.github.kubyk01.domain.ir.Constant;
+import io.github.kubyk01.domain.ir.Function;
+import io.github.kubyk01.domain.ir.Instruction;
+import io.github.kubyk01.domain.ir.Module;
 import io.github.kubyk01.domain.analyzer.lifetime.DestructionPoint;
 import io.github.kubyk01.domain.analyzer.lifetime.LifetimeAnalysisResult;
+import io.github.kubyk01.domain.ir.Opcode;
+import io.github.kubyk01.domain.ir.Parameter;
+import io.github.kubyk01.domain.ir.ReturnTerminator;
+import io.github.kubyk01.domain.ir.Temporary;
+import io.github.kubyk01.domain.ir.Type;
+import io.github.kubyk01.domain.ir.Value;
 import lombok.Getter;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -400,7 +411,6 @@ public class DestructorInserter {
         }
 
         // Get array length
-        String lenTmp = "len";
         Instruction lenInst = new Instruction(Opcode.ARRAYLENGTH);
         lenInst.addOperand(arrParam);
         Temporary lenVal = new Temporary(Type.INT);

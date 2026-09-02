@@ -1,4 +1,4 @@
-package io.github.kubyk01.domain.analyzer.ir;
+package io.github.kubyk01.domain.ir;
 
 public enum Opcode {
     ADD, SUB, MUL, DIV, REM,
@@ -20,5 +20,6 @@ public enum Opcode {
     ALOAD, ASTORE,
     JSR, INDIRECT_BRANCH,
     NOP,
-    PHI
+    PHI,
+    INVOKEDYNAMIC
 }

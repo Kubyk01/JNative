@@ -9,39 +9,42 @@ import io.github.kubyk01.domain.analyzer.dependencyresolver.MethodReference;
 import io.github.kubyk01.domain.analyzer.reachability.TypedValue;
 import io.github.kubyk01.domain.analyzer.reflection.ReflectClassInfo;
 import io.github.kubyk01.domain.analyzer.reflection.ReflectInfo;
+import io.github.kubyk01.domain.ir.Type;
 import lombok.extern.slf4j.Slf4j;
 import org.objectweb.asm.*;
 
 import java.util.*;
 
-import static io.github.kubyk01.domain.analyzer.ir.Type.*;
+import static io.github.kubyk01.domain.ir.Type.BOOLEAN;
+import static io.github.kubyk01.domain.ir.Type.BYTE;
+import static io.github.kubyk01.domain.ir.Type.CHAR;
+import static io.github.kubyk01.domain.ir.Type.DOUBLE;
+import static io.github.kubyk01.domain.ir.Type.FLOAT;
+import static io.github.kubyk01.domain.ir.Type.INT;
+import static io.github.kubyk01.domain.ir.Type.LONG;
+import static io.github.kubyk01.domain.ir.Type.SHORT;
+import static io.github.kubyk01.domain.ir.Type.UNKNOWN;
+import static io.github.kubyk01.domain.ir.Type.array;
+import static io.github.kubyk01.domain.ir.Type.fromDescriptor;
+import static io.github.kubyk01.domain.ir.Type.reference;
 
 @Slf4j
 public class MethodBytecodeVisitor extends ClassVisitor {
 
     private final DependencyResolver resolver;
     private final Set<String> reachableClasses;
-    private final Set<MethodReference> reachableMethods;
-    private final Deque<MethodReference> worklist;
-    private final Map<MethodReference, Set<MethodReference>> callGraph;
     private final ReflectInfo reflectInfo;
-    private final Set<MethodReference> userReachableMethods;
     private final ReachabilityAnalysis analysis;
 
     private final MethodReference currentMethod;
     private final boolean reachableFromUser;
     private final MethodReference caller;
 
-    private final Set<String> instantiatedClasses = new HashSet<>();
     private String lastLoadedClass = null;
 
     public MethodBytecodeVisitor(DependencyResolver resolver,
                                  Set<String> reachableClasses,
-                                 Set<MethodReference> reachableMethods,
-                                 Deque<MethodReference> worklist,
-                                 Map<MethodReference, Set<MethodReference>> callGraph,
                                  ReflectInfo reflectInfo,
-                                 Set<MethodReference> userReachableMethods,
                                  ReachabilityAnalysis analysis,
                                  MethodReference currentMethod,
                                  boolean reachableFromUser,
@@ -49,11 +52,7 @@ public class MethodBytecodeVisitor extends ClassVisitor {
         super(Opcodes.ASM9);
         this.resolver = resolver;
         this.reachableClasses = reachableClasses;
-        this.reachableMethods = reachableMethods;
-        this.worklist = worklist;
-        this.callGraph = callGraph;
         this.reflectInfo = reflectInfo;
-        this.userReachableMethods = userReachableMethods;
         this.analysis = analysis;
         this.currentMethod = currentMethod;
         this.reachableFromUser = reachableFromUser;
@@ -145,13 +144,13 @@ public class MethodBytecodeVisitor extends ClassVisitor {
                 int argCount = countArguments(mDesc);
                 List<TypedValue> args = new ArrayList<>();
                 for (int i = 0; i < argCount; i++) {
-                    args.add(0, simulator.pop()); // reverse order
+                    args.addFirst(simulator.pop()); // reverse order
                 }
                 if (opcode != Opcodes.INVOKESTATIC) {
                     simulator.pop(); // receiver
                 }
                 handleReflectiveCall(owner, mName, mDesc, args);
-                io.github.kubyk01.domain.analyzer.ir.Type retType = TypeResolver.descToReturnType(mDesc);
+                Type retType = TypeResolver.descToReturnType(mDesc);
                 if (!retType.isVoid()) {
                     simulator.push(TypedValue.fromType(retType));
                 }
@@ -164,12 +163,7 @@ public class MethodBytecodeVisitor extends ClassVisitor {
                     if (receiverType != null && isConcreteClass(receiverType)) {
                         candidateTypes.add(receiverType);
                     } else {
-                        Set<String> subclasses = new HashSet<>();
-                        if (receiverType != null) {
-                            subclasses.addAll(resolver.getSubclasses(receiverType));
-                        } else {
-                            subclasses.addAll(resolver.getSubclasses(owner));
-                        }
+                        Set<String> subclasses = new HashSet<>(resolver.getSubclasses(Objects.requireNonNullElse(receiverType, owner)));
                         if (subclasses.isEmpty()) {
                             subclasses.add(owner);
                         }
@@ -284,7 +278,7 @@ public class MethodBytecodeVisitor extends ClassVisitor {
             if (owner.equals("java/lang/Class") && mName.equals("forName")
                 && mDesc.equals("(Ljava/lang/String;)Ljava/lang/Class;")) {
                 if (!args.isEmpty()) {
-                    TypedValue arg = args.get(0);
+                    TypedValue arg = args.getFirst();
                     if (arg.isConstant() && arg.getValue() instanceof String) {
                         String className = ((String) arg.getValue()).replace('.', '/');
                         addClassWithInit(className);
@@ -296,7 +290,7 @@ public class MethodBytecodeVisitor extends ClassVisitor {
             if (owner.equals("java/lang/ClassLoader") && mName.equals("loadClass")
                 && mDesc.equals("(Ljava/lang/String;)Ljava/lang/Class;")) {
                 if (!args.isEmpty()) {
-                    TypedValue arg = args.get(0);
+                    TypedValue arg = args.getFirst();
                     if (arg.isConstant() && arg.getValue() instanceof String) {
                         String className = ((String) arg.getValue()).replace('.', '/');
                         addClassWithInit(className);
@@ -307,10 +301,9 @@ public class MethodBytecodeVisitor extends ClassVisitor {
             }
             if (owner.equals("java/lang/Class") && (mName.equals("getMethod") || mName.equals("getDeclaredMethod"))
                 && mDesc.startsWith("(Ljava/lang/String;")) {
-                if (args.size() < 1) return;
-                TypedValue nameArg = args.get(0);
-                if (!nameArg.isConstant() || !(nameArg.getValue() instanceof String)) return;
-                String methodName = (String) nameArg.getValue();
+                if (args.isEmpty()) return;
+                TypedValue nameArg = args.getFirst();
+                if (!nameArg.isConstant() || !(nameArg.getValue() instanceof String methodName)) return;
                 List<String> paramClassNames = new ArrayList<>();
                 for (int i = 1; i < args.size(); i++) {
                     TypedValue param = args.get(i);
@@ -329,11 +322,11 @@ public class MethodBytecodeVisitor extends ClassVisitor {
                 if (cn == null || cn.isExternal()) return;
                 for (MethodNode mn : cn.getMethods()) {
                     if (mn.getName().equals(methodName) && !mn.getName().equals("<init>")) {
-                        List<io.github.kubyk01.domain.analyzer.ir.Type> paramTypes = mn.getParameterTypes();
+                        List<Type> paramTypes = mn.getParameterTypes();
                         if (paramTypes.size() == paramClassNames.size()) {
                             boolean match = true;
                             for (int i = 0; i < paramTypes.size(); i++) {
-                                io.github.kubyk01.domain.analyzer.ir.Type pt = paramTypes.get(i);
+                                Type pt = paramTypes.get(i);
                                 String expected = paramClassNames.get(i);
                                 if (!typeMatches(expected, pt)) {
                                     match = false;
@@ -353,9 +346,8 @@ public class MethodBytecodeVisitor extends ClassVisitor {
             if (owner.equals("java/lang/Class") && (mName.equals("getField") || mName.equals("getDeclaredField"))
                 && mDesc.startsWith("(Ljava/lang/String;)")) {
                 if (!args.isEmpty()) {
-                    TypedValue arg = args.get(0);
-                    if (arg.isConstant() && arg.getValue() instanceof String) {
-                        String fieldName = (String) arg.getValue();
+                    TypedValue arg = args.getFirst();
+                    if (arg.isConstant() && arg.getValue() instanceof String fieldName) {
                         if (lastLoadedClass != null) {
                             String targetClass = lastLoadedClass;
                             FieldReference ref = new FieldReference(targetClass, fieldName, null);
@@ -403,13 +395,12 @@ public class MethodBytecodeVisitor extends ClassVisitor {
                         }
                     }
                 }
-                return;
             }
         }
 
-        private boolean typeMatches(String expected, io.github.kubyk01.domain.analyzer.ir.Type actual) {
-            io.github.kubyk01.domain.analyzer.ir.Type expectedType =
-                io.github.kubyk01.domain.analyzer.ir.Type.fromDescriptor(
+        private boolean typeMatches(String expected, Type actual) {
+            Type expectedType =
+                fromDescriptor(
                     expected.startsWith("[") ? expected : "L" + expected + ";"
                 );
             return expectedType.equals(actual);
@@ -546,7 +537,7 @@ public class MethodBytecodeVisitor extends ClassVisitor {
                 case Opcodes.AALOAD: {
                     pop(); // index
                     TypedValue arrayTv = pop();
-                    io.github.kubyk01.domain.analyzer.ir.Type elemType =
+                    Type elemType =
                         arrayTv.getType().isArray() ? arrayTv.getType().getElementType() : UNKNOWN;
                     push(TypedValue.fromType(elemType));
                     break;
@@ -565,7 +556,7 @@ public class MethodBytecodeVisitor extends ClassVisitor {
                 push(TypedValue.INT);
             } else if (opcode == Opcodes.NEWARRAY) {
                 pop();
-                io.github.kubyk01.domain.analyzer.ir.Type elemType = primitiveArrayType(operand);
+                Type elemType = primitiveArrayType(operand);
                 push(TypedValue.fromType(array(elemType)));
             }
         }
@@ -609,7 +600,7 @@ public class MethodBytecodeVisitor extends ClassVisitor {
         }
 
         void visitFieldInsn(int opcode, String descriptor) {
-            io.github.kubyk01.domain.analyzer.ir.Type fieldType = fromDescriptor(descriptor);
+            Type fieldType = fromDescriptor(descriptor);
             switch (opcode) {
                 case Opcodes.GETFIELD:
                     pop();
@@ -630,7 +621,7 @@ public class MethodBytecodeVisitor extends ClassVisitor {
 
         void visitMethodInsn(int opcode, String desc) {
             int argCount = countArguments(desc);
-            io.github.kubyk01.domain.analyzer.ir.Type retType = fromDescriptor(desc.substring(desc.lastIndexOf(')') + 1));
+            Type retType = fromDescriptor(desc.substring(desc.lastIndexOf(')') + 1));
 
             for (int i = 0; i < argCount; i++) {
                 pop();
@@ -645,24 +636,20 @@ public class MethodBytecodeVisitor extends ClassVisitor {
         }
 
         void visitLdcInsn(Object value) {
-            if (value instanceof Integer) {
-                push(TypedValue.fromConstant(io.github.kubyk01.domain.analyzer.ir.Type.INT, value));
-            } else if (value instanceof Long) {
-                push(TypedValue.fromConstant(io.github.kubyk01.domain.analyzer.ir.Type.LONG, value));
-            } else if (value instanceof Float) {
-                push(TypedValue.fromConstant(io.github.kubyk01.domain.analyzer.ir.Type.FLOAT, value));
-            } else if (value instanceof Double) {
-                push(TypedValue.fromConstant(io.github.kubyk01.domain.analyzer.ir.Type.DOUBLE, value));
-            } else if (value instanceof String) {
-                push(TypedValue.fromConstant(io.github.kubyk01.domain.analyzer.ir.Type.reference("java/lang/String"), value));
-            } else if (value instanceof org.objectweb.asm.Type asmType) {
-                if (asmType.getSort() == org.objectweb.asm.Type.OBJECT) {
-                    push(TypedValue.fromConstant(io.github.kubyk01.domain.analyzer.ir.Type.reference(asmType.getInternalName()), asmType.getInternalName()));
-                } else {
-                    push(TypedValue.fromConstant(io.github.kubyk01.domain.analyzer.ir.Type.fromDescriptor(asmType.getDescriptor()), asmType.getDescriptor()));
+            switch (value) {
+                case Integer ignored1 -> push(TypedValue.fromConstant(INT, value));
+                case Long ignored -> push(TypedValue.fromConstant(LONG, value));
+                case Float ignored -> push(TypedValue.fromConstant(FLOAT, value));
+                case Double ignored -> push(TypedValue.fromConstant(DOUBLE, value));
+                case String ignored -> push(TypedValue.fromConstant(reference("java/lang/String"), value));
+                case org.objectweb.asm.Type asmType -> {
+                    if (asmType.getSort() == org.objectweb.asm.Type.OBJECT) {
+                        push(TypedValue.fromConstant(reference(asmType.getInternalName()), asmType.getInternalName()));
+                    } else {
+                        push(TypedValue.fromConstant(fromDescriptor(asmType.getDescriptor()), asmType.getDescriptor()));
+                    }
                 }
-            } else {
-                push(TypedValue.UNKNOWN);
+                case null, default -> push(TypedValue.UNKNOWN);
             }
         }
 
@@ -707,7 +694,7 @@ public class MethodBytecodeVisitor extends ClassVisitor {
             return count;
         }
 
-        private io.github.kubyk01.domain.analyzer.ir.Type primitiveArrayType(int atype) {
+        private Type primitiveArrayType(int atype) {
             return switch (atype) {
                 case Opcodes.T_BOOLEAN -> BOOLEAN;
                 case Opcodes.T_BYTE    -> BYTE;

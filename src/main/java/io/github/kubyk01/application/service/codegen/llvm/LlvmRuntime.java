@@ -1,7 +1,7 @@
 package io.github.kubyk01.application.service.codegen.llvm;
 
 import io.github.kubyk01.application.service.analyzer.ssa.TypeResolver;
-import io.github.kubyk01.domain.analyzer.ir.Type;
+import io.github.kubyk01.domain.ir.Type;
 
 import java.util.List;
 
@@ -45,6 +45,9 @@ public class LlvmRuntime {
                 declare void @__jnative_throw_array_index_out_of_bounds()
                 declare void @__jnative_throw_class_cast_exception()
                 declare void @__jnative_throw_arithmetic_exception()
+
+                ; ----- String concatenation (implemented in jnative_runtime.c) -----
+                declare i8* @__jnative_concat_strings(i32, ...)
 
                 ; ----- Reflection runtime (implemented in jnative_runtime.c) -----
                 declare i8* @__jnative_invoke_method(i8*, i8*, i8**)
@@ -98,7 +101,7 @@ public class LlvmRuntime {
      */
     public static String mangleCallable(String callableName) {
         // Check whether the name matches the "ClassName.methodName(descriptor)" format
-        if (!callableName.matches("^[a-zA-Z0-9_/]+\\.[a-zA-Z0-9_<>]+\\([^)]*\\)[^)]*$")) {
+        if (!callableName.matches("^[a-zA-Z0-9_/$]+\\.[a-zA-Z0-9_<>$]+\\([^)]*\\)[^)]*$")) {
             // Non-standard name – replace all invalid characters with underscores
             String mangled = callableName.replaceAll("[^a-zA-Z0-9_]", "_");
             return "fn_" + mangled;

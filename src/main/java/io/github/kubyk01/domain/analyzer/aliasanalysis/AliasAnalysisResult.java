@@ -1,6 +1,6 @@
 package io.github.kubyk01.domain.analyzer.aliasanalysis;
 
-import io.github.kubyk01.domain.analyzer.ir.Value;
+import io.github.kubyk01.domain.ir.Value;
 import lombok.Getter;
 
 import java.util.Map;

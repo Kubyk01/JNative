@@ -1,6 +1,6 @@
 package io.github.kubyk01.application.service.analyzer.ssa;
 
-import io.github.kubyk01.domain.analyzer.ir.BasicBlock;
+import io.github.kubyk01.domain.ir.BasicBlock;
 import org.objectweb.asm.Label;
 
 import java.util.*;

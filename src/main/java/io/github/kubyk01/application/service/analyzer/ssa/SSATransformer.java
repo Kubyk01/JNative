@@ -1,9 +1,27 @@
 package io.github.kubyk01.application.service.analyzer.ssa;
 
-import io.github.kubyk01.domain.analyzer.ir.*;
+import io.github.kubyk01.domain.ir.BasicBlock;
+import io.github.kubyk01.domain.ir.CondBranchTerminator;
+import io.github.kubyk01.domain.ir.Constant;
+import io.github.kubyk01.domain.ir.Function;
+import io.github.kubyk01.domain.ir.IndirectBranchTerminator;
+import io.github.kubyk01.domain.ir.Instruction;
+import io.github.kubyk01.domain.ir.LookupSwitchTerminator;
+import io.github.kubyk01.domain.ir.Opcode;
+import io.github.kubyk01.domain.ir.Parameter;
+import io.github.kubyk01.domain.ir.ReturnTerminator;
+import io.github.kubyk01.domain.ir.TableSwitchTerminator;
+import io.github.kubyk01.domain.ir.Temporary;
+import io.github.kubyk01.domain.ir.Terminator;
+import io.github.kubyk01.domain.ir.ThrowTerminator;
+import io.github.kubyk01.domain.ir.Type;
+import io.github.kubyk01.domain.ir.UndefinedValue;
+import io.github.kubyk01.domain.ir.Value;
 import lombok.extern.slf4j.Slf4j;
 
 import java.util.*;
+
+import static io.github.kubyk01.util.LlvmUtil.inferLocalType;
 
 @Slf4j
 public class SSATransformer {
@@ -36,24 +54,6 @@ public class SSATransformer {
         }
     }
 
-    private Type inferType(int localIndex, Function function) {
-        for (Parameter p : function.getParameters()) {
-            if (p.getIndex() == localIndex) {
-                return p.getType();
-            }
-        }
-        for (BasicBlock block : function.getBlocks()) {
-            for (Instruction inst : block.getInstructions()) {
-                if (inst.getOpcode() == Opcode.STORE && inst.getLocalIndex() == localIndex) {
-                    if (!inst.getOperands().isEmpty()) {
-                        return inst.getOperands().getFirst().getType();
-                    }
-                }
-            }
-        }
-        return Type.UNKNOWN;
-    }
-
     private void insertPhiFunctions(Function function) {
         Map<Integer, Set<BasicBlock>> defs = collectDefBlocks(function);
 
@@ -72,7 +72,7 @@ public class SSATransformer {
                     if (!hasPhi.contains(frontier)) {
                         Instruction phi = new Instruction(Opcode.PHI);
                         phi.setLocalIndex(localIndex);
-                        Type varType = inferType(localIndex, function);
+                        Type varType = inferLocalType(function, localIndex);
                         Temporary phiResult = new Temporary(varType);
                         phi.setResult(phiResult);
                         phiResult.setDefiningInstruction(phi);
@@ -112,7 +112,7 @@ public class SSATransformer {
             if (inst.getOpcode() == Opcode.PHI) {
                 int idx = inst.getLocalIndex();
                 if (idx < 0) continue;
-                Type varType = inferType(idx, currentFunction);
+                Type varType = inferLocalType(currentFunction, idx);
                 Temporary newVer = newVersion(idx, varType);
                 inst.setResult(newVer);
                 newVer.setDefiningInstruction(inst);
@@ -133,7 +133,7 @@ public class SSATransformer {
                 if (idx < 0) continue;
                 Value curVer = currentVersion(idx);
                 if (curVer == null) {
-                    curVer = new UndefinedValue(inferType(idx, currentFunction));
+                    curVer = new UndefinedValue(inferLocalType(currentFunction, idx));
                     versionStacks.computeIfAbsent(idx, k -> new ArrayDeque<>()).push(curVer);
                     versionCounters.putIfAbsent(idx, 0);
                     savedSizes.putIfAbsent(idx, stackSize(idx));
@@ -169,7 +169,7 @@ public class SSATransformer {
                     Value curVer = currentVersion(inst.getLocalIndex());
                     if (curVer == null) {
                         // If the variable is undefined on this path, use UndefinedValue
-                        curVer = new UndefinedValue(inferType(inst.getLocalIndex(), currentFunction));
+                        curVer = new UndefinedValue(inferLocalType(currentFunction, inst.getLocalIndex()));
                     }
                     ensurePhiOperandCount(inst, predIdx + 1);
                     inst.getOperands().set(predIdx, curVer);

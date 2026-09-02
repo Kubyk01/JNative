@@ -4,18 +4,21 @@ import io.github.kubyk01.domain.analyzer.aliasanalysis.AllocationSite;
 import io.github.kubyk01.domain.analyzer.aliasanalysis.FunctionSummary;
 import io.github.kubyk01.domain.analyzer.aliasanalysis.PointsToGraph;
 import io.github.kubyk01.domain.analyzer.aliasanalysis.PointsToSet;
-import io.github.kubyk01.domain.analyzer.ir.BasicBlock;
-import io.github.kubyk01.domain.analyzer.ir.Constant;
-import io.github.kubyk01.domain.analyzer.ir.Function;
-import io.github.kubyk01.domain.analyzer.ir.Instruction;
-import io.github.kubyk01.domain.analyzer.ir.Module;
-import io.github.kubyk01.domain.analyzer.ir.Opcode;
-import io.github.kubyk01.domain.analyzer.ir.Parameter;
-import io.github.kubyk01.domain.analyzer.ir.Terminator;
-import io.github.kubyk01.domain.analyzer.ir.Value;
+import io.github.kubyk01.domain.ir.BasicBlock;
+import io.github.kubyk01.domain.ir.Function;
+import io.github.kubyk01.domain.ir.Instruction;
+import io.github.kubyk01.domain.ir.Module;
+import io.github.kubyk01.domain.ir.Opcode;
+import io.github.kubyk01.domain.ir.Parameter;
+import io.github.kubyk01.domain.ir.Terminator;
+import io.github.kubyk01.domain.ir.Value;
 import lombok.extern.slf4j.Slf4j;
 
 import java.util.*;
+
+import static io.github.kubyk01.util.LlvmUtil.extractCalleeName;
+import static io.github.kubyk01.util.LlvmUtil.extractFieldName;
+import static io.github.kubyk01.util.LlvmUtil.getCallArguments;
 
 @Slf4j
 public class InterproceduralPointsTo {
@@ -269,42 +272,5 @@ public class InterproceduralPointsTo {
 
     private void processTerminator() {
         // terminator instructions do not change points-to
-    }
-
-    /**
-     * The field name depends on the opcode: for GET_FIELD/PUT_FIELD the field constant is in operand 1,
-     * for GET_STATIC/PUT_STATIC – in operand 0.
-     * The full name (including the class) is returned, which prevents name collisions
-     * between static fields of different classes.
-     */
-    private String extractFieldName(Instruction inst) {
-        int fieldIdx = (inst.getOpcode() == Opcode.GET_STATIC || inst.getOpcode() == Opcode.PUT_STATIC) ? 0 : 1;
-        if (inst.getOperands().size() > fieldIdx) {
-            Value v = inst.getOperands().get(fieldIdx);
-            if (v instanceof Constant c && c.getType().isReference()) {
-                return c.getValue().toString(); // full name, e.g. "java/lang/System.out"
-            }
-        }
-        return "unknown";
-    }
-
-    private String extractCalleeName(Instruction inst) {
-        if (!inst.getOperands().isEmpty()) {
-            Value v = inst.getOperands().getFirst();
-            if (v instanceof Constant c && c.getType().isReference()) {
-                return c.getValue().toString();
-            }
-        }
-        return null;
-    }
-
-    private List<Value> getCallArguments(Instruction inst) {
-        List<Value> args = new ArrayList<>();
-        boolean skipFirst = true;
-        for (Value op : inst.getOperands()) {
-            if (skipFirst) { skipFirst = false; continue; }
-            args.add(op);
-        }
-        return args;
     }
 }

@@ -1,10 +1,10 @@
 package io.github.kubyk01.application.service.analyzer.ssa;
 
-import io.github.kubyk01.domain.analyzer.ir.Temporary;
-import io.github.kubyk01.domain.analyzer.ir.Type;
-import io.github.kubyk01.domain.analyzer.ir.UndefinedValue;
-import io.github.kubyk01.domain.analyzer.ir.Value;
-import io.github.kubyk01.domain.analyzer.ir.IrBuilder;
+import io.github.kubyk01.domain.ir.Temporary;
+import io.github.kubyk01.domain.ir.Type;
+import io.github.kubyk01.domain.ir.UndefinedValue;
+import io.github.kubyk01.domain.ir.Value;
+import io.github.kubyk01.domain.ir.IrBuilder;
 import lombok.extern.slf4j.Slf4j;
 
 import java.util.*;

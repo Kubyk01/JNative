@@ -1,4 +1,4 @@
-package io.github.kubyk01.domain.analyzer.ir;
+package io.github.kubyk01.domain.ir;
 
 import lombok.EqualsAndHashCode;
 import lombok.Getter;
@@ -91,6 +91,10 @@ public abstract class Type {
         private ReferenceType(String className) { super(TypeKind.REFERENCE); this.className = className; }
         @Override public String getClassName() { return className; }
         @Override public String toString() { return "ref(" + className + ")"; }
+
+        public boolean isClosure() {
+            return className != null && className.startsWith("__Lambda_");
+        }
     }
 
     public static class ArrayType extends Type {
@@ -131,5 +135,9 @@ public abstract class Type {
 
     public enum TypeKind {
         PRIMITIVE, REFERENCE, ARRAY, NULL, BLOCK, UNKNOWN
+    }
+
+    public static ReferenceType closure(String id) {
+        return new ReferenceType("__Lambda_" + id);
     }
 }

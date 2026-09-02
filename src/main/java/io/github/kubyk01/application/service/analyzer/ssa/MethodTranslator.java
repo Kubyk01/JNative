@@ -3,7 +3,21 @@ package io.github.kubyk01.application.service.analyzer.ssa;
 import io.github.kubyk01.application.service.analyzer.dependencyresolver.DependencyResolver;
 import io.github.kubyk01.application.service.codegen.llvm.LlvmRuntime;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.MethodReference;
-import io.github.kubyk01.domain.analyzer.ir.*;
+import io.github.kubyk01.domain.ir.BasicBlock;
+import io.github.kubyk01.domain.ir.BranchTerminator;
+import io.github.kubyk01.domain.ir.Constant;
+import io.github.kubyk01.domain.ir.Function;
+import io.github.kubyk01.domain.ir.IndirectBranchTerminator;
+import io.github.kubyk01.domain.ir.Instruction;
+import io.github.kubyk01.domain.ir.InvokeDynamicInfo;
+import io.github.kubyk01.domain.ir.IrBuilder;
+import io.github.kubyk01.domain.ir.Opcode;
+import io.github.kubyk01.domain.ir.ResolvedCall;
+import io.github.kubyk01.domain.ir.Temporary;
+import io.github.kubyk01.domain.ir.Terminator;
+import io.github.kubyk01.domain.ir.TryCatchRange;
+import io.github.kubyk01.domain.ir.Type;
+import io.github.kubyk01.domain.ir.Value;
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
 import org.objectweb.asm.Handle;
@@ -26,6 +40,7 @@ public class MethodTranslator extends MethodVisitor {
     // local index -> return blocks of all JSR instructions whose address is stored in that variable
     private final Map<Integer, Set<BasicBlock>> jsrReturnBlocks = new HashMap<>();
     private final List<IndirectBranchTerminator> indirectBranches = new ArrayList<>();
+    private int lambdaCounter = 0;
 
     @Getter
     private Function currentFunction;
@@ -357,26 +372,67 @@ public class MethodTranslator extends MethodVisitor {
 
     @Override
     public void visitInvokeDynamicInsn(String name, String desc, Handle bsm, Object... bsmArgs) {
-        String sb = "invokedynamic:" + name + desc +
-            " bsm=" + bsm.getOwner() + "." + bsm.getName() + bsm.getDesc();
-        Instruction call = new Instruction(Opcode.CALL);
-        call.addOperand(new Constant(Type.reference(sb), sb));
+        // Extract captured arguments from the stack
         List<Type> paramTypes = TypeResolver.descToParamTypes(desc);
-        int paramCount = paramTypes.size();
-        List<Value> args = frame.popArgs(paramCount);
-        for (Value arg : args) {
-            call.addOperand(arg);
+        List<Value> captured = new ArrayList<>();
+        for (int i = 0; i < paramTypes.size(); i++) {
+            captured.add(frame.pop());
         }
+        Collections.reverse(captured);
+
+        // Analyze bootstrap
+        ResolvedCall resolved = resolveInvokeDynamic(bsm, bsmArgs, captured);
+        InvokeDynamicInfo info = new InvokeDynamicInfo(name, desc, bsm, bsmArgs, resolved);
+
+        // Create IR instruction
+        Instruction inst = new Instruction(Opcode.INVOKEDYNAMIC);
+        inst.setInvokedynamicData(info);
+        for (Value v : captured) {
+            inst.addOperand(v);
+        }
+
         Type retType = TypeResolver.descToReturnType(desc);
         if (!retType.isVoid()) {
             Temporary tmp = builder.newTemporary(retType);
-            call.setResult(tmp);
-            tmp.setDefiningInstruction(call);
-            builder.currentBlock().addInstruction(call);
+            inst.setResult(tmp);
+            tmp.setDefiningInstruction(inst);
             frame.push(tmp);
-        } else {
-            builder.currentBlock().addInstruction(call);
         }
+        builder.currentBlock().addInstruction(inst);
+    }
+
+    private ResolvedCall resolveInvokeDynamic(Handle bsm,
+                                              Object[] bsmArgs, List<Value> captured) {
+        if (bsm == null) return ResolvedCall.unsupported();
+
+        String owner = bsm.getOwner();
+        String methodName = bsm.getName();
+
+        // ----- LambdaMetafactory -----
+        if (owner.contains("LambdaMetafactory") &&
+            (methodName.equals("metafactory") || methodName.equals("altMetafactory"))) {
+            if (bsmArgs.length < 3) return ResolvedCall.unsupported();
+
+            // samMethodType - signature of the single interface method
+            org.objectweb.asm.Type samType = (org.objectweb.asm.Type) bsmArgs[0];
+            String interfaceMethodSig = samType.getDescriptor();
+
+            // implMethod – Handle
+
+            String lambdaId = "lambda_" + (++lambdaCounter) + "_" + System.identityHashCode(this);
+
+            List<Type> capturedTypes = captured.stream().map(Value::getType).collect(java.util.stream.Collectors.toList());
+            return ResolvedCall.lambda(lambdaId, interfaceMethodSig, capturedTypes);
+        }
+
+        // ----- StringConcatFactory -----
+        if (owner.equals("java/lang/StringConcatFactory") &&
+            (methodName.equals("makeConcat") || methodName.equals("makeConcatWithConstants"))) {
+            // For simplicity, call the runtime function with arguments
+            return ResolvedCall.concat(null);
+        }
+
+        return ResolvedCall.unsupported();
     }
 
     @Override
@@ -434,7 +490,7 @@ public class MethodTranslator extends MethodVisitor {
     }
 
     // The helper class for storing the range was moved to
-    // io.github.kubyk01.domain.analyzer.ir.TryCatchRange
+    // io.github.kubyk01.domain.ir.TryCatchRange
 
     private BasicBlock getOrCreateBlock(Label label) {
         return labelToBlock.computeIfAbsent(label,

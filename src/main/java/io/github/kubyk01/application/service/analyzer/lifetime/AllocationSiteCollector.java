@@ -2,11 +2,11 @@ package io.github.kubyk01.application.service.analyzer.lifetime;
 
 import io.github.kubyk01.domain.analyzer.aliasanalysis.AliasAnalysisResult;
 import io.github.kubyk01.domain.analyzer.aliasanalysis.AllocationSite;
-import io.github.kubyk01.domain.analyzer.ir.BasicBlock;
-import io.github.kubyk01.domain.analyzer.ir.Function;
-import io.github.kubyk01.domain.analyzer.ir.Instruction;
-import io.github.kubyk01.domain.analyzer.ir.Module;
-import io.github.kubyk01.domain.analyzer.ir.Opcode;
+import io.github.kubyk01.domain.ir.BasicBlock;
+import io.github.kubyk01.domain.ir.Function;
+import io.github.kubyk01.domain.ir.Instruction;
+import io.github.kubyk01.domain.ir.Module;
+import io.github.kubyk01.domain.ir.Opcode;
 import lombok.RequiredArgsConstructor;
 
 import java.util.ArrayList;

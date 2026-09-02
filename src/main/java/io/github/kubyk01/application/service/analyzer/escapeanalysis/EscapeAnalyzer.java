@@ -6,7 +6,7 @@ import io.github.kubyk01.domain.analyzer.aliasanalysis.AllocationSite;
 import io.github.kubyk01.domain.analyzer.escapeanalysis.EscapeAnalysisResult;
 import io.github.kubyk01.domain.analyzer.escapeanalysis.EscapeStatus;
 import io.github.kubyk01.domain.analyzer.escapeanalysis.EscapeSummary;
-import io.github.kubyk01.domain.analyzer.ir.Module;
+import io.github.kubyk01.domain.ir.Module;
 import lombok.extern.slf4j.Slf4j;
 
 import java.util.Map;
