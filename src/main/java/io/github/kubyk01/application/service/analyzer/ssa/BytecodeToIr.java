@@ -100,7 +100,9 @@ public class BytecodeToIr {
                 functionMap.put(methodRef, func);
             }
         } catch (Exception e) {
-            log.warn("Failed to translate method: {} - {}", methodRef, e.getMessage());
+            //todo revert
+            System.out.println("Failed to translate method: " + methodRef + " " + e.getMessage());
+
             boolean isStatic = methodNode != null && methodNode.isStatic();
             Function func = createExternalFunction(methodRef, isStatic);
             functionMap.put(methodRef, func);

@@ -14,6 +14,7 @@ import org.objectweb.asm.*;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.net.URI;
 import java.nio.file.*;
 import java.util.*;
 import java.util.jar.JarEntry;
@@ -33,12 +34,10 @@ public class DependencyResolver {
     @Getter
     private final ReachabilityMetadata metadata = ReachabilityMetadata.builder().build();
 
-    @Getter
-    private boolean systemFsInitialized = false;
+    private FileSystem jrtFileSystem;
 
     /**
-     * Lazily loads a single system class from the JDK by its internal name.
-     * If the class is not found in the JDK, an external stub is created.
+     * Lazily loads a system class from the JDK (Java 9+ via jrt:/, or fallback to ClassLoader).
      */
     public synchronized void loadSystemClass(String internalName) {
         if (classMap.containsKey(internalName)) {
@@ -47,18 +46,22 @@ public class DependencyResolver {
 
         byte[] bytes = null;
 
-        try {
-            InputStream is = ClassLoader.getSystemResourceAsStream(internalName + ".class");
+        // 1. Try standard ClassLoader (may work in some environments)
+        try (InputStream is = ClassLoader.getSystemResourceAsStream(internalName + ".class")) {
             if (is != null) {
                 bytes = is.readAllBytes();
-                is.close();
-            } else {
-                log.debug("Class {} not found via system ClassLoader, trying fallback (if any)", internalName);
+                log.debug("Loaded system class {} via ClassLoader", internalName);
             }
         } catch (IOException e) {
-            log.warn("Failed to load system class {}: {}", internalName, e.getMessage());
+            log.debug("Failed to load system class {} via ClassLoader: {}", internalName, e.getMessage());
         }
 
+        // 2. If not loaded, try jrt:/ (Java 9+)
+        if (bytes == null) {
+            bytes = loadClassFromJrt(internalName);
+        }
+
+        // 3. If still null, create a stub
         if (bytes != null) {
             try {
                 parseClassBytes(internalName, bytes);
@@ -68,7 +71,6 @@ public class DependencyResolver {
             }
         }
 
-        log.debug("System class {} not loaded with bytecode, marked external", internalName);
         ClassNode stub = ClassNode.builder()
             .name(internalName)
             .superName("java/lang/Object")
@@ -76,6 +78,63 @@ public class DependencyResolver {
             .build();
         classMap.put(internalName, stub);
     }
+
+    /**
+     * Loads class bytes from the jrt:/ file system.
+     */
+    private byte[] loadClassFromJrt(String internalName) {
+        try {
+            FileSystem fs = getJrtFileSystem();
+            if (fs == null) {
+                return null;
+            }
+
+            String moduleName = getModuleNameForClass(internalName);
+            Path classPath = fs.getPath("modules", moduleName, internalName + ".class");
+
+            if (Files.exists(classPath)) {
+                byte[] bytes = Files.readAllBytes(classPath);
+                log.debug("Loaded system class {} from jrt:/{}/{}", internalName, moduleName, internalName + ".class");
+                return bytes;
+            } else {
+                log.debug("Class {} not found in jrt:/{}/{}", internalName, moduleName, internalName + ".class");
+            }
+        } catch (Exception e) {
+            log.debug("Failed to load system class {} via jrt:/: {}", internalName, e.getMessage());
+        }
+        return null;
+    }
+
+    /**
+     * Returns the jrt:/ FileSystem, creating it if necessary.
+     */
+    private FileSystem getJrtFileSystem() throws IOException {
+        if (jrtFileSystem != null && jrtFileSystem.isOpen()) {
+            return jrtFileSystem;
+        }
+        try {
+            // Try to get existing jrt file system
+            jrtFileSystem = FileSystems.getFileSystem(URI.create("jrt:/"));
+            return jrtFileSystem;
+        } catch (FileSystemNotFoundException e) {
+            // If not found, create a new one (shouldn't happen in Java 9+)
+            Map<String, String> env = new HashMap<>();
+            env.put("java.home", System.getProperty("java.home"));
+            jrtFileSystem = FileSystems.newFileSystem(URI.create("jrt:/"), env);
+            return jrtFileSystem;
+        }
+    }
+
+    /**
+     * Determines the module name for a given system class.
+     * Most core classes reside in java.base. Extend this logic if needed.
+     */
+    private String getModuleNameForClass(String internalName) {
+        // Default to java.base
+        return "java.base";
+    }
+
+    // --- The rest of the class remains unchanged ---
 
     public void scan(Path path) throws IOException {
         if (Files.isDirectory(path)) {
@@ -312,6 +371,8 @@ public class DependencyResolver {
         if (name == null) {
             throw new IOException("Class name not found");
         }
+        // todo remove
+        System.out.println("all methods of " + internalName + " " + methods);
 
         // Register the class (before recursion, to avoid cycles)
         classMap.put(name, classNode);
@@ -360,5 +421,4 @@ public class DependencyResolver {
     public Set<String> getAllClasses() {
         return classMap.keySet();
     }
-
 }

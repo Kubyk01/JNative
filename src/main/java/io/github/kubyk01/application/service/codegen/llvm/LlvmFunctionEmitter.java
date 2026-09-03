@@ -533,19 +533,37 @@ public class LlvmFunctionEmitter {
 
                 Type retType = inst.getResult() != null ? inst.getResult().getType() : Type.VOID;
 
-                if (idx < 0) {
-                    sb.append("  ; WARNING: virtual method not found in vtable, using direct call\n");
+                boolean receiverIsRef = receiver.getType().isReference() || receiver.getType().isArray()
+                    || receiver.getType().isNull() || receiver.getType().isBlock();
+                if (!receiverIsRef) {
                     String owner = calleeName.substring(0, dotIdx);
                     int parenIdx = sig.indexOf('(');
                     String mName = parenIdx > 0 ? sig.substring(0, parenIdx) : sig;
                     String mDesc = parenIdx > 0 ? sig.substring(parenIdx) : "";
-
                     ensureFunctionDeclared(owner, mName, mDesc);
-
                     String funcName = LlvmRuntime.mangleMethod(owner, mName, mDesc);
                     StringBuilder argList = new StringBuilder();
                     for (int i = 0; i < operands.size(); i++) {
-                        if (i == 1) continue; // skip the callee constant
+                        if (i == 1) continue; // skip callee constant
+                        if (!argList.isEmpty()) argList.append(", ");
+                        argList.append(typeMapper.toLlvmType(operands.get(i).getType()))
+                            .append(" ").append(getLlvmValue(operands.get(i)));
+                    }
+                    emitCall(sb, retType, resultName, "@" + funcName, argList.toString(), ranges);
+                    break;
+                }
+
+                if (idx < 0) {
+                    // fallback: direct call
+                    String owner = calleeName.substring(0, dotIdx);
+                    int parenIdx = sig.indexOf('(');
+                    String mName = parenIdx > 0 ? sig.substring(0, parenIdx) : sig;
+                    String mDesc = parenIdx > 0 ? sig.substring(parenIdx) : "";
+                    ensureFunctionDeclared(owner, mName, mDesc);
+                    String funcName = LlvmRuntime.mangleMethod(owner, mName, mDesc);
+                    StringBuilder argList = new StringBuilder();
+                    for (int i = 0; i < operands.size(); i++) {
+                        if (i == 1) continue;
                         if (!argList.isEmpty()) argList.append(", ");
                         argList.append(typeMapper.toLlvmType(operands.get(i).getType()))
                             .append(" ").append(getLlvmValue(operands.get(i)));

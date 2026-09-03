@@ -23,16 +23,8 @@ import lombok.Getter;
 import lombok.RequiredArgsConstructor;
 import org.objectweb.asm.Opcodes;
 
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.Comparator;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.LinkedHashMap;
-import java.util.LinkedHashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
+import java.util.*;
+import java.util.stream.Collectors;
 
 import static io.github.kubyk01.util.LlvmUtil.getElementSizeOfType;
 
@@ -262,19 +254,29 @@ public class LlvmGlobalEmitter {
             name.startsWith("io/micrometer/") || name.startsWith("org/junit/") || name.startsWith("com/fasterxml/");
     }
 
+    /**
+     * Исправленная генерация vtables.
+     * Сначала собираем все виртуальные сигнатуры из ВСЕХ классов (включая системные и интерфейсы),
+     * чтобы гарантировать, что каждый возможный вызов через интерфейс или виртуальный метод
+     * получит глобальный индекс. Затем строим vtable только для пользовательских классов.
+     */
     private String generateVtables() {
         Set<String> signatures = new HashSet<>();
+
+        // 1. Собираем сигнатуры из всех классов (включая системные)
         List<ClassNode> allClasses = new ArrayList<>(resolver.getClassMap().values());
         for (ClassNode cls : allClasses) {
-            if (cls.isExternal() || isSystemClass(cls.getName())) continue;
+            if (cls.isExternal()) continue;
             for (MethodNode mn : cls.getMethods()) {
                 if (isVirtual(mn)) {
                     signatures.add(mn.getName() + mn.getDescriptor());
                 }
             }
         }
+
         List<String> sortedSigs = new ArrayList<>(signatures);
         Collections.sort(sortedSigs);
+
         for (int i = 0; i < sortedSigs.size(); i++) {
             methodIndex.put(sortedSigs.get(i), i);
         }
@@ -283,7 +285,9 @@ public class LlvmGlobalEmitter {
         if (totalMethods == 0) return "";
 
         StringBuilder sb = new StringBuilder();
-        sb.append("\n");
+        sb.append("\n; ----- Vtables (global method indices: ").append(totalMethods).append(") -----\n");
+
+        // 2. Генерируем vtable только для пользовательских классов
         for (ClassNode cls : allClasses) {
             if (cls.isExternal() || isSystemClass(cls.getName())) continue;
             String className = cls.getName();
