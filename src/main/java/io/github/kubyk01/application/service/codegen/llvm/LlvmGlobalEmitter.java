@@ -24,7 +24,6 @@ import lombok.RequiredArgsConstructor;
 import org.objectweb.asm.Opcodes;
 
 import java.util.*;
-import java.util.stream.Collectors;
 
 import static io.github.kubyk01.util.LlvmUtil.getElementSizeOfType;
 
@@ -136,8 +135,26 @@ public class LlvmGlobalEmitter {
     }
 
     private String generateStructs() {
+        // Collect all class names used in NEW instructions
+        Set<String> newClassNames = new HashSet<>();
+        for (Function func : module.getFunctions()) {
+            for (BasicBlock block : func.getBlocks()) {
+                for (Instruction inst : block.getInstructions()) {
+                    if (inst.getOpcode() == Opcode.NEW) {
+                        if (!inst.getOperands().isEmpty()) {
+                            Value v = inst.getOperands().getFirst();
+                            if (v instanceof Constant c && c.getType().isReference()) {
+                                newClassNames.add(c.getValue().toString());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         StringBuilder sb = new StringBuilder();
 
+        // Define structs for all known classes (from resolver)
         String objStruct = typeMapper.toLlvmStruct("java/lang/Object");
         if (!structNames.containsKey("java/lang/Object")) {
             sb.append(objStruct).append(" = type { }\n");
@@ -162,10 +179,19 @@ public class LlvmGlobalEmitter {
             sb.append(" }\n");
             structNames.put(cls.getName(), structName);
         }
+
+        // Define minimal structs for any NEW class that is still missing
+        for (String className : newClassNames) {
+            if (!structNames.containsKey(className)) {
+                String structName = typeMapper.toLlvmStruct(className);
+                sb.append(structName).append(" = type { i8* }\n");
+                structNames.put(className, structName);
+            }
+        }
+
         sb.append("\n");
         return sb.toString();
     }
-
     private List<FieldNode> collectAllFields(ClassNode cls) {
         List<FieldNode> result = new ArrayList<>();
         if (cls.getSuperName() != null && !cls.getSuperName().equals("java/lang/Object")) {
@@ -201,7 +227,8 @@ public class LlvmGlobalEmitter {
                 init = "0";
             }
 
-            String globalName = "gv_" + fullName.replace('.', '_').replace('/', '_');
+            // Sanitize the full name for a global identifier
+            String globalName = "gv_" + LlvmTypeMapper.sanitizeIdentifier(fullName);
             sb.append("@").append(globalName).append(" = global ").append(llvmType)
                 .append(" ").append(init).append(", align 8\n");
         }
@@ -254,16 +281,9 @@ public class LlvmGlobalEmitter {
             name.startsWith("io/micrometer/") || name.startsWith("org/junit/") || name.startsWith("com/fasterxml/");
     }
 
-    /**
-     * Исправленная генерация vtables.
-     * Сначала собираем все виртуальные сигнатуры из ВСЕХ классов (включая системные и интерфейсы),
-     * чтобы гарантировать, что каждый возможный вызов через интерфейс или виртуальный метод
-     * получит глобальный индекс. Затем строим vtable только для пользовательских классов.
-     */
     private String generateVtables() {
         Set<String> signatures = new HashSet<>();
 
-        // 1. Собираем сигнатуры из всех классов (включая системные)
         List<ClassNode> allClasses = new ArrayList<>(resolver.getClassMap().values());
         for (ClassNode cls : allClasses) {
             if (cls.isExternal()) continue;
@@ -287,7 +307,6 @@ public class LlvmGlobalEmitter {
         StringBuilder sb = new StringBuilder();
         sb.append("\n; ----- Vtables (global method indices: ").append(totalMethods).append(") -----\n");
 
-        // 2. Генерируем vtable только для пользовательских классов
         for (ClassNode cls : allClasses) {
             if (cls.isExternal() || isSystemClass(cls.getName())) continue;
             String className = cls.getName();
@@ -296,8 +315,13 @@ public class LlvmGlobalEmitter {
             List<String> entries = new ArrayList<>();
             for (String sig : sortedSigs) {
                 MethodNode mn = methodMap.get(sig);
-                if (mn != null && !mn.isAbstract() && !mn.isNative()) {
-                    String funcName = LlvmRuntime.mangleMethod(className, mn.getName(), mn.getDescriptor());
+                if (mn != null && !mn.isAbstract()) {
+                    String funcName;
+                    if (mn.isNative()) {
+                        funcName = "__jnative_" + LlvmRuntime.mangleMethod(className, mn.getName(), mn.getDescriptor());
+                    } else {
+                        funcName = LlvmRuntime.mangleMethod(className, mn.getName(), mn.getDescriptor());
+                    }
                     String retType = typeMapper.toLlvmType(mn.getReturnType());
                     String paramTypes = buildParamTypes(mn);
                     entries.add("i8* bitcast (" + retType + " (" + paramTypes + ")* @" + funcName + " to i8*)");
@@ -305,7 +329,7 @@ public class LlvmGlobalEmitter {
                     entries.add("i8* null");
                 }
             }
-            String vtableName = "@vtable_" + className.replace('/', '_');
+            String vtableName = "@vtable_" + LlvmTypeMapper.sanitizeIdentifier(className);
             sb.append(vtableName).append(" = constant [").append(totalMethods).append(" x i8*] [");
             for (int i = 0; i < entries.size(); i++) {
                 if (i > 0) sb.append(", ");
@@ -340,7 +364,7 @@ public class LlvmGlobalEmitter {
             }
             entries.add("i8* null");
 
-            String typeInfoName = "@__type_info_" + className.replace('/', '_');
+            String typeInfoName = "@__type_info_" + LlvmTypeMapper.sanitizeIdentifier(className);
             typeInfoNames.put(className, typeInfoName);
             sb.append(typeInfoName).append(" = private constant [")
                 .append(entries.size()).append(" x i8*] [");
@@ -442,7 +466,7 @@ public class LlvmGlobalEmitter {
         for (String className : classNames) {
             ClassNode classNode = resolver.getClassNode(className);
             if (classNode == null || classNode.isExternal()) continue;
-            classVarNames.put(className, "@refclass_" + className.replace('/', '_'));
+            classVarNames.put(className, "@refclass_" + LlvmTypeMapper.sanitizeIdentifier(className));
         }
 
         List<String> classPtrs = new ArrayList<>();
@@ -451,7 +475,7 @@ public class LlvmGlobalEmitter {
             ClassNode classNode = resolver.getClassNode(className);
             if (classNode == null || classNode.isExternal()) continue;
 
-            String cleanClassName = className.replace('/', '_');
+            String cleanClassName = LlvmTypeMapper.sanitizeIdentifier(className);
             String classVarName = "@refclass_" + cleanClassName;
 
             int objectSize = OBJECT_HEADER_SIZE;
@@ -608,7 +632,7 @@ public class LlvmGlobalEmitter {
         String methodName = method.getName();
         String desc = method.getDescriptor();
         String origFuncName = LlvmRuntime.mangleMethod(className, methodName, desc);
-        String adaptorName = "__reflect_adaptor_" + className.replace('/', '_') + "_"
+        String adaptorName = "__reflect_adaptor_" + LlvmTypeMapper.sanitizeIdentifier(className) + "_"
             + methodName + "_" + desc.replaceAll("[^a-zA-Z0-9_]", "_");
 
         List<Type> paramTypes = TypeResolver.descToParamTypes(desc);
@@ -710,7 +734,7 @@ public class LlvmGlobalEmitter {
     private String emitAdaptorForConstructor(String className, MethodReference ctor, LlvmTypeMapper typeMapper, int objectSize) {
         String desc = ctor.getDescriptor();
         String origFuncName = LlvmRuntime.mangleMethod(className, "<init>", desc);
-        String adaptorName = "__reflect_adaptor_ctor_" + className.replace('/', '_') + "_"
+        String adaptorName = "__reflect_adaptor_ctor_" + LlvmTypeMapper.sanitizeIdentifier(className) + "_"
             + desc.replaceAll("[^a-zA-Z0-9_]", "_");
 
         List<Type> paramTypes = TypeResolver.descToParamTypes(desc);

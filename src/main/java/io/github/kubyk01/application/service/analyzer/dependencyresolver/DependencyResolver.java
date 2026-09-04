@@ -10,15 +10,23 @@ import io.github.kubyk01.domain.ir.Type;
 import lombok.Getter;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.objectweb.asm.*;
+import org.objectweb.asm.ClassReader;
+import org.objectweb.asm.ClassVisitor;
+import org.objectweb.asm.FieldVisitor;
+import org.objectweb.asm.MethodVisitor;
+import org.objectweb.asm.Opcodes;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
 import java.net.URI;
 import java.nio.file.*;
 import java.util.*;
 import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
+import java.util.stream.Collectors;
 
 @Slf4j
 @RequiredArgsConstructor
@@ -31,22 +39,34 @@ public class DependencyResolver {
     private final Map<String, byte[]> classBytes = new HashMap<>();
     private final Map<String, Set<String>> subclasses = new HashMap<>();
     private final Set<String> missingClasses = new HashSet<>();
+    private final Set<String> loadedClasses = new HashSet<>();
     @Getter
     private final ReachabilityMetadata metadata = ReachabilityMetadata.builder().build();
 
     private FileSystem jrtFileSystem;
 
     /**
-     * Lazily loads a system class from the JDK (Java 9+ via jrt:/, or fallback to ClassLoader).
+     * Lazily loads a system class. Tries bytecode first, then falls back to reflection.
      */
     public synchronized void loadSystemClass(String internalName) {
         if (classMap.containsKey(internalName)) {
             return;
         }
+        if (missingClasses.contains(internalName)) {
+            if (!classMap.containsKey(internalName)) {
+                ClassNode stub = ClassNode.builder()
+                    .name(internalName)
+                    .superName("java/lang/Object")
+                    .isExternal(true)
+                    .build();
+                classMap.put(internalName, stub);
+            }
+            return;
+        }
 
         byte[] bytes = null;
 
-        // 1. Try standard ClassLoader (may work in some environments)
+        // 1. Try standard ClassLoader
         try (InputStream is = ClassLoader.getSystemResourceAsStream(internalName + ".class")) {
             if (is != null) {
                 bytes = is.readAllBytes();
@@ -56,27 +76,124 @@ public class DependencyResolver {
             log.debug("Failed to load system class {} via ClassLoader: {}", internalName, e.getMessage());
         }
 
-        // 2. If not loaded, try jrt:/ (Java 9+)
+        // 2. Try jrt:/ (Java 9+)
         if (bytes == null) {
             bytes = loadClassFromJrt(internalName);
         }
 
-        // 3. If still null, create a stub
         if (bytes != null) {
             try {
                 parseClassBytes(internalName, bytes);
+                loadedClasses.add(internalName);
                 return;
             } catch (IOException e) {
                 log.warn("Failed to parse system class {}: {}", internalName, e.getMessage());
             }
         }
 
-        ClassNode stub = ClassNode.builder()
-            .name(internalName)
-            .superName("java/lang/Object")
-            .isExternal(true)
-            .build();
-        classMap.put(internalName, stub);
+        // 3. Fallback to reflection
+        loadClassViaReflection(internalName);
+    }
+
+    /**
+     * Loads class metadata via Java Reflection.
+     * Works reliably for system classes that are present in the runtime ClassLoader.
+     * Array types (names starting with '[') are skipped – they are not needed for struct generation.
+     */
+    private void loadClassViaReflection(String internalName) {
+        try {
+            String binaryName = internalName.replace('/', '.');
+            Class<?> clazz = Class.forName(binaryName, false, ClassLoader.getSystemClassLoader());
+
+            ClassNode.ClassNodeBuilder builder = ClassNode.builder();
+            builder.name(internalName)
+                .superName(clazz.getSuperclass() != null ? clazz.getSuperclass().getName().replace('.', '/') : "java/lang/Object")
+                .interfaces(Arrays.stream(clazz.getInterfaces())
+                    .map(c -> c.getName().replace('.', '/'))
+                    .collect(Collectors.toList()))
+                .access(clazz.getModifiers())
+                .isInterface(clazz.isInterface())
+                .isExternal(false);
+
+            // Fields
+            for (Field field : clazz.getDeclaredFields()) {
+                String desc = org.objectweb.asm.Type.getDescriptor(field.getType());
+                builder.field(FieldNode.builder()
+                    .name(field.getName())
+                    .descriptor(desc)
+                    .type(Type.fromDescriptor(desc))
+                    .access(field.getModifiers())
+                    .build());
+            }
+
+            // Methods
+            for (Method method : clazz.getDeclaredMethods()) {
+                String desc = org.objectweb.asm.Type.getMethodDescriptor(method);
+                org.objectweb.asm.Type retAsmType = org.objectweb.asm.Type.getReturnType(method);
+                String returnDesc = retAsmType.getDescriptor();
+                org.objectweb.asm.Type[] paramAsmTypes = org.objectweb.asm.Type.getArgumentTypes(method);
+                List<Type> paramIrTypes = Arrays.stream(paramAsmTypes)
+                    .map(t -> Type.fromDescriptor(t.getDescriptor()))
+                    .collect(Collectors.toList());
+
+                builder.method(MethodNode.builder()
+                    .name(method.getName())
+                    .descriptor(desc)
+                    .returnType(Type.fromDescriptor(returnDesc))
+                    .parameterTypes(paramIrTypes)
+                    .access(method.getModifiers())
+                    .isAbstract(Modifier.isAbstract(method.getModifiers()))
+                    .isNative(Modifier.isNative(method.getModifiers()))
+                    .isStatic(Modifier.isStatic(method.getModifiers()))
+                    .build());
+            }
+
+            // Constructors
+            for (java.lang.reflect.Constructor<?> ctor : clazz.getDeclaredConstructors()) {
+                String desc = org.objectweb.asm.Type.getConstructorDescriptor(ctor);
+                org.objectweb.asm.Type[] paramAsmTypes = org.objectweb.asm.Type.getArgumentTypes(desc);
+                List<Type> paramIrTypes = Arrays.stream(paramAsmTypes)
+                    .map(t -> Type.fromDescriptor(t.getDescriptor()))
+                    .collect(Collectors.toList());
+
+                builder.method(MethodNode.builder()
+                    .name("<init>")
+                    .descriptor(desc)
+                    .returnType(Type.VOID)
+                    .parameterTypes(paramIrTypes)
+                    .access(ctor.getModifiers())
+                    .isAbstract(false)
+                    .isNative(false)
+                    .isStatic(false)
+                    .build());
+            }
+
+            ClassNode node = builder.build();
+            classMap.put(internalName, node);
+            loadedClasses.add(internalName);
+            log.debug("Loaded system class {} via reflection", internalName);
+
+        } catch (ClassNotFoundException e) {
+            // fallback to stub
+            missingClasses.add(internalName);
+            ClassNode stub = ClassNode.builder()
+                .name(internalName)
+                .superName("java/lang/Object")
+                .isExternal(true)
+                .build();
+            classMap.put(internalName, stub);
+            log.warn("System class {} not found even via reflection, stub created", internalName);
+        } catch (Exception e) {
+            // fallback to stub
+            log.warn("Failed to load class {} via reflection: {}", internalName, e.getMessage());
+            missingClasses.add(internalName);
+            ClassNode stub = ClassNode.builder()
+                .name(internalName)
+                .superName("java/lang/Object")
+                .isExternal(true)
+                .build();
+            classMap.put(internalName, stub);
+        }
     }
 
     /**
@@ -85,19 +202,23 @@ public class DependencyResolver {
     private byte[] loadClassFromJrt(String internalName) {
         try {
             FileSystem fs = getJrtFileSystem();
-            if (fs == null) {
-                return null;
+            if (fs == null) return null;
+
+            Set<String> moduleNames = new HashSet<>();
+            for (Module module : ModuleLayer.boot().modules()) {
+                moduleNames.add(module.getName());
+            }
+            if (!moduleNames.contains("java.base")) {
+                moduleNames.add("java.base");
             }
 
-            String moduleName = getModuleNameForClass(internalName);
-            Path classPath = fs.getPath("modules", moduleName, internalName + ".class");
-
-            if (Files.exists(classPath)) {
-                byte[] bytes = Files.readAllBytes(classPath);
-                log.debug("Loaded system class {} from jrt:/{}/{}", internalName, moduleName, internalName + ".class");
-                return bytes;
-            } else {
-                log.debug("Class {} not found in jrt:/{}/{}", internalName, moduleName, internalName + ".class");
+            for (String moduleName : moduleNames) {
+                Path classPath = fs.getPath("modules", moduleName, internalName + ".class");
+                if (Files.exists(classPath)) {
+                    byte[] bytes = Files.readAllBytes(classPath);
+                    log.debug("Loaded system class {} from jrt:/{}/{}", internalName, moduleName, internalName + ".class");
+                    return bytes;
+                }
             }
         } catch (Exception e) {
             log.debug("Failed to load system class {} via jrt:/: {}", internalName, e.getMessage());
@@ -113,11 +234,9 @@ public class DependencyResolver {
             return jrtFileSystem;
         }
         try {
-            // Try to get existing jrt file system
             jrtFileSystem = FileSystems.getFileSystem(URI.create("jrt:/"));
             return jrtFileSystem;
         } catch (FileSystemNotFoundException e) {
-            // If not found, create a new one (shouldn't happen in Java 9+)
             Map<String, String> env = new HashMap<>();
             env.put("java.home", System.getProperty("java.home"));
             jrtFileSystem = FileSystems.newFileSystem(URI.create("jrt:/"), env);
@@ -126,15 +245,19 @@ public class DependencyResolver {
     }
 
     /**
-     * Determines the module name for a given system class.
-     * Most core classes reside in java.base. Extend this logic if needed.
+     * Forces a reload of a system class (removes stub and retries).
      */
-    private String getModuleNameForClass(String internalName) {
-        // Default to java.base
-        return "java.base";
+    public synchronized void forceLoadSystemClass(String internalName) {
+        ClassNode existing = classMap.get(internalName);
+        if (existing != null && existing.isExternal()) {
+            classMap.remove(internalName);
+            classBytes.remove(internalName);
+            missingClasses.remove(internalName);
+        }
+        loadSystemClass(internalName);
     }
 
-    // --- The rest of the class remains unchanged ---
+    // --- The rest of the class (scan, parseClassFile, etc.) remains unchanged ---
 
     public void scan(Path path) throws IOException {
         if (Files.isDirectory(path)) {
@@ -286,7 +409,7 @@ public class DependencyResolver {
         ClassNode node = classMap.get(internalName);
         if (node != null) return node;
 
-        // Try to lazily load the system class from the JDK
+        // Try to lazily load the system class
         loadSystemClass(internalName);
         node = classMap.get(internalName);
         if (node != null) return node;
@@ -304,14 +427,9 @@ public class DependencyResolver {
         return stub;
     }
 
-    /**
-     * Parses class bytes and stores the information, but does NOT recursively load
-     * the superclass and interfaces. They will be loaded lazily via getClassNode
-     * when needed.
-     */
     private void parseClassBytes(String internalName, byte[] bytes) throws IOException {
+        // Same as before – unchanged
         ClassReader reader = new ClassReader(bytes);
-
         ClassNode.ClassNodeBuilder builder = ClassNode.builder();
         final String[] currentClassName = {null};
         final List<FieldNode> fields = new ArrayList<>();
@@ -371,23 +489,17 @@ public class DependencyResolver {
         if (name == null) {
             throw new IOException("Class name not found");
         }
-        // todo remove
-        System.out.println("all methods of " + internalName + " " + methods);
 
-        // Register the class (before recursion, to avoid cycles)
         classMap.put(name, classNode);
         classBytes.put(name, bytes);
 
-        // Update the subclass index (for the current class)
+        // Update subclass index
         if (classNode.getSuperName() != null && !classNode.getSuperName().equals("java/lang/Object")) {
             subclasses.computeIfAbsent(classNode.getSuperName(), k -> new HashSet<>()).add(name);
         }
         for (String iface : classNode.getInterfaces()) {
             subclasses.computeIfAbsent(iface, k -> new HashSet<>()).add(name);
         }
-
-        // REMOVED recursive calls to loadSystemClass for the superclass and interfaces.
-        // They will be loaded lazily via getClassNode when needed.
     }
 
     public FieldNode getField(String className, String fieldName) {

@@ -138,10 +138,9 @@ public class Analyzer implements AnalyzerPort {
         }
 
         // --- Static initializers (<clinit>) must be processed first ---
-        // Extract all <clinit> functions from the module
         List<Function> clinitFunctions = new ArrayList<>();
         for (Function func : module.getFunctions()) {
-            if (func.getName().endsWith(".<clinit>()V")) { // name format from BytecodeToIr
+            if (func.getName().endsWith(".<clinit>()V")) {
                 clinitFunctions.add(func);
             }
         }
@@ -149,24 +148,16 @@ public class Analyzer implements AnalyzerPort {
         if (!clinitFunctions.isEmpty()) {
             System.out.println("Processing " + clinitFunctions.size() + " static initializers (<clinit>) first...");
 
-            // Build a temporary module containing only <clinit> functions
             Module clinitModule = new Module();
             for (Function func : clinitFunctions) {
                 clinitModule.addFunction(func);
             }
 
-            // Run alias and escape analysis on clinitModule to propagate static field initializations
             AliasAnalyzer clinitAlias = new AliasAnalyzer(clinitModule);
             clinitAlias.analyze();
-
-            // Now merge the results into the main alias result later, but we need a full result.
-            // Better: we run the main alias analysis, but we can force processing of <clinit> first.
-            // The existing AliasAnalyzer will process all functions anyway, but we can separate.
-            // Since the main analysis also processes them, we could just rely on fixed-point,
-            // but to be explicit we can run them first and then the rest.
         }
 
-        // --- Alias Analysis (always runs, output optional) ---
+        // --- Alias Analysis ---
         AliasAnalyzer aliasAnalyzer = new AliasAnalyzer(module);
         AliasAnalysisResult aliasResult = aliasAnalyzer.analyze();
 
@@ -189,7 +180,7 @@ public class Analyzer implements AnalyzerPort {
             }
         }
 
-        // --- Escape Analysis (always runs, output optional) ---
+        // --- Escape Analysis ---
         EscapeAnalyzer escapeAnalyzer = new EscapeAnalyzer(module, aliasResult, resolver);
         EscapeAnalysisResult escapeResult = escapeAnalyzer.analyze();
 
@@ -215,7 +206,7 @@ public class Analyzer implements AnalyzerPort {
             }
         }
 
-        // --- Lifetime Analysis (always runs, output optional) ---
+        // --- Lifetime Analysis ---
         Map<String, FunctionSummary> summaries = aliasResult.getFunctionSummaries();
         LifetimeAnalyzer lifetimeAnalyzer = new LifetimeAnalyzer(module, aliasResult, escapeResult, summaries);
         LifetimeAnalysisResult lifetimeResult = lifetimeAnalyzer.analyze(aliasResult.getAllocationSiteToValue());
@@ -245,7 +236,7 @@ public class Analyzer implements AnalyzerPort {
             }
         }
 
-        // --- Destructor Insertion (always runs, output optional) ---
+        // --- Destructor Insertion ---
         DestructorInserter inserter = new DestructorInserter(module, resolver, lifetimeResult,
             aliasResult.getAllocationSiteToValue(), aliasResult);
         inserter.insert();
@@ -337,8 +328,7 @@ public class Analyzer implements AnalyzerPort {
     }
 
     private void compileAndLink(Path llPath, Path exePath, Set<String> usedSystemClasses)
-            throws IOException, InterruptedException {
-        // Create a temporary directory for all intermediate files
+        throws IOException, InterruptedException {
         Path tempDir = Files.createTempDirectory("jnative_build_");
         tempDir.toFile().deleteOnExit();
 
@@ -356,19 +346,19 @@ public class Analyzer implements AnalyzerPort {
             Path runtimeObj = tempDir.resolve("jnative_runtime.o");
             compileCSource(compiler, runtimeC, runtimeObj);
 
-            // 2. Compile additional C files for system classes
+            // 2. Compile additional C files for system classes (preserving hierarchy)
             List<Path> extraSources = extractSystemNativeSources(usedSystemClasses, tempDir);
             List<Path> extraObjs = new ArrayList<>();
             for (Path src : extraSources) {
-                String objName = src.getFileName().toString().replaceAll("\\.c$", ".o");
-                Path obj = tempDir.resolve(objName);
+                // Place object file in the same directory as the source
+                Path obj = src.getParent().resolve(src.getFileName().toString().replaceAll("\\.c$", ".o"));
                 compileCSource(compiler, src, obj);
                 extraObjs.add(obj);
             }
 
             // 3. Compile LLVM IR into an object file
             Path objPath = tempDir.resolve(exePath.getFileName().toString() + ".o");
-            ProcessBuilder pb = new ProcessBuilder(compiler, "-c", "-O2", llPath.toString(), "-o", objPath.toString());
+            ProcessBuilder pb = new ProcessBuilder(compiler, "-c", "-O3", llPath.toString(), "-o", objPath.toString());
             pb.inheritIO();
             int exit = pb.start().waitFor();
             if (exit != 0) throw new RuntimeException("Compilation failed with exit code " + exit);
@@ -381,17 +371,27 @@ public class Analyzer implements AnalyzerPort {
             for (Path obj : extraObjs) linkCmd.add(obj.toString());
             linkCmd.add("-o");
             linkCmd.add(exePath.toString());
-            linkCmd.add("-lpthread");
+
+            String os = System.getProperty("os.name").toLowerCase();
+            if (os.contains("linux") || os.contains("mac") || os.contains("darwin")) {
+                linkCmd.add("-lpthread");
+                linkCmd.add("-ldl");
+            } else if (os.contains("win")) {
+                linkCmd.add("-lpthread");       // if using pthread-win32
+                // dbghelp is linked via #pragma comment(lib) in the C file
+            } else {
+                // fallback
+                linkCmd.add("-lpthread");
+            }
             pb = new ProcessBuilder(linkCmd);
             pb.inheritIO();
             exit = pb.start().waitFor();
             if (exit != 0) throw new RuntimeException("Linking failed with exit code " + exit);
 
         } finally {
-            // Recursively delete the entire temporary directory (including all files)
             Files.walk(tempDir)
-                 .sorted(Comparator.reverseOrder())
-                 .forEach(p -> { try { Files.deleteIfExists(p); } catch (IOException ignored) {} });
+                .sorted(Comparator.reverseOrder())
+                .forEach(p -> { try { Files.deleteIfExists(p); } catch (IOException ignored) {} });
         }
     }
 
@@ -403,20 +403,19 @@ public class Analyzer implements AnalyzerPort {
     }
 
     /**
-     * Returns the resource path of the native C implementation for the given class,
-     * or null if there is no mapping for its package.
+     * Returns the resource path for a native C implementation of the given class.
+     * The resource is expected to be at "jnative/<class-name>.c" where class-name
+     * uses internal format with slashes (e.g., "java/lang/String").
      */
     private String getNativeResourcePath(String className) {
-        if (!className.startsWith("java/")) {
-            return null;
+        if (className.startsWith("java/")) {
+            return NATIVE_BASE_PATH + className.substring("java/".length()) + ".c";
         }
-        String subPath = className.substring("java/".length());
-        return NATIVE_BASE_PATH + subPath + ".c";
+        return NATIVE_BASE_PATH + className + ".c";
     }
 
     private boolean hasNativeSupport(String className) {
         String path = getNativeResourcePath(className);
-        if (path == null) return false;
         try (InputStream is = Thread.currentThread().getContextClassLoader().getResourceAsStream(path)) {
             return is != null;
         } catch (IOException e) {
@@ -424,6 +423,12 @@ public class Analyzer implements AnalyzerPort {
         }
     }
 
+    /**
+     * Extracts native C sources for the given system classes, preserving the
+     * directory hierarchy under the temporary directory. For example,
+     * class "jdk/internal/reflect/Reflection" will be extracted to
+     * tempDir/jdk/internal/reflect/Reflection.c.
+     */
     private List<Path> extractSystemNativeSources(Set<String> usedClasses, Path tempDir) throws IOException {
         List<Path> extracted = new ArrayList<>();
         for (String cls : usedClasses) {
@@ -431,10 +436,11 @@ public class Analyzer implements AnalyzerPort {
             String resourcePath = getNativeResourcePath(cls);
             try (InputStream in = Thread.currentThread().getContextClassLoader().getResourceAsStream(resourcePath)) {
                 if (in == null) continue;
-                String fileName = cls.replace('/', '_') + ".c";
-                Path tempFile = tempDir.resolve("jnative_" + fileName);
-                Files.copy(in, tempFile, StandardCopyOption.REPLACE_EXISTING);
-                extracted.add(tempFile);
+                // Build target path preserving the directory structure
+                Path targetPath = tempDir.resolve(cls.replace('/', java.io.File.separatorChar) + ".c");
+                Files.createDirectories(targetPath.getParent());
+                Files.copy(in, targetPath, StandardCopyOption.REPLACE_EXISTING);
+                extracted.add(targetPath);
             }
         }
         return extracted;

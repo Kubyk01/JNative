@@ -156,8 +156,8 @@ public class ReachabilityAnalysis {
 
         ClassNode classNode = resolver.getClassNode(owner);
         if (classNode.isExternal()) {
-            log.debug("External method: {} – skipping body analysis", ref);
-            return;
+            resolver.forceLoadSystemClass(owner);
+            classNode = resolver.getClassNode(owner);
         }
 
         MethodNode method = findMethod(classNode, name, desc);
@@ -170,23 +170,46 @@ public class ReachabilityAnalysis {
             return;
         }
 
+        if (method.getName().equals("<init>")) {
+            MethodReference initRef = new MethodReference(owner, "init", "(Ljava/lang/String;)V");
+            if (!reachableMethods.contains(initRef)) {
+                MethodNode initMethod = findMethod(classNode, "init", "(Ljava/lang/String;)V");
+                if (initMethod != null) {
+                    addMethod(initRef, false);
+                }
+            }
+        }
+
         boolean reachableFromUser = userReachableMethods.contains(ref) || !isSystemClassName(owner);
         parseBytecode(owner, name, desc, reachableFromUser, ref);
     }
 
     private MethodNode findMethod(ClassNode classNode, String name, String desc) {
-        for (MethodNode m : classNode.getMethods()) {
+        Set<MethodNode> candidates = new HashSet<>();
+        collectMethodsRecursive(classNode, candidates);
+        for (MethodNode m : candidates) {
             if (m.getName().equals(name) && m.getDescriptor().equals(desc)) {
                 return m;
             }
         }
-        if (classNode.getSuperName() != null) {
+        return null;
+    }
+
+    private void collectMethodsRecursive(ClassNode classNode, Set<MethodNode> accumulator) {
+        if (classNode == null || classNode.isExternal()) return;
+        accumulator.addAll(classNode.getMethods());
+        if (classNode.getSuperName() != null && !classNode.getSuperName().equals("java/lang/Object")) {
             ClassNode superNode = resolver.getClassNode(classNode.getSuperName());
-            if (superNode != null && !superNode.isExternal()) {
-                return findMethod(superNode, name, desc);
+            if (superNode != null) {
+                collectMethodsRecursive(superNode, accumulator);
             }
         }
-        return null;
+        for (String ifaceName : classNode.getInterfaces()) {
+            ClassNode ifaceNode = resolver.getClassNode(ifaceName);
+            if (ifaceNode != null) {
+                collectMethodsRecursive(ifaceNode, accumulator);
+            }
+        }
     }
 
     private void parseBytecode(String owner, String name, String desc,

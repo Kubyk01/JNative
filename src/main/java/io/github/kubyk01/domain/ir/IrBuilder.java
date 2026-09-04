@@ -70,6 +70,27 @@ public class IrBuilder {
         return inst;
     }
 
+    public Instruction addInstruction(Opcode opcode, Type resultType, Value... operands) {
+        Instruction inst = new Instruction(opcode);
+        for (Value v : operands) {
+            inst.addOperand(v);
+        }
+        if (resultType != null && returnsValue(opcode)) {
+            Temporary tmp = newTemporary(resultType);
+            inst.setResult(tmp);
+            tmp.setDefiningInstruction(inst);
+        } else if (returnsValue(opcode)) {
+            Type inferred = inferResultType(opcode, operands);
+            Temporary tmp = newTemporary(inferred);
+            inst.setResult(tmp);
+            tmp.setDefiningInstruction(inst);
+        }
+        if (currentBlock != null) {
+            currentBlock.addInstruction(inst);
+        }
+        return inst;
+    }
+
     public Instruction createLoad(int localIndex, Type type) {
         Instruction load = new Instruction(Opcode.LOAD);
         load.setLocalIndex(localIndex);
@@ -103,9 +124,45 @@ public class IrBuilder {
                  INSTANCEOF, CHECKCAST,
                  ARRAYLENGTH,
                  ALOAD
-                 -> true;
+                -> true;
             default -> false;
         };
+    }
+
+    /**
+     * Computes a common type for arithmetic operations.
+     * Promotes integer types to int, long, float, or double as needed.
+     */
+    private Type computeCommonArithmeticType(Value... operands) {
+        if (operands == null || operands.length == 0) {
+            return Type.UNKNOWN;
+        }
+        // Determine the widest primitive type among operands
+        boolean hasDouble = false;
+        boolean hasFloat = false;
+        boolean hasLong = false;
+        boolean hasInt = false;
+        // Also check if any operand is a pointer/reference (treat as i64 for arithmetic)
+        boolean hasPointer = false;
+
+        for (Value v : operands) {
+            Type t = v.getType();
+            if (t == Type.DOUBLE) hasDouble = true;
+            else if (t == Type.FLOAT) hasFloat = true;
+            else if (t == Type.LONG) hasLong = true;
+            else if (t == Type.INT || t == Type.SHORT || t == Type.BYTE || t == Type.CHAR || t == Type.BOOLEAN) {
+                hasInt = true;
+            } else if (t.isReference() || t.isArray() || t.isNull() || t.isBlock()) {
+                hasPointer = true;
+            }
+        }
+
+        if (hasDouble) return Type.DOUBLE;
+        if (hasFloat) return Type.FLOAT;
+        if (hasLong) return Type.LONG;
+        if (hasPointer) return Type.LONG;  // treat pointer as i64 for arithmetic (e.g., pointer arith)
+        if (hasInt) return Type.INT;
+        return Type.UNKNOWN;
     }
 
     private Type inferResultType(Opcode op, Value... operands) {
@@ -136,7 +193,7 @@ public class IrBuilder {
             case NEW_ARRAY -> {
                 if (operands.length >= 2 && operands[1] instanceof Constant) {
                     String elemTypeName = ((Constant) operands[1]).getValue().toString();
-                    Type elemType = Type.fromDescriptor(elemTypeName); // handles "int", "java/lang/String", etc.
+                    Type elemType = Type.fromDescriptor(elemTypeName);
                     yield Type.array(elemType);
                 }
                 yield Type.UNKNOWN;
@@ -147,6 +204,11 @@ public class IrBuilder {
                     yield Type.array(desc);
                 }
                 yield Type.UNKNOWN;
+            }
+            case ADD, SUB, MUL, DIV, REM, AND, OR, XOR, SHL, SHR, USHR -> {
+                // Compute the common numeric type
+                Type common = computeCommonArithmeticType(operands);
+                yield common;
             }
             default -> {
                 if (operands.length > 0 && operands[0] != null) {

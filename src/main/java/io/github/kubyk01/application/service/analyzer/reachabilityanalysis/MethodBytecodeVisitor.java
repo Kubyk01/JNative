@@ -144,10 +144,10 @@ public class MethodBytecodeVisitor extends ClassVisitor {
                 int argCount = countArguments(mDesc);
                 List<TypedValue> args = new ArrayList<>();
                 for (int i = 0; i < argCount; i++) {
-                    args.addFirst(simulator.pop()); // reverse order
+                    args.addFirst(simulator.pop());
                 }
                 if (opcode != Opcodes.INVOKESTATIC) {
-                    simulator.pop(); // receiver
+                    simulator.pop();
                 }
                 handleReflectiveCall(owner, mName, mDesc, args);
                 Type retType = TypeResolver.descToReturnType(mDesc);
@@ -156,8 +156,12 @@ public class MethodBytecodeVisitor extends ClassVisitor {
                 }
             } else {
                 String receiverType = simulator.getReceiverType(opcode, mDesc);
+
+                // Всегда добавляем метод для владельца (owner)
+                MethodReference ownerRef = new MethodReference(owner, mName, mDesc);
+                addMethodWithContext(ownerRef, reachableFromUser);
+
                 if (opcode == Opcodes.INVOKEVIRTUAL || opcode == Opcodes.INVOKEINTERFACE) {
-                    Set<String> targets = new HashSet<>();
                     Set<String> candidateTypes = new HashSet<>();
 
                     if (receiverType != null && isConcreteClass(receiverType)) {
@@ -173,26 +177,15 @@ public class MethodBytecodeVisitor extends ClassVisitor {
                         }
                     }
 
-                    for (String cls : candidateTypes) {
-                        if (analysis.getInstantiatedClasses().contains(cls) && isConcreteClass(cls)) {
-                            targets.add(cls);
+                    // Добавляем для всех возможных целевых классов (подклассы и конкретный тип)
+                    for (String target : candidateTypes) {
+                        if (!target.equals(owner)) { // избегаем дублирования
+                            MethodReference ref = new MethodReference(target, mName, mDesc);
+                            addMethodWithContext(ref, reachableFromUser);
                         }
                     }
-                    if (targets.isEmpty() && receiverType != null && isConcreteClass(receiverType)) {
-                        targets.add(receiverType);
-                    }
-                    if (targets.isEmpty()) {
-                        targets.addAll(candidateTypes);
-                    }
-
-                    for (String target : targets) {
-                        MethodReference ref = new MethodReference(target, mName, mDesc);
-                        addMethodWithContext(ref, reachableFromUser);
-                    }
-                } else {
-                    MethodReference ref = new MethodReference(owner, mName, mDesc);
-                    addMethodWithContext(ref, reachableFromUser);
                 }
+                // Для INVOKESPECIAL и INVOKESTATIC мы уже добавили ownerRef выше
                 simulator.visitMethodInsn(opcode, mDesc);
             }
             super.visitMethodInsn(opcode, owner, mName, mDesc, isInterface);

@@ -82,6 +82,12 @@ public class InstructionHandlers {
         frame.push(conv.getResult());
     }
 
+    public void convertTo(Type targetType) {
+        Value val = frame.pop();
+        Instruction conv = builder.addInstruction(Opcode.CAST, targetType, val);
+        frame.push(conv.getResult());
+    }
+
     public void returnValue() {
         Value val = frame.pop();
         builder.createReturn(val);
@@ -147,6 +153,20 @@ public class InstructionHandlers {
         Instruction inst = builder.addInstruction(Opcode.INSTANCEOF, val,
                 new Constant(Type.reference(type), type));
         frame.push(inst.getResult());
+    }
+
+    public void arrayLoad() {
+        Value index = frame.pop();
+        Value array = frame.pop();
+        Instruction inst = builder.addInstruction(Opcode.ALOAD, array, index);
+        frame.push(inst.getResult());
+    }
+
+    public void arrayStore() {
+        Value value = frame.pop();
+        Value index = frame.pop();
+        Value array = frame.pop();
+        builder.addInstruction(Opcode.ASTORE, array, index, value);
     }
 
     public void multiNewArray(String desc, int dims) {

@@ -31,8 +31,8 @@ public class AllocationSite {
                 typeName = "array[" + typeName + "]";
                 type = Type.array(type);
             } else if (op == Opcode.MULTI_NEW_ARRAY) {
-                typeName = "multiarray[" + typeName + "]";
-                type = Type.array(type);
+                type = Type.fromDescriptor(typeName);
+                typeName = type.toString();
             }
         }
         return new AllocationSite(methodName, idx, typeName, type);
