@@ -147,6 +147,34 @@ public class ReachabilityAnalysis {
         log.info("Instantiated classes: {}", instantiatedClasses.size());
     }
 
+    private MethodNode findMethodInHierarchy(ClassNode classNode, String name, String desc, String[] foundClassName) {
+        if (classNode == null || classNode.isExternal()) return null;
+
+        for (MethodNode m : classNode.getMethods()) {
+            if (m.getName().equals(name) && m.getDescriptor().equals(desc)) {
+                if (!m.isAbstract()) {
+                    if (foundClassName != null) foundClassName[0] = classNode.getName();
+                    return m;
+                }
+            }
+        }
+
+        if (classNode.getSuperName() != null && !classNode.getSuperName().equals("java/lang/Object")) {
+            ClassNode superNode = resolver.getClassNode(classNode.getSuperName());
+            MethodNode result = findMethodInHierarchy(superNode, name, desc, foundClassName);
+            if (result != null) return result;
+        }
+
+        for (String iface : classNode.getInterfaces()) {
+            ClassNode ifaceNode = resolver.getClassNode(iface);
+            MethodNode result = findMethodInHierarchy(ifaceNode, name, desc, foundClassName);
+            if (result != null) return result;
+        }
+
+        return null;
+    }
+    // =====================================================
+
     private void processMethod(MethodReference ref) {
         String owner = ref.getOwner();
         String name = ref.getName();
@@ -160,9 +188,22 @@ public class ReachabilityAnalysis {
             classNode = resolver.getClassNode(owner);
         }
 
-        MethodNode method = findMethod(classNode, name, desc);
+        String[] actualOwnerHolder = new String[1];
+        MethodNode method = findMethodInHierarchy(classNode, name, desc, actualOwnerHolder);
+
         if (method == null) {
             log.warn("Method not found in class {}: {}{}", owner, name, desc);
+            return;
+        }
+
+        String actualOwner = actualOwnerHolder[0];
+
+        if (!actualOwner.equals(owner)) {
+            MethodReference actualRef = new MethodReference(actualOwner, name, desc);
+            if (!reachableMethods.contains(actualRef)) {
+                boolean isUser = userReachableMethods.contains(ref);
+                addMethod(actualRef, isUser);
+            }
             return;
         }
 
@@ -170,29 +211,8 @@ public class ReachabilityAnalysis {
             return;
         }
 
-        if (method.getName().equals("<init>")) {
-            MethodReference initRef = new MethodReference(owner, "init", "(Ljava/lang/String;)V");
-            if (!reachableMethods.contains(initRef)) {
-                MethodNode initMethod = findMethod(classNode, "init", "(Ljava/lang/String;)V");
-                if (initMethod != null) {
-                    addMethod(initRef, false);
-                }
-            }
-        }
-
-        boolean reachableFromUser = userReachableMethods.contains(ref) || !isSystemClassName(owner);
-        parseBytecode(owner, name, desc, reachableFromUser, ref);
-    }
-
-    private MethodNode findMethod(ClassNode classNode, String name, String desc) {
-        Set<MethodNode> candidates = new HashSet<>();
-        collectMethodsRecursive(classNode, candidates);
-        for (MethodNode m : candidates) {
-            if (m.getName().equals(name) && m.getDescriptor().equals(desc)) {
-                return m;
-            }
-        }
-        return null;
+        boolean reachableFromUser = userReachableMethods.contains(ref);
+        parseBytecode(actualOwner, name, desc, reachableFromUser, ref);
     }
 
     private void collectMethodsRecursive(ClassNode classNode, Set<MethodNode> accumulator) {

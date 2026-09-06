@@ -85,10 +85,6 @@ public class MethodBytecodeVisitor extends ClassVisitor {
         analysis.addTypeFromDescriptor(desc);
     }
 
-    private boolean isSystemClassName(String className) {
-        return analysis.isSystemClassName(className);
-    }
-
     private class MethodVisitorImpl extends MethodVisitor {
 
         private final TypeSimulator simulator = new TypeSimulator();
@@ -157,7 +153,7 @@ public class MethodBytecodeVisitor extends ClassVisitor {
             } else {
                 String receiverType = simulator.getReceiverType(opcode, mDesc);
 
-                // Всегда добавляем метод для владельца (owner)
+                // Always add the method for the owner
                 MethodReference ownerRef = new MethodReference(owner, mName, mDesc);
                 addMethodWithContext(ownerRef, reachableFromUser);
 
@@ -177,15 +173,15 @@ public class MethodBytecodeVisitor extends ClassVisitor {
                         }
                     }
 
-                    // Добавляем для всех возможных целевых классов (подклассы и конкретный тип)
+                    // Add for all possible target classes (subclasses and the concrete type)
                     for (String target : candidateTypes) {
-                        if (!target.equals(owner)) { // избегаем дублирования
+                        if (!target.equals(owner)) { // avoid duplication
                             MethodReference ref = new MethodReference(target, mName, mDesc);
                             addMethodWithContext(ref, reachableFromUser);
                         }
                     }
                 }
-                // Для INVOKESPECIAL и INVOKESTATIC мы уже добавили ownerRef выше
+                // For INVOKESPECIAL and INVOKESTATIC we already added ownerRef above
                 simulator.visitMethodInsn(opcode, mDesc);
             }
             super.visitMethodInsn(opcode, owner, mName, mDesc, isInterface);
