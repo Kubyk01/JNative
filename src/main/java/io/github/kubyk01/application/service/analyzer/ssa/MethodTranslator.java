@@ -2,6 +2,7 @@ package io.github.kubyk01.application.service.analyzer.ssa;
 
 import io.github.kubyk01.application.service.analyzer.dependencyresolver.DependencyResolver;
 import io.github.kubyk01.application.service.codegen.llvm.LlvmRuntime;
+import io.github.kubyk01.domain.analyzer.dependencyresolver.ClassNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.MethodReference;
 import io.github.kubyk01.domain.ir.BasicBlock;
 import io.github.kubyk01.domain.ir.BranchTerminator;
@@ -40,6 +41,7 @@ public class MethodTranslator extends MethodVisitor {
     private final Map<Integer, Set<BasicBlock>> jsrReturnBlocks = new HashMap<>();
     private final List<IndirectBranchTerminator> indirectBranches = new ArrayList<>();
     private int lambdaCounter = 0;
+    private final DependencyResolver resolver;
 
     @Getter
     private Function currentFunction;
@@ -51,6 +53,7 @@ public class MethodTranslator extends MethodVisitor {
         this.methodRef = methodRef;
         this.isStatic = isStatic;
         this.builder = builder;
+        this.resolver = resolver;
         this.frame = new StackFrame(builder);
         this.tryCatchHandler = new TryCatchHandler(labelToBlock);
         this.handlers = new InstructionHandlers(builder, frame, resolver);
@@ -483,7 +486,13 @@ public class MethodTranslator extends MethodVisitor {
 
     @Override
     public void visitMethodInsn(int opcode, String owner, String name, String desc, boolean isInterface) {
-        handlers.callMethod(opcode, owner, name, desc);
+        // Determine if the called method is polymorphic (has @PolymorphicSignature)
+        boolean isPolymorphic = false;
+        ClassNode targetClass = resolver.getClassNode(owner);
+        if (targetClass != null) {
+            isPolymorphic = targetClass.getPolymorphicMethodNames().contains(name);
+        }
+        handlers.callMethod(opcode, owner, name, desc, isPolymorphic);
     }
 
     @Override
@@ -580,21 +589,15 @@ public class MethodTranslator extends MethodVisitor {
 
     @Override
     public void visitLdcInsn(Object value) {
-        if (value instanceof Integer) {
-            handlers.pushInt((Integer) value);
-        } else if (value instanceof Long) {
-            handlers.pushLong((Long) value);
-        } else if (value instanceof Float) {
-            handlers.pushFloat((Float) value);
-        } else if (value instanceof Double) {
-            handlers.pushDouble((Double) value);
-        } else if (value instanceof String) {
-            frame.push(new Constant(Type.reference("java/lang/String"), value));
-        } else if (value instanceof org.objectweb.asm.Type) {
-            org.objectweb.asm.Type asmType = (org.objectweb.asm.Type) value;
-            frame.push(new Constant(Type.reference(asmType.getInternalName()), asmType.getInternalName()));
-        } else {
-            frame.push(new Constant(Type.UNKNOWN, value));
+        switch (value) {
+            case Integer i -> handlers.pushInt(i);
+            case Long l -> handlers.pushLong(l);
+            case Float v -> handlers.pushFloat(v);
+            case Double v -> handlers.pushDouble(v);
+            case String s -> frame.push(new Constant(Type.reference("java/lang/String"), value));
+            case org.objectweb.asm.Type asmType ->
+                frame.push(new Constant(Type.reference(asmType.getInternalName()), asmType.getInternalName()));
+            case null, default -> frame.push(new Constant(Type.UNKNOWN, value));
         }
     }
 

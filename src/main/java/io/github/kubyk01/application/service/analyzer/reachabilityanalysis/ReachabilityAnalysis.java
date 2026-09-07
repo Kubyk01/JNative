@@ -147,24 +147,41 @@ public class ReachabilityAnalysis {
         log.info("Instantiated classes: {}", instantiatedClasses.size());
     }
 
+    /**
+     * Searches for a method in the class hierarchy.
+     * First tries exact match by name and descriptor.
+     * If not found, looks for a polymorphic method with the same name
+     * (ignoring descriptor) in the current class and its hierarchy.
+     */
     private MethodNode findMethodInHierarchy(ClassNode classNode, String name, String desc, String[] foundClassName) {
-        if (classNode == null || classNode.isExternal()) return null;
+        if (classNode == null) {
+            return null;
+        }
 
+        // First, exact match by name and descriptor in current class
         for (MethodNode m : classNode.getMethods()) {
             if (m.getName().equals(name) && m.getDescriptor().equals(desc)) {
-                if (!m.isAbstract()) {
-                    if (foundClassName != null) foundClassName[0] = classNode.getName();
-                    return m;
-                }
+                if (foundClassName != null) foundClassName[0] = classNode.getName();
+                return m;
             }
         }
 
+        // If not found, look for polymorphic method with same name (ignoring descriptor)
+        for (MethodNode m : classNode.getMethods()) {
+            if (m.getName().equals(name) && m.isPolymorphicSignature()) {
+                if (foundClassName != null) foundClassName[0] = classNode.getName();
+                return m;
+            }
+        }
+
+        // Search in superclass
         if (classNode.getSuperName() != null && !classNode.getSuperName().equals("java/lang/Object")) {
             ClassNode superNode = resolver.getClassNode(classNode.getSuperName());
             MethodNode result = findMethodInHierarchy(superNode, name, desc, foundClassName);
             if (result != null) return result;
         }
 
+        // Search in interfaces
         for (String iface : classNode.getInterfaces()) {
             ClassNode ifaceNode = resolver.getClassNode(iface);
             MethodNode result = findMethodInHierarchy(ifaceNode, name, desc, foundClassName);
@@ -173,7 +190,6 @@ public class ReachabilityAnalysis {
 
         return null;
     }
-    // =====================================================
 
     private void processMethod(MethodReference ref) {
         String owner = ref.getOwner();
@@ -213,23 +229,6 @@ public class ReachabilityAnalysis {
 
         boolean reachableFromUser = userReachableMethods.contains(ref);
         parseBytecode(actualOwner, name, desc, reachableFromUser, ref);
-    }
-
-    private void collectMethodsRecursive(ClassNode classNode, Set<MethodNode> accumulator) {
-        if (classNode == null || classNode.isExternal()) return;
-        accumulator.addAll(classNode.getMethods());
-        if (classNode.getSuperName() != null && !classNode.getSuperName().equals("java/lang/Object")) {
-            ClassNode superNode = resolver.getClassNode(classNode.getSuperName());
-            if (superNode != null) {
-                collectMethodsRecursive(superNode, accumulator);
-            }
-        }
-        for (String ifaceName : classNode.getInterfaces()) {
-            ClassNode ifaceNode = resolver.getClassNode(ifaceName);
-            if (ifaceNode != null) {
-                collectMethodsRecursive(ifaceNode, accumulator);
-            }
-        }
     }
 
     private void parseBytecode(String owner, String name, String desc,

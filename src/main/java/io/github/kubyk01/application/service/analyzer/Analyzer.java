@@ -8,22 +8,24 @@ import io.github.kubyk01.application.service.analyzer.reachabilityanalysis.Reach
 import io.github.kubyk01.application.service.analyzer.ssa.BytecodeToIr;
 import io.github.kubyk01.application.service.analyzer.ssa.SSATransformer;
 import io.github.kubyk01.application.service.codegen.llvm.LlvmGenerator;
+import io.github.kubyk01.application.service.codegen.llvm.nativepolymorphicfunctionresolver.PolymorphicResolver;
 import io.github.kubyk01.application.service.optimizer.Optimizer;
 import io.github.kubyk01.domain.analyzer.aliasanalysis.AliasAnalysisResult;
 import io.github.kubyk01.domain.analyzer.aliasanalysis.AllocationSite;
 import io.github.kubyk01.domain.analyzer.aliasanalysis.FunctionSummary;
 import io.github.kubyk01.domain.analyzer.aliasanalysis.PointsToSet;
+import io.github.kubyk01.domain.analyzer.dependencyresolver.ClassNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.MethodReference;
 import io.github.kubyk01.domain.analyzer.escapeanalysis.EscapeAnalysisResult;
 import io.github.kubyk01.domain.analyzer.escapeanalysis.EscapeStatus;
+import io.github.kubyk01.domain.analyzer.lifetime.DestructionPoint;
+import io.github.kubyk01.domain.analyzer.lifetime.LifetimeAnalysisResult;
+import io.github.kubyk01.domain.ir.BasicBlock;
 import io.github.kubyk01.domain.ir.Function;
 import io.github.kubyk01.domain.ir.Instruction;
 import io.github.kubyk01.domain.ir.Module;
-import io.github.kubyk01.domain.ir.BasicBlock;
 import io.github.kubyk01.domain.ir.Opcode;
 import io.github.kubyk01.domain.ir.Type;
-import io.github.kubyk01.domain.analyzer.lifetime.DestructionPoint;
-import io.github.kubyk01.domain.analyzer.lifetime.LifetimeAnalysisResult;
 import io.github.kubyk01.port.primary.AnalyzerPort;
 import lombok.extern.slf4j.Slf4j;
 
@@ -74,6 +76,25 @@ public class Analyzer implements AnalyzerPort {
             if (isSystemClassName(cls) && hasNativeSupport(cls)) {
                 usedSystemClasses.add(cls);
             }
+        }
+
+        // ---- Load native method registry for polymorphic calls ----
+        // Only load C files for classes that actually contain polymorphic methods.
+        Set<String> polymorphicClasses = new HashSet<>();
+        for (String cls : allClasses) {
+            ClassNode node = resolver.getClassNode(cls);
+            if (node != null && node.getPolymorphicMethodNames() != null && !node.getPolymorphicMethodNames().isEmpty()) {
+                polymorphicClasses.add(cls);
+            }
+        }
+        Set<String> toLoad = new HashSet<>(polymorphicClasses);
+        toLoad.retainAll(usedSystemClasses);
+        PolymorphicResolver polymorphicResolver = new PolymorphicResolver();
+        polymorphicResolver.loadAll(toLoad);
+        if (toLoad.isEmpty()) {
+            log.debug("No polymorphic native methods found; skipping native registry load.");
+        } else {
+            log.debug("Loaded native methods for polymorphic classes: {}", toLoad);
         }
 
         // If includeSystem is false, filter to output only user classes and methods
@@ -257,7 +278,8 @@ public class Analyzer implements AnalyzerPort {
         // --- LLVM IR Generation ---
         System.out.println("\n--- Generating LLVM IR ---");
         LlvmGenerator llvmGen = new LlvmGenerator(module, resolver, aliasResult,
-            entryClass, entryMethod, entryDescriptor, analysis.getReflectInfo());
+            entryClass, entryMethod, entryDescriptor, analysis.getReflectInfo(),
+            polymorphicResolver);
         String llvmIR = llvmGen.generate();
         Path llPath = Paths.get("output.ll");
         try {

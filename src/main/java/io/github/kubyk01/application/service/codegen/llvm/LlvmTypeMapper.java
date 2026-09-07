@@ -14,7 +14,7 @@ public class LlvmTypeMapper {
         return name.replaceAll("[^a-zA-Z0-9_]", "_");
     }
 
-    public String toLlvmType(Type type) {
+    public static String toLlvmType(Type type) {
         if (type.isVoid()) return "void";
         if (type.isPrimitive()) {
             if (type == Type.BOOLEAN) return "i1";
@@ -31,7 +31,7 @@ public class LlvmTypeMapper {
         return "i8*"; // fallback
     }
 
-    public String toLlvmStruct(String className) {
+    public static String toLlvmStruct(String className) {
         return "%struct." + sanitizeIdentifier(className);
     }
 }

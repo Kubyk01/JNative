@@ -2,6 +2,7 @@ package io.github.kubyk01.application.service.codegen.llvm;
 
 import io.github.kubyk01.application.service.analyzer.ssa.GraphUtils;
 import io.github.kubyk01.application.service.analyzer.ssa.TypeResolver;
+import io.github.kubyk01.application.service.codegen.llvm.nativepolymorphicfunctionresolver.PolymorphicResolver;
 import io.github.kubyk01.domain.ir.BasicBlock;
 import io.github.kubyk01.domain.ir.BranchTerminator;
 import io.github.kubyk01.domain.ir.CondBranchTerminator;
@@ -22,10 +23,12 @@ import io.github.kubyk01.domain.ir.ThrowTerminator;
 import io.github.kubyk01.domain.ir.TryCatchRange;
 import io.github.kubyk01.domain.ir.Type;
 import io.github.kubyk01.domain.ir.Value;
+import io.github.kubyk01.util.parserC.ParserC.NativeMethodInfo;
 import lombok.RequiredArgsConstructor;
 
 import java.util.*;
 import java.util.function.Consumer;
+import java.util.stream.Collectors;
 
 import static io.github.kubyk01.util.LlvmUtil.extractCalleeName;
 import static io.github.kubyk01.util.LlvmUtil.extractClassName;
@@ -43,6 +46,7 @@ public class LlvmFunctionEmitter {
     private final Module module;
     private final LlvmTypeMapper typeMapper;
     private final LlvmGlobalEmitter globalEmitter;
+    private final PolymorphicResolver polymorphicResolver;
 
     private final LlvmValueMapper valueMapper = new LlvmValueMapper();
     private int tmpCounter = 0;
@@ -321,7 +325,6 @@ public class LlvmFunctionEmitter {
                 Value right = inst.getOperands().get(1);
                 Type resType = inst.getResult().getType();
 
-                // Division/remainder by zero check (only for int/long)
                 if ((op == Opcode.DIV || op == Opcode.REM) && !ranges.isEmpty()) {
                     Type lt = left.getType();
                     if (lt == Type.INT || lt == Type.LONG) {
@@ -334,7 +337,6 @@ public class LlvmFunctionEmitter {
                 boolean isBitwise = (op == Opcode.AND || op == Opcode.OR || op == Opcode.XOR || op == Opcode.SHL || op == Opcode.SHR || op == Opcode.USHR);
                 boolean anyPtr = leftIsPtr || rightIsPtr || resType.isReference() || resType.isArray() || resType.isNull() || resType.isBlock();
 
-                // Bitwise operations involving pointers: convert to i64, perform bitwise op, cast back
                 if (isBitwise && (leftIsPtr || rightIsPtr)) {
                     Type intType = Type.LONG;
                     String lInt = castValueToType(sb, getLlvmValue(left), left.getType(), intType);
@@ -351,7 +353,6 @@ public class LlvmFunctionEmitter {
                     break;
                 }
 
-                // Non‑bitwise arithmetic with pointers: convert both to i64, perform op, cast back
                 if (!isBitwise && anyPtr) {
                     String lInt = castValueToType(sb, getLlvmValue(left), left.getType(), Type.LONG);
                     String rInt = castValueToType(sb, getLlvmValue(right), right.getType(), Type.LONG);
@@ -366,7 +367,6 @@ public class LlvmFunctionEmitter {
                     break;
                 }
 
-                // Normal arithmetic (both operands are integers or floats)
                 String l = castValueToType(sb, getLlvmValue(left), left.getType(), resType);
                 String r = castValueToType(sb, getLlvmValue(right), right.getType(), resType);
                 String llvmOp = mapArithOp(op, resType);
@@ -386,38 +386,31 @@ public class LlvmFunctionEmitter {
                 boolean leftIsPtr = leftType.isReference() || leftType.isArray() || leftType.isNull() || leftType.isBlock();
                 boolean rightIsPtr = rightType.isReference() || rightType.isArray() || rightType.isNull() || rightType.isBlock();
 
-                // Replace integer 0 with null for pointer comparisons
                 if (leftIsPtr && "0".equals(r)) { r = "null"; }
                 if (rightIsPtr && "0".equals(l)) { l = "null"; }
 
-                // Handle mixed pointer/integer comparison: cast both to i64
                 if ((leftIsPtr && !rightIsPtr) || (!leftIsPtr && rightIsPtr)) {
                     l = castValueToType(sb, l, leftType, Type.LONG);
                     r = castValueToType(sb, r, rightType, Type.LONG);
                     leftType = Type.LONG;
                 } else if (!leftIsPtr && !rightIsPtr) {
-                    // Both are non-pointers
                     boolean leftIsFloat = leftType == Type.FLOAT || leftType == Type.DOUBLE;
                     boolean rightIsFloat = rightType == Type.FLOAT || rightType == Type.DOUBLE;
                     boolean leftIsInt = isIntegerType(leftType);
                     boolean rightIsInt = isIntegerType(rightType);
 
                     if ((leftIsFloat && rightIsInt) || (leftIsInt && rightIsFloat)) {
-                        // Convert integer to float
                         if (leftIsInt && rightIsFloat) {
                             l = castValueToType(sb, l, leftType, rightType);
                             leftType = rightType;
                         } else if (leftIsFloat && rightIsInt) {
                             r = castValueToType(sb, r, rightType, leftType);
-                            // leftType remains float
                         }
                     } else if (leftIsInt && rightIsInt) {
-                        // Both integers: promote to i64 to unify types
                         l = castValueToType(sb, l, leftType, Type.LONG);
                         r = castValueToType(sb, r, rightType, Type.LONG);
                         leftType = Type.LONG;
                     } else if (!leftType.equals(rightType)) {
-                        // Fallback: cast right to left type
                         r = castValueToType(sb, r, rightType, leftType);
                     }
                 }
@@ -447,7 +440,6 @@ public class LlvmFunctionEmitter {
                 int offset = globalEmitter.getFieldOffset(extractClassName(base), fieldName);
                 emitNullCheck(sb, base, ranges);
                 String baseI8 = newAux("base_i8");
-                // Use inttoptr if the base is an integer, bitcast otherwise
                 String baseTypeLlvm = typeMapper.toLlvmType(base.getType());
                 String castOp = baseTypeLlvm.endsWith("*") ? "bitcast" : "inttoptr";
                 sb.append("  ").append(baseI8).append(" = ").append(castOp)
@@ -490,7 +482,6 @@ public class LlvmFunctionEmitter {
                     }
                     String fieldLlvm = typeMapper.toLlvmType(fieldType);
                     String rhsRef = getLlvmValue(rhs);
-                    // Convert RHS to the field type (handles 0 -> null for pointers)
                     String rhsConverted = castValueToType(sb, rhsRef, rhs.getType(), fieldType);
                     sb.append("  ").append(ptrCast).append(" = bitcast i8* ").append(gep)
                         .append(" to ").append(fieldLlvm).append("*\n");
@@ -517,7 +508,6 @@ public class LlvmFunctionEmitter {
                     String fieldName = extractFieldName(inst);
                     String globalName = "gv_" + LlvmTypeMapper.sanitizeIdentifier(fieldName);
                     String rhsRef = getLlvmValue(rhs);
-                    // Use the RHS type as the target type; castValueToType will convert 0 to null if needed.
                     String rhsConverted = castValueToType(sb, rhsRef, rhs.getType(), rhs.getType());
                     String llvmType = typeMapper.toLlvmType(rhs.getType());
                     sb.append("  store ").append(llvmType).append(" ").append(rhsConverted)
@@ -537,7 +527,6 @@ public class LlvmFunctionEmitter {
 
                 String calleeName = ((Constant) calleeConst).getValue().toString();
 
-                // Extract the method signature: owner.methodName(descriptor)
                 int dotIdx = calleeName.lastIndexOf('.');
                 if (dotIdx < 0) break;
                 String owner = calleeName.substring(0, dotIdx);
@@ -549,59 +538,90 @@ public class LlvmFunctionEmitter {
 
                 Type retType = inst.getResult() != null ? inst.getResult().getType() : Type.VOID;
 
-                // Check for a native implementation first
+                // Polymorphic signature?
+                if (inst.isPolymorphicSignature()) {
+                    // Collect all arguments (including receiver)
+                    List<Value> allArgs = new ArrayList<>();
+                    allArgs.add(receiver);
+                    for (int i = 2; i < operands.size(); i++) {
+                        allArgs.add(operands.get(i));
+                    }
+
+                    // Exclude receiver from descriptor (first argument)
+                    List<Value> argsWithoutReceiver = allArgs.subList(1, allArgs.size());
+                    List<Type> paramTypes = argsWithoutReceiver.stream()
+                        .map(Value::getType)
+                        .collect(Collectors.toList());
+
+                    NativeMethodInfo best = polymorphicResolver.findBestMatch(owner, methodName, retType, paramTypes);
+                    if (best != null) {
+                        String expectedDesc = buildDescriptor(retType, paramTypes);
+                        if (expectedDesc.equals(best.getDescriptor())) {
+                            // Exact match – call native function with arguments without receiver
+                            String funcName = best.getFullFunctionName();
+                            Function func = ensurePolymorphicFunctionDeclared(best);
+                            StringBuilder argList = new StringBuilder();
+                            for (int i = 0; i < argsWithoutReceiver.size(); i++) {
+                                if (i > 0) argList.append(", ");
+                                Value arg = argsWithoutReceiver.get(i);
+                                Type paramType = (func != null && i < func.getParameters().size())
+                                    ? func.getParameters().get(i).getType()
+                                    : arg.getType();
+                                String val = castValueToType(sb, getLlvmValue(arg), arg.getType(), paramType);
+                                argList.append(typeMapper.toLlvmType(paramType)).append(" ").append(val);
+                            }
+                            emitCall(sb, retType, resultName, "@" + funcName, argList.toString(), ranges);
+                            break;
+                        } else {
+                            // Not exact – generic call via void** (pass all arguments including receiver)
+                            emitPolymorphicCall(sb, allArgs, best, retType, paramTypes, ranges, resultName);
+                            break;
+                        }
+                    }
+                }
+
+                // Regular (non-polymorphic) virtual call
+                // Check for native implementation
                 String nativeCandidate = "__jnative_" + LlvmRuntime.mangleCallable(calleeName);
                 Function nativeFunc = module.getFunction(nativeCandidate);
                 if (nativeFunc != null) {
-                    // Native call: we have the function declaration; use its parameter types
                     List<Value> args = new ArrayList<>();
                     args.add(receiver);
                     for (int i = 2; i < operands.size(); i++) {
                         args.add(operands.get(i));
                     }
-
-                    // Build argument list with casts to native function parameter types
                     StringBuilder argList = new StringBuilder();
                     for (int i = 0; i < args.size(); i++) {
                         if (i > 0) argList.append(", ");
                         Value arg = args.get(i);
-                        Type paramType;
-                        if (i < nativeFunc.getParameters().size()) {
-                            paramType = nativeFunc.getParameters().get(i).getType();
-                        } else {
-                            paramType = arg.getType(); // fallback
-                        }
+                        Type paramType = (i < nativeFunc.getParameters().size())
+                            ? nativeFunc.getParameters().get(i).getType()
+                            : arg.getType();
                         String val = castValueToType(sb, getLlvmValue(arg), arg.getType(), paramType);
-                        argList.append(typeMapper.toLlvmType(paramType))
-                            .append(" ").append(val);
+                        argList.append(typeMapper.toLlvmType(paramType)).append(" ").append(val);
                     }
                     emitCall(sb, retType, resultName, "@" + nativeCandidate, argList.toString(), ranges);
                     break;
                 }
 
-                // Parse parameter types from the descriptor
+                // Otherwise – via virtual table
                 List<Type> paramTypes = TypeResolver.descToParamTypes(methodDesc);
-                Type receiverType = Type.reference(owner); // For the receiver
-
-                // Build the list of all arguments (receiver + actual args)
+                Type receiverType = Type.reference(owner);
                 List<Value> allArgs = new ArrayList<>();
                 allArgs.add(receiver);
                 for (int i = 2; i < operands.size(); i++) {
                     allArgs.add(operands.get(i));
                 }
 
-                // If the receiver is not a reference (i.e., it's an integer or primitive),
-                // we cannot do a vtable lookup; fall back to a direct call.
+                // If receiver is not a reference type – call as static function (fallback)
                 boolean receiverIsRef = receiver.getType().isReference()
                     || receiver.getType().isArray()
                     || receiver.getType().isNull()
                     || receiver.getType().isBlock();
                 if (!receiverIsRef) {
-                    // Direct call: declare the function and call it
                     ensureFunctionDeclared(owner, methodName, methodDesc);
                     String funcName = LlvmRuntime.mangleMethod(owner, methodName, methodDesc);
                     Function func = module.getFunction(funcName);
-                    // Build argument list with casts to the function's parameter types (if available)
                     StringBuilder argList = new StringBuilder();
                     for (int i = 0; i < allArgs.size(); i++) {
                         if (i > 0) argList.append(", ");
@@ -610,23 +630,21 @@ public class LlvmFunctionEmitter {
                         if (func != null && i < func.getParameters().size()) {
                             paramType = func.getParameters().get(i).getType();
                         } else {
-                            // Fallback: for i==0, use receiverType; else use paramTypes[i-1] or arg type
                             if (i == 0) paramType = receiverType;
                             else if (i - 1 < paramTypes.size()) paramType = paramTypes.get(i - 1);
                             else paramType = arg.getType();
                         }
                         String val = castValueToType(sb, getLlvmValue(arg), arg.getType(), paramType);
-                        argList.append(typeMapper.toLlvmType(paramType))
-                            .append(" ").append(val);
+                        argList.append(typeMapper.toLlvmType(paramType)).append(" ").append(val);
                     }
                     emitCall(sb, retType, resultName, "@" + funcName, argList.toString(), ranges);
                     break;
                 }
 
-                // Vtable dispatch
+                // Get method index in virtual table
                 int idx = globalEmitter.getMethodIndex(sig);
                 if (idx < 0) {
-                    // Fallback: direct call (if the method is not in the vtable)
+                    // If index not found – use direct declaration
                     ensureFunctionDeclared(owner, methodName, methodDesc);
                     String funcName = LlvmRuntime.mangleMethod(owner, methodName, methodDesc);
                     Function func = module.getFunction(funcName);
@@ -643,17 +661,13 @@ public class LlvmFunctionEmitter {
                             else paramType = arg.getType();
                         }
                         String val = castValueToType(sb, getLlvmValue(arg), arg.getType(), paramType);
-                        argList.append(typeMapper.toLlvmType(paramType))
-                            .append(" ").append(val);
+                        argList.append(typeMapper.toLlvmType(paramType)).append(" ").append(val);
                     }
                     emitCall(sb, retType, resultName, "@" + funcName, argList.toString(), ranges);
                     break;
                 }
 
-                // Null check on receiver
                 emitNullCheck(sb, receiver, ranges);
-
-                // Load vtable and function pointer
                 String receiverRef = getLlvmValue(receiver);
                 String vtSlotPtr = newAux("vtslot");
                 sb.append("  ").append(vtSlotPtr).append(" = bitcast ")
@@ -661,36 +675,26 @@ public class LlvmFunctionEmitter {
                     .append(" to i8**\n");
                 String vtableLoad = newAux("vtable_load");
                 sb.append("  ").append(vtableLoad).append(" = load i8*, i8** ").append(vtSlotPtr).append("\n");
-
                 String funcPtrGep = newAux("funcptr_gep");
                 sb.append("  ").append(funcPtrGep).append(" = getelementptr i8*, i8* ").append(vtableLoad)
                     .append(", i32 ").append(idx).append("\n");
                 String funcPtr = newAux("funcptr");
                 sb.append("  ").append(funcPtr).append(" = load i8*, i8* ").append(funcPtrGep).append("\n");
-
                 String funcType = LlvmRuntime.getFunctionType(sig, typeMapper);
                 String funcPtrCast = newAux("fptrcast");
                 sb.append("  ").append(funcPtrCast).append(" = bitcast i8* ").append(funcPtr)
                     .append(" to ").append(funcType).append("\n");
-
-                // Build argument list with casts to the expected parameter types
                 StringBuilder argList = new StringBuilder();
                 for (int i = 0; i < allArgs.size(); i++) {
                     if (i > 0) argList.append(", ");
                     Value arg = allArgs.get(i);
                     Type paramType;
-                    if (i == 0) {
-                        paramType = receiverType;
-                    } else if (i - 1 < paramTypes.size()) {
-                        paramType = paramTypes.get(i - 1);
-                    } else {
-                        paramType = arg.getType();
-                    }
+                    if (i == 0) paramType = receiverType;
+                    else if (i - 1 < paramTypes.size()) paramType = paramTypes.get(i - 1);
+                    else paramType = arg.getType();
                     String val = castValueToType(sb, getLlvmValue(arg), arg.getType(), paramType);
-                    argList.append(typeMapper.toLlvmType(paramType))
-                        .append(" ").append(val);
+                    argList.append(typeMapper.toLlvmType(paramType)).append(" ").append(val);
                 }
-
                 emitCall(sb, retType, resultName, funcPtrCast, argList.toString(), ranges);
                 break;
             }
@@ -700,15 +704,59 @@ public class LlvmFunctionEmitter {
                 String calleeName = extractCalleeName(inst);
                 if (calleeName == null) break;
 
+                // Polymorphic signature?
+                if (inst.isPolymorphicSignature()) {
+                    int dotIdx = calleeName.lastIndexOf('.');
+                    int parenIdx = calleeName.indexOf('(');
+                    if (dotIdx > 0 && parenIdx > dotIdx) {
+                        String owner = calleeName.substring(0, dotIdx);
+                        String methodPart = calleeName.substring(dotIdx + 1);
+                        int localParenIdx = parenIdx - dotIdx - 1;
+                        String methodName = methodPart.substring(0, localParenIdx);
+
+                        Type retType = inst.getResult() != null ? inst.getResult().getType() : Type.VOID;
+                        List<Value> args = getCallArguments(inst);
+                        // For static call there is no receiver – all arguments are method parameters
+                        List<Type> paramTypes = args.stream().map(Value::getType).collect(Collectors.toList());
+
+                        NativeMethodInfo best = polymorphicResolver.findBestMatch(owner, methodName, retType, paramTypes);
+                        if (best != null) {
+                            String expectedDesc = buildDescriptor(retType, paramTypes);
+                            if (expectedDesc.equals(best.getDescriptor())) {
+                                String funcName = best.getFullFunctionName();
+                                Function func = ensurePolymorphicFunctionDeclared(best);
+                                StringBuilder argList = new StringBuilder();
+                                for (int i = 0; i < args.size(); i++) {
+                                    if (i > 0) argList.append(", ");
+                                    Value arg = args.get(i);
+                                    Type paramType = (func != null && i < func.getParameters().size())
+                                        ? func.getParameters().get(i).getType()
+                                        : arg.getType();
+                                    String val = castValueToType(sb, getLlvmValue(arg), arg.getType(), paramType);
+                                    argList.append(typeMapper.toLlvmType(paramType)).append(" ").append(val);
+                                }
+                                emitCall(sb, retType, resultName, "@" + funcName, argList.toString(), ranges);
+                                break;
+                            } else {
+                                emitPolymorphicCall(sb, args, best, retType, paramTypes, ranges, resultName);
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // Regular static call
                 Function calleeFunc = module.getFunction(calleeName);
                 String mangledCallee;
                 if (calleeFunc != null) {
                     mangledCallee = calleeFunc.getName();
                 } else {
+                    // Check for native implementation
                     String nativeCandidate = "__jnative_" + LlvmRuntime.mangleCallable(calleeName);
                     if (module.getFunction(nativeCandidate) != null) {
                         mangledCallee = nativeCandidate;
                     } else {
+                        // Try to declare function if not loaded
                         int dotIdx = calleeName.lastIndexOf('.');
                         int parenIdx = calleeName.indexOf('(');
                         if (dotIdx > 0 && parenIdx > dotIdx) {
@@ -725,8 +773,7 @@ public class LlvmFunctionEmitter {
 
                 List<Value> args = getCallArguments(inst);
 
-                // Adjust for static calls: if the callee function has fewer parameters than args,
-                // and the first arg is a reference while the first parameter is not, remove it.
+                // Adjust arguments if function is already known
                 if (calleeFunc != null) {
                     int expected = calleeFunc.getParameters().size();
                     if (args.size() > expected) {
@@ -746,7 +793,6 @@ public class LlvmFunctionEmitter {
                     }
                 }
 
-                // Build argument list with casts to expected parameter types
                 StringBuilder argList = new StringBuilder();
                 for (int i = 0; i < args.size(); i++) {
                     if (i > 0) argList.append(", ");
@@ -755,11 +801,10 @@ public class LlvmFunctionEmitter {
                     if (calleeFunc != null && i < calleeFunc.getParameters().size()) {
                         paramType = calleeFunc.getParameters().get(i).getType();
                     } else {
-                        paramType = arg.getType(); // fallback
+                        paramType = arg.getType();
                     }
                     String val = castValueToType(sb, getLlvmValue(arg), arg.getType(), paramType);
-                    argList.append(typeMapper.toLlvmType(paramType))
-                        .append(" ").append(val);
+                    argList.append(typeMapper.toLlvmType(paramType)).append(" ").append(val);
                 }
 
                 Type retType = inst.getResult() != null ? inst.getResult().getType() : Type.VOID;
@@ -774,6 +819,54 @@ public class LlvmFunctionEmitter {
                 if (!(calleeConst instanceof Constant)) break;
                 String calleeName = ((Constant) calleeConst).getValue().toString();
 
+                // Polymorphic signature?
+                if (inst.isPolymorphicSignature()) {
+                    int dotIdx = calleeName.lastIndexOf('.');
+                    int parenIdx = calleeName.indexOf('(');
+                    if (dotIdx > 0 && parenIdx > dotIdx) {
+                        String owner = calleeName.substring(0, dotIdx);
+                        String methodPart = calleeName.substring(dotIdx + 1);
+                        int localParenIdx = parenIdx - dotIdx - 1;
+                        String methodName = methodPart.substring(0, localParenIdx);
+
+                        List<Value> allArgs = new ArrayList<>();
+                        allArgs.add(receiver);
+                        for (int i = 2; i < inst.getOperands().size(); i++) {
+                            allArgs.add(inst.getOperands().get(i));
+                        }
+
+                        // Exclude receiver for descriptor
+                        List<Value> argsWithoutReceiver = allArgs.subList(1, allArgs.size());
+                        Type retType = inst.getResult() != null ? inst.getResult().getType() : Type.VOID;
+                        List<Type> paramTypes = argsWithoutReceiver.stream().map(Value::getType).collect(Collectors.toList());
+
+                        NativeMethodInfo best = polymorphicResolver.findBestMatch(owner, methodName, retType, paramTypes);
+                        if (best != null) {
+                            String expectedDesc = buildDescriptor(retType, paramTypes);
+                            if (expectedDesc.equals(best.getDescriptor())) {
+                                String funcName = best.getFullFunctionName();
+                                Function func = ensurePolymorphicFunctionDeclared(best);
+                                StringBuilder argList = new StringBuilder();
+                                for (int i = 0; i < argsWithoutReceiver.size(); i++) {
+                                    if (i > 0) argList.append(", ");
+                                    Value arg = argsWithoutReceiver.get(i);
+                                    Type paramType = (func != null && i < func.getParameters().size())
+                                        ? func.getParameters().get(i).getType()
+                                        : arg.getType();
+                                    String val = castValueToType(sb, getLlvmValue(arg), arg.getType(), paramType);
+                                    argList.append(typeMapper.toLlvmType(paramType)).append(" ").append(val);
+                                }
+                                emitCall(sb, retType, resultName, "@" + funcName, argList.toString(), ranges);
+                                break;
+                            } else {
+                                emitPolymorphicCall(sb, allArgs, best, retType, paramTypes, ranges, resultName);
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // Regular special call (constructor or super)
                 Function calleeFunc = module.getFunction(calleeName);
                 String mangledCallee;
                 if (calleeFunc != null) {
@@ -803,7 +896,6 @@ public class LlvmFunctionEmitter {
                     args.add(inst.getOperands().get(i));
                 }
 
-                // Build argument list with casts
                 StringBuilder argList = new StringBuilder();
                 for (int i = 0; i < args.size(); i++) {
                     if (i > 0) argList.append(", ");
@@ -815,8 +907,7 @@ public class LlvmFunctionEmitter {
                         paramType = arg.getType();
                     }
                     String val = castValueToType(sb, getLlvmValue(arg), arg.getType(), paramType);
-                    argList.append(typeMapper.toLlvmType(paramType))
-                        .append(" ").append(val);
+                    argList.append(typeMapper.toLlvmType(paramType)).append(" ").append(val);
                 }
 
                 Type retType = inst.getResult() != null ? inst.getResult().getType() : Type.VOID;
@@ -1099,8 +1190,6 @@ public class LlvmFunctionEmitter {
                 ResolvedCall call = dynInfo.resolvedCall();
                 if (call == null) {
                     sb.append("  ; unresolved invokedynamic\n");
-                    // If the result is unused - do nothing,
-                    // otherwise map it to null (valid LLVM constant)
                     if (inst.getResult() != null) {
                         valueMapper.setValue(inst.getResult(), "null");
                     }
@@ -1129,7 +1218,99 @@ public class LlvmFunctionEmitter {
         return sb.toString();
     }
 
-    // ----- Lambda / invokedynamic helpers -----
+    // ----- Helper methods for polymorphic calls -----
+
+    /**
+     * Generates a call to a polymorphic native function with argument packing into void**.
+     */
+    private void emitPolymorphicCall(StringBuilder sb, List<Value> args,
+                                     NativeMethodInfo best, Type retType,
+                                     List<Type> paramTypes, List<TryCatchRange> ranges,
+                                     String resultName) {
+        String arrayAlloc = newAux("poly_args");
+        int argCount = args.size();
+        sb.append("  ").append(arrayAlloc).append(" = alloca i8*, i32 ").append(argCount).append("\n");
+
+        for (int i = 0; i < argCount; i++) {
+            Value arg = args.get(i);
+            String val = getLlvmValue(arg);
+            String ptr;
+
+            if (arg.getType().isPrimitive()) {
+                String alloc = newAux("arg_alloc");
+                String ty = typeMapper.toLlvmType(arg.getType());
+                sb.append("  ").append(alloc).append(" = alloca ").append(ty).append("\n");
+                sb.append("  store ").append(ty).append(" ").append(val).append(", ").append(ty).append("* ").append(alloc).append("\n");
+                String cast = newAux("arg_cast");
+                sb.append("  ").append(cast).append(" = bitcast ").append(ty).append("* ").append(alloc).append(" to i8*\n");
+                ptr = cast;
+            } else {
+                String cast = newAux("arg_cast");
+                sb.append("  ").append(cast).append(" = bitcast ").append(typeMapper.toLlvmType(arg.getType()))
+                    .append(" ").append(val).append(" to i8*\n");
+                ptr = cast;
+            }
+
+            String slot = newAux("slot");
+            sb.append("  ").append(slot).append(" = getelementptr i8*, i8** ").append(arrayAlloc).append(", i32 ").append(i).append("\n");
+            sb.append("  store i8* ").append(ptr).append(", i8** ").append(slot).append("\n");
+        }
+
+        String funcName = best.getFullFunctionName();
+        ensurePolymorphicFunctionDeclared(best);
+
+        String retLlvm = typeMapper.toLlvmType(retType);
+        if (!retType.isVoid()) {
+            sb.append("  ").append(resultName).append(" = call ").append(retLlvm)
+                .append(" @").append(funcName).append("(i8** ").append(arrayAlloc).append(")\n");
+        } else {
+            sb.append("  call void @").append(funcName).append("(i8** ").append(arrayAlloc).append(")\n");
+        }
+    }
+
+    private Function ensurePolymorphicFunctionDeclared(NativeMethodInfo info) {
+        String funcName = info.getFullFunctionName();
+        Function func = module.getFunction(funcName);
+        if (func != null) return func;
+
+        String desc = info.getDescriptor();
+        Type retType = Type.fromDescriptor(desc.substring(desc.lastIndexOf(')') + 1));
+        List<Type> paramTypes = TypeResolver.descToParamTypes(desc);
+
+        Function newFunc = new Function(funcName, retType);
+        for (int i = 0; i < paramTypes.size(); i++) {
+            newFunc.addParameter(new Parameter(paramTypes.get(i), i));
+        }
+        module.addFunction(newFunc);
+        return newFunc;
+    }
+
+    private String buildDescriptor(Type returnType, List<Type> paramTypes) {
+        StringBuilder sb = new StringBuilder();
+        sb.append('(');
+        for (Type pt : paramTypes) {
+            sb.append(typeToDescriptorChar(pt));
+        }
+        sb.append(')');
+        sb.append(typeToDescriptorChar(returnType));
+        return sb.toString();
+    }
+
+    private char typeToDescriptorChar(Type type) {
+        if (type == Type.VOID) return 'V';
+        if (type == Type.BOOLEAN) return 'Z';
+        if (type == Type.BYTE) return 'B';
+        if (type == Type.SHORT) return 'S';
+        if (type == Type.CHAR) return 'C';
+        if (type == Type.INT) return 'I';
+        if (type == Type.LONG) return 'J';
+        if (type == Type.FLOAT) return 'F';
+        if (type == Type.DOUBLE) return 'D';
+        if (type.isReference()) return 'L';
+        if (type.isArray()) return '[';
+        return 'L';
+    }
+
 
     private void emitLambdaCreation(StringBuilder sb, Instruction inst, ResolvedCall call, String resultName) {
         String lambdaId = call.getLambdaStructName();
@@ -1140,19 +1321,15 @@ public class LlvmFunctionEmitter {
         String adaptorName = "adaptor_" + lambdaId;
         String vtableName = globalEmitter.registerLambdaVtable(lambdaId, adaptorName);
 
-        // Memory allocation
         String allocSize = newAux("lambda_alloc_size");
         sb.append("  ").append(allocSize).append(" = call i64 @llvm.objectsize.i64.p0i8(i8* null, i1 true)\n");
         String alloc = newAux("lambda_alloc");
         sb.append("  ").append(alloc).append(" = call i8* @malloc(i64 ").append(allocSize).append(")\n");
 
-        String objPtr;
-        // If the result is unused, still create the object (but it may be optimized)
-        objPtr = Objects.requireNonNullElseGet(resultName, () -> newAux("lambda_obj"));
+        String objPtr = Objects.requireNonNullElseGet(resultName, () -> newAux("lambda_obj"));
         sb.append("  ").append(objPtr).append(" = bitcast i8* ").append(alloc)
             .append(" to ").append(structName).append("*\n");
 
-        // Set vtable (first field)
         String vtablePtr = newAux("vtable_ptr");
         sb.append("  ").append(vtablePtr).append(" = bitcast [1 x i8*]* ").append(vtableName).append(" to i8*\n");
         String objVtable = newAux("obj_vtable_slot");
@@ -1160,7 +1337,6 @@ public class LlvmFunctionEmitter {
             .append("* ").append(objPtr).append(" to i8**\n");
         sb.append("  store i8* ").append(vtablePtr).append(", i8** ").append(objVtable).append("\n");
 
-        // Fill captured fields (offset 8 - after vtable)
         int offset = 8;
         for (Value cap : captured) {
             String fieldLlvm = typeMapper.toLlvmType(cap.getType());
@@ -1236,8 +1412,6 @@ public class LlvmFunctionEmitter {
         emitThrowHelper(sb, "@__jnative_throw_arithmetic_exception", ranges);
         sb.append(cont).append(":\n");
     }
-
-    // ----- Exception model based on setjmp/longjmp -----
 
     private void emitTryGuard(StringBuilder sb,
                               List<TryCatchRange> ranges,
@@ -1419,8 +1593,7 @@ public class LlvmFunctionEmitter {
         return sb.toString();
     }
 
-    // ----- Helper methods -----
-
+    // ----- Remaining helper methods (unchanged) -----
     private String mapArithOp(Opcode op, Type type) {
         boolean isFloat = type == Type.FLOAT || type == Type.DOUBLE;
         return switch (op) {
@@ -1466,23 +1639,19 @@ public class LlvmFunctionEmitter {
     private String getCastOp(Type src, Type dest) {
         if (src.equals(dest)) return null;
 
-        // Reference / array / null → bitcast
         if ((src.isReference() || src.isArray() || src.isNull()) &&
             (dest.isReference() || dest.isArray() || dest.isNull())) {
             return "bitcast";
         }
 
-        // Integer → pointer
         if (isIntegerType(src) && (dest.isReference() || dest.isArray() || dest.isNull() || dest.isBlock())) {
             return "inttoptr";
         }
 
-        // Pointer → integer
         if ((src.isReference() || src.isArray() || src.isNull() || src.isBlock()) && isIntegerType(dest)) {
             return "ptrtoint";
         }
 
-        // Primitive conversions
         if (src.isPrimitive() && dest.isPrimitive()) {
             boolean srcInt = isIntegerType(src);
             boolean destInt = isIntegerType(dest);
@@ -1511,7 +1680,6 @@ public class LlvmFunctionEmitter {
             if (src == Type.DOUBLE && dest == Type.FLOAT) return "fptrunc";
         }
 
-        // Fallback
         return "bitcast";
     }
 
@@ -1588,29 +1756,23 @@ public class LlvmFunctionEmitter {
     }
 
     private String castValueToType(StringBuilder sb, String value, Type fromType, Type toType) {
-        // Determine if the source value is a pointer type (by Type or by LLVM type string)
         boolean fromIsPtr = fromType.isReference() || fromType.isArray() || fromType.isNull() || fromType.isBlock();
         String fromLlvm = typeMapper.toLlvmType(fromType);
         if (!fromIsPtr && fromLlvm.endsWith("*")) {
             fromIsPtr = true;
         }
 
-        // If the value is "0" and the source is a pointer, treat it as null
         if ("0".equals(value) && fromIsPtr) {
             value = "null";
         }
 
-        // Convert integer zero to null when target is a pointer type
         if ("0".equals(value) && (toType.isReference() || toType.isArray() || toType.isNull() || toType.isBlock())) {
             return "null";
         }
-        // Convert null to zero when target is an integer type
         if ("null".equals(value) && isIntegerType(toType)) {
             return "0";
         }
 
-        // If the value is a floating-point literal that represents a whole number
-        // and the target type is integer, convert the literal to an integer literal.
         if (value.matches("-?\\d+\\.0") && (toType == Type.INT || toType == Type.LONG || toType == Type.BYTE ||
             toType == Type.SHORT || toType == Type.CHAR || toType == Type.BOOLEAN)) {
             return value.substring(0, value.indexOf('.'));
@@ -1627,7 +1789,6 @@ public class LlvmFunctionEmitter {
         boolean fromFloat = fromType == Type.FLOAT || fromType == Type.DOUBLE;
         boolean toFloat = toType == Type.FLOAT || toType == Type.DOUBLE;
 
-        // ---- Float ↔ Pointer conversions ----
         if (fromFloat && toPtr) {
             String intCast = newAux("float_to_i64");
             String fptosiOp = fromType == Type.FLOAT ? "fptosi" : "fptosi";
@@ -1652,7 +1813,6 @@ public class LlvmFunctionEmitter {
             return floatCast;
         }
 
-        // ---- Normal casts ----
         String castOp;
 
         if (fromIsPtr && toInt) {
@@ -1690,7 +1850,6 @@ public class LlvmFunctionEmitter {
             castOp = "bitcast";
         }
 
-        // Final safety net: if it's still bitcast but types are pointer/integer, correct it
         if (castOp.equals("bitcast")) {
             if (fromIsPtr && toInt) {
                 castOp = "ptrtoint";
@@ -1708,16 +1867,14 @@ public class LlvmFunctionEmitter {
     }
 
     private void ensureFunctionDeclared(String owner, String methodName, String descriptor) {
-        // Use the same mangling as the call site (fallback path)
         String mangled = LlvmRuntime.mangleMethod(owner, methodName, descriptor);
         if (module.getFunction(mangled) != null) {
-            return; // already declared
+            return;
         }
 
         Type retType = TypeResolver.descToReturnType(descriptor);
         List<Type> paramTypes = TypeResolver.descToParamTypes(descriptor);
 
-        // For non-static methods, the first parameter is the receiver (this)
         List<Type> allParams = new ArrayList<>();
         allParams.add(Type.reference(owner));
         allParams.addAll(paramTypes);
@@ -1726,7 +1883,6 @@ public class LlvmFunctionEmitter {
         for (int i = 0; i < allParams.size(); i++) {
             func.addParameter(new Parameter(allParams.get(i), i));
         }
-        // Adding a function without an entry block creates an external declaration
         module.addFunction(func);
     }
 
@@ -1734,7 +1890,6 @@ public class LlvmFunctionEmitter {
         String valRef = getLlvmValue(v);
         Type type = v.getType();
         if (type.isReference() || type.isArray() || type.isNull() || type.isBlock()) {
-            // Already a pointer – ensure it's i8* via bitcast if needed
             String ptrTy = typeMapper.toLlvmType(type);
             if (!ptrTy.equals("i8*")) {
                 String castName = newAux("ptrcast");
@@ -1744,11 +1899,8 @@ public class LlvmFunctionEmitter {
             }
             return valRef;
         } else if (isIntegerType(type)) {
-            // Convert integer to i8* via inttoptr
-            // Need to extend to i64 first if smaller
             String intVal = valRef;
             if (type == Type.INT || type == Type.SHORT || type == Type.BYTE || type == Type.CHAR || type == Type.BOOLEAN) {
-                // sext to i64
                 String ext = newAux("sext");
                 sb.append("  ").append(ext).append(" = sext ").append(typeMapper.toLlvmType(type))
                     .append(" ").append(valRef).append(" to i64\n");
@@ -1756,13 +1908,12 @@ public class LlvmFunctionEmitter {
             } else if (type == Type.LONG) {
                 // already i64
             } else {
-                // fallback: bitcast (shouldn't happen)
+                // fallback
             }
             String ptrCast = newAux("inttoptr");
             sb.append("  ").append(ptrCast).append(" = inttoptr i64 ").append(intVal).append(" to i8*\n");
             return ptrCast;
         } else {
-            // Unknown type – fallback to bitcast
             String ptrCast = newAux("ptrcast");
             sb.append("  ").append(ptrCast).append(" = bitcast ").append(typeMapper.toLlvmType(type))
                 .append(" ").append(valRef).append(" to i8*\n");

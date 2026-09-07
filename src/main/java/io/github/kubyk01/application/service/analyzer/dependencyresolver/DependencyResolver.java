@@ -10,6 +10,7 @@ import io.github.kubyk01.domain.ir.Type;
 import lombok.Getter;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.objectweb.asm.AnnotationVisitor;
 import org.objectweb.asm.ClassReader;
 import org.objectweb.asm.ClassVisitor;
 import org.objectweb.asm.FieldVisitor;
@@ -126,7 +127,7 @@ public class DependencyResolver {
                     .build());
             }
 
-            // Methods
+            // Methods – also collect polymorphic signature methods
             for (Method method : clazz.getDeclaredMethods()) {
                 String desc = org.objectweb.asm.Type.getMethodDescriptor(method);
                 org.objectweb.asm.Type retAsmType = org.objectweb.asm.Type.getReturnType(method);
@@ -136,7 +137,15 @@ public class DependencyResolver {
                     .map(t -> Type.fromDescriptor(t.getDescriptor()))
                     .collect(Collectors.toList());
 
-                builder.method(MethodNode.builder()
+                boolean isPoly = false;
+                for (java.lang.annotation.Annotation a : method.getDeclaredAnnotations()) {
+                    if (a.annotationType().getName().equals("java.lang.invoke.MethodHandle$PolymorphicSignature")) {
+                        isPoly = true;
+                        break;
+                    }
+                }
+
+                MethodNode mn = MethodNode.builder()
                     .name(method.getName())
                     .descriptor(desc)
                     .returnType(Type.fromDescriptor(returnDesc))
@@ -145,7 +154,13 @@ public class DependencyResolver {
                     .isAbstract(Modifier.isAbstract(method.getModifiers()))
                     .isNative(Modifier.isNative(method.getModifiers()))
                     .isStatic(Modifier.isStatic(method.getModifiers()))
-                    .build());
+                    .isPolymorphicSignature(isPoly)
+                    .build();
+                builder.method(mn);
+
+                if (isPoly) {
+                    builder.polymorphicMethodName(method.getName());
+                }
             }
 
             // Constructors
@@ -165,6 +180,7 @@ public class DependencyResolver {
                     .isAbstract(false)
                     .isNative(false)
                     .isStatic(false)
+                    .isPolymorphicSignature(false)
                     .build());
             }
 
@@ -174,7 +190,6 @@ public class DependencyResolver {
             log.debug("Loaded system class {} via reflection", internalName);
 
         } catch (ClassNotFoundException e) {
-            // fallback to stub
             missingClasses.add(internalName);
             ClassNode stub = ClassNode.builder()
                 .name(internalName)
@@ -184,7 +199,6 @@ public class DependencyResolver {
             classMap.put(internalName, stub);
             log.warn("System class {} not found even via reflection, stub created", internalName);
         } catch (Exception e) {
-            // fallback to stub
             log.warn("Failed to load class {} via reflection: {}", internalName, e.getMessage());
             missingClasses.add(internalName);
             ClassNode stub = ClassNode.builder()
@@ -327,6 +341,7 @@ public class DependencyResolver {
             final String[] currentClassName = {null};
             final List<FieldNode> fields = new ArrayList<>();
             final List<MethodNode> methods = new ArrayList<>();
+            final List<String> polymorphicMethodNames = new ArrayList<>();
 
             try {
                 reader.accept(new ClassVisitor(Opcodes.ASM9) {
@@ -366,11 +381,23 @@ public class DependencyResolver {
                             .isAbstract((access & Opcodes.ACC_ABSTRACT) != 0)
                             .isNative((access & Opcodes.ACC_NATIVE) != 0)
                             .isStatic((access & Opcodes.ACC_STATIC) != 0);
-                        if (exceptions != null) {
-                            mb.exceptions(Arrays.asList(exceptions));
-                        }
-                        methods.add(mb.build());
-                        return null;
+
+                        return new MethodVisitor(Opcodes.ASM9) {
+                            @Override
+                            public AnnotationVisitor visitAnnotation(String desc, boolean visible) {
+                                if ("Ljava/lang/invoke/MethodHandle$PolymorphicSignature;".equals(desc)) {
+                                    mb.isPolymorphicSignature(true);
+                                    polymorphicMethodNames.add(name);
+                                }
+                                return super.visitAnnotation(desc, visible);
+                            }
+
+                            @Override
+                            public void visitEnd() {
+                                methods.add(mb.build());
+                                super.visitEnd();
+                            }
+                        };
                     }
                 }, ClassReader.SKIP_CODE | ClassReader.SKIP_DEBUG);
             } catch (Exception e) {
@@ -379,7 +406,12 @@ public class DependencyResolver {
                 throw e;
             }
 
-            ClassNode classNode = builder.fields(fields).methods(methods).build();
+            ClassNode classNode = builder
+                .fields(fields)
+                .methods(methods)
+                .polymorphicMethodNames(polymorphicMethodNames)
+                .build();
+
             String name = currentClassName[0];
             if (name == null) {
                 System.err.println("ERROR: currentClassName is null, class not processed");
@@ -428,12 +460,12 @@ public class DependencyResolver {
     }
 
     private void parseClassBytes(String internalName, byte[] bytes) throws IOException {
-        // Same as before – unchanged
         ClassReader reader = new ClassReader(bytes);
         ClassNode.ClassNodeBuilder builder = ClassNode.builder();
         final String[] currentClassName = {null};
         final List<FieldNode> fields = new ArrayList<>();
         final List<MethodNode> methods = new ArrayList<>();
+        final List<String> polymorphicMethodNames = new ArrayList<>();
 
         try {
             reader.accept(new ClassVisitor(Opcodes.ASM9) {
@@ -473,18 +505,35 @@ public class DependencyResolver {
                         .isAbstract((access & Opcodes.ACC_ABSTRACT) != 0)
                         .isNative((access & Opcodes.ACC_NATIVE) != 0)
                         .isStatic((access & Opcodes.ACC_STATIC) != 0);
-                    if (exceptions != null) {
-                        mb.exceptions(Arrays.asList(exceptions));
-                    }
-                    methods.add(mb.build());
-                    return null;
+
+                    return new MethodVisitor(Opcodes.ASM9) {
+                        @Override
+                        public AnnotationVisitor visitAnnotation(String desc, boolean visible) {
+                            if ("Ljava/lang/invoke/MethodHandle$PolymorphicSignature;".equals(desc)) {
+                                mb.isPolymorphicSignature(true);
+                                polymorphicMethodNames.add(name);
+                            }
+                            return super.visitAnnotation(desc, visible);
+                        }
+
+                        @Override
+                        public void visitEnd() {
+                            methods.add(mb.build());
+                            super.visitEnd();
+                        }
+                    };
                 }
             }, ClassReader.SKIP_CODE | ClassReader.SKIP_DEBUG);
         } catch (Exception e) {
             throw new IOException("Failed to parse class " + internalName, e);
         }
 
-        ClassNode classNode = builder.fields(fields).methods(methods).build();
+        ClassNode classNode = builder
+            .fields(fields)
+            .methods(methods)
+            .polymorphicMethodNames(polymorphicMethodNames) // <--- added
+            .build();
+
         String name = currentClassName[0];
         if (name == null) {
             throw new IOException("Class name not found");
@@ -500,6 +549,20 @@ public class DependencyResolver {
         for (String iface : classNode.getInterfaces()) {
             subclasses.computeIfAbsent(iface, k -> new HashSet<>()).add(name);
         }
+    }
+
+    /**
+     * Returns a MethodNode for the given class, method name, and descriptor.
+     */
+    public MethodNode getMethodNode(String className, String methodName, String descriptor) {
+        ClassNode cn = classMap.get(className);
+        if (cn == null) return null;
+        for (MethodNode mn : cn.getMethods()) {
+            if (mn.getName().equals(methodName) && mn.getDescriptor().equals(descriptor)) {
+                return mn;
+            }
+        }
+        return null;
     }
 
     public FieldNode getField(String className, String fieldName) {

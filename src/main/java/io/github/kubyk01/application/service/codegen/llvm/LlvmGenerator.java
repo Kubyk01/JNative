@@ -2,6 +2,7 @@ package io.github.kubyk01.application.service.codegen.llvm;
 
 import io.github.kubyk01.application.service.analyzer.dependencyresolver.DependencyResolver;
 import io.github.kubyk01.application.service.analyzer.ssa.TypeResolver;
+import io.github.kubyk01.application.service.codegen.llvm.nativepolymorphicfunctionresolver.PolymorphicResolver;
 import io.github.kubyk01.domain.analyzer.aliasanalysis.AliasAnalysisResult;
 import io.github.kubyk01.domain.ir.BasicBlock;
 import io.github.kubyk01.domain.ir.Constant;
@@ -41,7 +42,8 @@ public class LlvmGenerator {
     public LlvmGenerator(Module module, DependencyResolver resolver,
                          AliasAnalysisResult aliasResult,
                          String entryClass, String entryMethod, String entryDescriptor,
-                         ReflectInfo reflectInfo) {
+                         ReflectInfo reflectInfo,
+                         PolymorphicResolver polymorphicResolver) {
         this.module = module;
         this.entryClass = entryClass;
         this.entryMethod = entryMethod;
@@ -49,7 +51,7 @@ public class LlvmGenerator {
         LlvmTypeMapper typeMapper = new LlvmTypeMapper();
         this.typeMapper = typeMapper;
         this.globalEmitter = new LlvmGlobalEmitter(module, resolver, aliasResult, typeMapper, reflectInfo);
-        this.functionEmitter = new LlvmFunctionEmitter(module, typeMapper, globalEmitter);
+        this.functionEmitter = new LlvmFunctionEmitter(module, typeMapper, globalEmitter, polymorphicResolver);
     }
 
     public String generate() {

@@ -141,4 +141,10 @@ public class LlvmRuntime {
         sb.append(")*");
         return sb.toString();
     }
+
+    public static String mangleBase(String className, String methodName) {
+        String safeClass = className.replace('/', '_').replaceAll("[^a-zA-Z0-9_]", "_");
+        String safeMethod = methodName.replaceAll("[^a-zA-Z0-9_]", "_");
+        return "fn_" + safeClass + "_" + safeMethod;
+    }
 }

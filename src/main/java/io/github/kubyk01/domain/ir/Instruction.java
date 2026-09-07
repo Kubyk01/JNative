@@ -19,6 +19,8 @@ public class Instruction {
     private int localIndex = -1;
     @Setter
     private Object invokedynamicData;
+    @Setter
+    private boolean polymorphicSignature;
 
     public Instruction(Opcode opcode) {
         this.opcode = opcode;

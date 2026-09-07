@@ -5,6 +5,7 @@ import lombok.Data;
 import lombok.Singular;
 
 import java.util.List;
+import java.util.Set;
 
 @Data
 @Builder
@@ -20,4 +21,6 @@ public class ClassNode {
     private List<MethodNode> methods;
     private boolean isInterface;
     private boolean isExternal;          // true if we don't have bytecode (JDK classes)
+    @Singular
+    private Set<String> polymorphicMethodNames;
 }

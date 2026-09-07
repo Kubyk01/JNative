@@ -56,8 +56,8 @@ public class InstructionHandlers {
     public void unaryNeg(Type type) {
         Value val = frame.pop();
         Constant zero = new Constant(type, type == Type.INT ? 0 :
-                type == Type.LONG ? 0L :
-                        type == Type.FLOAT ? 0.0f : 0.0);
+            type == Type.LONG ? 0L :
+                type == Type.FLOAT ? 0.0f : 0.0);
         Instruction inst = builder.addInstruction(Opcode.SUB, zero, val);
         frame.push(inst.getResult());
     }
@@ -122,36 +122,34 @@ public class InstructionHandlers {
         Value size = frame.pop();
         Type elemType = arrayTypeToIr(atype);
         Instruction inst = builder.addInstruction(Opcode.NEW_ARRAY, size,
-                new Constant(Type.reference(elemType.toString()), elemType.toString()));
+            new Constant(Type.reference(elemType.toString()), elemType.toString()));
         frame.push(inst.getResult());
     }
 
     public void newObject(String type) {
         Instruction inst = builder.addInstruction(Opcode.NEW,
-                new Constant(Type.reference(type), type));
+            new Constant(Type.reference(type), type));
         frame.push(inst.getResult());
     }
 
     public void anewArray(String type) {
         Value size = frame.pop();
         Instruction inst = builder.addInstruction(Opcode.NEW_ARRAY, size,
-                new Constant(Type.reference(type), type));
+            new Constant(Type.reference(type), type));
         frame.push(inst.getResult());
     }
 
     public void checkCast(String type) {
         Value val = frame.pop();
-        // The constant with the target type is needed by the emitter for the @__jnative_instanceof check
         Instruction inst = builder.addInstruction(Opcode.CHECKCAST, val,
-                new Constant(Type.reference(type), type));
+            new Constant(Type.reference(type), type));
         frame.push(inst.getResult());
     }
 
     public void instanceOf(String type) {
         Value val = frame.pop();
-        // The constant with the checked type is needed by the emitter to call @__jnative_instanceof
         Instruction inst = builder.addInstruction(Opcode.INSTANCEOF, val,
-                new Constant(Type.reference(type), type));
+            new Constant(Type.reference(type), type));
         frame.push(inst.getResult());
     }
 
@@ -174,10 +172,8 @@ public class InstructionHandlers {
         for (int i = 0; i < dims; i++) {
             sizes.add(frame.pop());
         }
-        // Operands: [0] – descriptor constant, then the sizes from the outer
-        // dimension to the inner one (sizes are popped off the stack in reverse order)
         Instruction inst = builder.addInstruction(Opcode.MULTI_NEW_ARRAY,
-                new Constant(Type.reference(desc), desc));
+            new Constant(Type.reference(desc), desc));
         for (int i = sizes.size() - 1; i >= 0; i--) {
             inst.addOperand(sizes.get(i));
         }
@@ -207,7 +203,7 @@ public class InstructionHandlers {
         Value val = frame.pop();
         Value obj = frame.pop();
         builder.addInstruction(Opcode.PUT_FIELD, obj,
-                new Constant(Type.reference(owner + "." + name), owner + "." + name), val);
+            new Constant(Type.reference(owner + "." + name), owner + "." + name), val);
     }
 
     public void getStatic(String owner, String name) {
@@ -230,10 +226,10 @@ public class InstructionHandlers {
     public void putStatic(String owner, String name) {
         Value val = frame.pop();
         builder.addInstruction(Opcode.PUT_STATIC,
-                new Constant(Type.reference(owner + "." + name), owner + "." + name), val);
+            new Constant(Type.reference(owner + "." + name), owner + "." + name), val);
     }
 
-    public void callMethod(int opcode, String owner, String name, String desc) {
+    public void callMethod(int opcode, String owner, String name, String desc, boolean polymorphic) {
         List<Type> paramTypes = TypeResolver.descToParamTypes(desc);
         Type retType = TypeResolver.descToReturnType(desc);
         int paramCount = paramTypes.size();
@@ -260,6 +256,7 @@ public class InstructionHandlers {
         };
 
         Instruction callInst = new Instruction(irOpcode);
+        callInst.setPolymorphicSignature(polymorphic);
         if (receiver != null) callInst.addOperand(receiver);
         callInst.addOperand(new Constant(Type.reference(owner + "." + name + desc), owner + "." + name + desc));
         for (Value arg : args) {
