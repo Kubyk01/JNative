@@ -42,18 +42,12 @@ public class PolymorphicResolver {
      */
     public NativeMethodInfo findBestMatch(String className, String methodName,
                                           Type returnType, List<Type> paramTypes) {
-        System.out.println("1111222");
-        System.out.println(className);
-        System.out.println(methodName);
-        System.out.println(returnType);
-        System.out.println(paramTypes);
         List<NativeMethodInfo> candidates = methodsByClass.getOrDefault(className, Collections.emptyList());
         if (candidates.isEmpty()) {
             return null;
         }
 
         String expectedDescriptor = buildDescriptor(returnType, paramTypes).trim();
-        System.out.println("expectedDescriptor: " + expectedDescriptor);
 
         NativeMethodInfo exactMatch = null;
         NativeMethodInfo returnMatch = null;
@@ -81,9 +75,6 @@ public class PolymorphicResolver {
             }
         }
 
-        System.out.println("exactMatch:" + exactMatch);
-        System.out.println("returnMatch:" + returnMatch);
-        System.out.println("voidMatch:" + voidMatch);
         if (exactMatch != null) return exactMatch;
         if (returnMatch != null) return returnMatch;
         return voidMatch;

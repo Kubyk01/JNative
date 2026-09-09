@@ -51,7 +51,7 @@ public class LlvmGenerator {
         LlvmTypeMapper typeMapper = new LlvmTypeMapper();
         this.typeMapper = typeMapper;
         this.globalEmitter = new LlvmGlobalEmitter(module, resolver, aliasResult, typeMapper, reflectInfo);
-        this.functionEmitter = new LlvmFunctionEmitter(module, typeMapper, globalEmitter, polymorphicResolver);
+        this.functionEmitter = new LlvmFunctionEmitter(module, typeMapper, globalEmitter, polymorphicResolver, resolver);
     }
 
     public String generate() {

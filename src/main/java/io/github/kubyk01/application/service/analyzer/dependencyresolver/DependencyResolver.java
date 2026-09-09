@@ -565,6 +565,29 @@ public class DependencyResolver {
         return null;
     }
 
+    /**
+     * Searches for a method in the given class and its superclasses.
+     * Returns the MethodNode if found, and stores the owner class name in foundOwner (if non-null).
+     */
+    public MethodNode findMethodInHierarchy(String className, String methodName, String descriptor, String[] foundOwner) {
+        ClassNode cn = classMap.get(className);
+        if (cn == null) {
+            loadSystemClass(className);
+            cn = classMap.get(className);
+            if (cn == null) return null;
+        }
+        for (MethodNode mn : cn.getMethods()) {
+            if (mn.getName().equals(methodName) && mn.getDescriptor().equals(descriptor)) {
+                if (foundOwner != null) foundOwner[0] = className;
+                return mn;
+            }
+        }
+        if (cn.getSuperName() != null && !cn.getSuperName().equals("java/lang/Object")) {
+            return findMethodInHierarchy(cn.getSuperName(), methodName, descriptor, foundOwner);
+        }
+        return null;
+    }
+
     public FieldNode getField(String className, String fieldName) {
         ClassNode cn = classMap.get(className);
         if (cn == null) return null;

@@ -1,5 +1,6 @@
 package io.github.kubyk01.application.service.codegen.llvm;
 
+import io.github.kubyk01.application.service.analyzer.dependencyresolver.DependencyResolver;
 import io.github.kubyk01.application.service.analyzer.ssa.GraphUtils;
 import io.github.kubyk01.application.service.analyzer.ssa.TypeResolver;
 import io.github.kubyk01.application.service.codegen.llvm.nativepolymorphicfunctionresolver.PolymorphicResolver;
@@ -47,6 +48,7 @@ public class LlvmFunctionEmitter {
     private final LlvmTypeMapper typeMapper;
     private final LlvmGlobalEmitter globalEmitter;
     private final PolymorphicResolver polymorphicResolver;
+    private final DependencyResolver resolver;
 
     private final LlvmValueMapper valueMapper = new LlvmValueMapper();
     private int tmpCounter = 0;
@@ -703,6 +705,24 @@ public class LlvmFunctionEmitter {
             case CALL: {
                 String calleeName = extractCalleeName(inst);
                 if (calleeName == null) break;
+
+                // Resolve owner for static calls
+                if (op == Opcode.STATIC_CALL) {
+                    int dotIdx = calleeName.lastIndexOf('.');
+                    int parenIdx = calleeName.indexOf('(');
+                    if (dotIdx > 0 && parenIdx > dotIdx) {
+                        String owner = calleeName.substring(0, dotIdx);
+                        String methodPart = calleeName.substring(dotIdx + 1);
+                        int localParenIdx = parenIdx - dotIdx - 1;
+                        String methodName = methodPart.substring(0, localParenIdx);
+                        String descriptor = methodPart.substring(localParenIdx);
+                        String[] foundOwner = new String[1];
+                        io.github.kubyk01.domain.analyzer.dependencyresolver.MethodNode mn = resolver.findMethodInHierarchy(owner, methodName, descriptor, foundOwner);
+                        if (mn != null && mn.isStatic() && foundOwner[0] != null && !foundOwner[0].equals(owner)) {
+                            calleeName = foundOwner[0] + "." + methodName + descriptor;
+                        }
+                    }
+                }
 
                 // Polymorphic signature?
                 if (inst.isPolymorphicSignature()) {

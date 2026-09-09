@@ -3,6 +3,7 @@ package io.github.kubyk01.application.service.analyzer.ssa;
 import io.github.kubyk01.application.service.analyzer.dependencyresolver.DependencyResolver;
 import io.github.kubyk01.application.service.codegen.llvm.LlvmRuntime;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.ClassNode;
+import io.github.kubyk01.domain.analyzer.dependencyresolver.MethodNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.MethodReference;
 import io.github.kubyk01.domain.ir.BasicBlock;
 import io.github.kubyk01.domain.ir.BranchTerminator;
@@ -492,7 +493,17 @@ public class MethodTranslator extends MethodVisitor {
         if (targetClass != null) {
             isPolymorphic = targetClass.getPolymorphicMethodNames().contains(name);
         }
-        handlers.callMethod(opcode, owner, name, desc, isPolymorphic);
+
+        String resolvedOwner = owner;
+        if (opcode != Opcodes.INVOKESTATIC && !name.equals("<init>") && !name.equals("<clinit>")) {
+            String[] foundOwner = new String[1];
+            MethodNode mn = resolver.findMethodInHierarchy(owner, name, desc, foundOwner);
+            if (mn != null && foundOwner[0] != null) {
+                resolvedOwner = foundOwner[0];
+            }
+        }
+
+        handlers.callMethod(opcode, resolvedOwner, name, desc, isPolymorphic);
     }
 
     @Override
@@ -723,46 +734,25 @@ public class MethodTranslator extends MethodVisitor {
     }
 
     private Type typeOfLoad(int opcode) {
-        switch (opcode) {
-            case Opcodes.ILOAD:
-                return Type.INT;
-            case Opcodes.LLOAD:
-                return Type.LONG;
-            case Opcodes.FLOAD:
-                return Type.FLOAT;
-            case Opcodes.DLOAD:
-                return Type.DOUBLE;
-            case Opcodes.ALOAD:
-                return Type.reference("java/lang/Object");
-            default:
-                return Type.UNKNOWN;
-        }
+        return switch (opcode) {
+            case Opcodes.ILOAD -> Type.INT;
+            case Opcodes.LLOAD -> Type.LONG;
+            case Opcodes.FLOAD -> Type.FLOAT;
+            case Opcodes.DLOAD -> Type.DOUBLE;
+            case Opcodes.ALOAD -> Type.reference("java/lang/Object");
+            default -> Type.UNKNOWN;
+        };
     }
 
     private Opcode mapIfOpcode(int opcode) {
-        switch (opcode) {
-            case Opcodes.IFEQ:
-            case Opcodes.IF_ICMPEQ:
-            case Opcodes.IF_ACMPEQ:
-                return Opcode.EQ;
-            case Opcodes.IFNE:
-            case Opcodes.IF_ICMPNE:
-            case Opcodes.IF_ACMPNE:
-                return Opcode.NE;
-            case Opcodes.IFLT:
-            case Opcodes.IF_ICMPLT:
-                return Opcode.LT;
-            case Opcodes.IFGE:
-            case Opcodes.IF_ICMPGE:
-                return Opcode.GE;
-            case Opcodes.IFGT:
-            case Opcodes.IF_ICMPGT:
-                return Opcode.GT;
-            case Opcodes.IFLE:
-            case Opcodes.IF_ICMPLE:
-                return Opcode.LE;
-            default:
-                return Opcode.EQ;
-        }
+        return switch (opcode) {
+            case Opcodes.IFEQ, Opcodes.IF_ICMPEQ, Opcodes.IF_ACMPEQ -> Opcode.EQ;
+            case Opcodes.IFNE, Opcodes.IF_ICMPNE, Opcodes.IF_ACMPNE -> Opcode.NE;
+            case Opcodes.IFLT, Opcodes.IF_ICMPLT -> Opcode.LT;
+            case Opcodes.IFGE, Opcodes.IF_ICMPGE -> Opcode.GE;
+            case Opcodes.IFGT, Opcodes.IF_ICMPGT -> Opcode.GT;
+            case Opcodes.IFLE, Opcodes.IF_ICMPLE -> Opcode.LE;
+            default -> Opcode.EQ;
+        };
     }
 }
