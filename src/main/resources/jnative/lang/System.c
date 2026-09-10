@@ -16,7 +16,7 @@ __attribute__((noreturn)) void __jnative_throw_exception(void* exc);
 // Array layout: [length (4 bytes)] [elem_size (4 bytes)] [data]
 // This matches the generation in LlvmFunctionEmitter (NEW_ARRAY / MULTI_NEW_ARRAY)
 // ---------------------------------------------------------------------------
-#define ARRAY_HEADER_SIZE 8
+#define ARRAY_HEADER_SIZE 4
 
 static inline int array_length(void* arr) {
     if (!arr) return -1;

@@ -37,7 +37,6 @@ public class LlvmGenerator {
 
     private final LlvmGlobalEmitter globalEmitter;
     private final LlvmFunctionEmitter functionEmitter;
-    private final LlvmTypeMapper typeMapper;
 
     public LlvmGenerator(Module module, DependencyResolver resolver,
                          AliasAnalysisResult aliasResult,
@@ -48,10 +47,8 @@ public class LlvmGenerator {
         this.entryClass = entryClass;
         this.entryMethod = entryMethod;
         this.entryDescriptor = entryDescriptor;
-        LlvmTypeMapper typeMapper = new LlvmTypeMapper();
-        this.typeMapper = typeMapper;
-        this.globalEmitter = new LlvmGlobalEmitter(module, resolver, aliasResult, typeMapper, reflectInfo);
-        this.functionEmitter = new LlvmFunctionEmitter(module, typeMapper, globalEmitter, polymorphicResolver, resolver);
+        this.globalEmitter = new LlvmGlobalEmitter(module, resolver, aliasResult, reflectInfo);
+        this.functionEmitter = new LlvmFunctionEmitter(module, globalEmitter, polymorphicResolver, resolver);
     }
 
     public String generate() {
@@ -97,12 +94,12 @@ public class LlvmGenerator {
 
     private String emitDeclaration(Function func) {
         StringBuilder sb = new StringBuilder();
-        sb.append("declare ").append(typeMapper.toLlvmType(func.getReturnType()))
+        sb.append("declare ").append(LlvmTypeMapper.toLlvmType(func.getReturnType()))
             .append(" @").append(func.getName()).append("(");
         List<Parameter> params = func.getParameters();
         for (int i = 0; i < params.size(); i++) {
             if (i > 0) sb.append(", ");
-            sb.append(typeMapper.toLlvmType(params.get(i).getType()));
+            sb.append(LlvmTypeMapper.toLlvmType(params.get(i).getType()));
         }
         sb.append(")\n");
         return sb.toString();

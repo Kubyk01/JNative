@@ -33,7 +33,6 @@ public class LlvmGlobalEmitter {
     private final Module module;
     private final DependencyResolver resolver;
     private final AliasAnalysisResult aliasResult;
-    private final LlvmTypeMapper typeMapper;
     private final ReflectInfo reflectInfo;
 
     private final Map<String, String> structNames = new HashMap<>();
@@ -64,7 +63,7 @@ public class LlvmGlobalEmitter {
         }
         StringBuilder fields = new StringBuilder("{ i8*");
         for (Type t : capturedTypes) {
-            fields.append(", ").append(typeMapper.toLlvmType(t));
+            fields.append(", ").append(LlvmTypeMapper.toLlvmType(t));
         }
         fields.append(" }");
         String structName = "%struct.lambda_" + lambdaId;
@@ -155,7 +154,7 @@ public class LlvmGlobalEmitter {
         StringBuilder sb = new StringBuilder();
 
         // Define structs for all known classes (from resolver)
-        String objStruct = typeMapper.toLlvmStruct("java/lang/Object");
+        String objStruct = LlvmTypeMapper.toLlvmStruct("java/lang/Object");
         if (!structNames.containsKey("java/lang/Object")) {
             sb.append(objStruct).append(" = type { }\n");
             structNames.put("java/lang/Object", objStruct);
@@ -164,7 +163,7 @@ public class LlvmGlobalEmitter {
         List<ClassNode> allClasses = new ArrayList<>(resolver.getClassMap().values());
         for (ClassNode cls : allClasses) {
             if (cls.isExternal()) continue;
-            String structName = typeMapper.toLlvmStruct(cls.getName());
+            String structName = LlvmTypeMapper.toLlvmStruct(cls.getName());
             if (structNames.containsKey(cls.getName())) continue;
 
             sb.append(structName).append(" = type { ");
@@ -173,7 +172,7 @@ public class LlvmGlobalEmitter {
             List<String> fieldTypes = new ArrayList<>();
             for (FieldNode field : allFields) {
                 Type ft = field.getType();
-                fieldTypes.add(typeMapper.toLlvmType(ft));
+                fieldTypes.add(LlvmTypeMapper.toLlvmType(ft));
             }
             sb.append(String.join(", ", fieldTypes));
             sb.append(" }\n");
@@ -183,7 +182,7 @@ public class LlvmGlobalEmitter {
         // Define minimal structs for any NEW class that is still missing
         for (String className : newClassNames) {
             if (!structNames.containsKey(className)) {
-                String structName = typeMapper.toLlvmStruct(className);
+                String structName = LlvmTypeMapper.toLlvmStruct(className);
                 sb.append(structName).append(" = type { i8* }\n");
                 structNames.put(className, structName);
             }
@@ -216,7 +215,7 @@ public class LlvmGlobalEmitter {
             if (fieldType == null) {
                 fieldType = Type.UNKNOWN;
             }
-            String llvmType = typeMapper.toLlvmType(fieldType);
+            String llvmType = LlvmTypeMapper.toLlvmType(fieldType);
 
             String init;
             if (fieldType.isReference() || fieldType.isArray() || fieldType.isNull() || fieldType.isUnknown()) {
@@ -237,7 +236,7 @@ public class LlvmGlobalEmitter {
     }
 
     public String getStructName(String className) {
-        return structNames.getOrDefault(className, typeMapper.toLlvmStruct(className));
+        return structNames.getOrDefault(className, LlvmTypeMapper.toLlvmStruct(className));
     }
 
     public int getFieldOffset(String className, String fieldName) {
@@ -322,7 +321,7 @@ public class LlvmGlobalEmitter {
                     } else {
                         funcName = LlvmRuntime.mangleMethod(className, mn.getName(), mn.getDescriptor());
                     }
-                    String retType = typeMapper.toLlvmType(mn.getReturnType());
+                    String retType = LlvmTypeMapper.toLlvmType(mn.getReturnType());
                     String paramTypes = buildParamTypes(mn);
                     entries.add("i8* bitcast (" + retType + " (" + paramTypes + ")* @" + funcName + " to i8*)");
                 } else {
@@ -432,7 +431,7 @@ public class LlvmGlobalEmitter {
         StringBuilder sb = new StringBuilder();
         for (int i = 0; i < params.size(); i++) {
             if (i > 0) sb.append(", ");
-            sb.append(typeMapper.toLlvmType(params.get(i)));
+            sb.append(LlvmTypeMapper.toLlvmType(params.get(i)));
         }
         return sb.toString();
     }
@@ -495,7 +494,7 @@ public class LlvmGlobalEmitter {
                 Function impl = module.getFunction(LlvmRuntime.mangleMethod(className, methodName, desc));
                 String adaptorPtr = "i8* null";
                 if (impl != null && impl.getEntryBlock() != null) {
-                    sb.append(emitAdaptorForMethod(className, method, typeMapper));
+                    sb.append(emitAdaptorForMethod(className, method));
                     adaptorPtr = "i8* bitcast (i8* (i8*, i8**)* @" + adaptorName + " to i8*)";
                 }
 
@@ -553,7 +552,7 @@ public class LlvmGlobalEmitter {
                 Function impl = module.getFunction(LlvmRuntime.mangleMethod(className, "<init>", desc));
                 String adaptorPtr = "i8* null";
                 if (impl != null && impl.getEntryBlock() != null) {
-                    sb.append(emitAdaptorForConstructor(className, ctor, typeMapper, objectSize));
+                    sb.append(emitAdaptorForConstructor(className, ctor, objectSize));
                     adaptorPtr = "i8* bitcast (i8* (i8**)* @" + adaptorName + " to i8*)";
                 }
 
@@ -628,7 +627,7 @@ public class LlvmGlobalEmitter {
         return LlvmRuntime.typeStringGlobalName(s);
     }
 
-    private String emitAdaptorForMethod(String className, MethodReference method, LlvmTypeMapper typeMapper) {
+    private String emitAdaptorForMethod(String className, MethodReference method) {
         String methodName = method.getName();
         String desc = method.getDescriptor();
         String origFuncName = LlvmRuntime.mangleMethod(className, methodName, desc);
@@ -648,7 +647,7 @@ public class LlvmGlobalEmitter {
 
         for (int i = 0; i < paramTypes.size(); i++) {
             Type pt = paramTypes.get(i);
-            String ptLlvm = typeMapper.toLlvmType(pt);
+            String ptLlvm = LlvmTypeMapper.toLlvmType(pt);
 
             String addr = "%arg" + i + "_addr";
             String val = "%arg" + i + "_val";
@@ -703,14 +702,14 @@ public class LlvmGlobalEmitter {
                 argsCsv.append(", ");
             }
 
-            argsCsv.append(typeMapper.toLlvmType(paramTypes.get(i)))
+            argsCsv.append(LlvmTypeMapper.toLlvmType(paramTypes.get(i)))
                 .append(" ")
                 .append(argLoads.get(i));
 
             firstArg = false;
         }
 
-        String retLlvm = typeMapper.toLlvmType(retType);
+        String retLlvm = LlvmTypeMapper.toLlvmType(retType);
         if (retType.isVoid()) {
             sb.append("  call void @").append(origFuncName).append("(").append(argsCsv).append(")\n");
             sb.append("  ret i8* null\n");
@@ -731,7 +730,7 @@ public class LlvmGlobalEmitter {
         return sb.toString();
     }
 
-    private String emitAdaptorForConstructor(String className, MethodReference ctor, LlvmTypeMapper typeMapper, int objectSize) {
+    private String emitAdaptorForConstructor(String className, MethodReference ctor, int objectSize) {
         String desc = ctor.getDescriptor();
         String origFuncName = LlvmRuntime.mangleMethod(className, "<init>", desc);
         String adaptorName = "__reflect_adaptor_ctor_" + LlvmTypeMapper.sanitizeIdentifier(className) + "_"
@@ -755,7 +754,7 @@ public class LlvmGlobalEmitter {
         List<String> argLoads = new ArrayList<>();
         for (int i = 0; i < paramTypes.size(); i++) {
             Type pt = paramTypes.get(i);
-            String ptLlvm = typeMapper.toLlvmType(pt);
+            String ptLlvm = LlvmTypeMapper.toLlvmType(pt);
             String addr = "%arg" + i + "_addr";
             String val = "%arg" + i + "_val";
             sb.append("  ").append(addr).append(" = getelementptr i8*, i8** %args, i32 ").append(i).append("\n");

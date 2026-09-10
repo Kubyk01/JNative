@@ -321,6 +321,12 @@ public class MethodTranslator extends MethodVisitor {
             case Opcodes.DUP2:
                 frame.dup2();
                 break;
+            case Opcodes.DUP2_X1:
+                frame.dup2X1();
+                break;
+            case Opcodes.DUP2_X2:
+                frame.dup2X2();
+                break;
             case Opcodes.SWAP:
                 frame.swap();
                 break;

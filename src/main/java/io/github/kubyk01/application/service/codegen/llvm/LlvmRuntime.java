@@ -126,17 +126,17 @@ public class LlvmRuntime {
      * Returns the LLVM function type for a method by its signature (of the form "name(desc)").
      * For example: "toString()Ljava/lang/String;" -> "i8* (i8*)*"
      */
-    public static String getFunctionType(String methodSig, LlvmTypeMapper typeMapper) {
+    public static String getFunctionType(String methodSig) {
         int paren = methodSig.indexOf('(');
         if (paren < 0) return "i8* (...) *"; // fallback
         String desc = methodSig.substring(paren);
         Type retType = TypeResolver.descToReturnType(desc);
         List<Type> paramTypes = TypeResolver.descToParamTypes(desc);
         StringBuilder sb = new StringBuilder();
-        sb.append(typeMapper.toLlvmType(retType)).append(" (");
+        sb.append(LlvmTypeMapper.toLlvmType(retType)).append(" (");
         for (int i = 0; i < paramTypes.size(); i++) {
             if (i > 0) sb.append(", ");
-            sb.append(typeMapper.toLlvmType(paramTypes.get(i)));
+            sb.append(LlvmTypeMapper.toLlvmType(paramTypes.get(i)));
         }
         sb.append(")*");
         return sb.toString();

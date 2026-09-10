@@ -54,7 +54,6 @@ public class PolymorphicResolver {
         NativeMethodInfo voidMatch = null;
 
         for (NativeMethodInfo info : candidates) {
-            System.out.println("candidate: " + info);
             if (!info.getMethodName().equals(methodName)) continue;
 
             String infoDescriptor = info.getDescriptor().trim();

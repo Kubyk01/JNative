@@ -62,7 +62,7 @@ public class StackFrame {
         for (int i = 0; i < count; i++) {
             if (stack.isEmpty()) {
                 log.warn("Stack underflow while popping args (requested {}, stack size {}), using undefined",
-                        count, 0);
+                    count, 0);
                 args.addFirst(new UndefinedValue(Type.UNKNOWN));
             } else {
                 args.addFirst(pop());
@@ -105,6 +105,51 @@ public class StackFrame {
             push(v1);
             push(v2);
             push(v1);
+        }
+    }
+
+    /**
+     * JVM DUP2_X1.
+     * Form 1 (both top values category 1): ..., v3, v2, v1 -> ..., v2, v1, v3, v2, v1
+     * Form 2 (top value category 2, second category 1): ..., v2, v1 -> ..., v1, v2, v1
+     *
+     * As in the rest of this StackFrame, every Value occupies exactly one slot,
+     * so we use the category-1 interpretation.
+     */
+    public void dup2X1() {
+        if (size() >= 3) {
+            Value v1 = pop();   // top
+            Value v2 = pop();
+            Value v3 = pop();
+            push(v2);
+            push(v1);
+            push(v3);
+            push(v2);
+            push(v1);
+        } else {
+            log.warn("Stack underflow in dup2X1 (size={})", size());
+        }
+    }
+
+    /**
+     * JVM DUP2_X2.
+     * Form 4 (all four values category 1): ..., v4, v3, v2, v1 -> ..., v2, v1, v4, v3, v2, v1
+     * (Other forms involve category-2 values; we use the uniform category-1 form.)
+     */
+    public void dup2X2() {
+        if (size() >= 4) {
+            Value v1 = pop();   // top
+            Value v2 = pop();
+            Value v3 = pop();
+            Value v4 = pop();
+            push(v2);
+            push(v1);
+            push(v4);
+            push(v3);
+            push(v2);
+            push(v1);
+        } else {
+            log.warn("Stack underflow in dup2X2 (size={})", size());
         }
     }
 
