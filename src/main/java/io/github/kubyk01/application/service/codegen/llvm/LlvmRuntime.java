@@ -33,18 +33,24 @@ public class LlvmRuntime {
 
                 ; ----- JNative runtime functions (implemented in jnative_runtime.c) -----
                 declare i8* @__jnative_create_string_array(i32, i8**)
+                declare i8* @__jnative_new_multi_array(i8*, i32, i32*, i32)
                 declare void @__jnative_monitor_enter(i8*)
                 declare void @__jnative_monitor_exit(i8*)
                 declare i1 @__jnative_instanceof(i8*, i8**)
                 declare void @__jnative_push_catch(i8*, i8**)
                 declare void @__jnative_pop_catch()
                 declare void @__jnative_throw_exception(i8*)
+                declare void @__jnative_throw_exception_ctx(i8*, i8*)
                 declare i8* @__jnative_get_exception_object()
                 declare i1 @__jnative_catch_matches(i8*, i8**)
                 declare void @__jnative_throw_null_pointer_exception()
+                declare void @__jnative_throw_null_pointer_exception_ctx(i8*)
                 declare void @__jnative_throw_array_index_out_of_bounds()
+                declare void @__jnative_throw_array_index_out_of_bounds_ctx(i8*)
                 declare void @__jnative_throw_class_cast_exception()
+                declare void @__jnative_throw_class_cast_exception_ctx(i8*)
                 declare void @__jnative_throw_arithmetic_exception()
+                declare void @__jnative_throw_arithmetic_exception_ctx(i8*)
 
                 ; ----- String concatenation (implemented in jnative_runtime.c) -----
                 declare i8* @__jnative_concat_strings(i32, ...)
@@ -71,6 +77,17 @@ public class LlvmRuntime {
     public static String typeStringConstant(String s) {
         return typeStringGlobalName(s) + " = private unnamed_addr constant ["
                 + s.length() + " x i8] c\"" + s + "\"\n";
+    }
+
+    /** Global name for a null-terminated string constant holding a function name. */
+    public static String functionNameGlobalName(String funcName) {
+        return "@.funcname." + funcName.replaceAll("[^a-zA-Z0-9_]", "_");
+    }
+
+    /** Null-terminated private constant for a function name (used by throw helpers). */
+    public static String functionNameConstant(String funcName) {
+        return functionNameGlobalName(funcName) + " = private unnamed_addr constant ["
+                + (funcName.length() + 1) + " x i8] c\"" + funcName + "\\00\"\n";
     }
 
     public static String mangleFunction(String name) {

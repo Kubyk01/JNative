@@ -145,50 +145,44 @@ public class LlvmGenerator {
         String lambdaId = call.getLambdaStructName();
         String adaptorName = "adaptor_" + lambdaId;
 
-        // 1. Check bootstrap arguments
         Object[] bsmArgs = info.bootstrapArgs();
-        if (bsmArgs.length < 2) {
-            return;
-        }
+        if (bsmArgs.length < 2) return;
+        if (module.getFunction(adaptorName) != null) return;
 
-        // 2. Check if adapter already exists
-        if (module.getFunction(adaptorName) != null) {
-            return;
-        }
-
-        // 3. Extract impl method
         Handle implHandle = (Handle) bsmArgs[1];
-        boolean isStatic = (implHandle.getTag() == Opcodes.H_INVOKESTATIC);
+        int implTag = implHandle.getTag();
+        boolean isStatic      = (implTag == Opcodes.H_INVOKESTATIC);
+        boolean isInterface   = (implTag == Opcodes.H_INVOKEINTERFACE);
+        boolean isSpecial     = (implTag == Opcodes.H_INVOKESPECIAL);
+        boolean isConstructor = (implTag == Opcodes.H_NEWINVOKESPECIAL);
+
         String implOwner = implHandle.getOwner();
-        String implName = implHandle.getName();
-        String implDesc = implHandle.getDesc();
+        String implName  = implHandle.getName();
+        String implDesc  = implHandle.getDesc();
 
         org.objectweb.asm.Type samType = (org.objectweb.asm.Type) bsmArgs[0];
-        String interfaceSig = samType.getDescriptor();
-        Type retType = TypeResolver.descToReturnType(interfaceSig);
-        List<Type> paramTypes = TypeResolver.descToParamTypes(interfaceSig);
+        String interfaceSig      = samType.getDescriptor();
+        Type   samReturnType     = TypeResolver.descToReturnType(interfaceSig);
+        List<Type> samParamTypes = TypeResolver.descToParamTypes(interfaceSig);
 
         IrBuilder builder = new IrBuilder(module);
         List<Type> allParamTypes = new ArrayList<>();
-        allParamTypes.add(Type.reference("java/lang/Object")); // receiver
-        allParamTypes.addAll(paramTypes);
-        Function adaptorFunc = builder.createFunction(adaptorName, retType, allParamTypes);
+        allParamTypes.add(Type.reference("java/lang/Object"));   // lambda object
+        allParamTypes.addAll(samParamTypes);
+        Function adaptorFunc = builder.createFunction(adaptorName, samReturnType, allParamTypes);
 
-        // 5. Register struct and vtable (after function creation)
         globalEmitter.registerLambdaStruct(lambdaId, call.getCapturedTypes());
         globalEmitter.registerLambdaVtable(lambdaId, adaptorName);
 
-        // 6. Create entry block
         builder.createBlock(adaptorName + "_entry");
         BasicBlock entry = builder.currentBlock();
         adaptorFunc.setEntryBlock(entry);
 
-        // 7. Load captured variables
+        // ---- Load captured variables ----
         List<Type> capturedTypes = call.getCapturedTypes();
         List<Value> loadedCaptures = new ArrayList<>();
-        int offset = 8; // offset after vtable
+        int offset = 8;
         Parameter lambdaObj = adaptorFunc.getParameters().getFirst();
-
         for (Type capType : capturedTypes) {
             Instruction getField = new Instruction(Opcode.GET_FIELD);
             getField.addOperand(lambdaObj);
@@ -201,36 +195,90 @@ public class LlvmGenerator {
             offset += getElementSizeOfType(capType);
         }
 
-        // 8. Form arguments for impl method call
+        // ---- Build the argument list for the impl method ----
+        // Note: constructor references are handled separately below; they take
+        // no receiver from captures or SAM args.
         List<Value> callArgs = new ArrayList<>();
-        if (!isStatic) {
+        int firstSamIdx = 1;
+        if (!isStatic && !isConstructor) {
             if (!loadedCaptures.isEmpty()) {
+                // Bound method reference: first capture is the receiver
                 callArgs.add(loadedCaptures.removeFirst());
+            } else if (adaptorFunc.getParameters().size() > 1) {
+                // Unbound method reference: first SAM argument IS the receiver
+                callArgs.add(adaptorFunc.getParameters().get(1));
+                firstSamIdx = 2;
             } else {
+                log.warn("Lambda adaptor {}: non-static impl {} with no captures and no SAM args",
+                    adaptorName, implOwner + "." + implName + implDesc);
                 callArgs.add(new Constant(Type.NULL, null));
             }
         }
         callArgs.addAll(loadedCaptures);
-        for (int i = 1; i < adaptorFunc.getParameters().size(); i++) {
+        for (int i = firstSamIdx; i < adaptorFunc.getParameters().size(); i++) {
             callArgs.add(adaptorFunc.getParameters().get(i));
         }
 
-        // 9. Call impl method
         String calleeName = implOwner + "." + implName + implDesc;
-        Instruction callInst = new Instruction(Opcode.STATIC_CALL);
-        callInst.addOperand(new Constant(Type.reference(calleeName), calleeName));
-        for (Value arg : callArgs) {
-            callInst.addOperand(arg);
+
+        // ---- Constructor reference (Foo::new) ----
+        // Allocate the object with NEW, call <init> on it, and return the object.
+        if (isConstructor) {
+            Instruction newInst = new Instruction(Opcode.NEW);
+            newInst.addOperand(new Constant(Type.reference(implOwner), implOwner));
+            Temporary objTmp = builder.newTemporary(Type.reference(implOwner));
+            newInst.setResult(objTmp);
+            objTmp.setDefiningInstruction(newInst);
+            entry.addInstruction(newInst);
+
+            Instruction ctorCall = new Instruction(Opcode.SPECIAL_CALL);
+            ctorCall.addOperand(objTmp);
+            ctorCall.addOperand(new Constant(Type.reference(calleeName), calleeName));
+            for (Value arg : callArgs) ctorCall.addOperand(arg);
+            entry.addInstruction(ctorCall);
+
+            if (samReturnType.isVoid()) {
+                builder.createReturn(null);
+            } else {
+                builder.createReturn(objTmp);
+            }
+            return;
         }
-        if (!retType.isVoid()) {
-            Temporary result = builder.newTemporary(retType);
+
+        // ---- Choose the right opcode for non-constructor references ----
+        Opcode callOpcode;
+        if (isStatic)          callOpcode = Opcode.STATIC_CALL;
+        else if (isInterface)  callOpcode = Opcode.INTERFACE_CALL;
+        else if (isSpecial)    callOpcode = Opcode.SPECIAL_CALL;
+        else                   callOpcode = Opcode.VIRTUAL_CALL;
+
+        Type implRetType = TypeResolver.descToReturnType(implDesc);
+
+        Instruction callInst = new Instruction(callOpcode);
+        if (callOpcode == Opcode.STATIC_CALL) {
+            // [callee, arg...]
+            callInst.addOperand(new Constant(Type.reference(calleeName), calleeName));
+            for (Value arg : callArgs) callInst.addOperand(arg);
+        } else {
+            // [receiver, callee, arg...]
+            callInst.addOperand(callArgs.getFirst());
+            callInst.addOperand(new Constant(Type.reference(calleeName), calleeName));
+            for (int i = 1; i < callArgs.size(); i++) callInst.addOperand(callArgs.get(i));
+        }
+
+        if (!implRetType.isVoid()) {
+            Temporary result = builder.newTemporary(implRetType);
             callInst.setResult(result);
             result.setDefiningInstruction(callInst);
-            entry.addInstruction(callInst);
-            builder.createReturn(result);
-        } else {
-            entry.addInstruction(callInst);
+        }
+        entry.addInstruction(callInst);
+
+        if (samReturnType.isVoid()) {
             builder.createReturn(null);
+        } else {
+            Value retVal = callInst.getResult();
+            if (retVal == null) retVal = new Constant(Type.NULL, null);
+            builder.createReturn(retVal);
         }
     }
 }

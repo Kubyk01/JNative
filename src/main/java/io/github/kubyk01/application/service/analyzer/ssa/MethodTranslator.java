@@ -14,6 +14,7 @@ import io.github.kubyk01.domain.ir.Instruction;
 import io.github.kubyk01.domain.ir.InvokeDynamicInfo;
 import io.github.kubyk01.domain.ir.IrBuilder;
 import io.github.kubyk01.domain.ir.Opcode;
+import io.github.kubyk01.domain.ir.Parameter;
 import io.github.kubyk01.domain.ir.ResolvedCall;
 import io.github.kubyk01.domain.ir.Temporary;
 import io.github.kubyk01.domain.ir.Terminator;
@@ -66,22 +67,22 @@ public class MethodTranslator extends MethodVisitor {
         List<Type> paramTypes = TypeResolver.descToParamTypes(methodRef.getDescriptor());
         List<Type> allParamTypes = new ArrayList<>();
         if (!isStatic) {
-            allParamTypes.add(Type.reference(methodRef.getOwner())); // receiver
+            allParamTypes.add(Type.reference(methodRef.getOwner()));
         }
         allParamTypes.addAll(paramTypes);
-        String mangledName = LlvmRuntime.mangleMethod(methodRef.getOwner(), methodRef.getName(), methodRef.getDescriptor());
+
+        String mangledName = LlvmRuntime.mangleMethod(methodRef.getOwner(),
+            methodRef.getName(),
+            methodRef.getDescriptor());
         currentFunction = builder.createFunction(mangledName, returnType, allParamTypes);
 
-        int paramIndex = 0;
-        if (!isStatic) {
-            if (!currentFunction.getParameters().isEmpty()) {
-                frame.setLocal(0, currentFunction.getParameters().getFirst());
-                paramIndex = 1;
-            }
+        int slot = 0;
+        for (int i = 0; i < currentFunction.getParameters().size(); i++) {
+            Parameter p = currentFunction.getParameters().get(i);
+            frame.setLocal(slot, p);
+            slot += (p.getType() == Type.LONG || p.getType() == Type.DOUBLE) ? 2 : 1;
         }
-        for (int i = paramIndex; i < currentFunction.getParameters().size(); i++) {
-            frame.setLocal(i, currentFunction.getParameters().get(i));
-        }
+
         currentBlock = builder.createBlock("entry");
     }
 

@@ -53,12 +53,14 @@ public class LlvmFunctionEmitter {
     private int tmpCounter = 0;
     private int labelCounter = 0;
     private BasicBlock currentEntryBlock;
+    private String currentFuncName;
 
     private final Map<BasicBlock, List<TryCatchRange>> blockToTryRanges = new HashMap<>();
     private final Map<TryCatchRange, BasicBlock> handlerBlockByRange = new HashMap<>();
     private final Map<TryCatchRange, Integer> rangeOrdinals = new HashMap<>();
 
     public String emitFunction(Function func) {
+        this.currentFuncName = func.getName();
         StringBuilder sb = new StringBuilder();
         String funcName = func.getName();
         sb.append("define ").append(LlvmTypeMapper.toLlvmType(func.getReturnType()))
@@ -196,14 +198,25 @@ public class LlvmFunctionEmitter {
     // ----- Helper for throwing exceptions -----
 
     private void emitThrowHelper(StringBuilder sb, String callee, List<TryCatchRange> ranges) {
+        String callerArg = callerStringArg();
         if (ranges.isEmpty()) {
-            sb.append("  call void ").append(callee).append("()\n");
+            sb.append("  call void ").append(callee).append("(").append(callerArg).append(")\n");
             sb.append("  unreachable\n");
         } else {
             emitTryGuard(sb, ranges,
-                inner -> inner.append("  call void ").append(callee).append("()\n"),
+                inner -> inner.append("  call void ").append(callee)
+                              .append("(").append(callerArg).append(")\n"),
                 true);
         }
+    }
+
+    /** LLVM operand yielding an i8* to the current function's mangled name. */
+    private String callerStringArg() {
+        if (currentFuncName == null) return "null";
+        int len = currentFuncName.length() + 1;
+        return "i8* getelementptr inbounds ([" + len + " x i8], [" + len + " x i8]* "
+            + LlvmRuntime.functionNameGlobalName(currentFuncName)
+            + ", i32 0, i32 0)";
     }
 
     private void emitNullCheck(StringBuilder sb, Value obj, List<TryCatchRange> ranges) {
@@ -221,7 +234,7 @@ public class LlvmFunctionEmitter {
             .append(", label %").append(cont)
             .append(", label %").append(throwBlk).append("\n");
         sb.append(throwBlk).append(":\n");
-        emitThrowHelper(sb, "@__jnative_throw_null_pointer_exception", ranges);
+        emitThrowHelper(sb, "@__jnative_throw_null_pointer_exception_ctx", ranges);
         sb.append(cont).append(":\n");
     }
 
@@ -244,7 +257,7 @@ public class LlvmFunctionEmitter {
             .append(", label %").append(cont)
             .append(", label %").append(throwBlk).append("\n");
         sb.append(throwBlk).append(":\n");
-        emitThrowHelper(sb, "@__jnative_throw_array_index_out_of_bounds", ranges);
+        emitThrowHelper(sb, "@__jnative_throw_array_index_out_of_bounds_ctx", ranges);
         sb.append(cont).append(":\n");
     }
 
@@ -320,6 +333,7 @@ public class LlvmFunctionEmitter {
                 }
                 break;
             }
+
             case ADD: case SUB: case MUL: case DIV: case REM:
             case AND: case OR: case XOR: case SHL: case SHR: case USHR: {
                 Value left = inst.getOperands().get(0);
@@ -333,14 +347,29 @@ public class LlvmFunctionEmitter {
                     }
                 }
 
-                boolean leftIsPtr = left.getType().isReference() || left.getType().isArray() || left.getType().isNull() || left.getType().isBlock();
-                boolean rightIsPtr = right.getType().isReference() || right.getType().isArray() || right.getType().isNull() || right.getType().isBlock();
-                boolean isBitwise = (op == Opcode.AND || op == Opcode.OR || op == Opcode.XOR || op == Opcode.SHL || op == Opcode.SHR || op == Opcode.USHR);
-                boolean anyPtr = leftIsPtr || rightIsPtr || resType.isReference() || resType.isArray() || resType.isNull() || resType.isBlock();
+                // Also treat values whose *LLVM* type is a pointer as pointers.
+                String leftLlvmType  = LlvmTypeMapper.toLlvmType(left.getType());
+                String rightLlvmType = LlvmTypeMapper.toLlvmType(right.getType());
+                String resLlvmType   = LlvmTypeMapper.toLlvmType(resType);
+
+                boolean leftIsPtr  = left.getType().isReference()  || left.getType().isArray()
+                    || left.getType().isNull()       || left.getType().isBlock()
+                    || leftLlvmType.endsWith("*");
+                boolean rightIsPtr = right.getType().isReference() || right.getType().isArray()
+                    || right.getType().isNull()      || right.getType().isBlock()
+                    || rightLlvmType.endsWith("*");
+
+                boolean isBitwise = (op == Opcode.AND || op == Opcode.OR || op == Opcode.XOR
+                    || op == Opcode.SHL || op == Opcode.SHR || op == Opcode.USHR);
+
+                boolean anyPtr = leftIsPtr || rightIsPtr
+                    || resType.isReference() || resType.isArray()
+                    || resType.isNull()      || resType.isBlock()
+                    || resLlvmType.endsWith("*");
 
                 if (isBitwise && (leftIsPtr || rightIsPtr)) {
                     Type intType = Type.LONG;
-                    String lInt = castValueToType(sb, getLlvmValue(left), left.getType(), intType);
+                    String lInt = castValueToType(sb, getLlvmValue(left),  left.getType(),  intType);
                     String rInt = castValueToType(sb, getLlvmValue(right), right.getType(), intType);
                     String llvmOp = mapArithOp(op, Type.LONG);
                     String tmp = newAux("bitwise_int");
@@ -348,27 +377,23 @@ public class LlvmFunctionEmitter {
                         .append(" ").append(LlvmTypeMapper.toLlvmType(intType))
                         .append(" ").append(lInt).append(", ").append(rInt).append("\n");
                     String finalVal = castValueToType(sb, tmp, intType, resType);
-                    if (resultName != null) {
-                        valueMapper.setValue(inst.getResult(), finalVal);
-                    }
+                    if (resultName != null) valueMapper.setValue(inst.getResult(), finalVal);
                     break;
                 }
 
                 if (!isBitwise && anyPtr) {
-                    String lInt = castValueToType(sb, getLlvmValue(left), left.getType(), Type.LONG);
+                    String lInt = castValueToType(sb, getLlvmValue(left),  left.getType(),  Type.LONG);
                     String rInt = castValueToType(sb, getLlvmValue(right), right.getType(), Type.LONG);
                     String llvmOp = mapArithOp(op, Type.LONG);
                     String tmp = newAux("ptr_arith");
                     sb.append("  ").append(tmp).append(" = ").append(llvmOp)
                         .append(" i64 ").append(lInt).append(", ").append(rInt).append("\n");
                     String finalVal = castValueToType(sb, tmp, Type.LONG, resType);
-                    if (resultName != null) {
-                        valueMapper.setValue(inst.getResult(), finalVal);
-                    }
+                    if (resultName != null) valueMapper.setValue(inst.getResult(), finalVal);
                     break;
                 }
 
-                String l = castValueToType(sb, getLlvmValue(left), left.getType(), resType);
+                String l = castValueToType(sb, getLlvmValue(left),  left.getType(),  resType);
                 String r = castValueToType(sb, getLlvmValue(right), right.getType(), resType);
                 String llvmOp = mapArithOp(op, resType);
                 sb.append("  ").append(resultName).append(" = ").append(llvmOp)
@@ -376,6 +401,7 @@ public class LlvmFunctionEmitter {
                     .append(" ").append(l).append(", ").append(r).append("\n");
                 break;
             }
+
             case EQ: case NE: case LT: case LE: case GT: case GE: {
                 Value left = inst.getOperands().get(0);
                 Value right = inst.getOperands().get(1);
@@ -437,57 +463,59 @@ public class LlvmFunctionEmitter {
             case GET_FIELD: {
                 Value base = inst.getOperands().getFirst();
                 String fieldName = extractFieldName(inst);
-                String baseRef = getLlvmValue(base);
-                int offset = globalEmitter.getFieldOffset(extractClassName(base), fieldName);
+
                 emitNullCheck(sb, base, ranges);
-                String baseI8 = newAux("base_i8");
-                String baseTypeLlvm = LlvmTypeMapper.toLlvmType(base.getType());
-                String castOp = baseTypeLlvm.endsWith("*") ? "bitcast" : "inttoptr";
-                sb.append("  ").append(baseI8).append(" = ").append(castOp)
-                    .append(" ").append(baseTypeLlvm).append(" ").append(baseRef)
-                    .append(" to i8*\n");
+
+                // *** FIX: legal cast of base to i8* ***
+                String baseI8 = castValueToType(sb, getLlvmValue(base), base.getType(),
+                                                Type.reference("java/lang/Object"));
+
+                int offset = globalEmitter.getFieldOffset(extractClassName(base), fieldName);
+
                 String gep = newAux("gep");
                 sb.append("  ").append(gep).append(" = getelementptr i8, i8* ").append(baseI8)
-                    .append(", i32 ").append(offset).append("\n");
+                  .append(", i32 ").append(offset).append("\n");
+
                 String ptrCast = newAux("ptrcast");
                 Type fieldType = inst.getResult().getType();
                 String fieldLlvm = LlvmTypeMapper.toLlvmType(fieldType);
+
                 sb.append("  ").append(ptrCast).append(" = bitcast i8* ").append(gep)
-                    .append(" to ").append(fieldLlvm).append("*\n");
+                  .append(" to ").append(fieldLlvm).append("*\n");
                 sb.append("  ").append(resultName).append(" = load ").append(fieldLlvm)
-                    .append(", ").append(fieldLlvm).append("* ").append(ptrCast).append("\n");
+                  .append(", ").append(fieldLlvm).append("* ").append(ptrCast).append("\n");
                 break;
             }
 
             case PUT_FIELD: {
                 if (inst.getOperands().size() >= 3) {
                     Value base = inst.getOperands().get(0);
-                    Value rhs = inst.getOperands().get(2);
+                    Value rhs  = inst.getOperands().get(2);
                     String fieldName = extractFieldName(inst);
-                    String baseRef = getLlvmValue(base);
-                    int offset = globalEmitter.getFieldOffset(extractClassName(base), fieldName);
+
                     emitNullCheck(sb, base, ranges);
-                    String baseI8 = newAux("base_i8");
-                    String baseTypeLlvm = LlvmTypeMapper.toLlvmType(base.getType());
-                    String castOp = baseTypeLlvm.endsWith("*") ? "bitcast" : "inttoptr";
-                    sb.append("  ").append(baseI8).append(" = ").append(castOp)
-                        .append(" ").append(baseTypeLlvm).append(" ").append(baseRef)
-                        .append(" to i8*\n");
+
+                    // *** FIX: legal cast of any base value to i8* ***
+                    String baseI8 = castValueToType(sb, getLlvmValue(base), base.getType(),
+                                                    Type.reference("java/lang/Object"));
+
+                    int offset = globalEmitter.getFieldOffset(extractClassName(base), fieldName);
+
                     String gep = newAux("gep");
                     sb.append("  ").append(gep).append(" = getelementptr i8, i8* ").append(baseI8)
-                        .append(", i32 ").append(offset).append("\n");
+                      .append(", i32 ").append(offset).append("\n");
+
                     String ptrCast = newAux("ptrcast");
                     Type fieldType = globalEmitter.getFieldType(extractClassName(base), fieldName);
-                    if (fieldType == null) {
-                        fieldType = rhs.getType();
-                    }
+                    if (fieldType == null) fieldType = rhs.getType();
                     String fieldLlvm = LlvmTypeMapper.toLlvmType(fieldType);
-                    String rhsRef = getLlvmValue(rhs);
-                    String rhsConverted = castValueToType(sb, rhsRef, rhs.getType(), fieldType);
+
+                    String rhsConverted = castValueToType(sb, getLlvmValue(rhs), rhs.getType(), fieldType);
+
                     sb.append("  ").append(ptrCast).append(" = bitcast i8* ").append(gep)
-                        .append(" to ").append(fieldLlvm).append("*\n");
+                      .append(" to ").append(fieldLlvm).append("*\n");
                     sb.append("  store ").append(fieldLlvm).append(" ").append(rhsConverted)
-                        .append(", ").append(fieldLlvm).append("* ").append(ptrCast).append("\n");
+                      .append(", ").append(fieldLlvm).append("* ").append(ptrCast).append("\n");
                 }
                 break;
             }
@@ -800,8 +828,8 @@ public class LlvmFunctionEmitter {
                         if (expected == 0) {
                             removeFirst = true;
                         } else if (expected > 0) {
-                            Type firstArgType = args.get(0).getType();
-                            Type firstParamType = calleeFunc.getParameters().get(0).getType();
+                            Type firstArgType = args.getFirst().getType();
+                            Type firstParamType = calleeFunc.getParameters().getFirst().getType();
                             if (firstArgType.isReference() && !firstParamType.isReference()) {
                                 removeFirst = true;
                             }
@@ -965,7 +993,10 @@ public class LlvmFunctionEmitter {
                 if (!(elemTypeConst instanceof Constant)) break;
                 Type elemType = elemTypeFromConst(((Constant) elemTypeConst).getValue().toString());
                 int elemSize = getElementSizeOfType(elemType);
-                String sizeRef = getLlvmValue(sizeVal);
+
+                String sizeRef = castValueToType(
+                    sb, getLlvmValue(sizeVal), sizeVal.getType(), Type.INT);
+
                 String totalSize = newAux("total_size");
                 sb.append("  ").append(totalSize).append(" = mul i32 ")
                     .append(sizeRef).append(", ").append(elemSize).append("\n");
@@ -1056,16 +1087,18 @@ public class LlvmFunctionEmitter {
             case MONITOR_ENTER: {
                 Value obj = inst.getOperands().getFirst();
                 emitNullCheck(sb, obj, ranges);
-                sb.append("  call void @__jnative_monitor_enter(i8* ")
-                    .append(getLlvmValue(obj)).append(")\n");
+                String objRef = castValueToType(sb, getLlvmValue(obj), obj.getType(),
+                    Type.reference("java/lang/Object"));
+                sb.append("  call void @__jnative_monitor_enter(i8* ").append(objRef).append(")\n");
                 break;
             }
 
             case MONITOR_EXIT: {
                 Value obj = inst.getOperands().getFirst();
                 emitNullCheck(sb, obj, ranges);
-                sb.append("  call void @__jnative_monitor_exit(i8* ")
-                    .append(getLlvmValue(obj)).append(")\n");
+                String objRef = castValueToType(sb, getLlvmValue(obj), obj.getType(),
+                    Type.reference("java/lang/Object"));
+                sb.append("  call void @__jnative_monitor_exit(i8* ").append(objRef).append(")\n");
                 break;
             }
 
@@ -1073,13 +1106,18 @@ public class LlvmFunctionEmitter {
                 Value obj = inst.getOperands().getFirst();
                 String typeName = extractTypeName(inst);
                 String typeInfoName = globalEmitter.getTypeInfoName(typeName);
+
+                // Cast the operand to i8* (handles int constant 0 -> null, refs -> bitcast, etc.)
+                String objRef = castValueToType(sb, getLlvmValue(obj), obj.getType(),
+                    Type.reference("java/lang/Object"));
+
                 if (typeInfoName == null) {
                     sb.append("  ; WARNING: no typeInfo for ").append(typeName).append("\n");
                     sb.append("  ").append(resultName).append(" = call i1 @__jnative_instanceof(i8* ")
-                        .append(getLlvmValue(obj)).append(", i8** null)\n");
+                        .append(objRef).append(", i8** null)\n");
                 } else {
                     sb.append("  ").append(resultName).append(" = call i1 @__jnative_instanceof(i8* ")
-                        .append(getLlvmValue(obj)).append(", i8** ")
+                        .append(objRef).append(", i8** ")
                         .append(typeInfoName).append(")\n");
                 }
                 break;
@@ -1089,24 +1127,29 @@ public class LlvmFunctionEmitter {
                 Value obj = inst.getOperands().getFirst();
                 String typeName = extractTypeName(inst);
                 String typeInfoName = globalEmitter.getTypeInfoName(typeName);
+
+                String objRef = castValueToType(sb, getLlvmValue(obj), obj.getType(),
+                    Type.reference("java/lang/Object"));
+
                 if (typeInfoName == null) {
-                    sb.append("  ; WARNING: no typeInfo for ").append(typeName).append(", checkcast skipped\n");
-                    sb.append("  ").append(resultName).append(" = bitcast i8* ").append(getLlvmValue(obj))
+                    sb.append("  ; WARNING: no typeInfo for ").append(typeName)
+                        .append(", checkcast skipped\n");
+                    sb.append("  ").append(resultName).append(" = bitcast i8* ").append(objRef)
                         .append(" to ").append(LlvmTypeMapper.toLlvmType(inst.getResult().getType())).append("\n");
                 } else {
-                    String okReg = newAux("ok");
+                    String okReg    = newAux("ok");
                     String failLabel = newLabel("check_fail");
-                    String okLabel = newLabel("check_ok");
+                    String okLabel   = newLabel("check_ok");
                     sb.append("  ").append(okReg).append(" = call i1 @__jnative_instanceof(i8* ")
-                        .append(getLlvmValue(obj)).append(", i8** ")
+                        .append(objRef).append(", i8** ")
                         .append(typeInfoName).append(")\n");
                     sb.append("  br i1 ").append(okReg)
                         .append(", label %").append(okLabel)
                         .append(", label %").append(failLabel).append("\n");
                     sb.append(failLabel).append(":\n");
-                    emitThrowHelper(sb, "@__jnative_throw_class_cast_exception", ranges);
+                    emitThrowHelper(sb, "@__jnative_throw_class_cast_exception_ctx", ranges);
                     sb.append(okLabel).append(":\n");
-                    sb.append("  ").append(resultName).append(" = bitcast i8* ").append(getLlvmValue(obj))
+                    sb.append("  ").append(resultName).append(" = bitcast i8* ").append(objRef)
                         .append(" to ").append(LlvmTypeMapper.toLlvmType(inst.getResult().getType())).append("\n");
                 }
                 break;
@@ -1428,7 +1471,7 @@ public class LlvmFunctionEmitter {
             .append(", label %").append(cont)
             .append(", label %").append(throwBlk).append("\n");
         sb.append(throwBlk).append(":\n");
-        emitThrowHelper(sb, "@__jnative_throw_arithmetic_exception", ranges);
+        emitThrowHelper(sb, "@__jnative_throw_arithmetic_exception_ctx", ranges);
         sb.append(cont).append(":\n");
     }
 
@@ -1506,7 +1549,8 @@ public class LlvmFunctionEmitter {
         }
         sb.append(missLabels[k - 1]).append(":\n");
         sb.append("  call void @__jnative_pop_catch()\n");
-        sb.append("  call void @__jnative_throw_exception(i8* ").append(exc).append(")\n");
+        sb.append("  call void @__jnative_throw_exception_ctx(i8* ").append(exc)
+            .append(", ").append(callerStringArg()).append(")\n");
         sb.append("  unreachable\n");
 
         if (contBlk != null) {
@@ -1546,22 +1590,25 @@ public class LlvmFunctionEmitter {
                 .append(llvmLabel(cbt.getFalseTarget())).append("\n");
         } else if (term instanceof ThrowTerminator tt) {
             Value exc = tt.getException();
+            String callerArg = callerStringArg();
             if (ranges.isEmpty()) {
                 if (exc != null) {
-                    sb.append("  call void @__jnative_throw_exception(i8* ")
-                        .append(getLlvmValue(exc)).append(")\n");
+                    sb.append("  call void @__jnative_throw_exception_ctx(i8* ")
+                        .append(getLlvmValue(exc)).append(", ").append(callerArg).append(")\n");
                 } else {
-                    sb.append("  call void @__jnative_throw_null_pointer_exception()\n");
+                    sb.append("  call void @__jnative_throw_null_pointer_exception_ctx(")
+                        .append(callerArg).append(")\n");
                 }
                 sb.append("  unreachable\n");
             } else {
                 final Value excVal = exc;
                 emitTryGuard(sb, ranges, inner -> {
                     if (excVal != null) {
-                        inner.append("  call void @__jnative_throw_exception(i8* ")
-                            .append(getLlvmValue(excVal)).append(")\n");
+                        inner.append("  call void @__jnative_throw_exception_ctx(i8* ")
+                             .append(getLlvmValue(excVal)).append(", ").append(callerArg).append(")\n");
                     } else {
-                        inner.append("  call void @__jnative_throw_null_pointer_exception()\n");
+                        inner.append("  call void @__jnative_throw_null_pointer_exception_ctx(")
+                             .append(callerArg).append(")\n");
                     }
                 }, true);
             }
@@ -1755,13 +1802,9 @@ public class LlvmFunctionEmitter {
         if (type == Type.FLOAT || type == Type.DOUBLE) {
             double d = ((Number) val).doubleValue();
             if (Double.isNaN(d)) {
-                return type == Type.FLOAT ? "0x7FC00000" : "0x7FF8000000000000";
+                return "0x7FF8000000000000";
             } else if (Double.isInfinite(d)) {
-                if (d > 0) {
-                    return type == Type.FLOAT ? "0x7F800000" : "0x7FF0000000000000";
-                } else {
-                    return type == Type.FLOAT ? "0xFF800000" : "0xFFF0000000000000";
-                }
+                return d > 0 ? "0x7FF0000000000000" : "0xFFF0000000000000";
             } else {
                 String s = Double.toString(d);
                 s = s.replace('E', 'e');
@@ -1810,7 +1853,7 @@ public class LlvmFunctionEmitter {
 
         if (fromFloat && toPtr) {
             String intCast = newAux("float_to_i64");
-            String fptosiOp = fromType == Type.FLOAT ? "fptosi" : "fptosi";
+            String fptosiOp = "fptosi";
             sb.append("  ").append(intCast).append(" = ").append(fptosiOp)
                 .append(" ").append(fromLlvm).append(" ").append(value)
                 .append(" to i64\n");
@@ -1906,38 +1949,30 @@ public class LlvmFunctionEmitter {
     }
 
     private String asPointer(StringBuilder sb, Value v) {
-        String valRef = getLlvmValue(v);
         Type type = v.getType();
         if (type.isReference() || type.isArray() || type.isNull() || type.isBlock()) {
-            String ptrTy = LlvmTypeMapper.toLlvmType(type);
-            if (!ptrTy.equals("i8*")) {
-                String castName = newAux("ptrcast");
-                sb.append("  ").append(castName).append(" = bitcast ").append(ptrTy)
-                    .append(" ").append(valRef).append(" to i8*\n");
-                return castName;
-            }
-            return valRef;
-        } else if (isIntegerType(type)) {
+            return castValueToType(sb, getLlvmValue(v), type,
+                                   Type.reference("java/lang/Object"));
+        }
+        if (isIntegerType(type)) {
+            // Existing integer path is fine (inttoptr after possible sext).
+            String valRef = getLlvmValue(v);
             String intVal = valRef;
-            if (type == Type.INT || type == Type.SHORT || type == Type.BYTE || type == Type.CHAR || type == Type.BOOLEAN) {
+            if (type != Type.LONG) {
                 String ext = newAux("sext");
-                sb.append("  ").append(ext).append(" = sext ").append(LlvmTypeMapper.toLlvmType(type))
-                    .append(" ").append(valRef).append(" to i64\n");
+                sb.append("  ").append(ext).append(" = sext ")
+                  .append(LlvmTypeMapper.toLlvmType(type)).append(" ").append(valRef)
+                  .append(" to i64\n");
                 intVal = ext;
-            } else if (type == Type.LONG) {
-                // already i64
-            } else {
-                // fallback
             }
             String ptrCast = newAux("inttoptr");
-            sb.append("  ").append(ptrCast).append(" = inttoptr i64 ").append(intVal).append(" to i8*\n");
-            return ptrCast;
-        } else {
-            String ptrCast = newAux("ptrcast");
-            sb.append("  ").append(ptrCast).append(" = bitcast ").append(LlvmTypeMapper.toLlvmType(type))
-                .append(" ").append(valRef).append(" to i8*\n");
+            sb.append("  ").append(ptrCast).append(" = inttoptr i64 ").append(intVal)
+              .append(" to i8*\n");
             return ptrCast;
         }
+        // *** FIX: float / double / unknown → legal conversion to i8* ***
+        return castValueToType(sb, getLlvmValue(v), type,
+                               Type.reference("java/lang/Object"));
     }
 
     private void emitNullCheck(StringBuilder sb, String ptr, List<TryCatchRange> ranges) {
@@ -1949,7 +1984,7 @@ public class LlvmFunctionEmitter {
             .append(", label %").append(cont)
             .append(", label %").append(throwBlk).append("\n");
         sb.append(throwBlk).append(":\n");
-        emitThrowHelper(sb, "@__jnative_throw_null_pointer_exception", ranges);
+        emitThrowHelper(sb, "@__jnative_throw_null_pointer_exception_ctx", ranges);
         sb.append(cont).append(":\n");
     }
 
@@ -1970,7 +2005,7 @@ public class LlvmFunctionEmitter {
             .append(", label %").append(cont)
             .append(", label %").append(throwBlk).append("\n");
         sb.append(throwBlk).append(":\n");
-        emitThrowHelper(sb, "@__jnative_throw_array_index_out_of_bounds", ranges);
+        emitThrowHelper(sb, "@__jnative_throw_array_index_out_of_bounds_ctx", ranges);
         sb.append(cont).append(":\n");
     }
 }

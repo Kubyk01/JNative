@@ -128,3 +128,20 @@ void* __jnative_fn_java_lang_Thread_getContextClassLoader__Ljava_lang_ClassLoade
     (void)this_thread;
     return NULL;
 }
+
+/* -----------------------------------------------------------------------
+ * ensureMaterializedForStackWalk
+ *
+ * In the reference implementation this method cooperates with the JVM's
+ * safepoint machinery: if a virtual thread is being walked, the supplied
+ * object may need to be materialized from the Java heap so that the
+ * native stack walker can find it. This runtime has neither virtual
+ * threads nor a JVM safepoint mechanism, therefore the object is always
+ * already materialized by construction (it lives on the native stack).
+ * The function is intentionally a no-op — that is the correct semantic
+ * behaviour for this runtime, not a placeholder for missing
+ * functionality.
+ * --------------------------------------------------------------------- */
+void __jnative_fn_java_lang_Thread_ensureMaterializedForStackWalk__Ljava_lang_Object__V(void* o) {
+    (void)o;
+}

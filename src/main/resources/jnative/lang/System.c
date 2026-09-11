@@ -1,110 +1,100 @@
-/* path: src/main/resources/jnative/lang/System.c */
-
 #include <string.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <time.h>
 
-// ---------------------------------------------------------------------------
-// Runtime exceptions
-// ---------------------------------------------------------------------------
 __attribute__((noreturn)) void __jnative_throw_null_pointer_exception(void);
 __attribute__((noreturn)) void __jnative_throw_array_index_out_of_bounds(void);
 __attribute__((noreturn)) void __jnative_throw_exception(void* exc);
 
-// ---------------------------------------------------------------------------
-// Array layout: [length (4 bytes)] [elem_size (4 bytes)] [data]
-// This matches the generation in LlvmFunctionEmitter (NEW_ARRAY / MULTI_NEW_ARRAY)
-// ---------------------------------------------------------------------------
+/*
+ * Array layout used by this runtime:
+ *   [ int32 length ][ int32 elem_size ][ raw element data ... ]
+ * The first 4 bytes hold the number of elements, the next 4 bytes hold the
+ * element size in bytes (written by the LLVM emitter for NEW_ARRAY and by
+ * __jnative_new_multi_array). The element payload begins at offset 4.
+ */
 #define ARRAY_HEADER_SIZE 4
 
-static inline int array_length(void* arr) {
-    if (!arr) return -1;
-    return *(int*)arr;
+static inline int32_t array_length(void* arr) {
+    if (arr == NULL) return -1;
+    return *(int32_t*)arr;
 }
 
-static inline int array_elem_size(void* arr) {
-    if (!arr) return -1;
-    return *(int*)((char*)arr + 4);
+static inline int32_t array_elem_size(void* arr) {
+    if (arr == NULL) return -1;
+    return *(int32_t*)((char*)arr + 4);
 }
 
 static inline void* array_data(void* arr) {
     return (char*)arr + ARRAY_HEADER_SIZE;
 }
 
-// ---------------------------------------------------------------------------
-// public static native void arraycopy(Object src, int srcPos, Object dest,
-//                                     int destPos, int length)
-// ---------------------------------------------------------------------------
+/* public static native void arraycopy(Object src, int srcPos, Object dest,
+ *                                     int destPos, int length) */
 void __jnative_fn_java_lang_System_arraycopy__Ljava_lang_Object_ILjava_lang_Object_II_V(
-    void* src, int srcPos, void* dest, int destPos, int length)
+    void* src, int32_t srcPos, void* dest, int32_t destPos, int32_t length)
 {
-    // Null checks
     if (src == NULL || dest == NULL) {
         __jnative_throw_null_pointer_exception();
         return;
     }
 
-    // Negative length is not allowed
     if (length < 0) {
         __jnative_throw_array_index_out_of_bounds();
         return;
     }
 
-    // Negative positions not allowed
     if (srcPos < 0 || destPos < 0) {
         __jnative_throw_array_index_out_of_bounds();
         return;
     }
 
-    // Get array lengths and element sizes
-    int srcLen = array_length(src);
-    int dstLen = array_length(dest);
+    int32_t srcLen = array_length(src);
+    int32_t dstLen = array_length(dest);
     if (srcLen < 0 || dstLen < 0) {
-        // Not a valid array object – treat as error
         __jnative_throw_array_index_out_of_bounds();
         return;
     }
 
-    // Check bounds
     if (srcPos + length > srcLen || destPos + length > dstLen) {
         __jnative_throw_array_index_out_of_bounds();
         return;
     }
 
-    int srcElemSize = array_elem_size(src);
-    int dstElemSize = array_elem_size(dest);
+    int32_t srcElemSize = array_elem_size(src);
+    int32_t dstElemSize = array_elem_size(dest);
 
-    // For primitive arrays, element sizes must match exactly.
-    // For object arrays (elem size = sizeof(void*)), we allow copying even
-    // if the destination is a superclass array (no runtime type check here).
-    // In a full implementation we would check assignability, but we skip it
-    // for simplicity – Java would throw ArrayStoreException if types mismatch.
     if (srcElemSize != dstElemSize) {
-        // Incompatible types: throw ArrayStoreException (generic)
         __jnative_throw_exception(NULL);
         return;
     }
 
-    // Perform the copy (safe for overlapping regions)
-    char* srcPtr = (char*)array_data(src) + srcPos * srcElemSize;
-    char* dstPtr = (char*)array_data(dest) + destPos * dstElemSize;
-    size_t bytes = (size_t)length * srcElemSize;
+    char* srcPtr = (char*)array_data(src) + (size_t)srcPos * (size_t)srcElemSize;
+    char* dstPtr = (char*)array_data(dest) + (size_t)destPos * (size_t)dstElemSize;
+    size_t bytes = (size_t)length * (size_t)srcElemSize;
+
     memmove(dstPtr, srcPtr, bytes);
 }
 
-// ---------------------------------------------------------------------------
-// public static native int identityHashCode(Object x)
-// ---------------------------------------------------------------------------
-int __jnative_fn_java_lang_System_identityHashCode__Ljava_lang_Object__I(void* obj) {
+/* public static native int identityHashCode(Object x) */
+int32_t __jnative_fn_java_lang_System_identityHashCode__Ljava_lang_Object__I(void* obj) {
     if (obj == NULL) return 0;
-    // Use the object's address as a simple hash (like OpenJDK does in many cases)
-    return (int)((uintptr_t)obj);
+    return (int32_t)((uintptr_t)obj);
 }
 
-// ---------------------------------------------------------------------------
-// Static fields for System.in, System.out, System.err
-// ---------------------------------------------------------------------------
+/* public static native long currentTimeMillis() */
+int64_t __jnative_fn_java_lang_System_currentTimeMillis___J(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_REALTIME, &ts) != 0) {
+        return (int64_t)0;
+    }
+    int64_t millis = (int64_t)ts.tv_sec * 1000LL + (int64_t)(ts.tv_nsec / 1000000LL);
+    return millis;
+}
+
+/* Static fields for System.in / System.out / System.err */
 static void* system_in  = NULL;
 static void* system_out = NULL;
 static void* system_err = NULL;
@@ -121,11 +111,7 @@ void __jnative_fn_java_lang_System_setErr0__Ljava_io_PrintStream_(void* err) {
     system_err = err;
 }
 
-// ---------------------------------------------------------------------------
-// private static native void initProperties(Properties props)
-// Stub – properties are usually read from the system, but we don't need them
-// for a minimal runtime.
-// ---------------------------------------------------------------------------
+/* private static native void initProperties(Properties props) */
 void __jnative_fn_java_lang_System_initProperties__Ljava_util_Properties_(void* props) {
-    // No‑op
+    (void)props;
 }

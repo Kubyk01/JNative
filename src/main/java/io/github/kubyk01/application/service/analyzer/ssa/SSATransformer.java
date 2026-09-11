@@ -47,11 +47,16 @@ public class SSATransformer {
     }
 
     private void initializeStacks(Function function) {
+        int slot = 0;
         for (Parameter param : function.getParameters()) {
-            int idx = param.getIndex();
-            versionStacks.computeIfAbsent(idx, k -> new ArrayDeque<>()).push(param);
-            versionCounters.putIfAbsent(idx, 0);
+            versionStacks.computeIfAbsent(slot, k -> new ArrayDeque<>()).push(param);
+            versionCounters.putIfAbsent(slot, 0);
+            slot += isCategory2(param.getType()) ? 2 : 1;
         }
+    }
+
+    private static boolean isCategory2(Type t) {
+        return t == Type.LONG || t == Type.DOUBLE;
     }
 
     private void insertPhiFunctions(Function function) {
@@ -89,8 +94,10 @@ public class SSATransformer {
         Map<Integer, Set<BasicBlock>> defs = new HashMap<>();
         BasicBlock entry = function.getEntryBlock();
 
+        int slot = 0;
         for (Parameter param : function.getParameters()) {
-            defs.computeIfAbsent(param.getIndex(), k -> new HashSet<>()).add(entry);
+            defs.computeIfAbsent(slot, k -> new HashSet<>()).add(entry);
+            slot += isCategory2(param.getType()) ? 2 : 1;
         }
 
         for (BasicBlock block : function.getBlocks()) {

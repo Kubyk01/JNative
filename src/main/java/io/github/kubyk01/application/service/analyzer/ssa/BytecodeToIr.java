@@ -20,8 +20,10 @@ import org.objectweb.asm.Opcodes;
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 @Slf4j
 @RequiredArgsConstructor
@@ -108,15 +110,31 @@ public class BytecodeToIr {
     }
 
     private MethodNode findMethod(ClassNode classNode, String name, String desc) {
+        return findMethod(classNode, name, desc, new HashSet<>());
+    }
+
+    private MethodNode findMethod(ClassNode classNode, String name, String desc,
+                                  Set<String> visited) {
+        if (classNode == null || !visited.add(classNode.getName())) return null;
+
         for (MethodNode m : classNode.getMethods()) {
             if (m.getName().equals(name) && m.getDescriptor().equals(desc)) {
                 return m;
             }
         }
-        if (classNode.getSuperName() != null) {
+        if (classNode.getSuperName() != null &&
+            !classNode.getSuperName().equals("java/lang/Object")) {
             ClassNode superNode = resolver.getClassNode(classNode.getSuperName());
-            if (superNode != null && !superNode.isExternal()) {
-                return findMethod(superNode, name, desc);
+            if (superNode != null) {
+                MethodNode r = findMethod(superNode, name, desc, visited);
+                if (r != null) return r;
+            }
+        }
+        for (String iface : classNode.getInterfaces()) {
+            ClassNode ifaceNode = resolver.getClassNode(iface);
+            if (ifaceNode != null) {
+                MethodNode r = findMethod(ifaceNode, name, desc, visited);
+                if (r != null) return r;
             }
         }
         return null;

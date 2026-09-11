@@ -14,8 +14,10 @@ import java.util.List;
 
 public class LlvmUtil {
     public static Type inferLocalType(Function func, int idx) {
+        int slot = 0;
         for (Parameter p : func.getParameters()) {
-            if (p.getIndex() == idx) return p.getType();
+            if (slot == idx) return p.getType();
+            slot += (p.getType() == Type.LONG || p.getType() == Type.DOUBLE) ? 2 : 1;
         }
         for (BasicBlock block : func.getBlocks()) {
             for (Instruction inst : block.getInstructions()) {

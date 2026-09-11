@@ -109,16 +109,37 @@ public class StackFrame {
     }
 
     /**
-     * JVM DUP2_X1.
-     * Form 1 (both top values category 1): ..., v3, v2, v1 -> ..., v2, v1, v3, v2, v1
-     * Form 2 (top value category 2, second category 1): ..., v2, v1 -> ..., v1, v2, v1
+     * JVM {@code DUP2_X1}. Two forms exist in the JVM spec:
      *
-     * As in the rest of this StackFrame, every Value occupies exactly one slot,
-     * so we use the category-1 interpretation.
+     * <ul>
+     *   <li><b>Form 1</b> (both values category 1):
+     *       {@code ..., v3, v2, v1 -> ..., v2, v1, v3, v2, v1}</li>
+     *   <li><b>Form 2</b> (value1 category 2, value2 category 1):
+     *       {@code ..., v2, v1 -> ..., v1, v2, v1}</li>
+     * </ul>
+     *
+     * In this project's IR a {@code long}/{@code double} is a single {@link Value},
+     * so we must look at the type of the top value to decide which form applies.
      */
     public void dup2X1() {
-        if (size() >= 3) {
-            Value v1 = pop();   // top
+        if (size() < 2) {
+            log.warn("Stack underflow in dup2X1 (size={})", size());
+            return;
+        }
+        Value v1 = pop();
+        if (isCategory2(v1)) {
+            // Form 2: v1 is long/double, v2 is any category-1 value.
+            Value v2 = pop();
+            push(v1);
+            push(v2);
+            push(v1);
+        } else {
+            // Form 1: all three values are category 1.
+            if (size() < 2) {
+                log.warn("Stack underflow in dup2X1 form 1 (size={})", size());
+                push(v1);
+                return;
+            }
             Value v2 = pop();
             Value v3 = pop();
             push(v2);
@@ -126,30 +147,89 @@ public class StackFrame {
             push(v3);
             push(v2);
             push(v1);
-        } else {
-            log.warn("Stack underflow in dup2X1 (size={})", size());
         }
     }
 
     /**
-     * JVM DUP2_X2.
-     * Form 4 (all four values category 1): ..., v4, v3, v2, v1 -> ..., v2, v1, v4, v3, v2, v1
-     * (Other forms involve category-2 values; we use the uniform category-1 form.)
+     * JVM {@code DUP2_X2}. Four forms exist in the JVM spec:
+     *
+     * <ul>
+     *   <li><b>Form 1</b> (all category 1):
+     *       {@code ..., v4, v3, v2, v1 -> ..., v2, v1, v4, v3, v2, v1}</li>
+     *   <li><b>Form 2</b> (v1 cat 2, v2,v3 cat 1):
+     *       {@code ..., v3, v2, v1 -> ..., v1, v3, v2, v1}</li>
+     *   <li><b>Form 3</b> (v1,v2 cat 1, v3 cat 2):
+     *       {@code ..., v3, v2, v1 -> ..., v2, v1, v3, v2, v1}</li>
+     *   <li><b>Form 4</b> (v1,v2 both cat 2):
+     *       {@code ..., v2, v1 -> ..., v1, v2, v1}</li>
+     * </ul>
      */
     public void dup2X2() {
-        if (size() >= 4) {
-            Value v1 = pop();   // top
+        if (size() < 2) {
+            log.warn("Stack underflow in dup2X2 (size={})", size());
+            return;
+        }
+        Value v1 = pop();
+        if (isCategory2(v1)) {
+            // v1 is long/double -> Form 2 or Form 4.
+            if (size() < 1) {
+                log.warn("Stack underflow in dup2X2 form 2/4 (size={})", size());
+                push(v1);
+                return;
+            }
+            Value v2 = pop();
+            if (isCategory2(v2)) {
+                // Form 4
+                push(v1);
+                push(v2);
+                push(v1);
+            } else {
+                // Form 2
+                if (size() < 1) {
+                    log.warn("Stack underflow in dup2X2 form 2 (size={})", size());
+                    push(v2);
+                    push(v1);
+                    return;
+                }
+                Value v3 = pop();
+                push(v1);
+                push(v3);
+                push(v2);
+                push(v1);
+            }
+        } else {
+            // v1 is category 1 -> Form 1 or Form 3.
+            if (size() < 2) {
+                log.warn("Stack underflow in dup2X2 form 1/3 (size={})", size());
+                push(v1);
+                return;
+            }
             Value v2 = pop();
             Value v3 = pop();
-            Value v4 = pop();
-            push(v2);
-            push(v1);
-            push(v4);
-            push(v3);
-            push(v2);
-            push(v1);
-        } else {
-            log.warn("Stack underflow in dup2X2 (size={})", size());
+            if (isCategory2(v3)) {
+                // Form 3
+                push(v2);
+                push(v1);
+                push(v3);
+                push(v2);
+                push(v1);
+            } else {
+                // Form 1
+                if (size() < 1) {
+                    log.warn("Stack underflow in dup2X2 form 1 (size={})", size());
+                    push(v3);
+                    push(v2);
+                    push(v1);
+                    return;
+                }
+                Value v4 = pop();
+                push(v2);
+                push(v1);
+                push(v4);
+                push(v3);
+                push(v2);
+                push(v1);
+            }
         }
     }
 
@@ -165,5 +245,15 @@ public class StackFrame {
     public void pop2() {
         if (!isEmpty()) pop();
         if (!isEmpty()) pop();
+    }
+
+    /**
+     * Returns {@code true} if the value occupies two JVM stack slots
+     * (i.e. is a {@code long} or {@code double}).
+     */
+    private static boolean isCategory2(Value v) {
+        if (v == null) return false;
+        Type t = v.getType();
+        return t == Type.LONG || t == Type.DOUBLE;
     }
 }

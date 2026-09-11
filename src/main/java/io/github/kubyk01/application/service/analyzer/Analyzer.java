@@ -158,10 +158,15 @@ public class Analyzer implements AnalyzerPort {
             ssaTransformer.transform(func);
         }
 
+        // >>> NEW: прореживаем <clinit> до наблюдаемого статического состояния.
+        StaticInitPruner staticInitPruner = new StaticInitPruner(module);
+        staticInitPruner.prune();
+
         // --- Static initializers (<clinit>) must be processed first ---
         List<Function> clinitFunctions = new ArrayList<>();
         for (Function func : module.getFunctions()) {
-            if (func.getName().endsWith(".<clinit>()V")) {
+            // Манглированное имя вида fn_<class>__clinit___V
+            if (func.getName().contains("__clinit__")) {
                 clinitFunctions.add(func);
             }
         }
@@ -396,12 +401,15 @@ public class Analyzer implements AnalyzerPort {
 
             String os = System.getProperty("os.name").toLowerCase();
             if (os.contains("linux") || os.contains("mac") || os.contains("darwin")) {
+                linkCmd.add("-rdynamic");
                 linkCmd.add("-lpthread");
                 linkCmd.add("-ldl");
             } else if (os.contains("win")) {
+                linkCmd.add("-rdynamic");
                 linkCmd.add("-lpthread");       // if using pthread-win32
                 // dbghelp is linked via #pragma comment(lib) in the C file
             } else {
+                linkCmd.add("-rdynamic");
                 // fallback
                 linkCmd.add("-lpthread");
             }
@@ -418,7 +426,7 @@ public class Analyzer implements AnalyzerPort {
     }
 
     private void compileCSource(String compiler, Path src, Path obj) throws IOException, InterruptedException {
-        ProcessBuilder pb = new ProcessBuilder(compiler, "-c", "-O2", src.toString(), "-o", obj.toString());
+        ProcessBuilder pb = new ProcessBuilder(compiler, "-c", "-O2", "-g", src.toString(), "-o", obj.toString());
         pb.inheritIO();
         int exit = pb.start().waitFor();
         if (exit != 0) throw new RuntimeException("Compilation of " + src + " failed with exit code " + exit);
