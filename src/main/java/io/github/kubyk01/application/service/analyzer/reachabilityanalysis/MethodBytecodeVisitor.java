@@ -188,6 +188,27 @@ public class MethodBytecodeVisitor extends ClassVisitor {
         }
 
         @Override
+        public void visitInvokeDynamicInsn(String name, String desc, Handle bsm, Object... bsmArgs) {
+            if (bsm != null && bsm.getOwner() != null) {
+                String bsmOwner = bsm.getOwner();
+                String bsmName  = bsm.getName();
+                boolean isLambdaFactory =
+                    bsmOwner.contains("LambdaMetafactory")
+                        && (bsmName.equals("metafactory") || bsmName.equals("altMetafactory"));
+
+                if (isLambdaFactory && bsmArgs.length >= 2 && bsmArgs[1] instanceof Handle implHandle) {
+                    MethodReference implRef = new MethodReference(
+                        implHandle.getOwner(),
+                        implHandle.getName(),
+                        implHandle.getDesc()
+                    );
+                    addMethodWithContext(implRef, reachableFromUser);
+                }
+            }
+            super.visitInvokeDynamicInsn(name, desc, bsm, bsmArgs);
+        }
+
+        @Override
         public void visitLdcInsn(Object value) {
             if (value instanceof String) {
             } else if (value instanceof org.objectweb.asm.Type asmType) {

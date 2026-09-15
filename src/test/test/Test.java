@@ -4,9 +4,7 @@ public class Test {
     public static void main(String[] args) {
         final int b = Example.lol();
         Thread.currentThread();
-        System.out.println("Hello World!");
-        System.out.println(Thread.currentThread());
-
+        throw new IllegalArgumentException("test" + b + " " + Thread.currentThread().getName());
     }
 }
 

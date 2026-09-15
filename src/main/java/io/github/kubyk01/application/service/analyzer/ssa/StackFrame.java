@@ -19,6 +19,10 @@ public class StackFrame {
         this.builder = builder;
     }
 
+    private static boolean isCategory2(Type t) {
+        return t == Type.LONG || t == Type.DOUBLE;
+    }
+
     public void setLocal(int index, Value value) {
         locals.put(index, value);
     }
@@ -98,58 +102,115 @@ public class StackFrame {
     }
 
     public void dup2() {
-        if (size() >= 2) {
-            Value v1 = pop();
-            Value v2 = pop();
-            push(v2);
+        if (isEmpty()) {
+            log.warn("Stack underflow in dup2 (size=0)");
+            return;
+        }
+        Value v1 = peek();
+        if (isCategory2(v1.getType())) {
+            // Form 2
             push(v1);
-            push(v2);
-            push(v1);
+        } else {
+            // Form 1
+            if (size() < 2) {
+                log.warn("Stack underflow in dup2 (size={})", size());
+                return;
+            }
+            Value a = pop(); // v1
+            Value b = pop(); // v2
+            push(b); push(a); push(b); push(a);
         }
     }
 
-    /**
-     * JVM DUP2_X1.
-     * Form 1 (both top values category 1): ..., v3, v2, v1 -> ..., v2, v1, v3, v2, v1
-     * Form 2 (top value category 2, second category 1): ..., v2, v1 -> ..., v1, v2, v1
-     *
-     * As in the rest of this StackFrame, every Value occupies exactly one slot,
-     * so we use the category-1 interpretation.
-     */
     public void dup2X1() {
-        if (size() >= 3) {
-            Value v1 = pop();   // top
-            Value v2 = pop();
-            Value v3 = pop();
-            push(v2);
-            push(v1);
-            push(v3);
-            push(v2);
-            push(v1);
+        if (isEmpty()) {
+            log.warn("Stack underflow in dup2X1 (size=0)");
+            return;
+        }
+        Value v1 = peek();
+        if (isCategory2(v1.getType())) {
+            // Form 2 — only two logical values involved.
+            if (size() < 2) {
+                log.warn("Stack underflow in dup2X1 (size={})", size());
+                return;
+            }
+            Value a = pop(); // v1 (cat 2)
+            Value b = pop(); // v2 (cat 1)
+            push(a); push(b); push(a);
         } else {
-            log.warn("Stack underflow in dup2X1 (size={})", size());
+            // Form 1 — three logical values involved.
+            if (size() < 3) {
+                log.warn("Stack underflow in dup2X1 (size={})", size());
+                return;
+            }
+            Value a = pop(); // v1
+            Value b = pop(); // v2
+            Value c = pop(); // v3
+            push(b); push(a); push(c); push(b); push(a);
         }
     }
 
-    /**
-     * JVM DUP2_X2.
-     * Form 4 (all four values category 1): ..., v4, v3, v2, v1 -> ..., v2, v1, v4, v3, v2, v1
-     * (Other forms involve category-2 values; we use the uniform category-1 form.)
-     */
     public void dup2X2() {
-        if (size() >= 4) {
-            Value v1 = pop();   // top
-            Value v2 = pop();
-            Value v3 = pop();
-            Value v4 = pop();
-            push(v2);
-            push(v1);
-            push(v4);
-            push(v3);
-            push(v2);
-            push(v1);
-        } else {
+        if (size() < 2) {
             log.warn("Stack underflow in dup2X2 (size={})", size());
+            return;
+        }
+        Value v1 = peek();
+        boolean v1c2 = isCategory2(v1.getType());
+
+        if (v1c2) {
+            Value a = pop(); // v1 (cat 2)
+            if (isEmpty()) {
+                push(a);
+                log.warn("Stack underflow in dup2X2");
+                return;
+            }
+            Value v2 = peek();
+            if (isCategory2(v2.getType())) {
+                // Form 4: ..., v2, v1 -> ..., v1, v2, v1
+                Value b = pop();
+                push(a); push(b); push(a);
+            } else {
+                // Form 2: ..., v3, v2, v1 -> ..., v1, v3, v2, v1
+                if (size() < 2) {
+                    push(a);
+                    log.warn("Stack underflow in dup2X2");
+                    return;
+                }
+                Value b = pop(); // v2 (cat 1)
+                Value c = pop(); // v3 (cat 1)
+                push(a); push(c); push(b); push(a);
+            }
+        } else {
+            Value a = pop(); // v1 (cat 1)
+            if (isEmpty()) {
+                push(a);
+                log.warn("Stack underflow in dup2X2");
+                return;
+            }
+            Value v2 = peek();
+            if (isCategory2(v2.getType())) {
+                // Form 3: ..., v3, v2, v1 -> ..., v2, v1, v3, v2, v1
+                if (size() < 2) {
+                    push(a);
+                    log.warn("Stack underflow in dup2X2");
+                    return;
+                }
+                Value b = pop(); // v2 (cat 2)
+                Value c = pop(); // v3 (cat 1)
+                push(b); push(a); push(c); push(b); push(a);
+            } else {
+                // Form 1: needs four logical values.
+                if (size() < 3) {
+                    push(a);
+                    log.warn("Stack underflow in dup2X2");
+                    return;
+                }
+                Value b = pop(); // v2 (cat 1)
+                Value c = pop(); // v3 (cat 1)
+                Value d = pop(); // v4 (cat 1)
+                push(b); push(a); push(d); push(c); push(b); push(a);
+            }
         }
     }
 
@@ -163,7 +224,10 @@ public class StackFrame {
     }
 
     public void pop2() {
-        if (!isEmpty()) pop();
-        if (!isEmpty()) pop();
+        if (isEmpty()) return;
+        Value v = pop();
+        if (!isCategory2(v.getType())) {
+            if (!isEmpty()) pop();
+        }
     }
 }

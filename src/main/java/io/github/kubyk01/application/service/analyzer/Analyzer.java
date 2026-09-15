@@ -70,7 +70,6 @@ public class Analyzer implements AnalyzerPort {
         Set<String> allClasses = analysis.getReachableClasses();
         Set<MethodReference> allMethods = analysis.getReachableMethods();
 
-        // Collect used system classes that have native C implementations
         Set<String> usedSystemClasses = new HashSet<>();
         for (String cls : allClasses) {
             if (isSystemClassName(cls) && hasNativeSupport(cls)) {
@@ -78,8 +77,6 @@ public class Analyzer implements AnalyzerPort {
             }
         }
 
-        // ---- Load native method registry for polymorphic calls ----
-        // Only load C files for classes that actually contain polymorphic methods.
         Set<String> polymorphicClasses = new HashSet<>();
         for (String cls : allClasses) {
             ClassNode node = resolver.getClassNode(cls);
@@ -97,7 +94,6 @@ public class Analyzer implements AnalyzerPort {
             log.debug("Loaded native methods for polymorphic classes: {}", toLoad);
         }
 
-        // If includeSystem is false, filter to output only user classes and methods
         Set<String> classesToShow;
         Set<MethodReference> methodsToShow;
         if (includeSystem) {
@@ -128,7 +124,6 @@ public class Analyzer implements AnalyzerPort {
         }
 
         if (showClasses) {
-            // filter classes/methods by debug name
             Set<String> filteredClasses = classesToShow.stream()
                 .filter(c -> matchesDebug(debugName, c))
                 .collect(Collectors.toSet());
@@ -146,7 +141,6 @@ public class Analyzer implements AnalyzerPort {
                 .forEach(m -> System.out.println("  " + m));
         }
 
-        // --- Translation to IR and SSA (always runs) ---
         System.out.println("\n--- Translating to IR and applying SSA ---");
         System.out.println("Total methods to translate: " + allMethods.size());
 
@@ -158,7 +152,6 @@ public class Analyzer implements AnalyzerPort {
             ssaTransformer.transform(func);
         }
 
-        // --- Static initializers (<clinit>) must be processed first ---
         List<Function> clinitFunctions = new ArrayList<>();
         for (Function func : module.getFunctions()) {
             if (func.getName().endsWith(".<clinit>()V")) {
@@ -178,7 +171,6 @@ public class Analyzer implements AnalyzerPort {
             clinitAlias.analyze();
         }
 
-        // --- Alias Analysis ---
         AliasAnalyzer aliasAnalyzer = new AliasAnalyzer(module);
         AliasAnalysisResult aliasResult = aliasAnalyzer.analyze();
 
@@ -201,7 +193,6 @@ public class Analyzer implements AnalyzerPort {
             }
         }
 
-        // --- Escape Analysis ---
         EscapeAnalyzer escapeAnalyzer = new EscapeAnalyzer(module, aliasResult, resolver);
         EscapeAnalysisResult escapeResult = escapeAnalyzer.analyze();
 
@@ -227,7 +218,6 @@ public class Analyzer implements AnalyzerPort {
             }
         }
 
-        // --- Lifetime Analysis ---
         Map<String, FunctionSummary> summaries = aliasResult.getFunctionSummaries();
         LifetimeAnalyzer lifetimeAnalyzer = new LifetimeAnalyzer(module, aliasResult, escapeResult, summaries);
         LifetimeAnalysisResult lifetimeResult = lifetimeAnalyzer.analyze(aliasResult.getAllocationSiteToValue());
@@ -257,12 +247,10 @@ public class Analyzer implements AnalyzerPort {
             }
         }
 
-        // --- Destructor Insertion ---
         DestructorInserter inserter = new DestructorInserter(module, resolver, lifetimeResult,
             aliasResult.getAllocationSiteToValue(), aliasResult);
         inserter.insert();
 
-        // --- Optimization ---
         boolean optimize = true;
         if (optimize) {
             System.out.println("\n--- Running Optimizations ---");
@@ -275,7 +263,6 @@ public class Analyzer implements AnalyzerPort {
             optimizer.optimize();
         }
 
-        // --- LLVM IR Generation ---
         System.out.println("\n--- Generating LLVM IR ---");
         LlvmGenerator llvmGen = new LlvmGenerator(module, resolver, aliasResult,
             entryClass, entryMethod, entryDescriptor, analysis.getReflectInfo(),
@@ -301,7 +288,6 @@ public class Analyzer implements AnalyzerPort {
             }
         }
 
-        // --- Compile and link to native executable ---
         if (!noCompile) {
             Path exePath = outputFile != null ? Paths.get(outputFile) : Paths.get("a.out");
             try {
@@ -363,29 +349,27 @@ public class Analyzer implements AnalyzerPort {
                 compiler = "gcc";
             }
 
-            // 1. Compile the main runtime
             Path runtimeC = extractRuntimeSource(tempDir);
             Path runtimeObj = tempDir.resolve("jnative_runtime.o");
             compileCSource(compiler, runtimeC, runtimeObj);
 
-            // 2. Compile additional C files for system classes (preserving hierarchy)
             List<Path> extraSources = extractSystemNativeSources(usedSystemClasses, tempDir);
             List<Path> extraObjs = new ArrayList<>();
             for (Path src : extraSources) {
-                // Place object file in the same directory as the source
                 Path obj = src.getParent().resolve(src.getFileName().toString().replaceAll("\\.c$", ".o"));
                 compileCSource(compiler, src, obj);
                 extraObjs.add(obj);
             }
 
-            // 3. Compile LLVM IR into an object file
             Path objPath = tempDir.resolve(exePath.getFileName().toString() + ".o");
-            ProcessBuilder pb = new ProcessBuilder(compiler, "-c", "-O3", llPath.toString(), "-o", objPath.toString());
+            ProcessBuilder pb = new ProcessBuilder(
+                compiler, "-c", "-O3",
+                "-g", "-fno-omit-frame-pointer",
+                llPath.toString(), "-o", objPath.toString());
             pb.inheritIO();
             int exit = pb.start().waitFor();
             if (exit != 0) throw new RuntimeException("Compilation failed with exit code " + exit);
 
-            // 4. Link all object files
             List<String> linkCmd = new ArrayList<>();
             linkCmd.add(compiler);
             linkCmd.add(objPath.toString());
@@ -395,15 +379,19 @@ public class Analyzer implements AnalyzerPort {
             linkCmd.add(exePath.toString());
 
             String os = System.getProperty("os.name").toLowerCase();
-            if (os.contains("linux") || os.contains("mac") || os.contains("darwin")) {
+            if (os.contains("linux")) {
+                linkCmd.add("-rdynamic");
                 linkCmd.add("-lpthread");
                 linkCmd.add("-ldl");
-            } else if (os.contains("win")) {
-                linkCmd.add("-lpthread");       // if using pthread-win32
-                // dbghelp is linked via #pragma comment(lib) in the C file
-            } else {
-                // fallback
+            } else if (os.contains("mac") || os.contains("darwin")) {
+                linkCmd.add("-Wl,-export_dynamic");
                 linkCmd.add("-lpthread");
+            } else if (os.contains("win")) {
+                linkCmd.add("-lpthread");
+            } else {
+                linkCmd.add("-rdynamic");
+                linkCmd.add("-lpthread");
+                linkCmd.add("-ldl");
             }
             pb = new ProcessBuilder(linkCmd);
             pb.inheritIO();
@@ -418,17 +406,15 @@ public class Analyzer implements AnalyzerPort {
     }
 
     private void compileCSource(String compiler, Path src, Path obj) throws IOException, InterruptedException {
-        ProcessBuilder pb = new ProcessBuilder(compiler, "-c", "-O2", src.toString(), "-o", obj.toString());
+        ProcessBuilder pb = new ProcessBuilder(
+            compiler, "-c", "-O2",
+            "-g", "-fno-omit-frame-pointer",
+            src.toString(), "-o", obj.toString());
         pb.inheritIO();
         int exit = pb.start().waitFor();
         if (exit != 0) throw new RuntimeException("Compilation of " + src + " failed with exit code " + exit);
     }
 
-    /**
-     * Returns the resource path for a native C implementation of the given class.
-     * The resource is expected to be at "jnative/<class-name>.c" where class-name
-     * uses internal format with slashes (e.g., "java/lang/String").
-     */
     private String getNativeResourcePath(String className) {
         if (className.startsWith("java/")) {
             return NATIVE_BASE_PATH + className.substring("java/".length()) + ".c";
@@ -445,12 +431,6 @@ public class Analyzer implements AnalyzerPort {
         }
     }
 
-    /**
-     * Extracts native C sources for the given system classes, preserving the
-     * directory hierarchy under the temporary directory. For example,
-     * class "jdk/internal/reflect/Reflection" will be extracted to
-     * tempDir/jdk/internal/reflect/Reflection.c.
-     */
     private List<Path> extractSystemNativeSources(Set<String> usedClasses, Path tempDir) throws IOException {
         List<Path> extracted = new ArrayList<>();
         for (String cls : usedClasses) {
@@ -458,7 +438,6 @@ public class Analyzer implements AnalyzerPort {
             String resourcePath = getNativeResourcePath(cls);
             try (InputStream in = Thread.currentThread().getContextClassLoader().getResourceAsStream(resourcePath)) {
                 if (in == null) continue;
-                // Build target path preserving the directory structure
                 Path targetPath = tempDir.resolve(cls.replace('/', java.io.File.separatorChar) + ".c");
                 Files.createDirectories(targetPath.getParent());
                 Files.copy(in, targetPath, StandardCopyOption.REPLACE_EXISTING);

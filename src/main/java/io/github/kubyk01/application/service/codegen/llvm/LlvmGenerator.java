@@ -164,19 +164,19 @@ public class LlvmGenerator {
         String implDesc = implHandle.getDesc();
 
         org.objectweb.asm.Type samType = (org.objectweb.asm.Type) bsmArgs[0];
-        String interfaceSig = samType.getDescriptor();
-        Type retType = TypeResolver.descToReturnType(interfaceSig);
-        List<Type> paramTypes = TypeResolver.descToParamTypes(interfaceSig);
+        String samDescriptor = samType.getDescriptor();
+        Type retType = TypeResolver.descToReturnType(samDescriptor);
+        List<Type> paramTypes = TypeResolver.descToParamTypes(samDescriptor);
 
+        // 4. Build adaptor function
         IrBuilder builder = new IrBuilder(module);
         List<Type> allParamTypes = new ArrayList<>();
-        allParamTypes.add(Type.reference("java/lang/Object")); // receiver
+        allParamTypes.add(Type.reference("java/lang/Object")); // receiver (лямбда-об'єкт)
         allParamTypes.addAll(paramTypes);
         Function adaptorFunc = builder.createFunction(adaptorName, retType, allParamTypes);
 
-        // 5. Register struct and vtable (after function creation)
         globalEmitter.registerLambdaStruct(lambdaId, call.getCapturedTypes());
-        globalEmitter.registerLambdaVtable(lambdaId, adaptorName);
+        globalEmitter.registerLambdaVtable(lambdaId, adaptorName, call.getInterfaceMethodSig());
 
         // 6. Create entry block
         builder.createBlock(adaptorName + "_entry");

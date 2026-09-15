@@ -589,11 +589,33 @@ public class DependencyResolver {
     }
 
     public FieldNode getField(String className, String fieldName) {
+        if (className == null || fieldName == null) return null;
+
         ClassNode cn = classMap.get(className);
-        if (cn == null) return null;
+        if (cn == null) {
+            // Lazy-load system classes (same as findMethodInHierarchy)
+            loadSystemClass(className);
+            cn = classMap.get(className);
+            if (cn == null) return null;
+        }
+
         for (FieldNode f : cn.getFields()) {
             if (f.getName().equals(fieldName)) return f;
         }
+
+        // Walk up the superclass hierarchy — the field may be inherited.
+        String superName = cn.getSuperName();
+        if (superName != null && !superName.equals("java/lang/Object")) {
+            FieldNode inherited = getField(superName, fieldName);
+            if (inherited != null) return inherited;
+        }
+
+        // Static fields can also be declared on interfaces.
+        for (String iface : cn.getInterfaces()) {
+            FieldNode ifaceField = getField(iface, fieldName);
+            if (ifaceField != null) return ifaceField;
+        }
+
         return null;
     }
 
