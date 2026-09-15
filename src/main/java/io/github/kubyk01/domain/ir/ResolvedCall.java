@@ -41,6 +41,12 @@ public class ResolvedCall {
     public static ResolvedCall concat(String format) {
         return new ResolvedCall(Type.CONCAT, null, null, null, null, format, null, null, null);
     }
+    public static ResolvedCall concatWithConstants(String recipe, String packedConstants) {
+        return new ResolvedCall(Type.CONCAT, null, null, null, null, recipe, packedConstants, null, null);
+    }
+    public String getPackedConstants() {
+        return directMethodName;
+    }
     public static ResolvedCall direct(String methodName) {
         return new ResolvedCall(Type.DIRECT, null, null, null, null, null, methodName, null, null);
     }

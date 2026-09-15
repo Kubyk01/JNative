@@ -17,6 +17,25 @@ void* __jnative_get_exception_object(void);
 void __jnative_monitor_enter(void* obj);
 void __jnative_monitor_exit(void* obj);
 
+/* ---------------------------------------------------------------------------
+ * The generated LLVM module defines a global constant
+ *     @vtable_java_lang_Thread = constant [73 x i8*] [ ... ]
+ * In the object file the symbol name is simply "vtable_java_lang_Thread".
+ * Every Java object starts with a pointer to its class vtable; the runtime
+ * must set it whenever it fabricates a Java object out of thin air.
+ * --------------------------------------------------------------------------- */
+extern const void* vtable_java_lang_Thread[];
+
+/* Size of %struct.java_lang_Thread from the generated LLVM IR:
+ *   { i64, i64, i8*, i1, i8*, i8*, i8*, i8*, i8*, i8*, i8*, i8*,
+ *     i8*, i8*, i32, i32, i32, i8*, i32, i8*, i8*, i8*, i64,
+ *     i32, i32, i8*, i8* }
+ *  with 8-byte alignment it is 200 bytes on x86_64.  The very first word
+ * is the vtable slot, the "name" String field sits at offset 24.
+ */
+#define JLTHREAD_OBJECT_SIZE 200
+#define JLTHREAD_NAME_OFFSET 24
+
 typedef struct ThreadState {
     void* java_thread;
     void* carrier_thread;
@@ -44,8 +63,30 @@ static _Thread_local ThreadState* tls_state = NULL;
 static ThreadState* main_thread_state = NULL;
 static int64_t next_tid = 1;
 
+/* ---------------------------------------------------------------------------
+ * create_thread_object
+ *
+ * Allocates a real Java Thread object (matching the layout that the LLVM
+ * emitter uses in its NEW instruction) and initialises the vtable slot so
+ * that virtual dispatch on the object works. Previously this function
+ * returned calloc(1, 16) — a 16-byte zero-filled stub with a NULL vtable —
+ * which caused SIGSEGV (address 0xa8 == 21 * 8) as soon as generated code
+ * executed Thread.getName() through the vtable.
+ * --------------------------------------------------------------------------- */
 static void* create_thread_object(void) {
-    return calloc(1, 16);
+    void* t = calloc(1, JLTHREAD_OBJECT_SIZE);
+    if (t == NULL) {
+        return NULL;
+    }
+
+    /* offset 0: vtable pointer — must be non-NULL for virtual calls. */
+    *(const void**)t = (const void*)vtable_java_lang_Thread;
+
+    /* offset 24: String name — seed with "main" so getName() returns
+     * something sane before the Java-level name has been set. */
+    *(const char**)((char*)t + JLTHREAD_NAME_OFFSET) = "main";
+
+    return t;
 }
 
 static ThreadState* find_thread_state(void* java_thread) {

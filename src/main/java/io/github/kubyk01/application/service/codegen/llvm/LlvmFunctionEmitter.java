@@ -923,8 +923,8 @@ public class LlvmFunctionEmitter {
                         if (expected == 0) {
                             removeFirst = true;
                         } else {
-                            Type firstArgType = args.get(0).getType();
-                            Type firstParamType = calleeFunc.getParameters().get(0).getType();
+                            Type firstArgType = args.getFirst().getType();
+                            Type firstParamType = calleeFunc.getParameters().getFirst().getType();
                             if (firstArgType.isReference() && !firstParamType.isReference()) {
                                 removeFirst = true;
                             }
@@ -1150,9 +1150,10 @@ public class LlvmFunctionEmitter {
                 }
 
                 String callRes = newAux("multiarr");
+                int arrLen = desc.length() + 1;
                 sb.append("  ").append(callRes).append(" = call i8* @__jnative_new_multi_array(i8* getelementptr inbounds ([")
-                    .append(desc.length()).append(" x i8], [")
-                    .append(desc.length()).append(" x i8]* ")
+                    .append(arrLen).append(" x i8], [")
+                    .append(arrLen).append(" x i8]* ")
                     .append(LlvmRuntime.typeStringGlobalName(desc)).append(", i32 0, i32 0), i32 ")
                     .append(dims).append(", i32* ").append(sizesI32).append(", i32 ")
                     .append(elemSize).append(")\n");
@@ -1529,19 +1530,125 @@ public class LlvmFunctionEmitter {
     }
 
     private void emitConcatCall(StringBuilder sb, Instruction inst, String resultName) {
-        List<Value> args = inst.getOperands();
-        sb.append("  %concat_result = call i8* @__jnative_concat_strings(i32 ").append(args.size());
-        for (Value arg : args) {
-            sb.append(", ").append(LlvmTypeMapper.toLlvmType(arg.getType()))
-                .append(" ").append(getLlvmValue(arg));
+        ResolvedCall call = ((InvokeDynamicInfo) inst.getInvokedynamicData()).resolvedCall();
+        String recipe = call.getConcatFormat();
+        List<Value> dynamicArgs = inst.getOperands();
+
+        List<String> parts = new ArrayList<>();
+        int dynIdx = 0;
+
+        if (recipe == null) {
+            for (Value arg : dynamicArgs) {
+                parts.add(convertArgToString(sb, arg));
+            }
+        } else {
+            Object[] constants = parseConstants(call.getPackedConstants());
+            int constIdx = 0;
+            StringBuilder literal = new StringBuilder();
+            for (int i = 0; i < recipe.length(); i++) {
+                char c = recipe.charAt(i);
+                if (c == '\u0001') {
+                    flushLiteral(sb, literal, parts);
+                    if (dynIdx >= dynamicArgs.size()) break;
+                    parts.add(convertArgToString(sb, dynamicArgs.get(dynIdx++)));
+                } else if (c == '\u0002') {
+                    flushLiteral(sb, literal, parts);
+                    if (constIdx < constants.length) {
+                        String s = String.valueOf(constants[constIdx++]);
+                        if (s != null) parts.add(emitLiteralString(sb, s));
+                    }
+                } else {
+                    literal.append(c);
+                }
+            }
+            flushLiteral(sb, literal, parts);
+        }
+
+        if (parts.isEmpty()) {
+            parts.add(emitLiteralString(sb, ""));
+        }
+
+        sb.append("  %concat_result = call i8* @__jnative_concat_strings(i32 ")
+            .append(parts.size());
+        for (String p : parts) {
+            sb.append(", i8* ").append(p);
         }
         sb.append(")\n");
+
         if (inst.getResult() != null && resultName != null) {
             String casted = newAux("concat_cast");
             sb.append("  ").append(casted).append(" = bitcast i8* %concat_result to ")
                 .append(LlvmTypeMapper.toLlvmType(inst.getResult().getType())).append("\n");
             valueMapper.setValue(inst.getResult(), casted);
         }
+    }
+
+    private void flushLiteral(StringBuilder sb, StringBuilder literal, List<String> parts) {
+        if (!literal.isEmpty()) {
+            parts.add(emitLiteralString(sb, literal.toString()));
+            literal.setLength(0);
+        }
+    }
+
+    private String emitLiteralString(StringBuilder sb, String s) {
+        int len = s.length() + 1;
+        String g = LlvmRuntime.typeStringGlobalName(s);
+        return "getelementptr inbounds ([" + len + " x i8], [" + len + " x i8]* "
+                + g + ", i32 0, i32 0)";
+    }
+
+    private String convertArgToString(StringBuilder sb, Value arg) {
+        Type t = arg.getType();
+        String ref = getLlvmValue(arg);
+
+        if (t.isReference() || t.isArray() || t.isNull() || t.isBlock() || t.isUnknown()) {
+            return ref;
+        }
+
+        if (t == Type.INT || t == Type.BYTE || t == Type.SHORT
+            || t == Type.CHAR || t == Type.BOOLEAN) {
+
+            String fn;
+            if (t == Type.BYTE)         fn = "__jnative_value_to_string_byte";
+            else if (t == Type.SHORT)   fn = "__jnative_value_to_string_short";
+            else if (t == Type.CHAR)    fn = "__jnative_value_to_string_char";
+            else if (t == Type.BOOLEAN) fn = "__jnative_value_to_string_boolean";
+            else                        fn = "__jnative_value_to_string_int";
+
+            String casted = castValueToType(sb, ref, t, Type.INT);
+            String res = newAux("to_str");
+            sb.append("  ").append(res).append(" = call i8* @").append(fn)
+                .append("(i32 ").append(casted).append(")\n");
+            return res;
+        }
+
+        if (t == Type.LONG) {
+            String res = newAux("to_str");
+            sb.append("  ").append(res).append(" = call i8* @__jnative_value_to_string_long(i64 ")
+                .append(ref).append(")\n");
+            return res;
+        }
+
+        if (t == Type.FLOAT) {
+            String res = newAux("to_str");
+            sb.append("  ").append(res).append(" = call i8* @__jnative_value_to_string_float(float ")
+                .append(ref).append(")\n");
+            return res;
+        }
+
+        if (t == Type.DOUBLE) {
+            String res = newAux("to_str");
+            sb.append("  ").append(res).append(" = call i8* @__jnative_value_to_string_double(double ")
+                .append(ref).append(")\n");
+            return res;
+        }
+
+        return emitLiteralString(sb, "");
+    }
+
+    private Object[] parseConstants(String packed) {
+        if (packed == null || packed.isEmpty()) return new Object[0];
+        return packed.split("\u0000", -1);
     }
 
     private void emitCall(StringBuilder sb, Type retType, String resultName,
@@ -1924,6 +2031,21 @@ public class LlvmFunctionEmitter {
         if (type == Type.BOOLEAN) {
             return ((Boolean) val) ? "true" : "false";
         }
+
+        if (type.isReference()
+                && "java/lang/String".equals(type.getClassName())
+                && val instanceof String s) {
+            int len = s.length() + 1;
+            return "getelementptr inbounds ([" + len + " x i8], [" + len + " x i8]* "
+                    + LlvmRuntime.typeStringGlobalName(s) + ", i32 0, i32 0)";
+        }
+
+        if (type.isReference() && val instanceof String s) {
+            int len = s.length() + 1;
+            return "getelementptr inbounds ([" + len + " x i8], [" + len + " x i8]* "
+                    + LlvmRuntime.typeStringGlobalName(s) + ", i32 0, i32 0)";
+        }
+
         return "null";
     }
 
@@ -1963,7 +2085,7 @@ public class LlvmFunctionEmitter {
 
         if (fromFloat && toPtr) {
             String intCast = newAux("float_to_i64");
-            String fptosiOp = fromType == Type.FLOAT ? "fptosi" : "fptosi";
+            String fptosiOp = "fptosi";
             sb.append("  ").append(intCast).append(" = ").append(fptosiOp)
                 .append(" ").append(fromLlvm).append(" ").append(value)
                 .append(" to i64\n");

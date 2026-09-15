@@ -37,6 +37,11 @@ public class LlvmGenerator {
 
     private final LlvmGlobalEmitter globalEmitter;
     private final LlvmFunctionEmitter functionEmitter;
+    private List<Function> clinitFunctions = new ArrayList<>();
+
+    public void setClinitFunctions(List<Function> functions) {
+        this.clinitFunctions = functions != null ? functions : new ArrayList<>();
+    }
 
     public LlvmGenerator(Module module, DependencyResolver resolver,
                          AliasAnalysisResult aliasResult,
@@ -112,6 +117,10 @@ public class LlvmGenerator {
             .append(LlvmRuntime.mangleFunction("__jnative_shutdown"))
             .append(")\n");
         String mainFunc = LlvmRuntime.mangleMethod(entryClass, entryMethod, entryDescriptor);
+        for (Function clinit : clinitFunctions) {
+            if (clinit.getEntryBlock() == null) continue;
+            sb.append("  call void @").append(clinit.getName()).append("()\n");
+        }
         sb.append("  %args_array = call i8* @__jnative_create_string_array(i32 %argc, i8** %argv)\n");
         sb.append("  call void @").append(mainFunc).append("(i8* %args_array)\n");
         sb.append("  ret i32 0\n");

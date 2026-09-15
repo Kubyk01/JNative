@@ -62,8 +62,15 @@ public class BytecodeToIr {
                 // the implementation is provided by the runtime (jnative_runtime.c)
                 String nativeName = "__jnative_" + LlvmRuntime.mangleMethod(owner, name, desc);
                 Function func = new Function(nativeName, methodNode.getReturnType());
-                for (Type paramType : methodNode.getParameterTypes()) {
-                    func.addParameter(new Parameter(paramType, func.getParameters().size()));
+
+                List<Type> allParams = new ArrayList<>();
+                if (!methodNode.isStatic()) {
+                    allParams.add(Type.reference(owner));
+                }
+                allParams.addAll(methodNode.getParameterTypes());
+
+                for (int i = 0; i < allParams.size(); i++) {
+                    func.addParameter(new Parameter(allParams.get(i), i));
                 }
                 builder.getModule().addFunction(func);
                 functionMap.put(methodRef, func);

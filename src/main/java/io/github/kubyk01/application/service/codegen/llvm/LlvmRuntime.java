@@ -49,6 +49,16 @@ public class LlvmRuntime {
                 ; ----- String concatenation (implemented in jnative_runtime.c) -----
                 declare i8* @__jnative_concat_strings(i32, ...)
 
+                ; ----- Value to string conversion (implemented in jnative_runtime.c) -----
+                declare i8* @__jnative_value_to_string_int(i32)
+                declare i8* @__jnative_value_to_string_long(i64)
+                declare i8* @__jnative_value_to_string_float(float)
+                declare i8* @__jnative_value_to_string_double(double)
+                declare i8* @__jnative_value_to_string_boolean(i32)
+                declare i8* @__jnative_value_to_string_char(i32)
+                declare i8* @__jnative_value_to_string_byte(i32)
+                declare i8* @__jnative_value_to_string_short(i32)
+
                 ; ----- Reflection runtime (implemented in jnative_runtime.c) -----
                 declare i8* @__jnative_invoke_method(i8*, i8*, i8**)
                 declare i8* @__jnative_new_instance(i8*, i8**)
@@ -65,12 +75,32 @@ public class LlvmRuntime {
     }
 
     /**
-     * Definition of a global string constant (without the \00 terminator,
-     * the array length equals the string length).
+     * Definition of a global string constant (with a \00 terminator,
+     * the array length equals the string length + 1).
      */
     public static String typeStringConstant(String s) {
+        String escaped = escapeLlvmString(s);
         return typeStringGlobalName(s) + " = private unnamed_addr constant ["
-                + s.length() + " x i8] c\"" + s + "\"\n";
+                + (s.length() + 1) + " x i8] c\"" + escaped + "\\00\"\n";
+    }
+
+    private static String escapeLlvmString(String s) {
+        StringBuilder sb = new StringBuilder(s.length() + 8);
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            switch (c) {
+                case '\\' -> sb.append("\\5C");
+                case '"'  -> sb.append("\\22");
+                case '\n' -> sb.append("\\0A");
+                case '\r' -> sb.append("\\0D");
+                case '\t' -> sb.append("\\09");
+                default -> {
+                    if (c < 0x20 || c > 0x7E) sb.append(String.format("\\%02X", (int) c));
+                    else sb.append(c);
+                }
+            }
+        }
+        return sb.toString();
     }
 
     public static String mangleFunction(String name) {

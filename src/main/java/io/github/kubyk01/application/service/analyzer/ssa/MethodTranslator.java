@@ -677,9 +677,29 @@ public class MethodTranslator extends MethodVisitor {
             return ResolvedCall.lambda(lambdaId, interfaceMethodSig, capturedTypes);
         }
 
-        if (owner.equals("java/lang/StringConcatFactory") &&
+        if (owner.equals("java/lang/invoke/StringConcatFactory") &&
             (methodName.equals("makeConcat") || methodName.equals("makeConcatWithConstants"))) {
-            return ResolvedCall.concat(null);
+
+            String recipe = null;
+            Object[] constants = null;
+            if (bsmArgs.length >= 1) {
+                if (bsmArgs[0] instanceof String s) {
+                    recipe = s;
+                    constants = bsmArgs.length > 1
+                        ? Arrays.copyOfRange(bsmArgs, 1, bsmArgs.length)
+                        : new Object[0];
+                }
+            }
+            ResolvedCall call = ResolvedCall.concat(recipe);
+            if (constants != null && constants.length > 0) {
+                StringBuilder sb = new StringBuilder();
+                for (int i = 0; i < constants.length; i++) {
+                    if (i > 0) sb.append('\u0000');
+                    sb.append(constants[i]);
+                }
+                call = ResolvedCall.concatWithConstants(recipe, sb.toString());
+            }
+            return call;
         }
 
         return ResolvedCall.unsupported();

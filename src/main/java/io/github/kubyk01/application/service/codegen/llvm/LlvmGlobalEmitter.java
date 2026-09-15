@@ -15,8 +15,10 @@ import io.github.kubyk01.domain.ir.BasicBlock;
 import io.github.kubyk01.domain.ir.Constant;
 import io.github.kubyk01.domain.ir.Function;
 import io.github.kubyk01.domain.ir.Instruction;
+import io.github.kubyk01.domain.ir.InvokeDynamicInfo;
 import io.github.kubyk01.domain.ir.Module;
 import io.github.kubyk01.domain.ir.Opcode;
+import io.github.kubyk01.domain.ir.Parameter;
 import io.github.kubyk01.domain.ir.Type;
 import io.github.kubyk01.domain.ir.Value;
 import lombok.Getter;
@@ -137,11 +139,13 @@ public class LlvmGlobalEmitter {
     }
 
     private String generateTypeStringConstants() {
-        Set<String> names = new HashSet<>();
+        Set<String> names = new LinkedHashSet<>();
         names.add("java/lang/Object");
+
         for (Function func : module.getFunctions()) {
             for (BasicBlock block : func.getBlocks()) {
                 for (Instruction inst : block.getInstructions()) {
+
                     if (inst.getOpcode() == Opcode.INSTANCEOF
                         || inst.getOpcode() == Opcode.CHECKCAST
                         || inst.getOpcode() == Opcode.MULTI_NEW_ARRAY) {
@@ -151,10 +155,51 @@ public class LlvmGlobalEmitter {
                             }
                         }
                     }
+
+                    for (Value v : inst.getOperands()) {
+                        if (v instanceof Constant c
+                            && c.getType().isReference()
+                            && "java/lang/String".equals(c.getType().getClassName())
+                            && c.getValue() instanceof String s) {
+                            names.add(s);
+                        }
+                    }
+
+                    if (inst.getOpcode() == Opcode.INVOKEDYNAMIC
+                        && inst.getInvokedynamicData() instanceof InvokeDynamicInfo dynInfo
+                        && dynInfo.bootstrapMethod() != null
+                        && "java/lang/invoke/StringConcatFactory".equals(dynInfo.bootstrapMethod().getOwner())
+                        && dynInfo.bootstrapArgs().length >= 1
+                        && dynInfo.bootstrapArgs()[0] instanceof String recipe) {
+
+                        StringBuilder seg = new StringBuilder();
+                        for (int i = 0; i < recipe.length(); i++) {
+                            char c = recipe.charAt(i);
+                            if (c == '\u0001' || c == '\u0002') {
+                                if (!seg.isEmpty()) {
+                                    names.add(seg.toString());
+                                    seg.setLength(0);
+                                }
+                            } else {
+                                seg.append(c);
+                            }
+                        }
+                        if (!seg.isEmpty()) {
+                            names.add(seg.toString());
+                        }
+
+                        for (int i = 1; i < dynInfo.bootstrapArgs().length; i++) {
+                            Object a = dynInfo.bootstrapArgs()[i];
+                            if (a != null) {
+                                names.add(String.valueOf(a));
+                            }
+                        }
+                    }
                 }
             }
         }
-        StringBuilder sb = new StringBuilder("\n; ----- Type name strings -----\n");
+
+        StringBuilder sb = new StringBuilder("\n; ----- String / type-name constants -----\n");
         List<String> sorted = new ArrayList<>(names);
         Collections.sort(sorted);
         for (String name : sorted) {
@@ -309,7 +354,7 @@ public class LlvmGlobalEmitter {
 
         List<ClassNode> allClasses = new ArrayList<>(resolver.getClassMap().values());
         for (ClassNode cls : allClasses) {
-            if (cls.isExternal() || isSystemClass(cls.getName())) continue;
+            if (cls.isExternal()) continue;
 
             String className = cls.getName();
             Map<String, MethodNode> methodMap = new HashMap<>();
@@ -318,21 +363,30 @@ public class LlvmGlobalEmitter {
             List<String> entries = new ArrayList<>();
             for (String sig : sortedSigs) {
                 MethodNode mn = methodMap.get(sig);
-                if (mn != null && !mn.isAbstract()) {
-                    String funcName;
-                    if (mn.isNative()) {
-                        funcName = "__jnative_"
-                            + LlvmRuntime.mangleMethod(className, mn.getName(), mn.getDescriptor());
-                    } else {
-                        funcName = LlvmRuntime.mangleMethod(className, mn.getName(), mn.getDescriptor());
-                    }
-                    String retType = LlvmTypeMapper.toLlvmType(mn.getReturnType());
-                    String paramTypes = buildParamTypes(mn);
-                    entries.add("i8* bitcast (" + retType + " (" + paramTypes + ")* @"
-                        + funcName + " to i8*)");
-                } else {
+                if (mn == null || mn.isAbstract()) {
                     entries.add("i8* null");
+                    continue;
                 }
+                String[] declOwner = new String[1];
+                resolver.findMethodInHierarchy(className, mn.getName(), mn.getDescriptor(), declOwner);
+                String owner = declOwner[0] != null ? declOwner[0] : className;
+                boolean isNative = mn.isNative();
+                String funcName = (isNative ? "__jnative_" : "")
+                    + LlvmRuntime.mangleMethod(owner, mn.getName(), mn.getDescriptor());
+
+                Function fn = module.getFunction(funcName);
+                if (fn == null) {
+                    if (isNative) {
+                        ensureNativeFunctionDeclared(funcName, mn, owner);
+                    } else {
+                        entries.add("i8* null");
+                        continue;
+                    }
+                }
+                String ret = LlvmTypeMapper.toLlvmType(mn.getReturnType());
+                String params = buildParamTypes(mn);
+                entries.add("i8* bitcast (" + ret + " (" + params + ")* @"
+                    + funcName + " to i8*)");
             }
 
             String vtableName = "@vtable_" + LlvmTypeMapper.sanitizeIdentifier(className);
@@ -391,15 +445,6 @@ public class LlvmGlobalEmitter {
         if (ft == Type.SHORT || ft == Type.CHAR) return 2;
         if (ft == Type.BYTE || ft == Type.BOOLEAN) return 1;
         return 8;
-    }
-
-    private boolean isSystemClass(String name) {
-        return name.startsWith("java/") || name.startsWith("javax/")
-            || name.startsWith("sun/") || name.startsWith("jdk/")
-            || name.startsWith("org/objectweb/asm/") || name.startsWith("picocli/")
-            || name.startsWith("reactor/") || name.startsWith("org/slf4j/")
-            || name.startsWith("org/reactivestreams/") || name.startsWith("io/micrometer/")
-            || name.startsWith("org/junit/") || name.startsWith("com/fasterxml/");
     }
 
     private String generateTypeInfo() {
@@ -495,6 +540,23 @@ public class LlvmGlobalEmitter {
             sb.append(LlvmTypeMapper.toLlvmType(params.get(i)));
         }
         return sb.toString();
+    }
+
+    private void ensureNativeFunctionDeclared(String funcName, MethodNode mn, String owner) {
+        if (module.getFunction(funcName) != null) return;
+
+        Type retType = mn.getReturnType();
+        List<Type> allParams = new ArrayList<>();
+        if (!mn.isStatic()) {
+            allParams.add(Type.reference(owner));
+        }
+        allParams.addAll(mn.getParameterTypes());
+
+        Function func = new Function(funcName, retType);
+        for (int i = 0; i < allParams.size(); i++) {
+            func.addParameter(new Parameter(allParams.get(i), i));
+        }
+        module.addFunction(func);
     }
 
     public int getMethodIndex(String sig) {

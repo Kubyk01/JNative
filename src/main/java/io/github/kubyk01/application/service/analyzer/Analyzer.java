@@ -154,7 +154,7 @@ public class Analyzer implements AnalyzerPort {
 
         List<Function> clinitFunctions = new ArrayList<>();
         for (Function func : module.getFunctions()) {
-            if (func.getName().endsWith(".<clinit>()V")) {
+            if (func.getName().endsWith("__clinit____V")) {
                 clinitFunctions.add(func);
             }
         }
@@ -267,6 +267,7 @@ public class Analyzer implements AnalyzerPort {
         LlvmGenerator llvmGen = new LlvmGenerator(module, resolver, aliasResult,
             entryClass, entryMethod, entryDescriptor, analysis.getReflectInfo(),
             polymorphicResolver);
+        llvmGen.setClinitFunctions(clinitFunctions);
         String llvmIR = llvmGen.generate();
         Path llPath = Paths.get("output.ll");
         try {
