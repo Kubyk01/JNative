@@ -254,29 +254,35 @@ public class ReachabilityAnalysis {
 
     void addClassWithInit(String className) {
         if (className == null || className.isEmpty()) return;
-        if (!reachableClasses.add(className)) return;
-
-        ClassNode cn = resolver.getClassNode(className);
-        if (cn == null || cn.isExternal() || cn.isInterface()) return;
-
-        for (MethodNode mn : cn.getMethods()) {
-            if (mn.getName().equals("<clinit>")) {
-                addMethod(new MethodReference(className, "<clinit>", "()V"), false);
-                break;
+        if (reachableClasses.add(className)) {
+            ClassNode cn = resolver.getClassNode(className);
+            if (cn != null && !cn.isExternal() && !cn.isInterface()) {
+                if (!isSystemClassName(className)) {
+                    for (MethodNode mn : cn.getMethods()) {
+                        if (mn.getName().equals("<clinit>")) {
+                            addMethod(new MethodReference(className, "<clinit>", "()V"), false);
+                            break;
+                        }
+                    }
+                }
             }
         }
+    }
 
-        for (MethodNode mn : cn.getMethods()) {
-            if (mn.isStatic()) continue;
-            if (mn.isAbstract()) continue;
-            String mname = mn.getName();
-            if (mname.equals("<init>") || mname.equals("<clinit>")) continue;
-
-            addMethod(
-                new MethodReference(className, mname, mn.getDescriptor()),
-                false
-            );
-        }
+    boolean isSystemClassName(String className) {
+        String dot = className.replace('/', '.');
+        return dot.startsWith("java.") ||
+            dot.startsWith("javax.") ||
+            dot.startsWith("sun.") ||
+            dot.startsWith("jdk.") ||
+            dot.startsWith("org.objectweb.asm.") ||
+            dot.startsWith("picocli.") ||
+            dot.startsWith("reactor.") ||
+            dot.startsWith("org.slf4j.") ||
+            dot.startsWith("org.reactivestreams.") ||
+            dot.startsWith("io.micrometer.") ||
+            dot.startsWith("org.junit.") ||
+            dot.startsWith("com.fasterxml.");
     }
 
     void addMethod(MethodReference ref, boolean isUser) {

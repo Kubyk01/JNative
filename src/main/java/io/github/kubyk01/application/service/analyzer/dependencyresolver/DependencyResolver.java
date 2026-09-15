@@ -566,50 +566,25 @@ public class DependencyResolver {
     }
 
     /**
-     * Searches for a method in the given class and its full hierarchy
-     * (superclasses first, then interfaces) following JVM resolution.
+     * Searches for a method in the given class and its superclasses.
      * Returns the MethodNode if found, and stores the owner class name in foundOwner (if non-null).
      */
-    public MethodNode findMethodInHierarchy(String className, String methodName,
-                                            String descriptor, String[] foundOwner) {
-        return findMethodInHierarchy(className, methodName, descriptor,
-                                     foundOwner, new HashSet<>());
-    }
-
-    private MethodNode findMethodInHierarchy(String className, String methodName,
-                                             String descriptor, String[] foundOwner,
-                                             Set<String> visited) {
-        if (className == null || !visited.add(className)) return null;
-
+    public MethodNode findMethodInHierarchy(String className, String methodName, String descriptor, String[] foundOwner) {
         ClassNode cn = classMap.get(className);
         if (cn == null) {
             loadSystemClass(className);
             cn = classMap.get(className);
             if (cn == null) return null;
         }
-
-        // 1. method declared directly on this class
         for (MethodNode mn : cn.getMethods()) {
             if (mn.getName().equals(methodName) && mn.getDescriptor().equals(descriptor)) {
                 if (foundOwner != null) foundOwner[0] = className;
                 return mn;
             }
         }
-
-        // 2. superclass first (JVM semantics: class beats interface)
         if (cn.getSuperName() != null && !cn.getSuperName().equals("java/lang/Object")) {
-            MethodNode res = findMethodInHierarchy(cn.getSuperName(), methodName,
-                                                   descriptor, foundOwner, visited);
-            if (res != null) return res;
+            return findMethodInHierarchy(cn.getSuperName(), methodName, descriptor, foundOwner);
         }
-
-        // 3. then interfaces
-        for (String iface : cn.getInterfaces()) {
-            MethodNode res = findMethodInHierarchy(iface, methodName,
-                                                   descriptor, foundOwner, visited);
-            if (res != null) return res;
-        }
-
         return null;
     }
 

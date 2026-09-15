@@ -254,20 +254,6 @@ public class ParserC {
 
     /**
      * Parses a comma-separated parameter string.
-     * <p>
-     * Handles declarations where the `*` markers end up attached to the
-     * parameter name rather than the type, e.g.:
-     *
-     * <pre>
-     *   "void **args"     → type="void**",    name="args"
-     *   "int *ptr"        → type="int*",      name="ptr"
-     *   "uint8_t* array"  → type="uint8_t*",  name="array"
-     * </pre>
-     *
-     * This matters for {@code isVoidPtrArgsSignature} in the polymorphic
-     * resolver: without the merge, a signature like {@code (void **args)}
-     * would be parsed as {@code type="void", name="**args"} and would not
-     * be recognised as the generic {@code void**} wrapper.
      */
     private static List<CParameter> parseParameters(String paramString) {
         List<CParameter> params = new ArrayList<>();
@@ -278,46 +264,27 @@ public class ParserC {
         for (String part : parts) {
             part = part.trim();
             if (part.isEmpty()) continue;
-
             int lastSpace = part.lastIndexOf(' ');
             if (lastSpace < 0) {
-                // No space at all — treat the whole token as the type.
                 params.add(new CParameter(part, ""));
-                continue;
+            } else {
+                String type = part.substring(0, lastSpace).trim();
+                String name = part.substring(lastSpace + 1).trim();
+                params.add(new CParameter(type, name));
             }
-
-            StringBuilder type = new StringBuilder(part.substring(0, lastSpace).trim());
-            String name = part.substring(lastSpace + 1).trim();
-
-            // Move any leading '*' markers from the name back onto the type.
-            // This handles "void **args", "int *ptr", "char *s", etc., where
-            // the star is glued to the parameter name rather than the type.
-            while (name.startsWith("*")) {
-                type.append("*");
-                name = name.substring(1);
-            }
-
-            params.add(new CParameter(type.toString(), name));
         }
         return params;
     }
 
     /**
      * Builds a Java method descriptor from C types.
-     * <p>
-     * A C function whose sole parameter is a {@code void**} is treated as a
-     * polymorphic wrapper: it carries the real Java argument list opaquely in
-     * the pointed-to array, so the descriptor we synthesise here is
-     * {@code ()<return-type>}. This matches the contract expected by
-     * {@code PolymorphicResolver.isVoidPtrArgsSignature}.
      */
     private static String buildDescriptor(String cReturnType, List<CParameter> params) {
-        // If there is exactly one parameter and its type contains "void" and "*",
-        // it is a polymorphic wrapper.
+        // If there is exactly one parameter and its type contains "void" and "*", it is a polymorphic wrapper
         if (params.size() == 1) {
             String pType = params.getFirst().getType().trim();
             if (pType.contains("void") && pType.contains("*")) {
-                return "()" + cTypeToDescriptor(cReturnType);
+                return "(" + cTypeToDescriptor(cReturnType); // descriptor without parameters
             }
         }
         StringBuilder sb = new StringBuilder();

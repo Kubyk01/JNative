@@ -99,22 +99,9 @@ public class LlvmGlobalEmitter {
         return generateStructs() +
             generateStaticFields() +
             generateTypeStringConstants() +
-            generateFunctionNameStrings() +
             generateVtables() +
             generateTypeInfo() +
             generateReflectionData();
-    }
-
-    private String generateFunctionNameStrings() {
-        StringBuilder sb = new StringBuilder("\n; ----- Function name strings (exception context) -----\n");
-        Set<String> seen = new HashSet<>();
-        for (Function func : module.getFunctions()) {
-            if (func.getEntryBlock() != null && seen.add(func.getName())) {
-                sb.append(LlvmRuntime.functionNameConstant(func.getName()));
-            }
-        }
-        sb.append("\n");
-        return sb.toString();
     }
 
     private String generateTypeStringConstants() {
@@ -328,21 +315,15 @@ public class LlvmGlobalEmitter {
             for (String sig : sortedSigs) {
                 MethodNode mn = methodMap.get(sig);
                 if (mn != null && !mn.isAbstract()) {
-                    String[] foundOwner = new String[1];
-                    resolver.findMethodInHierarchy(className, mn.getName(), mn.getDescriptor(), foundOwner);
-                    String actualOwner = foundOwner[0] != null ? foundOwner[0] : className;
-
-                    String funcName = mn.isNative()
-                        ? "__jnative_" + LlvmRuntime.mangleMethod(actualOwner, mn.getName(), mn.getDescriptor())
-                        : LlvmRuntime.mangleMethod(actualOwner, mn.getName(), mn.getDescriptor());
-
-                    if (module.getFunction(funcName) != null) {
-                        String retType = LlvmTypeMapper.toLlvmType(mn.getReturnType());
-                        String paramTypes = buildParamTypes(actualOwner, mn);
-                        entries.add("i8* bitcast (" + retType + " (" + paramTypes + ")* @" + funcName + " to i8*)");
+                    String funcName;
+                    if (mn.isNative()) {
+                        funcName = "__jnative_" + LlvmRuntime.mangleMethod(className, mn.getName(), mn.getDescriptor());
                     } else {
-                        entries.add("i8* null");
+                        funcName = LlvmRuntime.mangleMethod(className, mn.getName(), mn.getDescriptor());
                     }
+                    String retType = LlvmTypeMapper.toLlvmType(mn.getReturnType());
+                    String paramTypes = buildParamTypes(mn);
+                    entries.add("i8* bitcast (" + retType + " (" + paramTypes + ")* @" + funcName + " to i8*)");
                 } else {
                     entries.add("i8* null");
                 }
@@ -355,15 +336,6 @@ public class LlvmGlobalEmitter {
             }
             sb.append("]\n");
             vtableNames.put(className, vtableName);
-        }
-        return sb.toString();
-    }
-
-    private String buildParamTypes(String ownerClass, MethodNode mn) {
-        StringBuilder sb = new StringBuilder();
-        sb.append(LlvmTypeMapper.toLlvmType(Type.reference(ownerClass)));
-        for (Type pt : mn.getParameterTypes()) {
-            sb.append(", ").append(LlvmTypeMapper.toLlvmType(pt));
         }
         return sb.toString();
     }
