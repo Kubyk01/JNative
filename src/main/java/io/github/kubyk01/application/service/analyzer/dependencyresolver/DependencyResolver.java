@@ -582,8 +582,18 @@ public class DependencyResolver {
                 return mn;
             }
         }
-        if (cn.getSuperName() != null && !cn.getSuperName().equals("java/lang/Object")) {
-            return findMethodInHierarchy(cn.getSuperName(), methodName, descriptor, foundOwner);
+        String superName = cn.getSuperName();
+        if (superName != null && !superName.equals(className)) {
+            MethodNode result = findMethodInHierarchy(superName, methodName, descriptor, foundOwner);
+            if (result != null) return result;
+        } else if (superName == null && !"java/lang/Object".equals(className)) {
+            MethodNode result = findMethodInHierarchy("java/lang/Object", methodName, descriptor, foundOwner);
+            if (result != null) return result;
+        }
+        for (String iface : cn.getInterfaces()) {
+            if (iface.equals(className)) continue;
+            MethodNode result = findMethodInHierarchy(iface, methodName, descriptor, foundOwner);
+            if (result != null) return result;
         }
         return null;
     }

@@ -8,13 +8,6 @@ __attribute__((noreturn)) void __jnative_throw_null_pointer_exception(void);
 __attribute__((noreturn)) void __jnative_throw_array_index_out_of_bounds(void);
 __attribute__((noreturn)) void __jnative_throw_exception(void* exc);
 
-/*
- * Array layout used by this runtime:
- *   [ int32 length ][ int32 elem_size ][ raw element data ... ]
- * The first 4 bytes hold the number of elements, the next 4 bytes hold the
- * element size in bytes (written by the LLVM emitter for NEW_ARRAY and by
- * __jnative_new_multi_array). The element payload begins at offset 4.
- */
 #define ARRAY_HEADER_SIZE 4
 
 static inline int32_t array_length(void* arr) {
@@ -31,8 +24,6 @@ static inline void* array_data(void* arr) {
     return (char*)arr + ARRAY_HEADER_SIZE;
 }
 
-/* public static native void arraycopy(Object src, int srcPos, Object dest,
- *                                     int destPos, int length) */
 void __jnative_fn_java_lang_System_arraycopy__Ljava_lang_Object_ILjava_lang_Object_II_V(
     void* src, int32_t srcPos, void* dest, int32_t destPos, int32_t length)
 {
@@ -78,13 +69,11 @@ void __jnative_fn_java_lang_System_arraycopy__Ljava_lang_Object_ILjava_lang_Obje
     memmove(dstPtr, srcPtr, bytes);
 }
 
-/* public static native int identityHashCode(Object x) */
 int32_t __jnative_fn_java_lang_System_identityHashCode__Ljava_lang_Object__I(void* obj) {
     if (obj == NULL) return 0;
     return (int32_t)((uintptr_t)obj);
 }
 
-/* public static native long currentTimeMillis() */
 int64_t __jnative_fn_java_lang_System_currentTimeMillis___J(void) {
     struct timespec ts;
     if (clock_gettime(CLOCK_REALTIME, &ts) != 0) {
@@ -94,24 +83,43 @@ int64_t __jnative_fn_java_lang_System_currentTimeMillis___J(void) {
     return millis;
 }
 
-/* Static fields for System.in / System.out / System.err */
-static void* system_in  = NULL;
-static void* system_out = NULL;
-static void* system_err = NULL;
+extern void* gv_java_lang_System_in  __attribute__((weak));
+extern void* gv_java_lang_System_out __attribute__((weak));
+extern void* gv_java_lang_System_err __attribute__((weak));
 
-void __jnative_fn_java_lang_System_setIn0__Ljava_io_InputStream_(void* in) {
-    system_in = in;
+void __jnative_fn_java_lang_System_setIn0__Ljava_io_InputStream__V(void* in) {
+    if (&gv_java_lang_System_in != NULL) {
+        gv_java_lang_System_in = in;
+    }
 }
 
-void __jnative_fn_java_lang_System_setOut0__Ljava_io_PrintStream_(void* out) {
-    system_out = out;
+void __jnative_fn_java_lang_System_setOut0__Ljava_io_PrintStream__V(void* out) {
+    if (&gv_java_lang_System_out != NULL) {
+        gv_java_lang_System_out = out;
+    }
 }
 
-void __jnative_fn_java_lang_System_setErr0__Ljava_io_PrintStream_(void* err) {
-    system_err = err;
+void __jnative_fn_java_lang_System_setErr0__Ljava_io_PrintStream__V(void* err) {
+    if (&gv_java_lang_System_err != NULL) {
+        gv_java_lang_System_err = err;
+    }
 }
 
-/* private static native void initProperties(Properties props) */
 void __jnative_fn_java_lang_System_initProperties__Ljava_util_Properties_(void* props) {
     (void)props;
+}
+
+/*
+ * private static native void registerNatives();
+ *
+ * Called from System.<clinit> to bind the class's native methods
+ * (arraycopy, identityHashCode, currentTimeMillis, nanoTime,
+ * setIn0/setOut0/setErr0, initProperties, ...) to their C
+ * implementations inside the JVM. This runtime does not use JNI
+ * registration: every native method has a statically-linked
+ * __jnative_fn_<class>_<method>_<desc> symbol emitted by the LLVM
+ * backend, and call sites resolve to it directly. The symbol must
+ * exist because System.<clinit> emits a native call to it.
+ */
+void __jnative_fn_java_lang_System_registerNatives___V(void) {
 }

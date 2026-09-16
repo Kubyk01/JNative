@@ -59,3 +59,19 @@ int64_t __jnative_fn_jdk_internal_misc_VM_getNanoTimeAdjustment__J_J(int64_t off
 void* __jnative_fn_jdk_internal_misc_VM_latestUserDefinedLoader0___Ljava_lang_ClassLoader_(void) {
     return NULL;
 }
+
+/*
+ * private static native void initialize();
+ *
+ * Called from <clinit> of jdk.internal.misc.VM after every field that
+ * JDK code observes has already been stored by the Java-level static
+ * initializer (initLevel = 1, maxDirectMemory = -1, allowArraySyntax =
+ * false, isBooted = false, threadPriorities = filled array). In the
+ * reference JDK this hook is used by the HotSpot VM to install its own
+ * VM state on top of those defaults; this runtime keeps all of the
+ * corresponding state in LLVM globals that the static initializer has
+ * already populated, so no native-side work is required. The function
+ * exists so the native symbol resolves at link time.
+ */
+void __jnative_fn_jdk_internal_misc_VM_initialize___V(void) {
+}

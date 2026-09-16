@@ -62,20 +62,20 @@ public class LlvmGenerator {
         sb.append("target datalayout = \"e-m:e-p270:32:32-p271:64:64-i64:64-f80:128-n8:16:32:64-S128\"\n");
         sb.append("target triple = \"x86_64-pc-linux-gnu\"\n\n");
 
-        sb.append(LlvmRuntime.getDeclarations());
-
-        // First, generate all lambda adaptors and register their structs/vtables
-        generateLambdaAdaptors();
-
-        // Now emit the registered extra structs and vtables
-        globalEmitter.emitExtraStructs(sb);
-        globalEmitter.emitExtraVtables(sb);
+        sb.append(LlvmRuntime.getVtableTypeDefinition());
         sb.append("\n");
 
-        // Emit remaining globals (standard structs, static fields, vtables, type info, reflection data)
+        sb.append(LlvmRuntime.getDeclarations());
+
+        generateLambdaAdaptors();
+
+        globalEmitter.emitExtraStructs(sb);
+
+        sb.append(globalEmitter.emitLambdaVtables());
+        sb.append("\n");
+
         sb.append(globalEmitter.generateGlobals());
 
-        // Define functions with bodies - iterate over a copy to avoid modification
         List<Function> functionsCopy = new ArrayList<>(module.getFunctions());
         for (Function func : functionsCopy) {
             if (func.getEntryBlock() != null) {
@@ -83,15 +83,12 @@ public class LlvmGenerator {
             }
         }
 
-        // Now declare all functions that still have no entry block (external functions)
-        // This includes any new functions added by ensureFunctionDeclared during emission
         for (Function func : new ArrayList<>(module.getFunctions())) {
             if (func.getEntryBlock() == null) {
                 sb.append(emitDeclaration(func));
             }
         }
 
-        // Generate main entry point
         sb.append(generateMain());
 
         return sb.toString();
@@ -116,6 +113,7 @@ public class LlvmGenerator {
         sb.append("  call i32 @atexit(void ()* @")
             .append(LlvmRuntime.mangleFunction("__jnative_shutdown"))
             .append(")\n");
+
         String mainFunc = LlvmRuntime.mangleMethod(entryClass, entryMethod, entryDescriptor);
         for (Function clinit : clinitFunctions) {
             if (clinit.getEntryBlock() == null) continue;
@@ -125,6 +123,16 @@ public class LlvmGenerator {
         sb.append("  call void @").append(mainFunc).append("(i8* %args_array)\n");
         sb.append("  ret i32 0\n");
         sb.append("}\n\n");
+
+        int ifaceId  = globalEmitter.getInterfaceId("java/lang/Runnable");
+        int runSlot  = globalEmitter.getInterfaceMethodSlot("java/lang/Runnable", "run", "()V");
+        sb.append("@__jnative_runnable_iface_id = constant i32 ").append(ifaceId).append("\n");
+        sb.append("@__jnative_run_method_slot   = constant i32 ").append(runSlot).append("\n");
+
+        int toStringSlot = globalEmitter.getVirtualSlot(
+            "java/lang/Object", "toString", "()Ljava/lang/String;");
+        sb.append("@__jnative_tostring_slot    = constant i32 ")
+            .append(toStringSlot).append("\n\n");
         return sb.toString();
     }
 
@@ -154,48 +162,56 @@ public class LlvmGenerator {
         String lambdaId = call.getLambdaStructName();
         String adaptorName = "adaptor_" + lambdaId;
 
-        // 1. Check bootstrap arguments
         Object[] bsmArgs = info.bootstrapArgs();
-        if (bsmArgs.length < 2) {
-            return;
-        }
+        if (bsmArgs.length < 2) return;
 
-        // 2. Check if adapter already exists
-        if (module.getFunction(adaptorName) != null) {
-            return;
-        }
+        if (module.getFunction(adaptorName) != null) return;
 
-        // 3. Extract impl method
         Handle implHandle = (Handle) bsmArgs[1];
-        boolean isStatic = (implHandle.getTag() == Opcodes.H_INVOKESTATIC);
-        String implOwner = implHandle.getOwner();
-        String implName = implHandle.getName();
-        String implDesc = implHandle.getDesc();
+        int handleTag = implHandle.getTag();
+        Opcode callOpcode = switch (handleTag) {
+            case Opcodes.H_INVOKESTATIC -> Opcode.STATIC_CALL;
+            case Opcodes.H_INVOKEINTERFACE -> Opcode.INTERFACE_CALL;
+            case Opcodes.H_INVOKEVIRTUAL -> Opcode.VIRTUAL_CALL;
+            case Opcodes.H_INVOKESPECIAL, Opcodes.H_NEWINVOKESPECIAL -> Opcode.SPECIAL_CALL;
+            default -> Opcode.STATIC_CALL;
+        };
+        boolean isStatic = (handleTag == Opcodes.H_INVOKESTATIC);
 
-        org.objectweb.asm.Type samType = (org.objectweb.asm.Type) bsmArgs[0];
+        String implOwner = implHandle.getOwner();
+        String implName  = implHandle.getName();
+        String implDesc  = implHandle.getDesc();
+
+        if (!(bsmArgs[0] instanceof org.objectweb.asm.Type samType)) return;
+        if (samType.getSort() != org.objectweb.asm.Type.METHOD) return;
+
         String samDescriptor = samType.getDescriptor();
+        String samSig = info.name() + samDescriptor;
+
+        String dynDescriptor = info.descriptor();
+        org.objectweb.asm.Type dynReturnType = org.objectweb.asm.Type.getReturnType(dynDescriptor);
+        if (dynReturnType.getSort() != org.objectweb.asm.Type.OBJECT) return;
+        String samInterface = dynReturnType.getInternalName();
+
         Type retType = TypeResolver.descToReturnType(samDescriptor);
         List<Type> paramTypes = TypeResolver.descToParamTypes(samDescriptor);
 
-        // 4. Build adaptor function
         IrBuilder builder = new IrBuilder(module);
         List<Type> allParamTypes = new ArrayList<>();
-        allParamTypes.add(Type.reference("java/lang/Object")); // receiver (лямбда-об'єкт)
+        allParamTypes.add(Type.reference("java/lang/Object"));
         allParamTypes.addAll(paramTypes);
         Function adaptorFunc = builder.createFunction(adaptorName, retType, allParamTypes);
 
-        globalEmitter.registerLambdaStruct(lambdaId, call.getCapturedTypes());
-        globalEmitter.registerLambdaVtable(lambdaId, adaptorName, call.getInterfaceMethodSig());
+        globalEmitter.registerLambdaClass(
+            lambdaId, samInterface, samSig, adaptorName, call.getCapturedTypes());
 
-        // 6. Create entry block
         builder.createBlock(adaptorName + "_entry");
         BasicBlock entry = builder.currentBlock();
         adaptorFunc.setEntryBlock(entry);
 
-        // 7. Load captured variables
         List<Type> capturedTypes = call.getCapturedTypes();
         List<Value> loadedCaptures = new ArrayList<>();
-        int offset = 8; // offset after vtable
+        int offset = 8;
         Parameter lambdaObj = adaptorFunc.getParameters().getFirst();
 
         for (Type capType : capturedTypes) {
@@ -210,7 +226,6 @@ public class LlvmGenerator {
             offset += getElementSizeOfType(capType);
         }
 
-        // 8. Form arguments for impl method call
         List<Value> callArgs = new ArrayList<>();
         if (!isStatic) {
             if (!loadedCaptures.isEmpty()) {
@@ -224,13 +239,20 @@ public class LlvmGenerator {
             callArgs.add(adaptorFunc.getParameters().get(i));
         }
 
-        // 9. Call impl method
         String calleeName = implOwner + "." + implName + implDesc;
-        Instruction callInst = new Instruction(Opcode.STATIC_CALL);
-        callInst.addOperand(new Constant(Type.reference(calleeName), calleeName));
-        for (Value arg : callArgs) {
-            callInst.addOperand(arg);
+        Instruction callInst = new Instruction(callOpcode);
+        if (isStatic) {
+            callInst.addOperand(new Constant(Type.reference(calleeName), calleeName));
+            for (Value arg : callArgs) callInst.addOperand(arg);
+        } else {
+            Value receiver = callArgs.isEmpty()
+                ? new Constant(Type.NULL, null)
+                : callArgs.removeFirst();
+            callInst.addOperand(receiver);
+            callInst.addOperand(new Constant(Type.reference(calleeName), calleeName));
+            for (Value arg : callArgs) callInst.addOperand(arg);
         }
+
         if (!retType.isVoid()) {
             Temporary result = builder.newTemporary(retType);
             callInst.setResult(result);

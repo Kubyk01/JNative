@@ -23,10 +23,10 @@ __attribute__((noreturn)) void __jnative_throw_null_pointer_exception(void);
  * ========================================================================= */
 #define MAX_BITS        15
 #define MAX_LIT_CODES   288
-#define WINDOW_SIZE     65536            /* 64 KiB ring, > 32 KiB max distance */
+#define WINDOW_SIZE     65536
 #define WINDOW_MASK     (WINDOW_SIZE - 1)
 #define ADLER_BASE      65521
-#define JAVA_ARR_HDR    4                /* [int length] followed by elements */
+#define JAVA_ARR_HDR    4
 
 /* =========================================================================
  *  Decoder state
@@ -47,7 +47,6 @@ typedef enum {
 } DecodeState;
 
 typedef struct {
-    /* Bit reader (persists across calls) */
     uint32_t bitbuf;
     int      bitcnt;
     const uint8_t* in;
@@ -55,7 +54,6 @@ typedef struct {
     size_t   in_pos;
     uint64_t total_in;
 
-    /* Wrapper / block state */
     DecodeState state;
     int         nowrap;
     int         bfinal;
@@ -70,12 +68,10 @@ typedef struct {
     uint32_t pending_len;
     uint32_t pending_dist;
 
-    /* Output ring buffer */
     uint8_t  window[WINDOW_SIZE];
-    uint64_t win_total;       /* total decoded */
-    uint64_t drained_total;   /* total delivered to caller */
+    uint64_t win_total;
+    uint64_t drained_total;
 
-    /* ADLER32 */
     uint32_t adler_a;
     uint32_t adler_b;
 } InflaterState;
@@ -141,7 +137,6 @@ static int build_table(HuffmanTable* t, const uint8_t* lengths, int n) {
     return 0;
 }
 
-/* Returns >=0 symbol, -1 need more input, -2 invalid code */
 static int decode_sym(InflaterState* s, HuffmanTable* t) {
     uint32_t peeked;
     int avail;
@@ -278,12 +273,10 @@ static inline int64_t window_room(const InflaterState* s) {
 
 /* =========================================================================
  *  Decode one step
- *  Return:  1 done, 0 progress, -1 need input, -2 data error, -3 need dict
  * ========================================================================= */
 static int decode_more(InflaterState* s) {
     if (s->state == ST_DONE) return 1;
 
-    /* ---- Zlib wrapper ---- */
     if (s->state == ST_WRAPPER) {
         if (s->nowrap) { s->state = ST_BLOCK_HEADER; return 0; }
 
@@ -291,10 +284,10 @@ static int decode_more(InflaterState* s) {
         if (read_bits(s, 8, &a) < 0) return -1;
         if (read_bits(s, 8, &b) < 0) return -1;
         uint8_t cmf = (uint8_t)a, flg = (uint8_t)b;
-        if ((cmf & 0x0F) != 8) return -2;                /* CM != deflate */
-        if (((cmf << 8) | flg) % 31 != 0) return -2;     /* header checksum */
+        if ((cmf & 0x0F) != 8) return -2;
+        if (((cmf << 8) | flg) % 31 != 0) return -2;
 
-        if (flg & 0x20) {                                /* FDICT set */
+        if (flg & 0x20) {
             uint32_t d0,d1,d2,d3;
             if (read_bits(s, 8, &d0) < 0) return -1;
             if (read_bits(s, 8, &d1) < 0) return -1;
@@ -311,7 +304,6 @@ static int decode_more(InflaterState* s) {
         return 0;
     }
 
-    /* ---- Block header ---- */
     if (s->state == ST_BLOCK_HEADER) {
         if (window_room(s) <= 0) return 0;
         uint32_t bfinal, btype;
@@ -336,7 +328,6 @@ static int decode_more(InflaterState* s) {
         return 0;
     }
 
-    /* ---- Stored LEN/NLEN ---- */
     if (s->state == ST_STORED_LEN) {
         align_byte(s);
         uint32_t len, nlen;
@@ -348,7 +339,6 @@ static int decode_more(InflaterState* s) {
         return 0;
     }
 
-    /* ---- Stored data ---- */
     if (s->state == ST_STORED_DATA) {
         while (s->stored_remaining > 0) {
             if (window_room(s) <= 0) return 0;
@@ -365,9 +355,7 @@ static int decode_more(InflaterState* s) {
         return 0;
     }
 
-    /* ---- Huffman ---- */
     if (s->state == ST_HUFFMAN) {
-        /* Resume pending back-reference */
         while (s->pending_len > 0) {
             if (window_room(s) <= 0) return 0;
             uint8_t b = s->window[(s->win_total - s->pending_dist) & WINDOW_MASK];
@@ -384,7 +372,7 @@ static int decode_more(InflaterState* s) {
             emit_byte(s, (uint8_t)sym);
             return 0;
         }
-        if (sym == 256) {                                 /* end-of-block */
+        if (sym == 256) {
             if (s->bfinal) {
                 s->state = s->nowrap ? ST_DONE : ST_TRAILER;
             } else {
@@ -416,7 +404,6 @@ static int decode_more(InflaterState* s) {
         return 0;
     }
 
-    /* ---- ADLER32 trailer ---- */
     if (s->state == ST_TRAILER) {
         uint32_t c0, c1, c2, c3;
         if (read_bits(s, 8, &c0) < 0) return -1;
@@ -448,7 +435,6 @@ static int inflate_call(InflaterState* s,
     size_t produced = 0;
 
     for (;;) {
-        /* Drain window -> out */
         while (s->drained_total < s->win_total && produced < out_len) {
             size_t pos = (size_t)(s->drained_total & WINDOW_MASK);
             size_t avail = WINDOW_SIZE - pos;
@@ -462,7 +448,7 @@ static int inflate_call(InflaterState* s,
 
         s->total_in += s->in_pos;
         s->in_pos = 0;
-        s->in_len = 0;   /* don't re-add bytes already merged into bitbuf */
+        s->in_len = 0;
 
         if (s->state == ST_DONE && s->drained_total >= s->win_total) {
             *out_produced = produced;
@@ -494,12 +480,11 @@ static inline uint8_t* jbyte_out(void* arr, int32_t off) {
 }
 
 /* =========================================================================
- *  Public native methods (all signatures follow  this + descriptor args)
+ *  Public native methods
  * ========================================================================= */
 
 /* static void initIDs() */
 void __jnative_fn_java_util_zip_Inflater_initIDs___V(void) {
-    /* No-op — JNI IDs are not used in this runtime. */
 }
 
 /* long init(boolean nowrap) */
@@ -559,40 +544,51 @@ void __jnative_fn_java_util_zip_Inflater_reset__J_V(void* self, int64_t addr) {
     s->needs_dict = 0; s->dict_adler = 0;
 }
 
-/* ---- Inflate entry points ---- */
-
-int32_t __jnative_fn_java_util_zip_Inflater_inflateBytesBytes__JLjava_lang_byte_IILjava_lang_byte_II_I(
+/*
+ * The two entry points that the LLVM emitter actually references.
+ * Descriptors:
+ *   inflateBytesBytes(long, byte[], int, int, byte[], int, int) -> long
+ *   inflateBufferBytes(long, long,  int, byte[], int, int)      -> long
+ * The return type is `long` in this runtime's target JDK; the value is the
+ * number of bytes written into the output array.
+ */
+int64_t __jnative_fn_java_util_zip_Inflater_inflateBytesBytes__J_BII_BII_J(
         void* self, int64_t addr,
         void* input,  int32_t inputOff,  int32_t inputLen,
         void* output, int32_t outputOff, int32_t outputLen)
 {
     (void)self;
     InflaterState* s = (InflaterState*)(intptr_t)addr;
-    if (s == NULL) return Z_STREAM_ERROR;
+    if (s == NULL) return (int64_t)Z_STREAM_ERROR;
     if (input == NULL || output == NULL) {
         __jnative_throw_null_pointer_exception();
     }
     size_t produced = 0;
     inflate_call(s, jbyte_in(input, inputOff), (size_t)inputLen,
                     jbyte_out(output, outputOff), (size_t)outputLen, &produced);
-    return (int32_t)produced;
+    return (int64_t)produced;
 }
 
-int32_t __jnative_fn_java_util_zip_Inflater_inflateBufferBytes__JJILjava_lang_byte_II_I(
+int64_t __jnative_fn_java_util_zip_Inflater_inflateBufferBytes__JJI_BII_J(
         void* self, int64_t addr,
         int64_t inputAddress, int32_t inputLen,
         void* output, int32_t outputOff, int32_t outputLen)
 {
     (void)self;
     InflaterState* s = (InflaterState*)(intptr_t)addr;
-    if (s == NULL) return Z_STREAM_ERROR;
+    if (s == NULL) return (int64_t)Z_STREAM_ERROR;
     if (output == NULL) __jnative_throw_null_pointer_exception();
     size_t produced = 0;
     inflate_call(s, (const uint8_t*)(intptr_t)inputAddress, (size_t)inputLen,
                     jbyte_out(output, outputOff), (size_t)outputLen, &produced);
-    return (int32_t)produced;
+    return (int64_t)produced;
 }
 
+/*
+ * Legacy compatibility wrappers — kept for callers that emit the older
+ * descriptor forms. These are not referenced by the current LLVM backend
+ * but are harmless and keep the file usable across build generations.
+ */
 int32_t __jnative_fn_java_util_zip_Inflater_inflateBytesBuffer__JLjava_lang_byte_IJI_I(
         void* self, int64_t addr,
         void* input, int32_t inputOff, int32_t inputLen,

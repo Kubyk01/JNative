@@ -73,8 +73,28 @@ public class MethodBytecodeVisitor extends ClassVisitor {
         reader.accept(this, ClassReader.SKIP_DEBUG);
     }
 
+    // ------------------------------------------------------------------
+    //  Wrappers that thread the reachableFromUser flag through to the
+    //  ReachabilityAnalysis API.
+    // ------------------------------------------------------------------
+
+    /**
+     * Passive reference: the class becomes reachable, but its {@code <clinit>}
+     * is NOT enqueued. Use for descriptors, catch-types, {@code LDC X.class},
+     * annotation types and method references.
+     */
+    private void addClass(String className) {
+        analysis.addClass(className, reachableFromUser);
+    }
+
+    /**
+     * Active use: the class becomes reachable AND its {@code <clinit>} is
+     * enqueued. Use for {@code new}, {@code getstatic}/{@code putstatic},
+     * {@code invokestatic} into a non-native method, and reflective
+     * instantiation.
+     */
     private void addClassWithInit(String className) {
-        analysis.addClassWithInit(className);
+        analysis.addClassWithInit(className, reachableFromUser);
     }
 
     private void addMethodWithContext(MethodReference ref, boolean user) {
@@ -82,8 +102,12 @@ public class MethodBytecodeVisitor extends ClassVisitor {
     }
 
     private void addTypeFromDescriptor(String desc) {
-        analysis.addTypeFromDescriptor(desc);
+        analysis.addTypeFromDescriptor(desc, reachableFromUser);
     }
+
+    // ------------------------------------------------------------------
+    //  MethodVisitor
+    // ------------------------------------------------------------------
 
     private class MethodVisitorImpl extends MethodVisitor {
 
@@ -119,7 +143,8 @@ public class MethodBytecodeVisitor extends ClassVisitor {
         @Override
         public void visitTypeInsn(int opcode, String type) {
             if (opcode == Opcodes.NEW || opcode == Opcodes.ANEWARRAY || opcode == Opcodes.MULTIANEWARRAY) {
-                analysis.addInstantiatedClass(type);
+                // new X / new X[] / new X[][] — active use of X.
+                analysis.addInstantiatedClass(type, reachableFromUser);
             }
             simulator.visitTypeInsn(opcode, type);
             super.visitTypeInsn(opcode, type);
@@ -127,6 +152,13 @@ public class MethodBytecodeVisitor extends ClassVisitor {
 
         @Override
         public void visitFieldInsn(int opcode, String owner, String name, String descriptor) {
+            // getstatic/putstatic on owner's static field is an active use of
+            // the owner class (JLS §12.4.1) and must trigger its <clinit>.
+            // getfield/putfield only touch an already-created instance and
+            // do not require class initialization.
+            if (opcode == Opcodes.GETSTATIC || opcode == Opcodes.PUTSTATIC) {
+                analysis.triggerClinit(owner, reachableFromUser);
+            }
             simulator.visitFieldInsn(opcode, descriptor);
             super.visitFieldInsn(opcode, owner, name, descriptor);
         }
@@ -151,19 +183,45 @@ public class MethodBytecodeVisitor extends ClassVisitor {
                     simulator.push(TypedValue.fromType(retType));
                 }
             } else {
-                String receiverType = simulator.getReceiverType(opcode, mDesc);
+                String rawReceiverType = simulator.getReceiverType(opcode, mDesc);
+                String receiverType =
+                    (isAssignableTo(rawReceiverType, owner))
+                        ? rawReceiverType
+                        : null;
 
                 // Always add the method for the owner
                 MethodReference ownerRef = new MethodReference(owner, mName, mDesc);
                 addMethodWithContext(ownerRef, reachableFromUser);
 
+                // invokestatic triggers class initialization of the owner
+                // ONLY when the target Java method actually has a body that
+                // could read Java-side static state. A native method's
+                // implementation lives in C and is completely independent
+                // of the class's <clinit>; forcing <clinit> for it would
+                // pull in e.g. Thread.<clinit> (registerNatives) just
+                // because someone called Thread.currentThread().
+                if (opcode == Opcodes.INVOKESTATIC) {
+                    String[] foundOwner = new String[1];
+                    MethodNode target = resolver.findMethodInHierarchy(
+                        owner, mName, mDesc, foundOwner);
+                    if (target == null || !target.isNative()) {
+                        analysis.triggerClinit(owner, reachableFromUser);
+                    }
+                }
+
                 if (opcode == Opcodes.INVOKEVIRTUAL || opcode == Opcodes.INVOKEINTERFACE) {
                     Set<String> candidateTypes = new HashSet<>();
 
                     if (receiverType != null && isConcreteClass(receiverType)) {
+                        // The simulator pinned the receiver to an exact
+                        // concrete class: register that class passively
+                        // and use it as the sole dispatch candidate.
+                        addClass(receiverType);
                         candidateTypes.add(receiverType);
                     } else {
-                        Set<String> subclasses = new HashSet<>(resolver.getSubclasses(Objects.requireNonNullElse(receiverType, owner)));
+                        String dispatchRoot = receiverType != null ? receiverType : owner;
+                        Set<String> subclasses = new HashSet<>(
+                            resolver.getSubclasses(dispatchRoot));
                         if (subclasses.isEmpty()) {
                             subclasses.add(owner);
                         }
@@ -173,15 +231,33 @@ public class MethodBytecodeVisitor extends ClassVisitor {
                         }
                     }
 
-                    // Add for all possible target classes (subclasses and the concrete type)
+                    // For each candidate receiver, resolve to the class that
+                    // actually declares the dispatched implementation. Only
+                    // that declaring class (if different from `owner`) is a
+                    // genuinely new reachable target. Subclasses that simply
+                    // inherit the owner's implementation contribute nothing
+                    // and must not be registered as reachable — otherwise a
+                    // single virtual call on an unknown receiver pulls in
+                    // every loaded subclass.
+                    Set<String> addedDeclaringClasses = new HashSet<>();
                     for (String target : candidateTypes) {
-                        if (!target.equals(owner)) { // avoid duplication
-                            MethodReference ref = new MethodReference(target, mName, mDesc);
+                        if (target.equals(owner)) continue;
+
+                        String[] foundOwner = new String[1];
+                        MethodNode targetMethod = resolver.findMethodInHierarchy(
+                            target, mName, mDesc, foundOwner);
+                        if (targetMethod == null || targetMethod.isAbstract()) continue;
+
+                        String declaring = foundOwner[0];
+                        if (declaring == null || declaring.equals(owner)) continue;
+
+                        if (addedDeclaringClasses.add(declaring)) {
+                            MethodReference ref = new MethodReference(declaring, mName, mDesc);
                             addMethodWithContext(ref, reachableFromUser);
                         }
                     }
                 }
-                // For INVOKESPECIAL and INVOKESTATIC we already added ownerRef above
+                // For INVOKESPECIAL we already added ownerRef above
                 simulator.visitMethodInsn(opcode, mDesc);
             }
             super.visitMethodInsn(opcode, owner, mName, mDesc, isInterface);
@@ -214,7 +290,9 @@ public class MethodBytecodeVisitor extends ClassVisitor {
             } else if (value instanceof org.objectweb.asm.Type asmType) {
                 if (asmType.getSort() == org.objectweb.asm.Type.OBJECT) {
                     lastLoadedClass = asmType.getInternalName();
-                    addClassWithInit(asmType.getInternalName());
+                    // LDC of a class literal (Foo.class) is a PASSIVE
+                    // reference — it does NOT trigger Foo's <clinit>.
+                    addClass(asmType.getInternalName());
                 }
             }
             simulator.visitLdcInsn(value);
@@ -230,7 +308,9 @@ public class MethodBytecodeVisitor extends ClassVisitor {
         @Override
         public void visitTryCatchBlock(Label start, Label end, Label handler, String type) {
             if (type != null) {
-                addClassWithInit(type);
+                // Catching a type only requires the class to be loaded, not
+                // initialized (JLS §12.4.1 explicitly excludes it).
+                addClass(type);
             }
             super.visitTryCatchBlock(start, end, handler, type);
         }
@@ -283,6 +363,9 @@ public class MethodBytecodeVisitor extends ClassVisitor {
 
         private void handleReflectiveCall(String owner, String mName, String mDesc,
                                           List<TypedValue> args) {
+            MethodReference reflectiveRef = new MethodReference(owner, mName, mDesc);
+            addMethodWithContext(reflectiveRef, reachableFromUser);
+
             if (!reachableFromUser) return;
 
             if (owner.equals("java/lang/Class") && mName.equals("forName")
@@ -292,7 +375,7 @@ public class MethodBytecodeVisitor extends ClassVisitor {
                     if (arg.isConstant() && arg.getValue() instanceof String) {
                         String className = ((String) arg.getValue()).replace('.', '/');
                         addClassWithInit(className);
-                        analysis.addInstantiatedClass(className);
+                        analysis.addInstantiatedClass(className, reachableFromUser);
                     }
                 }
                 return;
@@ -304,7 +387,7 @@ public class MethodBytecodeVisitor extends ClassVisitor {
                     if (arg.isConstant() && arg.getValue() instanceof String) {
                         String className = ((String) arg.getValue()).replace('.', '/');
                         addClassWithInit(className);
-                        analysis.addInstantiatedClass(className);
+                        analysis.addInstantiatedClass(className, reachableFromUser);
                     }
                 }
                 return;
@@ -338,10 +421,7 @@ public class MethodBytecodeVisitor extends ClassVisitor {
                             for (int i = 0; i < paramTypes.size(); i++) {
                                 Type pt = paramTypes.get(i);
                                 String expected = paramClassNames.get(i);
-                                if (!typeMatches(expected, pt)) {
-                                    match = false;
-                                    break;
-                                }
+                                if (!typeMatches(expected, pt)) { match = false; break; }
                             }
                             if (match) {
                                 MethodReference ref = new MethodReference(targetClass, mn.getName(), mn.getDescriptor());
@@ -384,7 +464,7 @@ public class MethodBytecodeVisitor extends ClassVisitor {
                     ReflectClassInfo info = reflectInfo.getOrCreateClassInfo(cls);
                     for (MethodReference ctor : info.getConstructors()) {
                         addMethodWithContext(ctor, true);
-                        analysis.addInstantiatedClass(cls);
+                        analysis.addInstantiatedClass(cls, reachableFromUser);
                     }
                 }
                 return;
@@ -400,7 +480,7 @@ public class MethodBytecodeVisitor extends ClassVisitor {
                                 MethodReference ref = new MethodReference(targetClass, "<init>", "()V");
                                 reflectInfo.addConstructor(targetClass, ref);
                                 addMethodWithContext(ref, true);
-                                analysis.addInstantiatedClass(targetClass);
+                                analysis.addInstantiatedClass(targetClass, reachableFromUser);
                             }
                         }
                     }
@@ -445,7 +525,29 @@ public class MethodBytecodeVisitor extends ClassVisitor {
             if (cn.isInterface()) return false;
             return (cn.getAccess() & Opcodes.ACC_ABSTRACT) == 0;
         }
+
+        private boolean isAssignableTo(String sub, String sup) {
+            if (sub == null || sup == null) return false;
+            if (sub.equals(sup)) return true;
+            Set<String> visited = new HashSet<>();
+            Deque<String> work = new ArrayDeque<>();
+            work.add(sub);
+            while (!work.isEmpty()) {
+                String cur = work.pop();
+                if (!visited.add(cur)) continue;
+                if (cur.equals(sup)) return true;
+                ClassNode cn = resolver.getClassNode(cur);
+                if (cn == null) continue;
+                if (cn.getSuperName() != null) work.add(cn.getSuperName());
+                work.addAll(cn.getInterfaces());
+            }
+            return false;
+        }
     }
+
+    // ------------------------------------------------------------------
+    //  Bytecode-level type simulation (unchanged)
+    // ------------------------------------------------------------------
 
     private static class TypeSimulator {
         private final Deque<TypedValue> stack = new ArrayDeque<>();
@@ -647,7 +749,7 @@ public class MethodBytecodeVisitor extends ClassVisitor {
 
         void visitLdcInsn(Object value) {
             switch (value) {
-                case Integer ignored1 -> push(TypedValue.fromConstant(INT, value));
+                case Integer ignored -> push(TypedValue.fromConstant(INT, value));
                 case Long ignored -> push(TypedValue.fromConstant(LONG, value));
                 case Float ignored -> push(TypedValue.fromConstant(FLOAT, value));
                 case Double ignored -> push(TypedValue.fromConstant(DOUBLE, value));

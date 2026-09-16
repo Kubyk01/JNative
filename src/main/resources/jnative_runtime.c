@@ -26,42 +26,89 @@ __attribute__((noreturn)) void __jnative_throw_array_index_out_of_bounds_ctx(con
 __attribute__((noreturn)) void __jnative_throw_class_cast_exception_ctx(const char* caller);
 __attribute__((noreturn)) void __jnative_throw_arithmetic_exception_ctx(const char* caller);
 void* __jnative_get_exception_object(void);
-int __jnative_catch_matches(void* exc, void* type_info);
-int __jnative_instanceof(void* obj, void** type_info);
+int   __jnative_catch_matches(void* exc, void* type_info);
+int   __jnative_instanceof(void* obj, void** type_info);
+
+/* ============================================================================
+ * Reflection metadata layout
+ * ========================================================================== */
 
 struct ReflectionField {
     void* name;
     void* descriptor;
-    int offset;
-    int modifiers;
+    int   offset;
+    int   modifiers;
 };
 
 struct ReflectionMethod {
     void* name;
     void* descriptor;
     void* adaptor;
-    int modifiers;
+    int   modifiers;
 };
 
 struct ReflectionConstructor {
     void* descriptor;
     void* adaptor;
-    int modifiers;
+    int   modifiers;
 };
 
 struct ReflectionClass {
     void* name;
-    struct ReflectionClass* superclass;
-    struct ReflectionClass** interfaces;
+    struct ReflectionClass*   superclass;
+    struct ReflectionClass**  interfaces;
     struct ReflectionMethod** methods;
-    struct ReflectionField** fields;
+    struct ReflectionField**  fields;
     struct ReflectionConstructor** constructors;
-    int modifiers;
-    int object_size;
-    int detail_message_offset;
+    int   modifiers;
+    int   object_size;
 };
 
+/* ============================================================================
+ * Virtual-table ABI
+ * ========================================================================== */
+
+struct JNativeIfaceMapEntry {
+    int32_t id;
+    void**  itable;
+};
+
+struct JNativeIfaceMap {
+    int32_t count;
+    struct JNativeIfaceMapEntry* entries;
+};
+
+struct JNativeVTable {
+    void**  methods;
+    struct JNativeIfaceMap* ifacemap;
+    const char* name;
+};
+
+void** __jnative_lookup_itable(struct JNativeIfaceMap* ifacemap, int32_t iface_id) {
+    if (ifacemap == NULL) return NULL;
+    int32_t n = ifacemap->count;
+    struct JNativeIfaceMapEntry* e = ifacemap->entries;
+    if (e == NULL) return NULL;
+    for (int32_t i = 0; i < n; i++) {
+        if (e[i].id == iface_id) return e[i].itable;
+    }
+    return NULL;
+}
+
+static const char* __jnative_vtable_class_name(void* vtable) {
+    if (vtable == NULL) return NULL;
+    return ((struct JNativeVTable*)vtable)->name;
+}
+
+/* ============================================================================
+ * Class registry
+ * ========================================================================== */
+
 extern struct ReflectionClass* reflect_all_classes[] __attribute__((weak));
+
+/* ============================================================================
+ * Monitor table
+ * ========================================================================== */
 
 #define HASH_SIZE 1024
 
@@ -82,9 +129,7 @@ static pthread_mutex_t* find_mutex(void* obj) {
     uint32_t idx = hash_ptr(obj);
     MonitorEntry* entry = monitor_table[idx];
     while (entry) {
-        if (entry->obj == obj) {
-            return &entry->mutex;
-        }
+        if (entry->obj == obj) return &entry->mutex;
         entry = entry->next;
     }
     return NULL;
@@ -92,10 +137,8 @@ static pthread_mutex_t* find_mutex(void* obj) {
 
 static pthread_mutex_t* get_or_create_mutex(void* obj) {
     if (obj == NULL) return NULL;
-
     uint32_t idx = hash_ptr(obj);
     pthread_mutex_lock(&table_lock);
-
     MonitorEntry* entry = monitor_table[idx];
     while (entry) {
         if (entry->obj == obj) {
@@ -104,23 +147,19 @@ static pthread_mutex_t* get_or_create_mutex(void* obj) {
         }
         entry = entry->next;
     }
-
     MonitorEntry* new_entry = malloc(sizeof(MonitorEntry));
     if (new_entry == NULL) {
         pthread_mutex_unlock(&table_lock);
         return NULL;
     }
     new_entry->obj = obj;
-
     pthread_mutexattr_t attr;
     pthread_mutexattr_init(&attr);
     pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
     pthread_mutex_init(&new_entry->mutex, &attr);
     pthread_mutexattr_destroy(&attr);
-
     new_entry->next = monitor_table[idx];
     monitor_table[idx] = new_entry;
-
     pthread_mutex_unlock(&table_lock);
     return &new_entry->mutex;
 }
@@ -129,7 +168,6 @@ void __jnative_monitor_destroy(void* obj) {
     if (obj == NULL) return;
     uint32_t idx = hash_ptr(obj);
     pthread_mutex_lock(&table_lock);
-
     MonitorEntry** pp = &monitor_table[idx];
     while (*pp) {
         MonitorEntry* entry = *pp;
@@ -150,9 +188,7 @@ void __jnative_monitor_enter(void* obj) {
         return;
     }
     pthread_mutex_t* mtx = get_or_create_mutex(obj);
-    if (mtx) {
-        pthread_mutex_lock(mtx);
-    }
+    if (mtx) pthread_mutex_lock(mtx);
 }
 
 void __jnative_monitor_exit(void* obj) {
@@ -163,10 +199,12 @@ void __jnative_monitor_exit(void* obj) {
     pthread_mutex_lock(&table_lock);
     pthread_mutex_t* mtx = find_mutex(obj);
     pthread_mutex_unlock(&table_lock);
-    if (mtx) {
-        pthread_mutex_unlock(mtx);
-    }
+    if (mtx) pthread_mutex_unlock(mtx);
 }
+
+/* ============================================================================
+ * Type identity
+ * ========================================================================== */
 
 static char* build_type_info_name(const char* class_name) {
     static char buf[256];
@@ -180,14 +218,11 @@ static char* build_type_info_name(const char* class_name) {
 static void* get_class_vtable(struct ReflectionClass* cls) {
     if (!cls || !cls->name) return NULL;
     const char* name = (const char*)cls->name;
-
     char* info_name = build_type_info_name(name);
     void* handle = dlopen(NULL, RTLD_LAZY);
     if (!handle) return NULL;
-
     void** type_info = (void**)dlsym(handle, info_name);
     dlclose(handle);
-
     if (!type_info) return NULL;
     return type_info[0];
 }
@@ -195,18 +230,19 @@ static void* get_class_vtable(struct ReflectionClass* cls) {
 static struct ReflectionClass* find_class_by_vtable(void* vtable) {
     if (!vtable) return NULL;
     if (reflect_all_classes == NULL) return NULL;
-
     struct ReflectionClass** pp = reflect_all_classes;
     while (*pp) {
         struct ReflectionClass* cls = *pp;
         void* cls_vtable = get_class_vtable(cls);
-        if (cls_vtable == vtable) {
-            return cls;
-        }
+        if (cls_vtable == vtable) return cls;
         pp++;
     }
     return NULL;
 }
+
+/* ============================================================================
+ * Symbol demangling
+ * ========================================================================== */
 
 static const char* dotted_class_name(const char* internal, char* buf, size_t buf_size) {
     if (!internal) return NULL;
@@ -220,9 +256,7 @@ static const char* dotted_class_name(const char* internal, char* buf, size_t buf
 
 static void __jnative_demangle(const char* sym, char* out, size_t out_size) {
     if (!sym || !out || out_size == 0) { if (out) out[0] = '\0'; return; }
-
     while (*sym == '_') sym++;
-
     if (strncmp(sym, "fn_", 3) != 0) {
         size_t len = strlen(sym);
         if (len >= out_size) len = out_size - 1;
@@ -231,21 +265,17 @@ static void __jnative_demangle(const char* sym, char* out, size_t out_size) {
         return;
     }
     sym += 3;
-
     const char* desc_sep   = strstr(sym, "__");
     const char* desc_start = desc_sep ? desc_sep + 2 : NULL;
     size_t cm_len          = desc_sep ? (size_t)(desc_sep - sym) : strlen(sym);
-
     const char* last_us = NULL;
     for (size_t i = 0; i < cm_len; i++) {
         if (sym[i] == '_') last_us = &sym[i];
     }
     size_t class_len  = last_us ? (size_t)(last_us - sym) : cm_len;
     size_t method_len = last_us ? (cm_len - class_len - 1) : 0;
-
     size_t w = 0;
 #define PUT(c) do { if (w < out_size - 1) out[w++] = (c); } while (0)
-
     for (size_t i = 0; i < class_len; i++)  PUT(sym[i] == '_' ? '.' : sym[i]);
     if (method_len > 0) {
         PUT('.');
@@ -267,6 +297,10 @@ static void __jnative_demangle(const char* sym, char* out, size_t out_size) {
     out[w] = '\0';
 #undef PUT
 }
+
+/* ============================================================================
+ * Catch context stack
+ * ========================================================================== */
 
 typedef struct CatchContext {
     struct CatchContext* next;
@@ -297,12 +331,15 @@ void __jnative_pop_catch(void) {
     }
 }
 
+/* ============================================================================
+ * Frame unwinding
+ * ========================================================================== */
+
 static void __jnative_print_frame(uint64_t rip, int index) {
     Dl_info dli;
     memset(&dli, 0, sizeof(dli));
     char line[4096];
     int n;
-
     if (dladdr((void*)(uintptr_t)rip, &dli) && dli.dli_sname) {
         char demangled[1024];
         __jnative_demangle(dli.dli_sname, demangled, sizeof(demangled));
@@ -311,12 +348,10 @@ static void __jnative_print_frame(uint64_t rip, int index) {
         const char* mod = dli.dli_fname ? dli.dli_fname : "?";
         const char* slash = strrchr(mod, '/');
         mod = slash ? slash + 1 : mod;
-        n = snprintf(line, sizeof(line),
-            "\t#%-2d  %s (%s+0x%lx)  [0x%lx]\n",
+        n = snprintf(line, sizeof(line), "\t#%-2d  %s (%s+0x%lx)  [0x%lx]\n",
             index, demangled, mod, (unsigned long)off, (unsigned long)rip);
     } else {
-        n = snprintf(line, sizeof(line),
-            "\t#%-2d  <unknown>  [0x%lx]\n",
+        n = snprintf(line, sizeof(line), "\t#%-2d  <unknown>  [0x%lx]\n",
             index, (unsigned long)rip);
     }
     if (n > 0) (void)!write(2, line, (size_t)n);
@@ -327,24 +362,18 @@ static void __jnative_unwind_from_ucontext(ucontext_t* uc) {
     uint64_t rip = (uint64_t)uc->uc_mcontext.gregs[REG_RIP];
     uint64_t rbp = (uint64_t)uc->uc_mcontext.gregs[REG_RBP];
     uint64_t rsp = (uint64_t)uc->uc_mcontext.gregs[REG_RSP];
-
     __jnative_print_frame(rip, 0);
-
     uint64_t fp = rbp;
     for (int depth = 1; depth < 128 && fp != 0; depth++) {
         if (fp < rsp) break;
         if ((fp & 0x7) != 0) break;
         if (fp > rsp + (8ull << 20)) break;
         if (fp < 0x1000) break;
-
         uint64_t* frame = (uint64_t*)(uintptr_t)fp;
         uint64_t next_fp  = frame[0];
         uint64_t ret_addr = frame[1];
-
         if (ret_addr == 0) break;
-
         __jnative_print_frame(ret_addr, depth);
-
         if (next_fp <= fp) break;
         fp = next_fp;
     }
@@ -359,11 +388,14 @@ static void __jnative_unwind_with_backtrace(int skip) {
     void* frames[128];
     int n = backtrace(frames, 128);
     if (n <= skip) return;
-
     for (int i = skip; i < n; i++) {
         __jnative_print_frame((uint64_t)(uintptr_t)frames[i], i - skip);
     }
 }
+
+/* ============================================================================
+ * Fatal signal handler
+ * ========================================================================== */
 
 static volatile sig_atomic_t __jnative_in_fatal_handler = 0;
 
@@ -374,7 +406,6 @@ static void __jnative_fatal_signal_handler(int sig, siginfo_t* info, void* ucont
         _exit(128 + sig);
     }
     __jnative_in_fatal_handler = 1;
-
     const char* sig_desc;
     switch (sig) {
         case SIGSEGV: sig_desc = "Segmentation fault";       break;
@@ -383,68 +414,43 @@ static void __jnative_fatal_signal_handler(int sig, siginfo_t* info, void* ucont
         case SIGILL:  sig_desc = "Illegal instruction";      break;
         default:      sig_desc = "Fatal signal";             break;
     }
-
     char line[4096];
     int  n;
-
     uintptr_t fault_addr = info ? (uintptr_t)info->si_addr : 0;
-
-    const char* fault_kind = "";
-    if (fault_addr == 0) {
-        fault_kind = "NULL pointer dereference";
-    } else if (fault_addr < 0x1000) {
-        fault_kind = "near-NULL pointer dereference (likely NULL + offset)";
-    } else if (fault_addr < 0x10000) {
-        fault_kind = "small-offset pointer dereference";
-    } else {
-        fault_kind = "invalid memory access";
-    }
-
+    const char* fault_kind;
+    if (fault_addr == 0) fault_kind = "NULL pointer dereference";
+    else if (fault_addr < 0x1000) fault_kind = "near-NULL pointer dereference (likely NULL + offset)";
+    else if (fault_addr < 0x10000) fault_kind = "small-offset pointer dereference";
+    else fault_kind = "invalid memory access";
     n = snprintf(line, sizeof(line),
-        "\n=== JNative fatal error ===\n"
-        "Signal  : %s (SIG%d)\n"
-        "Address : %p   (%s)\n",
+        "\n=== JNative fatal error ===\nSignal  : %s (SIG%d)\nAddress : %p   (%s)\n",
         sig_desc, sig, info ? info->si_addr : NULL, fault_kind);
     if (n > 0) (void)!write(2, line, (size_t)n);
-
 #if defined(__x86_64__)
     if (ucontext) {
         ucontext_t* uc = (ucontext_t*)ucontext;
         n = snprintf(line, sizeof(line),
-            "RIP     : 0x%016lx\n"
-            "RSP     : 0x%016lx\n"
-            "RBP     : 0x%016lx\n",
+            "RIP     : 0x%016lx\nRSP     : 0x%016lx\nRBP     : 0x%016lx\n",
             (unsigned long)uc->uc_mcontext.gregs[REG_RIP],
             (unsigned long)uc->uc_mcontext.gregs[REG_RSP],
             (unsigned long)uc->uc_mcontext.gregs[REG_RBP]);
         if (n > 0) (void)!write(2, line, (size_t)n);
     }
 #endif
-
     if (current_exception) {
-        n = snprintf(line, sizeof(line),
-            "Thrown  : exception %p was being propagated\n",
-            current_exception);
+        n = snprintf(line, sizeof(line), "Thrown  : exception %p was being propagated\n", current_exception);
         if (n > 0) (void)!write(2, line, (size_t)n);
     }
-
-    n = snprintf(line, sizeof(line),
-        "\nCall tree (from crash point, innermost first):\n");
+    n = snprintf(line, sizeof(line), "\nCall tree (from crash point, innermost first):\n");
     if (n > 0) (void)!write(2, line, (size_t)n);
-
 #if defined(__x86_64__)
-    if (ucontext) {
-        __jnative_unwind_from_ucontext((ucontext_t*)ucontext);
-    } else {
-        __jnative_unwind_with_backtrace(0);
-    }
+    if (ucontext) __jnative_unwind_from_ucontext((ucontext_t*)ucontext);
+    else __jnative_unwind_with_backtrace(0);
 #else
     __jnative_unwind_with_backtrace(0);
 #endif
-
     n = snprintf(line, sizeof(line), "\n=== end of JNative trace ===\n\n");
     if (n > 0) (void)!write(2, line, (size_t)n);
-
     signal(sig, SIG_DFL);
     raise(sig);
     _exit(128 + sig);
@@ -457,31 +463,29 @@ static void __jnative_install_fatal_handlers(void) {
     sa.sa_sigaction = __jnative_fatal_signal_handler;
     sa.sa_flags     = SA_SIGINFO | SA_NODEFER | SA_RESTART;
     sigemptyset(&sa.sa_mask);
-
     sigaction(SIGSEGV, &sa, NULL);
     sigaction(SIGBUS,  &sa, NULL);
     sigaction(SIGFPE,  &sa, NULL);
     sigaction(SIGILL,  &sa, NULL);
 }
 
-static const char* __jnative_read_exception_message(void* exc,
-                                                    const char* clsName) {
+/* ============================================================================
+ * Exception message extraction
+ * ========================================================================== */
+
+#define JNATIVE_THROWABLE_MESSAGE_OFFSET 24
+
+static const char* __jnative_read_exception_message(void* exc, const char* clsName) {
     if (exc == NULL) return NULL;
-
-    int offset = 24;
-    if (reflect_all_classes != NULL) {
-        void* vtable = *(void**)exc;
-        struct ReflectionClass* cls = find_class_by_vtable(vtable);
-        if (cls != NULL && cls->detail_message_offset > 0) {
-            offset = cls->detail_message_offset;
-        }
-    }
     (void)clsName;
-
-    void* raw = *(void**)((char*)exc + offset);
+    void* raw = *(void**)((char*)exc + JNATIVE_THROWABLE_MESSAGE_OFFSET);
     if (raw == NULL) return NULL;
     return (const char*)raw;
 }
+
+/* ============================================================================
+ * Unhandled-exception reporting
+ * ========================================================================== */
 
 __attribute__((noreturn))
 static void __jnative_log_unhandled_exception(void* exc, const char* className,
@@ -492,16 +496,15 @@ static void __jnative_log_unhandled_exception(void* exc, const char* className,
 
     if (!clsName && exc) {
         void* vtable = *(void**)exc;
-        struct ReflectionClass* cls = find_class_by_vtable(vtable);
-        if (cls && cls->name) {
-            dotted = dotted_class_name((const char*)cls->name, dottedBuf, sizeof(dottedBuf));
+        const char* internal = __jnative_vtable_class_name(vtable);
+        if (internal) {
+            dotted = dotted_class_name(internal, dottedBuf, sizeof(dottedBuf));
             clsName = dotted;
         }
     }
     if (!clsName) clsName = "java.lang.Throwable";
 
     const char* message = __jnative_read_exception_message(exc, clsName);
-
     if (message != NULL) {
         fprintf(stderr, "Exception in thread \"main\" %s: %s\n", clsName, message);
     } else {
@@ -517,7 +520,6 @@ static void __jnative_log_unhandled_exception(void* exc, const char* className,
     void* buffer[64];
     int n = backtrace(buffer, 64);
     char** symbols = backtrace_symbols(buffer, n);
-
     if (symbols) {
         for (int i = 0; i < n; i++) {
             Dl_info dli;
@@ -532,18 +534,18 @@ static void __jnative_log_unhandled_exception(void* exc, const char* className,
         }
         free(symbols);
     } else {
-        for (int i = 0; i < n; i++) {
-            fprintf(stderr, "\tat %p\n", buffer[i]);
-        }
+        for (int i = 0; i < n; i++) fprintf(stderr, "\tat %p\n", buffer[i]);
     }
 
     fflush(stderr);
     _exit(1);
 }
 
-void* __jnative_get_exception_object(void) {
-    return current_exception;
-}
+/* ============================================================================
+ * Exception object accessors
+ * ========================================================================== */
+
+void* __jnative_get_exception_object(void) { return current_exception; }
 
 int __jnative_catch_matches(void* exc, void* type_info) {
     if (exc == NULL || type_info == NULL) return 0;
@@ -567,6 +569,10 @@ int __jnative_instanceof(void* obj, void** type_info) {
     }
     return 0;
 }
+
+/* ============================================================================
+ * Throw helpers
+ * ========================================================================== */
 
 __attribute__((noreturn))
 void __jnative_throw_exception_ctx(void* exc, const char* caller) {
@@ -633,45 +639,42 @@ void __jnative_throw_arithmetic_exception(void) {
     __jnative_throw_arithmetic_exception_ctx(NULL);
 }
 
+/* ============================================================================
+ * Bad-vtable diagnostic
+ * ========================================================================== */
+
 __attribute__((noreturn))
 void __jnative_throw_bad_vtable(void* method_name, void* obj) {
     char line[4096];
     int  n;
-
     n = snprintf(line, sizeof(line),
-        "\n=== JNative bad vtable ===\n"
-        "Method  : %s\n"
-        "Receiver: %p\n",
-        method_name ? (const char*)method_name : "<null>",
-        obj);
+        "\n=== JNative bad vtable ===\nMethod  : %s\nReceiver: %p\n",
+        method_name ? (const char*)method_name : "<null>", obj);
     if (n > 0) (void)!write(2, line, (size_t)n);
-
     if (obj != NULL) {
         void* first_word = *(void**)obj;
-        n = snprintf(line, sizeof(line),
-            "First word (vtable): %p\n", first_word);
+        n = snprintf(line, sizeof(line), "First word (vtable): %p\n", first_word);
         if (n > 0) (void)!write(2, line, (size_t)n);
     }
-
     n = snprintf(line, sizeof(line),
         "Cause   : virtual dispatch on an object whose vtable slot is NULL.\n"
         "          The object was created without a proper class vtable,\n"
         "          typically by a native stub using calloc()/malloc() instead\n"
         "          of going through the generated @__jnative_new_*() helper.\n");
     if (n > 0) (void)!write(2, line, (size_t)n);
-
     n = snprintf(line, sizeof(line), "\nCall tree (from throw point):\n");
     if (n > 0) (void)!write(2, line, (size_t)n);
-
     __jnative_unwind_with_backtrace(0);
-
     n = snprintf(line, sizeof(line), "\n=== end of JNative bad-vtable trace ===\n\n");
     if (n > 0) (void)!write(2, line, (size_t)n);
-
     fflush(stderr);
     signal(SIGABRT, SIG_DFL);
     abort();
 }
+
+/* ============================================================================
+ * Argument array construction
+ * ========================================================================== */
 
 void* __jnative_create_string_array(int argc, char** argv) {
     int total_size = 4 + argc * 8;
@@ -692,6 +695,10 @@ void* __jnative_create_string_array(int argc, char** argv) {
     return array;
 }
 
+/* ============================================================================
+ * Multi-dimensional array construction
+ * ========================================================================== */
+
 static void* create_multi_array_rec(const char* desc, int last_dim, int* sizes,
                                     int current_dim, int elem_size) {
     int is_last = (current_dim == last_dim);
@@ -700,7 +707,6 @@ static void* create_multi_array_rec(const char* desc, int last_dim, int* sizes,
     void* array = malloc(total_size);
     if (!array) return NULL;
     *(int*)array = length;
-
     if (!is_last) {
         void** slots = (void**)((char*)array + 4);
         for (int i = 0; i < length; i++) {
@@ -716,6 +722,10 @@ void* __jnative_new_multi_array(const char* desc, int dims, int* sizes, int elem
     return create_multi_array_rec(desc, last_dim, sizes, 0, elem_size);
 }
 
+/* ============================================================================
+ * Reflection invoke helpers
+ * ========================================================================== */
+
 void* __jnative_invoke_method(struct ReflectionMethod* method, void* obj, void** args) {
     if (method == NULL || method->adaptor == NULL) return NULL;
     typedef void* (*adaptor_t)(void*, void**);
@@ -730,6 +740,10 @@ void* __jnative_new_instance(struct ReflectionConstructor* ctor, void** args) {
     return adaptor(args);
 }
 
+/* ============================================================================
+ * String concatenation
+ * ========================================================================== */
+
 void* __jnative_concat_strings(int count, ...) {
     va_list args;
     va_start(args, count);
@@ -739,11 +753,9 @@ void* __jnative_concat_strings(int count, ...) {
         if (s) total_len += strlen(s);
     }
     va_end(args);
-
     char* result = malloc(total_len);
     if (!result) return NULL;
     result[0] = '\0';
-
     va_start(args, count);
     for (int i = 0; i < count; i++) {
         char* s = va_arg(args, char*);
@@ -753,9 +765,12 @@ void* __jnative_concat_strings(int count, ...) {
     return result;
 }
 
+/* ============================================================================
+ * Value-to-string helpers
+ * ========================================================================== */
+
 static char* __jnative_alloc_str(size_t cap) {
-    char* p = (char*)malloc(cap);
-    return p;
+    return (char*)malloc(cap);
 }
 
 char* __jnative_value_to_string_int(int32_t v) {
@@ -798,28 +813,38 @@ char* __jnative_value_to_string_char(int32_t v) {
 char* __jnative_value_to_string_byte(int32_t v)  { return __jnative_value_to_string_int((int8_t)v); }
 char* __jnative_value_to_string_short(int32_t v) { return __jnative_value_to_string_int((int16_t)v); }
 
-extern const int32_t __jnative_run_method_index;
+extern const int32_t __jnative_tostring_slot;
+
+char* __jnative_value_to_string_object(void* obj) {
+    if (obj == NULL) return strdup("null");
+    struct JNativeVTable* vt = *(struct JNativeVTable**)obj;
+    if (vt == NULL) return strdup("null");
+    int32_t slot = __jnative_tostring_slot;
+    if (slot < 0) return strdup("null");
+    void* entry = vt->methods[slot];
+    if (entry == NULL) return strdup("null");
+    char* (*toString)(void*) = (char* (*)(void*))entry;
+    return toString(obj);
+}
+
+/* ============================================================================
+ * Runnable dispatch
+ * ========================================================================== */
+
+extern const int32_t __jnative_runnable_iface_id;
+extern const int32_t __jnative_run_method_slot;
 
 void __jnative_invoke_runnable(void* runnable) {
-    if (runnable == NULL) {
-        return;
-    }
-
-    const int32_t idx = __jnative_run_method_index;
-    if (idx < 0) {
-        return;
-    }
-
-    void** vtable = *(void***)runnable;
-    if (vtable == NULL) {
-        return;
-    }
-
-    void* entry = vtable[idx];
-    if (entry == NULL) {
-        return;
-    }
-
+    if (runnable == NULL) return;
+    const int32_t iface_id = __jnative_runnable_iface_id;
+    const int32_t slot     = __jnative_run_method_slot;
+    if (iface_id < 0 || slot < 0) return;
+    struct JNativeVTable* vt = *(struct JNativeVTable**)runnable;
+    if (vt == NULL) return;
+    void** itable = __jnative_lookup_itable(vt->ifacemap, iface_id);
+    if (itable == NULL) return;
+    void* entry = itable[slot];
+    if (entry == NULL) return;
     void (*run)(void*) = (void (*)(void*))entry;
     run(runnable);
 }

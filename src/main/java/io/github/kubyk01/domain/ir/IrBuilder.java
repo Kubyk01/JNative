@@ -35,6 +35,23 @@ public class IrBuilder {
         return func;
     }
 
+    /**
+     * Creates a function with the given parameters. Unlike
+     * {@link #createFunction(String, Type, List)}, the parameter indices here are
+     * set by the caller — this allows a JVM slot to be used as the index rather
+     * than a positional ordinal. Required for correct SSA over methods where
+     * long/double occupy two consecutive slots.
+     */
+    public Function createFunctionWithSlots(String name, Type returnType, List<Parameter> params) {
+        Function func = new Function(name, returnType);
+        for (Parameter p : params) {
+            func.addParameter(p);
+        }
+        module.addFunction(func);
+        currentFunction = func;
+        return func;
+    }
+
     public BasicBlock createBlock(String label) {
         BasicBlock block = new BasicBlock(label);
         if (currentFunction != null) {

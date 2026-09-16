@@ -230,4 +230,8 @@ public class StackFrame {
             if (!isEmpty()) pop();
         }
     }
+
+    public void clear() {
+        stack.clear();
+    }
 }

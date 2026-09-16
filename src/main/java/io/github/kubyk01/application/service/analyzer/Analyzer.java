@@ -8,13 +8,16 @@ import io.github.kubyk01.application.service.analyzer.reachabilityanalysis.Reach
 import io.github.kubyk01.application.service.analyzer.ssa.BytecodeToIr;
 import io.github.kubyk01.application.service.analyzer.ssa.SSATransformer;
 import io.github.kubyk01.application.service.codegen.llvm.LlvmGenerator;
+import io.github.kubyk01.application.service.codegen.llvm.LlvmRuntime;
 import io.github.kubyk01.application.service.codegen.llvm.nativepolymorphicfunctionresolver.PolymorphicResolver;
+import io.github.kubyk01.application.service.optimizer.DeadCodeEliminator;
 import io.github.kubyk01.application.service.optimizer.Optimizer;
 import io.github.kubyk01.domain.analyzer.aliasanalysis.AliasAnalysisResult;
 import io.github.kubyk01.domain.analyzer.aliasanalysis.AllocationSite;
 import io.github.kubyk01.domain.analyzer.aliasanalysis.FunctionSummary;
 import io.github.kubyk01.domain.analyzer.aliasanalysis.PointsToSet;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.ClassNode;
+import io.github.kubyk01.domain.analyzer.dependencyresolver.MethodNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.MethodReference;
 import io.github.kubyk01.domain.analyzer.escapeanalysis.EscapeAnalysisResult;
 import io.github.kubyk01.domain.analyzer.escapeanalysis.EscapeStatus;
@@ -151,6 +154,11 @@ public class Analyzer implements AnalyzerPort {
         for (Function func : module.getFunctions()) {
             ssaTransformer.transform(func);
         }
+
+        System.out.println("\n--- Running dead code elimination ---");
+        DeadCodeEliminator dce = new DeadCodeEliminator(module);
+        // todo move it to optimiser not analyzer
+        dce.eliminate();
 
         List<Function> clinitFunctions = new ArrayList<>();
         for (Function func : module.getFunctions()) {
@@ -292,7 +300,21 @@ public class Analyzer implements AnalyzerPort {
         if (!noCompile) {
             Path exePath = outputFile != null ? Paths.get(outputFile) : Paths.get("a.out");
             try {
-                compileAndLink(llPath, exePath, usedSystemClasses);
+                // `usedSystemClasses` covers classes reachable from the entry point.
+                // However, the LLVM emitter iterates over every non-external class
+                // in the resolver when it builds vtables and type-info tables, so a
+                // class that was merely *loaded* (e.g. java.lang.Class, pulled in
+                // as the return type of Object.getClass) can end up with its native
+                // methods referenced from @vtable_* and @__type_info_* even though
+                // it is not "reachable" in the strict sense. Those .c sources must
+                // be compiled and linked too, otherwise the IR contains
+                // declarations with no matching definitions and the linker fails
+                // with "undefined reference to __jnative_fn_*".
+                Set<String> classesToCompile = new HashSet<>(usedSystemClasses);
+                classesToCompile.addAll(collectReferencedNativeClasses(module, resolver));
+                log.debug("System classes scheduled for compilation: {}", classesToCompile);
+
+                compileAndLink(llPath, exePath, classesToCompile);
                 System.out.println("Native executable built successfully: " + exePath.toAbsolutePath());
             } catch (IOException | InterruptedException e) {
                 log.error("Failed to build native executable", e);
@@ -457,6 +479,41 @@ public class Analyzer implements AnalyzerPort {
             Files.copy(in, runtimeC, StandardCopyOption.REPLACE_EXISTING);
         }
         return runtimeC;
+    }
+
+    /**
+     * System classes whose native methods are referenced from the generated
+     * module — typically because a vtable or type-info table for the class was
+     * emitted. The LLVM emitter iterates over every non-external class in the
+     * resolver when it builds those tables, so a class that was merely
+     * *loaded* (e.g. {@code java.lang.Class}, pulled in as the return type of
+     * {@code Object.getClass}) can end up with its native methods referenced
+     * from {@code @vtable_*} and {@code @__type_info_*} even though it is not
+     * "reachable" in the strict sense.
+     *
+     * <p>Any such class must have its {@code jnative/**}{@code .c} source
+     * compiled and linked, otherwise the IR will contain declarations with no
+     * definitions and the linker will fail with "undefined reference".
+     */
+    private Set<String> collectReferencedNativeClasses(Module module,
+                                                       DependencyResolver resolver) {
+        Set<String> result = new HashSet<>();
+        for (String cls : new ArrayList<>(resolver.getClassMap().keySet())) {
+            if (!isSystemClassName(cls)) continue;
+            if (!hasNativeSupport(cls)) continue;
+            ClassNode cn = resolver.getClassNode(cls);
+            if (cn == null || cn.isExternal()) continue;
+            for (MethodNode mn : cn.getMethods()) {
+                if (!mn.isNative()) continue;
+                String nativeName = "__jnative_" + LlvmRuntime.mangleMethod(
+                    cls, mn.getName(), mn.getDescriptor());
+                if (module.getFunction(nativeName) != null) {
+                    result.add(cls);
+                    break;
+                }
+            }
+        }
+        return result;
     }
 
     private static boolean matchesDebug(String debugName, String name) {

@@ -99,3 +99,9 @@ void* __jnative_fn_jdk_internal_loader_BootLoader_getSystemPackageNames____Ljava
     free(packages);
     return array;
 }
+
+
+void __jnative_fn_jdk_internal_loader_BootLoader_setBootLoaderUnnamedModule0__Ljava_lang_Module__V(void* module)
+{
+    (void)module;
+}

@@ -1,6 +1,7 @@
 package io.github.kubyk01.application.service.analyzer.ssa;
 
 import io.github.kubyk01.application.service.analyzer.dependencyresolver.DependencyResolver;
+import io.github.kubyk01.domain.analyzer.dependencyresolver.ClassNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.FieldNode;
 import io.github.kubyk01.domain.ir.Constant;
 import io.github.kubyk01.domain.ir.Instruction;
@@ -245,6 +246,16 @@ public class InstructionHandlers {
             }
             case Opcodes.INVOKEINTERFACE -> {
                 receiver = frame.pop();
+                // An invokeinterface can resolve to a method whose actual
+                // declaration lives on a class (typically java/lang/Object,
+                // whose methods every interface inherits). In that case the
+                // real dispatch is virtual — emit VIRTUAL_CALL, not
+                // INTERFACE_CALL. Otherwise the codegen would look up an
+                // itable that does not exist for a class.
+                ClassNode ownerNode = resolver.getClassNode(owner);
+                if (ownerNode != null && !ownerNode.isInterface()) {
+                    yield Opcode.VIRTUAL_CALL;
+                }
                 yield Opcode.INTERFACE_CALL;
             }
             case Opcodes.INVOKESTATIC -> Opcode.STATIC_CALL;
@@ -286,5 +297,17 @@ public class InstructionHandlers {
             case Opcodes.T_DOUBLE -> Type.DOUBLE;
             default -> Type.UNKNOWN;
         };
+    }
+
+    public void loadCaughtException() {
+        Instruction inst = new Instruction(Opcode.STATIC_CALL);
+        inst.addOperand(new Constant(
+            Type.reference("__jnative_get_exception_object"),
+            "__jnative_get_exception_object"));
+        Temporary tmp = builder.newTemporary(Type.reference("java/lang/Throwable"));
+        inst.setResult(tmp);
+        tmp.setDefiningInstruction(inst);
+        builder.currentBlock().addInstruction(inst);
+        frame.push(tmp);
     }
 }

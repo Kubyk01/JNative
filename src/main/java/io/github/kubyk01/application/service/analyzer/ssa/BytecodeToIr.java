@@ -51,15 +51,12 @@ public class BytecodeToIr {
             boolean isStatic = methodNode != null && methodNode.isStatic();
 
             if (classNode.isExternal()) {
-                // For external or abstract methods, we use the same logic.
                 Function func = createExternalFunction(methodRef, isStatic);
                 functionMap.put(methodRef, func);
                 return;
             }
 
             if (methodNode != null && methodNode.isNative()) {
-                // Native method: declare the function with the __jnative_ prefix,
-                // the implementation is provided by the runtime (jnative_runtime.c)
                 String nativeName = "__jnative_" + LlvmRuntime.mangleMethod(owner, name, desc);
                 Function func = new Function(nativeName, methodNode.getReturnType());
 
@@ -85,7 +82,10 @@ public class BytecodeToIr {
 
             byte[] bytes = resolver.getClassBytes(owner);
             if (bytes == null) {
-                log.warn("No bytecode for class {}", owner);
+                log.warn("No bytecode for class {}; emitting external declaration for {}.{}{}",
+                    owner, owner, name, desc);
+                Function func = createExternalFunction(methodRef, isStatic);
+                functionMap.put(methodRef, func);
                 return;
             }
 
@@ -105,9 +105,13 @@ public class BytecodeToIr {
             Function func = translator.getCurrentFunction();
             if (func != null) {
                 functionMap.put(methodRef, func);
+            } else {
+                Function external = createExternalFunction(methodRef, isStatic);
+                functionMap.put(methodRef, external);
             }
         } catch (Exception e) {
-
+            log.warn("Failed to translate method {}; falling back to external declaration: {}",
+                methodRef, e.getMessage());
             boolean isStatic = methodNode != null && methodNode.isStatic();
             Function func = createExternalFunction(methodRef, isStatic);
             functionMap.put(methodRef, func);

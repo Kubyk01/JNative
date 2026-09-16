@@ -14,6 +14,7 @@ import io.github.kubyk01.domain.ir.Instruction;
 import io.github.kubyk01.domain.ir.InvokeDynamicInfo;
 import io.github.kubyk01.domain.ir.IrBuilder;
 import io.github.kubyk01.domain.ir.Opcode;
+import io.github.kubyk01.domain.ir.Parameter;
 import io.github.kubyk01.domain.ir.ResolvedCall;
 import io.github.kubyk01.domain.ir.Temporary;
 import io.github.kubyk01.domain.ir.Terminator;
@@ -41,6 +42,7 @@ public class MethodTranslator extends MethodVisitor {
     private final List<TryCatchRange> tryCatchRanges = new ArrayList<>();
     private final Map<Integer, Set<BasicBlock>> jsrReturnBlocks = new HashMap<>();
     private final List<IndirectBranchTerminator> indirectBranches = new ArrayList<>();
+    private final Set<Label> handlerLabels = new HashSet<>();
     private int lambdaCounter = 0;
     private final DependencyResolver resolver;
 
@@ -64,24 +66,30 @@ public class MethodTranslator extends MethodVisitor {
     public void visitCode() {
         Type returnType = TypeResolver.descToReturnType(methodRef.getDescriptor());
         List<Type> paramTypes = TypeResolver.descToParamTypes(methodRef.getDescriptor());
-        List<Type> allParamTypes = new ArrayList<>();
-        if (!isStatic) {
-            allParamTypes.add(Type.reference(methodRef.getOwner())); // receiver
-        }
-        allParamTypes.addAll(paramTypes);
-        String mangledName = LlvmRuntime.mangleMethod(methodRef.getOwner(), methodRef.getName(), methodRef.getDescriptor());
-        currentFunction = builder.createFunction(mangledName, returnType, allParamTypes);
+        String mangledName = LlvmRuntime.mangleMethod(
+            methodRef.getOwner(), methodRef.getName(), methodRef.getDescriptor());
 
-        int paramIndex = 0;
+        // JVM slots: the receiver is in slot 0, then by logical parameters, with
+        // long/double occupying two slots. Use these slots as Parameter indices —
+        // then SSA versions, version stacks and bytecode LOAD/STORE all agree on
+        // the same system of indices.
+        List<Parameter> params = new ArrayList<>();
+        int slot = 0;
         if (!isStatic) {
-            if (!currentFunction.getParameters().isEmpty()) {
-                frame.setLocal(0, currentFunction.getParameters().getFirst());
-                paramIndex = 1;
-            }
+            params.add(new Parameter(Type.reference(methodRef.getOwner()), slot));
+            slot++;
         }
-        for (int i = paramIndex; i < currentFunction.getParameters().size(); i++) {
-            frame.setLocal(i, currentFunction.getParameters().get(i));
+        for (Type pt : paramTypes) {
+            params.add(new Parameter(pt, slot));
+            slot += (pt == Type.LONG || pt == Type.DOUBLE) ? 2 : 1;
         }
+
+        currentFunction = builder.createFunctionWithSlots(mangledName, returnType, params);
+
+        for (Parameter p : params) {
+            frame.setLocal(p.getIndex(), p);
+        }
+
         currentBlock = builder.createBlock("entry");
     }
 
@@ -90,6 +98,10 @@ public class MethodTranslator extends MethodVisitor {
         currentBlock = labelToBlock.computeIfAbsent(label,
             k -> builder.createBlock("L" + k.toString()));
         builder.setCurrentBlock(currentBlock);
+        if (handlerLabels.contains(label)) {
+            frame.clear();
+            handlers.loadCaughtException();
+        }
     }
 
     @Override
@@ -346,7 +358,6 @@ public class MethodTranslator extends MethodVisitor {
                 handlers.arrayLength();
                 break;
 
-            // Array loads and stores for all types
             case Opcodes.AALOAD:
             case Opcodes.IALOAD:
             case Opcodes.LALOAD:
@@ -493,7 +504,16 @@ public class MethodTranslator extends MethodVisitor {
 
     @Override
     public void visitMethodInsn(int opcode, String owner, String name, String desc, boolean isInterface) {
-        // Determine if the called method is polymorphic (has @PolymorphicSignature)
+        if (owner.equals("java/lang/Class")
+            && name.equals("desiredAssertionStatus")
+            && desc.equals("()Z")) {
+            if (opcode != Opcodes.INVOKESTATIC) {
+                frame.pop();
+            }
+            handlers.pushInt(0);
+            return;
+        }
+
         boolean isPolymorphic = false;
         ClassNode targetClass = resolver.getClassNode(owner);
         if (targetClass != null) {
@@ -612,8 +632,15 @@ public class MethodTranslator extends MethodVisitor {
             case Float v -> handlers.pushFloat(v);
             case Double v -> handlers.pushDouble(v);
             case String s -> frame.push(new Constant(Type.reference("java/lang/String"), value));
-            case org.objectweb.asm.Type asmType ->
-                frame.push(new Constant(Type.reference(asmType.getInternalName()), asmType.getInternalName()));
+            case org.objectweb.asm.Type asmType -> {
+                int sort = asmType.getSort();
+                if (sort == org.objectweb.asm.Type.OBJECT) {
+                    frame.push(new Constant(Type.reference("java/lang/Class"),
+                        asmType.getInternalName()));
+                } else {
+                    frame.push(new Constant(Type.NULL, null));
+                }
+            }
             case null, default -> frame.push(new Constant(Type.UNKNOWN, value));
         }
     }
@@ -627,6 +654,7 @@ public class MethodTranslator extends MethodVisitor {
     public void visitTryCatchBlock(Label start, Label end, Label handler, String type) {
         tryCatchRanges.add(new TryCatchRange(start, end, handler, type));
         tryCatchHandler.addTryCatch(start, end, handler, type);
+        handlerLabels.add(handler);
     }
 
     @Override
@@ -638,7 +666,13 @@ public class MethodTranslator extends MethodVisitor {
         }
         Collections.reverse(captured);
 
-        ResolvedCall resolved = resolveInvokeDynamic(bsm, bsmArgs, captured);
+        // Pass the invokedynamic call site name through so that the SAM
+        // interface method can be identified by its full signature
+        // (name + descriptor), not just by the descriptor. The global vtable
+        // index is keyed on the full "name(descriptor)" form; without the
+        // name the lookup in resolveSamIndex would degrade to a suffix match
+        // that may pick an arbitrary overload.
+        ResolvedCall resolved = resolveInvokeDynamic(name, bsm, bsmArgs, captured);
         InvokeDynamicInfo info = new InvokeDynamicInfo(name, desc, bsm, bsmArgs, resolved);
 
         Instruction inst = new Instruction(Opcode.INVOKEDYNAMIC);
@@ -657,7 +691,7 @@ public class MethodTranslator extends MethodVisitor {
         builder.currentBlock().addInstruction(inst);
     }
 
-    private ResolvedCall resolveInvokeDynamic(Handle bsm,
+    private ResolvedCall resolveInvokeDynamic(String samName, Handle bsm,
                                               Object[] bsmArgs, List<Value> captured) {
         if (bsm == null) return ResolvedCall.unsupported();
 
@@ -669,11 +703,16 @@ public class MethodTranslator extends MethodVisitor {
             if (bsmArgs.length < 3) return ResolvedCall.unsupported();
 
             org.objectweb.asm.Type samType = (org.objectweb.asm.Type) bsmArgs[0];
-            String interfaceMethodSig = samType.getDescriptor();
+            // Full SAM signature — this is what the global vtable index is
+            // keyed on. `samName` is the invokedynamic call-site name, which
+            // equals the SAM method's name (e.g. "run", "accept", "apply").
+            String interfaceMethodSig = samName + samType.getDescriptor();
 
             String lambdaId = "lambda_" + (++lambdaCounter) + "_" + System.identityHashCode(this);
 
-            List<Type> capturedTypes = captured.stream().map(Value::getType).collect(java.util.stream.Collectors.toList());
+            List<Type> capturedTypes = captured.stream()
+                .map(Value::getType)
+                .collect(java.util.stream.Collectors.toList());
             return ResolvedCall.lambda(lambdaId, interfaceMethodSig, capturedTypes);
         }
 

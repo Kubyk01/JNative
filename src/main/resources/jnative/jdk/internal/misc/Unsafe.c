@@ -75,49 +75,31 @@ void __jnative_fn_jdk_internal_misc_Unsafe_putDouble__Ljava_lang_Object_JD_V(voi
 
 /* ---- Volatile loads ---- */
 int32_t __jnative_fn_jdk_internal_misc_Unsafe_getIntVolatile__Ljava_lang_Object_J_I(void* obj, int64_t offset) {
-    int32_t v;
-    __atomic_load((int32_t*)effective_address(obj, offset), &v, __ATOMIC_SEQ_CST);
-    return v;
+    int32_t v; __atomic_load((int32_t*)effective_address(obj, offset), &v, __ATOMIC_SEQ_CST); return v;
 }
 int64_t __jnative_fn_jdk_internal_misc_Unsafe_getLongVolatile__Ljava_lang_Object_J_J(void* obj, int64_t offset) {
-    int64_t v;
-    __atomic_load((int64_t*)effective_address(obj, offset), &v, __ATOMIC_SEQ_CST);
-    return v;
+    int64_t v; __atomic_load((int64_t*)effective_address(obj, offset), &v, __ATOMIC_SEQ_CST); return v;
 }
 void* __jnative_fn_jdk_internal_misc_Unsafe_getReferenceVolatile__Ljava_lang_Object_J_Ljava_lang_Object_(void* obj, int64_t offset) {
-    void* v;
-    __atomic_load((void**)effective_address(obj, offset), &v, __ATOMIC_SEQ_CST);
-    return v;
+    void* v; __atomic_load((void**)effective_address(obj, offset), &v, __ATOMIC_SEQ_CST); return v;
 }
 int32_t __jnative_fn_jdk_internal_misc_Unsafe_getBooleanVolatile__Ljava_lang_Object_J_Z(void* obj, int64_t offset) {
-    uint8_t v;
-    __atomic_load((uint8_t*)effective_address(obj, offset), &v, __ATOMIC_SEQ_CST);
-    return v;
+    uint8_t v; __atomic_load((uint8_t*)effective_address(obj, offset), &v, __ATOMIC_SEQ_CST); return v;
 }
 int8_t __jnative_fn_jdk_internal_misc_Unsafe_getByteVolatile__Ljava_lang_Object_J_B(void* obj, int64_t offset) {
-    int8_t v;
-    __atomic_load((int8_t*)effective_address(obj, offset), &v, __ATOMIC_SEQ_CST);
-    return v;
+    int8_t v; __atomic_load((int8_t*)effective_address(obj, offset), &v, __ATOMIC_SEQ_CST); return v;
 }
 int16_t __jnative_fn_jdk_internal_misc_Unsafe_getShortVolatile__Ljava_lang_Object_J_S(void* obj, int64_t offset) {
-    int16_t v;
-    __atomic_load((int16_t*)effective_address(obj, offset), &v, __ATOMIC_SEQ_CST);
-    return v;
+    int16_t v; __atomic_load((int16_t*)effective_address(obj, offset), &v, __ATOMIC_SEQ_CST); return v;
 }
 uint16_t __jnative_fn_jdk_internal_misc_Unsafe_getCharVolatile__Ljava_lang_Object_J_C(void* obj, int64_t offset) {
-    uint16_t v;
-    __atomic_load((uint16_t*)effective_address(obj, offset), &v, __ATOMIC_SEQ_CST);
-    return v;
+    uint16_t v; __atomic_load((uint16_t*)effective_address(obj, offset), &v, __ATOMIC_SEQ_CST); return v;
 }
 float __jnative_fn_jdk_internal_misc_Unsafe_getFloatVolatile__Ljava_lang_Object_J_F(void* obj, int64_t offset) {
-    float v;
-    __atomic_load((float*)effective_address(obj, offset), &v, __ATOMIC_SEQ_CST);
-    return v;
+    float v; __atomic_load((float*)effective_address(obj, offset), &v, __ATOMIC_SEQ_CST); return v;
 }
 double __jnative_fn_jdk_internal_misc_Unsafe_getDoubleVolatile__Ljava_lang_Object_J_D(void* obj, int64_t offset) {
-    double v;
-    __atomic_load((double*)effective_address(obj, offset), &v, __ATOMIC_SEQ_CST);
-    return v;
+    double v; __atomic_load((double*)effective_address(obj, offset), &v, __ATOMIC_SEQ_CST); return v;
 }
 
 /* ---- Volatile stores ---- */
@@ -312,74 +294,55 @@ int64_t __jnative_fn_jdk_internal_misc_Unsafe_getAndBitwiseXorLong__Ljava_lang_O
 
 /* ---- Acquire/Release variants ---- */
 int32_t __jnative_fn_jdk_internal_misc_Unsafe_getIntAcquire__Ljava_lang_Object_J_I(void* obj, int64_t offset) {
-    int32_t v;
-    __atomic_load((int32_t*)effective_address(obj, offset), &v, __ATOMIC_ACQUIRE);
-    return v;
+    int32_t v; __atomic_load((int32_t*)effective_address(obj, offset), &v, __ATOMIC_ACQUIRE); return v;
 }
 void __jnative_fn_jdk_internal_misc_Unsafe_putIntRelease__Ljava_lang_Object_JI_V(void* obj, int64_t offset, int32_t x) {
     __atomic_store((int32_t*)effective_address(obj, offset), &x, __ATOMIC_RELEASE);
 }
 int64_t __jnative_fn_jdk_internal_misc_Unsafe_getLongAcquire__Ljava_lang_Object_J_J(void* obj, int64_t offset) {
-    int64_t v;
-    __atomic_load((int64_t*)effective_address(obj, offset), &v, __ATOMIC_ACQUIRE);
-    return v;
+    int64_t v; __atomic_load((int64_t*)effective_address(obj, offset), &v, __ATOMIC_ACQUIRE); return v;
 }
 void __jnative_fn_jdk_internal_misc_Unsafe_putLongRelease__Ljava_lang_Object_JJ_V(void* obj, int64_t offset, int64_t x) {
     __atomic_store((int64_t*)effective_address(obj, offset), &x, __ATOMIC_RELEASE);
 }
 void* __jnative_fn_jdk_internal_misc_Unsafe_getReferenceAcquire__Ljava_lang_Object_J_Ljava_lang_Object_(void* obj, int64_t offset) {
-    void* v;
-    __atomic_load((void**)effective_address(obj, offset), &v, __ATOMIC_ACQUIRE);
-    return v;
+    void* v; __atomic_load((void**)effective_address(obj, offset), &v, __ATOMIC_ACQUIRE); return v;
 }
 void __jnative_fn_jdk_internal_misc_Unsafe_putReferenceRelease__Ljava_lang_Object_JLjava_lang_Object__V(void* obj, int64_t offset, void* x) {
     __atomic_store((void**)effective_address(obj, offset), &x, __ATOMIC_RELEASE);
 }
 int32_t __jnative_fn_jdk_internal_misc_Unsafe_getBooleanAcquire__Ljava_lang_Object_J_Z(void* obj, int64_t offset) {
-    uint8_t v;
-    __atomic_load((uint8_t*)effective_address(obj, offset), &v, __ATOMIC_ACQUIRE);
-    return v;
+    uint8_t v; __atomic_load((uint8_t*)effective_address(obj, offset), &v, __ATOMIC_ACQUIRE); return v;
 }
 void __jnative_fn_jdk_internal_misc_Unsafe_putBooleanRelease__Ljava_lang_Object_JZ_V(void* obj, int64_t offset, int32_t x) {
-    uint8_t v = (uint8_t)x;
-    __atomic_store((uint8_t*)effective_address(obj, offset), &v, __ATOMIC_RELEASE);
+    uint8_t v = (uint8_t)x; __atomic_store((uint8_t*)effective_address(obj, offset), &v, __ATOMIC_RELEASE);
 }
 int8_t __jnative_fn_jdk_internal_misc_Unsafe_getByteAcquire__Ljava_lang_Object_J_B(void* obj, int64_t offset) {
-    int8_t v;
-    __atomic_load((int8_t*)effective_address(obj, offset), &v, __ATOMIC_ACQUIRE);
-    return v;
+    int8_t v; __atomic_load((int8_t*)effective_address(obj, offset), &v, __ATOMIC_ACQUIRE); return v;
 }
 void __jnative_fn_jdk_internal_misc_Unsafe_putByteRelease__Ljava_lang_Object_JB_V(void* obj, int64_t offset, int8_t x) {
     __atomic_store((int8_t*)effective_address(obj, offset), &x, __ATOMIC_RELEASE);
 }
 int16_t __jnative_fn_jdk_internal_misc_Unsafe_getShortAcquire__Ljava_lang_Object_J_S(void* obj, int64_t offset) {
-    int16_t v;
-    __atomic_load((int16_t*)effective_address(obj, offset), &v, __ATOMIC_ACQUIRE);
-    return v;
+    int16_t v; __atomic_load((int16_t*)effective_address(obj, offset), &v, __ATOMIC_ACQUIRE); return v;
 }
 void __jnative_fn_jdk_internal_misc_Unsafe_putShortRelease__Ljava_lang_Object_JS_V(void* obj, int64_t offset, int16_t x) {
     __atomic_store((int16_t*)effective_address(obj, offset), &x, __ATOMIC_RELEASE);
 }
 uint16_t __jnative_fn_jdk_internal_misc_Unsafe_getCharAcquire__Ljava_lang_Object_J_C(void* obj, int64_t offset) {
-    uint16_t v;
-    __atomic_load((uint16_t*)effective_address(obj, offset), &v, __ATOMIC_ACQUIRE);
-    return v;
+    uint16_t v; __atomic_load((uint16_t*)effective_address(obj, offset), &v, __ATOMIC_ACQUIRE); return v;
 }
 void __jnative_fn_jdk_internal_misc_Unsafe_putCharRelease__Ljava_lang_Object_JC_V(void* obj, int64_t offset, uint16_t x) {
     __atomic_store((uint16_t*)effective_address(obj, offset), &x, __ATOMIC_RELEASE);
 }
 float __jnative_fn_jdk_internal_misc_Unsafe_getFloatAcquire__Ljava_lang_Object_J_F(void* obj, int64_t offset) {
-    float v;
-    __atomic_load((float*)effective_address(obj, offset), &v, __ATOMIC_ACQUIRE);
-    return v;
+    float v; __atomic_load((float*)effective_address(obj, offset), &v, __ATOMIC_ACQUIRE); return v;
 }
 void __jnative_fn_jdk_internal_misc_Unsafe_putFloatRelease__Ljava_lang_Object_JF_V(void* obj, int64_t offset, float x) {
     __atomic_store((float*)effective_address(obj, offset), &x, __ATOMIC_RELEASE);
 }
 double __jnative_fn_jdk_internal_misc_Unsafe_getDoubleAcquire__Ljava_lang_Object_J_D(void* obj, int64_t offset) {
-    double v;
-    __atomic_load((double*)effective_address(obj, offset), &v, __ATOMIC_ACQUIRE);
-    return v;
+    double v; __atomic_load((double*)effective_address(obj, offset), &v, __ATOMIC_ACQUIRE); return v;
 }
 void __jnative_fn_jdk_internal_misc_Unsafe_putDoubleRelease__Ljava_lang_Object_JD_V(void* obj, int64_t offset, double x) {
     __atomic_store((double*)effective_address(obj, offset), &x, __ATOMIC_RELEASE);
@@ -387,25 +350,19 @@ void __jnative_fn_jdk_internal_misc_Unsafe_putDoubleRelease__Ljava_lang_Object_J
 
 /* ---- Opaque variants ---- */
 int32_t __jnative_fn_jdk_internal_misc_Unsafe_getIntOpaque__Ljava_lang_Object_J_I(void* obj, int64_t offset) {
-    int32_t v;
-    __atomic_load((int32_t*)effective_address(obj, offset), &v, __ATOMIC_RELAXED);
-    return v;
+    int32_t v; __atomic_load((int32_t*)effective_address(obj, offset), &v, __ATOMIC_RELAXED); return v;
 }
 void __jnative_fn_jdk_internal_misc_Unsafe_putIntOpaque__Ljava_lang_Object_JI_V(void* obj, int64_t offset, int32_t x) {
     __atomic_store((int32_t*)effective_address(obj, offset), &x, __ATOMIC_RELAXED);
 }
 int64_t __jnative_fn_jdk_internal_misc_Unsafe_getLongOpaque__Ljava_lang_Object_J_J(void* obj, int64_t offset) {
-    int64_t v;
-    __atomic_load((int64_t*)effective_address(obj, offset), &v, __ATOMIC_RELAXED);
-    return v;
+    int64_t v; __atomic_load((int64_t*)effective_address(obj, offset), &v, __ATOMIC_RELAXED); return v;
 }
 void __jnative_fn_jdk_internal_misc_Unsafe_putLongOpaque__Ljava_lang_Object_JJ_V(void* obj, int64_t offset, int64_t x) {
     __atomic_store((int64_t*)effective_address(obj, offset), &x, __ATOMIC_RELAXED);
 }
 void* __jnative_fn_jdk_internal_misc_Unsafe_getReferenceOpaque__Ljava_lang_Object_J_Ljava_lang_Object_(void* obj, int64_t offset) {
-    void* v;
-    __atomic_load((void**)effective_address(obj, offset), &v, __ATOMIC_RELAXED);
-    return v;
+    void* v; __atomic_load((void**)effective_address(obj, offset), &v, __ATOMIC_RELAXED); return v;
 }
 void __jnative_fn_jdk_internal_misc_Unsafe_putReferenceOpaque__Ljava_lang_Object_JLjava_lang_Object__V(void* obj, int64_t offset, void* x) {
     __atomic_store((void**)effective_address(obj, offset), &x, __ATOMIC_RELAXED);
@@ -454,8 +411,13 @@ void __jnative_fn_jdk_internal_misc_Unsafe_setMemory__Ljava_lang_Object_JJBB_V(v
 void __jnative_fn_jdk_internal_misc_Unsafe_copyMemory__JJJ_V(void* src, void* dst, int64_t bytes) {
     memmove(dst, src, (size_t)bytes);
 }
-void __jnative_fn_jdk_internal_misc_Unsafe_copyMemory__Ljava_lang_Object_JLjava_lang_Object_JJ_V(void* srcBase, int64_t srcOffset, void* dstBase, int64_t dstOffset, int64_t bytes) {
-    memmove(effective_address(dstBase, dstOffset), effective_address(srcBase, srcOffset), (size_t)bytes);
+void __jnative_fn_jdk_internal_misc_Unsafe_copyMemory__Ljava_lang_Object_JLjava_lang_Object_JJ_V(
+        void* srcBase, int64_t srcOffset,
+        void* dstBase, int64_t dstOffset,
+        int64_t bytes) {
+    memmove(effective_address(dstBase, dstOffset),
+            effective_address(srcBase, srcOffset),
+            (size_t)bytes);
 }
 void __jnative_fn_jdk_internal_misc_Unsafe_copySwapMemory0__Ljava_lang_Object_JLjava_lang_Object_JJJ_V(void* srcBase, int64_t srcOffset, void* dstBase, int64_t dstOffset, int64_t bytes, int64_t elemSize) {
     char* s = (char*)effective_address(srcBase, srcOffset);
@@ -539,12 +501,10 @@ void __jnative_fn_jdk_internal_misc_Unsafe_park__ZJ_V(void* isAbsolute, int64_t 
     pthread_mutex_unlock(&e->mutex);
 }
 
-void __jnative_fn_jdk_internal_misc_Unsafe_unpark__Ljava_lang_Object_V(void* thread) {
+void __jnative_fn_jdk_internal_misc_Unsafe_unpark__Ljava_lang_Object__V(
+        void* this_unsafe, void* thread) {
+    (void)this_unsafe;
     if (!thread) return;
-    /* Thread object is opaque here; unpark is invoked on the current thread
-     * because this runtime has no way to map a Java thread object back to a
-     * pthread_t from C. The Java-side Thread.unpark() implementation passes
-     * the current thread. */
     pthread_t t = pthread_self();
     ParkEntry* e = get_park_entry(t);
     if (!e) return;
@@ -602,7 +562,9 @@ int32_t __jnative_fn_jdk_internal_misc_Unsafe_arrayIndexScale__Ljava_lang_Class_
 }
 
 /* ---- Misc ---- */
-void* __jnative_fn_jdk_internal_misc_Unsafe_allocateInstance__Ljava_lang_Class_Ljava_lang_Object_(void* cls) {
+void* __jnative_fn_jdk_internal_misc_Unsafe_allocateInstance__Ljava_lang_Class__Ljava_lang_Object_(
+        void* this_unsafe, void* cls) {
+    (void)this_unsafe;
     if (!cls) {
         __jnative_throw_null_pointer_exception();
         return NULL;
@@ -621,9 +583,38 @@ void* __jnative_fn_jdk_internal_misc_Unsafe_allocateInstance__Ljava_lang_Class_L
     if (size <= 0) size = 8;
     return calloc(1, (size_t)size);
 }
-void __jnative_fn_jdk_internal_misc_Unsafe_throwException__Ljava_lang_Throwable_V(void* throwable) {
+
+void* __jnative_fn_jdk_internal_misc_Unsafe_defineClass0__Ljava_lang_String__BIILjava_lang_ClassLoader_Ljava_security_ProtectionDomain__Ljava_lang_Class_(
+        void* this_unsafe,
+        void* name,
+        void* b,
+        int32_t off,
+        int32_t len,
+        void* loader,
+        void* protectionDomain) {
+    (void)this_unsafe;
+    (void)name;
+    (void)b;
+    (void)off;
+    (void)len;
+    (void)loader;
+    (void)protectionDomain;
+    __jnative_throw_exception(NULL);
+    return NULL;
+}
+
+void* __jnative_fn_jdk_internal_misc_Unsafe_getUncompressedObject__J_Ljava_lang_Object_(
+        void* this_unsafe, int64_t address) {
+    (void)this_unsafe;
+    return (void*)(uintptr_t)address;
+}
+
+void __jnative_fn_jdk_internal_misc_Unsafe_throwException__Ljava_lang_Throwable__V(
+        void* this_unsafe, void* throwable) {
+    (void)this_unsafe;
     __jnative_throw_exception(throwable);
 }
+
 int32_t __jnative_fn_jdk_internal_misc_Unsafe_shouldBeInitialized__Ljava_lang_Class_Z(void* cls) {
     (void)cls;
     return 0;
@@ -640,4 +631,45 @@ int32_t __jnative_fn_jdk_internal_misc_Unsafe_getLoadAverage___D_I(double* loada
 }
 void __jnative_fn_jdk_internal_misc_Unsafe_invokeCleaner__Ljava_nio_ByteBuffer_V(void* directBuffer) {
     (void)directBuffer;
+}
+
+/*
+ * JDK 17+ renamed several of the Unsafe natives by appending a `0` to
+ * the Java-visible name. The bodies are identical, so we forward to the
+ * un-suffixed implementations. Keeping both symbol families present
+ * makes the same C file usable across JDK 8 — 22 build targets.
+ */
+int32_t __jnative_fn_jdk_internal_misc_Unsafe_shouldBeInitialized0__Ljava_lang_Class__Z(void* cls) {
+    return __jnative_fn_jdk_internal_misc_Unsafe_shouldBeInitialized__Ljava_lang_Class_Z(cls);
+}
+void __jnative_fn_jdk_internal_misc_Unsafe_ensureClassInitialized0__Ljava_lang_Class__V(void* cls) {
+    __jnative_fn_jdk_internal_misc_Unsafe_ensureClassInitialized__Ljava_lang_Class_V(cls);
+}
+int64_t __jnative_fn_jdk_internal_misc_Unsafe_objectFieldOffset0__Ljava_lang_reflect_Field__J(void* field) {
+    return __jnative_fn_jdk_internal_misc_Unsafe_objectFieldOffset__Ljava_lang_reflect_Field_J(field);
+}
+
+/*
+ * void copyMemory0(Object srcBase, long srcOffset, Object dstBase, long dstOffset, long bytes)
+ *
+ * The JDK 17+ name of the two-object copy. Same layout as copyMemory: the
+ * two (object, offset) pairs address the source and destination ranges in
+ * that order.
+ */
+void __jnative_fn_jdk_internal_misc_Unsafe_copyMemory0__Ljava_lang_Object_JLjava_lang_Object_JJ_V(
+        void* srcBase, int64_t srcOffset,
+        void* dstBase, int64_t dstOffset,
+        int64_t bytes) {
+    __jnative_fn_jdk_internal_misc_Unsafe_copyMemory__Ljava_lang_Object_JLjava_lang_Object_JJ_V(
+        srcBase, srcOffset, dstBase, dstOffset, bytes);
+}
+
+/*
+ * private static native void registerNatives();
+ *
+ * Called from Unsafe.<clinit>. This runtime resolves every native method
+ * through its statically-linked __jnative_fn_<class>_<method>_<desc> symbol
+ * emitted by the LLVM backend, so there is nothing to register.
+ */
+void __jnative_fn_jdk_internal_misc_Unsafe_registerNatives___V(void) {
 }

@@ -12,16 +12,21 @@ import io.github.kubyk01.domain.analyzer.dependencyresolver.MethodReference;
 import io.github.kubyk01.domain.analyzer.reflection.ReflectClassInfo;
 import io.github.kubyk01.domain.analyzer.reflection.ReflectInfo;
 import io.github.kubyk01.domain.ir.BasicBlock;
+import io.github.kubyk01.domain.ir.CondBranchTerminator;
 import io.github.kubyk01.domain.ir.Constant;
 import io.github.kubyk01.domain.ir.Function;
+import io.github.kubyk01.domain.ir.IndirectBranchTerminator;
 import io.github.kubyk01.domain.ir.Instruction;
 import io.github.kubyk01.domain.ir.InvokeDynamicInfo;
+import io.github.kubyk01.domain.ir.LookupSwitchTerminator;
 import io.github.kubyk01.domain.ir.Module;
 import io.github.kubyk01.domain.ir.Opcode;
-import io.github.kubyk01.domain.ir.Parameter;
+import io.github.kubyk01.domain.ir.ReturnTerminator;
+import io.github.kubyk01.domain.ir.TableSwitchTerminator;
+import io.github.kubyk01.domain.ir.Terminator;
+import io.github.kubyk01.domain.ir.ThrowTerminator;
 import io.github.kubyk01.domain.ir.Type;
 import io.github.kubyk01.domain.ir.Value;
-import lombok.Getter;
 import lombok.RequiredArgsConstructor;
 import org.objectweb.asm.Opcodes;
 
@@ -43,16 +48,39 @@ public class LlvmGlobalEmitter {
     private final Map<String, Integer> fieldOffsets = new HashMap<>();
     private final Set<String> emittedStringConstants = new HashSet<>();
 
-    private final Map<String, Integer> methodIndex = new HashMap<>();
+    public static final class VtableLayout {
+        public final List<String> slots = new ArrayList<>();
+        public final Map<String, Integer> slotBySignature = new HashMap<>();
+    }
+
+    private final Map<String, VtableLayout> classLayouts = new HashMap<>();
+    private final Map<String, VtableLayout> interfaceLayouts = new HashMap<>();
+    private final Set<String> classLayoutInProgress = new HashSet<>();
+    private final Set<String> ifaceLayoutInProgress = new HashSet<>();
+
+    private final Map<String, Integer> interfaceIds = new HashMap<>();
+    private int nextInterfaceId = 0;
+    private int totalInterfaces = 0;
+    private boolean layoutsBuilt = false;
+
     private final Map<String, String> vtableNames = new HashMap<>();
-    @Getter
-    private int totalMethods = 0;
-    private boolean methodIndexBuilt = false;
+    private final Map<String, Integer> vtableLengths = new HashMap<>();
+    private final Map<String, Integer> lambdaVtableLengths = new HashMap<>();
 
     private final Map<String, String> typeInfoNames = new HashMap<>();
 
     private final Map<String, String> extraStructs = new LinkedHashMap<>();
     private final Map<String, String> extraVtables = new LinkedHashMap<>();
+
+    private static final class LambdaInfo {
+        String lambdaId;
+        String lambdaClassName;
+        String samInterface;
+        String samSig;
+        String adaptorName;
+        List<Type> capturedTypes;
+    }
+    private final Map<String, LambdaInfo> lambdaRegistry = new LinkedHashMap<>();
 
     public void addExtraStruct(String name, String definition) {
         extraStructs.put(name, definition);
@@ -60,6 +88,424 @@ public class LlvmGlobalEmitter {
 
     public void addExtraVtable(String name, String content) {
         extraVtables.put(name, content);
+    }
+
+    public void emitExtraStructs(StringBuilder sb) {
+        for (String def : extraStructs.values()) {
+            sb.append(def).append("\n");
+        }
+    }
+
+    public void emitExtraVtables(StringBuilder sb) {
+        for (String def : extraVtables.values()) {
+            sb.append(def).append("\n");
+        }
+    }
+
+    public void prepareLayouts() {
+        if (layoutsBuilt) return;
+
+        List<ClassNode> all = new ArrayList<>(resolver.getClassMap().values());
+        all.sort(Comparator.comparing(ClassNode::getName));
+
+        for (ClassNode cn : all) {
+            if (cn.isExternal()) continue;
+            if (cn.isInterface()) continue;
+            getOrBuildClassLayout(cn.getName());
+        }
+        getOrBuildClassLayout("java/lang/Object");
+
+        Set<String> needed = new LinkedHashSet<>();
+
+        for (ClassNode cn : all) {
+            if (cn.isExternal()) continue;
+            if (cn.isInterface()) continue;
+            collectAllInterfacesRec(cn, needed);
+        }
+
+        for (Function func : module.getFunctions()) {
+            for (BasicBlock block : func.getBlocks()) {
+                for (Instruction inst : block.getInstructions()) {
+                    if (inst.getOpcode() != Opcode.INTERFACE_CALL) continue;
+                    if (inst.getOperands().size() < 2) continue;
+                    Value callee = inst.getOperands().get(1);
+                    if (!(callee instanceof Constant c)) continue;
+                    if (!c.getType().isReference()) continue;
+                    String full = c.getValue().toString();
+                    int dotIdx = full.lastIndexOf('.');
+                    if (dotIdx <= 0) continue;
+                    String owner = full.substring(0, dotIdx);
+
+                    ClassNode ownerNode = resolver.getClassNode(owner);
+                    if (ownerNode == null || !ownerNode.isInterface()) continue;
+                    needed.add(owner);
+                }
+            }
+        }
+
+        needed.addAll(interfaceIds.keySet());
+
+        List<String> ifaceNames = new ArrayList<>(needed);
+        Collections.sort(ifaceNames);
+        interfaceIds.clear();
+        nextInterfaceId = 0;
+        for (String name : ifaceNames) {
+            ClassNode cn = resolver.getClassNode(name);
+            if (cn == null || !cn.isInterface()) continue;
+            interfaceIds.put(name, nextInterfaceId++);
+            getOrBuildInterfaceLayout(name);
+        }
+        totalInterfaces = nextInterfaceId;
+        layoutsBuilt = true;
+    }
+
+    public void prepareMethodIndex() {
+        prepareLayouts();
+    }
+
+    private VtableLayout getOrBuildClassLayout(String className) {
+        VtableLayout cached = classLayouts.get(className);
+        if (cached != null) return cached;
+
+        if (classLayoutInProgress.contains(className)) {
+            return new VtableLayout();
+        }
+        classLayoutInProgress.add(className);
+
+        VtableLayout layout = new VtableLayout();
+        classLayouts.put(className, layout);
+
+        ClassNode cn = resolver.getClassNode(className);
+        if (cn == null) {
+            classLayoutInProgress.remove(className);
+            return layout;
+        }
+
+        if (!"java/lang/Object".equals(className)) {
+            String superName = cn.getSuperName();
+            if (superName == null || superName.equals(className)) superName = "java/lang/Object";
+            VtableLayout parent = getOrBuildClassLayout(superName);
+            layout.slots.addAll(parent.slots);
+            layout.slotBySignature.putAll(parent.slotBySignature);
+        }
+
+        if (!cn.isExternal()) {
+            for (MethodNode mn : cn.getMethods()) {
+                if (!isVtableVirtual(mn)) continue;
+                String sig = mn.getName() + mn.getDescriptor();
+                if (!layout.slotBySignature.containsKey(sig)) {
+                    layout.slotBySignature.put(sig, layout.slots.size());
+                    layout.slots.add(sig);
+                }
+            }
+        }
+
+        classLayoutInProgress.remove(className);
+        return layout;
+    }
+
+    private VtableLayout getOrBuildInterfaceLayout(String ifaceName) {
+        VtableLayout cached = interfaceLayouts.get(ifaceName);
+        if (cached != null) return cached;
+
+        if (ifaceLayoutInProgress.contains(ifaceName)) {
+            return new VtableLayout();
+        }
+
+        ClassNode cn = resolver.getClassNode(ifaceName);
+        if (cn == null || !cn.isInterface()) {
+            return new VtableLayout();
+        }
+
+        ifaceLayoutInProgress.add(ifaceName);
+
+        VtableLayout layout = new VtableLayout();
+        interfaceLayouts.put(ifaceName, layout);
+
+        for (String parent : cn.getInterfaces()) {
+            if (parent.equals(ifaceName)) continue;
+            VtableLayout parentLayout = getOrBuildInterfaceLayout(parent);
+            for (String sig : parentLayout.slots) {
+                if (!layout.slotBySignature.containsKey(sig)) {
+                    layout.slotBySignature.put(sig, layout.slots.size());
+                    layout.slots.add(sig);
+                }
+            }
+        }
+
+        if (!cn.isExternal()) {
+            for (MethodNode mn : cn.getMethods()) {
+                if (!isVtableVirtual(mn)) continue;
+                String sig = mn.getName() + mn.getDescriptor();
+                if (!layout.slotBySignature.containsKey(sig)) {
+                    layout.slotBySignature.put(sig, layout.slots.size());
+                    layout.slots.add(sig);
+                }
+            }
+        }
+
+        ifaceLayoutInProgress.remove(ifaceName);
+        return layout;
+    }
+
+    private boolean isVtableVirtual(MethodNode mn) {
+        int access = mn.getAccess();
+        if ((access & Opcodes.ACC_STATIC)  != 0) return false;
+        if ((access & Opcodes.ACC_PRIVATE) != 0) return false;
+        String n = mn.getName();
+        return !n.equals("<init>") && !n.equals("<clinit>");
+    }
+
+    public int getVirtualSlot(String owner, String name, String desc) {
+        prepareLayouts();
+        VtableLayout layout = getOrBuildClassLayout(owner);
+        Integer slot = layout.slotBySignature.get(name + desc);
+        return slot != null ? slot : -1;
+    }
+
+    public int getInterfaceMethodSlot(String iface, String name, String desc) {
+        prepareLayouts();
+        if (!interfaceIds.containsKey(iface)) return -1;
+        VtableLayout layout = getOrBuildInterfaceLayout(iface);
+        Integer slot = layout.slotBySignature.get(name + desc);
+        return slot != null ? slot : -1;
+    }
+
+    public int getInterfaceId(String iface) {
+        prepareLayouts();
+        Integer id = interfaceIds.get(iface);
+        return id != null ? id : -1;
+    }
+
+    public int getTotalInterfaces() {
+        prepareLayouts();
+        return totalInterfaces;
+    }
+
+    public String getVtableName(String className) {
+        return vtableNames.get(className);
+    }
+
+    public int getVtableLength(String className) {
+        return vtableLengths.getOrDefault(className, -1);
+    }
+
+    public int getLambdaVtableLength(String lambdaId) {
+        return lambdaVtableLengths.getOrDefault(lambdaId, -1);
+    }
+
+    public String getStructName(String className) {
+        return structNames.getOrDefault(className, LlvmTypeMapper.toLlvmStruct(className));
+    }
+
+    public String getTypeInfoName(String className) {
+        return typeInfoNames.get(className);
+    }
+
+    public String generateGlobals() {
+        prepareLayouts();
+        return generateStructs()
+            + generateStaticFields()
+            + generateTypeStringConstants()
+            + generateVtables()
+            + generateTypeInfo()
+            + generateReflectionData();
+    }
+
+    private static final class ResolvedFn {
+        final String name;
+        final String type;
+        ResolvedFn(String name, String type) { this.name = name; this.type = type; }
+    }
+
+    private ResolvedFn resolveVtableEntry(String className, String sig) {
+        int parenIdx = sig.indexOf('(');
+        if (parenIdx <= 0) return null;
+        String name = sig.substring(0, parenIdx);
+        String desc = sig.substring(parenIdx);
+
+        String[] foundOwner = new String[1];
+        MethodNode mn = resolver.findMethodInHierarchy(className, name, desc, foundOwner);
+        if (mn == null || mn.isAbstract()) return null;
+
+        String owner = foundOwner[0] != null ? foundOwner[0] : className;
+        String baseName   = LlvmRuntime.mangleMethod(owner, name, desc);
+        String nativeName = "__jnative_" + baseName;
+
+        String funcName;
+        if (module.getFunction(baseName) != null) {
+            funcName = baseName;
+        } else if (module.getFunction(nativeName) != null) {
+            funcName = nativeName;
+        } else {
+            return null;
+        }
+
+        String ret = LlvmTypeMapper.toLlvmType(mn.getReturnType());
+        StringBuilder params = new StringBuilder();
+        params.append(LlvmTypeMapper.toLlvmType(Type.reference(owner)));
+        for (Type pt : mn.getParameterTypes()) {
+            params.append(", ").append(LlvmTypeMapper.toLlvmType(pt));
+        }
+        return new ResolvedFn(funcName, ret + " (" + params + ")*");
+    }
+
+    private String generateVtables() {
+        prepareLayouts();
+        StringBuilder sb = new StringBuilder();
+        sb.append("\n; ----- Vtables (hierarchy-local slots) -----\n");
+
+        List<ClassNode> allClasses = new ArrayList<>(resolver.getClassMap().values());
+        allClasses.sort(Comparator.comparing(ClassNode::getName));
+
+        for (String iface : interfaceLayouts.keySet()) {
+            String vtableName = "@vtable_" + LlvmTypeMapper.sanitizeIdentifier(iface);
+            vtableNames.put(iface, vtableName);
+            String ifaceNameRef = ensureStringConstantPtr(sb, iface);
+            sb.append(vtableName)
+                .append(" = constant %JNativeVTable { i8** null, %JNativeIfaceMap* null, i8* ")
+                .append(ifaceNameRef).append(" }\n");
+        }
+
+        for (ClassNode cls : allClasses) {
+            if (cls.isExternal()) continue;
+            if (cls.isInterface()) continue;
+
+            String className = cls.getName();
+            VtableLayout layout = getOrBuildClassLayout(className);
+            int length = Math.max(layout.slots.size(), 1);
+
+            List<String> entries = new ArrayList<>(length);
+            for (int i = 0; i < length; i++) entries.add("i8* null");
+
+            for (int i = 0; i < layout.slots.size(); i++) {
+                String sig = layout.slots.get(i);
+                ResolvedFn fn = resolveVtableEntry(className, sig);
+                if (fn != null) {
+                    entries.set(i, "i8* bitcast (" + fn.type + " @" + fn.name + " to i8*)");
+                }
+            }
+
+            String methodsName = "@vtable_methods_" + LlvmTypeMapper.sanitizeIdentifier(className);
+            sb.append(methodsName).append(" = private constant [")
+                .append(length).append(" x i8*] [");
+            for (int i = 0; i < length; i++) {
+                if (i > 0) sb.append(", ");
+                sb.append(entries.get(i));
+            }
+            sb.append("]\n");
+
+            vtableLengths.put(className, length);
+        }
+
+        for (ClassNode cls : allClasses) {
+            if (cls.isExternal() || cls.isInterface()) continue;
+            String className = cls.getName();
+
+            Set<String> ifaces = collectAllInterfaces(cls);
+            Map<String, String>  itableNames = new LinkedHashMap<>();
+            Map<String, Integer> itableLens  = new LinkedHashMap<>();
+            Map<String, Integer> itableIds   = new LinkedHashMap<>();
+
+            for (String iface : ifaces) {
+                Integer ifaceId = interfaceIds.get(iface);
+                if (ifaceId == null) continue;
+
+                VtableLayout ifaceLayout = getOrBuildInterfaceLayout(iface);
+                int len = Math.max(ifaceLayout.slots.size(), 1);
+
+                List<String> entries = new ArrayList<>(len);
+                for (int i = 0; i < len; i++) entries.add("i8* null");
+
+                for (int i = 0; i < ifaceLayout.slots.size(); i++) {
+                    String sig = ifaceLayout.slots.get(i);
+                    ResolvedFn fn = resolveVtableEntry(className, sig);
+                    if (fn != null) {
+                        entries.set(i, "i8* bitcast (" + fn.type + " @" + fn.name + " to i8*)");
+                    }
+                }
+
+                String itableName = "@itable_"
+                    + LlvmTypeMapper.sanitizeIdentifier(className) + "_"
+                    + LlvmTypeMapper.sanitizeIdentifier(iface);
+                sb.append(itableName).append(" = private constant [")
+                    .append(len).append(" x i8*] [");
+                for (int i = 0; i < len; i++) {
+                    if (i > 0) sb.append(", ");
+                    sb.append(entries.get(i));
+                }
+                sb.append("]\n");
+
+                itableNames.put(iface, itableName);
+                itableLens.put(iface, len);
+                itableIds.put(iface, ifaceId);
+            }
+
+            List<String> sortedIfaces = new ArrayList<>(itableIds.keySet());
+            sortedIfaces.sort(Comparator.comparingInt(itableIds::get));
+
+            String ifacemapName = "@ifacemap_" + LlvmTypeMapper.sanitizeIdentifier(className);
+
+            if (!sortedIfaces.isEmpty()) {
+                String entriesArrayName = "@ifacemap_entries_"
+                    + LlvmTypeMapper.sanitizeIdentifier(className);
+                sb.append(entriesArrayName).append(" = private constant [")
+                    .append(sortedIfaces.size()).append(" x %JNativeIfaceMapEntry] [");
+                for (int i = 0; i < sortedIfaces.size(); i++) {
+                    if (i > 0) sb.append(", ");
+                    String iface = sortedIfaces.get(i);
+                    sb.append("%JNativeIfaceMapEntry { i32 ").append(itableIds.get(iface))
+                        .append(", i8** bitcast ([").append(itableLens.get(iface))
+                        .append(" x i8*]* ").append(itableNames.get(iface))
+                        .append(" to i8**) }");
+                }
+                sb.append("]\n");
+
+                sb.append(ifacemapName).append(" = constant %JNativeIfaceMap { i32 ")
+                    .append(sortedIfaces.size()).append(", %JNativeIfaceMapEntry* ")
+                    .append(entriesArrayName).append(" }\n");
+            } else {
+                sb.append(ifacemapName)
+                    .append(" = constant %JNativeIfaceMap { i32 0, %JNativeIfaceMapEntry* null }\n");
+            }
+
+            int methodLen = vtableLengths.getOrDefault(className, 1);
+            String methodsName = "@vtable_methods_" + LlvmTypeMapper.sanitizeIdentifier(className);
+
+            String vtableName = "@vtable_" + LlvmTypeMapper.sanitizeIdentifier(className);
+            String classNameRef = ensureStringConstantPtr(sb, className);
+            sb.append(vtableName).append(" = constant %JNativeVTable {\n")
+                .append("  i8** bitcast ([").append(methodLen).append(" x i8*]* ")
+                .append(methodsName).append(" to i8**),\n")
+                .append("  %JNativeIfaceMap* ").append(ifacemapName).append(",\n")
+                .append("  i8* ").append(classNameRef).append("\n")
+                .append("}\n");
+
+            vtableNames.put(className, vtableName);
+        }
+
+        return sb.toString();
+    }
+
+    private Set<String> collectAllInterfaces(ClassNode cls) {
+        Set<String> result = new LinkedHashSet<>();
+        if (cls != null) collectAllInterfacesRec(cls, result);
+        return result;
+    }
+
+    private void collectAllInterfacesRec(ClassNode cls, Set<String> out) {
+        if (cls == null) return;
+        for (String i : cls.getInterfaces()) {
+            if (out.add(i)) {
+                ClassNode in = resolver.getClassNode(i);
+                if (in != null) collectAllInterfacesRec(in, out);
+            }
+        }
+        String superName = cls.getSuperName();
+        if (superName != null && !superName.equals(cls.getName())) {
+            ClassNode sn = resolver.getClassNode(superName);
+            if (sn != null) collectAllInterfacesRec(sn, out);
+        }
     }
 
     public String registerLambdaStruct(String lambdaId, List<Type> capturedTypes) {
@@ -76,137 +522,147 @@ public class LlvmGlobalEmitter {
         return structName;
     }
 
-    public String registerLambdaVtable(String lambdaId, String adaptorName, String samSig) {
-        ensureMethodIndex();
+    public String registerLambdaClass(String lambdaId,
+                                      String samInterface,
+                                      String samSig,
+                                      String adaptorName,
+                                      List<Type> capturedTypes) {
+        prepareLayouts();
 
-        String vtableName = "@vtable_lambda_" + lambdaId;
-        if (extraVtables.containsKey(vtableName)) return vtableName;
-
-        int idx = resolveSamIndex(samSig);
-        if (idx < 0) idx = 0;
-
-        int length = Math.max(totalMethods, idx + 1);
-
-        StringBuilder entries = new StringBuilder();
-        for (int i = 0; i < length; i++) {
-            if (i > 0) entries.append(", ");
-            if (i == idx) {
-                entries.append("i8* bitcast (void (i8*, ...)* @")
-                    .append(adaptorName).append(" to i8*)");
-            } else {
-                entries.append("i8* null");
-            }
+        if (samInterface == null
+            || samInterface.isEmpty()
+            || samInterface.indexOf('(') >= 0
+            || samInterface.indexOf(')') >= 0
+            || samInterface.charAt(0) == '[') {
+            throw new IllegalStateException(
+                "registerLambdaClass called with an invalid SAM interface name '"
+                    + samInterface + "' for lambda " + lambdaId);
         }
 
-        String content = vtableName + " = constant [" + length + " x i8*] [" + entries + "]";
-        extraVtables.put(vtableName, content);
+        ClassNode samNode = resolver.getClassNode(samInterface);
+        if (samNode != null && !samNode.isExternal() && !samNode.isInterface()) {
+            throw new IllegalStateException(
+                "registerLambdaClass: SAM '" + samInterface
+                    + "' resolves to a class, not an interface (lambdaId="
+                    + lambdaId + ")");
+        }
+
+        String lambdaClassName = "__Lambda_" + lambdaId;
+        if (lambdaRegistry.containsKey(lambdaId)) {
+            return vtableNames.get(lambdaClassName);
+        }
+
+        if (!interfaceIds.containsKey(samInterface)) {
+            interfaceIds.put(samInterface, nextInterfaceId++);
+            totalInterfaces = nextInterfaceId;
+        }
+        getOrBuildInterfaceLayout(samInterface);
+
+        registerLambdaStruct(lambdaId, capturedTypes);
+
+        LambdaInfo info = new LambdaInfo();
+        info.lambdaId = lambdaId;
+        info.lambdaClassName = lambdaClassName;
+        info.samInterface = samInterface;
+        info.samSig = samSig;
+        info.adaptorName = adaptorName;
+        info.capturedTypes = new ArrayList<>(capturedTypes);
+        lambdaRegistry.put(lambdaId, info);
+
+        String vtableName = "@vtable_" + LlvmTypeMapper.sanitizeIdentifier(lambdaClassName);
+        vtableNames.put(lambdaClassName, vtableName);
         return vtableName;
     }
 
-    private int resolveSamIndex(String samSig) {
-        if (samSig == null) return -1;
-        int paren = samSig.indexOf('(');
-        if (paren > 0) {
-            return getMethodIndex(samSig);
-        }
-        if (paren == 0) {
-            for (Map.Entry<String, Integer> e : methodIndex.entrySet()) {
-                if (e.getKey().endsWith(samSig)) return e.getValue();
-            }
-        }
-        return -1;
-    }
+    public String emitLambdaVtables() {
+        prepareLayouts();
+        StringBuilder sb = new StringBuilder();
+        sb.append("\n; ----- Lambda vtables -----\n");
 
-    public void emitExtraStructs(StringBuilder sb) {
-        for (String def : extraStructs.values()) {
-            sb.append(def).append("\n");
-        }
-    }
+        VtableLayout objectLayout = getOrBuildClassLayout("java/lang/Object");
+        int methodLen = Math.max(objectLayout.slots.size(), 1);
 
-    public void emitExtraVtables(StringBuilder sb) {
-        for (String def : extraVtables.values()) {
-            sb.append(def).append("\n");
-        }
-    }
+        for (LambdaInfo info : lambdaRegistry.values()) {
+            String lambdaClassName = info.lambdaClassName;
+            String samInterface    = info.samInterface;
 
-    public String generateGlobals() {
-        return generateStructs()
-            + generateStaticFields()
-            + generateTypeStringConstants()
-            + generateVtables()
-            + generateTypeInfo()
-            + generateReflectionData();
-    }
-
-    private String generateTypeStringConstants() {
-        Set<String> names = new LinkedHashSet<>();
-        names.add("java/lang/Object");
-
-        for (Function func : module.getFunctions()) {
-            for (BasicBlock block : func.getBlocks()) {
-                for (Instruction inst : block.getInstructions()) {
-
-                    if (inst.getOpcode() == Opcode.INSTANCEOF
-                        || inst.getOpcode() == Opcode.CHECKCAST
-                        || inst.getOpcode() == Opcode.MULTI_NEW_ARRAY) {
-                        for (Value v : inst.getOperands()) {
-                            if (v instanceof Constant c && c.getType().isReference()) {
-                                names.add(c.getValue().toString());
-                            }
-                        }
-                    }
-
-                    for (Value v : inst.getOperands()) {
-                        if (v instanceof Constant c
-                            && c.getType().isReference()
-                            && "java/lang/String".equals(c.getType().getClassName())
-                            && c.getValue() instanceof String s) {
-                            names.add(s);
-                        }
-                    }
-
-                    if (inst.getOpcode() == Opcode.INVOKEDYNAMIC
-                        && inst.getInvokedynamicData() instanceof InvokeDynamicInfo dynInfo
-                        && dynInfo.bootstrapMethod() != null
-                        && "java/lang/invoke/StringConcatFactory".equals(dynInfo.bootstrapMethod().getOwner())
-                        && dynInfo.bootstrapArgs().length >= 1
-                        && dynInfo.bootstrapArgs()[0] instanceof String recipe) {
-
-                        StringBuilder seg = new StringBuilder();
-                        for (int i = 0; i < recipe.length(); i++) {
-                            char c = recipe.charAt(i);
-                            if (c == '\u0001' || c == '\u0002') {
-                                if (!seg.isEmpty()) {
-                                    names.add(seg.toString());
-                                    seg.setLength(0);
-                                }
-                            } else {
-                                seg.append(c);
-                            }
-                        }
-                        if (!seg.isEmpty()) {
-                            names.add(seg.toString());
-                        }
-
-                        for (int i = 1; i < dynInfo.bootstrapArgs().length; i++) {
-                            Object a = dynInfo.bootstrapArgs()[i];
-                            if (a != null) {
-                                names.add(String.valueOf(a));
-                            }
-                        }
-                    }
+            List<String> methodEntries = new ArrayList<>(methodLen);
+            for (int i = 0; i < methodLen; i++) methodEntries.add("i8* null");
+            for (int i = 0; i < objectLayout.slots.size(); i++) {
+                String sig = objectLayout.slots.get(i);
+                ResolvedFn fn = resolveVtableEntry("java/lang/Object", sig);
+                if (fn != null) {
+                    methodEntries.set(i,
+                        "i8* bitcast (" + fn.type + " @" + fn.name + " to i8*)");
                 }
             }
-        }
 
-        StringBuilder sb = new StringBuilder("\n; ----- String / type-name constants -----\n");
-        List<String> sorted = new ArrayList<>(names);
-        Collections.sort(sorted);
-        for (String name : sorted) {
-            emittedStringConstants.add(name);
-            sb.append(LlvmRuntime.typeStringConstant(name));
+            String methodsName = "@vtable_methods_"
+                + LlvmTypeMapper.sanitizeIdentifier(lambdaClassName);
+            sb.append(methodsName).append(" = private constant [")
+                .append(methodLen).append(" x i8*] [");
+            for (int i = 0; i < methodLen; i++) {
+                if (i > 0) sb.append(", ");
+                sb.append(methodEntries.get(i));
+            }
+            sb.append("]\n");
+
+            VtableLayout samLayout = getOrBuildInterfaceLayout(samInterface);
+            int samLen = Math.max(samLayout.slots.size(), 1);
+            Integer samSlotObj = samLayout.slotBySignature.get(info.samSig);
+            if (samSlotObj == null) samSlotObj = 0;
+            int samSlot = samSlotObj;
+
+            List<String> itableEntries = new ArrayList<>(samLen);
+            for (int i = 0; i < samLen; i++) itableEntries.add("i8* null");
+            itableEntries.set(samSlot,
+                "i8* bitcast (i8* (i8*, ...)* @" + info.adaptorName + " to i8*)");
+
+            String itableName = "@itable_"
+                + LlvmTypeMapper.sanitizeIdentifier(lambdaClassName) + "_"
+                + LlvmTypeMapper.sanitizeIdentifier(samInterface);
+            sb.append(itableName).append(" = private constant [")
+                .append(samLen).append(" x i8*] [");
+            for (int i = 0; i < samLen; i++) {
+                if (i > 0) sb.append(", ");
+                sb.append(itableEntries.get(i));
+            }
+            sb.append("]\n");
+
+            Integer samIfaceId = interfaceIds.get(samInterface);
+            if (samIfaceId == null) {
+                throw new IllegalStateException(
+                    "Lambda '" + info.lambdaId + "' SAM interface '" + samInterface
+                        + "' has no global interface id");
+            }
+
+            String ifacemapEntriesName = "@ifacemap_entries_"
+                + LlvmTypeMapper.sanitizeIdentifier(lambdaClassName);
+            String ifacemapName = "@ifacemap_"
+                + LlvmTypeMapper.sanitizeIdentifier(lambdaClassName);
+
+            sb.append(ifacemapEntriesName)
+                .append(" = private constant [1 x %JNativeIfaceMapEntry] [")
+                .append("%JNativeIfaceMapEntry { i32 ").append(samIfaceId)
+                .append(", i8** bitcast ([").append(samLen).append(" x i8*]* ")
+                .append(itableName).append(" to i8**) }]\n");
+
+            sb.append(ifacemapName)
+                .append(" = constant %JNativeIfaceMap { i32 1, %JNativeIfaceMapEntry* ")
+                .append(ifacemapEntriesName).append(" }\n");
+
+            String vtableName = vtableNames.get(lambdaClassName);
+            String lambdaNameRef = ensureStringConstantPtr(sb, lambdaClassName);
+            sb.append(vtableName).append(" = constant %JNativeVTable {\n")
+                .append("  i8** bitcast ([").append(methodLen).append(" x i8*]* ")
+                .append(methodsName).append(" to i8**),\n")
+                .append("  %JNativeIfaceMap* ").append(ifacemapName).append(",\n")
+                .append("  i8* ").append(lambdaNameRef).append("\n")
+                .append("}\n");
+
+            vtableLengths.put(lambdaClassName, methodLen);
+            lambdaVtableLengths.put(info.lambdaId, methodLen);
         }
-        sb.append("\n");
         return sb.toString();
     }
 
@@ -234,6 +690,7 @@ public class LlvmGlobalEmitter {
         }
 
         List<ClassNode> allClasses = new ArrayList<>(resolver.getClassMap().values());
+        allClasses.sort(Comparator.comparing(ClassNode::getName));
         for (ClassNode cls : allClasses) {
             if (cls.isExternal()) continue;
             if (structNames.containsKey(cls.getName())) continue;
@@ -278,8 +735,9 @@ public class LlvmGlobalEmitter {
     private String generateStaticFields() {
         StringBuilder sb = new StringBuilder();
         Map<String, PointsToSet> staticFields = aliasResult.getGraph().getStaticFieldPointsToMap();
-        for (Map.Entry<String, PointsToSet> entry : staticFields.entrySet()) {
-            String fullName = entry.getKey();
+        List<String> sorted = new ArrayList<>(staticFields.keySet());
+        Collections.sort(sorted);
+        for (String fullName : sorted) {
             int dot = fullName.lastIndexOf('.');
             String owner = fullName.substring(0, dot);
             String fieldName = fullName.substring(dot + 1);
@@ -305,105 +763,150 @@ public class LlvmGlobalEmitter {
         return sb.toString();
     }
 
-    public void ensureMethodIndex() {
-        if (methodIndexBuilt) return;
-        buildMethodIndex();
-        methodIndexBuilt = true;
-    }
+    private String generateTypeStringConstants() {
+        Set<String> names = new LinkedHashSet<>();
+        names.add("java/lang/Object");
 
-    private void buildMethodIndex() {
-        Set<String> signatures = new HashSet<>();
+        for (ClassNode cn : resolver.getClassMap().values()) {
+            if (cn.isExternal()) continue;
+            names.add(cn.getName());
+        }
 
-        List<ClassNode> allClasses = new ArrayList<>(resolver.getClassMap().values());
-        for (ClassNode cls : allClasses) {
-            if (cls.isExternal()) continue;
-            for (MethodNode mn : cls.getMethods()) {
-                if (isVirtual(mn)) {
-                    signatures.add(mn.getName() + mn.getDescriptor());
+        for (Function func : module.getFunctions()) {
+            String fn = func.getName();
+            if (fn != null && !fn.isEmpty()) names.add(fn);
+        }
+
+        for (Function func : module.getFunctions()) {
+            for (BasicBlock block : func.getBlocks()) {
+                for (Instruction inst : block.getInstructions()) {
+                    collectStringConstantsFromInstruction(inst, names);
                 }
+                Terminator term = block.getTerminator();
+                if (term != null) collectStringConstantsFromTerminator(term, names);
             }
         }
 
-        List<String> sortedSigs = new ArrayList<>(signatures);
-        Collections.sort(sortedSigs);
-
-        for (int i = 0; i < sortedSigs.size(); i++) {
-            methodIndex.put(sortedSigs.get(i), i);
+        StringBuilder sb = new StringBuilder("\n; ----- String / type-name constants -----\n");
+        List<String> sorted = new ArrayList<>(names);
+        Collections.sort(sorted);
+        for (String name : sorted) {
+            emittedStringConstants.add(name);
+            sb.append(LlvmRuntime.typeStringConstant(name));
         }
-        totalMethods = sortedSigs.size();
+        sb.append("\n");
+        return sb.toString();
     }
 
-    private String generateVtables() {
-        ensureMethodIndex();
-
-        StringBuilder sb = new StringBuilder();
-        sb.append("\n; ----- Vtables (global method indices: ")
-            .append(totalMethods).append(") -----\n");
-
-        int runIdx = methodIndex.getOrDefault("run()V", -1);
-        sb.append("@__jnative_run_method_index = constant i32 ")
-            .append(runIdx).append("\n");
-
-        if (totalMethods == 0) {
-            sb.append("\n");
-            return sb.toString();
+    private void collectStringConstantsFromInstruction(Instruction inst, Set<String> names) {
+        Opcode op = inst.getOpcode();
+        for (Value v : inst.getOperands()) {
+            if (v instanceof Constant c
+                && c.getType().isReference()
+                && c.getValue() instanceof String s) {
+                names.add(s);
+            }
         }
+        if (op == Opcode.INVOKEDYNAMIC
+            && inst.getInvokedynamicData() instanceof InvokeDynamicInfo dynInfo
+            && dynInfo.bootstrapMethod() != null
+            && "java/lang/invoke/StringConcatFactory".equals(dynInfo.bootstrapMethod().getOwner())
+            && dynInfo.bootstrapArgs().length >= 1
+            && dynInfo.bootstrapArgs()[0] instanceof String recipe) {
+            StringBuilder seg = new StringBuilder();
+            for (int i = 0; i < recipe.length(); i++) {
+                char c = recipe.charAt(i);
+                if (c == '\u0001' || c == '\u0002') {
+                    if (!seg.isEmpty()) { names.add(seg.toString()); seg.setLength(0); }
+                } else {
+                    seg.append(c);
+                }
+            }
+            if (!seg.isEmpty()) names.add(seg.toString());
+            for (int i = 1; i < dynInfo.bootstrapArgs().length; i++) {
+                Object a = dynInfo.bootstrapArgs()[i];
+                if (a != null) names.add(String.valueOf(a));
+            }
+        }
+    }
 
-        List<String> sortedSigs = new ArrayList<>(methodIndex.keySet());
-        sortedSigs.sort(Comparator.comparingInt(methodIndex::get));
+    private void addIfStringConstant(Value v, Set<String> names) {
+        if (v instanceof Constant c
+            && c.getType().isReference()
+            && c.getValue() instanceof String s) {
+            names.add(s);
+        }
+    }
+
+    private void collectStringConstantsFromTerminator(Terminator term, Set<String> names) {
+        if (term instanceof ReturnTerminator rt) addIfStringConstant(rt.getValue(), names);
+        else if (term instanceof ThrowTerminator tt) addIfStringConstant(tt.getException(), names);
+        else if (term instanceof CondBranchTerminator cbt) addIfStringConstant(cbt.getCondition(), names);
+        else if (term instanceof LookupSwitchTerminator lst) addIfStringConstant(lst.getKey(), names);
+        else if (term instanceof TableSwitchTerminator tst) addIfStringConstant(tst.getKey(), names);
+        else if (term instanceof IndirectBranchTerminator ibt) addIfStringConstant(ibt.getTargetBlock(), names);
+    }
+
+    private String generateTypeInfo() {
+        StringBuilder sb = new StringBuilder();
+        sb.append("\n; ----- Type info tables -----\n");
 
         List<ClassNode> allClasses = new ArrayList<>(resolver.getClassMap().values());
+        allClasses.sort(Comparator.comparing(ClassNode::getName));
+
         for (ClassNode cls : allClasses) {
             if (cls.isExternal()) continue;
-
             String className = cls.getName();
-            Map<String, MethodNode> methodMap = new HashMap<>();
-            collectMethods(cls, methodMap);
+            Set<String> allParents = new LinkedHashSet<>();
+            collectSuperclasses(cls, allParents);
+            collectInterfaces(cls, allParents);
 
             List<String> entries = new ArrayList<>();
-            for (String sig : sortedSigs) {
-                MethodNode mn = methodMap.get(sig);
-                if (mn == null || mn.isAbstract()) {
+            for (String parent : allParents) {
+                String vtableName = vtableNames.get(parent);
+                if (vtableName == null) {
                     entries.add("i8* null");
-                    continue;
+                } else {
+                    entries.add("i8* bitcast (%JNativeVTable* " + vtableName + " to i8*)");
                 }
-                String[] declOwner = new String[1];
-                resolver.findMethodInHierarchy(className, mn.getName(), mn.getDescriptor(), declOwner);
-                String owner = declOwner[0] != null ? declOwner[0] : className;
-                boolean isNative = mn.isNative();
-                String funcName = (isNative ? "__jnative_" : "")
-                    + LlvmRuntime.mangleMethod(owner, mn.getName(), mn.getDescriptor());
-
-                Function fn = module.getFunction(funcName);
-                if (fn == null) {
-                    if (isNative) {
-                        ensureNativeFunctionDeclared(funcName, mn, owner);
-                    } else {
-                        entries.add("i8* null");
-                        continue;
-                    }
-                }
-                String ret = LlvmTypeMapper.toLlvmType(mn.getReturnType());
-                String params = buildParamTypes(mn);
-                entries.add("i8* bitcast (" + ret + " (" + params + ")* @"
-                    + funcName + " to i8*)");
             }
+            entries.add("i8* null");
 
-            String vtableName = "@vtable_" + LlvmTypeMapper.sanitizeIdentifier(className);
-            sb.append(vtableName).append(" = constant [")
-                .append(totalMethods).append(" x i8*] [");
+            String typeInfoName = "@__type_info_" + LlvmTypeMapper.sanitizeIdentifier(className);
+            typeInfoNames.put(className, typeInfoName);
+            sb.append(typeInfoName).append(" = private constant [")
+                .append(entries.size()).append(" x i8*] [");
             for (int i = 0; i < entries.size(); i++) {
                 if (i > 0) sb.append(", ");
                 sb.append(entries.get(i));
             }
             sb.append("]\n");
-            vtableNames.put(className, vtableName);
         }
         return sb.toString();
     }
 
-    public String getStructName(String className) {
-        return structNames.getOrDefault(className, LlvmTypeMapper.toLlvmStruct(className));
+    private void collectSuperclasses(ClassNode cls, Set<String> accumulator) {
+        accumulator.add(cls.getName());
+        if (cls.getSuperName() != null && !cls.getSuperName().equals("java/lang/Object")) {
+            ClassNode superNode = resolver.getClassNode(cls.getSuperName());
+            if (superNode != null && !superNode.isExternal()) {
+                collectSuperclasses(superNode, accumulator);
+            } else {
+                accumulator.add("java/lang/Object");
+            }
+        } else {
+            accumulator.add("java/lang/Object");
+        }
+    }
+
+    private void collectInterfaces(ClassNode cls, Set<String> accumulator) {
+        for (String iface : cls.getInterfaces()) {
+            accumulator.add(iface);
+            ClassNode ifaceNode = resolver.getClassNode(iface);
+            if (ifaceNode != null && !ifaceNode.isExternal()) {
+                collectInterfaces(ifaceNode, accumulator);
+            }
+        }
     }
 
     public int getFieldOffset(String className, String fieldName) {
@@ -447,124 +950,9 @@ public class LlvmGlobalEmitter {
         return 8;
     }
 
-    private String generateTypeInfo() {
-        StringBuilder sb = new StringBuilder();
-        sb.append("\n; ----- Type info tables -----\n");
-
-        List<ClassNode> allClasses = new ArrayList<>(resolver.getClassMap().values());
-        for (ClassNode cls : allClasses) {
-            if (cls.isExternal()) continue;
-            String className = cls.getName();
-            Set<String> allParents = new LinkedHashSet<>();
-            collectSuperclasses(cls, allParents);
-            collectInterfaces(cls, allParents);
-
-            List<String> entries = new ArrayList<>();
-            for (String parent : allParents) {
-                String vtableName = getVtableName(parent);
-                if (vtableName == null) {
-                    entries.add("i8* null");
-                } else {
-                    entries.add("i8* bitcast ([" + totalMethods + " x i8*]* "
-                        + vtableName + " to i8*)");
-                }
-            }
-            entries.add("i8* null");
-
-            String typeInfoName = "@__type_info_" + LlvmTypeMapper.sanitizeIdentifier(className);
-            typeInfoNames.put(className, typeInfoName);
-            sb.append(typeInfoName).append(" = private constant [")
-                .append(entries.size()).append(" x i8*] [");
-            for (int i = 0; i < entries.size(); i++) {
-                if (i > 0) sb.append(", ");
-                sb.append(entries.get(i));
-            }
-            sb.append("]\n");
-        }
-        return sb.toString();
-    }
-
-    private void collectSuperclasses(ClassNode cls, Set<String> accumulator) {
-        accumulator.add(cls.getName());
-        if (cls.getSuperName() != null && !cls.getSuperName().equals("java/lang/Object")) {
-            ClassNode superNode = resolver.getClassNode(cls.getSuperName());
-            if (superNode != null && !superNode.isExternal()) {
-                collectSuperclasses(superNode, accumulator);
-            } else {
-                accumulator.add("java/lang/Object");
-            }
-        } else {
-            accumulator.add("java/lang/Object");
-        }
-    }
-
-    private void collectInterfaces(ClassNode cls, Set<String> accumulator) {
-        for (String iface : cls.getInterfaces()) {
-            accumulator.add(iface);
-            ClassNode ifaceNode = resolver.getClassNode(iface);
-            if (ifaceNode != null && !ifaceNode.isExternal()) {
-                collectInterfaces(ifaceNode, accumulator);
-            }
-        }
-    }
-
-    public String getTypeInfoName(String className) {
-        return typeInfoNames.get(className);
-    }
-
-    private boolean isVirtual(MethodNode mn) {
-        int access = mn.getAccess();
-        if ((access & Opcodes.ACC_STATIC) != 0) return false;
-        if ((access & Opcodes.ACC_PRIVATE) != 0) return false;
-        if (mn.getName().equals("<init>")) return false;
-        return !mn.getName().equals("<clinit>");
-    }
-
-    private void collectMethods(ClassNode cls, Map<String, MethodNode> methodMap) {
-        if (cls.getSuperName() != null && !cls.getSuperName().equals("java/lang/Object")) {
-            ClassNode superNode = resolver.getClassNode(cls.getSuperName());
-            if (superNode != null && !superNode.isExternal()) {
-                collectMethods(superNode, methodMap);
-            }
-        }
-        for (MethodNode mn : cls.getMethods()) {
-            methodMap.put(mn.getName() + mn.getDescriptor(), mn);
-        }
-    }
-
-    private String buildParamTypes(MethodNode mn) {
-        List<Type> params = mn.getParameterTypes();
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < params.size(); i++) {
-            if (i > 0) sb.append(", ");
-            sb.append(LlvmTypeMapper.toLlvmType(params.get(i)));
-        }
-        return sb.toString();
-    }
-
-    private void ensureNativeFunctionDeclared(String funcName, MethodNode mn, String owner) {
-        if (module.getFunction(funcName) != null) return;
-
-        Type retType = mn.getReturnType();
-        List<Type> allParams = new ArrayList<>();
-        if (!mn.isStatic()) {
-            allParams.add(Type.reference(owner));
-        }
-        allParams.addAll(mn.getParameterTypes());
-
-        Function func = new Function(funcName, retType);
-        for (int i = 0; i < allParams.size(); i++) {
-            func.addParameter(new Parameter(allParams.get(i), i));
-        }
-        module.addFunction(func);
-    }
-
-    public int getMethodIndex(String sig) {
-        return methodIndex.getOrDefault(sig, -1);
-    }
-
-    public String getVtableName(String className) {
-        return vtableNames.get(className);
+    public Type getFieldType(String className, String fieldName) {
+        FieldNode fn = resolver.getField(className, fieldName);
+        return fn != null ? fn.getType() : null;
     }
 
     private String generateReflectionData() {
@@ -756,6 +1144,17 @@ public class LlvmGlobalEmitter {
         return LlvmRuntime.typeStringGlobalName(s);
     }
 
+    private String ensureStringConstantPtr(StringBuilder defsBuffer, String s) {
+        if (s == null) return "null";
+        if (emittedStringConstants.add(s)) {
+            defsBuffer.append(LlvmRuntime.typeStringConstant(s));
+        }
+        int len = LlvmRuntime.typeStringArrayLength(s);
+        String g = LlvmRuntime.typeStringGlobalName(s);
+        return "getelementptr inbounds ([" + len + " x i8], [" + len + " x i8]* "
+            + g + ", i32 0, i32 0)";
+    }
+
     private String emitAdaptorForMethod(String className, MethodReference method) {
         String methodName = method.getName();
         String desc = method.getDescriptor();
@@ -778,31 +1177,25 @@ public class LlvmGlobalEmitter {
             Type pt = paramTypes.get(i);
             String ptLlvm = LlvmTypeMapper.toLlvmType(pt);
             String addr = "%arg" + i + "_addr";
-            String val = "%arg" + i + "_val";
-
+            String val  = "%arg" + i + "_val";
             sb.append("  ").append(addr)
                 .append(" = getelementptr i8*, i8** %args, i32 ").append(i).append("\n");
-
             if (pt.isReference() || pt.isArray() || pt.isNull() || pt.isBlock()) {
-                sb.append("  ").append(val)
-                    .append(" = load i8*, i8** ").append(addr).append("\n");
+                sb.append("  ").append(val).append(" = load i8*, i8** ")
+                    .append(addr).append("\n");
             } else {
                 String ptr = "%arg" + i + "_ptr";
                 sb.append("  ").append(ptr).append(" = bitcast i8** ")
                     .append(addr).append(" to ").append(ptLlvm).append("*\n");
-                sb.append("  ").append(val).append(" = load ")
-                    .append(ptLlvm).append(", ").append(ptLlvm).append("* ")
-                    .append(ptr).append("\n");
+                sb.append("  ").append(val).append(" = load ").append(ptLlvm)
+                    .append(", ").append(ptLlvm).append("* ").append(ptr).append("\n");
             }
             argLoads.add(val);
         }
 
         StringBuilder argsCsv = new StringBuilder();
         boolean firstArg = true;
-        if (!isStatic) {
-            argsCsv.append("i8* %obj");
-            firstArg = false;
-        }
+        if (!isStatic) { argsCsv.append("i8* %obj"); firstArg = false; }
         for (int i = 0; i < argLoads.size(); i++) {
             if (!firstArg) argsCsv.append(", ");
             argsCsv.append(LlvmTypeMapper.toLlvmType(paramTypes.get(i)))
@@ -851,8 +1244,8 @@ public class LlvmGlobalEmitter {
 
         String vtableName = getVtableName(className);
         if (vtableName != null) {
-            sb.append("  %vtable = bitcast [").append(totalMethods)
-                .append(" x i8*]* ").append(vtableName).append(" to i8*\n");
+            sb.append("  %vtable = bitcast %JNativeVTable* ").append(vtableName)
+                .append(" to i8*\n");
             sb.append("  %vtable_slot = bitcast i8* %obj to i8**\n");
             sb.append("  store i8* %vtable, i8** %vtable_slot\n");
         }
@@ -862,7 +1255,7 @@ public class LlvmGlobalEmitter {
             Type pt = paramTypes.get(i);
             String ptLlvm = LlvmTypeMapper.toLlvmType(pt);
             String addr = "%arg" + i + "_addr";
-            String val = "%arg" + i + "_val";
+            String val  = "%arg" + i + "_val";
             sb.append("  ").append(addr)
                 .append(" = getelementptr i8*, i8** %args, i32 ").append(i).append("\n");
             if (pt.isReference() || pt.isArray() || pt.isNull() || pt.isBlock()) {
@@ -880,9 +1273,7 @@ public class LlvmGlobalEmitter {
 
         StringBuilder argsCsv = new StringBuilder();
         argsCsv.append("i8* %obj");
-        for (String a : argLoads) {
-            argsCsv.append(", ").append(a);
-        }
+        for (String a : argLoads) argsCsv.append(", ").append(a);
         sb.append("  call void @").append(origFuncName)
             .append("(").append(argsCsv).append(")\n");
         sb.append("  ret i8* %obj\n");
@@ -902,10 +1293,5 @@ public class LlvmGlobalEmitter {
             }
         }
         return null;
-    }
-
-    public Type getFieldType(String className, String fieldName) {
-        FieldNode fn = resolver.getField(className, fieldName);
-        return fn != null ? fn.getType() : null;
     }
 }
