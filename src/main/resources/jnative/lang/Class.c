@@ -20,6 +20,9 @@ struct ReflectionClass {
 extern struct ReflectionClass* reflect_all_classes[];
 extern int __jnative_instanceof(void* obj, void** type_info);
 
+extern void* __jnative_make_string_obj(const char* bytes, int32_t len);
+extern const char* __jnative_read_string_bytes(void* s, int32_t* out_len);
+
 /* Java array layout: [int32 length][payload] */
 #define JAVA_ARR_HDR 4
 
@@ -152,7 +155,9 @@ int __jnative_fn_java_lang_Class_isPrimitive___Z(void* this_cls) {
 
 void* __jnative_fn_java_lang_Class_getName___Ljava_lang_String_(void* this_cls) {
     if (this_cls == NULL) return NULL;
-    return ((struct ReflectionClass*)this_cls)->name;
+    const char* name = (const char*)((struct ReflectionClass*)this_cls)->name;
+    if (name == NULL) return NULL;
+    return __jnative_make_string_obj(name, (int32_t)strlen(name));
 }
 
 /*
@@ -174,13 +179,15 @@ void* __jnative_fn_java_lang_Class_initClassName___Ljava_lang_String_(void* this
     if (internal == NULL) return NULL;
 
     size_t len = strlen(internal);
-    char* out = (char*)malloc(len + 1);
+    char* out = malloc(len + 1);
     if (out == NULL) return NULL;
     for (size_t i = 0; i < len; i++) {
         out[i] = (internal[i] == '/') ? '.' : internal[i];
     }
     out[len] = '\0';
-    return out;
+    void* result = __jnative_make_string_obj(out, (int32_t)len);
+    free(out);
+    return result;
 }
 
 void* __jnative_fn_java_lang_Class_getClassLoader___Ljava_lang_ClassLoader_(void* this_cls) {
@@ -272,7 +279,10 @@ void* __jnative_fn_java_lang_Class_getPrimitiveClass__Ljava_lang_String__Ljava_l
         void* name_str)
 {
     if (name_str == NULL) return NULL;
-    return (void*)find_registered_class((const char*)name_str);
+    int32_t len = 0;
+    const char* name = __jnative_read_string_bytes(name_str, &len);
+    (void)len;
+    return (void*)find_registered_class(name);
 }
 
 void __jnative_fn_java_lang_Class_registerNatives___V(void) {

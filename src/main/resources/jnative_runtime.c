@@ -29,6 +29,9 @@ void* __jnative_get_exception_object(void);
 int   __jnative_catch_matches(void* exc, void* type_info);
 int   __jnative_instanceof(void* obj, void** type_info);
 
+void* __jnative_make_string_obj(const char* bytes, int32_t len);
+const char* __jnative_read_string_bytes(void* s, int32_t* out_len);
+
 /* ============================================================================
  * Reflection metadata layout
  * ========================================================================== */
@@ -478,9 +481,9 @@ static void __jnative_install_fatal_handlers(void) {
 static const char* __jnative_read_exception_message(void* exc, const char* clsName) {
     if (exc == NULL) return NULL;
     (void)clsName;
-    void* raw = *(void**)((char*)exc + JNATIVE_THROWABLE_MESSAGE_OFFSET);
-    if (raw == NULL) return NULL;
-    return (const char*)raw;
+    void* msg = *(void**)((char*)exc + JNATIVE_THROWABLE_MESSAGE_OFFSET);
+    if (msg == NULL) return NULL;
+    return __jnative_read_string_bytes(msg, NULL);
 }
 
 /* ============================================================================
@@ -741,90 +744,211 @@ void* __jnative_new_instance(struct ReflectionConstructor* ctor, void** args) {
 }
 
 /* ============================================================================
- * String concatenation
+ * String object helpers.
+ *
+ * A Java String is a %struct.java_lang_String laid out as
+ *   [ i8* vtable ][ i8* value ][ i8 coder ][ i32 hash ][ i1 hashIsZero ]
+ * where `value` points at a byte[] of shape [i32 length][bytes][NUL].
+ * ========================================================================== */
+
+extern struct JNativeVTable vtable_java_lang_String;
+
+void* __jnative_make_string_obj(const char* bytes, int32_t len) {
+    void* value = malloc(4 + (size_t)len + 1);
+    if (value == NULL) {
+        __jnative_throw_null_pointer_exception_ctx(NULL);
+    }
+    *(int32_t*)value = len;
+    if (len > 0) memcpy((char*)value + 4, bytes, (size_t)len);
+    ((char*)value)[4 + len] = '\0';
+
+    void* s = malloc(32);
+    if (s == NULL) {
+        __jnative_throw_null_pointer_exception_ctx(NULL);
+    }
+    *(void**)((char*)s + 0)  = (void*)&vtable_java_lang_String;
+    *(void**)((char*)s + 8)  = value;
+    *(uint8_t*)((char*)s + 16) = 0;
+    *(int32_t*)((char*)s + 20) = 0;
+    *(uint8_t*)((char*)s + 24) = 0;
+    return s;
+}
+
+const char* __jnative_read_string_bytes(void* s, int32_t* out_len) {
+    if (s == NULL) {
+        if (out_len) *out_len = 0;
+        return "";
+    }
+    void* value = *(void**)((char*)s + 8);
+    if (value == NULL) {
+        if (out_len) *out_len = 0;
+        return "";
+    }
+    if (out_len) *out_len = *(int32_t*)value;
+    return (const char*)value + 4;
+}
+
+static int32_t __jnative_string_eq(void* a, void* b) {
+    int32_t la = 0, lb = 0;
+    const char* ba = __jnative_read_string_bytes(a, &la);
+    const char* bb = __jnative_read_string_bytes(b, &lb);
+    return la == lb && memcmp(ba, bb, (size_t)la) == 0;
+}
+
+/* ---- literal pool ---- */
+static void**  __jnative_pool = NULL;
+static int32_t __jnative_pool_size = 0;
+
+void __jnative_init_string_pool(void** pool, int32_t size) {
+    __jnative_pool = pool;
+    __jnative_pool_size = size;
+}
+
+/* ---- runtime intern table ---- */
+typedef struct JNativeInternEntry {
+    void* str;
+    struct JNativeInternEntry* next;
+} JNativeInternEntry;
+
+#define JNATIVE_INTERN_BUCKETS 4096
+static JNativeInternEntry* __jnative_intern_table[JNATIVE_INTERN_BUCKETS];
+static pthread_mutex_t __jnative_intern_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static uint32_t __jnative_string_hash(void* s) {
+    int32_t len = 0;
+    const char* bytes = __jnative_read_string_bytes(s, &len);
+    uint32_t h = 2166136261u;
+    for (int32_t i = 0; i < len; i++) {
+        h ^= (uint8_t)bytes[i];
+        h *= 16777619u;
+    }
+    return h;
+}
+
+/* ============================================================================
+ * String concatenation (accepts String objects)
  * ========================================================================== */
 
 void* __jnative_concat_strings(int count, ...) {
     va_list args;
     va_start(args, count);
-    size_t total_len = 1;
+    size_t total = 0;
     for (int i = 0; i < count; i++) {
-        char* s = va_arg(args, char*);
-        if (s) total_len += strlen(s);
+        void* s = va_arg(args, void*);
+        int32_t len = 0;
+        __jnative_read_string_bytes(s, &len);
+        total += (size_t)len;
     }
     va_end(args);
-    char* result = malloc(total_len);
-    if (!result) return NULL;
-    result[0] = '\0';
+
+    char* buf = malloc(total + 1);
+    if (buf == NULL) {
+        __jnative_throw_null_pointer_exception_ctx(NULL);
+    }
+    size_t pos = 0;
     va_start(args, count);
     for (int i = 0; i < count; i++) {
-        char* s = va_arg(args, char*);
-        if (s) strcat(result, s);
+        void* s = va_arg(args, void*);
+        int32_t len = 0;
+        const char* bytes = __jnative_read_string_bytes(s, &len);
+        if (len > 0) memcpy(buf + pos, bytes, (size_t)len);
+        pos += (size_t)len;
     }
     va_end(args);
+    buf[pos] = '\0';
+
+    void* result = __jnative_make_string_obj(buf, (int32_t)pos);
+    free(buf);
     return result;
 }
 
 /* ============================================================================
- * Value-to-string helpers
+ * Value-to-String helpers (return String objects)
  * ========================================================================== */
-
-static char* __jnative_alloc_str(size_t cap) {
-    return (char*)malloc(cap);
-}
-
-char* __jnative_value_to_string_int(int32_t v) {
-    char* p = __jnative_alloc_str(16);
-    if (p) snprintf(p, 16, "%d", v);
-    return p;
-}
-
-char* __jnative_value_to_string_long(int64_t v) {
-    char* p = __jnative_alloc_str(32);
-    if (p) snprintf(p, 32, "%lld", (long long)v);
-    return p;
-}
-
-char* __jnative_value_to_string_float(float v) {
-    char* p = __jnative_alloc_str(32);
-    if (p) snprintf(p, 32, "%g", (double)v);
-    return p;
-}
-
-char* __jnative_value_to_string_double(double v) {
-    char* p = __jnative_alloc_str(32);
-    if (p) snprintf(p, 32, "%g", v);
-    return p;
-}
-
-char* __jnative_value_to_string_boolean(int32_t v) {
-    return strdup(v ? "true" : "false");
-}
-
-char* __jnative_value_to_string_char(int32_t v) {
-    char* p = __jnative_alloc_str(8);
-    if (p) {
-        p[0] = (char)(v & 0xFF);
-        p[1] = '\0';
-    }
-    return p;
-}
-
-char* __jnative_value_to_string_byte(int32_t v)  { return __jnative_value_to_string_int((int8_t)v); }
-char* __jnative_value_to_string_short(int32_t v) { return __jnative_value_to_string_int((int16_t)v); }
 
 extern const int32_t __jnative_tostring_slot;
 
-char* __jnative_value_to_string_object(void* obj) {
-    if (obj == NULL) return strdup("null");
+void* __jnative_value_to_string_int(int32_t v) {
+    char buf[16];
+    int n = snprintf(buf, sizeof(buf), "%d", v);
+    return __jnative_make_string_obj(buf, n);
+}
+
+void* __jnative_value_to_string_long(int64_t v) {
+    char buf[32];
+    int n = snprintf(buf, sizeof(buf), "%lld", (long long)v);
+    return __jnative_make_string_obj(buf, n);
+}
+
+void* __jnative_value_to_string_float(float v) {
+    char buf[32];
+    int n = snprintf(buf, sizeof(buf), "%g", (double)v);
+    return __jnative_make_string_obj(buf, n);
+}
+
+void* __jnative_value_to_string_double(double v) {
+    char buf[32];
+    int n = snprintf(buf, sizeof(buf), "%g", v);
+    return __jnative_make_string_obj(buf, n);
+}
+
+void* __jnative_value_to_string_boolean(int32_t v) {
+    return v ? __jnative_make_string_obj("true", 4)
+             : __jnative_make_string_obj("false", 5);
+}
+
+void* __jnative_value_to_string_char(int32_t v) {
+    char c = (char)(v & 0xFF);
+    return __jnative_make_string_obj(&c, 1);
+}
+
+void* __jnative_value_to_string_byte(int32_t v)  { return __jnative_value_to_string_int((int8_t)v); }
+void* __jnative_value_to_string_short(int32_t v) { return __jnative_value_to_string_int((int16_t)v); }
+
+void* __jnative_value_to_string_object(void* obj) {
+    if (obj == NULL) return __jnative_make_string_obj("null", 4);
     struct JNativeVTable* vt = *(struct JNativeVTable**)obj;
-    if (vt == NULL) return strdup("null");
+    if (vt == NULL) return __jnative_make_string_obj("null", 4);
     int32_t slot = __jnative_tostring_slot;
-    if (slot < 0) return strdup("null");
+    if (slot < 0) return __jnative_make_string_obj("null", 4);
     void* entry = vt->methods[slot];
-    if (entry == NULL) return strdup("null");
-    char* (*toString)(void*) = (char* (*)(void*))entry;
+    if (entry == NULL) return __jnative_make_string_obj("null", 4);
+    void* (*toString)(void*) = (void* (*)(void*))entry;
     return toString(obj);
+}
+
+/* ============================================================================
+ * Runtime-side intern used by jnative/lang/String.c
+ * ========================================================================== */
+
+void* __jnative_string_intern(void* this_str) {
+    if (this_str == NULL) return NULL;
+
+    for (int32_t i = 0; i < __jnative_pool_size; i++) {
+        if (__jnative_pool[i] != NULL && __jnative_string_eq(this_str, __jnative_pool[i])) {
+            return __jnative_pool[i];
+        }
+    }
+
+    uint32_t h = __jnative_string_hash(this_str);
+    uint32_t bucket = h % JNATIVE_INTERN_BUCKETS;
+
+    pthread_mutex_lock(&__jnative_intern_lock);
+    for (JNativeInternEntry* e = __jnative_intern_table[bucket]; e; e = e->next) {
+        if (__jnative_string_eq(e->str, this_str)) {
+            void* found = e->str;
+            pthread_mutex_unlock(&__jnative_intern_lock);
+            return found;
+        }
+    }
+    JNativeInternEntry* ne = malloc(sizeof(JNativeInternEntry));
+    if (ne != NULL) {
+        ne->str = this_str;
+        ne->next = __jnative_intern_table[bucket];
+        __jnative_intern_table[bucket] = ne;
+    }
+    pthread_mutex_unlock(&__jnative_intern_lock);
+    return this_str;
 }
 
 /* ============================================================================
@@ -847,4 +971,9 @@ void __jnative_invoke_runnable(void* runnable) {
     if (entry == NULL) return;
     void (*run)(void*) = (void (*)(void*))entry;
     run(runnable);
+}
+
+void __jnative_debug_clinit(const char* name) {
+    fprintf(stderr, "[clinit] %s\n", name);
+    fflush(stderr);
 }

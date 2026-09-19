@@ -28,6 +28,8 @@ struct ReflectionClass {
 
 extern struct ReflectionClass* reflect_all_classes[] __attribute__((weak));
 
+extern const char* __jnative_read_string_bytes(void* s, int32_t* out_len);
+
 /* --------------------------------------------------------------------------
  * Lookup helper — finds a ReflectionClass by its binary name. Accepts both
  * slash-separated ("java/lang/Object") and dot-separated ("java.lang.Object")
@@ -81,7 +83,10 @@ void* __jnative_fn_java_lang_ClassLoader_findLoadedClass0__Ljava_lang_String__Lj
         void* this_loader, void* name_str) {
     (void)this_loader;
     if (name_str == NULL) return NULL;
-    return (void*)find_registered_class_dotted((const char*)name_str);
+    int32_t len = 0;
+    const char* name = __jnative_read_string_bytes(name_str, &len);
+    (void)len;
+    return (void*)find_registered_class_dotted(name);
 }
 
 /* --------------------------------------------------------------------------

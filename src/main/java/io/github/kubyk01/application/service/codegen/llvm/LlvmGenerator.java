@@ -114,11 +114,24 @@ public class LlvmGenerator {
             .append(LlvmRuntime.mangleFunction("__jnative_shutdown"))
             .append(")\n");
 
-        String mainFunc = LlvmRuntime.mangleMethod(entryClass, entryMethod, entryDescriptor);
+        int poolSize = globalEmitter.getLiteralPoolSize();
+        sb.append("  call void @__jnative_init_string_pool(i8** getelementptr inbounds ([")
+            .append(poolSize).append(" x i8*], [").append(poolSize)
+            .append(" x i8*]* @__jnative_literal_pool, i32 0, i32 0), i32 ")
+            .append(poolSize).append(")\n");
+
         for (Function clinit : clinitFunctions) {
             if (clinit.getEntryBlock() == null) continue;
-            sb.append("  call void @").append(clinit.getName()).append("()\n");
+            String name = clinit.getName();
+            int len = LlvmRuntime.typeStringArrayLength(name);
+            String g = LlvmRuntime.typeStringGlobalName(name);
+            sb.append("  call void @__jnative_debug_clinit(i8* getelementptr inbounds ([")
+                .append(len).append(" x i8], [").append(len)
+                .append(" x i8]* ").append(g).append(", i32 0, i32 0))\n");
+            sb.append("  call void @").append(name).append("()\n");
         }
+
+        String mainFunc = LlvmRuntime.mangleMethod(entryClass, entryMethod, entryDescriptor);
         sb.append("  %args_array = call i8* @__jnative_create_string_array(i32 %argc, i8** %argv)\n");
         sb.append("  call void @").append(mainFunc).append("(i8* %args_array)\n");
         sb.append("  ret i32 0\n");
@@ -133,6 +146,23 @@ public class LlvmGenerator {
             "java/lang/Object", "toString", "()Ljava/lang/String;");
         sb.append("@__jnative_tostring_slot    = constant i32 ")
             .append(toStringSlot).append("\n\n");
+
+        int privActionIfaceId = globalEmitter.getInterfaceId("java/security/PrivilegedAction");
+        int privActionRunSlot = globalEmitter.getInterfaceMethodSlot(
+            "java/security/PrivilegedAction", "run", "()Ljava/lang/Object;");
+        sb.append("@__jnative_privilegedaction_iface_id = constant i32 ")
+            .append(privActionIfaceId).append("\n");
+        sb.append("@__jnative_privilegedaction_run_slot = constant i32 ")
+            .append(privActionRunSlot).append("\n");
+
+        int privExcActionIfaceId = globalEmitter.getInterfaceId("java/security/PrivilegedExceptionAction");
+        int privExcActionRunSlot = globalEmitter.getInterfaceMethodSlot(
+            "java/security/PrivilegedExceptionAction", "run", "()Ljava/lang/Object;");
+        sb.append("@__jnative_privilegedexceptionaction_iface_id = constant i32 ")
+            .append(privExcActionIfaceId).append("\n");
+        sb.append("@__jnative_privilegedexceptionaction_run_slot = constant i32 ")
+            .append(privExcActionRunSlot).append("\n\n");
+
         return sb.toString();
     }
 

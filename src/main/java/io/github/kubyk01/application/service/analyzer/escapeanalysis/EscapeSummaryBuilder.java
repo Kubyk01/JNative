@@ -174,8 +174,9 @@ public class EscapeSummaryBuilder {
                 break;
             }
             case PUT_STATIC: {
-                if (!inst.getOperands().isEmpty()) {
-                    Value rhs = inst.getOperands().getFirst();
+                // Layout PUT_STATIC: [fieldConst, val]. Значение — операнд 1.
+                if (inst.getOperands().size() >= 2) {
+                    Value rhs = inst.getOperands().get(1);
                     if (rhs instanceof Parameter p) {
                         paramsEscaped.add(p.getIndex());
                         addAliases(p.getIndex(), paramAliases, paramsEscaped);

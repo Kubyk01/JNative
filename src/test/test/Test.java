@@ -2,7 +2,13 @@ public class Test {
 
 
     public static void main(String[] args) {
-        System.err.println("[dbg] System.out = " + System.out);    }
+        final int b = Example.lol();
+        Thread.currentThread();
+
+        String lol = "true";
+        var x = lol.equals("true");
+        throw new IllegalArgumentException("test" + b + " " + Thread.currentThread().getName() + "here should be true:"+ x);
+    }
 }
 
 class Example {
@@ -11,8 +17,10 @@ class Example {
 
     static {
         String lol = "dont add this";
+        String butThis = "this should be added";
     }
     public static int lol(){
         return a;
     }
+
 }

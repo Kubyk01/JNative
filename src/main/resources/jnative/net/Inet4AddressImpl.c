@@ -25,6 +25,9 @@ struct ReflectionClass {
 
 extern struct ReflectionClass* reflect_all_classes[];
 
+extern void* __jnative_make_string_obj(const char* bytes, int32_t len);
+extern const char* __jnative_read_string_bytes(void* s, int32_t* out_len);
+
 #define JAVA_ARR_HDR 4
 #define JAVA_IPV4 1
 
@@ -79,11 +82,7 @@ static void* make_byte_array(const uint8_t* data, int32_t len) {
 
 static void* make_string(const char* s) {
     if (!s) return NULL;
-    size_t len = strlen(s);
-    char* copy = (char*)malloc(len + 1);
-    if (!copy) return NULL;
-    memcpy(copy, s, len + 1);
-    return copy;
+    return __jnative_make_string_obj(s, (int32_t)strlen(s));
 }
 
 /*
@@ -140,7 +139,9 @@ void* __jnative_fn_java_net_Inet4AddressImpl_lookupAllHostAddr__Ljava_lang_Strin
     if (!host_str) {
         __jnative_throw_exception(NULL);
     }
-    const char* host = (const char*)host_str;
+    int32_t hostLen = 0;
+    const char* host = __jnative_read_string_bytes(host_str, &hostLen);
+    (void)hostLen;
 
     struct addrinfo hints;
     memset(&hints, 0, sizeof(hints));

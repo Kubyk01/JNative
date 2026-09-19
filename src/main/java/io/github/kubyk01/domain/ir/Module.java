@@ -17,9 +17,13 @@ public class Module {
             functions.add(func);
             functionMap.put(func.getName(), func);
             func.setModule(this);
-        } else {
-            // Ignore duplicate function entries by name.
         }
+    }
+
+    public void removeFunction(Function func) {
+        if (func == null) return;
+        functions.remove(func);
+        functionMap.remove(func.getName());
     }
 
     public Function getFunction(String name) {

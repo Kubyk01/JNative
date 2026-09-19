@@ -1,3 +1,5 @@
+/* path: src/main/java/io/github/kubyk01/application/service/analyzer/Analyzer.java */
+
 package io.github.kubyk01.application.service.analyzer;
 
 import io.github.kubyk01.application.service.analyzer.aliasanalysis.AliasAnalyzer;
@@ -24,11 +26,13 @@ import io.github.kubyk01.domain.analyzer.escapeanalysis.EscapeStatus;
 import io.github.kubyk01.domain.analyzer.lifetime.DestructionPoint;
 import io.github.kubyk01.domain.analyzer.lifetime.LifetimeAnalysisResult;
 import io.github.kubyk01.domain.ir.BasicBlock;
+import io.github.kubyk01.domain.ir.Constant;
 import io.github.kubyk01.domain.ir.Function;
 import io.github.kubyk01.domain.ir.Instruction;
 import io.github.kubyk01.domain.ir.Module;
 import io.github.kubyk01.domain.ir.Opcode;
 import io.github.kubyk01.domain.ir.Type;
+import io.github.kubyk01.domain.ir.Value;
 import io.github.kubyk01.port.primary.AnalyzerPort;
 import lombok.extern.slf4j.Slf4j;
 
@@ -157,7 +161,6 @@ public class Analyzer implements AnalyzerPort {
 
         System.out.println("\n--- Running dead code elimination ---");
         DeadCodeEliminator dce = new DeadCodeEliminator(module);
-        // todo move it to optimiser not analyzer
         dce.eliminate();
 
         List<Function> clinitFunctions = new ArrayList<>();
@@ -166,6 +169,7 @@ public class Analyzer implements AnalyzerPort {
                 clinitFunctions.add(func);
             }
         }
+        clinitFunctions = sortClinitFunctions(clinitFunctions, resolver, module);
 
         if (!clinitFunctions.isEmpty()) {
             System.out.println("Processing " + clinitFunctions.size() + " static initializers (<clinit>) first...");
@@ -271,6 +275,8 @@ public class Analyzer implements AnalyzerPort {
             optimizer.optimize();
         }
 
+        analysis.registerClassLiterals(module);
+
         System.out.println("\n--- Generating LLVM IR ---");
         LlvmGenerator llvmGen = new LlvmGenerator(module, resolver, aliasResult,
             entryClass, entryMethod, entryDescriptor, analysis.getReflectInfo(),
@@ -300,16 +306,6 @@ public class Analyzer implements AnalyzerPort {
         if (!noCompile) {
             Path exePath = outputFile != null ? Paths.get(outputFile) : Paths.get("a.out");
             try {
-                // `usedSystemClasses` covers classes reachable from the entry point.
-                // However, the LLVM emitter iterates over every non-external class
-                // in the resolver when it builds vtables and type-info tables, so a
-                // class that was merely *loaded* (e.g. java.lang.Class, pulled in
-                // as the return type of Object.getClass) can end up with its native
-                // methods referenced from @vtable_* and @__type_info_* even though
-                // it is not "reachable" in the strict sense. Those .c sources must
-                // be compiled and linked too, otherwise the IR contains
-                // declarations with no matching definitions and the linker fails
-                // with "undefined reference to __jnative_fn_*".
                 Set<String> classesToCompile = new HashSet<>(usedSystemClasses);
                 classesToCompile.addAll(collectReferencedNativeClasses(module, resolver));
                 log.debug("System classes scheduled for compilation: {}", classesToCompile);
@@ -323,6 +319,228 @@ public class Analyzer implements AnalyzerPort {
         } else {
             System.out.println("Skipping native compilation (--no-compile specified)");
         }
+    }
+
+    /**
+     * Orders class initializers so that if <clinit> of class A (transitively)
+     * triggers <clinit> of class B, B's <clinit> is scheduled first.
+     *
+     * <p>{@code LlvmGenerator.generateMain()} calls every function in this list
+     * unconditionally at process start. The order must therefore reflect the
+     * JVM's own initialization order, which is transitive through arbitrary
+     * call graphs — a purely local scan of each <clinit>'s own bytecode is
+     * insufficient: {@code AccessibleObject.<clinit>} only statically calls
+     * {@code AccessController.doPrivileged}, and the static touch of
+     * {@code ReflectionFactory.soleInstance} happens three call frames deeper,
+     * through an interface dispatch that the local scan cannot see.
+     *
+     * <p>The implementation precomputes, once, two flat indexes over the whole
+     * module:
+     * <ul>
+     *   <li>{@code directCalls}: for each function, the names of every function
+     *       it directly invokes (static calls, plus every module implementation
+     *       matching the method+descriptor signature of a virtual or interface
+     *       call site);</li>
+     *   <li>{@code directClinitDeps}: for each function, the {@code <clinit>}
+     *       of every class it directly touches via {@code NEW}, {@code GET_STATIC},
+     *       {@code PUT_STATIC} or an {@code invokestatic} whose target has a body.</li>
+     * </ul>
+     * A per-root BFS then walks {@code directCalls} and unions
+     * {@code directClinitDeps} along the way. The graph construction is
+     * O(module size); each BFS visits every reachable function at most once.
+     */
+    private List<Function> sortClinitFunctions(List<Function> clinitFunctions,
+                                               DependencyResolver resolver,
+                                               Module module) {
+        Map<String, Function> nameToFunc = new HashMap<>();
+        for (Function f : module.getFunctions()) {
+            nameToFunc.put(f.getName(), f);
+        }
+
+        Map<String, Function> classNameToClinit = new HashMap<>();
+        for (ClassNode cn : resolver.getClassMap().values()) {
+            String clinitName = LlvmRuntime.mangleMethod(cn.getName(), "<clinit>", "()V");
+            Function f = nameToFunc.get(clinitName);
+            if (f != null) {
+                classNameToClinit.put(cn.getName(), f);
+            }
+        }
+
+        // suffix `_<mangledMethod>_<mangledDescriptor>` -> list of function names
+        // present in the module whose class declares a method with that signature.
+        // Used to expand a virtual/interface call site into the set of candidate
+        // implementations without re-scanning the entire module per call site.
+        Map<String, List<String>> functionsBySuffix = new HashMap<>();
+        for (ClassNode cn : resolver.getClassMap().values()) {
+            for (MethodNode mn : cn.getMethods()) {
+                String mangled = LlvmRuntime.mangleMethod(cn.getName(), mn.getName(), mn.getDescriptor());
+                if (!nameToFunc.containsKey(mangled)) continue;
+                String methodSuffix = mn.getName().replaceAll("[^a-zA-Z0-9_]", "_");
+                String descSuffix   = mn.getDescriptor().replaceAll("[^a-zA-Z0-9_]", "_");
+                String suffix = "_" + methodSuffix + "_" + descSuffix;
+                functionsBySuffix.computeIfAbsent(suffix, k -> new ArrayList<>()).add(mangled);
+            }
+        }
+
+        Map<String, Set<String>> directCalls = new HashMap<>();
+        Map<String, Set<String>> directClinitDeps = new HashMap<>();
+
+        for (Function func : module.getFunctions()) {
+            Set<String> calls = new HashSet<>();
+            Set<String> deps  = new HashSet<>();
+
+            for (BasicBlock block : func.getBlocks()) {
+                for (Instruction inst : block.getInstructions()) {
+                    Opcode op = inst.getOpcode();
+
+                    if (op == Opcode.GET_STATIC || op == Opcode.PUT_STATIC
+                        || op == Opcode.NEW || op == Opcode.STATIC_CALL) {
+                        String owner = extractTriggerOwner(inst);
+                        if (owner != null) {
+                            Function dep = classNameToClinit.get(owner);
+                            if (dep != null) deps.add(dep.getName());
+                        }
+                    }
+
+                    if (op == Opcode.STATIC_CALL || op == Opcode.CALL) {
+                        if (!inst.getOperands().isEmpty()) {
+                            Value v = inst.getOperands().getFirst();
+                            if (v instanceof Constant c && c.getType().isReference()) {
+                                String callee = c.getValue().toString();
+                                if (nameToFunc.containsKey(callee)) {
+                                    calls.add(callee);
+                                } else {
+                                    String mangled = LlvmRuntime.mangleCallable(callee);
+                                    if (nameToFunc.containsKey(mangled)) {
+                                        calls.add(mangled);
+                                    }
+                                }
+                            }
+                        }
+                    } else if (op == Opcode.VIRTUAL_CALL || op == Opcode.INTERFACE_CALL
+                        || op == Opcode.SPECIAL_CALL) {
+                        if (inst.getOperands().size() >= 2) {
+                            Value v = inst.getOperands().get(1);
+                            if (v instanceof Constant c && c.getType().isReference()) {
+                                String suffix = computeMangledCallSuffix(c.getValue().toString());
+                                if (suffix != null) {
+                                    List<String> candidates = functionsBySuffix.get(suffix);
+                                    if (candidates != null) {
+                                        calls.addAll(candidates);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            directCalls.put(func.getName(), calls);
+            directClinitDeps.put(func.getName(), deps);
+        }
+
+        Map<Function, Set<Function>> transitiveDeps = new LinkedHashMap<>();
+        for (Function rootClinit : clinitFunctions) {
+            Set<Function> deps = new HashSet<>();
+            Set<String> visited = new HashSet<>();
+            Deque<String> worklist = new ArrayDeque<>();
+            worklist.add(rootClinit.getName());
+
+            while (!worklist.isEmpty()) {
+                String calleeName = worklist.poll();
+                if (!visited.add(calleeName)) continue;
+
+                Set<String> clinitDeps = directClinitDeps.get(calleeName);
+                if (clinitDeps != null) {
+                    for (String depName : clinitDeps) {
+                        Function dep = nameToFunc.get(depName);
+                        if (dep != null && dep != rootClinit) {
+                            deps.add(dep);
+                        }
+                    }
+                }
+
+                Set<String> calls = directCalls.get(calleeName);
+                if (calls != null) {
+                    worklist.addAll(calls);
+                }
+            }
+
+            transitiveDeps.put(rootClinit, deps);
+        }
+
+        List<Function> sorted = new ArrayList<>(clinitFunctions.size());
+        Set<Function> visited = new HashSet<>();
+        Set<Function> onStack = new HashSet<>();
+        for (Function f : clinitFunctions) {
+            dfsClinit(f, transitiveDeps, visited, onStack, sorted);
+        }
+        return sorted;
+    }
+
+    /**
+     * From a textual call-site reference of the form
+     * {@code owner.method(desc)ret} or {@code owner.method(desc)}, produces the
+     * suffix {@code _method_desc_} that every mangled IR symbol for a matching
+     * implementation ends with.
+     */
+    private static String computeMangledCallSuffix(String callName) {
+        int parenIdx = callName.indexOf('(');
+        if (parenIdx < 0) return null;
+        int dotIdx = callName.lastIndexOf('.', parenIdx);
+        if (dotIdx < 0) return null;
+        String methodName = callName.substring(dotIdx + 1, parenIdx);
+        String descriptor = callName.substring(parenIdx);
+        String mangledMethod = methodName.replaceAll("[^a-zA-Z0-9_]", "_");
+        String mangledDesc   = descriptor.replaceAll("[^a-zA-Z0-9_]", "_");
+        return "_" + mangledMethod + "_" + mangledDesc;
+    }
+
+    /**
+     * Extracts the class that a trigger instruction references: the
+     * instantiated class for {@code NEW}, or the owner of a static member
+     * reference for {@code GET_STATIC}/{@code PUT_STATIC}/{@code STATIC_CALL}.
+     */
+    private static String extractTriggerOwner(Instruction inst) {
+        Opcode op = inst.getOpcode();
+        if (op == Opcode.NEW) {
+            if (!inst.getOperands().isEmpty()) {
+                Value v = inst.getOperands().getFirst();
+                if (v instanceof Constant c && c.getType().isReference()) {
+                    return c.getValue().toString();
+                }
+            }
+            return null;
+        }
+        if (op == Opcode.GET_STATIC || op == Opcode.PUT_STATIC || op == Opcode.STATIC_CALL) {
+            if (!inst.getOperands().isEmpty()) {
+                Value v = inst.getOperands().getFirst();
+                if (v instanceof Constant c && c.getType().isReference()) {
+                    return extractOwnerClassName(c.getValue().toString());
+                }
+            }
+            return null;
+        }
+        return null;
+    }
+
+    private void dfsClinit(Function f,
+                           Map<Function, Set<Function>> deps,
+                           Set<Function> visited,
+                           Set<Function> onStack,
+                           List<Function> out) {
+        if (visited.contains(f)) return;
+        if (!onStack.add(f)) return;
+        for (Function dep : deps.getOrDefault(f, Collections.emptySet())) {
+            dfsClinit(dep, deps, visited, onStack, out);
+        }
+        onStack.remove(f);
+        visited.add(f);
+        out.add(f);
+    }
+
+    private static String extractOwnerClassName(String ref) {
+        int dot = ref.lastIndexOf('.');
+        return dot <= 0 ? ref : ref.substring(0, dot);
     }
 
     private void printCallGraph(ReachabilityAnalysis analysis, String entryClass,
@@ -481,20 +699,6 @@ public class Analyzer implements AnalyzerPort {
         return runtimeC;
     }
 
-    /**
-     * System classes whose native methods are referenced from the generated
-     * module — typically because a vtable or type-info table for the class was
-     * emitted. The LLVM emitter iterates over every non-external class in the
-     * resolver when it builds those tables, so a class that was merely
-     * *loaded* (e.g. {@code java.lang.Class}, pulled in as the return type of
-     * {@code Object.getClass}) can end up with its native methods referenced
-     * from {@code @vtable_*} and {@code @__type_info_*} even though it is not
-     * "reachable" in the strict sense.
-     *
-     * <p>Any such class must have its {@code jnative/**}{@code .c} source
-     * compiled and linked, otherwise the IR will contain declarations with no
-     * definitions and the linker will fail with "undefined reference".
-     */
     private Set<String> collectReferencedNativeClasses(Module module,
                                                        DependencyResolver resolver) {
         Set<String> result = new HashSet<>();

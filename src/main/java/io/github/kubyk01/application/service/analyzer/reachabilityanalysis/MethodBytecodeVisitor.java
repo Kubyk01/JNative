@@ -287,13 +287,32 @@ public class MethodBytecodeVisitor extends ClassVisitor {
         @Override
         public void visitLdcInsn(Object value) {
             if (value instanceof String) {
+                // String literals are tracked by
+                // LlvmGlobalEmitter.generateStringLiterals; nothing to
+                // register in the reachability walk.
             } else if (value instanceof org.objectweb.asm.Type asmType) {
-                if (asmType.getSort() == org.objectweb.asm.Type.OBJECT) {
-                    lastLoadedClass = asmType.getInternalName();
+                int sort = asmType.getSort();
+                if (sort == org.objectweb.asm.Type.OBJECT) {
+                    String internalName = asmType.getInternalName();
+                    lastLoadedClass = internalName;
                     // LDC of a class literal (Foo.class) is a PASSIVE
-                    // reference — it does NOT trigger Foo's <clinit>.
-                    addClass(asmType.getInternalName());
+                    // reference — it does NOT trigger Foo's <clinit>. It
+                    // must, however, materialise a real Class object at
+                    // runtime; register it here (threading the current
+                    // method's reachability flag through) so the LLVM
+                    // emitter produces the matching @refclass_Foo global
+                    // that the literal can point at.
+                    analysis.addClassLiteral(internalName, reachableFromUser);
+                } else if (sort == org.objectweb.asm.Type.ARRAY) {
+                    // Array class literal, e.g. Foo[].class or int[].class.
+                    // The ASM descriptor IS the internal form of an array
+                    // type, and is exactly the key used by
+                    // LlvmGlobalEmitter.generateReflectionData when it
+                    // emits @refclass_<sanitised descriptor>.
+                    analysis.addClassLiteral(asmType.getDescriptor(), reachableFromUser);
                 }
+                // Primitive class literals (int.class, …) compile to
+                // GETSTATIC Integer.TYPE and never reach this branch.
             }
             simulator.visitLdcInsn(value);
             super.visitLdcInsn(value);

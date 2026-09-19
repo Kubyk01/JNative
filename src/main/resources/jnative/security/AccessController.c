@@ -1,164 +1,122 @@
 #define _GNU_SOURCE
 #include <stddef.h>
 #include <stdint.h>
-#include <stdlib.h>
-#include <string.h>
-#include <pthread.h>
 
-struct ReflectionClass {
-    void* name;
-    struct ReflectionClass* superclass;
-    struct ReflectionClass** interfaces;
-    void** methods;
-    void** fields;
-    void** constructors;
-    int modifiers;
-    int object_size;
+struct JNativeIfaceMapEntry {
+    int32_t id;
+    void** itable;
 };
 
-extern struct ReflectionClass* reflect_all_classes[] __attribute__((weak));
+struct JNativeIfaceMap {
+    int32_t count;
+    struct JNativeIfaceMapEntry* entries;
+};
 
-__attribute__((noreturn)) void __jnative_throw_exception(void* exc);
+struct JNativeVTable {
+    void** methods;
+    struct JNativeIfaceMap* ifacemap;
+    const char* name;
+};
 
-typedef struct ProtectionDomainEntry {
-    struct ReflectionClass* clazz;
-    void* domain;
-    struct ProtectionDomainEntry* next;
-} ProtectionDomainEntry;
+extern void** __jnative_lookup_itable(struct JNativeIfaceMap* ifacemap, int32_t iface_id);
+extern const int32_t __jnative_privilegedaction_iface_id;
+extern const int32_t __jnative_privilegedaction_run_slot;
+extern const int32_t __jnative_privilegedexceptionaction_iface_id;
+extern const int32_t __jnative_privilegedexceptionaction_run_slot;
 
-static pthread_mutex_t pd_lock = PTHREAD_MUTEX_INITIALIZER;
-static ProtectionDomainEntry* pd_table = NULL;
+__attribute__((noreturn)) void __jnative_throw_null_pointer_exception(void);
 
-static void* lookup_or_create_domain(struct ReflectionClass* cls) {
-    if (!cls) return NULL;
-    pthread_mutex_lock(&pd_lock);
-    for (ProtectionDomainEntry* e = pd_table; e; e = e->next) {
-        if (e->clazz == cls) {
-            void* d = e->domain;
-            pthread_mutex_unlock(&pd_lock);
-            return d;
-        }
+static void* invoke_action_run(void* action, int32_t iface_id, int32_t slot) {
+    if (action == NULL) {
+        __jnative_throw_null_pointer_exception();
     }
-    void* domain = calloc(1, 32);
-    ProtectionDomainEntry* e = calloc(1, sizeof(ProtectionDomainEntry));
-    if (e && domain) {
-        e->clazz = cls;
-        e->domain = domain;
-        e->next = pd_table;
-        pd_table = e;
-    } else {
-        free(domain);
-        free(e);
-        domain = NULL;
+    struct JNativeVTable* vt = *(struct JNativeVTable**)action;
+    if (vt == NULL) {
+        __jnative_throw_null_pointer_exception();
     }
-    pthread_mutex_unlock(&pd_lock);
-    return domain;
+    void** itable = __jnative_lookup_itable(vt->ifacemap, iface_id);
+    if (itable == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    void* entry = itable[slot];
+    if (entry == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    void* (*run)(void*) = (void*)entry;
+    return run(action);
 }
 
-typedef struct AccessControlContextEntry {
-    void* context;
-    void** domains;
-    int count;
-    struct AccessControlContextEntry* next;
-} AccessControlContextEntry;
+void* __jnative_fn_java_security_AccessController_doPrivileged__Ljava_security_PrivilegedAction__Ljava_lang_Object_(
+        void* action) {
+    return invoke_action_run(action,
+        __jnative_privilegedaction_iface_id,
+        __jnative_privilegedaction_run_slot);
+}
 
-static pthread_mutex_t acc_lock = PTHREAD_MUTEX_INITIALIZER;
-static AccessControlContextEntry* acc_table = NULL;
+void* __jnative_fn_java_security_AccessController_doPrivileged__Ljava_security_PrivilegedExceptionAction__Ljava_lang_Object_(
+        void* action) {
+    return invoke_action_run(action,
+        __jnative_privilegedexceptionaction_iface_id,
+        __jnative_privilegedexceptionaction_run_slot);
+}
+
+void* __jnative_fn_java_security_AccessController_doPrivileged__Ljava_security_PrivilegedAction_Ljava_security_AccessControlContext__Ljava_lang_Object_(
+        void* action, void* ctx) {
+    (void)ctx;
+    return invoke_action_run(action,
+        __jnative_privilegedaction_iface_id,
+        __jnative_privilegedaction_run_slot);
+}
+
+void* __jnative_fn_java_security_AccessController_doPrivileged__Ljava_security_PrivilegedExceptionAction_Ljava_security_AccessControlContext__Ljava_lang_Object_(
+        void* action, void* ctx) {
+    (void)ctx;
+    return invoke_action_run(action,
+        __jnative_privilegedexceptionaction_iface_id,
+        __jnative_privilegedexceptionaction_run_slot);
+}
+
+void* __jnative_fn_java_security_AccessController_doPrivileged__Ljava_security_PrivilegedAction_Ljava_security_AccessControlContext_Ljava_security_Permission__Ljava_lang_Object_(
+        void* action, void* ctx, void* perm) {
+    (void)ctx; (void)perm;
+    return invoke_action_run(action,
+        __jnative_privilegedaction_iface_id,
+        __jnative_privilegedaction_run_slot);
+}
+
+void* __jnative_fn_java_security_AccessController_doPrivileged__Ljava_security_PrivilegedExceptionAction_Ljava_security_AccessControlContext_Ljava_security_Permission__Ljava_lang_Object_(
+        void* action, void* ctx, void* perm) {
+    (void)ctx; (void)perm;
+    return invoke_action_run(action,
+        __jnative_privilegedexceptionaction_iface_id,
+        __jnative_privilegedexceptionaction_run_slot);
+}
 
 void* __jnative_fn_java_security_AccessController_getStackAccessControlContext___Ljava_security_AccessControlContext_(void) {
-    void* ctx = calloc(1, 16);
-    return ctx;
+    return NULL;
 }
 
 void* __jnative_fn_java_security_AccessController_getContext___Ljava_security_AccessControlContext_(void) {
-    void* ctx = calloc(1, 16);
-    return ctx;
+    return NULL;
 }
 
 void* __jnative_fn_java_security_AccessController_getInheritedAccessControlContext___Ljava_security_AccessControlContext_(void) {
-    return __jnative_fn_java_security_AccessController_getStackAccessControlContext___Ljava_security_AccessControlContext_();
+    return NULL;
 }
 
-void* __jnative_fn_java_security_AccessController_getProtectionDomain__Ljava_lang_Class__Ljava_security_ProtectionDomain_(void* clazz) {
-    if (!clazz) return NULL;
-    return lookup_or_create_domain((struct ReflectionClass*)clazz);
+void* __jnative_fn_java_security_AccessController_getProtectionDomain__Ljava_lang_Class__Ljava_security_ProtectionDomain_(
+        void* clazz) {
+    (void)clazz;
+    return NULL;
 }
 
 void* __jnative_fn_java_security_AccessController_createWrapper__Ljava_security_DomainCombiner_Ljava_lang_Class_Ljava_security_AccessControlContext_Ljava_security_AccessControlContext__Ljava_security_Permission__Ljava_security_AccessControlContext_(
-    void* combiner, void* clazz, void* acc, void* parent, void* perm)
-{
-    AccessControlContextEntry* e = calloc(1, sizeof(AccessControlContextEntry));
-    if (!e) {
-        __jnative_throw_exception(NULL);
-        return NULL;
-    }
-    e->context = calloc(1, 32);
-    e->domains = calloc(4, sizeof(void*));
-    e->count = 0;
-    if (clazz) {
-        e->domains[e->count++] = lookup_or_create_domain((struct ReflectionClass*)clazz);
-    }
-    if (acc) {
-        e->domains[e->count++] = acc;
-    }
-    if (parent) {
-        e->domains[e->count++] = parent;
-    }
-    if (perm) {
-        e->domains[e->count++] = perm;
-    }
-    (void)combiner;
-    pthread_mutex_lock(&acc_lock);
-    e->next = acc_table;
-    acc_table = e;
-    pthread_mutex_unlock(&acc_lock);
-    return e->context;
-}
-
-int32_t __jnative_fn_java_security_AccessController_checkPermission__Ljava_security_Permission__V(void* perm) {
-    if (!perm) return 0;
-    if (!pd_table) return 0;
-    pthread_mutex_lock(&pd_lock);
-    for (ProtectionDomainEntry* e = pd_table; e; e = e->next) {
-        if (!e->domain) {
-            pthread_mutex_unlock(&pd_lock);
-            __jnative_throw_exception(NULL);
-            return 0;
-        }
-    }
-    pthread_mutex_unlock(&pd_lock);
-    return 0;
-}
-
-void* __jnative_fn_java_security_AccessController_doPrivileged__Ljava_security_PrivilegedAction__Ljava_lang_Object_(void* action) {
-    if (!action) return NULL;
-    /* PrivilegedAction.run() is invoked by the Java-side wrapper before
-     * this native method is reached; this entry point just returns null
-     * in case bytecode calls it directly. */
+        void* combiner, void* clazz, void* acc, void* parent, void* perm) {
+    (void)combiner; (void)clazz; (void)acc; (void)parent; (void)perm;
     return NULL;
 }
 
-void* __jnative_fn_java_security_AccessController_doPrivileged__Ljava_security_PrivilegedExceptionAction__Ljava_lang_Object_(void* action) {
-    if (!action) return NULL;
-    return NULL;
-}
-
-void* __jnative_fn_java_security_AccessController_doPrivileged__Ljava_security_PrivilegedAction_Ljava_security_AccessControlContext__Ljava_lang_Object_(void* action, void* ctx) {
-    (void)ctx;
-    return __jnative_fn_java_security_AccessController_doPrivileged__Ljava_security_PrivilegedAction__Ljava_lang_Object_(action);
-}
-
-void* __jnative_fn_java_security_AccessController_doPrivileged__Ljava_security_PrivilegedExceptionAction_Ljava_security_AccessControlContext__Ljava_lang_Object_(void* action, void* ctx) {
-    (void)ctx;
-    return __jnative_fn_java_security_AccessController_doPrivileged__Ljava_security_PrivilegedExceptionAction__Ljava_lang_Object_(action);
-}
-
-void* __jnative_fn_java_security_AccessController_doPrivileged__Ljava_security_PrivilegedAction_Ljava_security_AccessControlContext_Ljava_security_Permission__Ljava_lang_Object_(void* action, void* ctx, void* perm) {
-    (void)ctx; (void)perm;
-    return __jnative_fn_java_security_AccessController_doPrivileged__Ljava_security_PrivilegedAction__Ljava_lang_Object_(action);
-}
-
-void* __jnative_fn_java_security_AccessController_doPrivileged__Ljava_security_PrivilegedExceptionAction_Ljava_security_AccessControlContext_Ljava_security_Permission__Ljava_lang_Object_(void* action, void* ctx, void* perm) {
-    (void)ctx; (void)perm;
-    return __jnative_fn_java_security_AccessController_doPrivileged__Ljava_security_PrivilegedExceptionAction__Ljava_lang_Object_(action);
+void __jnative_fn_java_security_AccessController_checkPermission__Ljava_security_Permission__V(
+        void* perm) {
+    (void)perm;
 }

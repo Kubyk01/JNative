@@ -592,7 +592,21 @@ public class LlvmFunctionEmitter {
             case GET_STATIC: {
                 String fieldName = extractFieldName(inst);
                 String globalName = "gv_" + LlvmTypeMapper.sanitizeIdentifier(fieldName);
-                Type fieldType = inst.getResult().getType();
+
+                String owner;
+                String bareField;
+                int lastDot = fieldName.lastIndexOf('.');
+                if (lastDot > 0) {
+                    owner = fieldName.substring(0, lastDot);
+                    bareField = fieldName.substring(lastDot + 1);
+                } else {
+                    owner = "";
+                    bareField = fieldName;
+                }
+                Type fieldType = globalEmitter.getFieldType(owner, bareField);
+                if (fieldType == null) {
+                    fieldType = inst.getResult().getType();
+                }
                 String llvmType = LlvmTypeMapper.toLlvmType(fieldType);
                 sb.append("  ").append(resultName).append(" = load ")
                     .append(llvmType).append(", ")
@@ -605,9 +619,26 @@ public class LlvmFunctionEmitter {
                     Value rhs = inst.getOperands().get(1);
                     String fieldName = extractFieldName(inst);
                     String globalName = "gv_" + LlvmTypeMapper.sanitizeIdentifier(fieldName);
+
+                    String owner;
+                    String bareField;
+                    int lastDot = fieldName.lastIndexOf('.');
+                    if (lastDot > 0) {
+                        owner = fieldName.substring(0, lastDot);
+                        bareField = fieldName.substring(lastDot + 1);
+                    } else {
+                        owner = "";
+                        bareField = fieldName;
+                    }
+                    Type fieldType = globalEmitter.getFieldType(owner, bareField);
+                    if (fieldType == null) {
+                        fieldType = rhs.getType();
+                    }
+
                     String rhsRef = getLlvmValue(rhs);
-                    String rhsConverted = castValueToType(sb, rhsRef, rhs.getType(), rhs.getType());
-                    String llvmType = LlvmTypeMapper.toLlvmType(rhs.getType());
+                    String rhsConverted = castValueToType(sb, rhsRef, rhs.getType(), fieldType);
+                    String llvmType = LlvmTypeMapper.toLlvmType(fieldType);
+
                     sb.append("  store ").append(llvmType).append(" ").append(rhsConverted)
                         .append(", ").append(llvmType).append("* @").append(globalName).append("\n");
                 }
@@ -1080,10 +1111,9 @@ public class LlvmFunctionEmitter {
             case NEW: {
                 String className = extractTypeName(inst);
                 String structType = globalEmitter.getStructName(className);
-                String sizeReg = newAux("size");
                 String allocReg = newAux("alloc");
-                sb.append("  ").append(sizeReg).append(" = call i64 @llvm.objectsize.i64.p0i8(i8* null, i1 true)\n");
-                sb.append("  ").append(allocReg).append(" = call i8* @malloc(i64 ptrtoint (").append(structType)
+                sb.append("  ").append(allocReg)
+                    .append(" = call i8* @malloc(i64 ptrtoint (").append(structType)
                     .append("* getelementptr (").append(structType).append(", ").append(structType)
                     .append("* null, i32 1) to i64))\n");
                 sb.append("  ").append(resultName).append(" = bitcast i8* ").append(allocReg)
@@ -1312,6 +1342,12 @@ public class LlvmFunctionEmitter {
                     emitNullCheck(sb, arrPtr, ranges);
                     emitBoundsCheck(sb, arrPtr, idxI32, ranges);
                     Type elemType = val.getType();
+                    if (arr.getType().isArray()) {
+                        Type arrElem = arr.getType().getElementType();
+                        if (!arrElem.isUnknown()) {
+                            elemType = arrElem;
+                        }
+                    }
                     int elemSize = getElementSizeOfType(elemType);
                     String offset = newAux("offset");
                     sb.append("  ").append(offset).append(" = mul i32 ")
@@ -1609,10 +1645,8 @@ public class LlvmFunctionEmitter {
     }
 
     private String emitLiteralString(StringBuilder sb, String s) {
-        int len = LlvmRuntime.typeStringArrayLength(s);
-        String g = LlvmRuntime.typeStringGlobalName(s);
-        return "getelementptr inbounds ([" + len + " x i8], [" + len + " x i8]* "
-            + g + ", i32 0, i32 0)";
+        return "bitcast (%struct.java_lang_String* @"
+            + LlvmRuntime.stringObjectGlobalName(s) + " to i8*)";
     }
 
     private String convertArgToString(StringBuilder sb, Value arg) {
@@ -2043,10 +2077,6 @@ public class LlvmFunctionEmitter {
     private String constantToLlvmLiteral(Constant c) {
         Object val = c.getValue();
         if (val == null) {
-            // Null-constant carries no value. The LLVM literal depends on the
-            // declared type: `null` for pointers, zero/false for primitives.
-            // Returning `null` for a primitive constant produces IR like
-            // `inttoptr i16 null to i8*`, which clang rejects.
             Type type = c.getType();
             if (type.isReference() || type.isArray() || type.isNull()
                 || type.isBlock() || type.isUnknown()) {
@@ -2083,15 +2113,18 @@ public class LlvmFunctionEmitter {
         }
 
         if (type.isReference() && "java/lang/Class".equals(type.getClassName())) {
+            if (val instanceof String className && !className.isEmpty()) {
+                return "bitcast (%ReflectionClass* @refclass_"
+                    + LlvmTypeMapper.sanitizeIdentifier(className)
+                    + " to i8*)";
+            }
             return "null";
         }
 
-        if (type.isReference()
-            && "java/lang/String".equals(type.getClassName())
+        if (type.isReference() && "java/lang/String".equals(type.getClassName())
             && val instanceof String s) {
-            int len = LlvmRuntime.typeStringArrayLength(s);
-            return "getelementptr inbounds ([" + len + " x i8], [" + len + " x i8]* "
-                + LlvmRuntime.typeStringGlobalName(s) + ", i32 0, i32 0)";
+            return "bitcast (%struct.java_lang_String* @"
+                + LlvmRuntime.stringObjectGlobalName(s) + " to i8*)";
         }
 
         if (type.isReference() && val instanceof String s) {

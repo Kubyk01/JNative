@@ -437,6 +437,10 @@ public class DependencyResolver {
         }
     }
 
+    public Map<String, ClassNode> getClassMap() {
+        return classMap;
+    }
+
     public ClassNode getClassNode(String internalName) {
         ClassNode node = classMap.get(internalName);
         if (node != null) return node;

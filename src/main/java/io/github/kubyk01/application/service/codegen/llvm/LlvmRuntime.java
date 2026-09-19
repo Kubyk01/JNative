@@ -5,11 +5,17 @@ import io.github.kubyk01.domain.ir.Type;
 
 import java.nio.charset.StandardCharsets;
 import java.util.List;
+import java.util.concurrent.ConcurrentHashMap;
 
 public class LlvmRuntime {
 
+    private static final ConcurrentHashMap<String, String> STRING_ID_CACHE =
+        new ConcurrentHashMap<>();
+
     public static String getDeclarations() {
         return """
+            declare void @__jnative_debug_clinit(i8*)
+            declare void @__jnative_init_string_pool(i8**, i32)
             declare i8* @malloc(i64)
             declare void @free(i8*)
             declare i32 @printf(i8*, ...)
@@ -88,8 +94,48 @@ public class LlvmRuntime {
         return s.getBytes(StandardCharsets.UTF_8).length + 1;
     }
 
+    /**
+     * Builds a deterministic, collision-free identifier suffix from the
+     * full UTF-8 byte content of {@code s}.
+     *
+     * <p>Historically the suffix was {@code Integer.toHexString(s.hashCode())}.
+     * That is not injective: distinct strings can share a hash code, e.g.
+     * {@code "Mn"} and {@code "NO"} both hash to {@code 0x9c1}. When two such
+     * strings appeared in the same module the generated IR contained two
+     * globals with identical names and clang rejected it with
+     * {@code redefinition of global}.
+     *
+     * <p>Encoding every byte as two lowercase hex digits guarantees that
+     * distinct strings produce distinct suffixes, and that the same string
+     * always produces the same suffix (an in-process cache avoids rebuilding
+     * long suffixes for the same literal).
+     */
+    public static String stringIdSuffix(String s) {
+        if (s == null) {
+            return "_null";
+        }
+        String cached = STRING_ID_CACHE.get(s);
+        if (cached != null) {
+            return cached;
+        }
+        byte[] bytes = s.getBytes(StandardCharsets.UTF_8);
+        StringBuilder sb = new StringBuilder(bytes.length * 2);
+        for (byte b : bytes) {
+            int v = b & 0xFF;
+            sb.append(Character.forDigit(v >>> 4, 16));
+            sb.append(Character.forDigit(v & 0xF, 16));
+        }
+        String result = sb.toString();
+        STRING_ID_CACHE.put(s, result);
+        return result;
+    }
+
     public static String typeStringGlobalName(String s) {
-        return "@.str." + s.replaceAll("[^a-zA-Z0-9]", "_") + "_" + Integer.toHexString(s.hashCode());
+        return "@.str." + stringIdSuffix(s);
+    }
+
+    public static String stringObjectGlobalName(String s) {
+        return "jstr_" + stringIdSuffix(s);
     }
 
     public static String typeStringConstant(String s) {

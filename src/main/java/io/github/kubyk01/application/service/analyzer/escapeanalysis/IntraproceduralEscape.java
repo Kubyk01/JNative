@@ -208,8 +208,11 @@ public class IntraproceduralEscape {
                 break;
             }
             case PUT_STATIC: {
-                if (!inst.getOperands().isEmpty()) {
-                    Value rhs = inst.getOperands().getFirst();
+                // Layout PUT_STATIC: [fieldConst, val]. Статическое поле живёт
+                // в глобале, доступном из любой точки программы, поэтому всё,
+                // что туда записано, немедленно становится GLOBAL.
+                if (inst.getOperands().size() >= 2) {
+                    Value rhs = inst.getOperands().get(1);
                     markEscaped(rhs, EscapeStatus.GLOBAL);
                 }
                 break;

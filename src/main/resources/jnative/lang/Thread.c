@@ -19,6 +19,9 @@ void __jnative_monitor_exit(void* obj);
 
 extern const void* vtable_java_lang_Thread[];
 
+extern void* __jnative_make_string_obj(const char* bytes, int32_t len);
+extern const char* __jnative_read_string_bytes(void* s, int32_t* out_len);
+
 #define JLTHREAD_OBJECT_SIZE 200
 #define JLTHREAD_NAME_OFFSET 24
 #define JLTHREAD_TID_OFFSET  32
@@ -357,18 +360,27 @@ void* __jnative_fn_java_lang_Thread_getName___Ljava_lang_String_(void* this_thre
     if (!s) return NULL;
     if (!s->name) {
         char buf[32];
-        snprintf(buf, sizeof(buf), "Thread-%lld", (long long)s->tid);
+        int n = snprintf(buf, sizeof(buf), "Thread-%lld", (long long)s->tid);
         s->name = strdup(buf);
+        (void)n;
     }
-    return s->name;
+    return __jnative_make_string_obj(s->name, (int32_t)strlen(s->name));
 }
 
 void __jnative_fn_java_lang_Thread_setName__Ljava_lang_String__V(void* this_thread, void* name) {
     if (!this_thread) return;
     ThreadState* s = find_thread_state(this_thread);
     if (!s) return;
-    if (s->name) free(s->name);
-    s->name = name ? strdup((const char*)name) : NULL;
+    if (s->name) { free(s->name); s->name = NULL; }
+    if (name != NULL) {
+        int32_t len = 0;
+        const char* bytes = __jnative_read_string_bytes(name, &len);
+        s->name = malloc((size_t)len + 1);
+        if (s->name) {
+            memcpy(s->name, bytes, (size_t)len);
+            s->name[len] = '\0';
+        }
+    }
 }
 
 void __jnative_fn_java_lang_Thread_setNativeName__Ljava_lang_String__V(void* this_thread, void* name) {

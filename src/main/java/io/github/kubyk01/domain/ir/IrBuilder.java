@@ -208,9 +208,9 @@ public class IrBuilder {
                 yield Type.UNKNOWN;
             }
             case NEW_ARRAY -> {
-                if (operands.length >= 2 && operands[1] instanceof Constant) {
-                    String elemTypeName = ((Constant) operands[1]).getValue().toString();
-                    Type elemType = Type.fromDescriptor(elemTypeName);
+                if (operands.length >= 2 && operands[1] instanceof Constant c) {
+                    String elemTypeName = c.getValue().toString();
+                    Type elemType = parseArrayElementName(elemTypeName);
                     yield Type.array(elemType);
                 }
                 yield Type.UNKNOWN;
@@ -234,6 +234,24 @@ public class IrBuilder {
                 yield Type.UNKNOWN;
             }
         };
+    }
+
+    private Type parseArrayElementName(String name) {
+        Type prim = switch (name) {
+            case "boolean" -> Type.BOOLEAN;
+            case "byte"    -> Type.BYTE;
+            case "short"   -> Type.SHORT;
+            case "char"    -> Type.CHAR;
+            case "int"     -> Type.INT;
+            case "long"    -> Type.LONG;
+            case "float"   -> Type.FLOAT;
+            case "double"  -> Type.DOUBLE;
+            default -> null;
+        };
+        if (prim != null) return prim;
+        if (name.startsWith("[")) return Type.array(name);
+        if (name.length() == 1)   return Type.fromDescriptor(name);
+        return Type.reference(name);
     }
 
     public Terminator createBranch(BasicBlock target) {

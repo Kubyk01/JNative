@@ -8,6 +8,19 @@ import io.github.kubyk01.domain.analyzer.dependencyresolver.MethodReference;
 import io.github.kubyk01.domain.analyzer.reachability.ReachabilityMetadata;
 import io.github.kubyk01.domain.analyzer.reflection.ReflectClassInfo;
 import io.github.kubyk01.domain.analyzer.reflection.ReflectInfo;
+import io.github.kubyk01.domain.ir.BasicBlock;
+import io.github.kubyk01.domain.ir.CondBranchTerminator;
+import io.github.kubyk01.domain.ir.Constant;
+import io.github.kubyk01.domain.ir.Function;
+import io.github.kubyk01.domain.ir.IndirectBranchTerminator;
+import io.github.kubyk01.domain.ir.Instruction;
+import io.github.kubyk01.domain.ir.LookupSwitchTerminator;
+import io.github.kubyk01.domain.ir.Module;
+import io.github.kubyk01.domain.ir.ReturnTerminator;
+import io.github.kubyk01.domain.ir.TableSwitchTerminator;
+import io.github.kubyk01.domain.ir.Terminator;
+import io.github.kubyk01.domain.ir.ThrowTerminator;
+import io.github.kubyk01.domain.ir.Value;
 import lombok.Getter;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -43,14 +56,60 @@ public class ReachabilityAnalysis {
     @Getter
     private final Set<String> instantiatedClasses = new HashSet<>();
 
-    // ------------------------------------------------------------------
-    //  Public entry points
-    // ------------------------------------------------------------------
-
     public void addInstantiatedClass(String className, boolean fromUser) {
         if (className == null || className.isEmpty()) return;
         instantiatedClasses.add(className);
         addClassWithInit(className, fromUser);
+    }
+
+    public void addClassLiteral(String className, boolean fromUser) {
+        if (className == null || className.isEmpty()) return;
+        reflectInfo.getOrCreateClassInfo(className);
+        addClass(className, fromUser);
+    }
+
+    public void registerClassLiterals(Module module) {
+        if (module == null) return;
+        for (Function func : module.getFunctions()) {
+            if (func.getEntryBlock() == null) continue;
+            for (BasicBlock block : func.getBlocks()) {
+                for (Instruction inst : block.getInstructions()) {
+                    for (Value op : inst.getOperands()) {
+                        registerClassLiteralFromValue(op);
+                    }
+                }
+                Terminator term = block.getTerminator();
+                if (term != null) {
+                    for (Value op : terminatorOperandsOf(term)) {
+                        registerClassLiteralFromValue(op);
+                    }
+                }
+            }
+        }
+    }
+
+    private void registerClassLiteralFromValue(Value v) {
+        if (!(v instanceof Constant c)) return;
+        if (!c.getType().isReference()) return;
+        if (!"java/lang/Class".equals(c.getType().getClassName())) return;
+        Object val = c.getValue();
+        if (!(val instanceof String name) || name.isEmpty()) return;
+        // No `fromUser` flag here: the IR no longer carries the "user-reachable"
+        // distinction, and by the time this method is called the reflectInfo
+        // set is what matters for the emitter. Class literals are always
+        // passive with respect to <clinit>, so `false` is correct.
+        addClassLiteral(name, false);
+    }
+
+    private static List<Value> terminatorOperandsOf(Terminator term) {
+        List<Value> out = new ArrayList<>();
+        if (term instanceof ReturnTerminator rt && rt.getValue() != null) out.add(rt.getValue());
+        else if (term instanceof ThrowTerminator tt && tt.getException() != null) out.add(tt.getException());
+        else if (term instanceof CondBranchTerminator cbt) out.add(cbt.getCondition());
+        else if (term instanceof LookupSwitchTerminator lst) out.add(lst.getKey());
+        else if (term instanceof TableSwitchTerminator tst) out.add(tst.getKey());
+        else if (term instanceof IndirectBranchTerminator ibt) out.add(ibt.getTargetBlock());
+        return out;
     }
 
     public void applyMetadata(ReachabilityMetadata metadata) {
@@ -161,10 +220,6 @@ public class ReachabilityAnalysis {
         log.info("Instantiated classes: {}", instantiatedClasses.size());
     }
 
-    // ------------------------------------------------------------------
-    //  Internals
-    // ------------------------------------------------------------------
-
     private MethodNode findMethodInHierarchy(ClassNode classNode, String name, String desc, String[] foundClassName) {
         if (classNode == null) {
             return null;
@@ -272,10 +327,6 @@ public class ReachabilityAnalysis {
         visitor.parse(bytes);
     }
 
-    // ------------------------------------------------------------------
-    //  Called from MethodBytecodeVisitor (package-private)
-    // ------------------------------------------------------------------
-
     void addClass(String className, boolean fromUser) {
         if (className == null || className.isEmpty()) return;
         reachableClasses.add(className);
@@ -284,6 +335,14 @@ public class ReachabilityAnalysis {
         }
     }
 
+    /**
+     * Marks a class as initialized. Enqueues its {@code <clinit>} for
+     * analysis when the class actually declares one and its bytecode is
+     * available. No class — user, system, or external — is skipped on the
+     * basis of being "external": the reachability walker needs to see
+     * every instruction that can affect program state, including the
+     * static initializer bodies of library classes.
+     */
     void addClassWithInit(String className, boolean fromUser) {
         if (className == null || className.isEmpty()) return;
 
@@ -293,28 +352,32 @@ public class ReachabilityAnalysis {
         }
 
         if (clinitProcessed.contains(className)) return;
-
-        ClassNode cn = resolver.getClassNode(className);
-        boolean isSystem = isSystemClassName(className);
-
-        if (cn != null && cn.isExternal() && isSystem) {
-            resolver.forceLoadSystemClass(className);
-            cn = resolver.getClassNode(className);
-        }
-
-        if (cn == null || cn.isExternal() || cn.isInterface()) {
-            clinitProcessed.add(className);
-            return;
-        }
-
         clinitProcessed.add(className);
 
+        ClassNode cn = resolver.getClassNode(className);
+        if (cn == null || cn.isInterface()) return;
+
+        if (cn.isExternal()) {
+            resolver.forceLoadSystemClass(className);
+            cn = resolver.getClassNode(className);
+            if (cn == null || cn.isInterface()) return;
+        }
+
+        boolean hasClinit = false;
         for (MethodNode mn : cn.getMethods()) {
             if (mn.getName().equals("<clinit>")) {
-                addMethod(new MethodReference(className, "<clinit>", "()V"), false);
+                hasClinit = true;
                 break;
             }
         }
+        if (!hasClinit) return;
+
+        // Without bytecode we can neither analyse nor codegen <clinit>.
+        // Reflection-loaded classes have method signatures but no
+        // instruction stream; such classes must not be enqueued.
+        if (resolver.getClassBytes(className) == null) return;
+
+        addMethod(new MethodReference(className, "<clinit>", "()V"), fromUser);
     }
 
     public void triggerClinit(String className, boolean fromUser) {

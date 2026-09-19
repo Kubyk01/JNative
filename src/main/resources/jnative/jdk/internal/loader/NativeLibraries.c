@@ -9,6 +9,9 @@
 #define PATH_MAX 4096
 #endif
 
+extern const char* __jnative_read_string_bytes(void* s, int32_t* out_len);
+extern void* __jnative_make_string_obj(const char* bytes, int32_t len);
+
 /*
  * static native String findBuiltinLib(String name);
  *
@@ -40,13 +43,14 @@ void* __jnative_fn_jdk_internal_loader_NativeLibraries_findBuiltinLib__Ljava_lan
 
     if (name_str == NULL) return NULL;
 
-    const char* name = (const char*)name_str;
-    if (name[0] == '\0') return NULL;
+    int32_t nameLen = 0;
+    const char* name = __jnative_read_string_bytes(name_str, &nameLen);
+    if (name[0] == '\0' || nameLen <= 0) return NULL;
 
     if (strchr(name, '/') != NULL) return NULL;
 
     char base[256];
-    size_t n = strlen(name);
+    size_t n = (size_t)nameLen;
     if (n >= sizeof(base)) return NULL;
     memcpy(base, name, n + 1);
 
@@ -87,8 +91,5 @@ void* __jnative_fn_jdk_internal_loader_NativeLibraries_findBuiltinLib__Ljava_lan
     exe[len] = '\0';
 
     size_t sl = strlen(exe);
-    char* result = (char*)malloc(sl + 1);
-    if (!result) return NULL;
-    memcpy(result, exe, sl + 1);
-    return result;
+    return __jnative_make_string_obj(exe, (int32_t)sl);
 }

@@ -5,6 +5,8 @@
 __attribute__((noreturn)) void __jnative_throw_null_pointer_exception(void);
 __attribute__((noreturn)) void __jnative_throw_array_index_out_of_bounds(void);
 
+extern void* __jnative_make_string_obj(const char* bytes, int32_t len);
+
 #define CP_CLASS_FILE_OFFSET 8
 #define CP_OOP_OFFSET        16
 
@@ -79,8 +81,6 @@ double __jnative_fn_jdk_internal_reflect_ConstantPool_getDoubleAt0__Ljava_lang_O
     return 0.0;
 }
 
-static char __cp_empty_string[] = "";
-
 void* __jnative_fn_jdk_internal_reflect_ConstantPool_getUTF8At0__Ljava_lang_Object_I_Ljava_lang_String_(
         void* constantPoolOop, int32_t index) {
     cp_check_index(constantPoolOop, index);
@@ -89,5 +89,5 @@ void* __jnative_fn_jdk_internal_reflect_ConstantPool_getUTF8At0__Ljava_lang_Obje
     if (cls == NULL || cp_size_of_class(cls) <= 0) {
         __jnative_throw_array_index_out_of_bounds();
     }
-    return (void*)__cp_empty_string;
+    return __jnative_make_string_obj("", 0);
 }

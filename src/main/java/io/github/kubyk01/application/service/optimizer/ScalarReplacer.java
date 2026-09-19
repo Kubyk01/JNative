@@ -78,15 +78,26 @@ public class ScalarReplacer {
         Set<AllocationSite> candidates = new HashSet<>();
         for (BasicBlock block : func.getBlocks()) {
             for (Instruction inst : block.getInstructions()) {
-                if (inst.getOpcode() == Opcode.NEW || inst.getOpcode() == Opcode.NEW_ARRAY || inst.getOpcode() == Opcode.MULTI_NEW_ARRAY) {
-                    Value result = inst.getResult();
-                    if (result == null) continue;
-                    PointsToSet pts = aliasResult.getPointsTo(result);
-                    for (AllocationSite site : pts.getSites()) {
-                        EscapeStatus status = escapeResult.getSiteStatus(site);
-                        if (status == EscapeStatus.STACK && !isUsedAsObject(inst)) {
-                            candidates.add(site);
-                        }
+                Opcode op = inst.getOpcode();
+
+                // Массивы этим оптимизатором не поддерживаются: fieldValues
+                // индексируется по имени поля, но элементы массива делят
+                // один ключ "[]". Удаление NEW_ARRAY сломало бы ALOAD/ASTORE.
+                if (op == Opcode.NEW_ARRAY || op == Opcode.MULTI_NEW_ARRAY) {
+                    continue;
+                }
+                if (op != Opcode.NEW) {
+                    continue;
+                }
+
+                Value result = inst.getResult();
+                if (result == null) continue;
+
+                PointsToSet pts = aliasResult.getPointsTo(result);
+                for (AllocationSite site : pts.getSites()) {
+                    EscapeStatus status = escapeResult.getSiteStatus(site);
+                    if (status == EscapeStatus.STACK && !isUsedAsObject(inst)) {
+                        candidates.add(site);
                     }
                 }
             }
@@ -95,13 +106,8 @@ public class ScalarReplacer {
     }
 
     private boolean isUsedAsObject(Instruction newInst) {
-        // Check whether the result of NEW is used as an object (e.g., passed to a method)
-        // For simplicity, assume that if there is a method call with this object as receiver or argument,
-        // the object is not eligible for scalar replacement.
         Value result = newInst.getResult();
         if (result == null) return false;
-        // If used in GET_FIELD or PUT_FIELD, that is fine (we will replace them).
-        // If used in CALL as receiver or argument, do not replace.
         BasicBlock parent = newInst.getParent();
         if (parent == null) return false;
         Function func = parent.getFunction();
@@ -109,16 +115,32 @@ public class ScalarReplacer {
 
         for (BasicBlock block : func.getBlocks()) {
             for (Instruction inst : block.getInstructions()) {
-                for (Value operand : inst.getOperands()) {
-                    if (operand == result) {
-                        Opcode op = inst.getOpcode();
-                        if (op == Opcode.CALL || op == Opcode.VIRTUAL_CALL || op == Opcode.INTERFACE_CALL
-                                || op == Opcode.STATIC_CALL || op == Opcode.SPECIAL_CALL) {
-                            return true;
-                        }
+                if (inst == newInst) continue;
+                Opcode op = inst.getOpcode();
+
+                // Объект передан как аргумент в вызов — заменять нельзя.
+                // Проверяем все операнды, начиная с позиции 1 для CALL-подобных
+                // опкодов (позиция 0 — это получатель), и все операнды для
+                // остальных инструкций.
+                int startIdx = 0;
+                switch (op) {
+                    case CALL, STATIC_CALL -> startIdx = 0;
+                    case VIRTUAL_CALL, INTERFACE_CALL, SPECIAL_CALL -> startIdx = 1;
+                    default -> startIdx = 0;
+                }
+
+                boolean isCall = switch (op) {
+                    case CALL, VIRTUAL_CALL, INTERFACE_CALL, STATIC_CALL, SPECIAL_CALL -> true;
+                    default -> false;
+                };
+
+                if (!isCall) continue;
+
+                for (int i = startIdx; i < inst.getOperands().size(); i++) {
+                    if (inst.getOperands().get(i) == result) {
+                        return true;
                     }
                 }
-                // GET_FIELD/PUT_FIELD with this object do not prevent scalar replacement – they will be replaced
             }
         }
         return false;
@@ -127,7 +149,8 @@ public class ScalarReplacer {
     private boolean processInstruction(Instruction inst,
                                        Set<AllocationSite> candidates) {
         Opcode op = inst.getOpcode();
-        if (op == Opcode.NEW || op == Opcode.NEW_ARRAY || op == Opcode.MULTI_NEW_ARRAY) {
+
+        if (op == Opcode.NEW) {
             Value result = inst.getResult();
             if (result == null) return false;
             PointsToSet pts = aliasResult.getPointsTo(result);
@@ -142,7 +165,15 @@ public class ScalarReplacer {
                     return true;
                 }
             }
-        } else if (op == Opcode.GET_FIELD) {
+            return false;
+        }
+
+        if (op == Opcode.NEW_ARRAY || op == Opcode.MULTI_NEW_ARRAY) {
+            // Массивы в этой реализации не заменяются.
+            return false;
+        }
+
+        if (op == Opcode.GET_FIELD) {
             if (inst.getOperands().size() >= 2) {
                 Value base = inst.getOperands().getFirst();
                 String fieldName = extractFieldName(inst);

@@ -31,6 +31,7 @@ import lombok.RequiredArgsConstructor;
 import org.objectweb.asm.Opcodes;
 
 import java.util.*;
+import java.nio.charset.StandardCharsets;
 
 import static io.github.kubyk01.util.LlvmUtil.getElementSizeOfType;
 
@@ -47,6 +48,11 @@ public class LlvmGlobalEmitter {
     private final Map<String, String> structNames = new HashMap<>();
     private final Map<String, Integer> fieldOffsets = new HashMap<>();
     private final Set<String> emittedStringConstants = new HashSet<>();
+    private final List<String> stringLiteralPool = new ArrayList<>();
+
+    public int getLiteralPoolSize() {
+        return stringLiteralPool.size();
+    }
 
     public static final class VtableLayout {
         public final List<String> slots = new ArrayList<>();
@@ -306,8 +312,9 @@ public class LlvmGlobalEmitter {
         prepareLayouts();
         return generateStructs()
             + generateStaticFields()
-            + generateTypeStringConstants()
             + generateVtables()
+            + generateTypeStringConstants()
+            + generateStringLiterals()
             + generateTypeInfo()
             + generateReflectionData();
     }
@@ -685,7 +692,7 @@ public class LlvmGlobalEmitter {
 
         String objStruct = LlvmTypeMapper.toLlvmStruct("java/lang/Object");
         if (!structNames.containsKey("java/lang/Object")) {
-            sb.append(objStruct).append(" = type { }\n");
+            sb.append(objStruct).append(" = type { i8* }\n");
             structNames.put("java/lang/Object", objStruct);
         }
 
@@ -696,14 +703,12 @@ public class LlvmGlobalEmitter {
             if (structNames.containsKey(cls.getName())) continue;
 
             String structName = LlvmTypeMapper.toLlvmStruct(cls.getName());
-            sb.append(structName).append(" = type { ");
+            sb.append(structName).append(" = type { i8*");
 
-            List<FieldNode> allFields = collectAllFields(cls);
-            List<String> fieldTypes = new ArrayList<>();
+            List<FieldNode> allFields = collectInstanceFields(cls);
             for (FieldNode field : allFields) {
-                fieldTypes.add(LlvmTypeMapper.toLlvmType(field.getType()));
+                sb.append(", ").append(LlvmTypeMapper.toLlvmType(field.getType()));
             }
-            sb.append(String.join(", ", fieldTypes));
             sb.append(" }\n");
             structNames.put(cls.getName(), structName);
         }
@@ -720,15 +725,19 @@ public class LlvmGlobalEmitter {
         return sb.toString();
     }
 
-    private List<FieldNode> collectAllFields(ClassNode cls) {
+    private List<FieldNode> collectInstanceFields(ClassNode cls) {
         List<FieldNode> result = new ArrayList<>();
         if (cls.getSuperName() != null && !cls.getSuperName().equals("java/lang/Object")) {
             ClassNode superNode = resolver.getClassNode(cls.getSuperName());
             if (superNode != null && !superNode.isExternal()) {
-                result.addAll(collectAllFields(superNode));
+                result.addAll(collectInstanceFields(superNode));
             }
         }
-        result.addAll(cls.getFields());
+        for (FieldNode f : cls.getFields()) {
+            if ((f.getAccess() & Opcodes.ACC_STATIC) == 0) {
+                result.add(f);
+            }
+        }
         return result;
     }
 
@@ -791,8 +800,9 @@ public class LlvmGlobalEmitter {
         List<String> sorted = new ArrayList<>(names);
         Collections.sort(sorted);
         for (String name : sorted) {
-            emittedStringConstants.add(name);
-            sb.append(LlvmRuntime.typeStringConstant(name));
+            if (emittedStringConstants.add(name)) {
+                sb.append(LlvmRuntime.typeStringConstant(name));
+            }
         }
         sb.append("\n");
         return sb.toString();
@@ -845,6 +855,138 @@ public class LlvmGlobalEmitter {
         else if (term instanceof LookupSwitchTerminator lst) addIfStringConstant(lst.getKey(), names);
         else if (term instanceof TableSwitchTerminator tst) addIfStringConstant(tst.getKey(), names);
         else if (term instanceof IndirectBranchTerminator ibt) addIfStringConstant(ibt.getTargetBlock(), names);
+    }
+
+    private Set<String> collectJavaStringLiterals() {
+        Set<String> result = new LinkedHashSet<>();
+        for (Function func : module.getFunctions()) {
+            for (BasicBlock block : func.getBlocks()) {
+                for (Instruction inst : block.getInstructions()) {
+                    for (Value v : inst.getOperands()) {
+                        if (v instanceof Constant c
+                            && c.getType().isReference()
+                            && "java/lang/String".equals(c.getType().getClassName())
+                            && c.getValue() instanceof String s) {
+                            result.add(s);
+                        }
+                    }
+                    if (inst.getOpcode() == Opcode.INVOKEDYNAMIC
+                        && inst.getInvokedynamicData() instanceof InvokeDynamicInfo dynInfo
+                        && dynInfo.bootstrapMethod() != null
+                        && "java/lang/invoke/StringConcatFactory".equals(dynInfo.bootstrapMethod().getOwner())
+                        && dynInfo.bootstrapArgs().length >= 1
+                        && dynInfo.bootstrapArgs()[0] instanceof String recipe) {
+                        StringBuilder seg = new StringBuilder();
+                        for (int i = 0; i < recipe.length(); i++) {
+                            char ch = recipe.charAt(i);
+                            if (ch == '\u0001' || ch == '\u0002') {
+                                if (!seg.isEmpty()) { result.add(seg.toString()); seg.setLength(0); }
+                            } else {
+                                seg.append(ch);
+                            }
+                        }
+                        if (!seg.isEmpty()) result.add(seg.toString());
+                        for (int i = 1; i < dynInfo.bootstrapArgs().length; i++) {
+                            Object a = dynInfo.bootstrapArgs()[i];
+                            if (a instanceof String s) result.add(s);
+                        }
+                    }
+                }
+                Terminator term = block.getTerminator();
+                if (term != null) {
+                    for (Value v : terminatorOperands(term)) {
+                        if (v instanceof Constant c
+                            && c.getType().isReference()
+                            && "java/lang/String".equals(c.getType().getClassName())
+                            && c.getValue() instanceof String s) {
+                            result.add(s);
+                        }
+                    }
+                }
+            }
+        }
+        result.add("");
+        return result;
+    }
+
+    private static List<Value> terminatorOperands(Terminator term) {
+        List<Value> out = new ArrayList<>();
+        if (term instanceof ReturnTerminator rt && rt.getValue() != null) out.add(rt.getValue());
+        else if (term instanceof ThrowTerminator tt && tt.getException() != null) out.add(tt.getException());
+        else if (term instanceof CondBranchTerminator cbt) out.add(cbt.getCondition());
+        else if (term instanceof LookupSwitchTerminator lst) out.add(lst.getKey());
+        else if (term instanceof TableSwitchTerminator tst) out.add(tst.getKey());
+        else if (term instanceof IndirectBranchTerminator ibt) out.add(ibt.getTargetBlock());
+        return out;
+    }
+
+    private String generateStringLiterals() {
+        StringBuilder sb = new StringBuilder();
+        sb.append("\n; ----- String literal objects -----\n");
+        stringLiteralPool.clear();
+
+        String vtableName = vtableNames.get("java/lang/String");
+        if (vtableName == null) {
+            throw new IllegalStateException(
+                "vtable_java_lang_String must be emitted before string literals");
+        }
+
+        List<String> literals = new ArrayList<>(collectJavaStringLiterals());
+        Collections.sort(literals);
+
+        for (String s : literals) {
+            byte[] bytes = s.getBytes(StandardCharsets.UTF_8);
+            int len = bytes.length;
+            int totalLen = 4 + len + 1;
+
+            StringBuilder escaped = new StringBuilder();
+            escaped.append(String.format("\\%02X\\%02X\\%02X\\%02X",
+                len & 0xFF, (len >> 8) & 0xFF, (len >> 16) & 0xFF, (len >> 24) & 0xFF));
+            for (byte b : bytes) {
+                int v = b & 0xFF;
+                switch (v) {
+                    case '\\' -> escaped.append("\\5C");
+                    case '"'  -> escaped.append("\\22");
+                    case '\n' -> escaped.append("\\0A");
+                    case '\r' -> escaped.append("\\0D");
+                    case '\t' -> escaped.append("\\09");
+                    default -> {
+                        if (v < 0x20 || v > 0x7E) escaped.append(String.format("\\%02X", v));
+                        else escaped.append((char) v);
+                    }
+                }
+            }
+            escaped.append("\\00");
+
+            String safe = LlvmRuntime.stringIdSuffix(s);
+            String bytesGlobal = "strbytes_" + safe;
+            String objGlobal = "jstr_" + safe;
+
+            sb.append("@").append(bytesGlobal)
+                .append(" = private unnamed_addr constant [").append(totalLen)
+                .append(" x i8] c\"").append(escaped).append("\", align 4\n");
+
+            sb.append("@").append(objGlobal)
+                .append(" = global %struct.java_lang_String {\n")
+                .append("  i8* bitcast (%JNativeVTable* ").append(vtableName).append(" to i8*),\n")
+                .append("  i8* bitcast ([").append(totalLen).append(" x i8]* @").append(bytesGlobal).append(" to i8*),\n")
+                .append("  i8 0,\n")
+                .append("  i32 0,\n")
+                .append("  i1 false\n")
+                .append("}, align 8\n");
+
+            stringLiteralPool.add(objGlobal);
+        }
+
+        int n = stringLiteralPool.size();
+        sb.append("@__jnative_literal_pool = constant [").append(n).append(" x i8*] [");
+        for (int i = 0; i < n; i++) {
+            if (i > 0) sb.append(", ");
+            sb.append("i8* bitcast (%struct.java_lang_String* @").append(stringLiteralPool.get(i)).append(" to i8*)");
+        }
+        sb.append("], align 8\n");
+        sb.append("@__jnative_literal_pool_size = constant i32 ").append(n).append("\n");
+        return sb.toString();
     }
 
     private String generateTypeInfo() {
@@ -924,12 +1066,17 @@ public class LlvmGlobalEmitter {
                 "Cannot compute field offset for external class: " + className + "." + fieldName);
         }
 
-        List<FieldNode> allFields = collectAllFields(cls);
+        List<FieldNode> allFields = collectInstanceFields(cls);
         int offset = OBJECT_HEADER_SIZE;
         int foundOffset = -1;
         for (FieldNode f : allFields) {
-            if (f.getName().equals(fieldName)) foundOffset = offset;
-            offset += fieldSize(f.getType());
+            Type ft = f.getType();
+            int align = fieldAlignment(ft);
+            offset = (offset + align - 1) & -align;
+            if (f.getName().equals(fieldName)) {
+                foundOffset = offset;
+            }
+            offset += fieldSize(ft);
         }
 
         if (foundOffset < 0) {
@@ -938,6 +1085,16 @@ public class LlvmGlobalEmitter {
         }
         fieldOffsets.put(key, foundOffset);
         return foundOffset;
+    }
+
+    private static int fieldAlignment(Type ft) {
+        if (ft == null) return 8;
+        if (ft.isReference() || ft.isArray()) return 8;
+        if (ft == Type.LONG || ft == Type.DOUBLE) return 8;
+        if (ft == Type.INT || ft == Type.FLOAT) return 4;
+        if (ft == Type.SHORT || ft == Type.CHAR) return 2;
+        if (ft == Type.BYTE || ft == Type.BOOLEAN) return 1;
+        return 8;
     }
 
     private static int fieldSize(Type ft) {
@@ -978,7 +1135,7 @@ public class LlvmGlobalEmitter {
         Map<String, String> classVarNames = new HashMap<>();
         for (String className : classNames) {
             ClassNode classNode = resolver.getClassNode(className);
-            if (classNode == null || classNode.isExternal()) continue;
+            if (classNode == null) continue;
             classVarNames.put(className,
                 "@refclass_" + LlvmTypeMapper.sanitizeIdentifier(className));
         }
@@ -987,13 +1144,13 @@ public class LlvmGlobalEmitter {
         for (String className : classNames) {
             ReflectClassInfo info = reflectInfo.getOrCreateClassInfo(className);
             ClassNode classNode = resolver.getClassNode(className);
-            if (classNode == null || classNode.isExternal()) continue;
+            if (classNode == null) continue;
 
             String cleanClassName = LlvmTypeMapper.sanitizeIdentifier(className);
             String classVarName = "@refclass_" + cleanClassName;
 
             int objectSize = OBJECT_HEADER_SIZE;
-            for (FieldNode f : collectAllFields(classNode)) {
+            for (FieldNode f : collectInstanceFields(classNode)) {
                 objectSize += getElementSizeOfType(f.getType());
             }
 
@@ -1037,14 +1194,22 @@ public class LlvmGlobalEmitter {
             for (FieldReference field : sortedFields) {
                 String fieldName = field.getName();
                 String desc = field.getDescriptor();
-                int offset = 0;
                 int modifiers = 0;
                 FieldNode fn = resolver.getField(className, fieldName);
                 if (fn != null) {
                     modifiers = fn.getAccess();
                     if (desc == null) desc = fn.getDescriptor();
                 }
-                if (desc != null) offset = getFieldOffset(className, fieldName);
+
+                // Offset is only meaningful for instance fields. Static fields
+                // live in a separate global, they are not part of the struct,
+                // and getFieldOffset would throw. For static fields we emit 0;
+                // ReflectionField.offset is only read at runtime through
+                // Unsafe.objectFieldOffset(), which is never called for statics.
+                int offset = 0;
+                if (fn != null && desc != null && (modifiers & Opcodes.ACC_STATIC) == 0) {
+                    offset = getFieldOffset(className, fieldName);
+                }
 
                 String fieldVar = "@reffield_" + cleanClassName + "_" + fieldName;
                 sb.append(fieldVar).append(" = constant %ReflectionField { i8* ")

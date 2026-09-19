@@ -1,3 +1,5 @@
+/* path: src/main/java/io/github/kubyk01/application/service/optimizer/DeadCodeEliminator.java */
+
 package io.github.kubyk01.application.service.optimizer;
 
 import io.github.kubyk01.domain.ir.BasicBlock;
@@ -64,11 +66,64 @@ public class DeadCodeEliminator {
         } else {
             log.debug("Dead code elimination completed in {} iterations", iterations);
         }
+
+        removeEmptyClinitFunctions();
     }
 
-    // ------------------------------------------------------------------
-    //  Static field read collection
-    // ------------------------------------------------------------------
+    /**
+     * Removes every {@code <clinit>} function whose body became empty after
+     * elimination and removes all call sites that referenced them. A
+     * {@code <clinit>} that performs no observable work — no calls, no
+     * writes to fields that are read elsewhere — is not part of the
+     * reachable program and must not appear in the emitted module.
+     */
+    private void removeEmptyClinitFunctions() {
+        Set<String> emptyClinits = new HashSet<>();
+        for (Function func : module.getFunctions()) {
+            String name = func.getName();
+            if (!name.contains("__clinit__")) continue;
+            if (isEffectivelyEmpty(func)) {
+                emptyClinits.add(name);
+            }
+        }
+
+        if (emptyClinits.isEmpty()) return;
+
+        for (Function func : module.getFunctions()) {
+            if (emptyClinits.contains(func.getName())) continue;
+            for (BasicBlock block : func.getBlocks()) {
+                block.getInstructions().removeIf(inst -> isCallTo(inst, emptyClinits));
+            }
+        }
+
+        for (Function func : new ArrayList<>(module.getFunctions())) {
+            if (emptyClinits.contains(func.getName())) {
+                module.removeFunction(func);
+            }
+        }
+
+        log.debug("Removed {} empty <clinit> function(s)", emptyClinits.size());
+    }
+
+    private boolean isEffectivelyEmpty(Function func) {
+        if (func.getEntryBlock() == null) return true;
+        for (BasicBlock block : func.getBlocks()) {
+            for (Instruction inst : block.getInstructions()) {
+                Opcode op = inst.getOpcode();
+                if (op == Opcode.NOP) continue;
+                if (op == Opcode.PHI) continue;
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private boolean isCallTo(Instruction inst, Set<String> calleeNames) {
+        Opcode op = inst.getOpcode();
+        if (op != Opcode.STATIC_CALL && op != Opcode.CALL) return false;
+        String callee = extractCalleeName(inst);
+        return callee != null && calleeNames.contains(callee);
+    }
 
     private Set<String> collectReadStaticFields() {
         Set<String> fields = new HashSet<>();
@@ -95,17 +150,6 @@ public class DeadCodeEliminator {
         return null;
     }
 
-    /**
-     * Extracts the callee name from a call instruction. The operand layout
-     * depends on the opcode:
-     *
-     * <ul>
-     *   <li>{@code VIRTUAL_CALL} / {@code INTERFACE_CALL} / {@code SPECIAL_CALL}:
-     *       {@code [receiver, calleeConst, args...]}</li>
-     *   <li>{@code STATIC_CALL} / {@code CALL}:
-     *       {@code [calleeConst, args...]}</li>
-     * </ul>
-     */
     private String extractCalleeName(Instruction inst) {
         Opcode op = inst.getOpcode();
         int idx = (op == Opcode.VIRTUAL_CALL
@@ -120,15 +164,10 @@ public class DeadCodeEliminator {
         return null;
     }
 
-    // ------------------------------------------------------------------
-    //  Live value analysis
-    // ------------------------------------------------------------------
-
     private Set<Value> collectUsedValues(Set<String> readStaticFields) {
         Set<Value> used = new HashSet<>();
         Deque<Value> worklist = new ArrayDeque<>();
 
-        // Seed: operands of root (side-effecting) instructions and terminator operands.
         for (Function func : module.getFunctions()) {
             if (func.getEntryBlock() == null) continue;
             for (BasicBlock block : func.getBlocks()) {
@@ -148,8 +187,6 @@ public class DeadCodeEliminator {
             }
         }
 
-        // Transitive closure: if a used value is produced by an instruction,
-        // its operands become used as well.
         while (!worklist.isEmpty()) {
             Value v = worklist.poll();
             if (v instanceof Temporary t) {
@@ -183,22 +220,10 @@ public class DeadCodeEliminator {
         return result;
     }
 
-    /**
-     * A root instruction is one whose side effects must be preserved even if
-     * its result is unused. Everything not marked here is a candidate for
-     * removal if its result is unused.
-     */
     private boolean isRoot(Instruction inst, Set<String> readStaticFields) {
         Opcode op = inst.getOpcode();
         return switch (op) {
             case CALL, VIRTUAL_CALL, INTERFACE_CALL, STATIC_CALL, SPECIAL_CALL -> {
-                // A call whose result is unused is dead only if the target has
-                // no observable side effects. The JVM's assertion-status query
-                // is a pure read of VM state — whitelist it so that
-                // `assert` machinery inside <clinit> blocks does not force
-                // us to emit a call to a method that is not actually in the
-                // reachable set (and whose vtable slot is therefore null).
-                // Any other call remains a root (conservative).
                 String callee = extractCalleeName(inst);
                 boolean pureQuery = callee != null
                     && callee.startsWith("java/lang/Class.")
@@ -239,7 +264,6 @@ public class DeadCodeEliminator {
             return !usedValues.contains(inst.getResult());
         }
 
-        // Whitelisted pure query calls: drop them if the result is unused.
         if ((op == Opcode.VIRTUAL_CALL
             || op == Opcode.INTERFACE_CALL
             || op == Opcode.STATIC_CALL
