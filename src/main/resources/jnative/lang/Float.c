@@ -9,7 +9,7 @@ int32_t __jnative_fn_java_lang_Float_floatToRawIntBits__F_I(float value) {
 
 int32_t __jnative_fn_java_lang_Float_floatToIntBits__F_I(float value) {
     if (isnan(value)) {
-        return 0x7fc00000; // канонический NaN
+        return 0x7fc00000;
     }
     union { float f; int32_t i; } u;
     u.f = value;

@@ -10,10 +10,11 @@ import io.github.kubyk01.domain.ir.BasicBlock;
 import io.github.kubyk01.domain.ir.Function;
 import io.github.kubyk01.domain.ir.Instruction;
 import io.github.kubyk01.domain.ir.Module;
-import io.github.kubyk01.domain.ir.Opcode;
 import lombok.extern.slf4j.Slf4j;
 
 import java.util.*;
+
+import static io.github.kubyk01.util.LlvmUtil.isAllocation;
 
 @Slf4j
 public class InterproceduralEscape {
@@ -65,9 +66,5 @@ public class InterproceduralEscape {
         }
 
         return globalStatus;
-    }
-
-    private boolean isAllocation(Opcode op) {
-        return op == Opcode.NEW || op == Opcode.NEW_ARRAY || op == Opcode.MULTI_NEW_ARRAY;
     }
 }

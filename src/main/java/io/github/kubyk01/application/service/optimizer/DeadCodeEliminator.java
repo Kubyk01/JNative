@@ -4,7 +4,6 @@ package io.github.kubyk01.application.service.optimizer;
 
 import io.github.kubyk01.domain.ir.BasicBlock;
 import io.github.kubyk01.domain.ir.CondBranchTerminator;
-import io.github.kubyk01.domain.ir.Constant;
 import io.github.kubyk01.domain.ir.Function;
 import io.github.kubyk01.domain.ir.IndirectBranchTerminator;
 import io.github.kubyk01.domain.ir.Instruction;
@@ -27,6 +26,9 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 
+import static io.github.kubyk01.util.LlvmUtil.extractCalleeName;
+import static io.github.kubyk01.util.LlvmUtil.extractFieldName;
+
 @Slf4j
 @RequiredArgsConstructor
 public class DeadCodeEliminator {
@@ -42,7 +44,8 @@ public class DeadCodeEliminator {
             changed = false;
 
             Set<String> readStaticFields = collectReadStaticFields();
-            Set<Value> usedValues = collectUsedValues(readStaticFields);
+            Set<Integer> loadedLocals   = collectLoadedLocals();
+            Set<Value> usedValues       = collectUsedValues(readStaticFields);
 
             for (Function func : module.getFunctions()) {
                 if (func.getEntryBlock() == null) continue;
@@ -50,7 +53,7 @@ public class DeadCodeEliminator {
                     List<Instruction> instructions = block.getInstructions();
                     for (int i = 0; i < instructions.size(); i++) {
                         Instruction inst = instructions.get(i);
-                        if (shouldRemove(inst, usedValues, readStaticFields)) {
+                        if (shouldRemove(inst, usedValues, readStaticFields, loadedLocals)) {
                             instructions.remove(i);
                             i--;
                             changed = true;
@@ -125,6 +128,27 @@ public class DeadCodeEliminator {
         return callee != null && calleeNames.contains(callee);
     }
 
+    /**
+     * Slot indices for which at least one LOAD instruction still exists after
+     * the SSA pass. These are exactly the slots that the SSA transformer
+     * left in memory (see SSATransformer.identifyUnsafeLocals); every STORE
+     * to such a slot is observable and must not be eliminated.
+     */
+    private Set<Integer> collectLoadedLocals() {
+        Set<Integer> loaded = new HashSet<>();
+        for (Function func : module.getFunctions()) {
+            if (func.getEntryBlock() == null) continue;
+            for (BasicBlock block : func.getBlocks()) {
+                for (Instruction inst : block.getInstructions()) {
+                    if (inst.getOpcode() == Opcode.LOAD && inst.getLocalIndex() >= 0) {
+                        loaded.add(inst.getLocalIndex());
+                    }
+                }
+            }
+        }
+        return loaded;
+    }
+
     private Set<String> collectReadStaticFields() {
         Set<String> fields = new HashSet<>();
         for (Function func : module.getFunctions()) {
@@ -132,36 +156,13 @@ public class DeadCodeEliminator {
             for (BasicBlock block : func.getBlocks()) {
                 for (Instruction inst : block.getInstructions()) {
                     if (inst.getOpcode() == Opcode.GET_STATIC) {
-                        String name = extractFieldName(inst, 0);
+                        String name = extractFieldName(inst);
                         if (name != null) fields.add(name);
                     }
                 }
             }
         }
         return fields;
-    }
-
-    private String extractFieldName(Instruction inst, int idx) {
-        if (inst.getOperands().size() <= idx) return null;
-        Value v = inst.getOperands().get(idx);
-        if (v instanceof Constant c && c.getType().isReference()) {
-            return c.getValue().toString();
-        }
-        return null;
-    }
-
-    private String extractCalleeName(Instruction inst) {
-        Opcode op = inst.getOpcode();
-        int idx = (op == Opcode.VIRTUAL_CALL
-            || op == Opcode.INTERFACE_CALL
-            || op == Opcode.SPECIAL_CALL) ? 1 : 0;
-        if (inst.getOperands().size() > idx) {
-            Value v = inst.getOperands().get(idx);
-            if (v instanceof Constant c && c.getType().isReference()) {
-                return c.getValue().toString();
-            }
-        }
-        return null;
     }
 
     private Set<Value> collectUsedValues(Set<String> readStaticFields) {
@@ -239,7 +240,7 @@ public class DeadCodeEliminator {
                  JSR,
                  NEW, NEW_ARRAY, MULTI_NEW_ARRAY -> true;
             case PUT_STATIC -> {
-                String name = extractFieldName(inst, 0);
+                String name = extractFieldName(inst);
                 yield name != null && readStaticFields.contains(name);
             }
             default -> false;
@@ -248,15 +249,20 @@ public class DeadCodeEliminator {
 
     private boolean shouldRemove(Instruction inst,
                                  Set<Value> usedValues,
-                                 Set<String> readStaticFields) {
+                                 Set<String> readStaticFields,
+                                 Set<Integer> loadedLocals) {
         Opcode op = inst.getOpcode();
 
         if (op == Opcode.PUT_STATIC) {
-            String name = extractFieldName(inst, 0);
+            String name = extractFieldName(inst);
             return name != null && !readStaticFields.contains(name);
         }
 
         if (op == Opcode.STORE) {
+            int idx = inst.getLocalIndex();
+            if (idx >= 0 && loadedLocals.contains(idx)) {
+                return false;
+            }
             return inst.getResult() != null && !usedValues.contains(inst.getResult());
         }
 
@@ -272,11 +278,9 @@ public class DeadCodeEliminator {
             && inst.getResult() != null
             && !usedValues.contains(inst.getResult())) {
             String callee = extractCalleeName(inst);
-            if (callee != null
+            return callee != null
                 && callee.startsWith("java/lang/Class.")
-                && callee.contains("desiredAssertionStatus")) {
-                return true;
-            }
+                && callee.contains("desiredAssertionStatus");
         }
 
         return false;

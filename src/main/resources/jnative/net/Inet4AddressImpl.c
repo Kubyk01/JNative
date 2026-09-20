@@ -13,6 +13,7 @@
 __attribute__((noreturn)) void __jnative_throw_exception(void* exc);
 
 struct ReflectionClass {
+    void* vtable;
     void* name;
     struct ReflectionClass* superclass;
     struct ReflectionClass** interfaces;
@@ -28,7 +29,7 @@ extern struct ReflectionClass* reflect_all_classes[];
 extern void* __jnative_make_string_obj(const char* bytes, int32_t len);
 extern const char* __jnative_read_string_bytes(void* s, int32_t* out_len);
 
-#define JAVA_ARR_HDR 4
+#define JAVA_ARR_HDR 8
 #define JAVA_IPV4 1
 
 static struct ReflectionClass* find_class_by_name(const char* internal_name) {
@@ -122,20 +123,27 @@ static void* make_inet4_address(const uint8_t* bytes, const char* hostname) {
     return ia;
 }
 
-/*
- * private native InetAddress[] lookupAllHostAddr(String host, int policy)
- *     throws UnknownHostException;
+/* --------------------------------------------------------------------------
+ * lookupAllHostAddr — canonical single-argument implementation
  *
- * IPv4-only forward resolution. getaddrinfo is restricted to AF_INET
- * so the returned array holds only IPv4 addresses; anything else the
- * resolver produces is dropped. Each element is a fully-shaped
- * InetAddress so Java callers can invoke getAddress / getHostAddress
- * without further native assistance.
- */
-void* __jnative_fn_java_net_Inet4AddressImpl_lookupAllHostAddr__Ljava_lang_String_I__Ljava_net_InetAddress_(
-        void* host_str, int32_t policy)
+ *   private native InetAddress[] lookupAllHostAddr(String host)
+ *       throws UnknownHostException;
+ *
+ * This is the JDK 8 – 17 signature: no policy argument, IPv4-only
+ * resolution via getaddrinfo with ai_family = AF_INET. It is the base
+ * implementation that both of the later overloads forward to, so the
+ * same body serves every JDK generation this runtime targets.
+ *
+ * The returned array is packed in the runtime's Java-array layout
+ * (4-byte int length header, then pointer slots), and each element is a
+ * fully-shaped InetAddress — vtable, canonical name, and an
+ * InetAddressHolder carrying the hostname, family, and 4-byte address.
+ * Java callers can therefore invoke getAddress / getHostAddress
+ * without any further native assistance.
+ * ------------------------------------------------------------------------ */
+void* __jnative_fn_java_net_Inet4AddressImpl_lookupAllHostAddr__Ljava_lang_String___Ljava_net_InetAddress_(
+        void* host_str)
 {
-    (void)policy;
     if (!host_str) {
         __jnative_throw_exception(NULL);
     }
@@ -183,13 +191,57 @@ void* __jnative_fn_java_net_Inet4AddressImpl_lookupAllHostAddr__Ljava_lang_Strin
     return array;
 }
 
-/*
- * private native String getHostByAddr(byte[] addr);
+/* --------------------------------------------------------------------------
+ * lookupAllHostAddr — pre-JDK-18 two-argument form
  *
- * Reverse DNS through getnameinfo(3) with NI_NAMEREQD. Only 4-byte
- * input is meaningful for IPv4 reverse lookup; any other length yields
- * null, which the caller turns into a numeric fallback.
- */
+ *   private native InetAddress[] lookupAllHostAddr(String host, int policy)
+ *       throws UnknownHostException;
+ *
+ * Some intermediate JDK versions carried an int policy argument whose
+ * bit values selected the address-family ordering. Inet4AddressImpl is
+ * selected only when the caller has already decided the IPv4 path
+ * applies, so the policy is informational here; the IPv4-only resolution
+ * is the correct answer regardless of which bits are set.
+ * ------------------------------------------------------------------------ */
+void* __jnative_fn_java_net_Inet4AddressImpl_lookupAllHostAddr__Ljava_lang_String_I__Ljava_net_InetAddress_(
+        void* host_str, int32_t policy)
+{
+    (void)policy;
+    return __jnative_fn_java_net_Inet4AddressImpl_lookupAllHostAddr__Ljava_lang_String___Ljava_net_InetAddress_(
+        host_str);
+}
+
+/* --------------------------------------------------------------------------
+ * lookupAllHostAddr — JDK 18+ LookupPolicy form
+ *
+ *   public native InetAddress[] lookupAllHostAddr(
+ *           String host,
+ *           InetAddressResolver.LookupPolicy lookupPolicy)
+ *       throws UnknownHostException;
+ *
+ * The LookupPolicy object carries the caller's requested address-family
+ * ordering. As with the int policy above, Inet4AddressImpl is only ever
+ * dispatched to when the Java layer has already established that the
+ * IPv4 path applies, so the argument is informational and the body
+ * forwards to the canonical single-argument implementation.
+ *
+ * The mangled symbol encodes the descriptor
+ *   (Ljava/lang/String;Ljava/net/spi/InetAddressResolver$LookupPolicy;)[Ljava/net/InetAddress;
+ * exactly, with the three underscores between `Ljava_lang_String_` and
+ * `Ljava_net_InetAddress_` coming from the `;`, `)`, and `[`
+ * respectively.
+ * ------------------------------------------------------------------------ */
+void* __jnative_fn_java_net_Inet4AddressImpl_lookupAllHostAddr__Ljava_lang_String_Ljava_net_spi_InetAddressResolver_LookupPolicy___Ljava_net_InetAddress_(
+        void* host_str, void* lookup_policy)
+{
+    (void)lookup_policy;
+    return __jnative_fn_java_net_Inet4AddressImpl_lookupAllHostAddr__Ljava_lang_String___Ljava_net_InetAddress_(
+        host_str);
+}
+
+/* --------------------------------------------------------------------------
+ * getHostByAddr — reverse DNS
+ * ------------------------------------------------------------------------ */
 void* __jnative_fn_java_net_Inet4AddressImpl_getHostByAddr___B_Ljava_lang_String_(
         void* addr_bytes)
 {
@@ -214,12 +266,9 @@ void* __jnative_fn_java_net_Inet4AddressImpl_getHostByAddr___B_Ljava_lang_String
     return make_string(hostbuf);
 }
 
-/*
- * private native String getLocalHostName();
- *
- * The local host name as reported by gethostname(3). A null return
- * causes the Java caller to fall back to the numeric loopback address.
- */
+/* --------------------------------------------------------------------------
+ * getLocalHostName
+ * ------------------------------------------------------------------------ */
 void* __jnative_fn_java_net_Inet4AddressImpl_getLocalHostName___Ljava_lang_String_(void)
 {
     char buf[256];

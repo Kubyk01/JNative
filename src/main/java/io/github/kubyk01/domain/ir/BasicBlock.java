@@ -13,7 +13,7 @@ public class BasicBlock {
     private Terminator terminator;
     @Setter
     private Function function;
-    private List<BasicBlock> predecessors = new ArrayList<>();
+    private final List<BasicBlock> predecessors = new ArrayList<>();
     private final List<BasicBlock> successors = new ArrayList<>();
     private final List<BasicBlock> exceptionalSuccessors = new ArrayList<>();
 
@@ -23,7 +23,13 @@ public class BasicBlock {
 
     public void setTerminator(Terminator terminator) {
         this.terminator = terminator;
-        if (terminator != null) terminator.setBlock(this);
+        if (terminator == null) return;
+        terminator.setBlock(this);
+        for (BasicBlock target : terminator.getTargets()) {
+            if (target != null) {
+                addSuccessor(target);
+            }
+        }
     }
 
     public void addInstruction(Instruction inst) {
@@ -32,26 +38,31 @@ public class BasicBlock {
     }
 
     public void addSuccessor(BasicBlock block) {
+        if (successors.contains(block)) return;
         successors.add(block);
-        block.predecessors.add(this);
-    }
-
-    public void addExceptionalSuccessor(BasicBlock block) {
-        // Duplicate guard is required for multi-catch (one handler for several
-        // ranges and several throwing instructions in the same block)
-        if (!exceptionalSuccessors.contains(block)) {
-            exceptionalSuccessors.add(block);
-            block.predecessors.add(this); // also add as a predecessor
+        if (!block.predecessors.contains(this)) {
+            block.predecessors.add(this);
         }
     }
 
-    /**
-     * Returns the union of normal and exceptional successors.
-     * Overrides the Lombok-generated getter for the {@code successors} field.
-     */
+    public void addExceptionalSuccessor(BasicBlock block) {
+        if (exceptionalSuccessors.contains(block)) return;
+        exceptionalSuccessors.add(block);
+        if (!block.predecessors.contains(this)) {
+            block.predecessors.add(this);
+        }
+    }
+
     public List<BasicBlock> getSuccessors() {
+        if (exceptionalSuccessors.isEmpty()) {
+            return new ArrayList<>(successors);
+        }
         List<BasicBlock> all = new ArrayList<>(successors);
-        all.addAll(exceptionalSuccessors);
+        for (BasicBlock ex : exceptionalSuccessors) {
+            if (!all.contains(ex)) {
+                all.add(ex);
+            }
+        }
         return all;
     }
 

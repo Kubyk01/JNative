@@ -46,9 +46,6 @@ public class DependencyResolver {
 
     private FileSystem jrtFileSystem;
 
-    /**
-     * Lazily loads a system class. Tries bytecode first, then falls back to reflection.
-     */
     public synchronized void loadSystemClass(String internalName) {
         if (classMap.containsKey(internalName)) {
             return;
@@ -67,7 +64,6 @@ public class DependencyResolver {
 
         byte[] bytes = null;
 
-        // 1. Try standard ClassLoader
         try (InputStream is = ClassLoader.getSystemResourceAsStream(internalName + ".class")) {
             if (is != null) {
                 bytes = is.readAllBytes();
@@ -77,7 +73,6 @@ public class DependencyResolver {
             log.debug("Failed to load system class {} via ClassLoader: {}", internalName, e.getMessage());
         }
 
-        // 2. Try jrt:/ (Java 9+)
         if (bytes == null) {
             bytes = loadClassFromJrt(internalName);
         }
@@ -92,15 +87,9 @@ public class DependencyResolver {
             }
         }
 
-        // 3. Fallback to reflection
         loadClassViaReflection(internalName);
     }
 
-    /**
-     * Loads class metadata via Java Reflection.
-     * Works reliably for system classes that are present in the runtime ClassLoader.
-     * Array types (names starting with '[') are skipped – they are not needed for struct generation.
-     */
     private void loadClassViaReflection(String internalName) {
         try {
             String binaryName = internalName.replace('/', '.');
@@ -116,7 +105,6 @@ public class DependencyResolver {
                 .isInterface(clazz.isInterface())
                 .isExternal(false);
 
-            // Fields
             for (Field field : clazz.getDeclaredFields()) {
                 String desc = org.objectweb.asm.Type.getDescriptor(field.getType());
                 builder.field(FieldNode.builder()
@@ -127,7 +115,6 @@ public class DependencyResolver {
                     .build());
             }
 
-            // Methods – also collect polymorphic signature methods
             for (Method method : clazz.getDeclaredMethods()) {
                 String desc = org.objectweb.asm.Type.getMethodDescriptor(method);
                 org.objectweb.asm.Type retAsmType = org.objectweb.asm.Type.getReturnType(method);
@@ -163,7 +150,6 @@ public class DependencyResolver {
                 }
             }
 
-            // Constructors
             for (java.lang.reflect.Constructor<?> ctor : clazz.getDeclaredConstructors()) {
                 String desc = org.objectweb.asm.Type.getConstructorDescriptor(ctor);
                 org.objectweb.asm.Type[] paramAsmTypes = org.objectweb.asm.Type.getArgumentTypes(desc);
@@ -210,9 +196,6 @@ public class DependencyResolver {
         }
     }
 
-    /**
-     * Loads class bytes from the jrt:/ file system.
-     */
     private byte[] loadClassFromJrt(String internalName) {
         try {
             FileSystem fs = getJrtFileSystem();
@@ -227,22 +210,27 @@ public class DependencyResolver {
             }
 
             for (String moduleName : moduleNames) {
-                Path classPath = fs.getPath("modules", moduleName, internalName + ".class");
+                // Leading '/' is REQUIRED: the JRT filesystem resolves
+                // relative paths against an internal root that does not
+                // contain the module tree, so Files.exists() on a path
+                // built by fs.getPath("modules", ...) silently returns
+                // false. The absolute form is the only one that works.
+                Path classPath = fs.getPath(
+                    "/modules/" + moduleName + "/" + internalName + ".class");
                 if (Files.exists(classPath)) {
                     byte[] bytes = Files.readAllBytes(classPath);
-                    log.debug("Loaded system class {} from jrt:/{}/{}", internalName, moduleName, internalName + ".class");
+                    log.debug("Loaded system class {} from jrt:/{}/{}",
+                        internalName, moduleName, internalName + ".class");
                     return bytes;
                 }
             }
         } catch (Exception e) {
-            log.debug("Failed to load system class {} via jrt:/: {}", internalName, e.getMessage());
+            log.debug("Failed to load system class {} via jrt:/: {}",
+                internalName, e.getMessage());
         }
         return null;
     }
 
-    /**
-     * Returns the jrt:/ FileSystem, creating it if necessary.
-     */
     private FileSystem getJrtFileSystem() throws IOException {
         if (jrtFileSystem != null && jrtFileSystem.isOpen()) {
             return jrtFileSystem;
@@ -258,20 +246,45 @@ public class DependencyResolver {
         }
     }
 
-    /**
-     * Forces a reload of a system class (removes stub and retries).
-     */
     public synchronized void forceLoadSystemClass(String internalName) {
         ClassNode existing = classMap.get(internalName);
-        if (existing != null && existing.isExternal()) {
-            classMap.remove(internalName);
-            classBytes.remove(internalName);
-            missingClasses.remove(internalName);
+        if (existing != null) {
+            // A class produced by loadClassViaReflection carries
+            // isExternal == false but has no bytecode: reflection does
+            // not expose <clinit> and does not hand over the raw class
+            // file.  Such a class must be re-resolved from the JRT image
+            // (or the ClassLoader) so that every method body can be
+            // translated and every call site resolves at link time.
+            boolean noBytes = classBytes.get(internalName) == null
+                && !existing.isInterface();
+            if (existing.isExternal() || noBytes) {
+                classMap.remove(internalName);
+                classBytes.remove(internalName);
+                missingClasses.remove(internalName);
+                loadedClasses.remove(internalName);
+            }
         }
         loadSystemClass(internalName);
     }
 
-    // --- The rest of the class (scan, parseClassFile, etc.) remains unchanged ---
+    /**
+     * Discards any cached metadata and re-resolves the class from scratch,
+     * preferring the JRT image or ClassLoader over reflection.
+     *
+     * <p>A {@link ClassNode} produced by {@link #loadClassViaReflection} has
+     * no {@code <clinit>} entry (reflection does not expose static
+     * initializers) and no associated {@code classBytes}. Any pass that
+     * needs the bytecode-level view of a class — in particular, emitting
+     * its static initializer — must call this method first so the class
+     * is re-resolved from its actual {@code .class} payload.</p>
+     */
+    public synchronized void reloadSystemClass(String internalName) {
+        classMap.remove(internalName);
+        classBytes.remove(internalName);
+        missingClasses.remove(internalName);
+        loadedClasses.remove(internalName);
+        loadSystemClass(internalName);
+    }
 
     public void scan(Path path) throws IOException {
         if (Files.isDirectory(path)) {
@@ -428,7 +441,7 @@ public class DependencyResolver {
 
     private void buildSubclassIndex() {
         for (ClassNode cn : classMap.values()) {
-            if (cn.getSuperName() != null && !cn.getSuperName().equals("java/lang/Object")) {
+            if (cn.getSuperName() != null) {
                 subclasses.computeIfAbsent(cn.getSuperName(), k -> new HashSet<>()).add(cn.getName());
             }
             for (String iface : cn.getInterfaces()) {
@@ -437,15 +450,10 @@ public class DependencyResolver {
         }
     }
 
-    public Map<String, ClassNode> getClassMap() {
-        return classMap;
-    }
-
     public ClassNode getClassNode(String internalName) {
         ClassNode node = classMap.get(internalName);
         if (node != null) return node;
 
-        // Try to lazily load the system class
         loadSystemClass(internalName);
         node = classMap.get(internalName);
         if (node != null) return node;
@@ -535,7 +543,7 @@ public class DependencyResolver {
         ClassNode classNode = builder
             .fields(fields)
             .methods(methods)
-            .polymorphicMethodNames(polymorphicMethodNames) // <--- added
+            .polymorphicMethodNames(polymorphicMethodNames)
             .build();
 
         String name = currentClassName[0];
@@ -546,8 +554,7 @@ public class DependencyResolver {
         classMap.put(name, classNode);
         classBytes.put(name, bytes);
 
-        // Update subclass index
-        if (classNode.getSuperName() != null && !classNode.getSuperName().equals("java/lang/Object")) {
+        if (classNode.getSuperName() != null) {
             subclasses.computeIfAbsent(classNode.getSuperName(), k -> new HashSet<>()).add(name);
         }
         for (String iface : classNode.getInterfaces()) {
@@ -555,9 +562,6 @@ public class DependencyResolver {
         }
     }
 
-    /**
-     * Returns a MethodNode for the given class, method name, and descriptor.
-     */
     public MethodNode getMethodNode(String className, String methodName, String descriptor) {
         ClassNode cn = classMap.get(className);
         if (cn == null) return null;
@@ -569,10 +573,6 @@ public class DependencyResolver {
         return null;
     }
 
-    /**
-     * Searches for a method in the given class and its superclasses.
-     * Returns the MethodNode if found, and stores the owner class name in foundOwner (if non-null).
-     */
     public MethodNode findMethodInHierarchy(String className, String methodName, String descriptor, String[] foundOwner) {
         ClassNode cn = classMap.get(className);
         if (cn == null) {
@@ -586,6 +586,14 @@ public class DependencyResolver {
                 return mn;
             }
         }
+
+        for (MethodNode mn : cn.getMethods()) {
+            if (mn.getName().equals(methodName) && mn.isPolymorphicSignature()) {
+                if (foundOwner != null) foundOwner[0] = className;
+                return mn;
+            }
+        }
+
         String superName = cn.getSuperName();
         if (superName != null && !superName.equals(className)) {
             MethodNode result = findMethodInHierarchy(superName, methodName, descriptor, foundOwner);
@@ -607,7 +615,6 @@ public class DependencyResolver {
 
         ClassNode cn = classMap.get(className);
         if (cn == null) {
-            // Lazy-load system classes (same as findMethodInHierarchy)
             loadSystemClass(className);
             cn = classMap.get(className);
             if (cn == null) return null;
@@ -617,14 +624,12 @@ public class DependencyResolver {
             if (f.getName().equals(fieldName)) return f;
         }
 
-        // Walk up the superclass hierarchy — the field may be inherited.
         String superName = cn.getSuperName();
         if (superName != null && !superName.equals("java/lang/Object")) {
             FieldNode inherited = getField(superName, fieldName);
             if (inherited != null) return inherited;
         }
 
-        // Static fields can also be declared on interfaces.
         for (String iface : cn.getInterfaces()) {
             FieldNode ifaceField = getField(iface, fieldName);
             if (ifaceField != null) return ifaceField;

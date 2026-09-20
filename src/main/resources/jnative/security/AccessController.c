@@ -120,3 +120,8 @@ void __jnative_fn_java_security_AccessController_checkPermission__Ljava_security
         void* perm) {
     (void)perm;
 }
+
+void __jnative_fn_java_security_AccessController_ensureMaterializedForStackWalk__Ljava_lang_Object__V(
+        void* value) {
+    (void)value;
+}

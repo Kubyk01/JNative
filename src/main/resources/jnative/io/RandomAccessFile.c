@@ -4,11 +4,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <errno.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 
 __attribute__((noreturn)) void __jnative_throw_exception(void* exc);
 __attribute__((noreturn)) void __jnative_throw_null_pointer_exception(void);
+
+extern const char* __jnative_read_string_bytes(void* s, int32_t* out_len);
 
 /*
  * Object layout used by this runtime for java.io.RandomAccessFile:
@@ -34,14 +38,120 @@ __attribute__((noreturn)) void __jnative_throw_null_pointer_exception(void);
 #define RAF_POSITION_OFFSET 16
 #define RAF_RW_OFFSET       24
 
-#define JAVA_ARR_HDR 4
+#define FD_RAW_FD_OFFSET    8
+
+#define JAVA_ARR_HDR 8
 
 static inline void* fd_object_of(void* this_file) {
     return *(void**)((char*)this_file + RAF_FD_OFFSET);
 }
 
 static inline int32_t fd_of_fd_object(void* fd_obj) {
-    return *(int32_t*)((char*)fd_obj + 8);
+    return *(int32_t*)((char*)fd_obj + FD_RAW_FD_OFFSET);
+}
+
+/* --------------------------------------------------------------------------
+ * private native void open0(String name, int mode) throws FileNotFoundException;
+ *
+ * Opens the named file in the requested mode and stores the resulting
+ * kernel descriptor into the already-allocated FileDescriptor that the
+ * RandomAccessFile constructor created. The mode integer is one of the
+ * constants the Java layer declares:
+ *
+ *     1  = O_RDONLY                    ("r")
+ *     2  = O_RDWR                      ("rw")
+ *     6  = O_RDWR | O_SYNC             ("rws")
+ *     10 = O_RDWR | O_DSYNC            ("rwd")
+ *
+ * Those numeric values are not the platform's O_* constants; they are
+ * the fixed Java-side encoding that the JDK's own C implementation also
+ * uses, which is why the mapping below is spelled out explicitly rather
+ * than relying on the numeric coincidence with Linux's <fcntl.h>.
+ *
+ * Any failure to open the file — ENOENT, EACCES, EISDIR when opening a
+ * directory for writing, EMFILE — surfaces as the generic throw helper.
+ * The Java caller catches and re-raises it as FileNotFoundException with
+ * the file's name attached, matching the reference JDK's behaviour.
+ * ------------------------------------------------------------------------ */
+void __jnative_fn_java_io_RandomAccessFile_open0__Ljava_lang_String_I_V(
+        void* this_file, void* name_str, int32_t mode)
+{
+    if (this_file == NULL || name_str == NULL) {
+        __jnative_throw_null_pointer_exception();
+        return;
+    }
+
+    void* fd_obj = fd_object_of(this_file);
+    if (fd_obj == NULL) {
+        __jnative_throw_null_pointer_exception();
+        return;
+    }
+
+    /* Translate the Java-level mode constants to the platform's open(2)
+     * flags. Any unrecognised value is a programming error at the Java
+     * level; report it as an I/O failure rather than silently opening
+     * with the wrong access mode. */
+    int flags = -1;
+    switch (mode) {
+        case 1:  flags = O_RDONLY;                break;
+        case 2:  flags = O_RDWR;                  break;
+        case 6:  flags = O_RDWR | O_SYNC;         break;
+        case 10: flags = O_RDWR | O_DSYNC;        break;
+        default: flags = -1;                      break;
+    }
+    if (flags < 0) {
+        __jnative_throw_exception(NULL);
+        return;
+    }
+
+    int32_t nameLen = 0;
+    const char* path = __jnative_read_string_bytes(name_str, &nameLen);
+    (void)nameLen;
+    if (path == NULL) {
+        __jnative_throw_null_pointer_exception();
+        return;
+    }
+
+    int fd = open(path, flags);
+    if (fd < 0) {
+        __jnative_throw_exception(NULL);
+        return;
+    }
+
+    *(int32_t*)((char*)fd_obj + FD_RAW_FD_OFFSET) = fd;
+}
+
+/* --------------------------------------------------------------------------
+ * private native long length() throws IOException;
+ *
+ * Total length of the underlying file in bytes, obtained with fstat(2)
+ * on the FileDescriptor. Uses the descriptor rather than the path so
+ * the answer is correct even when the file is being accessed through a
+ * FileDescriptor that has been passed in from elsewhere.
+ * ------------------------------------------------------------------------ */
+int64_t __jnative_fn_java_io_RandomAccessFile_length0___J(void* this_file) {
+    if (this_file == NULL) {
+        __jnative_throw_null_pointer_exception();
+        return 0;
+    }
+
+    void* fd_obj = fd_object_of(this_file);
+    if (fd_obj == NULL) {
+        __jnative_throw_exception(NULL);
+        return 0;
+    }
+    int32_t fd = fd_of_fd_object(fd_obj);
+    if (fd < 0) {
+        __jnative_throw_exception(NULL);
+        return 0;
+    }
+
+    struct stat st;
+    if (fstat(fd, &st) < 0) {
+        __jnative_throw_exception(NULL);
+        return 0;
+    }
+    return (int64_t)st.st_size;
 }
 
 /* --------------------------------------------------------------------------
@@ -180,6 +290,63 @@ int32_t __jnative_fn_java_io_RandomAccessFile_readBytes0___BII_I(
 
     *(int64_t*)((char*)this_file + RAF_POSITION_OFFSET) += (int64_t)n;
     return (int32_t)n;
+}
+
+void __jnative_fn_java_io_RandomAccessFile_writeBytes0___BII_V(
+        void* this_file, void* b, int32_t off, int32_t len)
+{
+    if (this_file == NULL || b == NULL) {
+        __jnative_throw_null_pointer_exception();
+        return;
+    }
+    if (off < 0 || len < 0) {
+        __jnative_throw_exception(NULL);
+        return;
+    }
+    if (len == 0) {
+        return;
+    }
+
+    void* fd_obj = fd_object_of(this_file);
+    if (fd_obj == NULL) {
+        __jnative_throw_exception(NULL);
+        return;
+    }
+    int32_t fd = fd_of_fd_object(fd_obj);
+    if (fd < 0) {
+        __jnative_throw_exception(NULL);
+        return;
+    }
+
+    const uint8_t* src = (const uint8_t*)b + JAVA_ARR_HDR + off;
+    int32_t remaining = len;
+    int64_t written_total = 0;
+
+    while (remaining > 0) {
+        ssize_t n = write(fd, src, (size_t)remaining);
+        if (n < 0) {
+            if (errno == EINTR) {
+                /* Signal delivered before any byte was committed.
+                 * Retry the same write with the same arguments. */
+                continue;
+            }
+            __jnative_throw_exception(NULL);
+            return;
+        }
+        if (n == 0) {
+            /* write(2) returning 0 for a non-zero count is not a
+             * legitimate outcome on a regular file; looping on it
+             * would hang the write forever. */
+            __jnative_throw_exception(NULL);
+            return;
+        }
+
+        src += (size_t)n;
+        remaining -= (int32_t)n;
+        written_total += (int64_t)n;
+    }
+
+    *(int64_t*)((char*)this_file + RAF_POSITION_OFFSET) += written_total;
 }
 
 /* --------------------------------------------------------------------------

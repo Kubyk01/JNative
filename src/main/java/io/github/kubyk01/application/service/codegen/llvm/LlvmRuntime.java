@@ -17,13 +17,13 @@ public class LlvmRuntime {
             declare void @__jnative_debug_clinit(i8*)
             declare void @__jnative_init_string_pool(i8**, i32)
             declare i8* @malloc(i64)
+            declare i8* @calloc(i64, i64)
             declare void @free(i8*)
             declare i32 @printf(i8*, ...)
             declare void @abort() noreturn
             declare i32 @atexit(void ()*)
             declare i64 @llvm.objectsize.i64.p0i8(i8*, i1)
 
-            ; ----- pthread mutex functions -----
             declare i32 @pthread_mutex_lock(i8*)
             declare i32 @pthread_mutex_unlock(i8*)
             declare i32 @pthread_mutex_init(i8*, i8*)
@@ -32,12 +32,11 @@ public class LlvmRuntime {
             declare i32 @pthread_mutexattr_settype(i8*, i32)
             declare i32 @pthread_mutexattr_destroy(i8*)
 
-            ; ----- setjmp / longjmp -----
             declare i32 @_setjmp(i8*) returns_twice
             declare void @longjmp(i8*, i32) noreturn
 
-            ; ----- JNative runtime functions (implemented in jnative_runtime.c) -----
             declare i8* @__jnative_create_string_array(i32, i8**)
+            declare i8* @__jnative_make_bootstrap_props(i32, i32, i32, i32, i32, i32, i32, i32, i32, i32)
             declare i8* @__jnative_new_multi_array(i8*, i32, i32*, i32)
             declare void @__jnative_monitor_enter(i8*)
             declare void @__jnative_monitor_exit(i8*)
@@ -48,26 +47,23 @@ public class LlvmRuntime {
             declare i8* @__jnative_get_exception_object()
             declare i1 @__jnative_catch_matches(i8*, i8**)
 
-            ; ----- Sparse interface table lookup -----
             declare i8** @__jnative_lookup_itable(%JNativeIfaceMap*, i32)
 
-            ; ----- Throw helpers without caller context -----
             declare void @__jnative_throw_null_pointer_exception()
             declare void @__jnative_throw_array_index_out_of_bounds()
             declare void @__jnative_throw_class_cast_exception()
             declare void @__jnative_throw_arithmetic_exception()
 
-            ; ----- Throw helpers with caller context -----
             declare void @__jnative_throw_exception_ctx(i8*, i8*)
-            declare void @__jnative_throw_null_pointer_exception_ctx(i8*)
+            declare void @__jnative_throw_null_pointer_exception_ctx(i8*, i8*)
             declare void @__jnative_throw_array_index_out_of_bounds_ctx(i8*)
             declare void @__jnative_throw_class_cast_exception_ctx(i8*)
             declare void @__jnative_throw_arithmetic_exception_ctx(i8*)
 
-            ; ----- String concatenation -----
+            declare void @__jnative_unresolved_slot(i8*) noreturn
+
             declare i8* @__jnative_concat_strings(i32, ...)
 
-            ; ----- Value to string conversion -----
             declare i8* @__jnative_value_to_string_int(i32)
             declare i8* @__jnative_value_to_string_long(i64)
             declare i8* @__jnative_value_to_string_float(float)
@@ -78,38 +74,23 @@ public class LlvmRuntime {
             declare i8* @__jnative_value_to_string_short(i32)
             declare i8* @__jnative_value_to_string_object(i8*)
 
-            ; ----- Reflection runtime -----
             declare i8* @__jnative_invoke_method(i8*, i8*, i8**)
             declare i8* @__jnative_new_instance(i8*, i8**)
             """;
     }
 
     public static String getVtableTypeDefinition() {
-        return "%JNativeIfaceMapEntry = type { i32, i8** }\n"
-            + "%JNativeIfaceMap      = type { i32, %JNativeIfaceMapEntry* }\n"
-            + "%JNativeVTable       = type { i8**, %JNativeIfaceMap*, i8* }\n";
+        return """
+            %JNativeIfaceMapEntry = type { i32, i8** }
+            %JNativeIfaceMap      = type { i32, %JNativeIfaceMapEntry* }
+            %JNativeVTable       = type { i8**, %JNativeIfaceMap*, i8* }
+            """;
     }
 
     public static int typeStringArrayLength(String s) {
         return s.getBytes(StandardCharsets.UTF_8).length + 1;
     }
 
-    /**
-     * Builds a deterministic, collision-free identifier suffix from the
-     * full UTF-8 byte content of {@code s}.
-     *
-     * <p>Historically the suffix was {@code Integer.toHexString(s.hashCode())}.
-     * That is not injective: distinct strings can share a hash code, e.g.
-     * {@code "Mn"} and {@code "NO"} both hash to {@code 0x9c1}. When two such
-     * strings appeared in the same module the generated IR contained two
-     * globals with identical names and clang rejected it with
-     * {@code redefinition of global}.
-     *
-     * <p>Encoding every byte as two lowercase hex digits guarantees that
-     * distinct strings produce distinct suffixes, and that the same string
-     * always produces the same suffix (an in-process cache avoids rebuilding
-     * long suffixes for the same literal).
-     */
     public static String stringIdSuffix(String s) {
         if (s == null) {
             return "_null";

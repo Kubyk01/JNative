@@ -7,6 +7,7 @@
 #include <dlfcn.h>
 
 struct ReflectionClass {
+    void* vtable;
     void* name;
     struct ReflectionClass* superclass;
     struct ReflectionClass** interfaces;
@@ -23,17 +24,16 @@ extern int __jnative_instanceof(void* obj, void** type_info);
 extern void* __jnative_make_string_obj(const char* bytes, int32_t len);
 extern const char* __jnative_read_string_bytes(void* s, int32_t* out_len);
 
+__attribute__((noreturn)) void __jnative_throw_exception(void* exc);
+__attribute__((noreturn)) void __jnative_throw_null_pointer_exception(void);
+
 /* Java array layout: [int32 length][payload] */
-#define JAVA_ARR_HDR 4
+#define JAVA_ARR_HDR 8
 
 /* --------------------------------------------------------------------------
  * Small helpers
  * ------------------------------------------------------------------------ */
 
-/*
- * Allocates a Java Class[] of the given length. The payload slots are filled
- * with the pointer values supplied by the caller. Used by getInterfaces0.
- */
 static void* make_class_array(struct ReflectionClass** ptrs) {
     int count = 0;
     if (ptrs != NULL) {
@@ -50,6 +50,13 @@ static void* make_class_array(struct ReflectionClass** ptrs) {
     return arr;
 }
 
+static void* make_empty_ref_array(void) {
+    void* arr = malloc(JAVA_ARR_HDR);
+    if (arr == NULL) return NULL;
+    *(int32_t*)arr = 0;
+    return arr;
+}
+
 static struct ReflectionClass* find_registered_class(const char* name) {
     if (name == NULL) return NULL;
     struct ReflectionClass** pp = reflect_all_classes;
@@ -60,6 +67,29 @@ static struct ReflectionClass* find_registered_class(const char* name) {
         pp++;
     }
     return NULL;
+}
+
+/*
+ * Same lookup, but accepts a binary name whose package segments are
+ * separated by '.' instead of '/'. java.lang.Class.forName0 receives the
+ * binary name exactly as written in the Java source, so we must normalise
+ * before hitting reflect_all_classes[] (which is keyed on the slash form
+ * emitted by LlvmGlobalEmitter).
+ */
+static struct ReflectionClass* find_registered_class_dotted(const char* name) {
+    if (name == NULL) return NULL;
+
+    struct ReflectionClass* cls = find_registered_class(name);
+    if (cls != NULL) return cls;
+
+    char buf[512];
+    size_t n = strlen(name);
+    if (n >= sizeof(buf)) return NULL;
+    memcpy(buf, name, n + 1);
+    for (char* p = buf; *p; p++) {
+        if (*p == '.') *p = '/';
+    }
+    return find_registered_class(buf);
 }
 
 static int class_implements_interface(struct ReflectionClass* cls,
@@ -160,19 +190,6 @@ void* __jnative_fn_java_lang_Class_getName___Ljava_lang_String_(void* this_cls) 
     return __jnative_make_string_obj(name, (int32_t)strlen(name));
 }
 
-/*
- * private native String initClassName();
- *
- * Returns the name of the class as computed by the VM. In HotSpot this is
- * the binary name (packages separated by dots), which Class.getName() then
- * hands to callers verbatim. The ReflectionClass in this runtime stores the
- * internal form (slash-separated); we convert on the fly into a thread-local
- * buffer. Because Class caches the result of this method in a transient
- * field, the returned string is not freed by the runtime — the C buffer is
- * therefore deliberately re-used per call and never returned twice without
- * the caller copying it first (the Java side copies it into a heap String
- * the first time getName() is called).
- */
 void* __jnative_fn_java_lang_Class_initClassName___Ljava_lang_String_(void* this_cls) {
     if (this_cls == NULL) return NULL;
     const char* internal = (const char*)((struct ReflectionClass*)this_cls)->name;
@@ -285,7 +302,87 @@ void* __jnative_fn_java_lang_Class_getPrimitiveClass__Ljava_lang_String__Ljava_l
     return (void*)find_registered_class(name);
 }
 
+void* __jnative_fn_java_lang_Class_getProtectionDomain0___Ljava_security_ProtectionDomain_(
+        void* this_cls)
+{
+    (void)this_cls;
+    return NULL;
+}
+
 void __jnative_fn_java_lang_Class_registerNatives___V(void) {
+}
+
+/* --------------------------------------------------------------------------
+ * Class.forName0
+ *
+ *   private static native Class<?> forName0(String name,
+ *                                           boolean initialize,
+ *                                           ClassLoader loader,
+ *                                           Class<?> caller)
+ *       throws ClassNotFoundException;
+ *
+ * The runtime's universe of classes is fixed at build time and lives in the
+ * reflect_all_classes[] table. There is no bytecode-loaded-at-runtime path
+ * and no user class loader hierarchy, so the loader and caller arguments
+ * are ignored. A name that is not present in the table causes the generic
+ * throw helper to fire, which the Java side's ClassNotFoundException catch
+ * block converts into the appropriate checked exception.
+ *
+ * The `initialize` flag is likewise ignored: the runtime eagerly initialises
+ * every reachable class from @main (see LlvmGenerator.generateMain), so a
+ * class is either already initialised by the time forName0 runs or it is not
+ * part of the compiled image at all.
+ */
+void* __jnative_fn_java_lang_Class_forName0__Ljava_lang_String_ZLjava_lang_ClassLoader_Ljava_lang_Class__Ljava_lang_Class_(
+        void* name_str,
+        int32_t initialize,
+        void* loader,
+        void* caller)
+{
+    (void)initialize;
+    (void)loader;
+    (void)caller;
+
+    if (name_str == NULL) {
+        __jnative_throw_null_pointer_exception();
+        return NULL;
+    }
+
+    int32_t len = 0;
+    const char* name = __jnative_read_string_bytes(name_str, &len);
+    if (name == NULL || len <= 0) {
+        /* ClassNotFoundException */
+        __jnative_throw_exception(NULL);
+        return NULL;
+    }
+
+    struct ReflectionClass* cls = find_registered_class_dotted(name);
+    if (cls == NULL) {
+        /* ClassNotFoundException */
+        __jnative_throw_exception(NULL);
+        return NULL;
+    }
+    return (void*)cls;
+}
+
+/* --------------------------------------------------------------------------
+ * desiredAssertionStatus0
+ *
+ *   private static native boolean desiredAssertionStatus0(Class<?> clazz);
+ *
+ * Asserts are always disabled in this runtime: java.lang.Class's
+ * desiredAssertionStatus() path is short-circuited at the Java layer only
+ * for classes whose assertion status was explicitly set, and every other
+ * class reaches this native. The reference JDK consults the class's
+ * per-loader assert setting; this runtime has no per-loader assert state
+ * (there is only the bootstrap loader and no -ea/-da mechanism), so the
+ * only correct answer is false.
+ */
+int32_t __jnative_fn_java_lang_Class_desiredAssertionStatus0__Ljava_lang_Class__Z(
+        void* this_cls)
+{
+    (void)this_cls;
+    return 0;
 }
 
 /* --------------------------------------------------------------------------
@@ -299,27 +396,12 @@ void __jnative_fn_java_lang_Class_registerNatives___V(void) {
  * defined path instead of dereferencing a NULL vtable slot.
  * ------------------------------------------------------------------------ */
 
-/*
- * private static native Class<?>[] getInterfaces0();
- *
- * The interface list is available (stored as a NULL-terminated C array of
- * ReflectionClass pointers on the class), so we can materialise the proper
- * Java Class[] form.
- */
 void* __jnative_fn_java_lang_Class_getInterfaces0____Ljava_lang_Class_(void* this_cls) {
     if (this_cls == NULL) return NULL;
     struct ReflectionClass* cls = (struct ReflectionClass*)this_cls;
     return make_class_array(cls->interfaces);
 }
 
-/*
- * private native String getGenericSignature0();
- *
- * The generic signature attribute is not retained by the parser. Returning
- * null makes Class.getGenericInterfaces / getGenericSuperclass fall back
- * to the erased (non-generic) view, which is the correct behaviour for a
- * runtime that does not round-trip generic metadata.
- */
 void* __jnative_fn_java_lang_Class_getGenericSignature0___Ljava_lang_String_(void* this_cls) {
     (void)this_cls;
     return NULL;
@@ -329,18 +411,32 @@ void* __jnative_fn_java_lang_Class_getGenericSignature0___Ljava_lang_String_(voi
  * private native Method[] getDeclaredMethods0(boolean publicOnly);
  *
  * The runtime does not build Method objects from the class structure. An
- * empty array is a valid — and the only truthful — answer here: every
- * caller (Class.getDeclaredMethods, privateGetDeclaredMethods, and their
- * internal users) handles a zero-length result as "no methods visible".
+ * empty array is a valid — and the only truthful — answer here.
  */
 void* __jnative_fn_java_lang_Class_getDeclaredMethods0__Z__Ljava_lang_reflect_Method_(
         void* this_cls, int32_t public_only) {
     (void)this_cls;
     (void)public_only;
-    void* arr = malloc(JAVA_ARR_HDR);
-    if (arr == NULL) return NULL;
-    *(int32_t*)arr = 0;
-    return arr;
+    return make_empty_ref_array();
+}
+
+/*
+ * private native Field[] getDeclaredFields0(boolean publicOnly);
+ *
+ * Same rationale as getDeclaredMethods0: the class parser keeps only the
+ * structural information required for code generation and never builds
+ * Field objects. Every caller (Class.getDeclaredFields / getFields and
+ * their internal users) handles a zero-length array as "no fields visible".
+ *
+ * The LLVM backend currently emits an external call to this symbol from
+ * java.lang.Class's getFields path, so its presence is required for the
+ * module to link.
+ */
+void* __jnative_fn_java_lang_Class_getDeclaredFields0__Z__Ljava_lang_reflect_Field_(
+        void* this_cls, int32_t public_only) {
+    (void)this_cls;
+    (void)public_only;
+    return make_empty_ref_array();
 }
 
 /*
@@ -350,68 +446,31 @@ void* __jnative_fn_java_lang_Class_getDeclaredConstructors0__Z__Ljava_lang_refle
         void* this_cls, int32_t public_only) {
     (void)this_cls;
     (void)public_only;
-    void* arr = malloc(JAVA_ARR_HDR);
-    if (arr == NULL) return NULL;
-    *(int32_t*)arr = 0;
-    return arr;
+    return make_empty_ref_array();
 }
 
-/*
- * private native String getSimpleBinaryName0();
- *
- * Only meaningful for local and anonymous classes, which this runtime does
- * not model. Returning null makes Class.getSimpleName() fall back to the
- * ordinary name-derived path, which is correct for every top-level and
- * member class in the compiled universe.
- */
 void* __jnative_fn_java_lang_Class_getSimpleBinaryName0___Ljava_lang_String_(void* this_cls) {
     (void)this_cls;
     return NULL;
 }
 
-/*
- * private native Class<?> getNestHost0();
- *
- * A null result signals "no separate nest host": the caller substitutes
- * `this` and every class is its own nest host. That matches the flat,
- * single-module structure of the compiled image.
- */
 void* __jnative_fn_java_lang_Class_getNestHost0___Ljava_lang_Class_(void* this_cls) {
     (void)this_cls;
     return NULL;
 }
 
-/*
- * private native Class<?>[] getPermittedSubclasses0();
- *
- * Sealed classes are not supported: returning null makes
- * Class.getPermittedSubclasses() return null per the JDK contract for
- * non-sealed classes.
- */
 void* __jnative_fn_java_lang_Class_getPermittedSubclasses0____Ljava_lang_Class_(
         void* this_cls) {
     (void)this_cls;
     return NULL;
 }
 
-/*
- * private native RecordComponent[] getRecordComponents0();
- *
- * Records are not modelled: returning null makes
- * Class.getRecordComponents() return null, which is the documented
- * behaviour for non-record classes.
- */
 void* __jnative_fn_java_lang_Class_getRecordComponents0____Ljava_lang_reflect_RecordComponent_(
         void* this_cls) {
     (void)this_cls;
     return NULL;
 }
 
-/*
- * private native boolean isRecord0();
- *
- * False for every class in the compiled universe.
- */
 int32_t __jnative_fn_java_lang_Class_isRecord0___Z(void* this_cls) {
     (void)this_cls;
     return 0;

@@ -11,6 +11,7 @@ extern void* __jnative_make_string_obj(const char* bytes, int32_t len);
 #define CP_OOP_OFFSET        16
 
 struct ReflectionClass {
+    void* vtable;
     void* name;
     struct ReflectionClass* superclass;
     struct ReflectionClass** interfaces;

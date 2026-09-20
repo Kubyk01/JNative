@@ -220,6 +220,16 @@ void __jnative_fn_java_lang_Thread_yield__V(void) {
     sched_yield();
 }
 
+/*
+ * JDK 17+ renamed several Thread natives by appending a '0' to the
+ * Java-visible name. The bodies are identical to their un-suffixed
+ * counterparts; we keep both symbol families present so the same C file
+ * works across JDK 8 — 22 build targets.
+ */
+void __jnative_fn_java_lang_Thread_yield0___V(void) {
+    __jnative_fn_java_lang_Thread_yield__V();
+}
+
 void __jnative_fn_java_lang_Thread_start__V(void* this_thread) {
     if (!this_thread) {
         __jnative_throw_null_pointer_exception();
@@ -258,6 +268,11 @@ void __jnative_fn_java_lang_Thread_start__V(void* this_thread) {
         free(sa);
         __jnative_throw_exception(NULL);
     }
+}
+
+/* JDK 17+ name for Thread.start(). Forward to the legacy implementation. */
+void __jnative_fn_java_lang_Thread_start0___V(void* this_thread) {
+    __jnative_fn_java_lang_Thread_start__V(this_thread);
 }
 
 /*
@@ -312,6 +327,11 @@ void __jnative_fn_java_lang_Thread_setPriority__I(void* this_thread, int newPrio
     if (!this_thread) return;
     ThreadState* s = find_thread_state(this_thread);
     if (s) s->priority = newPriority;
+}
+
+/* JDK 17+ name for setPriority. Forward to the legacy implementation. */
+void __jnative_fn_java_lang_Thread_setPriority0__I_V(void* this_thread, int newPriority) {
+    __jnative_fn_java_lang_Thread_setPriority__I(this_thread, newPriority);
 }
 
 int __jnative_fn_java_lang_Thread_getPriority__I(void* this_thread) {
@@ -436,6 +456,23 @@ void __jnative_fn_java_lang_Thread_clearInterrupt__V(void* this_thread) {
     pthread_mutex_unlock(&s->mutex);
 }
 
+/*
+ * JDK 17+ name for Thread.clearInterrupt(). The reference implementation
+ * additionally clears the per-thread interrupt *event* (the Windows-style
+ * event object that Thread.interrupt() signals to wake a blocked I/O
+ * operation). This runtime has no such event object — interrupt state
+ * lives entirely in the ThreadState.interrupted flag, and the blocking
+ * primitives (Object.wait, Thread.sleep, Thread.join) re-check the flag
+ * on every wake-up. Clearing the flag is therefore all that is required.
+ *
+ * Both the legacy clearInterrupt() and the modern getAndClearInterrupt()
+ * paths reach this symbol, so it must forward to the same flag-clearing
+ * body.
+ */
+void __jnative_fn_java_lang_Thread_clearInterruptEvent___V(void* this_thread) {
+    __jnative_fn_java_lang_Thread_clearInterrupt__V(this_thread);
+}
+
 void __jnative_fn_java_lang_Thread_exit__V(void* this_thread) {
     if (!this_thread) return;
     ThreadState* s = find_thread_state(this_thread);
@@ -462,6 +499,10 @@ void __jnative_fn_java_lang_Thread_setScopedValueCache___Ljava_lang_Object__V(vo
 
 int64_t __jnative_fn_java_lang_Thread_getNextThreadIdOffset___J(void) {
     return (int64_t)JLTHREAD_TID_OFFSET;
+}
+
+void __jnative_fn_java_lang_Thread_sleep0__J_V(long millis) {
+    __jnative_fn_java_lang_Thread_sleep__J(millis);
 }
 
 void __jnative_fn_java_lang_Thread_registerNatives___V(void* arg) {

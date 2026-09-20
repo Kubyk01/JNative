@@ -60,8 +60,12 @@ public class LlvmUtil {
     }
 
     public static String extractCalleeName(Instruction inst) {
-        if (!inst.getOperands().isEmpty()) {
-            Value v = inst.getOperands().getFirst();
+        int idx = switch (inst.getOpcode()) {
+            case VIRTUAL_CALL, INTERFACE_CALL, SPECIAL_CALL -> 1;
+            default -> 0;
+        };
+        if (inst.getOperands().size() > idx) {
+            Value v = inst.getOperands().get(idx);
             if (v instanceof Constant c && c.getType().isReference()) {
                 return c.getValue().toString();
             }
@@ -70,11 +74,27 @@ public class LlvmUtil {
     }
 
     public static List<Value> getCallArguments(Instruction inst) {
+        Opcode op = inst.getOpcode();
         List<Value> args = new ArrayList<>();
-        boolean skipFirst = true;
-        for (Value op : inst.getOperands()) {
-            if (skipFirst) { skipFirst = false; continue; }
-            args.add(op);
+        switch (op) {
+            case VIRTUAL_CALL, INTERFACE_CALL, SPECIAL_CALL: {
+                // operands = [receiver, calleeConst, arg0, arg1, ...]
+                // receiver —  0; calleeConst skip.
+                if (!inst.getOperands().isEmpty()) {
+                    args.add(inst.getOperands().getFirst());
+                }
+                for (int i = 2; i < inst.getOperands().size(); i++) {
+                    args.add(inst.getOperands().get(i));
+                }
+                break;
+            }
+            default: {
+                // CALL / STATIC_CALL: operands = [calleeConst, arg0, arg1, ...]
+                for (int i = 1; i < inst.getOperands().size(); i++) {
+                    args.add(inst.getOperands().get(i));
+                }
+                break;
+            }
         }
         return args;
     }
@@ -97,6 +117,17 @@ public class LlvmUtil {
             else return "java/lang/Object";
         }
         return "java/lang/Object";
+    }
+
+    public static boolean isAllocation(Opcode op) {
+        return op == Opcode.NEW || op == Opcode.NEW_ARRAY || op == Opcode.MULTI_NEW_ARRAY;
+    }
+
+    public static String[] extractFieldOwnerAndName(Instruction inst) {
+        String full = extractFieldName(inst);
+        int dot = full.lastIndexOf('.');
+        if (dot > 0) return new String[]{full.substring(0, dot), full.substring(dot + 1)};
+        return new String[]{"", full};
     }
 
 }

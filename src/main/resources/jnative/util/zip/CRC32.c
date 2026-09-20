@@ -6,7 +6,7 @@
  * The length header occupies exactly 4 bytes (see NEW_ARRAY in
  * LlvmFunctionEmitter and __jnative_create_string_array in the runtime).
  */
-#define JAVA_ARR_HDR 4
+#define JAVA_ARR_HDR 8
 
 /* IEEE 802.3 / zlib CRC-32 polynomial, reflected form. */
 #define CRC32_POLY 0xEDB88320u

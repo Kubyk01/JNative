@@ -231,6 +231,34 @@ public class StackFrame {
         }
     }
 
+    /**
+     * Returns the current operand stack from bottom to top. The head of the
+     * underlying Deque is the top of the stack; this method reverses that
+     * ordering so index 0 is the bottom-most value.
+     */
+    public List<Value> snapshotStackFromBottom() {
+        List<Value> result = new ArrayList<>(stack);
+        Collections.reverse(result);
+        return result;
+    }
+
+    /**
+     * Returns the types of the top {@code n} values of the stack, in
+     * bottom-to-top order. Used to reconstruct the expected stack shape at a
+     * bytecode label. If the stack is shorter than {@code n}, fewer types are
+     * returned; callers treat that as a bytecode-level inconsistency.
+     */
+    public List<Type> snapshotStackTypesFromBottom(int n) {
+        List<Value> all = snapshotStackFromBottom();
+        int actual = Math.min(n, all.size());
+        List<Type> types = new ArrayList<>(actual);
+        int start = all.size() - actual;
+        for (int i = start; i < all.size(); i++) {
+            types.add(all.get(i).getType());
+        }
+        return types;
+    }
+
     public void clear() {
         stack.clear();
     }

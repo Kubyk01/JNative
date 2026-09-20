@@ -21,7 +21,7 @@ __attribute__((noreturn)) void __jnative_throw_class_cast_exception(void);
 __attribute__((noreturn)) void __jnative_throw_arithmetic_exception(void);
 __attribute__((noreturn)) void __jnative_throw_bad_vtable(void* method_name, void* obj);
 __attribute__((noreturn)) void __jnative_throw_exception_ctx(void* exc, const char* caller);
-__attribute__((noreturn)) void __jnative_throw_null_pointer_exception_ctx(const char* caller);
+__attribute__((noreturn)) void __jnative_throw_null_pointer_exception_ctx(const char* caller, const char* var_desc);
 __attribute__((noreturn)) void __jnative_throw_array_index_out_of_bounds_ctx(const char* caller);
 __attribute__((noreturn)) void __jnative_throw_class_cast_exception_ctx(const char* caller);
 __attribute__((noreturn)) void __jnative_throw_arithmetic_exception_ctx(const char* caller);
@@ -57,6 +57,7 @@ struct ReflectionConstructor {
 };
 
 struct ReflectionClass {
+    void* vtable;
     void* name;
     struct ReflectionClass*   superclass;
     struct ReflectionClass**  interfaces;
@@ -476,7 +477,7 @@ static void __jnative_install_fatal_handlers(void) {
  * Exception message extraction
  * ========================================================================== */
 
-#define JNATIVE_THROWABLE_MESSAGE_OFFSET 24
+#define JNATIVE_THROWABLE_MESSAGE_OFFSET 16
 
 static const char* __jnative_read_exception_message(void* exc, const char* clsName) {
     if (exc == NULL) return NULL;
@@ -488,11 +489,16 @@ static const char* __jnative_read_exception_message(void* exc, const char* clsNa
 
 /* ============================================================================
  * Unhandled-exception reporting
+ *
+ * `extra` carries an optional register/value description that the LLVM
+ * emitter attaches to NullPointerException throws — e.g. "%tmp_20739" or
+ * "%param_1". It is printed as a supplementary line right below the
+ * function in which the throw happened.
  * ========================================================================== */
 
 __attribute__((noreturn))
 static void __jnative_log_unhandled_exception(void* exc, const char* className,
-                                              const char* caller) {
+                                              const char* caller, const char* extra) {
     const char* clsName = className;
     char dottedBuf[256];
     const char* dotted = NULL;
@@ -518,6 +524,10 @@ static void __jnative_log_unhandled_exception(void* exc, const char* className,
         char demangled[1024];
         __jnative_demangle(caller, demangled, sizeof(demangled));
         fprintf(stderr, "\tat %s\n", demangled);
+    }
+
+    if (extra != NULL) {
+        fprintf(stderr, "\t(null value: %s)\n", extra);
     }
 
     void* buffer[64];
@@ -582,15 +592,16 @@ void __jnative_throw_exception_ctx(void* exc, const char* caller) {
     current_exception = exc;
     CatchContext* ctx = current_context;
     if (ctx) longjmp(ctx->buf, 1);
-    __jnative_log_unhandled_exception(exc, NULL, caller);
+    __jnative_log_unhandled_exception(exc, NULL, caller, NULL);
 }
 
 __attribute__((noreturn))
-void __jnative_throw_null_pointer_exception_ctx(const char* caller) {
+void __jnative_throw_null_pointer_exception_ctx(const char* caller, const char* var_desc) {
     current_exception = NULL;
     CatchContext* ctx = current_context;
     if (ctx) longjmp(ctx->buf, 1);
-    __jnative_log_unhandled_exception(NULL, "java.lang.NullPointerException", caller);
+    __jnative_log_unhandled_exception(NULL, "java.lang.NullPointerException",
+                                      caller, var_desc);
 }
 
 __attribute__((noreturn))
@@ -598,7 +609,8 @@ void __jnative_throw_array_index_out_of_bounds_ctx(const char* caller) {
     current_exception = NULL;
     CatchContext* ctx = current_context;
     if (ctx) longjmp(ctx->buf, 1);
-    __jnative_log_unhandled_exception(NULL, "java.lang.ArrayIndexOutOfBoundsException", caller);
+    __jnative_log_unhandled_exception(NULL, "java.lang.ArrayIndexOutOfBoundsException",
+                                      caller, NULL);
 }
 
 __attribute__((noreturn))
@@ -606,7 +618,7 @@ void __jnative_throw_class_cast_exception_ctx(const char* caller) {
     current_exception = NULL;
     CatchContext* ctx = current_context;
     if (ctx) longjmp(ctx->buf, 1);
-    __jnative_log_unhandled_exception(NULL, "java.lang.ClassCastException", caller);
+    __jnative_log_unhandled_exception(NULL, "java.lang.ClassCastException", caller, NULL);
 }
 
 __attribute__((noreturn))
@@ -614,7 +626,7 @@ void __jnative_throw_arithmetic_exception_ctx(const char* caller) {
     current_exception = NULL;
     CatchContext* ctx = current_context;
     if (ctx) longjmp(ctx->buf, 1);
-    __jnative_log_unhandled_exception(NULL, "java.lang.ArithmeticException", caller);
+    __jnative_log_unhandled_exception(NULL, "java.lang.ArithmeticException", caller, NULL);
 }
 
 __attribute__((noreturn))
@@ -624,7 +636,7 @@ void __jnative_throw_exception(void* exc) {
 
 __attribute__((noreturn))
 void __jnative_throw_null_pointer_exception(void) {
-    __jnative_throw_null_pointer_exception_ctx(NULL);
+    __jnative_throw_null_pointer_exception_ctx(NULL, NULL);
 }
 
 __attribute__((noreturn))
@@ -676,20 +688,71 @@ void __jnative_throw_bad_vtable(void* method_name, void* obj) {
 }
 
 /* ============================================================================
+ * Unresolved vtable/itable slot
+ *
+ * A null function pointer in a vtable or itable slot means a code-generation
+ * pass left a slot unpopulated: the corresponding method's mangled symbol was
+ * not present in the module when LlvmGlobalEmitter.generateVtables() built the
+ * table. Executing that slot would jump to address 0 and crash with an
+ * uninformative "SIGSEGV at 0x0" — no frame, no method name, no class.
+ *
+ * Every such slot is filled with the address of a small trap stub whose name
+ * is derived from the (class, interface, signature) triple. Each stub calls
+ * this runtime helper, passing the pre-formatted "class '...', slot '...'"
+ * message that identifies the incomplete table entry. We print the diagnostic
+ * together with a call tree and abort, turning a silent, unrecoverable
+ * jump-to-null into an actionable report.
+ *
+ * The signature matches the LLVM declaration emitted by
+ * LlvmRuntime.getDeclarations():
+ *
+ *     declare void @__jnative_unresolved_slot(i8*) noreturn
+ *
+ * i.e. a single pointer to a NUL-terminated string. The stub passes the
+ * string as an i8*, which is bit-compatible with const char* on this ABI.
+ * ========================================================================== */
+__attribute__((noreturn))
+void __jnative_unresolved_slot(const char* what) {
+    char line[1024];
+    int n = snprintf(line, sizeof(line),
+        "\n=== JNative unresolved vtable/itable slot ===\n"
+        "%s\n"
+        "Cause : codegen emitted a null function pointer for a slot that\n"
+        "        was never populated by LlvmGlobalEmitter.resolveVtableEntry.\n"
+        "        The mangled method symbol was absent from the Module at\n"
+        "        generateVtables() time.\n",
+        what != NULL ? what : "<unknown slot>");
+    if (n > 0) (void)!write(2, line, (size_t)n);
+
+    n = snprintf(line, sizeof(line), "\nCall tree (from throw point):\n");
+    if (n > 0) (void)!write(2, line, (size_t)n);
+    __jnative_unwind_with_backtrace(0);
+
+    n = snprintf(line, sizeof(line),
+        "\n=== end of JNative unresolved-slot trace ===\n\n");
+    if (n > 0) (void)!write(2, line, (size_t)n);
+
+    fflush(stderr);
+    signal(SIGABRT, SIG_DFL);
+    abort();
+}
+
+/* ============================================================================
  * Argument array construction
  * ========================================================================== */
 
 void* __jnative_create_string_array(int argc, char** argv) {
-    int total_size = 4 + argc * 8;
-    void* array = malloc(total_size);
+    int total_size = 8 + argc * 8;
+    void* array = calloc(1, (size_t)total_size);
     if (!array) return NULL;
     *(int*)array = argc;
-    char** slots = (char**)((char*)array + 4);
+    *(int*)((char*)array + 4) = 8;
+    char** slots = (char**)((char*)array + 8);
     for (int i = 0; i < argc; i++) {
         int len = strlen(argv[i]);
-        char* str = malloc(len + 1);
+        char* str = malloc((size_t)len + 1);
         if (str) {
-            strcpy(str, argv[i]);
+            memcpy(str, argv[i], (size_t)len + 1);
             slots[i] = str;
         } else {
             slots[i] = NULL;
@@ -706,12 +769,14 @@ static void* create_multi_array_rec(const char* desc, int last_dim, int* sizes,
                                     int current_dim, int elem_size) {
     int is_last = (current_dim == last_dim);
     int length = sizes[current_dim];
-    int total_size = 4 + length * (is_last ? elem_size : sizeof(void*));
-    void* array = malloc(total_size);
+    int slot_size = is_last ? elem_size : (int)sizeof(void*);
+    int64_t total_size = 8 + (int64_t)length * (int64_t)slot_size;
+    void* array = calloc(1, (size_t)total_size);
     if (!array) return NULL;
-    *(int*)array = length;
+    *(int32_t*)array = length;
+    *(int32_t*)((char*)array + 4) = slot_size;
     if (!is_last) {
-        void** slots = (void**)((char*)array + 4);
+        void** slots = (void**)((char*)array + 8);
         for (int i = 0; i < length; i++) {
             slots[i] = create_multi_array_rec(desc, last_dim, sizes, current_dim + 1, elem_size);
         }
@@ -754,17 +819,18 @@ void* __jnative_new_instance(struct ReflectionConstructor* ctor, void** args) {
 extern struct JNativeVTable vtable_java_lang_String;
 
 void* __jnative_make_string_obj(const char* bytes, int32_t len) {
-    void* value = malloc(4 + (size_t)len + 1);
+    void* value = calloc(1, 8 + (size_t)len + 1);
     if (value == NULL) {
-        __jnative_throw_null_pointer_exception_ctx(NULL);
+        __jnative_throw_null_pointer_exception_ctx(NULL, NULL);
     }
     *(int32_t*)value = len;
-    if (len > 0) memcpy((char*)value + 4, bytes, (size_t)len);
-    ((char*)value)[4 + len] = '\0';
+    *(int32_t*)((char*)value + 4) = 1;
+    if (len > 0) memcpy((char*)value + 8, bytes, (size_t)len);
+    ((char*)value)[8 + len] = '\0';
 
-    void* s = malloc(32);
+    void* s = calloc(1, 32);
     if (s == NULL) {
-        __jnative_throw_null_pointer_exception_ctx(NULL);
+        __jnative_throw_null_pointer_exception_ctx(NULL, NULL);
     }
     *(void**)((char*)s + 0)  = (void*)&vtable_java_lang_String;
     *(void**)((char*)s + 8)  = value;
@@ -785,7 +851,7 @@ const char* __jnative_read_string_bytes(void* s, int32_t* out_len) {
         return "";
     }
     if (out_len) *out_len = *(int32_t*)value;
-    return (const char*)value + 4;
+    return (const char*)value + 8;
 }
 
 static int32_t __jnative_string_eq(void* a, void* b) {
@@ -843,7 +909,7 @@ void* __jnative_concat_strings(int count, ...) {
 
     char* buf = malloc(total + 1);
     if (buf == NULL) {
-        __jnative_throw_null_pointer_exception_ctx(NULL);
+        __jnative_throw_null_pointer_exception_ctx(NULL, NULL);
     }
     size_t pos = 0;
     va_start(args, count);

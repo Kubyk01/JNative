@@ -10,12 +10,13 @@
  * class that reaches the LLVM emitter is materialised as a @__type_info_*
  * global and — if it is reachable via reflection — registered in the
  * reflect_all_classes[] table. There is no bytecode-loaded-at-runtime path
- * and no user-defined class loader hierarchy. The two natives below are the
+ * and no user-defined class loader hierarchy. The natives below are the
  * only ones that the JDK's ClassLoader implementation actually reaches in
  * that setup.
  */
 
 struct ReflectionClass {
+    void* vtable;
     void* name;
     struct ReflectionClass* superclass;
     struct ReflectionClass** interfaces;
@@ -33,9 +34,9 @@ extern const char* __jnative_read_string_bytes(void* s, int32_t* out_len);
 /* --------------------------------------------------------------------------
  * Lookup helper — finds a ReflectionClass by its binary name. Accepts both
  * slash-separated ("java/lang/Object") and dot-separated ("java.lang.Object")
- * forms, because ClassLoader.findLoadedClass0 receives the binary name as it
- * was spelled in the original source, whereas reflect_all_classes[] is keyed
- * on the internal slash form emitted by LlvmGlobalEmitter.
+ * forms, because ClassLoader's natives receive the binary name as it was
+ * spelled in the original source, whereas reflect_all_classes[] is keyed on
+ * the internal slash form emitted by LlvmGlobalEmitter.
  * ------------------------------------------------------------------------ */
 static struct ReflectionClass* find_registered_class(const char* name) {
     if (name == NULL || reflect_all_classes == NULL) return NULL;
@@ -90,13 +91,100 @@ void* __jnative_fn_java_lang_ClassLoader_findLoadedClass0__Ljava_lang_String__Lj
 }
 
 /* --------------------------------------------------------------------------
+ * private static native Class<?> findBootstrapClass(String name);
+ *
+ * Bootstrap-loader counterpart of findLoadedClass0. In this runtime the
+ * bootstrap loader is the only loader and there is no separate bootstrap
+ * class table — every class reachable at build time is already present in
+ * reflect_all_classes[]. The name arrives as a binary name (dots), so we
+ * reuse the dotted-form lookup.
+ *
+ * The caller (ClassLoader.findBootstrapClassOrNull) treats a null result as
+ * "not present in the bootstrap loader" and falls through to the ordinary
+ * loadClass path, which will in turn raise ClassNotFoundException at the
+ * Java layer for any name outside the compiled universe. That is the
+ * correct behaviour: this runtime cannot load classes that were not part
+ * of the build-time reachability closure.
+ * ------------------------------------------------------------------------ */
+void* __jnative_fn_java_lang_ClassLoader_findBootstrapClass__Ljava_lang_String__Ljava_lang_Class_(
+        void* name_str) {
+    if (name_str == NULL) return NULL;
+    int32_t len = 0;
+    const char* name = __jnative_read_string_bytes(name_str, &len);
+    (void)len;
+    return (void*)find_registered_class_dotted(name);
+}
+
+/* --------------------------------------------------------------------------
+ * private static native Class<?> defineClass0(ClassLoader loader,
+ *                                             Class<?> lookup,
+ *                                             String name,
+ *                                             byte[] b,
+ *                                             int off,
+ *                                             int len,
+ *                                             ProtectionDomain pd,
+ *                                             boolean initialize,
+ *                                             int flags,
+ *                                             Object classData);
+ *
+ * The modern (JDK 9+) entry point that ClassLoader.defineClass delegates
+ * to, reached from ClassLoader's own defineClass paths and from
+ * MethodHandles.Lookup.defineClass / java.lang.invoke's hidden-class
+ * machinery. The `lookup` argument is the caller's Lookup object, `flags`
+ * carries the access-mode bits that distinguish a normal class from a
+ * hidden one, and `classData` is the opaque token that the JDK's Class
+ * object exposes through Class.getClassData.
+ *
+ * This runtime has no runtime bytecode loader at all: every class that
+ * reaches the LLVM emitter is compiled into the executable at build
+ * time, and there is no mechanism by which new bytes can be turned into
+ * a live Class object. Returning NULL is the documented "loading
+ * refused" answer, and every Java caller of this native translates a
+ * NULL return into the appropriate checked exception:
+ *
+ *   - ClassLoader.defineClass -> ClassFormatError / NoClassDefFoundError
+ *   - MethodHandles.Lookup.defineClass -> IllegalArgumentException
+ *   - the hidden-class path in InnerClassLambdaMetafactory -> an
+ *     InternalError about the VM not supporting hidden classes
+ *
+ * All three failure modes are well-defined and the Java layer already
+ * handles them. Returning NULL is therefore both truthful and safe.
+ *
+ * The arguments are deliberately ignored. There is no class table to
+ * look the name up in, no bytecode buffer to parse, no protection
+ * domain to attach, and no class-data slot to write into.
+ * ------------------------------------------------------------------------ */
+void* __jnative_fn_java_lang_ClassLoader_defineClass0__Ljava_lang_ClassLoader_Ljava_lang_Class_Ljava_lang_String__BIILjava_security_ProtectionDomain_ZILjava_lang_Object__Ljava_lang_Class_(
+        void* this_loader,
+        void* lookup,
+        void* name,
+        void* b,
+        int32_t off,
+        int32_t len,
+        void* protection_domain,
+        int32_t initialize,
+        int32_t flags,
+        void* class_data) {
+    (void)this_loader;
+    (void)lookup;
+    (void)name;
+    (void)b;
+    (void)off;
+    (void)len;
+    (void)protection_domain;
+    (void)initialize;
+    (void)flags;
+    (void)class_data;
+    return NULL;
+}
+
+/* --------------------------------------------------------------------------
  * private native Class<?> defineClass1(ClassLoader loader, String name,
  *     byte[] b, int off, int len, ProtectionDomain pd, String source);
  *
- * This runtime has no runtime bytecode loader. Every class must already be
- * present in the compiled module. Returning null makes ClassLoader.loadClass
- * raise ClassNotFoundException with a meaningful message at the Java level,
- * instead of dereferencing an undefined symbol or corrupting the heap.
+ * Pre-JDK-9 signature. Retained for builds whose ClassLoader still emits
+ * the older call site. Same rationale and same return value as
+ * defineClass0.
  * ------------------------------------------------------------------------ */
 void* __jnative_fn_java_lang_ClassLoader_defineClass1__Ljava_lang_ClassLoader_Ljava_lang_String__BIILjava_security_ProtectionDomain_Ljava_lang_String__Ljava_lang_Class_(
         void* this_loader,

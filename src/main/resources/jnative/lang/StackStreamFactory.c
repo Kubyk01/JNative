@@ -1,17 +1,29 @@
 #include <stdint.h>
 
+// todo fix that
 /*
  * java.lang.StackStreamFactory.checkStackWalkModes() -> boolean
  *
- * HotSpot-specific check that tells StackWalker whether the VM annotates
- * individual frames with a walk-mode (visible vs. hidden). This runtime
- * does not maintain per-frame walk-mode metadata: the stack is unwound
- * through backtrace()/frame-pointers with no VM-side frame tagging, so
- * only WALK_ALL_FRAMES is meaningful. Returning false makes the caller
- * fall back to that mode.
+ * HotSpot-specific check that tells the class initializer whether the
+ * VM's JavaLangAccess walk-mode constants agree with the ones compiled
+ * into the class body. In HotSpot a "false" answer aborts <clinit> with
+ * an InternalError, because the StackWalker implementation would then
+ * dispatch to VM entry points whose mode bits mean something else.
+ *
+ * This runtime has no VM-side mode constants. Every walk-mode bit
+ * (DEFAULT_MODE, FILL_CLASS_REFS_ONLY, GET_CALLER_CLASS, SHOW_HIDDEN_FRAMES,
+ * FILL_LIVE_STACK_FRAMES) is defined only in the Java source and is
+ * consumed only by the three native entry points in this file, all of
+ * which unconditionally return "no frames". There is nothing the VM
+ * could disagree with, so the check always succeeds.
+ *
+ * Returning 0 here would make StackStreamFactory.<clinit> throw
+ * InternalError("StackWalker mode values do not match with JVM") before
+ * the class is usable, which is precisely the failure this stub exists
+ * to prevent.
  */
 int32_t __jnative_fn_java_lang_StackStreamFactory_checkStackWalkModes___Z(void) {
-    return 0;
+    return 1;
 }
 
 /* =========================================================================

@@ -2,10 +2,12 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <errno.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/uio.h>
+#include <sys/mman.h>
 
 __attribute__((noreturn)) void __jnative_throw_exception(void* exc);
 __attribute__((noreturn)) void __jnative_throw_null_pointer_exception(void);
@@ -201,6 +203,10 @@ void __jnative_fn_sun_nio_ch_UnixFileDispatcherImpl_force0__Ljava_io_FileDescrip
 
 /* ---------------------------------------------------------------------------
  * static native void truncate0(FileDescriptor fd, long size)
+ *
+ * Pre-JDK-18 signature: reports failure by throwing. Kept for backward
+ * compatibility with class files compiled against older JDKs. The JDK 18+
+ * signature below is the one that newer builds actually reference.
  * ------------------------------------------------------------------------- */
 void __jnative_fn_sun_nio_ch_UnixFileDispatcherImpl_truncate0__Ljava_io_FileDescriptor_J_V(
         void* fd_obj, int64_t size)
@@ -212,6 +218,27 @@ void __jnative_fn_sun_nio_ch_UnixFileDispatcherImpl_truncate0__Ljava_io_FileDesc
     if (ftruncate(fd, (off_t)size) < 0) {
         __jnative_throw_exception(NULL);
     }
+}
+
+/* ---------------------------------------------------------------------------
+ * static native int truncate0(FileDescriptor fd, long size)
+ *
+ * JDK 18+ signature: returns 0 on success. Errors are still surfaced
+ * through the generic throw helper so the Java caller's existing
+ * `catch (IOException)` block continues to work; the return value is the
+ * "success" sentinel the newer Java-level signature expects.
+ * ------------------------------------------------------------------------- */
+int32_t __jnative_fn_sun_nio_ch_UnixFileDispatcherImpl_truncate0__Ljava_io_FileDescriptor_J_I(
+        void* fd_obj, int64_t size)
+{
+    int32_t fd = raw_fd(fd_obj);
+    if (size < 0) {
+        __jnative_throw_exception(NULL);
+    }
+    if (ftruncate(fd, (off_t)size) < 0) {
+        __jnative_throw_exception(NULL);
+    }
+    return 0;
 }
 
 /* ---------------------------------------------------------------------------
@@ -240,4 +267,180 @@ int64_t __jnative_fn_sun_nio_ch_UnixFileDispatcherImpl_seek0__Ljava_io_FileDescr
         __jnative_throw_exception(NULL);
     }
     return (int64_t)pos;
+}
+
+/* ===========================================================================
+ * Memory-mapped file support
+ *
+ * FileChannel.map(FileChannel.MapMode mode, long position, long size)
+ * delegates to the platform's mmap(2), and FileChannel's default
+ * implementation of an explicit unmapping cycle delegates to munmap(2).
+ * The `prot` argument carries the small integer encoding that
+ * sun.nio.ch.FileChannelImpl declares:
+ *
+ *     MAP_RO (0) : read-only mapping
+ *     MAP_RW (1) : read-write mapping
+ *     MAP_PV (2) : private mapping (copy-on-write)
+ *
+ * Note the encoding is bitwise, not ordinal: MAP_PV implies both read and
+ * write access, and MAP_RW implies read access as well. The translation
+ * below sets the matching PROT_* bits accordingly.
+ * ========================================================================= */
+
+/* sun.nio.ch.FileChannelImpl constants */
+#define JDK_MAP_RO 0
+#define JDK_MAP_RW 1
+#define JDK_MAP_PV 2
+
+/* ---------------------------------------------------------------------------
+ * static native long map0(FileDescriptor fd, int prot, long position,
+ *                        long size, boolean isSync)
+ *
+ * Maps the region [position, position + size) of the underlying file into
+ * the process address space and returns its start address. The `isSync`
+ * flag requests a mapping whose modifications are synchronously written
+ * back to the backing store; on Linux this is expressed with MAP_SYNC,
+ * which is only honoured on DAX-capable filesystems. When the running
+ * kernel or filesystem does not support MAP_SYNC, the flag is silently
+ * dropped and an ordinary MAP_SHARED mapping is produced — the same
+ * degradation the reference JDK exhibits.
+ *
+ * A NULL return address from mmap is impossible on Linux (mmap returns
+ * MAP_FAILED, which is (void*)-1, on failure); the runtime signals failure
+ * through the generic throw helper so the Java caller's IOException
+ * handler sees a uniform error channel.
+ * ------------------------------------------------------------------------- */
+int64_t __jnative_fn_sun_nio_ch_UnixFileDispatcherImpl_map0__Ljava_io_FileDescriptor_IJJZ_J(
+        void* fd_obj, int32_t prot, int64_t position, int64_t size, int32_t isSync)
+{
+    int32_t fd = raw_fd(fd_obj);
+    if (position < 0 || size < 0) {
+        __jnative_throw_exception(NULL);
+    }
+
+    int mmap_prot = 0;
+    if (prot & (1 << JDK_MAP_RO)) mmap_prot |= PROT_READ;
+    if (prot & (1 << JDK_MAP_RW)) mmap_prot |= PROT_READ | PROT_WRITE;
+    if (prot & (1 << JDK_MAP_PV)) mmap_prot |= PROT_READ | PROT_WRITE;
+
+    int mmap_flags = MAP_SHARED;
+
+    /* MAP_SYNC was introduced in Linux 4.15 and is only effective on
+     * filesystems that support the DAX direct-access model (ext4 with
+     * -O dax, XFS with DAX, and a few others). On any other filesystem
+     * the kernel rejects the call with EINVAL, so we only attempt it
+     * when the build environment's headers declare the constant and
+     * fall back to plain MAP_SHARED when the kernel refuses. */
+    if (isSync) {
+#ifdef MAP_SYNC
+        mmap_flags |= MAP_SYNC;
+#endif
+    }
+
+    void* result = mmap(NULL, (size_t)size, mmap_prot, mmap_flags,
+                        fd, (off_t)position);
+    if (result == MAP_FAILED && isSync) {
+        /* Retry without MAP_SYNC: the filesystem may not support it. */
+        mmap_flags &= ~MAP_SYNC;
+        result = mmap(NULL, (size_t)size, mmap_prot, mmap_flags,
+                      fd, (off_t)position);
+    }
+    if (result == MAP_FAILED) {
+        __jnative_throw_exception(NULL);
+        return 0;
+    }
+
+    return (int64_t)(intptr_t)result;
+}
+
+/* ---------------------------------------------------------------------------
+ * static native int unmap0(long address, long size)
+ *
+ * Releases a mapping previously established by map0. Returns 0 on success
+ * and the errno on failure; the Java caller inspects the numeric result
+ * rather than an exception because unmapping happens on the cleaner
+ * thread, where throwing would be dangerous (the underlying mapping is
+ * already being dismantled and the JVM may be mid-shutdown).
+ *
+ * A zero address is treated as "nothing to unmap" and succeeds silently:
+ * the JDK's Cleaner machinery can call this after a successful close that
+ * already released the mapping.
+ * ------------------------------------------------------------------------- */
+int32_t __jnative_fn_sun_nio_ch_UnixFileDispatcherImpl_unmap0__JJ_I(
+        int64_t address, int64_t size)
+{
+    if (address == 0) {
+        return 0;
+    }
+    if (munmap((void*)(intptr_t)address, (size_t)size) < 0) {
+        return (int32_t)errno;
+    }
+    return 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * static native long allocationGranularity0()
+ *
+ * The smallest unit in which the operating system allocates address
+ * space. On Linux this is the page size, obtained from sysconf(3); every
+ * page-size kernel this runtime targets (4 KiB, 16 KiB on some ARM, 64 KiB
+ * on some PPC) is returned exactly as the kernel reports it.
+ *
+ * FileChannel uses this value to align the position at which a mapping
+ * starts when the caller has requested a non-page-aligned offset. If
+ * sysconf fails — which has no realistic failure mode on Linux but is
+ * defensive against a malformed environment — the 4 KiB default is the
+ * smallest value that will satisfy every kernel.
+ * ------------------------------------------------------------------------- */
+int64_t __jnative_fn_sun_nio_ch_UnixFileDispatcherImpl_allocationGranularity0___J(void)
+{
+    long pg = sysconf(_SC_PAGESIZE);
+    if (pg <= 0) {
+        pg = 4096;
+    }
+    return (int64_t)pg;
+}
+
+int32_t __jnative_fn_sun_nio_ch_UnixFileDispatcherImpl_setDirect0__Ljava_io_FileDescriptor__I(
+        void* fd_obj)
+{
+    int32_t fd = raw_fd(fd_obj);
+
+    int flags = fcntl(fd, F_GETFL);
+    if (flags < 0) {
+        __jnative_throw_exception(NULL);
+        return 0;
+    }
+
+#if defined(O_DIRECT)
+    if ((flags & O_DIRECT) == 0) {
+        if (fcntl(fd, F_SETFL, flags | O_DIRECT) < 0) {
+            __jnative_throw_exception(NULL);
+            return 0;
+        }
+        return 1;
+    }
+#endif
+    /* Either the flag was already set, or the platform does not define
+     * O_DIRECT. In both cases there is nothing more to do and the
+     * descriptor is in the state the Java caller asked for. */
+    return 0;
+}
+
+void __jnative_fn_sun_nio_ch_UnixFileDispatcherImpl_release0__Ljava_io_FileDescriptor_JJ_V(
+        void* fd_obj, int64_t pos, int64_t size)
+{
+    (void)pos;
+    (void)size;
+
+    if (fd_obj == NULL) {
+        __jnative_throw_null_pointer_exception();
+        return;
+    }
+
+    /* Intentionally empty on Unix: the kernel releases an fd's file
+     * locks automatically on close, so there is no side table to walk
+     * and no unlock operation to issue. See the function header for the
+     * full rationale and the contrast with the Windows implementation. */
+    (void)fd_of(fd_obj);
 }

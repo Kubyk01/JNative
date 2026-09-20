@@ -3,6 +3,7 @@ package io.github.kubyk01.application.service.analyzer.reachabilityanalysis;
 import io.github.kubyk01.application.service.analyzer.dependencyresolver.DependencyResolver;
 import io.github.kubyk01.application.service.analyzer.ssa.TypeResolver;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.ClassNode;
+import io.github.kubyk01.domain.analyzer.dependencyresolver.FieldNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.FieldReference;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.MethodNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.MethodReference;
@@ -377,6 +378,32 @@ public class MethodBytecodeVisitor extends ClassVisitor {
                 && desc.equals("()Ljava/lang/Object;")) {
                 return true;
             }
+            // ------------------------------------------------------------------
+            // jdk.internal.misc.Unsafe.objectFieldOffset(Class, String)
+            // (and its native bridge objectFieldOffset1).
+            //
+            // The call sites that matter here all live in static initializers
+            // of JDK classes that compute their own field offsets at class-
+            // initialization time — ConcurrentHashMap.<clinit> is the
+            // canonical example, computing SIZECTL, TRANSFERINDEX, BASECOUNT
+            // and CELLSBUSY exactly this way.
+            //
+            // Treating the call as reflective is what makes the reachability
+            // walk register the named field in ReflectInfo. Without that
+            // registration LlvmGlobalEmitter emits an empty @reffields_*
+            // array for the target class; the runtime's
+            // objectFieldOffset1 then returns 0 for every lookup, and any
+            // CAS that uses the returned offset compares the object's
+            // vtable slot at offset 0 instead of the intended field. For
+            // ConcurrentHashMap.initTable the effect is a livelock: the
+            // CAS on sizeCtl never succeeds because it is not looking at
+            // sizeCtl.
+            // ------------------------------------------------------------------
+            if (owner.equals("jdk/internal/misc/Unsafe")
+                && (name.equals("objectFieldOffset") || name.equals("objectFieldOffset1"))
+                && desc.equals("(Ljava/lang/Class;Ljava/lang/String;)J")) {
+                return true;
+            }
             return false;
         }
 
@@ -386,6 +413,30 @@ public class MethodBytecodeVisitor extends ClassVisitor {
             addMethodWithContext(reflectiveRef, reachableFromUser);
 
             if (!reachableFromUser) return;
+
+            // ------------------------------------------------------------------
+            // Unsafe.objectFieldOffset(Class, String) /
+            // Unsafe.objectFieldOffset1(Class, String).
+            //
+            // Both arguments of every JDK call site that reaches this path are
+            // statically resolvable: the class argument is always an LDC of a
+            // class literal (which also sets `lastLoadedClass`), and the field
+            // name is always an LDC of a string constant. Registering the
+            // resolved (class, field) pair in ReflectInfo ensures
+            // LlvmGlobalEmitter.generateReflectionData emits a
+            // @reffields_<class> entry with the same byte offset that every
+            // direct GET_FIELD/PUT_FIELD in the generated code uses.
+            //
+            // This is what makes ConcurrentHashMap's static initializer
+            // agree with the CAS operations in initTable about where
+            // sizeCtl actually lives.
+            // ------------------------------------------------------------------
+            if (owner.equals("jdk/internal/misc/Unsafe")
+                && (mName.equals("objectFieldOffset") || mName.equals("objectFieldOffset1"))
+                && mDesc.equals("(Ljava/lang/Class;Ljava/lang/String;)J")) {
+                registerUnsafeObjectFieldOffset(args);
+                return;
+            }
 
             if (owner.equals("java/lang/Class") && mName.equals("forName")
                 && mDesc.equals("(Ljava/lang/String;)Ljava/lang/Class;")) {
@@ -505,6 +556,60 @@ public class MethodBytecodeVisitor extends ClassVisitor {
                     }
                 }
             }
+        }
+
+        private void registerUnsafeObjectFieldOffset(List<TypedValue> args) {
+            if (args.size() < 2) return;
+
+            String targetClass = resolveClassNameFromValue(args.getFirst());
+            if (targetClass == null && lastLoadedClass != null) {
+                // The class literal LDC that immediately precedes this call
+                // set lastLoadedClass. Fall back to it when the arg itself
+                // could not be resolved, which happens when the class was
+                // ASTORE'd into a local and ALOAD'd back with a widened type.
+                targetClass = lastLoadedClass;
+            }
+            if (targetClass == null) return;
+
+            String fieldName = null;
+            TypedValue nameArg = args.get(1);
+            if (nameArg.isConstant() && nameArg.getValue() instanceof String s) {
+                fieldName = s;
+            }
+            if (fieldName == null) return;
+
+            ClassNode cn = resolver.getClassNode(targetClass);
+            if (cn == null || cn.isExternal() || resolver.getClassBytes(targetClass) == null) {
+                resolver.forceLoadSystemClass(targetClass);
+                cn = resolver.getClassNode(targetClass);
+            }
+            if (cn == null || cn.isExternal()) return;
+
+            FieldNode fn = resolver.getField(targetClass, fieldName);
+            if (fn == null) return;
+
+            FieldReference ref = new FieldReference(targetClass, fieldName, fn.getDescriptor());
+            reflectInfo.addField(targetClass, ref);
+            reflectInfo.getOrCreateClassInfo(targetClass);
+            addClass(targetClass);
+        }
+
+        /**
+         * Extracts an internal (slash-separated) class name from a
+         * {@link TypedValue} produced by an {@code LDC} of a class
+         * literal. The simulator stores such literals as a constant whose
+         * value is the class's internal name and whose declared type is a
+         * reference to that same class.
+         */
+        private String resolveClassNameFromValue(TypedValue tv) {
+            if (tv == null) return null;
+            if (tv.isConstant() && tv.getValue() instanceof String s && !s.isEmpty()) {
+                return s.replace('.', '/');
+            }
+            if (tv.isExact()) {
+                return tv.getClassName();
+            }
+            return null;
         }
 
         private boolean typeMatches(String expected, Type actual) {

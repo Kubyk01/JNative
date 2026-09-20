@@ -26,7 +26,7 @@ __attribute__((noreturn)) void __jnative_throw_null_pointer_exception(void);
 #define WINDOW_SIZE     65536
 #define WINDOW_MASK     (WINDOW_SIZE - 1)
 #define ADLER_BASE      65521
-#define JAVA_ARR_HDR    4
+#define JAVA_ARR_HDR 8
 
 /* =========================================================================
  *  Decoder state

@@ -73,3 +73,19 @@ int64_t __jnative_fn_jdk_internal_perf_Perf_highResFrequency___J(void) {
     perf_high_res_frequency_cached = hz;
     return hz;
 }
+
+/*
+ * private static native void registerNatives();
+ *
+ * Called from jdk.internal.perf.Perf.<clinit>. In HotSpot this hook binds
+ * the class's other natives (createLong, createByteArray, createString,
+ * highResCounter, highResFrequency) to their JVM-side implementations.
+ *
+ * This runtime resolves every native method through its statically-linked
+ * __jnative_fn_<class>_<method>_<desc> symbol emitted by the LLVM
+ * backend, and call sites resolve to it directly. There is no native
+ * registry to populate and no method table to patch. The symbol must
+ * nevertheless exist because Perf.<clinit> emits a native call to it.
+ */
+void __jnative_fn_jdk_internal_perf_Perf_registerNatives___V(void) {
+}

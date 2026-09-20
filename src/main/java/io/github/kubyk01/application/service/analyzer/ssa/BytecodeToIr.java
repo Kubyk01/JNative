@@ -82,10 +82,20 @@ public class BytecodeToIr {
 
             byte[] bytes = resolver.getClassBytes(owner);
             if (bytes == null) {
-                log.warn("No bytecode for class {}; emitting external declaration for {}.{}{}",
+                // Try one more time — the class may have been loaded via
+                // reflection earlier and not yet replaced by its real
+                // bytecode-backed ClassNode.
+                resolver.forceLoadSystemClass(owner);
+                bytes = resolver.getClassBytes(owner);
+            }
+            if (bytes == null) {
+                // Do NOT emit a declaration without a body: the linker
+                // would fail with an undefined-symbol error.  Skipping the
+                // method leaves the mangled name out of the module, and the
+                // LLVM emitter will skip any call to it.
+                log.warn("No bytecode for class {}; method {}.{}{} will "
+                    + "be skipped (no body emitted)",
                     owner, owner, name, desc);
-                Function func = createExternalFunction(methodRef, isStatic);
-                functionMap.put(methodRef, func);
                 return;
             }
 

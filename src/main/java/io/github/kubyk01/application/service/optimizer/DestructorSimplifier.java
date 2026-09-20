@@ -59,20 +59,23 @@ public class DestructorSimplifier {
     }
 
     private void eliminateDeadDestructors() {
-        // Build the destructor call graph from destruction points and the shutdown function
-        Set<Function> called = new HashSet<>();
-        for (Map.Entry<AllocationSite, Set<DestructionPoint>> entry : lifetimeResult.getDestructionPoints().entrySet()) {
+        Set<Function> called = new LinkedHashSet<>();
+
+        for (Map.Entry<AllocationSite, Set<DestructionPoint>> entry
+            : lifetimeResult.getDestructionPoints().entrySet()) {
             Type type = entry.getKey().getType();
             Function dtor = module.getFunction(destructorName(type));
-            if (dtor != null) called.add(dtor);
+            if (dtor != null && called.add(dtor)) {
+                collectCalls(dtor, called);
+            }
         }
-        // The shutdown function may also call destructors of static fields
+
         Function shutdown = module.getFunction("__jnative_shutdown");
         if (shutdown != null) {
             collectCalls(shutdown, called);
         }
 
-        // Remove destructors that are never called
+        // Remove destructors that are never called.
         Set<Function> dead = new HashSet<>(destructors);
         dead.removeAll(called);
         for (Function func : dead) {

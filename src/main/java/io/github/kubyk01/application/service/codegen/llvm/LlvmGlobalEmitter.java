@@ -21,6 +21,7 @@ import io.github.kubyk01.domain.ir.InvokeDynamicInfo;
 import io.github.kubyk01.domain.ir.LookupSwitchTerminator;
 import io.github.kubyk01.domain.ir.Module;
 import io.github.kubyk01.domain.ir.Opcode;
+import io.github.kubyk01.domain.ir.Parameter;
 import io.github.kubyk01.domain.ir.ReturnTerminator;
 import io.github.kubyk01.domain.ir.TableSwitchTerminator;
 import io.github.kubyk01.domain.ir.Terminator;
@@ -49,6 +50,9 @@ public class LlvmGlobalEmitter {
     private final Map<String, Integer> fieldOffsets = new HashMap<>();
     private final Set<String> emittedStringConstants = new HashSet<>();
     private final List<String> stringLiteralPool = new ArrayList<>();
+    private final Set<String> deferredStrings = new LinkedHashSet<>();
+
+    private final Set<String> emittedVtableThunks = new HashSet<>();
 
     public int getLiteralPoolSize() {
         return stringLiteralPool.size();
@@ -86,6 +90,7 @@ public class LlvmGlobalEmitter {
         String adaptorName;
         List<Type> capturedTypes;
     }
+
     private final Map<String, LambdaInfo> lambdaRegistry = new LinkedHashMap<>();
 
     public void addExtraStruct(String name, String definition) {
@@ -109,6 +114,8 @@ public class LlvmGlobalEmitter {
     }
 
     public void prepareLayouts() {
+        resolver.forceLoadSystemClass("java/lang/String");
+
         if (layoutsBuilt) return;
 
         List<ClassNode> all = new ArrayList<>(resolver.getClassMap().values());
@@ -256,7 +263,7 @@ public class LlvmGlobalEmitter {
 
     private boolean isVtableVirtual(MethodNode mn) {
         int access = mn.getAccess();
-        if ((access & Opcodes.ACC_STATIC)  != 0) return false;
+        if ((access & Opcodes.ACC_STATIC) != 0) return false;
         if ((access & Opcodes.ACC_PRIVATE) != 0) return false;
         String n = mn.getName();
         return !n.equals("<init>") && !n.equals("<clinit>");
@@ -322,7 +329,11 @@ public class LlvmGlobalEmitter {
     private static final class ResolvedFn {
         final String name;
         final String type;
-        ResolvedFn(String name, String type) { this.name = name; this.type = type; }
+
+        ResolvedFn(String name, String type) {
+            this.name = name;
+            this.type = type;
+        }
     }
 
     private ResolvedFn resolveVtableEntry(String className, String sig) {
@@ -336,13 +347,27 @@ public class LlvmGlobalEmitter {
         if (mn == null || mn.isAbstract()) return null;
 
         String owner = foundOwner[0] != null ? foundOwner[0] : className;
-        String baseName   = LlvmRuntime.mangleMethod(owner, name, desc);
+        String baseName = LlvmRuntime.mangleMethod(owner, name, desc);
         String nativeName = "__jnative_" + baseName;
 
         String funcName;
         if (module.getFunction(baseName) != null) {
             funcName = baseName;
         } else if (module.getFunction(nativeName) != null) {
+            funcName = nativeName;
+        } else if (mn.isNative()) {
+            Type retType = mn.getReturnType();
+            List<Type> paramTypes = mn.getParameterTypes();
+
+            List<Type> allParams = new ArrayList<>();
+            allParams.add(Type.reference(owner));
+            allParams.addAll(paramTypes);
+
+            Function nf = new Function(nativeName, retType);
+            for (int i = 0; i < allParams.size(); i++) {
+                nf.addParameter(new Parameter(allParams.get(i), i));
+            }
+            module.addFunction(nf);
             funcName = nativeName;
         } else {
             return null;
@@ -355,6 +380,48 @@ public class LlvmGlobalEmitter {
             params.append(", ").append(LlvmTypeMapper.toLlvmType(pt));
         }
         return new ResolvedFn(funcName, ret + " (" + params + ")*");
+    }
+
+    private String vtableSlotEntry(String className,
+                                   String ifaceOrNull,
+                                   String sig,
+                                   ResolvedFn fn,
+                                   StringBuilder sb) {
+        if (fn != null) {
+            return "i8* bitcast (" + fn.type + " @" + fn.name + " to i8*)";
+        }
+
+        String slotId = LlvmTypeMapper.sanitizeIdentifier(className)
+            + (ifaceOrNull == null
+            ? ""
+            : "_" + LlvmTypeMapper.sanitizeIdentifier(ifaceOrNull))
+            + "_" + LlvmTypeMapper.sanitizeIdentifier(sig);
+
+        String thunkName = "__jnative_vtable_missing_" + slotId;
+
+        if (!emittedVtableThunks.add(thunkName)) {
+            return "i8* bitcast (i8* (...)* @" + thunkName + " to i8*)";
+        }
+
+        String message;
+        if (ifaceOrNull == null) {
+            message = "class '" + className + "', slot '" + sig + "'";
+        } else {
+            message = "interface '" + ifaceOrNull
+                + "' implemented by '" + className
+                + "', slot '" + sig + "'";
+        }
+
+        String msgRef = ensureStringConstantPtr(sb, message);
+
+        sb.append("define i8* @").append(thunkName).append("(...) {\n")
+            .append("entry:\n")
+            .append("  call void @__jnative_unresolved_slot(i8* ")
+            .append(msgRef).append(")\n")
+            .append("  unreachable\n")
+            .append("}\n");
+
+        return "i8* bitcast (i8* (...)* @" + thunkName + " to i8*)";
     }
 
     private String generateVtables() {
@@ -388,9 +455,7 @@ public class LlvmGlobalEmitter {
             for (int i = 0; i < layout.slots.size(); i++) {
                 String sig = layout.slots.get(i);
                 ResolvedFn fn = resolveVtableEntry(className, sig);
-                if (fn != null) {
-                    entries.set(i, "i8* bitcast (" + fn.type + " @" + fn.name + " to i8*)");
-                }
+                entries.set(i, vtableSlotEntry(className, null, sig, fn, sb));
             }
 
             String methodsName = "@vtable_methods_" + LlvmTypeMapper.sanitizeIdentifier(className);
@@ -410,9 +475,9 @@ public class LlvmGlobalEmitter {
             String className = cls.getName();
 
             Set<String> ifaces = collectAllInterfaces(cls);
-            Map<String, String>  itableNames = new LinkedHashMap<>();
-            Map<String, Integer> itableLens  = new LinkedHashMap<>();
-            Map<String, Integer> itableIds   = new LinkedHashMap<>();
+            Map<String, String> itableNames = new LinkedHashMap<>();
+            Map<String, Integer> itableLens = new LinkedHashMap<>();
+            Map<String, Integer> itableIds = new LinkedHashMap<>();
 
             for (String iface : ifaces) {
                 Integer ifaceId = interfaceIds.get(iface);
@@ -427,9 +492,7 @@ public class LlvmGlobalEmitter {
                 for (int i = 0; i < ifaceLayout.slots.size(); i++) {
                     String sig = ifaceLayout.slots.get(i);
                     ResolvedFn fn = resolveVtableEntry(className, sig);
-                    if (fn != null) {
-                        entries.set(i, "i8* bitcast (" + fn.type + " @" + fn.name + " to i8*)");
-                    }
+                    entries.set(i, vtableSlotEntry(className, iface, sig, fn, sb));
                 }
 
                 String itableName = "@itable_"
@@ -591,17 +654,14 @@ public class LlvmGlobalEmitter {
 
         for (LambdaInfo info : lambdaRegistry.values()) {
             String lambdaClassName = info.lambdaClassName;
-            String samInterface    = info.samInterface;
+            String samInterface = info.samInterface;
 
             List<String> methodEntries = new ArrayList<>(methodLen);
             for (int i = 0; i < methodLen; i++) methodEntries.add("i8* null");
             for (int i = 0; i < objectLayout.slots.size(); i++) {
                 String sig = objectLayout.slots.get(i);
                 ResolvedFn fn = resolveVtableEntry("java/lang/Object", sig);
-                if (fn != null) {
-                    methodEntries.set(i,
-                        "i8* bitcast (" + fn.type + " @" + fn.name + " to i8*)");
-                }
+                methodEntries.set(i, vtableSlotEntry("java/lang/Object", null, sig, fn, sb));
             }
 
             String methodsName = "@vtable_methods_"
@@ -621,7 +681,12 @@ public class LlvmGlobalEmitter {
             int samSlot = samSlotObj;
 
             List<String> itableEntries = new ArrayList<>(samLen);
-            for (int i = 0; i < samLen; i++) itableEntries.add("i8* null");
+            for (int i = 0; i < samLen; i++) {
+                String sig = i < samLayout.slots.size()
+                    ? samLayout.slots.get(i)
+                    : "<unknown>";
+                itableEntries.add(vtableSlotEntry(lambdaClassName, samInterface, sig, null, sb));
+            }
             itableEntries.set(samSlot,
                 "i8* bitcast (i8* (i8*, ...)* @" + info.adaptorName + " to i8*)");
 
@@ -808,6 +873,33 @@ public class LlvmGlobalEmitter {
         return sb.toString();
     }
 
+    public void registerDeferredString(String s) {
+        if (s != null && !s.isEmpty()) {
+            deferredStrings.add(s);
+        }
+    }
+
+    public String generateDeferredStringConstants() {
+        if (deferredStrings.isEmpty()) return "";
+
+        List<String> sorted = new ArrayList<>(deferredStrings);
+        Collections.sort(sorted);
+
+        StringBuilder body = new StringBuilder();
+        boolean any = false;
+        for (String s : sorted) {
+            if (emittedStringConstants.add(s)) {
+                body.append(LlvmRuntime.typeStringConstant(s));
+                any = true;
+            }
+        }
+        if (!any) return "";
+
+        return "\n; ----- Deferred string constants (NPE register names) -----\n"
+            + body
+            + "\n";
+    }
+
     private void collectStringConstantsFromInstruction(Instruction inst, Set<String> names) {
         Opcode op = inst.getOpcode();
         for (Value v : inst.getOperands()) {
@@ -827,7 +919,10 @@ public class LlvmGlobalEmitter {
             for (int i = 0; i < recipe.length(); i++) {
                 char c = recipe.charAt(i);
                 if (c == '\u0001' || c == '\u0002') {
-                    if (!seg.isEmpty()) { names.add(seg.toString()); seg.setLength(0); }
+                    if (!seg.isEmpty()) {
+                        names.add(seg.toString());
+                        seg.setLength(0);
+                    }
                 } else {
                     seg.append(c);
                 }
@@ -880,7 +975,10 @@ public class LlvmGlobalEmitter {
                         for (int i = 0; i < recipe.length(); i++) {
                             char ch = recipe.charAt(i);
                             if (ch == '\u0001' || ch == '\u0002') {
-                                if (!seg.isEmpty()) { result.add(seg.toString()); seg.setLength(0); }
+                                if (!seg.isEmpty()) {
+                                    result.add(seg.toString());
+                                    seg.setLength(0);
+                                }
                             } else {
                                 seg.append(ch);
                             }
@@ -937,16 +1035,17 @@ public class LlvmGlobalEmitter {
         for (String s : literals) {
             byte[] bytes = s.getBytes(StandardCharsets.UTF_8);
             int len = bytes.length;
-            int totalLen = 4 + len + 1;
+            int totalLen = 8 + len + 1;
 
             StringBuilder escaped = new StringBuilder();
             escaped.append(String.format("\\%02X\\%02X\\%02X\\%02X",
                 len & 0xFF, (len >> 8) & 0xFF, (len >> 16) & 0xFF, (len >> 24) & 0xFF));
+            escaped.append("\\01\\00\\00\\00");
             for (byte b : bytes) {
                 int v = b & 0xFF;
                 switch (v) {
                     case '\\' -> escaped.append("\\5C");
-                    case '"'  -> escaped.append("\\22");
+                    case '"' -> escaped.append("\\22");
                     case '\n' -> escaped.append("\\0A");
                     case '\r' -> escaped.append("\\0D");
                     case '\t' -> escaped.append("\\09");
@@ -996,34 +1095,49 @@ public class LlvmGlobalEmitter {
         List<ClassNode> allClasses = new ArrayList<>(resolver.getClassMap().values());
         allClasses.sort(Comparator.comparing(ClassNode::getName));
 
+        Map<String, Set<String>> instancesOf = new HashMap<>();
+
         for (ClassNode cls : allClasses) {
             if (cls.isExternal()) continue;
+            if (cls.isInterface()) continue;
+
             String className = cls.getName();
-            Set<String> allParents = new LinkedHashSet<>();
-            collectSuperclasses(cls, allParents);
-            collectInterfaces(cls, allParents);
+            String classVtable = vtableNames.get(className);
+            if (classVtable == null) continue;
 
-            List<String> entries = new ArrayList<>();
-            for (String parent : allParents) {
-                String vtableName = vtableNames.get(parent);
-                if (vtableName == null) {
-                    entries.add("i8* null");
-                } else {
-                    entries.add("i8* bitcast (%JNativeVTable* " + vtableName + " to i8*)");
-                }
+            Set<String> supertypes = new LinkedHashSet<>();
+            collectSuperclasses(cls, supertypes);
+            collectInterfaces(cls, supertypes);
+
+            for (String supertype : supertypes) {
+                instancesOf.computeIfAbsent(supertype, k -> new LinkedHashSet<>())
+                    .add(classVtable);
             }
-            entries.add("i8* null");
+        }
 
+        for (ClassNode cls : allClasses) {
+            if (cls.isExternal()) continue;
+            if (cls.getName().startsWith("[")) continue;
+
+            String className = cls.getName();
             String typeInfoName = "@__type_info_" + LlvmTypeMapper.sanitizeIdentifier(className);
             typeInfoNames.put(className, typeInfoName);
-            sb.append(typeInfoName).append(" = private constant [")
-                .append(entries.size()).append(" x i8*] [");
-            for (int i = 0; i < entries.size(); i++) {
+
+            Set<String> entries = instancesOf.getOrDefault(className, Collections.emptySet());
+            List<String> sorted = new ArrayList<>(entries);
+            Collections.sort(sorted);
+
+            sb.append(typeInfoName).append(" = constant [")
+                .append(sorted.size() + 1).append(" x i8*] [");
+            for (int i = 0; i < sorted.size(); i++) {
                 if (i > 0) sb.append(", ");
-                sb.append(entries.get(i));
+                sb.append("i8* bitcast (%JNativeVTable* ")
+                    .append(sorted.get(i)).append(" to i8*)");
             }
-            sb.append("]\n");
+            if (!sorted.isEmpty()) sb.append(", ");
+            sb.append("i8* null]\n");
         }
+
         return sb.toString();
     }
 
@@ -1042,11 +1156,24 @@ public class LlvmGlobalEmitter {
     }
 
     private void collectInterfaces(ClassNode cls, Set<String> accumulator) {
+        if (cls == null) return;
+
         for (String iface : cls.getInterfaces()) {
-            accumulator.add(iface);
-            ClassNode ifaceNode = resolver.getClassNode(iface);
-            if (ifaceNode != null && !ifaceNode.isExternal()) {
-                collectInterfaces(ifaceNode, accumulator);
+            if (accumulator.add(iface)) {
+                ClassNode ifaceNode = resolver.getClassNode(iface);
+                if (ifaceNode != null && !ifaceNode.isExternal()) {
+                    collectInterfaces(ifaceNode, accumulator);
+                }
+            }
+        }
+
+        String superName = cls.getSuperName();
+        if (superName != null
+            && !superName.equals(cls.getName())
+            && !superName.equals("java/lang/Object")) {
+            ClassNode superNode = resolver.getClassNode(superName);
+            if (superNode != null && !superNode.isExternal()) {
+                collectInterfaces(superNode, accumulator);
             }
         }
     }
@@ -1120,8 +1247,15 @@ public class LlvmGlobalEmitter {
         sb.append("%ReflectionMethod = type { i8*, i8*, i8*, i32 }\n");
         sb.append("%ReflectionField = type { i8*, i8*, i32, i32 }\n");
         sb.append("%ReflectionConstructor = type { i8*, i8*, i32 }\n");
-        sb.append("%ReflectionClass = type { i8*, %ReflectionClass*, %ReflectionClass**, "
+        sb.append("%ReflectionClass = type { %JNativeVTable*, i8*, %ReflectionClass*, %ReflectionClass**, "
             + "%ReflectionMethod**, %ReflectionField**, %ReflectionConstructor**, i32, i32 }\n");
+
+        String classVtableRef = vtableNames.get("java/lang/Class");
+        if (classVtableRef == null) {
+            throw new IllegalStateException(
+                "vtable_java_lang_Class must be emitted before reflection data "
+                    + "(Class literal objects need a valid %JNativeVTable* in word[0])");
+        }
 
         if (reflectInfo == null || reflectInfo.getAllClasses().isEmpty()) {
             sb.append("@reflect_all_classes = constant [1 x %ReflectionClass*] "
@@ -1145,6 +1279,24 @@ public class LlvmGlobalEmitter {
             ReflectClassInfo info = reflectInfo.getOrCreateClassInfo(className);
             ClassNode classNode = resolver.getClassNode(className);
             if (classNode == null) continue;
+
+            if (classNode.isExternal() || resolver.getClassBytes(className) == null) {
+                resolver.forceLoadSystemClass(className);
+                classNode = resolver.getClassNode(className);
+                if (classNode == null) continue;
+            }
+
+            if (!classNode.isExternal()) {
+                Map<String, FieldNode> mostDerivedByName = new LinkedHashMap<>();
+                for (FieldNode f : collectInstanceFields(classNode)) {
+                    if ((f.getAccess() & Opcodes.ACC_STATIC) != 0) continue;
+                    mostDerivedByName.put(f.getName(), f);
+                }
+                for (FieldNode f : mostDerivedByName.values()) {
+                    info.addField(new FieldReference(
+                        className, f.getName(), f.getDescriptor()));
+                }
+            }
 
             String cleanClassName = LlvmTypeMapper.sanitizeIdentifier(className);
             String classVarName = "@refclass_" + cleanClassName;
@@ -1189,6 +1341,23 @@ public class LlvmGlobalEmitter {
             appendNullTerminatedPtrArray(sb, methodsArray, methodPtrs);
 
             List<FieldReference> sortedFields = new ArrayList<>(info.getFields());
+            {
+                Map<String, FieldReference> byName = new LinkedHashMap<>();
+                for (FieldReference fr : sortedFields) {
+                    FieldReference existing = byName.get(fr.getName());
+                    if (existing == null) {
+                        byName.put(fr.getName(), fr);
+                        continue;
+                    }
+                    FieldNode mostDerived = resolver.getField(className, fr.getName());
+                    if (mostDerived != null
+                        && mostDerived.getDescriptor() != null
+                        && mostDerived.getDescriptor().equals(fr.getDescriptor())) {
+                        byName.put(fr.getName(), fr);
+                    }
+                }
+                sortedFields = new ArrayList<>(byName.values());
+            }
             sortedFields.sort(Comparator.comparing(FieldReference::toString));
             List<String> fieldPtrs = new ArrayList<>();
             for (FieldReference field : sortedFields) {
@@ -1201,11 +1370,6 @@ public class LlvmGlobalEmitter {
                     if (desc == null) desc = fn.getDescriptor();
                 }
 
-                // Offset is only meaningful for instance fields. Static fields
-                // live in a separate global, they are not part of the struct,
-                // and getFieldOffset would throw. For static fields we emit 0;
-                // ReflectionField.offset is only read at runtime through
-                // Unsafe.objectFieldOffset(), which is never called for statics.
                 int offset = 0;
                 if (fn != null && desc != null && (modifiers & Opcodes.ACC_STATIC) == 0) {
                     offset = getFieldOffset(className, fieldName);
@@ -1273,7 +1437,9 @@ public class LlvmGlobalEmitter {
             for (String p : ifacePtrs) sb.append("%ReflectionClass* ").append(p).append(", ");
             sb.append("%ReflectionClass* null]\n");
 
-            sb.append(classVarName).append(" = constant %ReflectionClass { i8* ")
+            sb.append(classVarName).append(" = constant %ReflectionClass { %JNativeVTable* ")
+                .append(classVtableRef)
+                .append(", i8* ")
                 .append(ensureStringConstant(strConsts, className))
                 .append(", %ReflectionClass* ").append(superClassPtr)
                 .append(", %ReflectionClass** ").append(ifacesArray)
@@ -1342,7 +1508,7 @@ public class LlvmGlobalEmitter {
             Type pt = paramTypes.get(i);
             String ptLlvm = LlvmTypeMapper.toLlvmType(pt);
             String addr = "%arg" + i + "_addr";
-            String val  = "%arg" + i + "_val";
+            String val = "%arg" + i + "_val";
             sb.append("  ").append(addr)
                 .append(" = getelementptr i8*, i8** %args, i32 ").append(i).append("\n");
             if (pt.isReference() || pt.isArray() || pt.isNull() || pt.isBlock()) {
@@ -1360,7 +1526,10 @@ public class LlvmGlobalEmitter {
 
         StringBuilder argsCsv = new StringBuilder();
         boolean firstArg = true;
-        if (!isStatic) { argsCsv.append("i8* %obj"); firstArg = false; }
+        if (!isStatic) {
+            argsCsv.append("i8* %obj");
+            firstArg = false;
+        }
         for (int i = 0; i < argLoads.size(); i++) {
             if (!firstArg) argsCsv.append(", ");
             argsCsv.append(LlvmTypeMapper.toLlvmType(paramTypes.get(i)))
@@ -1382,7 +1551,7 @@ public class LlvmGlobalEmitter {
                     .append(" %result to i8*\n");
                 sb.append("  ret i8* %ret_ptr\n");
             } else {
-                sb.append("  %mem = call i8* @malloc(i64 ")
+                sb.append("  %mem = call i8* @calloc(i64 1, i64 ")
                     .append(getElementSizeOfType(retType)).append(")\n");
                 sb.append("  %cast = bitcast i8* %mem to ").append(retLlvm).append("*\n");
                 sb.append("  store ").append(retLlvm).append(" %result, ")
@@ -1405,7 +1574,7 @@ public class LlvmGlobalEmitter {
 
         StringBuilder sb = new StringBuilder();
         sb.append("define i8* @").append(adaptorName).append("(i8** %args) {\n");
-        sb.append("  %obj = call i8* @malloc(i64 ").append(objectSize).append(")\n");
+        sb.append("  %obj = call i8* @calloc(i64 1, i64 ").append(objectSize).append(")\n");
 
         String vtableName = getVtableName(className);
         if (vtableName != null) {
@@ -1420,7 +1589,7 @@ public class LlvmGlobalEmitter {
             Type pt = paramTypes.get(i);
             String ptLlvm = LlvmTypeMapper.toLlvmType(pt);
             String addr = "%arg" + i + "_addr";
-            String val  = "%arg" + i + "_val";
+            String val = "%arg" + i + "_val";
             sb.append("  ").append(addr)
                 .append(" = getelementptr i8*, i8** %args, i32 ").append(i).append("\n");
             if (pt.isReference() || pt.isArray() || pt.isNull() || pt.isBlock()) {
@@ -1438,7 +1607,11 @@ public class LlvmGlobalEmitter {
 
         StringBuilder argsCsv = new StringBuilder();
         argsCsv.append("i8* %obj");
-        for (String a : argLoads) argsCsv.append(", ").append(a);
+        for (int i = 0; i < argLoads.size(); i++) {
+            argsCsv.append(", ")
+                .append(LlvmTypeMapper.toLlvmType(paramTypes.get(i)))
+                .append(" ").append(argLoads.get(i));
+        }
         sb.append("  call void @").append(origFuncName)
             .append("(").append(argsCsv).append(")\n");
         sb.append("  ret i8* %obj\n");
@@ -1458,5 +1631,40 @@ public class LlvmGlobalEmitter {
             }
         }
         return null;
+    }
+
+    public void ensureInterfaceRegistered(String ifaceName) {
+        if (ifaceName == null || ifaceName.isEmpty()) return;
+
+        ClassNode cn = resolver.getClassNode(ifaceName);
+        if (cn == null || cn.isExternal() || cn.getMethods().isEmpty()) {
+            resolver.forceLoadSystemClass(ifaceName);
+            cn = resolver.getClassNode(ifaceName);
+        }
+        if (cn == null || !cn.isInterface()) return;
+
+        prepareLayouts();
+        interfaceLayouts.remove(ifaceName);
+
+        if (!interfaceIds.containsKey(ifaceName)) {
+            interfaceIds.put(ifaceName, nextInterfaceId++);
+            totalInterfaces = nextInterfaceId;
+        }
+        getOrBuildInterfaceLayout(ifaceName);
+    }
+
+    public void ensureClassLayoutBuilt(String className) {
+        if (className == null || className.isEmpty()) return;
+
+        ClassNode cn = resolver.getClassNode(className);
+        if (cn == null || cn.isExternal()) {
+            resolver.forceLoadSystemClass(className);
+            cn = resolver.getClassNode(className);
+        }
+        if (cn == null || cn.isInterface()) return;
+
+        prepareLayouts();
+        classLayouts.remove(className);
+        getOrBuildClassLayout(className);
     }
 }

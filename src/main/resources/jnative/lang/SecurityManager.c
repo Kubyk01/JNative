@@ -8,6 +8,7 @@
 __attribute__((noreturn)) void __jnative_throw_null_pointer_exception(void);
 
 struct ReflectionClass {
+    void* vtable;
     void* name;
     struct ReflectionClass* superclass;
     struct ReflectionClass** interfaces;
@@ -20,7 +21,7 @@ struct ReflectionClass {
 
 extern struct ReflectionClass* reflect_all_classes[] __attribute__((weak));
 
-#define JAVA_ARR_HDR 4
+#define JAVA_ARR_HDR 8
 
 static const char* extract_class_name(const char* symbol, char* buffer, size_t size) {
     if (!symbol) return NULL;

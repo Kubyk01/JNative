@@ -8,18 +8,24 @@ import io.github.kubyk01.domain.analyzer.dependencyresolver.FieldNode;
 import io.github.kubyk01.domain.analyzer.escapeanalysis.EscapeStatus;
 import io.github.kubyk01.domain.analyzer.escapeanalysis.EscapeSummary;
 import io.github.kubyk01.domain.ir.BasicBlock;
-import io.github.kubyk01.domain.ir.Constant;
 import io.github.kubyk01.domain.ir.Function;
 import io.github.kubyk01.domain.ir.Instruction;
 import io.github.kubyk01.domain.ir.Opcode;
 import io.github.kubyk01.domain.ir.ReturnTerminator;
 import io.github.kubyk01.domain.ir.Terminator;
+import io.github.kubyk01.domain.ir.ThrowTerminator;
 import io.github.kubyk01.domain.ir.Type;
 import io.github.kubyk01.domain.ir.Value;
 import lombok.extern.slf4j.Slf4j;
 import org.objectweb.asm.Opcodes;
 
 import java.util.*;
+
+import static io.github.kubyk01.util.LlvmUtil.extractCalleeName;
+import static io.github.kubyk01.util.LlvmUtil.extractFieldName;
+import static io.github.kubyk01.util.LlvmUtil.extractFieldOwnerAndName;
+import static io.github.kubyk01.util.LlvmUtil.getCallArguments;
+import static io.github.kubyk01.util.LlvmUtil.isAllocation;
 
 @Slf4j
 public class IntraproceduralEscape {
@@ -208,9 +214,7 @@ public class IntraproceduralEscape {
                 break;
             }
             case PUT_STATIC: {
-                // Layout PUT_STATIC: [fieldConst, val]. Статическое поле живёт
-                // в глобале, доступном из любой точки программы, поэтому всё,
-                // что туда записано, немедленно становится GLOBAL.
+                // Layout PUT_STATIC: [fieldConst, val].
                 if (inst.getOperands().size() >= 2) {
                     Value rhs = inst.getOperands().get(1);
                     markEscaped(rhs, EscapeStatus.GLOBAL);
@@ -293,6 +297,15 @@ public class IntraproceduralEscape {
             if (retVal != null && retVal.getType() != Type.VOID) {
                 markEscaped(retVal, EscapeStatus.RETURN);
             }
+        } else if (term instanceof ThrowTerminator tt) {
+            Value exc = tt.getException();
+            if (exc != null) {
+                // The exception escapes the current method: either it is
+                // caught higher up the stack, or the runtime's throw helper
+                // takes ownership of it. Either way it must not be destroyed
+                // (or scalar-replaced away) inside this function.
+                markEscaped(exc, EscapeStatus.RETURN);
+            }
         }
     }
 
@@ -321,29 +334,6 @@ public class IntraproceduralEscape {
         return max;
     }
 
-    private boolean isAllocation(Opcode op) {
-        return op == Opcode.NEW || op == Opcode.NEW_ARRAY || op == Opcode.MULTI_NEW_ARRAY;
-    }
-
-    private String[] extractFieldOwnerAndName(Instruction inst) {
-        String full = extractFieldName(inst);
-        int dot = full.lastIndexOf('.');
-        if (dot > 0) {
-            return new String[]{full.substring(0, dot), full.substring(dot + 1)};
-        }
-        return new String[]{"", full};
-    }
-
-    private String extractFieldName(Instruction inst) {
-        int fieldIdx = (inst.getOpcode() == Opcode.GET_STATIC || inst.getOpcode() == Opcode.PUT_STATIC) ? 0 : 1;
-        if (inst.getOperands().size() > fieldIdx) {
-            Value v = inst.getOperands().get(fieldIdx);
-            if (v instanceof Constant c && c.getType().isReference()) {
-                return c.getValue().toString();
-            }
-        }
-        return "unknown";
-    }
 
     private boolean isVolatileField(String owner, String fieldName) {
         if (owner == null || owner.isEmpty() || fieldName == null || fieldName.isEmpty()) return false;
@@ -351,23 +341,4 @@ public class IntraproceduralEscape {
         return field != null && (field.getAccess() & Opcodes.ACC_VOLATILE) != 0;
     }
 
-    private String extractCalleeName(Instruction inst) {
-        if (!inst.getOperands().isEmpty()) {
-            Value v = inst.getOperands().getFirst();
-            if (v instanceof Constant c && c.getType().isReference()) {
-                return c.getValue().toString();
-            }
-        }
-        return null;
-    }
-
-    private List<Value> getCallArguments(Instruction inst) {
-        List<Value> args = new ArrayList<>();
-        boolean skipFirst = true;
-        for (Value op : inst.getOperands()) {
-            if (skipFirst) { skipFirst = false; continue; }
-            args.add(op);
-        }
-        return args;
-    }
 }

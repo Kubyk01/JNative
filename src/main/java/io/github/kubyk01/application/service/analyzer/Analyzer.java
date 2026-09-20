@@ -1,5 +1,3 @@
-/* path: src/main/java/io/github/kubyk01/application/service/analyzer/Analyzer.java */
-
 package io.github.kubyk01.application.service.analyzer;
 
 import io.github.kubyk01.application.service.analyzer.aliasanalysis.AliasAnalyzer;
@@ -8,7 +6,10 @@ import io.github.kubyk01.application.service.analyzer.lifetime.LifetimeAnalyzer;
 import io.github.kubyk01.application.service.analyzer.dependencyresolver.DependencyResolver;
 import io.github.kubyk01.application.service.analyzer.reachabilityanalysis.ReachabilityAnalysis;
 import io.github.kubyk01.application.service.analyzer.ssa.BytecodeToIr;
+import io.github.kubyk01.application.service.analyzer.ssa.MethodTranslator;
+import io.github.kubyk01.application.service.analyzer.ssa.OutOfSsaPass;
 import io.github.kubyk01.application.service.analyzer.ssa.SSATransformer;
+import io.github.kubyk01.application.service.analyzer.ssa.TypeResolver;
 import io.github.kubyk01.application.service.codegen.llvm.LlvmGenerator;
 import io.github.kubyk01.application.service.codegen.llvm.LlvmRuntime;
 import io.github.kubyk01.application.service.codegen.llvm.nativepolymorphicfunctionresolver.PolymorphicResolver;
@@ -29,12 +30,18 @@ import io.github.kubyk01.domain.ir.BasicBlock;
 import io.github.kubyk01.domain.ir.Constant;
 import io.github.kubyk01.domain.ir.Function;
 import io.github.kubyk01.domain.ir.Instruction;
+import io.github.kubyk01.domain.ir.IrBuilder;
 import io.github.kubyk01.domain.ir.Module;
 import io.github.kubyk01.domain.ir.Opcode;
+import io.github.kubyk01.domain.ir.Parameter;
 import io.github.kubyk01.domain.ir.Type;
 import io.github.kubyk01.domain.ir.Value;
 import io.github.kubyk01.port.primary.AnalyzerPort;
 import lombok.extern.slf4j.Slf4j;
+import org.objectweb.asm.ClassReader;
+import org.objectweb.asm.ClassVisitor;
+import org.objectweb.asm.MethodVisitor;
+import org.objectweb.asm.Opcodes;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -45,6 +52,8 @@ import java.nio.file.StandardCopyOption;
 import java.util.*;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
+
+import static io.github.kubyk01.util.LlvmUtil.isAllocation;
 
 @Slf4j
 public class Analyzer implements AnalyzerPort {
@@ -159,9 +168,47 @@ public class Analyzer implements AnalyzerPort {
             ssaTransformer.transform(func);
         }
 
+        Set<String> clinitNamesBeforeDce = new HashSet<>();
+        for (Function f : module.getFunctions()) {
+            if (f.getName().endsWith("__clinit____V")) {
+                clinitNamesBeforeDce.add(f.getName());
+            }
+        }
+
         System.out.println("\n--- Running dead code elimination ---");
         DeadCodeEliminator dce = new DeadCodeEliminator(module);
         dce.eliminate();
+
+        int resurrected = resurrectRemovedClinits(module, resolver);
+        if (resurrected > 0) {
+            System.out.println("Resurrected " + resurrected
+                + " <clinit> function(s) removed by DCE.");
+        }
+
+        int ensured = ensureReferencedClinitsPresent(module, resolver);
+        if (ensured > 0) {
+            System.out.println("Added " + ensured
+                + " missing <clinit> function(s) for referenced classes.");
+        }
+
+        int declaredNatives = declareMissingNativeTargets(module, resolver);
+        if (declaredNatives > 0) {
+            System.out.println("Declared " + declaredNatives
+                + " missing native-method symbol(s).");
+        }
+
+        Set<String> clinitNamesAfterDce = new HashSet<>();
+        for (Function f : module.getFunctions()) {
+            if (f.getName().endsWith("__clinit____V")) {
+                clinitNamesAfterDce.add(f.getName());
+            }
+        }
+        Set<String> stillMissing = new HashSet<>(clinitNamesBeforeDce);
+        stillMissing.removeAll(clinitNamesAfterDce);
+        if (!stillMissing.isEmpty()) {
+            log.debug("Empty <clinit> function(s) dropped by DCE (no remaining references): {}",
+                stillMissing);
+        }
 
         List<Function> clinitFunctions = new ArrayList<>();
         for (Function func : module.getFunctions()) {
@@ -172,7 +219,8 @@ public class Analyzer implements AnalyzerPort {
         clinitFunctions = sortClinitFunctions(clinitFunctions, resolver, module);
 
         if (!clinitFunctions.isEmpty()) {
-            System.out.println("Processing " + clinitFunctions.size() + " static initializers (<clinit>) first...");
+            System.out.println("Processing " + clinitFunctions.size()
+                + " static initializers (<clinit>) first...");
 
             Module clinitModule = new Module();
             for (Function func : clinitFunctions) {
@@ -197,7 +245,8 @@ public class Analyzer implements AnalyzerPort {
                         if (inst.getResult() != null) {
                             PointsToSet pts = aliasResult.getPointsTo(inst.getResult());
                             if (!pts.isEmpty()) {
-                                System.out.println("  " + func.getName() + " : " + inst.getResult() + " -> " + pts);
+                                System.out.println("  " + func.getName() + " : "
+                                    + inst.getResult() + " -> " + pts);
                             }
                         }
                     }
@@ -276,6 +325,7 @@ public class Analyzer implements AnalyzerPort {
         }
 
         analysis.registerClassLiterals(module);
+        OutOfSsaPass.transform(module);
 
         System.out.println("\n--- Generating LLVM IR ---");
         LlvmGenerator llvmGen = new LlvmGenerator(module, resolver, aliasResult,
@@ -321,40 +371,319 @@ public class Analyzer implements AnalyzerPort {
         }
     }
 
-    /**
-     * Orders class initializers so that if <clinit> of class A (transitively)
-     * triggers <clinit> of class B, B's <clinit> is scheduled first.
-     *
-     * <p>{@code LlvmGenerator.generateMain()} calls every function in this list
-     * unconditionally at process start. The order must therefore reflect the
-     * JVM's own initialization order, which is transitive through arbitrary
-     * call graphs — a purely local scan of each <clinit>'s own bytecode is
-     * insufficient: {@code AccessibleObject.<clinit>} only statically calls
-     * {@code AccessController.doPrivileged}, and the static touch of
-     * {@code ReflectionFactory.soleInstance} happens three call frames deeper,
-     * through an interface dispatch that the local scan cannot see.
-     *
-     * <p>The implementation precomputes, once, two flat indexes over the whole
-     * module:
-     * <ul>
-     *   <li>{@code directCalls}: for each function, the names of every function
-     *       it directly invokes (static calls, plus every module implementation
-     *       matching the method+descriptor signature of a virtual or interface
-     *       call site);</li>
-     *   <li>{@code directClinitDeps}: for each function, the {@code <clinit>}
-     *       of every class it directly touches via {@code NEW}, {@code GET_STATIC},
-     *       {@code PUT_STATIC} or an {@code invokestatic} whose target has a body.</li>
-     * </ul>
-     * A per-root BFS then walks {@code directCalls} and unions
-     * {@code directClinitDeps} along the way. The graph construction is
-     * O(module size); each BFS visits every reachable function at most once.
-     */
+    private int resurrectRemovedClinits(Module module, DependencyResolver resolver) {
+        int total = 0;
+        boolean anyAdded = true;
+        int guard = 0;
+        final int maxPasses = 8;
+
+        while (anyAdded && guard++ < maxPasses) {
+            anyAdded = false;
+
+            Set<String> neededOwners = collectTriggeredOwners(module);
+
+            for (String owner : neededOwners) {
+                ClassNode cn = resolver.getClassNode(owner);
+                if (cn == null) continue;
+
+                if (!cn.isExternal() && resolver.getClassBytes(owner) == null) {
+                    resolver.reloadSystemClass(owner);
+                    cn = resolver.getClassNode(owner);
+                    if (cn == null) continue;
+                }
+
+                if (cn.isExternal() || cn.isInterface()) continue;
+
+                boolean declaresClinit = false;
+                for (MethodNode mn : cn.getMethods()) {
+                    if (mn.getName().equals("<clinit>") && mn.getDescriptor().equals("()V")) {
+                        declaresClinit = true;
+                        break;
+                    }
+                }
+                if (!declaresClinit) continue;
+
+                String clinitName = LlvmRuntime.mangleMethod(owner, "<clinit>", "()V");
+                if (module.getFunction(clinitName) != null) continue;
+
+                if (resolver.getClassBytes(owner) == null) continue;
+
+                Function resurrected = retranslateClinit(owner, module, resolver);
+                if (resurrected != null) {
+                    total++;
+                    anyAdded = true;
+                    log.debug("Resurrected <clinit> of {}", owner);
+                }
+            }
+        }
+        return total;
+    }
+
+    private int ensureReferencedClinitsPresent(Module module, DependencyResolver resolver) {
+        int added = 0;
+        boolean changed = true;
+        int guard = 0;
+        final int maxPasses = 8;
+
+        while (changed && guard++ < maxPasses) {
+            changed = false;
+            Set<String> referenced = collectTriggeredOwners(module);
+            for (String owner : referenced) {
+                ClassNode cn = resolver.getClassNode(owner);
+                if (cn == null || cn.isExternal() || cn.isInterface()) continue;
+
+                if (resolver.getClassBytes(owner) == null) {
+                    resolver.reloadSystemClass(owner);
+                    cn = resolver.getClassNode(owner);
+                    if (cn == null || cn.isExternal() || cn.isInterface()) continue;
+                }
+
+                boolean declaresClinit = false;
+                for (MethodNode mn : cn.getMethods()) {
+                    if (mn.getName().equals("<clinit>") && mn.getDescriptor().equals("()V")) {
+                        declaresClinit = true;
+                        break;
+                    }
+                }
+                if (!declaresClinit) continue;
+
+                String clinitName = LlvmRuntime.mangleMethod(owner, "<clinit>", "()V");
+                if (module.getFunction(clinitName) != null) continue;
+                if (resolver.getClassBytes(owner) == null) continue;
+
+                Function resurrected = retranslateClinit(owner, module, resolver);
+                if (resurrected != null) {
+                    added++;
+                    changed = true;
+                    log.debug("Ensured <clinit> of {}", owner);
+                }
+            }
+        }
+        return added;
+    }
+
+    private Set<String> collectTriggeredOwners(Module module) {
+        Set<String> owners = new HashSet<>();
+        for (Function f : module.getFunctions()) {
+            if (f.getEntryBlock() == null) continue;
+            for (BasicBlock b : f.getBlocks()) {
+                for (Instruction inst : b.getInstructions()) {
+                    Opcode op = inst.getOpcode();
+                    if (op == Opcode.GET_STATIC || op == Opcode.PUT_STATIC
+                        || op == Opcode.NEW || op == Opcode.STATIC_CALL) {
+                        String owner = extractTriggerOwner(inst);
+                        if (owner != null && !owner.isEmpty()) {
+                            owners.add(owner);
+                        }
+                    } else if (op == Opcode.CALL) {
+                        String callee = extractCalleeConstant(inst, 0);
+                        if (callee != null) {
+                            int dot = callee.lastIndexOf('.');
+                            int paren = callee.indexOf('(');
+                            if (dot > 0 && paren > dot) {
+                                owners.add(callee.substring(0, dot));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return owners;
+    }
+
+    private Function retranslateClinit(String className, Module module, DependencyResolver resolver) {
+        byte[] bytes = resolver.getClassBytes(className);
+        if (bytes == null) return null;
+
+        MethodReference ref = new MethodReference(className, "<clinit>", "()V");
+        IrBuilder builder = new IrBuilder(module);
+        MethodTranslator translator = new MethodTranslator(ref, true, builder, resolver);
+
+        try {
+            ClassReader reader = new ClassReader(bytes);
+            reader.accept(new ClassVisitor(Opcodes.ASM9) {
+                @Override
+                public MethodVisitor visitMethod(int access, String name, String desc,
+                                                 String signature, String[] exceptions) {
+                    if (name.equals("<clinit>") && desc.equals("()V")) {
+                        return translator;
+                    }
+                    return null;
+                }
+            }, ClassReader.SKIP_DEBUG);
+        } catch (Exception e) {
+            log.warn("Failed to re-translate <clinit> of {}: {}", className, e.getMessage());
+            return null;
+        }
+
+        Function func = translator.getCurrentFunction();
+        if (func == null) return null;
+
+        try {
+            new SSATransformer().transform(func);
+        } catch (Exception e) {
+            log.warn("SSA transform failed for resurrected <clinit> of {}: {}",
+                className, e.getMessage());
+        }
+        return func;
+    }
+
+    private int declareMissingNativeTargets(Module module, DependencyResolver resolver) {
+        int added = 0;
+        boolean changed = true;
+        int guard = 0;
+        final int maxPasses = 8;
+
+        while (changed && guard++ < maxPasses) {
+            changed = false;
+
+            Set<String> callees = new HashSet<>();
+            for (Function f : new ArrayList<>(module.getFunctions())) {
+                if (f.getEntryBlock() == null) continue;
+                for (BasicBlock b : f.getBlocks()) {
+                    for (Instruction inst : b.getInstructions()) {
+                        Opcode op = inst.getOpcode();
+                        if (op != Opcode.STATIC_CALL && op != Opcode.CALL) continue;
+                        String callee = extractCalleeConstant(inst, 0);
+                        if (callee != null) callees.add(callee);
+                    }
+                }
+            }
+
+            for (String calleeName : callees) {
+                int dotIdx = calleeName.lastIndexOf('.');
+                int parenIdx = calleeName.indexOf('(');
+                if (dotIdx <= 0 || parenIdx <= dotIdx) continue;
+
+                String owner = calleeName.substring(0, dotIdx);
+                String methodPart = calleeName.substring(dotIdx + 1);
+                int localParenIdx = parenIdx - dotIdx - 1;
+                String methodName = methodPart.substring(0, localParenIdx);
+                String descriptor = methodPart.substring(localParenIdx);
+
+                String[] foundOwner = new String[1];
+                MethodNode mn = resolver.findMethodInHierarchy(
+                    owner, methodName, descriptor, foundOwner);
+                if (mn == null || !mn.isNative()) continue;
+
+                String actualOwner = foundOwner[0] != null ? foundOwner[0] : owner;
+                String nativeName = "__jnative_"
+                    + LlvmRuntime.mangleMethod(actualOwner, methodName, descriptor);
+                if (module.getFunction(nativeName) != null) continue;
+
+                Type retType = TypeResolver.descToReturnType(descriptor);
+                List<Type> paramTypes = TypeResolver.descToParamTypes(descriptor);
+                Function func = new Function(nativeName, retType);
+                for (int i = 0; i < paramTypes.size(); i++) {
+                    func.addParameter(new Parameter(paramTypes.get(i), i));
+                }
+                module.addFunction(func);
+                added++;
+                changed = true;
+            }
+        }
+        return added;
+    }
+
     private List<Function> sortClinitFunctions(List<Function> clinitFunctions,
                                                DependencyResolver resolver,
                                                Module module) {
+        if (clinitFunctions.isEmpty()) return clinitFunctions;
+
         Map<String, Function> nameToFunc = new HashMap<>();
         for (Function f : module.getFunctions()) {
             nameToFunc.put(f.getName(), f);
+        }
+
+        Map<String, Set<String>> directReads = new HashMap<>();
+        Map<String, Set<String>> directWrites = new HashMap<>();
+        Map<String, Set<String>> directCallees = new HashMap<>();
+
+        for (Function f : module.getFunctions()) {
+            Set<String> reads = new HashSet<>();
+            Set<String> writes = new HashSet<>();
+            Set<String> callees = new HashSet<>();
+            for (BasicBlock b : f.getBlocks()) {
+                for (Instruction inst : b.getInstructions()) {
+                    Opcode op = inst.getOpcode();
+                    if (op == Opcode.GET_STATIC) {
+                        String n = extractFieldNameConst(inst, 0);
+                        if (n != null) reads.add(n);
+                    } else if (op == Opcode.PUT_STATIC) {
+                        String n = extractFieldNameConst(inst, 0);
+                        if (n != null) writes.add(n);
+                    } else if (op == Opcode.STATIC_CALL || op == Opcode.CALL) {
+                        String callee = extractCalleeConstant(inst, 0);
+                        if (callee != null) {
+                            String mangled = nameToFunc.containsKey(callee)
+                                ? callee
+                                : LlvmRuntime.mangleCallable(callee);
+                            if (nameToFunc.containsKey(mangled)) {
+                                callees.add(mangled);
+                            }
+                        }
+                    }
+                }
+            }
+            directReads.put(f.getName(), reads);
+            directWrites.put(f.getName(), writes);
+            directCallees.put(f.getName(), callees);
+        }
+
+        Map<String, Set<String>> transReads = new HashMap<>();
+        Map<String, Set<String>> transWrites = new HashMap<>();
+        for (String name : directReads.keySet()) {
+            transReads.put(name, new HashSet<>(directReads.get(name)));
+            transWrites.put(name, new HashSet<>(directWrites.get(name)));
+        }
+
+        boolean changed = true;
+        int guard = 0;
+        final int maxPasses = Math.max(32, module.getFunctions().size() / 4 + 8);
+
+        while (changed && guard++ < maxPasses) {
+            changed = false;
+            for (String name : directReads.keySet()) {
+                Set<String> r = transReads.get(name);
+                Set<String> w = transWrites.get(name);
+                int rOld = r.size();
+                int wOld = w.size();
+                for (String callee : directCallees.get(name)) {
+                    Set<String> cr = transReads.get(callee);
+                    Set<String> cw = transWrites.get(callee);
+                    if (cr != null) r.addAll(cr);
+                    if (cw != null) w.addAll(cw);
+                }
+                if (r.size() != rOld || w.size() != wOld) changed = true;
+            }
+        }
+
+        Map<String, Set<Function>> writersOfGlobal = new HashMap<>();
+        for (Function clinit : clinitFunctions) {
+            Set<String> w = transWrites.get(clinit.getName());
+            if (w == null) continue;
+            for (String g : w) {
+                writersOfGlobal.computeIfAbsent(g, k -> new LinkedHashSet<>()).add(clinit);
+            }
+        }
+
+        Map<Function, Set<Function>> deps = new LinkedHashMap<>();
+        for (Function clinit : clinitFunctions) {
+            deps.put(clinit, new LinkedHashSet<>());
+        }
+
+        for (Function clinit : clinitFunctions) {
+            Set<String> r = transReads.get(clinit.getName());
+            if (r == null) continue;
+            for (String g : r) {
+                Set<Function> writers = writersOfGlobal.get(g);
+                if (writers == null) continue;
+                for (Function w : writers) {
+                    if (w != clinit) {
+                        deps.get(clinit).add(w);
+                    }
+                }
+            }
         }
 
         Map<String, Function> classNameToClinit = new HashMap<>();
@@ -366,140 +695,76 @@ public class Analyzer implements AnalyzerPort {
             }
         }
 
-        // suffix `_<mangledMethod>_<mangledDescriptor>` -> list of function names
-        // present in the module whose class declares a method with that signature.
-        // Used to expand a virtual/interface call site into the set of candidate
-        // implementations without re-scanning the entire module per call site.
-        Map<String, List<String>> functionsBySuffix = new HashMap<>();
-        for (ClassNode cn : resolver.getClassMap().values()) {
-            for (MethodNode mn : cn.getMethods()) {
-                String mangled = LlvmRuntime.mangleMethod(cn.getName(), mn.getName(), mn.getDescriptor());
-                if (!nameToFunc.containsKey(mangled)) continue;
-                String methodSuffix = mn.getName().replaceAll("[^a-zA-Z0-9_]", "_");
-                String descSuffix   = mn.getDescriptor().replaceAll("[^a-zA-Z0-9_]", "_");
-                String suffix = "_" + methodSuffix + "_" + descSuffix;
-                functionsBySuffix.computeIfAbsent(suffix, k -> new ArrayList<>()).add(mangled);
-            }
-        }
-
-        Map<String, Set<String>> directCalls = new HashMap<>();
-        Map<String, Set<String>> directClinitDeps = new HashMap<>();
-
-        for (Function func : module.getFunctions()) {
-            Set<String> calls = new HashSet<>();
-            Set<String> deps  = new HashSet<>();
-
-            for (BasicBlock block : func.getBlocks()) {
-                for (Instruction inst : block.getInstructions()) {
+        for (Function func : clinitFunctions) {
+            for (BasicBlock b : func.getBlocks()) {
+                for (Instruction inst : b.getInstructions()) {
                     Opcode op = inst.getOpcode();
-
-                    if (op == Opcode.GET_STATIC || op == Opcode.PUT_STATIC
-                        || op == Opcode.NEW || op == Opcode.STATIC_CALL) {
-                        String owner = extractTriggerOwner(inst);
-                        if (owner != null) {
-                            Function dep = classNameToClinit.get(owner);
-                            if (dep != null) deps.add(dep.getName());
-                        }
+                    if (op != Opcode.NEW && op != Opcode.GET_STATIC
+                        && op != Opcode.PUT_STATIC && op != Opcode.STATIC_CALL) {
+                        continue;
                     }
-
-                    if (op == Opcode.STATIC_CALL || op == Opcode.CALL) {
-                        if (!inst.getOperands().isEmpty()) {
-                            Value v = inst.getOperands().getFirst();
-                            if (v instanceof Constant c && c.getType().isReference()) {
-                                String callee = c.getValue().toString();
-                                if (nameToFunc.containsKey(callee)) {
-                                    calls.add(callee);
-                                } else {
-                                    String mangled = LlvmRuntime.mangleCallable(callee);
-                                    if (nameToFunc.containsKey(mangled)) {
-                                        calls.add(mangled);
-                                    }
-                                }
-                            }
-                        }
-                    } else if (op == Opcode.VIRTUAL_CALL || op == Opcode.INTERFACE_CALL
-                        || op == Opcode.SPECIAL_CALL) {
-                        if (inst.getOperands().size() >= 2) {
-                            Value v = inst.getOperands().get(1);
-                            if (v instanceof Constant c && c.getType().isReference()) {
-                                String suffix = computeMangledCallSuffix(c.getValue().toString());
-                                if (suffix != null) {
-                                    List<String> candidates = functionsBySuffix.get(suffix);
-                                    if (candidates != null) {
-                                        calls.addAll(candidates);
-                                    }
-                                }
-                            }
-                        }
+                    String owner = extractTriggerOwner(inst);
+                    if (owner == null) continue;
+                    Function dep = classNameToClinit.get(owner);
+                    if (dep != null && dep != func) {
+                        deps.get(func).add(dep);
                     }
                 }
             }
-            directCalls.put(func.getName(), calls);
-            directClinitDeps.put(func.getName(), deps);
-        }
-
-        Map<Function, Set<Function>> transitiveDeps = new LinkedHashMap<>();
-        for (Function rootClinit : clinitFunctions) {
-            Set<Function> deps = new HashSet<>();
-            Set<String> visited = new HashSet<>();
-            Deque<String> worklist = new ArrayDeque<>();
-            worklist.add(rootClinit.getName());
-
-            while (!worklist.isEmpty()) {
-                String calleeName = worklist.poll();
-                if (!visited.add(calleeName)) continue;
-
-                Set<String> clinitDeps = directClinitDeps.get(calleeName);
-                if (clinitDeps != null) {
-                    for (String depName : clinitDeps) {
-                        Function dep = nameToFunc.get(depName);
-                        if (dep != null && dep != rootClinit) {
-                            deps.add(dep);
-                        }
-                    }
-                }
-
-                Set<String> calls = directCalls.get(calleeName);
-                if (calls != null) {
-                    worklist.addAll(calls);
-                }
-            }
-
-            transitiveDeps.put(rootClinit, deps);
         }
 
         List<Function> sorted = new ArrayList<>(clinitFunctions.size());
         Set<Function> visited = new HashSet<>();
         Set<Function> onStack = new HashSet<>();
         for (Function f : clinitFunctions) {
-            dfsClinit(f, transitiveDeps, visited, onStack, sorted);
+            dfsClinit(f, deps, visited, onStack, sorted);
         }
+
+        if (sorted.size() != clinitFunctions.size()) {
+            Set<Function> included = new HashSet<>(sorted);
+            for (Function f : clinitFunctions) {
+                if (!included.contains(f)) {
+                    sorted.add(f);
+                }
+            }
+        }
+
         return sorted;
     }
 
-    /**
-     * From a textual call-site reference of the form
-     * {@code owner.method(desc)ret} or {@code owner.method(desc)}, produces the
-     * suffix {@code _method_desc_} that every mangled IR symbol for a matching
-     * implementation ends with.
-     */
-    private static String computeMangledCallSuffix(String callName) {
-        int parenIdx = callName.indexOf('(');
-        if (parenIdx < 0) return null;
-        int dotIdx = callName.lastIndexOf('.', parenIdx);
-        if (dotIdx < 0) return null;
-        String methodName = callName.substring(dotIdx + 1, parenIdx);
-        String descriptor = callName.substring(parenIdx);
-        String mangledMethod = methodName.replaceAll("[^a-zA-Z0-9_]", "_");
-        String mangledDesc   = descriptor.replaceAll("[^a-zA-Z0-9_]", "_");
-        return "_" + mangledMethod + "_" + mangledDesc;
+    private void dfsClinit(Function f,
+                           Map<Function, Set<Function>> deps,
+                           Set<Function> visited,
+                           Set<Function> onStack,
+                           List<Function> out) {
+        if (visited.contains(f)) return;
+        if (!onStack.add(f)) return;
+        for (Function dep : deps.getOrDefault(f, Collections.emptySet())) {
+            dfsClinit(dep, deps, visited, onStack, out);
+        }
+        onStack.remove(f);
+        visited.add(f);
+        out.add(f);
     }
 
-    /**
-     * Extracts the class that a trigger instruction references: the
-     * instantiated class for {@code NEW}, or the owner of a static member
-     * reference for {@code GET_STATIC}/{@code PUT_STATIC}/{@code STATIC_CALL}.
-     */
+    private static String extractFieldNameConst(Instruction inst, int idx) {
+        if (inst.getOperands().size() <= idx) return null;
+        Value v = inst.getOperands().get(idx);
+        if (v instanceof Constant c && c.getType().isReference()) {
+            return c.getValue().toString();
+        }
+        return null;
+    }
+
+    private static String extractCalleeConstant(Instruction inst, int operandIdx) {
+        if (inst.getOperands().size() <= operandIdx) return null;
+        Value v = inst.getOperands().get(operandIdx);
+        if (v instanceof Constant c && c.getType().isReference()) {
+            return c.getValue().toString();
+        }
+        return null;
+    }
+
     private static String extractTriggerOwner(Instruction inst) {
         Opcode op = inst.getOpcode();
         if (op == Opcode.NEW) {
@@ -521,21 +786,6 @@ public class Analyzer implements AnalyzerPort {
             return null;
         }
         return null;
-    }
-
-    private void dfsClinit(Function f,
-                           Map<Function, Set<Function>> deps,
-                           Set<Function> visited,
-                           Set<Function> onStack,
-                           List<Function> out) {
-        if (visited.contains(f)) return;
-        if (!onStack.add(f)) return;
-        for (Function dep : deps.getOrDefault(f, Collections.emptySet())) {
-            dfsClinit(dep, deps, visited, onStack, out);
-        }
-        onStack.remove(f);
-        visited.add(f);
-        out.add(f);
     }
 
     private static String extractOwnerClassName(String ref) {
@@ -611,6 +861,40 @@ public class Analyzer implements AnalyzerPort {
             int exit = pb.start().waitFor();
             if (exit != 0) throw new RuntimeException("Compilation failed with exit code " + exit);
 
+            // ------------------------------------------------------------------
+            // Link command.
+            //
+            // Order matters with GNU ld: archive members are pulled in only
+            // when they satisfy a currently-undefined symbol, and the scan is
+            // strictly left-to-right. Every object file that references a
+            // library must therefore precede that library on the command line.
+            //
+            //   -lm       : libm. Required on x86-64 because LLVM lowers
+            //               `frem {float,double,x86_fp80}` to `fmodf` /
+            //               `fmod` / `fmodl`, and `frem` appears in the
+            //               generated IR for every Java `%` on a float or
+            //               double (see CompactNumberFormat.evalLOperand).
+            //               Also covers `sin`, `cos`, `pow`, `sqrt` if the
+            //               emitter ever starts producing those intrinsics.
+            //   -lpthread : pthread_mutex_* and pthread_cond_*, used by the
+            //               monitor table and the per-thread park table.
+            //   -ldl      : dlopen(NULL) / dlsym / dlclose, used by every
+            //               native that resolves a symbol from the process
+            //               image at runtime (Class.c, Unsafe.c,
+            //               NativeMethodAccessorImpl.c, SystemProps.c, …).
+            //   -rdynamic : emits all global symbols into the dynamic symbol
+            //               table so that dlopen(NULL)+dlsym can find the
+            //               mangled `fn_*` and `__type_info_*` globals the
+            //               LLVM module defines. Without it those helpers
+            //               return NULL and every reflective or offset-based
+            //               lookup silently fails.
+            //
+            // macOS does not have a separate libm — its math symbols live in
+            // libSystem, which is linked implicitly — but `-lm` is accepted
+            // and is a no-op, so it can be passed unconditionally without a
+            // platform branch. MinGW provides an import library as libm.a,
+            // so the same holds there.
+            // ------------------------------------------------------------------
             List<String> linkCmd = new ArrayList<>();
             linkCmd.add(compiler);
             linkCmd.add(objPath.toString());
@@ -624,15 +908,19 @@ public class Analyzer implements AnalyzerPort {
                 linkCmd.add("-rdynamic");
                 linkCmd.add("-lpthread");
                 linkCmd.add("-ldl");
+                linkCmd.add("-lm");
             } else if (os.contains("mac") || os.contains("darwin")) {
                 linkCmd.add("-Wl,-export_dynamic");
                 linkCmd.add("-lpthread");
+                linkCmd.add("-lm");
             } else if (os.contains("win")) {
                 linkCmd.add("-lpthread");
+                linkCmd.add("-lm");
             } else {
                 linkCmd.add("-rdynamic");
                 linkCmd.add("-lpthread");
                 linkCmd.add("-ldl");
+                linkCmd.add("-lm");
             }
             pb = new ProcessBuilder(linkCmd);
             pb.inheritIO();
@@ -733,10 +1021,6 @@ public class Analyzer implements AnalyzerPort {
     private static boolean matchesDebug(String debugName, AllocationSite site) {
         if (debugName == null) return true;
         return site != null && site.getMethodName() != null && site.getMethodName().contains(debugName);
-    }
-
-    private static boolean isAllocation(Opcode op) {
-        return op == Opcode.NEW || op == Opcode.NEW_ARRAY || op == Opcode.MULTI_NEW_ARRAY;
     }
 
     private static boolean isSystemClassName(String className) {

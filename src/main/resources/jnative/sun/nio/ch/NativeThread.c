@@ -68,3 +68,25 @@ int64_t __jnative_fn_sun_nio_ch_NativeThread_current0___J(void) {
 void __jnative_fn_sun_nio_ch_NativeThread_signal__J_V(int64_t native_thread) {
     (void)native_thread;
 }
+
+/* ---------------------------------------------------------------------------
+ * static native void signal0(long nativeThread);
+ *
+ * JDK 17+ name for NativeThread.signal. Same body as the legacy
+ * signal(long) symbol above: on HotSpot this writes to a self-pipe that
+ * the target thread monitors, so a blocking syscall aborts with EINTR
+ * and the NIO layer can re-check the interrupt state. This runtime's
+ * blocking primitives retry only on EINTR and surface every other errno
+ * immediately, so the interrupt path is reached without external
+ * wake-up; the call is a no-op for the same reason as the unsuffixed
+ * variant.
+ *
+ * Keeping both symbols in the same file lets the same C body serve
+ * JDK 8 through 22 without conditional compilation. The JDK 17 rename
+ * wave touched this method the same way it touched Thread.sleep /
+ * Thread.start / Thread.interrupt, and every call site the LLVM backend
+ * emits uses whichever spelling the compiled JDK's class files carry.
+ * ------------------------------------------------------------------------- */
+void __jnative_fn_sun_nio_ch_NativeThread_signal0__J_V(int64_t native_thread) {
+    __jnative_fn_sun_nio_ch_NativeThread_signal__J_V(native_thread);
+}

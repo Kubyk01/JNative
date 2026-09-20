@@ -1,9 +1,20 @@
 #include <stdint.h>
+#include <stddef.h>
 
-/* static native boolean isSupported0();
- * This runtime does not implement continuations / virtual threads, so the
- * only correct answer is false. Callers fall back to the platform-thread
- * implementation. */
+__attribute__((noreturn)) void __jnative_throw_exception(void* exc);
+
 int32_t __jnative_fn_jdk_internal_vm_ContinuationSupport_isSupported0___Z(void) {
+    return 0;
+}
+
+void __jnative_fn_jdk_internal_vm_Continuation_registerNatives___V(void) {
+}
+
+int32_t __jnative_fn_jdk_internal_vm_Continuation_doYield___I(int32_t mode) {
+    (void)mode;
+    __jnative_throw_exception(NULL);
+    /* __jnative_throw_exception is declared noreturn, but the explicit
+     * return keeps the compiler happy on toolchains that do not honour
+     * the attribute in every optimisation mode. */
     return 0;
 }

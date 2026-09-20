@@ -7,7 +7,6 @@ import io.github.kubyk01.domain.analyzer.escapeanalysis.EscapeAnalysisResult;
 import io.github.kubyk01.domain.analyzer.escapeanalysis.EscapeStatus;
 import io.github.kubyk01.domain.ir.BasicBlock;
 import io.github.kubyk01.domain.ir.CondBranchTerminator;
-import io.github.kubyk01.domain.ir.Constant;
 import io.github.kubyk01.domain.ir.Function;
 import io.github.kubyk01.domain.ir.Instruction;
 import io.github.kubyk01.domain.ir.LookupSwitchTerminator;
@@ -28,6 +27,8 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+
+import static io.github.kubyk01.util.LlvmUtil.extractFieldName;
 
 /**
  * Replaces objects that do not escape and have no observable side effects
@@ -80,9 +81,6 @@ public class ScalarReplacer {
             for (Instruction inst : block.getInstructions()) {
                 Opcode op = inst.getOpcode();
 
-                // Массивы этим оптимизатором не поддерживаются: fieldValues
-                // индексируется по имени поля, но элементы массива делят
-                // один ключ "[]". Удаление NEW_ARRAY сломало бы ALOAD/ASTORE.
                 if (op == Opcode.NEW_ARRAY || op == Opcode.MULTI_NEW_ARRAY) {
                     continue;
                 }
@@ -118,25 +116,19 @@ public class ScalarReplacer {
                 if (inst == newInst) continue;
                 Opcode op = inst.getOpcode();
 
-                // Объект передан как аргумент в вызов — заменять нельзя.
-                // Проверяем все операнды, начиная с позиции 1 для CALL-подобных
-                // опкодов (позиция 0 — это получатель), и все операнды для
-                // остальных инструкций.
-                int startIdx = 0;
-                switch (op) {
-                    case CALL, STATIC_CALL -> startIdx = 0;
-                    case VIRTUAL_CALL, INTERFACE_CALL, SPECIAL_CALL -> startIdx = 1;
-                    default -> startIdx = 0;
-                }
-
                 boolean isCall = switch (op) {
                     case CALL, VIRTUAL_CALL, INTERFACE_CALL, STATIC_CALL, SPECIAL_CALL -> true;
                     default -> false;
                 };
-
                 if (!isCall) continue;
 
-                for (int i = startIdx; i < inst.getOperands().size(); i++) {
+                // Every operand, including the receiver slot at index 0 for
+                // VIRTUAL_CALL / INTERFACE_CALL / SPECIAL_CALL. The old code
+                // started at index 1 for those opcodes, which hid exactly the
+                // `throw new X(...)` and `new X(); super(...)` cases and led
+                // ScalarReplacer to delete the NEW while its Temporary was
+                // still live as a call receiver / throw operand.
+                for (int i = 0; i < inst.getOperands().size(); i++) {
                     if (inst.getOperands().get(i) == result) {
                         return true;
                     }
@@ -169,7 +161,6 @@ public class ScalarReplacer {
         }
 
         if (op == Opcode.NEW_ARRAY || op == Opcode.MULTI_NEW_ARRAY) {
-            // Массивы в этой реализации не заменяются.
             return false;
         }
 
@@ -216,18 +207,6 @@ public class ScalarReplacer {
         }
         // Leave other instructions untouched
         return false;
-    }
-
-    private String extractFieldName(Instruction inst) {
-        if (inst.getOperands().size() >= 2) {
-            Value v = inst.getOperands().get(1);
-            if (v instanceof Constant c && c.getType().isReference()) {
-                String val = c.getValue().toString();
-                int dot = val.lastIndexOf('.');
-                return dot >= 0 ? val.substring(dot + 1) : val;
-            }
-        }
-        return "unknown";
     }
 
     private void replaceUses(Value oldVal, Value newVal) {

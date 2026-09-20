@@ -5,7 +5,6 @@ import io.github.kubyk01.domain.analyzer.aliasanalysis.AllocationSite;
 import io.github.kubyk01.domain.analyzer.aliasanalysis.FunctionSummary;
 import io.github.kubyk01.domain.ir.BasicBlock;
 import io.github.kubyk01.domain.ir.CondBranchTerminator;
-import io.github.kubyk01.domain.ir.Constant;
 import io.github.kubyk01.domain.ir.Function;
 import io.github.kubyk01.domain.ir.Instruction;
 import io.github.kubyk01.domain.ir.LookupSwitchTerminator;
@@ -18,7 +17,6 @@ import io.github.kubyk01.domain.ir.ThrowTerminator;
 import io.github.kubyk01.domain.ir.Value;
 import lombok.RequiredArgsConstructor;
 
-import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
@@ -26,6 +24,9 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+
+import static io.github.kubyk01.util.LlvmUtil.extractCalleeName;
+import static io.github.kubyk01.util.LlvmUtil.getCallArguments;
 
 /**
  * Computes liveness for all allocation sites of the module simultaneously.
@@ -218,23 +219,4 @@ public class LivenessAnalyzer {
         return result;
     }
 
-    private String extractCalleeName(Instruction inst) {
-        if (!inst.getOperands().isEmpty()) {
-            Value v = inst.getOperands().getFirst();
-            if (v instanceof Constant c && c.getType().isReference()) {
-                return c.getValue().toString();
-            }
-        }
-        return null;
-    }
-
-    private List<Value> getCallArguments(Instruction inst) {
-        List<Value> args = new ArrayList<>();
-        boolean skipFirst = true;
-        for (Value op : inst.getOperands()) {
-            if (skipFirst) { skipFirst = false; continue; }
-            args.add(op);
-        }
-        return args;
-    }
 }

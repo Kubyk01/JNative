@@ -13,12 +13,17 @@ import io.github.kubyk01.domain.ir.Opcode;
 import io.github.kubyk01.domain.ir.Parameter;
 import io.github.kubyk01.domain.ir.ReturnTerminator;
 import io.github.kubyk01.domain.ir.Terminator;
+import io.github.kubyk01.domain.ir.ThrowTerminator;
 import io.github.kubyk01.domain.ir.Type;
 import io.github.kubyk01.domain.ir.Value;
 import lombok.extern.slf4j.Slf4j;
 import org.objectweb.asm.Opcodes;
 
 import java.util.*;
+
+import static io.github.kubyk01.util.LlvmUtil.extractCalleeName;
+import static io.github.kubyk01.util.LlvmUtil.extractFieldOwnerAndName;
+import static io.github.kubyk01.util.LlvmUtil.getCallArguments;
 
 @Slf4j
 public class EscapeSummaryBuilder {
@@ -174,7 +179,7 @@ public class EscapeSummaryBuilder {
                 break;
             }
             case PUT_STATIC: {
-                // Layout PUT_STATIC: [fieldConst, val]. Значение — операнд 1.
+                // Layout PUT_STATIC: [fieldConst, val]
                 if (inst.getOperands().size() >= 2) {
                     Value rhs = inst.getOperands().get(1);
                     if (rhs instanceof Parameter p) {
@@ -314,27 +319,45 @@ public class EscapeSummaryBuilder {
                     }
                 }
             }
-        }
-    }
-
-    private String[] extractFieldOwnerAndName(Instruction inst) {
-        String full = extractFieldName(inst);
-        int dot = full.lastIndexOf('.');
-        if (dot > 0) {
-            return new String[]{full.substring(0, dot), full.substring(dot + 1)};
-        }
-        return new String[]{"", full};
-    }
-
-    private String extractFieldName(Instruction inst) {
-        int fieldIdx = (inst.getOpcode() == Opcode.GET_STATIC || inst.getOpcode() == Opcode.PUT_STATIC) ? 0 : 1;
-        if (inst.getOperands().size() > fieldIdx) {
-            Value v = inst.getOperands().get(fieldIdx);
-            if (v instanceof Constant c && c.getType().isReference()) {
-                return c.getValue().toString();
+        } else if (term instanceof ThrowTerminator tt) {
+            // A thrown exception leaves the current method exactly like a
+            // returned value does: it is observed by the caller (either by
+            // an enclosing try/catch or by the runtime's unhandled-exception
+            // reporter). It must therefore not be treated as method-local,
+            // or the escape analysis would report its AllocationSite as
+            // STACK and ScalarReplacer / DestructorInserter would delete or
+            // destroy it while it is still referenced.
+            //
+            // The same reasoning applies to any parameter that appears in
+            // the thrown expression (typically the exception object itself,
+            // but also any parameter referenced while building the message
+            // or cause chain): throwing it hands it to the caller, so the
+            // parameter escapes and may be returned in the sense used by
+            // the EscapeSummary contract.
+            Value exc = tt.getException();
+            if (exc != null) {
+                if (exc instanceof Parameter p) {
+                    paramsEscaped.add(p.getIndex());
+                    paramsReturned.add(p.getIndex());
+                    addAliases(p.getIndex(), paramAliases, paramsEscaped);
+                    addAliases(p.getIndex(), paramAliases, paramsReturned);
+                } else {
+                    // The exception value may be derived from a parameter —
+                    // for instance it may be an element loaded out of a
+                    // parameter array, or a value stashed away by an earlier
+                    // ALOAD. Reuse the same origin tracking that the RETURN
+                    // branch uses so the parameter that really escaped is
+                    // the one recorded.
+                    Value origin = valueOrigin.get(exc);
+                    if (origin instanceof Parameter p) {
+                        paramsEscaped.add(p.getIndex());
+                        paramsReturned.add(p.getIndex());
+                        addAliases(p.getIndex(), paramAliases, paramsEscaped);
+                        addAliases(p.getIndex(), paramAliases, paramsReturned);
+                    }
+                }
             }
         }
-        return "unknown";
     }
 
     private boolean isVolatileField(String owner, String fieldName) {
@@ -350,23 +373,4 @@ public class EscapeSummaryBuilder {
         }
     }
 
-    private String extractCalleeName(Instruction inst) {
-        if (!inst.getOperands().isEmpty()) {
-            Value v = inst.getOperands().getFirst();
-            if (v instanceof Constant c && c.getType().isReference()) {
-                return c.getValue().toString();
-            }
-        }
-        return null;
-    }
-
-    private List<Value> getCallArguments(Instruction inst) {
-        List<Value> args = new ArrayList<>();
-        boolean skipFirst = true;
-        for (Value op : inst.getOperands()) {
-            if (skipFirst) { skipFirst = false; continue; }
-            args.add(op);
-        }
-        return args;
-    }
 }

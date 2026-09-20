@@ -13,6 +13,7 @@
 __attribute__((noreturn)) void __jnative_throw_exception(void* exc);
 
 struct ReflectionClass {
+    void* vtable;
     void* name;
     struct ReflectionClass* superclass;
     struct ReflectionClass** interfaces;
@@ -28,7 +29,7 @@ extern struct ReflectionClass* reflect_all_classes[];
 extern void* __jnative_make_string_obj(const char* bytes, int32_t len);
 extern const char* __jnative_read_string_bytes(void* s, int32_t* out_len);
 
-#define JAVA_ARR_HDR 4
+#define JAVA_ARR_HDR 8
 #define JAVA_IPV4 1
 #define JAVA_IPV6 2
 

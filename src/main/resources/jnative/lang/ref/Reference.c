@@ -1,12 +1,16 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 
 __attribute__((noreturn)) void __jnative_throw_null_pointer_exception(void);
 
 /* OBJECT_HEADER_SIZE = 8 (vtable), then first field = referent */
 #define OBJECT_HEADER_SIZE 8
 #define REFERENT_OFFSET    OBJECT_HEADER_SIZE
+
+static pthread_mutex_t reference_wait_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  reference_wait_cond  = PTHREAD_COND_INITIALIZER;
 
 static inline void** referent_slot(void* ref) {
     return (void**)((char*)ref + REFERENT_OFFSET);
@@ -27,4 +31,18 @@ void __jnative_fn_java_lang_ref_Reference_clear0___V(void* this_ref) {
         return;
     }
     *referent_slot(this_ref) = NULL;
+}
+
+int32_t __jnative_fn_java_lang_ref_Reference_hasReferencePendingList___Z(void) {
+    return 0;
+}
+
+void __jnative_fn_java_lang_ref_Reference_waitForReferencePendingList___V(void) {
+    pthread_mutex_lock(&reference_wait_mutex);
+    pthread_cond_wait(&reference_wait_cond, &reference_wait_mutex);
+    pthread_mutex_unlock(&reference_wait_mutex);
+}
+
+void* __jnative_fn_java_lang_ref_Reference_getAndClearReferencePendingList___Ljava_lang_ref_Reference_(void) {
+    return NULL;
 }

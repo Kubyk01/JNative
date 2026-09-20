@@ -6,6 +6,7 @@ __attribute__((noreturn)) void __jnative_throw_null_pointer_exception(void);
 __attribute__((noreturn)) void __jnative_throw_exception(void* exc);
 
 struct ReflectionClass {
+    void* vtable;
     void* name;
     struct ReflectionClass* superclass;
     struct ReflectionClass** interfaces;
@@ -16,10 +17,11 @@ struct ReflectionClass {
     int object_size;
 };
 
-/* In our runtime, arrays have a 4-byte header (element count) followed by
- * elements. This matches what the LLVM emitter writes in NEW_ARRAY and what
- * __jnative_create_string_array / __jnative_new_multi_array allocate. */
-#define ARRAY_HEADER_SIZE 4
+/* In our runtime, arrays have an 8-byte header ([i32 length][i32
+ * element_size]) followed by elements. This matches what the LLVM emitter
+ * writes in NEW_ARRAY and what __jnative_create_string_array /
+ * __jnative_new_multi_array allocate. */
+#define ARRAY_HEADER_SIZE 8
 
 /* Determine the size in bytes of one element for the given component class.
  * Primitive classes are identified by their canonical names ("int", "long",
@@ -61,5 +63,18 @@ void* __jnative_fn_java_lang_reflect_Array_newArray__Ljava_lang_Class_I_Ljava_la
         return NULL;
     }
     *((int32_t*)arr) = length;
+    *((int32_t*)((char*)arr + 4)) = elem_size;
     return arr;
+}
+
+
+int32_t __jnative_fn_java_lang_reflect_Array_getLength__Ljava_lang_Object__I(
+        void* array) {
+
+    if (array == NULL) {
+        __jnative_throw_null_pointer_exception();
+        return 0;
+    }
+
+    return *(int32_t*)array;
 }

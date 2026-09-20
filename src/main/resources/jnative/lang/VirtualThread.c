@@ -58,3 +58,21 @@ void __jnative_fn_java_lang_VirtualThread_notifyJvmtiHideFrames__Z_V(int32_t hid
 void __jnative_fn_java_lang_VirtualThread_notifyJvmtiUnmount__Z_V(int32_t hide) {
     (void)hide;
 }
+
+/*
+ * private static native void registerNatives();
+ *
+ * Called from java.lang.VirtualThread.<clinit>. In HotSpot this hook
+ * binds the class's native methods — the three notifyJvmti* entry
+ * points above, plus isVirtual0 and the continuation-related hooks — to
+ * their C implementations inside the VM.
+ *
+ * This runtime never uses JNI registration: every native method has a
+ * statically-linked __jnative_fn_<class>_<method>_<desc> symbol emitted
+ * by the LLVM backend, and call sites resolve to it directly. The
+ * symbol must nevertheless exist because VirtualThread.<clinit> emits a
+ * native call to it. Making it a no-op is the only correct behaviour:
+ * there is no registry to populate and no method table to patch.
+ */
+void __jnative_fn_java_lang_VirtualThread_registerNatives___V(void) {
+}

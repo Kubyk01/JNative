@@ -1,7 +1,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 
-#define JAVA_ARR_HDR 4
+#define JAVA_ARR_HDR 8
 
 void* __jnative_fn_java_lang_reflect_Field_getTypeAnnotationBytes0____B(void* this_field) {
     (void)this_field;

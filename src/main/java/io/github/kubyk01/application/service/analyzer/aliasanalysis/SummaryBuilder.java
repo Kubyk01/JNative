@@ -3,7 +3,6 @@ package io.github.kubyk01.application.service.analyzer.aliasanalysis;
 import io.github.kubyk01.domain.analyzer.aliasanalysis.AllocationSite;
 import io.github.kubyk01.domain.analyzer.aliasanalysis.FunctionSummary;
 import io.github.kubyk01.domain.ir.BasicBlock;
-import io.github.kubyk01.domain.ir.Constant;
 import io.github.kubyk01.domain.ir.Function;
 import io.github.kubyk01.domain.ir.Instruction;
 import io.github.kubyk01.domain.ir.Module;
@@ -16,6 +15,11 @@ import io.github.kubyk01.domain.ir.Value;
 import lombok.extern.slf4j.Slf4j;
 
 import java.util.*;
+
+import static io.github.kubyk01.util.LlvmUtil.extractCalleeName;
+import static io.github.kubyk01.util.LlvmUtil.extractFieldName;
+import static io.github.kubyk01.util.LlvmUtil.getCallArguments;
+import static io.github.kubyk01.util.LlvmUtil.isAllocation;
 
 @Slf4j
 public class SummaryBuilder {
@@ -379,44 +383,4 @@ public class SummaryBuilder {
         }
     }
 
-    private boolean isAllocation(Opcode op) {
-        return op == Opcode.NEW || op == Opcode.NEW_ARRAY || op == Opcode.MULTI_NEW_ARRAY;
-    }
-
-    /**
-     * The field name depends on the opcode: for GET_FIELD/PUT_FIELD the field constant is in operand 1,
-     * for GET_STATIC/PUT_STATIC – in operand 0.
-     * The full name (including the class) is returned, which prevents name collisions
-     * between static fields of different classes.
-     */
-    private String extractFieldName(Instruction inst) {
-        int fieldIdx = (inst.getOpcode() == Opcode.GET_STATIC || inst.getOpcode() == Opcode.PUT_STATIC) ? 0 : 1;
-        if (inst.getOperands().size() > fieldIdx) {
-            Value v = inst.getOperands().get(fieldIdx);
-            if (v instanceof Constant c && c.getType().isReference()) {
-                return c.getValue().toString(); // full name, e.g. "java/lang/System.out"
-            }
-        }
-        return "unknown";
-    }
-
-    private String extractCalleeName(Instruction inst) {
-        if (!inst.getOperands().isEmpty()) {
-            Value v = inst.getOperands().getFirst();
-            if (v instanceof Constant c && c.getType().isReference()) {
-                return c.getValue().toString();
-            }
-        }
-        return null;
-    }
-
-    private List<Value> getCallArguments(Instruction inst) {
-        List<Value> args = new ArrayList<>();
-        boolean skipFirst = true;
-        for (Value op : inst.getOperands()) {
-            if (skipFirst) { skipFirst = false; continue; }
-            args.add(op);
-        }
-        return args;
-    }
 }

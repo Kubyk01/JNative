@@ -63,10 +63,10 @@ public class InstructionHandlers {
         frame.push(inst.getResult());
     }
 
-    public void shiftOp() {
+    public void shiftOp(Opcode op) {
         Value amount = frame.pop();
-        Value value = frame.pop();
-        Instruction inst = builder.addInstruction(Opcode.SHL, value, amount);
+        Value value  = frame.pop();
+        Instruction inst = builder.addInstruction(op, value, amount);
         frame.push(inst.getResult());
     }
 

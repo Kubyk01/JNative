@@ -1,3 +1,5 @@
+/* path: src/main/java/io/github/kubyk01/application/service/analyzer/ssa/MethodTranslator.java */
+
 package io.github.kubyk01.application.service.analyzer.ssa;
 
 import io.github.kubyk01.application.service.analyzer.dependencyresolver.DependencyResolver;
@@ -20,6 +22,7 @@ import io.github.kubyk01.domain.ir.Temporary;
 import io.github.kubyk01.domain.ir.Terminator;
 import io.github.kubyk01.domain.ir.TryCatchRange;
 import io.github.kubyk01.domain.ir.Type;
+import io.github.kubyk01.domain.ir.UndefinedValue;
 import io.github.kubyk01.domain.ir.Value;
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
@@ -46,6 +49,11 @@ public class MethodTranslator extends MethodVisitor {
     private int lambdaCounter = 0;
     private final DependencyResolver resolver;
 
+    private final Map<Label, Integer> labelStackBase = new HashMap<>();
+    private final Map<Label, Integer> labelStackHeight = new HashMap<>();
+    private final Map<Label, List<Type>> labelStackTypes = new HashMap<>();
+    private int nextSyntheticLocal = 10000;
+
     @Getter
     private Function currentFunction;
     private BasicBlock currentBlock;
@@ -69,10 +77,6 @@ public class MethodTranslator extends MethodVisitor {
         String mangledName = LlvmRuntime.mangleMethod(
             methodRef.getOwner(), methodRef.getName(), methodRef.getDescriptor());
 
-        // JVM slots: the receiver is in slot 0, then by logical parameters, with
-        // long/double occupying two slots. Use these slots as Parameter indices —
-        // then SSA versions, version stacks and bytecode LOAD/STORE all agree on
-        // the same system of indices.
         List<Parameter> params = new ArrayList<>();
         int slot = 0;
         if (!isStatic) {
@@ -95,12 +99,30 @@ public class MethodTranslator extends MethodVisitor {
 
     @Override
     public void visitLabel(Label label) {
-        currentBlock = labelToBlock.computeIfAbsent(label,
-            k -> builder.createBlock("L" + k.toString()));
-        builder.setCurrentBlock(currentBlock);
+        BasicBlock current = builder.currentBlock();
+        BasicBlock target = labelToBlock.get(label);
+
+        if (target == null) {
+            target = builder.createBlock("L" + label);
+            labelToBlock.put(label, target);
+        }
+
+        if (current != null
+            && current != target
+            && current.getTerminator() == null
+            && !handlerLabels.contains(label)) {
+            emitStackStoresForTarget(label);
+            current.setTerminator(new BranchTerminator(target));
+        }
+
+        currentBlock = target;
+        builder.setCurrentBlock(target);
+
         if (handlerLabels.contains(label)) {
             frame.clear();
             handlers.loadCaughtException();
+        } else {
+            emitStackLoadsForLabel(label);
         }
     }
 
@@ -176,9 +198,13 @@ public class MethodTranslator extends MethodVisitor {
                 handlers.unaryNeg(Type.INT);
                 break;
             case Opcodes.ISHL:
+                handlers.shiftOp(Opcode.SHL);
+                break;
             case Opcodes.ISHR:
+                handlers.shiftOp(Opcode.SHR);
+                break;
             case Opcodes.IUSHR:
-                handlers.shiftOp();
+                handlers.shiftOp(Opcode.USHR);
                 break;
             case Opcodes.IAND:
                 handlers.binaryOp(Opcode.AND);
@@ -209,9 +235,13 @@ public class MethodTranslator extends MethodVisitor {
                 handlers.unaryNeg(Type.LONG);
                 break;
             case Opcodes.LSHL:
+                handlers.shiftOp(Opcode.SHL);
+                break;
             case Opcodes.LSHR:
+                handlers.shiftOp(Opcode.SHR);
+                break;
             case Opcodes.LUSHR:
-                handlers.shiftOp();
+                handlers.shiftOp(Opcode.USHR);
                 break;
             case Opcodes.LAND:
                 handlers.binaryOp(Opcode.AND);
@@ -463,6 +493,19 @@ public class MethodTranslator extends MethodVisitor {
     }
 
     @Override
+    public void visitIincInsn(int var, int increment) {
+        Instruction load = builder.createLoad(var, Type.INT);
+        Value loaded = load.getResult();
+
+        Constant incConst = new Constant(Type.INT, increment);
+        Instruction add = builder.addInstruction(Opcode.ADD, loaded, incConst);
+        Temporary sum = add.getResult();
+
+        Instruction store = builder.createStore(sum, var);
+        frame.setLocal(var, store.getResult());
+    }
+
+    @Override
     public void visitTypeInsn(int opcode, String type) {
         switch (opcode) {
             case Opcodes.NEW:
@@ -534,11 +577,14 @@ public class MethodTranslator extends MethodVisitor {
 
     @Override
     public void visitJumpInsn(int opcode, Label label) {
-        BasicBlock target = getOrCreateBlock(label);
         switch (opcode) {
-            case Opcodes.GOTO:
+            case Opcodes.GOTO: {
+                BasicBlock target = getOrCreateBlock(label, frame.size());
+                emitStackStoresForTarget(label);
                 builder.createBranch(target);
                 break;
+            }
+
             case Opcodes.IFEQ:
             case Opcodes.IFNE:
             case Opcodes.IFLT:
@@ -546,12 +592,18 @@ public class MethodTranslator extends MethodVisitor {
             case Opcodes.IFGT:
             case Opcodes.IFLE: {
                 Value val = frame.pop();
+                BasicBlock target = getOrCreateBlock(label, frame.size());
+                emitStackStoresForTarget(label);
+
                 Constant zero = new Constant(Type.INT, 0);
                 Instruction cmp = builder.addInstruction(mapIfOpcode(opcode), val, zero);
                 BasicBlock next = createNextBlock();
                 builder.createCondBranch(cmp.getResult(), target, next);
+                builder.setCurrentBlock(next);
+                currentBlock = next;
                 break;
             }
+
             case Opcodes.IF_ICMPEQ:
             case Opcodes.IF_ICMPNE:
             case Opcodes.IF_ICMPLT:
@@ -560,35 +612,53 @@ public class MethodTranslator extends MethodVisitor {
             case Opcodes.IF_ICMPLE: {
                 Value right = frame.pop();
                 Value left = frame.pop();
+                BasicBlock target = getOrCreateBlock(label, frame.size());
+                emitStackStoresForTarget(label);
+
                 Instruction cmp = builder.addInstruction(mapIfOpcode(opcode), left, right);
                 BasicBlock next = createNextBlock();
                 builder.createCondBranch(cmp.getResult(), target, next);
+                builder.setCurrentBlock(next);
+                currentBlock = next;
                 break;
             }
+
             case Opcodes.IF_ACMPEQ:
             case Opcodes.IF_ACMPNE: {
                 Value right = frame.pop();
                 Value left = frame.pop();
+                BasicBlock target = getOrCreateBlock(label, frame.size());
+                emitStackStoresForTarget(label);
+
                 Opcode cmpOp = opcode == Opcodes.IF_ACMPEQ ? Opcode.EQ : Opcode.NE;
                 Instruction cmp = builder.addInstruction(cmpOp, left, right);
                 BasicBlock next = createNextBlock();
                 builder.createCondBranch(cmp.getResult(), target, next);
+                builder.setCurrentBlock(next);
+                currentBlock = next;
                 break;
             }
+
             case Opcodes.IFNULL:
             case Opcodes.IFNONNULL: {
                 Value val = frame.pop();
+                BasicBlock target = getOrCreateBlock(label, frame.size());
+                emitStackStoresForTarget(label);
+
                 Opcode cmpOp = opcode == Opcodes.IFNULL ? Opcode.EQ : Opcode.NE;
                 Constant nul = new Constant(Type.NULL, null);
                 Instruction cmp = builder.addInstruction(cmpOp, val, nul);
                 BasicBlock next = createNextBlock();
                 builder.createCondBranch(cmp.getResult(), target, next);
+                builder.setCurrentBlock(next);
+                currentBlock = next;
                 break;
             }
+
             case Opcodes.JSR: {
                 BasicBlock current = builder.currentBlock();
                 BasicBlock returnBlock = createNextBlock();
-                BasicBlock targetBlock = getOrCreateBlock(label);
+                BasicBlock targetBlock = getOrCreateBlock(label, frame.size());
 
                 Instruction jsrInst = new Instruction(Opcode.JSR);
                 jsrInst.addOperand(new Constant(Type.BLOCK, returnBlock));
@@ -599,10 +669,12 @@ public class MethodTranslator extends MethodVisitor {
                 frame.push(blockVal);
 
                 current.setTerminator(new BranchTerminator(targetBlock));
+
                 builder.setCurrentBlock(returnBlock);
                 currentBlock = returnBlock;
                 break;
             }
+
             default:
                 log.warn("Unhandled jump insn: {}", opcode);
         }
@@ -611,16 +683,32 @@ public class MethodTranslator extends MethodVisitor {
     @Override
     public void visitLookupSwitchInsn(Label dflt, int[] keys, Label[] labels) {
         Value key = frame.pop();
-        BasicBlock defaultBlock = getOrCreateBlock(dflt);
-        BasicBlock[] targetBlocks = Arrays.stream(labels).map(this::getOrCreateBlock).toArray(BasicBlock[]::new);
+
+        BasicBlock defaultBlock = getOrCreateBlock(dflt, frame.size());
+        BasicBlock[] targetBlocks = new BasicBlock[labels.length];
+        for (int i = 0; i < labels.length; i++) {
+            targetBlocks[i] = getOrCreateBlock(labels[i], frame.size());
+        }
+
+        for (Label l : labels) emitStackStoresForTarget(l);
+        emitStackStoresForTarget(dflt);
+
         builder.createLookupSwitch(key, keys, targetBlocks, defaultBlock);
     }
 
     @Override
     public void visitTableSwitchInsn(int min, int max, Label dflt, Label... labels) {
         Value key = frame.pop();
-        BasicBlock defaultBlock = getOrCreateBlock(dflt);
-        BasicBlock[] targetBlocks = Arrays.stream(labels).map(this::getOrCreateBlock).toArray(BasicBlock[]::new);
+
+        BasicBlock defaultBlock = getOrCreateBlock(dflt, frame.size());
+        BasicBlock[] targetBlocks = new BasicBlock[labels.length];
+        for (int i = 0; i < labels.length; i++) {
+            targetBlocks[i] = getOrCreateBlock(labels[i], frame.size());
+        }
+
+        for (Label l : labels) emitStackStoresForTarget(l);
+        emitStackStoresForTarget(dflt);
+
         builder.createTableSwitch(key, min, max, targetBlocks, defaultBlock);
     }
 
@@ -637,6 +725,9 @@ public class MethodTranslator extends MethodVisitor {
                 if (sort == org.objectweb.asm.Type.OBJECT) {
                     frame.push(new Constant(Type.reference("java/lang/Class"),
                         asmType.getInternalName()));
+                } else if (sort == org.objectweb.asm.Type.ARRAY) {
+                    frame.push(new Constant(Type.reference("java/lang/Class"),
+                        asmType.getDescriptor()));
                 } else {
                     frame.push(new Constant(Type.NULL, null));
                 }
@@ -666,12 +757,6 @@ public class MethodTranslator extends MethodVisitor {
         }
         Collections.reverse(captured);
 
-        // Pass the invokedynamic call site name through so that the SAM
-        // interface method can be identified by its full signature
-        // (name + descriptor), not just by the descriptor. The global vtable
-        // index is keyed on the full "name(descriptor)" form; without the
-        // name the lookup in resolveSamIndex would degrade to a suffix match
-        // that may pick an arbitrary overload.
         ResolvedCall resolved = resolveInvokeDynamic(name, bsm, bsmArgs, captured);
         InvokeDynamicInfo info = new InvokeDynamicInfo(name, desc, bsm, bsmArgs, resolved);
 
@@ -703,9 +788,6 @@ public class MethodTranslator extends MethodVisitor {
             if (bsmArgs.length < 3) return ResolvedCall.unsupported();
 
             org.objectweb.asm.Type samType = (org.objectweb.asm.Type) bsmArgs[0];
-            // Full SAM signature — this is what the global vtable index is
-            // keyed on. `samName` is the invokedynamic call-site name, which
-            // equals the SAM method's name (e.g. "run", "accept", "apply").
             String interfaceMethodSig = samName + samType.getDescriptor();
 
             String lambdaId = "lambda_" + (++lambdaCounter) + "_" + System.identityHashCode(this);
@@ -750,8 +832,18 @@ public class MethodTranslator extends MethodVisitor {
     @Override
     public void visitEnd() {
         if (currentBlock != null && currentBlock.getTerminator() == null) {
-            handlers.returnVoid();
+            Type returnType = currentFunction.getReturnType();
+            if (returnType.isVoid()) {
+                handlers.returnVoid();
+            } else {
+                log.warn(
+                    "Method {} ended with an unterminated block {} "
+                        + "(return type {}); leaving the terminator empty so "
+                        + "the CFG stays honest",
+                    methodRef, currentBlock.getLabel(), returnType);
+            }
         }
+
         for (IndirectBranchTerminator ibt : indirectBranches) {
             int var = -1;
             if (ibt.getTargetBlock() instanceof Temporary t
@@ -789,13 +881,69 @@ public class MethodTranslator extends MethodVisitor {
         }
     }
 
-    private BasicBlock getOrCreateBlock(Label label) {
-        return labelToBlock.computeIfAbsent(label,
-            k -> builder.createBlock("L" + k.toString()));
+    private BasicBlock getOrCreateBlock(Label label, int expectedHeight) {
+        BasicBlock saved = builder.currentBlock();
+        BasicBlock block = labelToBlock.get(label);
+        if (block == null) {
+            block = builder.createBlock("L" + label);
+            labelToBlock.put(label, block);
+
+            labelStackHeight.put(label, expectedHeight);
+            labelStackTypes.put(label, frame.snapshotStackTypesFromBottom(expectedHeight));
+            if (expectedHeight > 0) {
+                labelStackBase.put(label, nextSyntheticLocal);
+                nextSyntheticLocal += expectedHeight;
+            }
+        }
+        if (saved != null) {
+            builder.setCurrentBlock(saved);
+        }
+        return block;
+    }
+
+    private void emitStackStoresForTarget(Label label) {
+        Integer base = labelStackBase.get(label);
+        Integer height = labelStackHeight.get(label);
+        if (base == null || height == null || height == 0) return;
+
+        List<Value> stack = frame.snapshotStackFromBottom();
+        if (stack.size() < height) {
+            log.warn("Stack underflow while materialising slots for {}: "
+                    + "expected height {}, got {}",
+                label, height, stack.size());
+        }
+        int start = Math.max(0, stack.size() - height);
+        for (int i = 0; i < height; i++) {
+            Value v = (start + i) < stack.size()
+                ? stack.get(start + i)
+                : new UndefinedValue(Type.UNKNOWN);
+            builder.createStore(v, base + i);
+        }
+    }
+
+    private void emitStackLoadsForLabel(Label label) {
+        Integer height = labelStackHeight.get(label);
+        if (height == null) return;
+
+        frame.clear();
+        if (height == 0) return;
+
+        int base = labelStackBase.get(label);
+        List<Type> types = labelStackTypes.get(label);
+        for (int i = 0; i < height; i++) {
+            Type t = (types != null && i < types.size()) ? types.get(i) : Type.UNKNOWN;
+            Instruction load = builder.createLoad(base + i, t);
+            frame.push(load.getResult());
+        }
     }
 
     private BasicBlock createNextBlock() {
-        return builder.createBlock("block" + currentFunction.getBlocks().size());
+        BasicBlock saved = builder.currentBlock();
+        BasicBlock block = builder.createBlock("block" + currentFunction.getBlocks().size());
+        if (saved != null) {
+            builder.setCurrentBlock(saved);
+        }
+        return block;
     }
 
     private Type typeOfLoad(int opcode) {

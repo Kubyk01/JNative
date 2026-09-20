@@ -6,13 +6,14 @@ import io.github.kubyk01.domain.ir.BasicBlock;
 import io.github.kubyk01.domain.ir.Function;
 import io.github.kubyk01.domain.ir.Instruction;
 import io.github.kubyk01.domain.ir.Module;
-import io.github.kubyk01.domain.ir.Opcode;
 import lombok.RequiredArgsConstructor;
 
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+
+import static io.github.kubyk01.util.LlvmUtil.isAllocation;
 
 @RequiredArgsConstructor
 public class AllocationSiteCollector {
@@ -38,7 +39,4 @@ public class AllocationSiteCollector {
         return new ArrayList<>(sites);
     }
 
-    private boolean isAllocation(Opcode op) {
-        return op == Opcode.NEW || op == Opcode.NEW_ARRAY || op == Opcode.MULTI_NEW_ARRAY;
-    }
 }

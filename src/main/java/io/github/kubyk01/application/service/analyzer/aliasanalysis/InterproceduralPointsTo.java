@@ -19,6 +19,7 @@ import java.util.*;
 import static io.github.kubyk01.util.LlvmUtil.extractCalleeName;
 import static io.github.kubyk01.util.LlvmUtil.extractFieldName;
 import static io.github.kubyk01.util.LlvmUtil.getCallArguments;
+import static io.github.kubyk01.util.LlvmUtil.isAllocation;
 
 @Slf4j
 public class InterproceduralPointsTo {
@@ -70,10 +71,6 @@ public class InterproceduralPointsTo {
         }
     }
 
-    private boolean isAllocation(Opcode op) {
-        return op == Opcode.NEW || op == Opcode.NEW_ARRAY || op == Opcode.MULTI_NEW_ARRAY;
-    }
-
     private void processFunction(Function func) {
         for (BasicBlock block : func.getBlocks()) {
             for (Instruction inst : block.getInstructions()) {
@@ -96,6 +93,15 @@ public class InterproceduralPointsTo {
                     if (local != null && stored != null) {
                         changed |= graph.merge(local, graph.get(stored));
                     }
+                }
+                break;
+            }
+            case PHI: {
+                Value result = inst.getResult();
+                if (result == null) break;
+                for (Value operand : inst.getOperands()) {
+                    if (operand == null) continue;
+                    changed |= graph.merge(result, graph.get(operand));
                 }
                 break;
             }

@@ -1,13 +1,17 @@
+import java.io.IOException;
+
 public class Test {
 
 
-    public static void main(String[] args) {
+    public static void main(String[] args) throws IOException {
         final int b = Example.lol();
         Thread.currentThread();
 
-        String lol = "true";
-        var x = lol.equals("true");
-        throw new IllegalArgumentException("test" + b + " " + Thread.currentThread().getName() + "here should be true:"+ x);
+        for (int i = 0; i < 100; i++) {
+            var x = new Test2(i);
+        }
+
+        throw new IllegalArgumentException("test");
     }
 }
 
@@ -17,10 +21,17 @@ class Example {
 
     static {
         String lol = "dont add this";
-        String butThis = "this should be added";
     }
     public static int lol(){
         return a;
     }
 
+}
+
+class Test2{
+    public int b;
+
+    public Test2(int b) {
+        this.b = b;
+    }
 }
