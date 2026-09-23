@@ -2,17 +2,20 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <unistd.h>
-#include <malloc.h>
 
-__attribute__((noreturn)) void __jnative_throw_exception(void* exc);
-
+#include "jnative_runtime.h"
 
 /*
  * public native void exit(int status);
  *
- * Terminates the process with the given status. exit() runs atexit
+ * Terminates the process with the given status. exit(3) runs atexit
  * handlers, which is required because __jnative_shutdown is registered
- * via atexit in @main and must release objects held in static fields.
+ * via atexit from @main (see LlvmGenerator.generateMain) and must
+ * release objects held in static fields before the process image is
+ * torn down.
+ *
+ * The receiver is unused: Runtime is a singleton and every instance
+ * delegates to the same process-wide exit.
  */
 void __jnative_fn_java_lang_Runtime_exit__I_V(void* this_runtime, int32_t status) {
     (void)this_runtime;
@@ -22,11 +25,17 @@ void __jnative_fn_java_lang_Runtime_exit__I_V(void* this_runtime, int32_t status
 /*
  * public native void gc();
  *
- * Requests a garbage collection. This runtime has no garbage collector:
- * every allocation is a libc malloc and every destruction is an explicit
- * free emitted by DestructorInserter. The closest analogue is returning
- * free arena pages to the OS, which the allocator does on its own via
- * its trim threshold; nothing needs to be forced here.
+ * Requests a garbage collection. This runtime has no garbage
+ * collector: every allocation is a libc malloc and every destruction
+ * is an explicit free emitted by DestructorInserter at a statically
+ * determined point. The closest analogue is returning free arena pages
+ * to the OS, which the allocator does on its own via its trim
+ * threshold; nothing needs to be forced here.
+ *
+ * The call is deliberately a no-op rather than a call to malloc_trim(3)
+ * or equivalent. Forcing a trim on every Runtime.gc() would trade a
+ * negligible memory saving for a measurable wall-clock cost in the
+ * common case where the caller is not actually memory-constrained.
  */
 void __jnative_fn_java_lang_Runtime_gc___V(void* this_runtime) {
     (void)this_runtime;
@@ -35,10 +44,14 @@ void __jnative_fn_java_lang_Runtime_gc___V(void* this_runtime) {
 /*
  * public native long maxMemory();
  *
- * Returns the maximum amount of memory the JVM will attempt to use. The
- * heap in this runtime is the process address space, so the upper bound
- * is INT64_MAX. The value is clamped to INT64_MAX so callers that
- * multiply it by a factor cannot overflow.
+ * Returns the maximum amount of memory the JVM will attempt to use.
+ * The heap in this runtime is the process address space, so the upper
+ * bound is INT64_MAX. The value is clamped to INT64_MAX so callers
+ * that multiply it by a factor cannot overflow.
+ *
+ * The absolute value is not meaningful to a caller that uses it to
+ * decide how much memory to allocate; what matters is that it is a
+ * large, consistent upper bound. INT64_MAX satisfies both.
  */
 int64_t __jnative_fn_java_lang_Runtime_maxMemory___J(void* this_runtime) {
     (void)this_runtime;
@@ -53,6 +66,12 @@ int64_t __jnative_fn_java_lang_Runtime_maxMemory___J(void* this_runtime) {
  * region, so totalMemory and freeMemory return the same value: the
  * amount of physical memory the kernel reports as available to new
  * mappings, capped at INT64_MAX.
+ *
+ * On Linux this is sysconf(_SC_AVPHYS_PAGES) * sysconf(_SC_PAGESIZE),
+ * which reflects the cgroup's view of available memory when the
+ * process is running under one. A sysconf failure or a non-positive
+ * result is reported as 0, which the Java layer treats as "unknown"
+ * rather than as a genuine zero-memory state.s
  */
 int64_t __jnative_fn_java_lang_Runtime_totalMemory___J(void* this_runtime) {
     (void)this_runtime;
@@ -73,7 +92,9 @@ int64_t __jnative_fn_java_lang_Runtime_totalMemory___J(void* this_runtime) {
  *
  * Returns the amount of memory available for future allocations. As
  * explained for totalMemory, this equals totalMemory in the current
- * design.
+ * design: the runtime has no separate pool of committed-but-unused
+ * memory that could be reported independently of the process's own
+ * free address space.
  */
 int64_t __jnative_fn_java_lang_Runtime_freeMemory___J(void* this_runtime) {
     (void)this_runtime;
@@ -94,10 +115,14 @@ int64_t __jnative_fn_java_lang_Runtime_freeMemory___J(void* this_runtime) {
  *
  * Returns the number of processors available to the JVM. On Linux this
  * is _SC_NPROCESSORS_ONLN, which reports the number of online CPUs in
- * the current cgroup's effective CPU set. If the sysconf call fails or
- * returns a non-positive value, 1 is the only safe answer: callers such
- * as Striped64 use this to size a probe array and would divide by zero
- * on 0.
+ * the current cgroup's effective CPU set.
+ *
+ * A non-positive result from sysconf (which would mean the platform is
+ * reporting zero online CPUs, a nonsensical state that can occur
+ * transiently under some cgroup configurations during startup) is
+ * clamped to 1. Clamping rather than returning the raw value matters
+ * because callers such as Striped64 use the result to size a probe
+ * array and would divide by zero on 0.
  */
 int32_t __jnative_fn_java_lang_Runtime_availableProcessors___I(void) {
     long n = sysconf(_SC_NPROCESSORS_ONLN);

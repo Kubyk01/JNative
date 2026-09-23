@@ -11,85 +11,65 @@
 #include <sys/socket.h>
 #include <sys/ioctl.h>
 #include <net/if_arp.h>
-#include <dlfcn.h>
 
-__attribute__((noreturn)) void __jnative_throw_exception(void* exc);
-__attribute__((noreturn)) void __jnative_throw_null_pointer_exception(void);
+#include "jnative_runtime.h"
 
-extern void* __jnative_make_string_obj(const char* bytes, int32_t len);
-extern const char* __jnative_read_string_bytes(void* s, int32_t* out_len);
-
-struct ReflectionClass {
-    void* vtable;
-    void* name;
-    struct ReflectionClass* superclass;
-    struct ReflectionClass** interfaces;
-    void** methods;
-    void** fields;
-    void** constructors;
-    int modifiers;
-    int object_size;
-};
-
-extern struct ReflectionClass* reflect_all_classes[];
-
-void* gv_java_net_NetworkInterface_name_0        = NULL;
-void* gv_java_net_NetworkInterface_displayName_0 = NULL;
-void* gv_java_net_NetworkInterface_index_0       = NULL;
-void* gv_java_net_NetworkInterface_addrs_0       = NULL;
-void* gv_java_net_NetworkInterface_bindings_0    = NULL;
-void* gv_java_net_NetworkInterface_childs_0      = NULL;
-
-#define JAVA_ARR_HDR 8
-
-/* --------------------------------------------------------------------------
- * Registry helpers (same shape as the ones in Inet4AddressImpl.c).
- * ------------------------------------------------------------------------ */
-
-static struct ReflectionClass* find_class_by_name(const char* internal_name) {
-    if (!internal_name) return NULL;
-    if (reflect_all_classes[0] == NULL) return NULL;
-    struct ReflectionClass** pp = reflect_all_classes;
-    while (*pp) {
-        struct ReflectionClass* cls = *pp;
-        const char* n = (const char*)cls->name;
-        if (n && strcmp(n, internal_name) == 0) return cls;
-        pp++;
-    }
-    return NULL;
-}
-
-static void* lookup_class_vtable(struct ReflectionClass* cls) {
-    if (!cls || !cls->name) return NULL;
-    char buf[512];
-    snprintf(buf, sizeof(buf), "__type_info_%s", (const char*)cls->name);
-    for (char* p = buf; *p; p++) {
-        if (*p == '/' || *p == '.') *p = '_';
-    }
-    void* handle = dlopen(NULL, RTLD_LAZY);
-    if (!handle) return NULL;
-    void** type_info = (void**)dlsym(handle, buf);
-    dlclose(handle);
-    if (!type_info) return NULL;
-    return type_info[0];
-}
-
-/* --------------------------------------------------------------------------
- * Array builders.
+/*
+ * java.net.NetworkInterface — the native entry points that back the
+ * interface enumeration API. The class declares five natives:
  *
- * Every array produced here matches the runtime's Java-array layout:
- * an 8-byte header ([i32 length][i32 element_size]) followed by the
- * payload. The name and displayName arrays hold Java String objects,
- * not raw C strings, because that is what the Java layer reads them as
- * via GET_STATIC.
- * ------------------------------------------------------------------------ */
+ *   init()                                   — one-shot setup, <clinit>
+ *   getByName0(String)                       — lookup by interface name
+ *   getAll()                                 — list all interfaces
+ *   isLoopback0(String, int)                 — loopback predicate
+ *   getMacAddr0(byte[], String, int)         — hardware address
+ *   boundInetAddress0(InetAddress)           — local-address predicate
+ *
+ * The runtime does not synthesise InetAddress or InterfaceAddress
+ * objects for the local interfaces: a caller that iterates
+ * NetworkInterface.getInetAddresses() / getInterfaceAddresses()
+ * observes an empty result, which is a valid, non-null state for every
+ * caller in the JDK and in user code. The address-family checks that
+ * the JDK performs against the network interface list are still
+ * answered truthfully by getMacAddr0 and isLoopback0 below.
+ */
 
+/*
+ * The static lookup arrays emitted by LlvmGlobalEmitter for
+ * NetworkInterface.<clinit>. They hold, respectively:
+ *
+ *   name_0        — String[] of interface names
+ *   displayName_0 — String[] of display names
+ *   index_0       — int[]    of interface indices
+ *   addrs_0       — Object[] of InetAddress (always empty here)
+ *   bindings_0    — Object[] of InterfaceAddress (always empty here)
+ *   childs_0      — Object[] of NetworkInterface (always empty here)
+ *
+ * The weak externs let this translation unit link even when the class
+ * is not part of the compiled image, and every store below is guarded
+ * by a `&global != NULL` check that tests whether the linker actually
+ * bound the symbol.
+ */
+extern void* gv_java_net_NetworkInterface_name_0        __attribute__((weak));
+extern void* gv_java_net_NetworkInterface_displayName_0 __attribute__((weak));
+extern void* gv_java_net_NetworkInterface_index_0       __attribute__((weak));
+extern void* gv_java_net_NetworkInterface_addrs_0       __attribute__((weak));
+extern void* gv_java_net_NetworkInterface_bindings_0    __attribute__((weak));
+extern void* gv_java_net_NetworkInterface_childs_0      __attribute__((weak));
+
+/*
+ * Build a Java String[] from an array of C strings. A NULL element in
+ * the input becomes a NULL slot in the output, matching the Java-side
+ * caller's expectation that the array may contain nulls.
+ *
+ * The array itself comes from jnative_ref_array_of_class(), so it carries
+ * the standard header — including the [Ljava/lang/String; class mirror —
+ * and its payload starts at JAVA_ARR_HDR.
+ */
 static void* make_java_string_array(int count, char** strings) {
-    size_t total = JAVA_ARR_HDR + (size_t)count * sizeof(void*);
-    void* arr = malloc(total);
+    void* arr = jnative_ref_array_of_class(NULL, count,
+                                           "[Ljava/lang/String;");
     if (arr == NULL) return NULL;
-    *(int32_t*)arr = count;
-    *(int32_t*)((char*)arr + 4) = (int32_t)sizeof(void*);
     void** slots = (void**)((char*)arr + JAVA_ARR_HDR);
     for (int i = 0; i < count; i++) {
         if (strings[i] != NULL) {
@@ -101,43 +81,37 @@ static void* make_java_string_array(int count, char** strings) {
     return arr;
 }
 
-static void* make_int_array(int count, int32_t* values) {
-    size_t total = JAVA_ARR_HDR + (size_t)count * sizeof(int32_t);
-    void* arr = malloc(total);
-    if (arr == NULL) return NULL;
-    *(int32_t*)arr = count;
-    *(int32_t*)((char*)arr + 4) = (int32_t)sizeof(int32_t);
-    int32_t* slots = (int32_t*)((char*)arr + JAVA_ARR_HDR);
-    for (int i = 0; i < count; i++) {
-        slots[i] = values[i];
-    }
-    return arr;
-}
-
-static void* make_empty_ref_array(void) {
-    void* arr = malloc(JAVA_ARR_HDR);
-    if (arr == NULL) return NULL;
-    *(int32_t*)arr = 0;
-    *(int32_t*)((char*)arr + 4) = (int32_t)sizeof(void*);
-    return arr;
-}
-
-static void set_all_empty(void) {
-    gv_java_net_NetworkInterface_name_0        = make_empty_ref_array();
-    gv_java_net_NetworkInterface_displayName_0 = make_empty_ref_array();
-    gv_java_net_NetworkInterface_index_0       = make_int_array(0, NULL);
-    gv_java_net_NetworkInterface_addrs_0       = make_empty_ref_array();
-    gv_java_net_NetworkInterface_bindings_0    = make_empty_ref_array();
-    gv_java_net_NetworkInterface_childs_0      = make_empty_ref_array();
-}
-
-/* --------------------------------------------------------------------------
- * allocate_network_interface
+/*
+ * Replace every static lookup array with an empty one. Called when the
+ * runtime cannot enumerate interfaces at all (getifaddrs failed) or
+ * when an allocation failed mid-enumeration; leaving the arrays in a
+ * partially built state would be worse than leaving them empty.
  *
- * Builds a fresh java.net.NetworkInterface instance with the three
+ * The empty-array helpers come from jnative_runtime.h, so the layout
+ * is guaranteed to match every other array the runtime produces.
+ */
+static void set_all_empty(void) {
+    if (&gv_java_net_NetworkInterface_name_0 != NULL)
+        gv_java_net_NetworkInterface_name_0        = jnative_empty_ref_array();
+    if (&gv_java_net_NetworkInterface_displayName_0 != NULL)
+        gv_java_net_NetworkInterface_displayName_0 = jnative_empty_ref_array();
+    if (&gv_java_net_NetworkInterface_index_0 != NULL)
+        gv_java_net_NetworkInterface_index_0       = jnative_int_array(NULL, 0);
+    if (&gv_java_net_NetworkInterface_addrs_0 != NULL)
+        gv_java_net_NetworkInterface_addrs_0       = jnative_empty_ref_array();
+    if (&gv_java_net_NetworkInterface_bindings_0 != NULL)
+        gv_java_net_NetworkInterface_bindings_0    = jnative_empty_ref_array();
+    if (&gv_java_net_NetworkInterface_childs_0 != NULL)
+        gv_java_net_NetworkInterface_childs_0      = jnative_empty_ref_array();
+}
+
+/*
+ * Build a fresh java.net.NetworkInterface instance with the three
  * identity fields populated (name, displayName, index) and the three
  * collection fields (addrs, bindings, childs) initialised to empty
- * arrays. The field offsets match the declaration order of the JDK's
+ * arrays.
+ *
+ * The field offsets match the declaration order of the JDK's
  * NetworkInterface class laid out by LlvmGlobalEmitter.getFieldOffset:
  *
  *   offset  0 : i8*       vtable
@@ -148,16 +122,16 @@ static void set_all_empty(void) {
  *   offset 40 : Object[]  bindings
  *   offset 48 : Object[]  childs
  *
- * Returns NULL if the class is not in the reflection registry or if an
- * allocation fails. The caller is responsible for deciding what a NULL
- * result means in context (skip the entry, return null to Java, …).
- * ------------------------------------------------------------------------ */
+ * Returns NULL if the class is not in the reflection registry or if
+ * any allocation fails. The caller is responsible for deciding what a
+ * NULL result means in context (skip the entry, return null to Java).
+ */
 static void* allocate_network_interface(const char* name,
                                         const char* display_name,
                                         int32_t index)
 {
-    struct ReflectionClass* ni_cls =
-        find_class_by_name("java/net/NetworkInterface");
+    ReflectionClass* ni_cls =
+        jnative_class_by_name("java/net/NetworkInterface");
     if (ni_cls == NULL) return NULL;
 
     int size = ni_cls->object_size;
@@ -166,7 +140,7 @@ static void* allocate_network_interface(const char* name,
     void* obj = calloc(1, (size_t)size);
     if (obj == NULL) return NULL;
 
-    void* vtable = lookup_class_vtable(ni_cls);
+    void* vtable = jnative_lookup_class_vtable(ni_cls);
     if (vtable == NULL) {
         free(obj);
         return NULL;
@@ -178,26 +152,27 @@ static void* allocate_network_interface(const char* name,
     *(void**)((char*)obj + 16) = __jnative_make_string_obj(display_name,
         (int32_t)strlen(display_name));
     *(int32_t*)((char*)obj + 24) = index;
-    *(void**)((char*)obj + 32) = make_empty_ref_array();
-    *(void**)((char*)obj + 40) = make_empty_ref_array();
-    *(void**)((char*)obj + 48) = make_empty_ref_array();
+    *(void**)((char*)obj + 32) = jnative_empty_ref_array();
+    *(void**)((char*)obj + 40) = jnative_empty_ref_array();
+    *(void**)((char*)obj + 48) = jnative_empty_ref_array();
 
     return obj;
 }
 
-/* --------------------------------------------------------------------------
+/*
  * static native void init();
  *
- * Enumerates the local interfaces via getifaddrs(3), deduplicates them by
- * name, sorts the resulting list by interface index (matching the JDK's
- * ordering) and installs the six static lookup arrays that the Java side
- * reads. Called once from NetworkInterface.<clinit>.
+ * Enumerates the local interfaces via getifaddrs(3), deduplicates them
+ * by name, sorts the resulting list by interface index (matching the
+ * JDK's ordering) and installs the six static lookup arrays that the
+ * Java side reads. Called once from NetworkInterface.<clinit>.
  *
- * A failing getifaddrs call leaves every array empty, which is the same
- * state the JDK's own network stack reports when the host has no
- * interfaces — every subsequent getByName / getByIndex / getNetworkInterfaces
- * call then returns the empty result documented by the Java API.
- * ------------------------------------------------------------------------ */
+ * A failing getifaddrs call leaves every array empty, which is the
+ * same state the JDK's own network stack reports when the host has no
+ * interfaces — every subsequent getByName / getByIndex /
+ * getNetworkInterfaces call then returns the empty result documented
+ * by the Java API.
+ */
 void __jnative_fn_java_net_NetworkInterface_init___V(void) {
     struct ifaddrs* ifaddr = NULL;
     if (getifaddrs(&ifaddr) != 0) {
@@ -281,35 +256,36 @@ void __jnative_fn_java_net_NetworkInterface_init___V(void) {
         displayNames[j + 1] = dkey;
     }
 
-    gv_java_net_NetworkInterface_name_0        = make_java_string_array(count, names);
-    gv_java_net_NetworkInterface_displayName_0 = make_java_string_array(count, displayNames);
-    gv_java_net_NetworkInterface_index_0       = make_int_array(count, indices);
-    gv_java_net_NetworkInterface_addrs_0       = make_empty_ref_array();
-    gv_java_net_NetworkInterface_bindings_0    = make_empty_ref_array();
-    gv_java_net_NetworkInterface_childs_0      = make_empty_ref_array();
+    if (&gv_java_net_NetworkInterface_name_0 != NULL)
+        gv_java_net_NetworkInterface_name_0        = make_java_string_array(count, names);
+    if (&gv_java_net_NetworkInterface_displayName_0 != NULL)
+        gv_java_net_NetworkInterface_displayName_0 = make_java_string_array(count, displayNames);
+    if (&gv_java_net_NetworkInterface_index_0 != NULL)
+        gv_java_net_NetworkInterface_index_0       = jnative_int_array(indices, count);
+    if (&gv_java_net_NetworkInterface_addrs_0 != NULL)
+        gv_java_net_NetworkInterface_addrs_0       = jnative_empty_ref_array();
+    if (&gv_java_net_NetworkInterface_bindings_0 != NULL)
+        gv_java_net_NetworkInterface_bindings_0    = jnative_empty_ref_array();
+    if (&gv_java_net_NetworkInterface_childs_0 != NULL)
+        gv_java_net_NetworkInterface_childs_0      = jnative_empty_ref_array();
 
     free(names);
     free(displayNames);
     free(indices);
 }
 
-/* --------------------------------------------------------------------------
+/*
  * private static native NetworkInterface getByName0(String name);
  *
- * Returns a NetworkInterface object for the interface whose name matches
- * the argument, or null if no such interface exists.
+ * Returns a NetworkInterface object for the interface whose name
+ * matches the argument, or null if no such interface exists.
  *
  * The lookup walks the static name_0 / displayName_0 / index_0 arrays
  * populated by init() and, on a hit, delegates to
  * allocate_network_interface to build the object. The addrs, bindings
  * and childs fields are initialised to empty arrays, matching what
- * init() installs in the corresponding static lookup tables: this
- * runtime does not synthesise InetAddress or InterfaceAddress objects
- * for the local interfaces, so a caller that iterates
- * getInetAddresses() / getInterfaceAddresses() observes an empty
- * result. That is a valid, non-null state for every caller in the JDK
- * and in user code.
- * ------------------------------------------------------------------------ */
+ * init() installs in the corresponding static lookup tables.
+ */
 void* __jnative_fn_java_net_NetworkInterface_getByName0__Ljava_lang_String__Ljava_net_NetworkInterface_(
         void* name_str)
 {
@@ -331,12 +307,12 @@ void* __jnative_fn_java_net_NetworkInterface_getByName0__Ljava_lang_String__Ljav
         return NULL;
     }
 
-    int32_t count = *(int32_t*)namesArr;
+    int32_t count = jnative_array_length(namesArr);
     if (count <= 0) return NULL;
 
-    void**    nameSlots    = (void**)((char*)namesArr   + JAVA_ARR_HDR);
-    void**    displaySlots = (void**)((char*)displayArr + JAVA_ARR_HDR);
-    int32_t*  indexSlots   = (int32_t*)((char*)indicesArr + JAVA_ARR_HDR);
+    void**    nameSlots    = (void**)jnative_array_data(namesArr);
+    void**    displaySlots = (void**)jnative_array_data(displayArr);
+    int32_t*  indexSlots   = (int32_t*)jnative_array_data(indicesArr);
 
     int32_t found = -1;
     for (int32_t i = 0; i < count; i++) {
@@ -359,7 +335,7 @@ void* __jnative_fn_java_net_NetworkInterface_getByName0__Ljava_lang_String__Ljav
     return allocate_network_interface(nm, dnm, indexSlots[found]);
 }
 
-/* --------------------------------------------------------------------------
+/*
  * private static native NetworkInterface[] getAll();
  *
  * Returns the list of every local interface that init() discovered, in
@@ -372,37 +348,37 @@ void* __jnative_fn_java_net_NetworkInterface_getByName0__Ljava_lang_String__Ljav
  *
  * The returned array is a standard Java reference array; each slot
  * holds a freshly allocated NetworkInterface instance built by the
- * same allocator getByName0 uses, so the objects are indistinguishable
- * from the ones a per-name lookup would produce. If init() has not run
- * yet or every allocation fails, the result is an empty array rather
- * than null: getNetworkInterfaces()'s contract is to always answer with
- * an Enumeration, and callers that iterate it should see zero elements
- * rather than a NullPointerException.
- * ------------------------------------------------------------------------ */
+ * same allocator getByName0 uses, so the objects are
+ * indistinguishable from the ones a per-name lookup would produce. If
+ * init() has not run yet or every allocation fails, the result is an
+ * empty array rather than null: getNetworkInterfaces()'s contract is
+ * to always answer with an Enumeration, and callers that iterate it
+ * should see zero elements rather than a NullPointerException.
+ */
 void* __jnative_fn_java_net_NetworkInterface_getAll____Ljava_net_NetworkInterface_(void) {
     void* namesArr   = gv_java_net_NetworkInterface_name_0;
     void* displayArr = gv_java_net_NetworkInterface_displayName_0;
     void* indicesArr = gv_java_net_NetworkInterface_index_0;
     if (namesArr == NULL || displayArr == NULL || indicesArr == NULL) {
-        return make_empty_ref_array();
+        return jnative_empty_ref_array();
     }
 
-    int32_t count = *(int32_t*)namesArr;
+    int32_t count = jnative_array_length(namesArr);
     if (count <= 0) {
-        return make_empty_ref_array();
+        return jnative_empty_ref_array();
     }
 
-    void**   nameSlots    = (void**)((char*)namesArr   + JAVA_ARR_HDR);
-    void**   displaySlots = (void**)((char*)displayArr + JAVA_ARR_HDR);
-    int32_t* indexSlots   = (int32_t*)((char*)indicesArr + JAVA_ARR_HDR);
+    void**   nameSlots    = (void**)jnative_array_data(namesArr);
+    void**   displaySlots = (void**)jnative_array_data(displayArr);
+    int32_t* indexSlots   = (int32_t*)jnative_array_data(indicesArr);
 
-    size_t total = JAVA_ARR_HDR + (size_t)count * sizeof(void*);
-    void* array = malloc(total);
+    /* NetworkInterface[] — the descriptor matches the declared Java return
+     * type of NetworkInterface.getNetworkInterfaces(). */
+    void* array = jnative_ref_array_of_class(NULL, count,
+                                             "[Ljava/net/NetworkInterface;");
     if (array == NULL) {
-        return make_empty_ref_array();
+        return jnative_empty_ref_array();
     }
-    *(int32_t*)array = count;
-    *(int32_t*)((char*)array + 4) = (int32_t)sizeof(void*);
 
     void** slots = (void**)((char*)array + JAVA_ARR_HDR);
 
@@ -420,7 +396,7 @@ void* __jnative_fn_java_net_NetworkInterface_getAll____Ljava_net_NetworkInterfac
     return array;
 }
 
-/* --------------------------------------------------------------------------
+/*
  * private static native boolean isLoopback0(String name, int index);
  *
  * Reports whether the named interface is a loopback device. The `index`
@@ -440,7 +416,7 @@ void* __jnative_fn_java_net_NetworkInterface_getAll____Ljava_net_NetworkInterfac
  * is unqueryable. A false result simply classifies the interface as
  * non-loopback, which is the safe answer for callers that use this
  * predicate to skip entropy sources.
- * ------------------------------------------------------------------------ */
+ */
 int32_t __jnative_fn_java_net_NetworkInterface_isLoopback0__Ljava_lang_String_I_Z(
         void* ifname_str, int32_t index)
 {
@@ -481,33 +457,33 @@ int32_t __jnative_fn_java_net_NetworkInterface_isLoopback0__Ljava_lang_String_I_
     return is_loopback;
 }
 
-/* --------------------------------------------------------------------------
+/*
  * private static native byte[] getMacAddr0(byte[] inAddr,
  *                                          String ifname,
  *                                          int index);
  *
- * Returns the hardware (MAC) address of the named interface as a six-
- * byte Java byte[], or null if the address cannot be obtained.
+ * Returns the hardware (MAC) address of the named interface as a
+ * six-byte Java byte[], or null if the address cannot be obtained.
  *
  * The `inAddr` argument is a dummy byte[] passed by the Java layer
  * purely so that the native's return type is unambiguously byte[]; its
  * contents and length are not consulted. The `index` argument is
- * informational and likewise unused: on Linux the interface name alone
- * is sufficient to query the address via ioctl(SIOCGIFHWADDR).
+ * informational and likewise unused: on Linux the interface name
+ * alone is sufficient to query the address via ioctl(SIOCGIFHWADDR).
  *
  * A null or empty name raises NullPointerException, matching the
  * isLoopback0 contract above. Any failure to open the probe socket, to
  * look up the interface, or to read its hardware address returns null.
  * The Java layer treats a null result as "no MAC address available",
  * which is exactly the state NetworkInterface.getHardwareAddress()
- * documents for interfaces that do not have one (loopback, tunnel,
- * certain virtual devices, …).
+ * documents for interfaces that do not have one.
  *
- * The returned array uses the runtime's standard Java-array layout:
- * an 8-byte header holding the length and element size, followed by
- * the six address bytes. The element-size field is set to 1 because
- * the payload is a byte array, not a reference array.
- * ------------------------------------------------------------------------ */
+ * A six-byte MAC that is all zeroes — which the kernel returns for
+ * some virtual devices — is reported as an empty array rather than as
+ * six zero bytes, matching the Java-side contract that
+ * getHardwareAddress() returns a zero-length array (not null) when the
+ * interface exists but has no meaningful hardware address.
+ */
 void* __jnative_fn_java_net_NetworkInterface_getMacAddr0___BLjava_lang_String_I__B(
         void* in_addr, void* ifname_str, int32_t index)
 {
@@ -546,43 +522,30 @@ void* __jnative_fn_java_net_NetworkInterface_getMacAddr0___BLjava_lang_String_I_
 
     const unsigned char* mac = (const unsigned char*)ifr.ifr_hwaddr.sa_data;
 
-    /* The Java-side contract for getHardwareAddress() is to return an
-     * array of length 0 (not null) when the interface exists but has no
-     * meaningful hardware address. A zeroed six-byte MAC — which is
-     * what the kernel returns for some virtual devices — is reported
-     * as an empty array to match that contract. */
     int all_zero = 1;
     for (int i = 0; i < 6; i++) {
         if (mac[i] != 0) { all_zero = 0; break; }
     }
     if (all_zero) {
-        size_t empty_total = JAVA_ARR_HDR;
-        void* empty = malloc(empty_total);
+        void* empty = jnative_byte_array(NULL, 0);
         if (empty == NULL) return NULL;
-        *(int32_t*)empty = 0;
-        *(int32_t*)((char*)empty + 4) = 1;
         return empty;
     }
 
-    size_t total = JAVA_ARR_HDR + 6;
-    void* arr = malloc(total);
-    if (arr == NULL) return NULL;
-    *(int32_t*)arr = 6;
-    *(int32_t*)((char*)arr + 4) = 1;
-    memcpy((char*)arr + JAVA_ARR_HDR, mac, 6);
-    return arr;
+    return jnative_byte_array(mac, 6);
 }
 
-/* --------------------------------------------------------------------------
+/*
  * private static native boolean boundInetAddress0(InetAddress addr);
  *
- * Returns true iff the given address is currently assigned to some local
- * network interface. In this runtime an InetAddress is represented as a
- * NUL-terminated textual address (possibly prefixed with a hostname and a
- * '/' separator, matching InetAddress.toString()), so the input is parsed
- * with inet_pton and matched byte-for-byte against the addresses returned
- * by getifaddrs().
- * ------------------------------------------------------------------------ */
+ * Returns true iff the given address is currently assigned to some
+ * local network interface. In this runtime an InetAddress is
+ * represented as a NUL-terminated textual address (possibly prefixed
+ * with a hostname and a '/' separator, matching
+ * InetAddress.toString()), so the input is parsed with inet_pton and
+ * matched byte-for-byte against the addresses returned by
+ * getifaddrs().
+ */
 int32_t __jnative_fn_java_net_NetworkInterface_boundInetAddress0__Ljava_net_InetAddress__Z(
         void* addr)
 {

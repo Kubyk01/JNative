@@ -19,16 +19,25 @@ public class TryCatchHandler {
 
     public void handle() {
         for (TryCatchInfo info : tryCatchBlocks) {
-            BasicBlock startBlock = labelToBlock.get(info.start);
-            BasicBlock endBlock = labelToBlock.get(info.end);
+            BasicBlock startBlock   = labelToBlock.get(info.start);
+            BasicBlock endBlock     = labelToBlock.get(info.end);
             BasicBlock handlerBlock = labelToBlock.get(info.handler);
             if (startBlock == null || endBlock == null || handlerBlock == null) continue;
-            List<BasicBlock> tryBlocks = GraphUtils.getBlocksBetween(startBlock, endBlock);
+
+            // The handler is reached from the body by an exceptional edge,
+            // not by normal flow, so it must not be enumerated as part of
+            // the body. Excluding it here also prevents the handler from
+            // being given a normal self-edge when it contains a throwing
+            // instruction — that self-edge was the mechanism behind the
+            // structural livelock in NormalizerImpl.load and
+            // ScopedMemoryAccess.copyMemoryInternal.
+            List<BasicBlock> tryBlocks =
+                GraphUtils.getBlocksBetween(startBlock, endBlock, handlerBlock);
+
             for (BasicBlock b : tryBlocks) {
-                // addSuccessor updates both sides of the edge; the duplicate guard
-                // is required for multi-catch (one handler for several ranges)
+                if (b == handlerBlock) continue;   // explicit, belt-and-braces
                 if (!b.getSuccessors().contains(handlerBlock)) {
-                    b.addSuccessor(handlerBlock);          // edge to the handler
+                    b.addSuccessor(handlerBlock);
                 }
             }
         }

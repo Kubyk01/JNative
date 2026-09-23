@@ -1,7 +1,7 @@
 #include <stdint.h>
 #include <stdatomic.h>
 
-__attribute__((noreturn)) void __jnative_throw_null_pointer_exception(void);
+#include "jnative_runtime.h"
 
 #define MEMORY_SESSION_STATE_OFFSET 8
 

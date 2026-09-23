@@ -4,24 +4,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <execinfo.h>
+#include "jnative_runtime.h"
 
-__attribute__((noreturn)) void __jnative_throw_null_pointer_exception(void);
-
-struct ReflectionClass {
-    void* vtable;
-    void* name;
-    struct ReflectionClass* superclass;
-    struct ReflectionClass** interfaces;
-    void** methods;
-    void** fields;
-    void** constructors;
-    int modifiers;
-    int object_size;
-};
-
-extern struct ReflectionClass* reflect_all_classes[] __attribute__((weak));
-
-#define JAVA_ARR_HDR 8
+/*
+ * JAVA_ARR_HDR is taken from jnative_runtime.h; the local `#define ... 8`
+ * that used to sit here shadowed the real header size and made this file
+ * build arrays whose payload started at the wrong offset.
+ */
 
 static const char* extract_class_name(const char* symbol, char* buffer, size_t size) {
     if (!symbol) return NULL;
@@ -54,7 +43,7 @@ static struct ReflectionClass* lookup_class(const char* name) {
     if (!name || !reflect_all_classes) return NULL;
     struct ReflectionClass** pp = reflect_all_classes;
     while (*pp) {
-        const char* n = (const char*)(*pp)->name;
+        const char* n = (*pp)->cname;
         if (n && strcmp(n, name) == 0) return *pp;
         pp++;
     }
@@ -82,16 +71,12 @@ void* __jnative_fn_java_lang_SecurityManager_getClassContext____Ljava_lang_Class
         classes[class_count++] = cls;
     }
 
-    size_t total = (size_t)JAVA_ARR_HDR + (size_t)class_count * sizeof(void*);
-    void* array = malloc(total);
+    /* Class[] — the descriptor matches the Java return type. */
+    void* array = jnative_ref_array_of_class((void**)classes, class_count,
+                                             "[Ljava/lang/Class;");
     if (!array) {
         __jnative_throw_null_pointer_exception();
         return NULL;
-    }
-    *(int32_t*)array = class_count;
-    void** slots = (void**)((char*)array + JAVA_ARR_HDR);
-    for (int i = 0; i < class_count; i++) {
-        slots[i] = (void*)classes[i];
     }
     return array;
 }

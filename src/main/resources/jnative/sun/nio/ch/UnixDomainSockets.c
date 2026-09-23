@@ -10,66 +10,44 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 
-__attribute__((noreturn)) void __jnative_throw_exception(void* exc);
-__attribute__((noreturn)) void __jnative_throw_null_pointer_exception(void);
-
-extern const char* __jnative_read_string_bytes(void* s, int32_t* out_len);
-
-/*
- * FileDescriptor layout in this runtime:
- *   [ 8 bytes vtable ][ int32 fd ][ long handle ]
- *
- * The raw kernel fd is the first instance field, at offset 8.
- */
-#define FD_OFFSET 8
-
-static inline int32_t fd_of(void* fd_obj) {
-    return *(int32_t*)((char*)fd_obj + FD_OFFSET);
-}
-
-static int32_t raw_fd(void* fd_obj) {
-    if (fd_obj == NULL) {
-        __jnative_throw_null_pointer_exception();
-    }
-    int32_t fd = fd_of(fd_obj);
-    if (fd < 0) {
-        __jnative_throw_exception(NULL);
-    }
-    return fd;
-}
-
-/* Java array layout: [ int32 length ][ payload ... ] */
-#define JAVA_ARR_HDR 8
+#include "jnative_runtime.h"
 
 /*
  * sun.nio.ch.UnixDomainSockets — the Unix-domain-socket backend for
- * SocketChannel / ServerSocketChannel on platforms that support AF_UNIX.
+ * SocketChannel / ServerSocketChannel on platforms that support
+ * AF_UNIX.
  *
  * This file provides the whole class of natives, not just the init()
- * symbol whose absence caused the linker error: the reachability analysis
- * pulls in every native of the class the moment any of its call sites
- * becomes reachable, and the JDK's own <clinit> plus the channel
- * constructors reference all of them. Providing only init() would move
- * the linker error from one symbol to the next; providing the whole set
- * at once keeps the module linkable and gives the runtime a coherent
- * implementation for a feature the JDK exercises on every Unix target.
+ * symbol whose absence would produce a linker error: the reachability
+ * analysis pulls in every native of the class the moment any of its
+ * call sites becomes reachable, and the JDK's own <clinit> plus the
+ * channel constructors reference all of them. Providing only init()
+ * would move the linker error from one symbol to the next; providing
+ * the whole set at once keeps the module linkable and gives the
+ * runtime a coherent implementation for a feature the JDK exercises
+ * on every Unix target.
  *
- * The class is only used when init() reports support, which on Linux is
- * always: AF_UNIX has been part of the kernel since the first release.
+ * The class is only used when init() reports support, which on Linux
+ * is always: AF_UNIX has been part of the kernel since the first
+ * release.
+ *
+ * The raw kernel fd is extracted with jnative_raw_fd from
+ * jnative_runtime.h, which enforces the runtime's standard
+ * "NPE on null receiver, throw on closed descriptor" convention.
  */
 
-/* ---------------------------------------------------------------------------
+/*
  * static native boolean init();
  *
- * Reports whether the platform supports Unix domain sockets. On Linux the
- * answer is unconditionally yes — AF_UNIX is a core part of the kernel
- * ABI and has been present since day one. The check does not actually
- * open a socket: creating one here and leaking it, or closing it and
- * racing with another thread that opens the same fd number, buys nothing
- * over the compile-time knowledge that AF_UNIX is available. The
- * compile-time #if below keeps the file honest on the (hypothetical)
- * target where it is not.
- * ----------------------------------------------------------------------- */
+ * Reports whether the platform supports Unix domain sockets. On Linux
+ * the answer is unconditionally yes — AF_UNIX is a core part of the
+ * kernel ABI and has been present since day one. The check does not
+ * actually open a socket: creating one here and leaking it, or closing
+ * it and racing with another thread that opens the same fd number,
+ * buys nothing over the compile-time knowledge that AF_UNIX is
+ * available. The compile-time #if below keeps the file honest on the
+ * (hypothetical) target where it is not.
+ */
 int32_t __jnative_fn_sun_nio_ch_UnixDomainSockets_init___Z(void) {
 #if defined(AF_UNIX)
     return 1;
@@ -78,12 +56,13 @@ int32_t __jnative_fn_sun_nio_ch_UnixDomainSockets_init___Z(void) {
 #endif
 }
 
-/* ---------------------------------------------------------------------------
- * static native int socket0(boolean block, boolean toBeBound, boolean server)
+/*
+ * static native int socket0(boolean block, boolean toBeBound,
+ *                           boolean server)
  *     throws IOException;
  *
- * Creates an AF_UNIX socket of the appropriate type. The two booleans
- * mirror the JDK's own implementation exactly:
+ * Creates an AF_UNIX socket of the appropriate type. The three
+ * booleans mirror the JDK's own implementation exactly:
  *
  *   - `server` selects SOCK_STREAM for a listening socket (a
  *     ServerSocketChannel), and SOCK_STREAM too for a client socket.
@@ -96,15 +75,15 @@ int32_t __jnative_fn_sun_nio_ch_UnixDomainSockets_init___Z(void) {
  *     when the caller plans to register the socket with a Selector).
  *     The setting is applied with fcntl(F_SETFL, O_NONBLOCK).
  *
- *   - `toBeBound` is informational: the JDK passes true when the caller
- *     has already supplied a path and will bind immediately, false
- *     otherwise. The kernel does not care.
+ *   - `toBeBound` is informational: the JDK passes true when the
+ *     caller has already supplied a path and will bind immediately,
+ *     false otherwise. The kernel does not care.
  *
  * The return value is the raw kernel descriptor. Any failure — EMFILE,
- * ENFILE, ENOMEM, EAFNOSUPPORT on a hypothetical kernel without AF_UNIX
- * — is routed through the generic throw helper and surfaces to the Java
- * caller as an IOException.
- * ----------------------------------------------------------------------- */
+ * ENFILE, ENOMEM, EAFNOSUPPORT on a hypothetical kernel without
+ * AF_UNIX — is routed through the generic throw helper and surfaces
+ * to the Java caller as an IOException.
+ */
 int32_t __jnative_fn_sun_nio_ch_UnixDomainSockets_socket0__ZZZ_I(
         int32_t block, int32_t toBeBound, int32_t server)
 {
@@ -140,33 +119,35 @@ int32_t __jnative_fn_sun_nio_ch_UnixDomainSockets_socket0__ZZZ_I(
     return (int32_t)fd;
 }
 
-/* ---------------------------------------------------------------------------
- * Helper: populate a sockaddr_un from the caller's path representation.
+/*
+ * Populate a sockaddr_un from the caller's path representation.
  *
- * The JDK's Unix domain socket API allows the peer address to be specified
- * in two mutually exclusive ways:
+ * The JDK's Unix domain socket API allows the peer address to be
+ * specified in two mutually exclusive ways:
  *
  *   1. As a String (the ordinary filesystem path of the socket file).
  *      The bytes are the UTF-8 encoding of the path, NUL-terminated.
  *      `sun_path` accepts at most `sizeof(sun_path) - 1` characters; a
  *      longer path is ENAMETOOLONG at the Java level.
  *
- *   2. As a byte[] with offset/length (the Linux abstract namespace form,
- *      introduced by the JDK to support abstract sockets). The first byte
- *      must be NUL, and the remaining `len - 1` bytes are the abstract
- *      name. The kernel interprets the leading NUL as "this is an abstract
- *      socket name", and the reported `sun_path` length covers the NUL.
+ *   2. As a byte[] with offset/length (the Linux abstract namespace
+ *      form, introduced by the JDK to support abstract sockets). The
+ *      first byte must be NUL, and the remaining `len - 1` bytes are
+ *      the abstract name. The kernel interprets the leading NUL as
+ *      "this is an abstract socket name", and the reported `sun_path`
+ *      length covers the NUL.
  *
  * Exactly one of the two forms is used per call: when a String is
- * supplied, the byte[] is null; when a byte[] is supplied, the String is
- * null. The helper below encodes both into the same sockaddr_un structure
- * and returns the length that must be passed to bind/connect — which, for
- * abstract sockets, is `offsetof(sockaddr_un, sun_path) + nameLen`, not
+ * supplied, the byte[] is null; when a byte[] is supplied, the String
+ * is null. The helper below encodes both into the same sockaddr_un
+ * structure and returns the length that must be passed to
+ * bind/connect — which, for abstract sockets, is
+ * `offsetof(sockaddr_un, sun_path) + nameLen`, not
  * `sizeof(sockaddr_un)`, because the kernel reads only the significant
  * prefix.
  *
  * Returns 0 on success, -1 with errno set on failure.
- * ----------------------------------------------------------------------- */
+ */
 static int build_sockaddr_un(struct sockaddr_un* addr, socklen_t* addrlen,
                              void* path_str, void* path_bytes,
                              int32_t path_off, int32_t path_len)
@@ -202,10 +183,12 @@ static int build_sockaddr_un(struct sockaddr_un* addr, socklen_t* addrlen,
             errno = ENAMETOOLONG;
             return -1;
         }
-        /* The leading NUL (abstract namespace marker) must be present
-         * in the buffer; the Java layer is responsible for supplying it.
-         * We copy the raw bytes and rely on the kernel to interpret the
-         * leading NUL. */
+        /*
+         * The leading NUL (abstract namespace marker) must be present
+         * in the buffer; the Java layer is responsible for supplying
+         * it. We copy the raw bytes and rely on the kernel to interpret
+         * the leading NUL.
+         */
         memcpy(addr->sun_path, src, (size_t)path_len);
         used = (size_t)path_len;
     } else {
@@ -217,29 +200,30 @@ static int build_sockaddr_un(struct sockaddr_un* addr, socklen_t* addrlen,
     return 0;
 }
 
-/* ---------------------------------------------------------------------------
+/*
  * static native void bind0(FileDescriptor fd, FileDescriptor fd2,
- *                          String path, byte[] bytes, int offset, int len)
+ *                          String path, byte[] bytes, int offset,
+ *                          int len)
  *     throws IOException;
  *
  * Binds the socket to the given Unix path. `fd2` is the FileDescriptor
  * object that wraps the raw kernel fd in `fd`'s world — this runtime
- * only ever has one FileDescriptor per kernel fd, so the second argument
- * is informational and is not consulted.
+ * only ever has one FileDescriptor per kernel fd, so the second
+ * argument is informational and is not consulted.
  *
- * A stale socket file left over from a previous process is not unlinked
- * here. The JDK's Java-layer contract is that the caller is responsible
- * for that cleanup via Files.deleteIfExists before invoking bind; doing
- * it silently in the native would create a race with any other process
- * that is currently listening on the same path.
- * ----------------------------------------------------------------------- */
+ * A stale socket file left over from a previous process is not
+ * unlinked here. The JDK's Java-layer contract is that the caller is
+ * responsible for that cleanup via Files.deleteIfExists before
+ * invoking bind; doing it silently in the native would create a race
+ * with any other process that is currently listening on the same path.
+ */
 void __jnative_fn_sun_nio_ch_UnixDomainSockets_bind0__Ljava_io_FileDescriptor_Ljava_io_FileDescriptor_Ljava_lang_String__BII_V(
         void* fd_obj, void* fd2_obj,
         void* path_str, void* path_bytes,
         int32_t path_off, int32_t path_len)
 {
     (void)fd2_obj;
-    int32_t fd = raw_fd(fd_obj);
+    int32_t fd = jnative_raw_fd(fd_obj);
 
     struct sockaddr_un addr;
     socklen_t addrlen = 0;
@@ -254,19 +238,19 @@ void __jnative_fn_sun_nio_ch_UnixDomainSockets_bind0__Ljava_io_FileDescriptor_Lj
     }
 }
 
-/* ---------------------------------------------------------------------------
+/*
  * static native int connect0(FileDescriptor fd, FileDescriptor fd2,
  *                            String path, byte[] bytes,
  *                            int offset, int len)
  *     throws IOException;
  *
- * Initiates a connection to the peer whose address is given. The return
- * value follows the platform's connect(2) conventions, which the Java
- * caller inspects to distinguish three outcomes:
+ * Initiates a connection to the peer whose address is given. The
+ * return value follows the platform's connect(2) conventions, which
+ * the Java caller inspects to distinguish three outcomes:
  *
  *    1   : connect completed synchronously, the channel is now connected
- *    0   : connect is in progress (EINPROGRESS on a non-blocking socket),
- *          the selector will later report the channel writable
+ *    0   : connect is in progress (EINPROGRESS on a non-blocking
+ *          socket), the selector will later report the channel writable
  *    -1  : EINTR was observed before the connection attempt was committed
  *
  * Every other error (ECONNREFUSED, ENOENT for a missing socket file,
@@ -274,14 +258,14 @@ void __jnative_fn_sun_nio_ch_UnixDomainSockets_bind0__Ljava_io_FileDescriptor_Lj
  * an IOException, matching the reference JDK's behaviour: those errors
  * are terminal, not "try again later", and the Java layer has no
  * meaningful retry to offer.
- * ----------------------------------------------------------------------- */
+ */
 int32_t __jnative_fn_sun_nio_ch_UnixDomainSockets_connect0__Ljava_io_FileDescriptor_Ljava_io_FileDescriptor_Ljava_lang_String__BII_I(
         void* fd_obj, void* fd2_obj,
         void* path_str, void* path_bytes,
         int32_t path_off, int32_t path_len)
 {
     (void)fd2_obj;
-    int32_t fd = raw_fd(fd_obj);
+    int32_t fd = jnative_raw_fd(fd_obj);
 
     struct sockaddr_un addr;
     socklen_t addrlen = 0;
@@ -307,14 +291,14 @@ int32_t __jnative_fn_sun_nio_ch_UnixDomainSockets_connect0__Ljava_io_FileDescrip
     return 0;
 }
 
-/* ---------------------------------------------------------------------------
+/*
  * static native void localAddress0(FileDescriptor fd, byte[] bytes)
  *     throws IOException;
  *
  * Writes the local address of a bound Unix socket into the supplied
- * byte array. The JDK allocates a byte[] of size sun_path and passes it
- * in; the native is expected to fill in the bytes of the address and,
- * when the address is an abstract socket name, the leading NUL.
+ * byte array. The JDK allocates a byte[] of size sun_path and passes
+ * it in; the native is expected to fill in the bytes of the address
+ * and, when the address is an abstract socket name, the leading NUL.
  *
  * When getsockname(2) succeeds with a zero-length sun_path (the socket
  * is bound to an autobind address that the kernel has not yet
@@ -322,11 +306,11 @@ int32_t __jnative_fn_sun_nio_ch_UnixDomainSockets_connect0__Ljava_io_FileDescrip
  * untouched. The Java layer treats that as "no address available" and
  * throws NotYetConnectedException or returns null depending on the
  * caller.
- * ----------------------------------------------------------------------- */
+ */
 void __jnative_fn_sun_nio_ch_UnixDomainSockets_localAddress0__Ljava_io_FileDescriptor__BII_V(
         void* fd_obj, void* bytes, int32_t offset, int32_t length)
 {
-    int32_t fd = raw_fd(fd_obj);
+    int32_t fd = jnative_raw_fd(fd_obj);
     if (bytes == NULL) {
         __jnative_throw_null_pointer_exception();
         return;
@@ -352,7 +336,7 @@ void __jnative_fn_sun_nio_ch_UnixDomainSockets_localAddress0__Ljava_io_FileDescr
     memcpy((char*)bytes + JAVA_ARR_HDR + offset, addr.sun_path, name_len);
 }
 
-/* ---------------------------------------------------------------------------
+/*
  * static native void remoteAddress0(FileDescriptor fd, byte[] bytes)
  *     throws IOException;
  *
@@ -361,11 +345,11 @@ void __jnative_fn_sun_nio_ch_UnixDomainSockets_localAddress0__Ljava_io_FileDescr
  * ENOTCONN, which the Java layer treats as "peer unknown" — the
  * generic throw helper surfaces it as an IOException, which the caller
  * catches and converts into the appropriate NotYetConnectedException.
- * ----------------------------------------------------------------------- */
+ */
 void __jnative_fn_sun_nio_ch_UnixDomainSockets_remoteAddress0__Ljava_io_FileDescriptor__BII_V(
         void* fd_obj, void* bytes, int32_t offset, int32_t length)
 {
-    int32_t fd = raw_fd(fd_obj);
+    int32_t fd = jnative_raw_fd(fd_obj);
     if (bytes == NULL) {
         __jnative_throw_null_pointer_exception();
         return;
@@ -391,27 +375,28 @@ void __jnative_fn_sun_nio_ch_UnixDomainSockets_remoteAddress0__Ljava_io_FileDesc
     memcpy((char*)bytes + JAVA_ARR_HDR + offset, addr.sun_path, name_len);
 }
 
-/* ---------------------------------------------------------------------------
+/*
  * static native int accept0(FileDescriptor fd, FileDescriptor fd2,
- *                           FileDescriptor fd3, String path, byte[] bytes,
- *                           int offset, int len)
+ *                           FileDescriptor fd3, String path,
+ *                           byte[] bytes, int offset, int len)
  *     throws IOException;
  *
  * Accepts an incoming connection on a listening Unix socket. The new
- * kernel descriptor is written into `fd2`'s FileDescriptor slot, and the
- * peer's address (if any) is copied into `bytes` at the given offset.
+ * kernel descriptor is written into `fd2`'s FileDescriptor slot, and
+ * the peer's address (if any) is copied into `bytes` at the given
+ * offset.
  *
  * The `fd3` argument is the FileDescriptor wrapper the JDK wants the
  * new descriptor to be associated with; in this runtime each kernel fd
- * has exactly one FileDescriptor wrapper, so the caller-supplied wrapper
- * is the one that receives the new fd.
+ * has exactly one FileDescriptor wrapper, so the caller-supplied
+ * wrapper is the one that receives the new fd.
  *
  * Return value:
  *
  *    1  : accept succeeded, fd2 now holds the accepted descriptor
  *    0  : the listening socket is non-blocking and there is currently
- *         no pending connection (EAGAIN / EWOULDBLOCK); the Java caller
- *         treats this as "try again later"
+ *         no pending connection (EAGAIN / EWOULDBLOCK); the Java
+ *         caller treats this as "try again later"
  *
  * Every other error (EMFILE, ECONNABORTED, EINTR before the accepted
  * socket was established) is thrown as an IOException.
@@ -419,9 +404,9 @@ void __jnative_fn_sun_nio_ch_UnixDomainSockets_remoteAddress0__Ljava_io_FileDesc
  * A `path` (or byte-array) argument is present so that the JDK can
  * capture the peer's address at accept time — the kernel fills in the
  * address of the connecting socket when the listener is a Unix socket
- * whose accept path was invoked from Java. When both path arguments are
- * null, the peer's address is simply not captured.
- * ----------------------------------------------------------------------- */
+ * whose accept path was invoked from Java. When both path arguments
+ * are null, the peer's address is simply not captured.
+ */
 int32_t __jnative_fn_sun_nio_ch_UnixDomainSockets_accept0__Ljava_io_FileDescriptor_Ljava_io_FileDescriptor_Ljava_io_FileDescriptor_Ljava_lang_String__BII_I(
         void* fd_obj, void* fd2_obj, void* fd3_obj,
         void* path_str, void* path_bytes,
@@ -433,7 +418,7 @@ int32_t __jnative_fn_sun_nio_ch_UnixDomainSockets_accept0__Ljava_io_FileDescript
     (void)path_off;
     (void)path_len;
 
-    int32_t listen_fd = raw_fd(fd_obj);
+    int32_t listen_fd = jnative_raw_fd(fd_obj);
     if (fd2_obj == NULL) {
         __jnative_throw_null_pointer_exception();
         return 0;
@@ -456,9 +441,12 @@ int32_t __jnative_fn_sun_nio_ch_UnixDomainSockets_accept0__Ljava_io_FileDescript
         return 0;
     }
 
-    /* Install the freshly accepted descriptor into the FileDescriptor
+    /*
+     * Install the freshly accepted descriptor into the FileDescriptor
      * object the Java layer allocated for it. The wrapper's fd slot is
-     * the same offset used everywhere else in the runtime. */
+     * the same offset used everywhere else in the runtime (FD_OFFSET
+     * from jnative_runtime.h).
+     */
     *(int32_t*)((char*)fd2_obj + FD_OFFSET) = new_fd;
 
     return 1;

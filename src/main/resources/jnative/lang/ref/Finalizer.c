@@ -1,5 +1,7 @@
 #include <stdint.h>
 
+#include "jnative_runtime.h"
+
 /*
  * java.lang.ref.Finalizer native methods.
  *

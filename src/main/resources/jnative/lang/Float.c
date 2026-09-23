@@ -1,6 +1,8 @@
 #include <stdint.h>
 #include <math.h>
 
+#include "jnative_runtime.h"
+
 int32_t __jnative_fn_java_lang_Float_floatToRawIntBits__F_I(float value) {
     union { float f; int32_t i; } u;
     u.f = value;

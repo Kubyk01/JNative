@@ -3,13 +3,51 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Runtime exception helpers (defined in jnative_runtime.c) */
-__attribute__((noreturn)) void __jnative_throw_exception(void* exc);
-__attribute__((noreturn)) void __jnative_throw_null_pointer_exception(void);
+#include "jnative_runtime.h"
 
-/* =========================================================================
- *  zlib-compatible status codes
- * ========================================================================= */
+/*
+ * java.util.zip.Inflater — the raw DEFLATE decompressor that backs
+ * java.util.zip.Inflater and, through it, java.util.zip.ZipFile,
+ * java.util.jar.JarFile and the GZIPInputStream / DeflaterInputStream
+ * families.
+ *
+ * The implementation is a self-contained RFC 1950 (zlib wrapper) +
+ * RFC 1951 (DEFLATE bitstream) decoder. It does not link against
+ * libz: the JDK's own Inflater is a JNI binding around libz, but this
+ * runtime deliberately reimplements the decoder in C so that the
+ * final executable has no external zlib dependency and the build is
+ * not sensitive to which libz version happens to be installed on the
+ * target.
+ *
+ * The public interface mirrors java.util.zip.Inflater's native
+ * bindings one-to-one:
+ *
+ *   init(boolean nowrap) -> long
+ *   end(long addr) -> void
+ *   getBytesRead(long addr) -> long
+ *   getBytesWritten(long addr) -> long
+ *   getAdler(long addr) -> int
+ *   reset(long addr) -> void
+ *   inflateBytesBytes(long addr, byte[], int, int, byte[], int, int) -> long
+ *   inflateBufferBytes(long addr, long, int, byte[], int, int) -> long
+ *
+ * The two `inflate*` entry points differ only in how the input is
+ * supplied: as a Java byte[] (with offset and length) or as a raw
+ * native address (with length). Both produce output into a Java
+ * byte[], because the JDK's byte-channel and direct-buffer paths both
+ * funnel their output through the same array-based API.
+ *
+ * The DECODE state is kept in a heap-allocated InflaterState struct
+ * whose address is handed to Java as a jlong. The struct is opaque to
+ * the Java side; every operation is a C function that takes the
+ * address as its first argument.
+ */
+
+/*
+ * =========================================================================
+ * zlib-compatible status codes.
+ * =========================================================================
+ */
 #define Z_OK           0
 #define Z_STREAM_END   1
 #define Z_NEED_DICT    2
@@ -18,19 +56,36 @@ __attribute__((noreturn)) void __jnative_throw_null_pointer_exception(void);
 #define Z_MEM_ERROR    (-4)
 #define Z_BUF_ERROR    (-5)
 
-/* =========================================================================
- *  DEFLATE constants
- * ========================================================================= */
+/*
+ * =========================================================================
+ * DEFLATE constants.
+ * =========================================================================
+ */
 #define MAX_BITS        15
 #define MAX_LIT_CODES   288
 #define WINDOW_SIZE     65536
 #define WINDOW_MASK     (WINDOW_SIZE - 1)
 #define ADLER_BASE      65521
-#define JAVA_ARR_HDR 8
 
-/* =========================================================================
- *  Decoder state
- * ========================================================================= */
+/*
+ * =========================================================================
+ * Decoder state.
+ *
+ * A single InflaterState instance lives for the lifetime of one Java
+ * Inflater object. It holds the bit-reader position within the current
+ * input chunk, the Huffman tables for the current block, the
+ * sliding-window output buffer, and the partial Adler-32 checksum
+ * accumulated across the whole stream.
+ *
+ * The sliding window is 64 KiB, the maximum size DEFLATE permits for a
+ * back-reference. Bytes are written into the window first and then
+ * drained into the caller's output array; the `win_total` /
+ * `drained_total` pair tracks how much has been produced and how much
+ * has been handed back to Java, so a single inflate() call that
+ * produces more than the caller's output buffer can hold leaves the
+ * remainder in the window for the next call.
+ * =========================================================================
+ */
 typedef struct {
     uint16_t count[MAX_BITS + 1];
     uint16_t symbol[MAX_LIT_CODES];
@@ -76,9 +131,17 @@ typedef struct {
     uint32_t adler_b;
 } InflaterState;
 
-/* =========================================================================
- *  Bit reader
- * ========================================================================= */
+/*
+ * =========================================================================
+ * Bit reader.
+ *
+ * DEFLATE packs bits into the stream least-significant-bit first, and
+ * the bit reader mirrors that: it fills `bitbuf` from the low end and
+ * consumes bits from the same end. `peek_bits_max` only reads as many
+ * bits as are available, so a truncated input does not read past the
+ * end of the buffer.
+ * =========================================================================
+ */
 static int peek_bits_max(InflaterState* s, int max_n, uint32_t* bits, int* got) {
     while (s->bitcnt < max_n) {
         if (s->in_pos >= s->in_len) break;
@@ -112,9 +175,18 @@ static void align_byte(InflaterState* s) {
     s->bitcnt -= rem;
 }
 
-/* =========================================================================
- *  Huffman
- * ========================================================================= */
+/*
+ * =========================================================================
+ * Huffman decoding.
+ *
+ * The canonical-form Huffman table (RFC 1951 §3.2.2) is built from the
+ * per-symbol code lengths and stored as two parallel arrays: `count[len]`
+ * is the number of codes of length `len`, and `symbol[]` lists the
+ * symbols in canonical order. `decode_sym` then walks the code lengths
+ * from shortest to longest, accumulating a candidate code until it
+ * falls within the range of the current length.
+ * =========================================================================
+ */
 static int build_table(HuffmanTable* t, const uint8_t* lengths, int n) {
     for (int i = 0; i <= MAX_BITS; i++) t->count[i] = 0;
     for (int i = 0; i < n; i++) t->count[lengths[i]]++;
@@ -161,9 +233,15 @@ static int decode_sym(InflaterState* s, HuffmanTable* t) {
     return (avail < MAX_BITS) ? -1 : -2;
 }
 
-/* =========================================================================
- *  Fixed Huffman (RFC 1951 §3.2.6)
- * ========================================================================= */
+/*
+ * =========================================================================
+ * Fixed Huffman (RFC 1951 §3.2.6).
+ *
+ * The fixed tables are hard-coded by the DEFLATE specification: literal
+ * codes 0..143 have 8-bit codes, 144..255 have 9, 256..279 have 7, and
+ * 280..287 have 8; the distance alphabet uses 5-bit codes throughout.
+ * =========================================================================
+ */
 static void setup_fixed(InflaterState* s) {
     uint8_t lit_len[288];
     for (int i = 0; i < 144; i++) lit_len[i] = 8;
@@ -177,9 +255,17 @@ static void setup_fixed(InflaterState* s) {
     build_table(&s->dist_table, dist_len, 32);
 }
 
-/* =========================================================================
- *  Dynamic Huffman (RFC 1951 §3.2.7)
- * ========================================================================= */
+/*
+ * =========================================================================
+ * Dynamic Huffman (RFC 1951 §3.2.7).
+ *
+ * The block header carries the code lengths themselves, run-length
+ * encoded with a small secondary alphabet (the "code-length alphabet"
+ * with its own 19-symbol Huffman table). The order in which the code
+ * lengths of that secondary alphabet appear in the stream is fixed by
+ * the specification and is reflected by CL_ORDER below.
+ * =========================================================================
+ */
 static const int CL_ORDER[19] = {
     16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15
 };
@@ -232,9 +318,17 @@ static int setup_dynamic(InflaterState* s) {
     return 0;
 }
 
-/* =========================================================================
- *  Length / distance tables (RFC 1951 §3.2.5)
- * ========================================================================= */
+/*
+ * =========================================================================
+ * Length / distance tables (RFC 1951 §3.2.5).
+ *
+ * A back-reference is encoded as a length code (257..285) followed by a
+ * distance code (0..29). Each code has a fixed base value and a number
+ * of extra bits that are read verbatim from the stream and added to the
+ * base. The tables below are the specification's own; they are frozen
+ * by RFC 1951 and cannot change.
+ * =========================================================================
+ */
 static const uint16_t LENGTH_BASE[29] = {
     3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,
     35,43,51,59,67,83,99,115,131,163,195,227,258
@@ -253,9 +347,11 @@ static const uint8_t DIST_EXTRA[30] = {
     7,7,8,8,9,9,10,10,11,11,12,12,13,13
 };
 
-/* =========================================================================
- *  Helpers
- * ========================================================================= */
+/*
+ * =========================================================================
+ * Sliding-window helpers.
+ * =========================================================================
+ */
 static inline void adler_update(InflaterState* s, uint8_t b) {
     s->adler_a = (s->adler_a + b) % ADLER_BASE;
     s->adler_b = (s->adler_b + s->adler_a) % ADLER_BASE;
@@ -271,9 +367,22 @@ static inline int64_t window_room(const InflaterState* s) {
     return (int64_t)WINDOW_SIZE - (int64_t)(s->win_total - s->drained_total);
 }
 
-/* =========================================================================
- *  Decode one step
- * ========================================================================= */
+/*
+ * =========================================================================
+ * Single decoding step.
+ *
+ * Decodes as much as the current input chunk permits and returns one of:
+ *
+ *    1  : the stream is complete (ST_DONE reached)
+ *    0  : progress was made but more input or output space is needed
+ *   -1  : the input chunk ran out mid-decode
+ *   -2  : a data error was detected
+ *   -3  : a preset dictionary is required (zlib stream only)
+ *
+ * The caller (inflate_call) loops until it has filled the output buffer
+ * or reached the end of the stream.
+ * =========================================================================
+ */
 static int decode_more(InflaterState* s) {
     if (s->state == ST_DONE) return 1;
 
@@ -420,9 +529,17 @@ static int decode_more(InflaterState* s) {
     return -2;
 }
 
-/* =========================================================================
- *  Main inflate call
- * ========================================================================= */
+/*
+ * =========================================================================
+ * Main inflate loop.
+ *
+ * Drains the sliding window into the caller's output buffer, then
+ * decodes another chunk of input into the window, alternating between
+ * the two until the output buffer is full or the stream has reached its
+ * end. Returns a zlib-style status code; the number of bytes actually
+ * written into the output buffer is written through `out_produced`.
+ * =========================================================================
+ */
 static int inflate_call(InflaterState* s,
                         const uint8_t* in, size_t in_len,
                         uint8_t* out, size_t out_len,
@@ -469,9 +586,16 @@ static int inflate_call(InflaterState* s,
     }
 }
 
-/* =========================================================================
- *  Java byte[] helpers
- * ========================================================================= */
+/*
+ * =========================================================================
+ * Java byte[] helpers.
+ *
+ * A Java byte array's payload starts at JAVA_ARR_HDR and continues for
+ * the length stored in the 4-byte header. The helpers below return a
+ * raw pointer to a slice of that payload, respecting the caller's
+ * offset argument.
+ * =========================================================================
+ */
 static inline const uint8_t* jbyte_in(void* arr, int32_t off) {
     return (arr == NULL) ? NULL : (const uint8_t*)arr + JAVA_ARR_HDR + off;
 }
@@ -479,15 +603,37 @@ static inline uint8_t* jbyte_out(void* arr, int32_t off) {
     return (arr == NULL) ? NULL : (uint8_t*)arr + JAVA_ARR_HDR + off;
 }
 
-/* =========================================================================
- *  Public native methods
- * ========================================================================= */
+/*
+ * =========================================================================
+ * Public native methods.
+ * =========================================================================
+ */
 
-/* static void initIDs() */
+/*
+ * static void initIDs();
+ *
+ * Called from Inflater.<clinit>. On HotSpot this hook caches the JNI
+ * field IDs used by the other natives. This runtime accesses every
+ * field through its LLVM-computed byte offset and never consults JNI
+ * field IDs, so there is nothing to cache. The symbol must exist
+ * because Inflater.<clinit> emits a native call to it.
+ */
 void __jnative_fn_java_util_zip_Inflater_initIDs___V(void) {
 }
 
-/* long init(boolean nowrap) */
+/*
+ * long init(boolean nowrap);
+ *
+ * Allocates a fresh InflaterState and returns its address as a jlong.
+ * The `nowrap` argument selects between the zlib-wrapped form (the
+ * default, with its 2-byte header and 4-byte Adler-32 trailer) and the
+ * raw DEFLATE form (no header, no trailer), matching the semantics of
+ * the Java-level Inflater(boolean) constructor.
+ *
+ * An allocation failure surfaces as an exception through the generic
+ * throw helper; there is no "null state" path because the Java caller
+ * has no way to recover from one.
+ */
 int64_t __jnative_fn_java_util_zip_Inflater_init__Z_J(void* self, int32_t nowrap) {
     (void)self;
     InflaterState* s = (InflaterState*)calloc(1, sizeof(InflaterState));
@@ -501,34 +647,60 @@ int64_t __jnative_fn_java_util_zip_Inflater_init__Z_J(void* self, int32_t nowrap
     return (int64_t)(intptr_t)s;
 }
 
-/* void end(long addr) */
+/*
+ * void end(long addr);
+ *
+ * Releases the InflaterState allocated by init. A zero address is a
+ * no-op, matching the reference implementation's tolerance for a
+ * double-end call.
+ */
 void __jnative_fn_java_util_zip_Inflater_end__J_V(void* self, int64_t addr) {
     (void)self;
     if (addr != 0) free((void*)(intptr_t)addr);
 }
 
-/* long getBytesRead(long addr) */
+/*
+ * long getBytesRead(long addr);
+ *
+ * Total number of compressed bytes consumed so far.
+ */
 int64_t __jnative_fn_java_util_zip_Inflater_getBytesRead__J_J(void* self, int64_t addr) {
     (void)self;
     InflaterState* s = (InflaterState*)(intptr_t)addr;
     return s ? (int64_t)s->total_in : 0;
 }
 
-/* long getBytesWritten(long addr) */
+/*
+ * long getBytesWritten(long addr);
+ *
+ * Total number of uncompressed bytes produced so far.
+ */
 int64_t __jnative_fn_java_util_zip_Inflater_getBytesWritten__J_J(void* self, int64_t addr) {
     (void)self;
     InflaterState* s = (InflaterState*)(intptr_t)addr;
     return s ? (int64_t)s->win_total : 0;
 }
 
-/* int getAdler(long addr) */
+/*
+ * int getAdler(long addr);
+ *
+ * Current Adler-32 checksum, as a 32-bit integer with the low 16 bits
+ * holding the low-order sum and the high 16 bits holding the
+ * high-order sum.
+ */
 int32_t __jnative_fn_java_util_zip_Inflater_getAdler__J_I(void* self, int64_t addr) {
     (void)self;
     InflaterState* s = (InflaterState*)(intptr_t)addr;
     return s ? (int32_t)((s->adler_b << 16) | s->adler_a) : 0;
 }
 
-/* void reset(long addr) */
+/*
+ * void reset(long addr);
+ *
+ * Returns the decoder to its initial state without freeing the
+ * underlying allocation, so the same Inflater object can be reused for
+ * a new stream.
+ */
 void __jnative_fn_java_util_zip_Inflater_reset__J_V(void* self, int64_t addr) {
     (void)self;
     InflaterState* s = (InflaterState*)(intptr_t)addr;
@@ -545,12 +717,20 @@ void __jnative_fn_java_util_zip_Inflater_reset__J_V(void* self, int64_t addr) {
 }
 
 /*
- * The two entry points that the LLVM emitter actually references.
- * Descriptors:
- *   inflateBytesBytes(long, byte[], int, int, byte[], int, int) -> long
- *   inflateBufferBytes(long, long,  int, byte[], int, int)      -> long
- * The return type is `long` in this runtime's target JDK; the value is the
- * number of bytes written into the output array.
+ * long inflateBytesBytes(long addr,
+ *                        byte[] input,  int inputOff,  int inputLen,
+ *                        byte[] output, int outputOff, int outputLen);
+ *
+ * The byte-array-to-byte-array entry point. Compressed input is read
+ * from the slice `input[inputOff .. inputOff+inputLen)`; uncompressed
+ * output is written into `output[outputOff .. outputOff+outputLen)`.
+ *
+ * The return value is the number of bytes written into the output
+ * array. The zlib status (stream end, need dict, data error) is
+ * communicated through the Java-side wrapper's own checks against the
+ * inflater's internal state, not through this return value; the
+ * return-value interpretation matches the JDK's own contract for this
+ * native.
  */
 int64_t __jnative_fn_java_util_zip_Inflater_inflateBytesBytes__J_BII_BII_J(
         void* self, int64_t addr,
@@ -569,6 +749,16 @@ int64_t __jnative_fn_java_util_zip_Inflater_inflateBytesBytes__J_BII_BII_J(
     return (int64_t)produced;
 }
 
+/*
+ * long inflateBufferBytes(long addr,
+ *                         long inputAddress, int inputLen,
+ *                         byte[] output, int outputOff, int outputLen);
+ *
+ * The direct-buffer-to-byte-array entry point. Compressed input is read
+ * from the raw address `inputAddress` for `inputLen` bytes; output goes
+ * into `output[outputOff .. outputOff+outputLen)`. The return value is
+ * the number of bytes written.
+ */
 int64_t __jnative_fn_java_util_zip_Inflater_inflateBufferBytes__JJI_BII_J(
         void* self, int64_t addr,
         int64_t inputAddress, int32_t inputLen,
@@ -585,9 +775,14 @@ int64_t __jnative_fn_java_util_zip_Inflater_inflateBufferBytes__JJI_BII_J(
 }
 
 /*
- * Legacy compatibility wrappers — kept for callers that emit the older
- * descriptor forms. These are not referenced by the current LLVM backend
- * but are harmless and keep the file usable across build generations.
+ * Legacy compatibility wrappers.
+ *
+ * These match the older descriptor forms that earlier JDK versions (and
+ * earlier revisions of this runtime) used for the same logical
+ * operations: one returns an int32 instead of an int64, the other
+ * accepts the output as a raw address instead of a Java byte[]. They
+ * are kept so the same source file links against the older call sites
+ * that the LLVM backend may still emit for pre-JDK-11 class files.
  */
 int32_t __jnative_fn_java_util_zip_Inflater_inflateBytesBuffer__JLjava_lang_byte_IJI_I(
         void* self, int64_t addr,

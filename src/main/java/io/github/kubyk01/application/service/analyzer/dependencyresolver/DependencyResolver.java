@@ -112,6 +112,7 @@ public class DependencyResolver {
                     .descriptor(desc)
                     .type(Type.fromDescriptor(desc))
                     .access(field.getModifiers())
+                    .owner(internalName)                 // <-- FIX: declaring class
                     .build());
             }
 
@@ -125,10 +126,14 @@ public class DependencyResolver {
                     .collect(Collectors.toList());
 
                 boolean isPoly = false;
+                boolean isCS = false;
                 for (java.lang.annotation.Annotation a : method.getDeclaredAnnotations()) {
-                    if (a.annotationType().getName().equals("java.lang.invoke.MethodHandle$PolymorphicSignature")) {
+                    String an = a.annotationType().getName();
+                    if (an.equals("java.lang.invoke.MethodHandle$PolymorphicSignature")) {
                         isPoly = true;
-                        break;
+                    } else if (an.equals("jdk.internal.reflect.CallerSensitive")
+                        || an.equals("sun.reflect.CallerSensitive")) {
+                        isCS = true;
                     }
                 }
 
@@ -142,6 +147,7 @@ public class DependencyResolver {
                     .isNative(Modifier.isNative(method.getModifiers()))
                     .isStatic(Modifier.isStatic(method.getModifiers()))
                     .isPolymorphicSignature(isPoly)
+                    .callerSensitive(isCS)
                     .build();
                 builder.method(mn);
 
@@ -249,14 +255,7 @@ public class DependencyResolver {
     public synchronized void forceLoadSystemClass(String internalName) {
         ClassNode existing = classMap.get(internalName);
         if (existing != null) {
-            // A class produced by loadClassViaReflection carries
-            // isExternal == false but has no bytecode: reflection does
-            // not expose <clinit> and does not hand over the raw class
-            // file.  Such a class must be re-resolved from the JRT image
-            // (or the ClassLoader) so that every method body can be
-            // translated and every call site resolves at link time.
-            boolean noBytes = classBytes.get(internalName) == null
-                && !existing.isInterface();
+            boolean noBytes = classBytes.get(internalName) == null;
             if (existing.isExternal() || noBytes) {
                 classMap.remove(internalName);
                 classBytes.remove(internalName);
@@ -270,13 +269,6 @@ public class DependencyResolver {
     /**
      * Discards any cached metadata and re-resolves the class from scratch,
      * preferring the JRT image or ClassLoader over reflection.
-     *
-     * <p>A {@link ClassNode} produced by {@link #loadClassViaReflection} has
-     * no {@code <clinit>} entry (reflection does not expose static
-     * initializers) and no associated {@code classBytes}. Any pass that
-     * needs the bytecode-level view of a class — in particular, emitting
-     * its static initializer — must call this method first so the class
-     * is re-resolved from its actual {@code .class} payload.</p>
      */
     public synchronized void reloadSystemClass(String internalName) {
         classMap.remove(internalName);
@@ -378,6 +370,7 @@ public class DependencyResolver {
                             .descriptor(descriptor)
                             .type(Type.fromDescriptor(descriptor))
                             .access(access)
+                            .owner(currentClassName[0])          // <-- FIX
                             .build());
                         return null;
                     }
@@ -398,6 +391,10 @@ public class DependencyResolver {
                         return new MethodVisitor(Opcodes.ASM9) {
                             @Override
                             public AnnotationVisitor visitAnnotation(String desc, boolean visible) {
+                                if ("Ljdk/internal/reflect/CallerSensitive;".equals(desc)
+                                    || "Lsun/reflect/CallerSensitive;".equals(desc)) {
+                                    mb.callerSensitive(true);
+                                }
                                 if ("Ljava/lang/invoke/MethodHandle$PolymorphicSignature;".equals(desc)) {
                                     mb.isPolymorphicSignature(true);
                                     polymorphicMethodNames.add(name);
@@ -501,6 +498,7 @@ public class DependencyResolver {
                         .descriptor(descriptor)
                         .type(Type.fromDescriptor(descriptor))
                         .access(access)
+                        .owner(currentClassName[0])              // <-- FIX
                         .build());
                     return null;
                 }
@@ -521,6 +519,10 @@ public class DependencyResolver {
                     return new MethodVisitor(Opcodes.ASM9) {
                         @Override
                         public AnnotationVisitor visitAnnotation(String desc, boolean visible) {
+                            if ("Ljdk/internal/reflect/CallerSensitive;".equals(desc)
+                                || "Lsun/reflect/CallerSensitive;".equals(desc)) {
+                                mb.callerSensitive(true);
+                            }
                             if ("Ljava/lang/invoke/MethodHandle$PolymorphicSignature;".equals(desc)) {
                                 mb.isPolymorphicSignature(true);
                                 polymorphicMethodNames.add(name);
@@ -621,7 +623,12 @@ public class DependencyResolver {
         }
 
         for (FieldNode f : cn.getFields()) {
-            if (f.getName().equals(fieldName)) return f;
+            if (f.getName().equals(fieldName)) {
+                if (f.getOwner() == null) {
+                    f.setOwner(cn.getName());
+                }
+                return f;
+            }
         }
 
         String superName = cn.getSuperName();

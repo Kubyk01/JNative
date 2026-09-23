@@ -3,6 +3,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "jnative_runtime.h"
 /*
  * static void initializeFromArchive(Class<?> c);
  *

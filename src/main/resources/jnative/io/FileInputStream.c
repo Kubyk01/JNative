@@ -8,33 +8,26 @@
 #include <sys/stat.h>
 #include <sys/ioctl.h>
 
-__attribute__((noreturn)) void __jnative_throw_exception(void* exc);
-__attribute__((noreturn)) void __jnative_throw_null_pointer_exception(void);
-
-extern const char* __jnative_read_string_bytes(void* s, int32_t* out_len);
+#include "jnative_runtime.h"
 
 /*
  * Object layout used by this runtime for java.io.FileInputStream:
  *
  *   [ 8-byte vtable ][ FileDescriptor fd ][ String path ][ Object closeLock ][ boolean closed ]
  *
- * FileDescriptor layout (see jnative/io/FileDescriptor.c):
+ * The FileDescriptor's own layout is fixed by jnative_runtime.h:
  *
  *   [ 8-byte vtable ][ int32 fd ][ long handle ]
  *
  * Consequently:
- *   this     + 8 -> FileDescriptor object pointer
- *   fd_obj   + 8 -> raw kernel file descriptor (int32_t)
+ *   this     + FIS_FD_OFFSET  -> FileDescriptor object pointer
+ *   fd_obj   + FD_OFFSET      -> raw kernel file descriptor (int32_t)
  *
  * The FileInputStream constructor allocates the FileDescriptor itself
  * (`fd = new FileDescriptor()`) before calling open0(name), so open0 only
  * needs to write the kernel descriptor into the already-existing object.
  */
-#define FIS_FD_OFFSET           8
-#define FD_RAW_FD_OFFSET        8
-
-/* Java array layout: [ int32 length ][ payload ... ] */
-#define JAVA_ARR_HDR 8
+#define FIS_FD_OFFSET 8
 
 static inline void* fis_fd_object(void* this_fis) {
     return *(void**)((char*)this_fis + FIS_FD_OFFSET);
@@ -43,7 +36,7 @@ static inline void* fis_fd_object(void* this_fis) {
 static inline int32_t fis_raw_fd(void* this_fis) {
     void* fd_obj = fis_fd_object(this_fis);
     if (fd_obj == NULL) return -1;
-    return *(int32_t*)((char*)fd_obj + FD_RAW_FD_OFFSET);
+    return jnative_fd_of(fd_obj);
 }
 
 /*
@@ -80,7 +73,7 @@ void __jnative_fn_java_io_FileInputStream_open0__Ljava_lang_String__V(
         return;
     }
 
-    *(int32_t*)((char*)fd_obj + FD_RAW_FD_OFFSET) = fd;
+    *(int32_t*)((char*)fd_obj + FD_OFFSET) = fd;
 }
 
 /*
@@ -124,6 +117,9 @@ int32_t __jnative_fn_java_io_FileInputStream_read0___I(void* this_fis)
  *
  * Bulk read into a byte array. Returns the number of bytes actually read
  * (0 on end of file, never more than len).
+ *
+ * The payload of a Java byte[] starts at JAVA_ARR_HDR, the same offset
+ * the runtime's array factories and the LLVM emitter use.
  */
 int32_t __jnative_fn_java_io_FileInputStream_readBytes___BII_I(
         void* this_fis, void* b, int32_t off, int32_t len)

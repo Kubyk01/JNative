@@ -1,5 +1,3 @@
-/* path: src/main/java/io/github/kubyk01/application/service/optimizer/DeadCodeEliminator.java */
-
 package io.github.kubyk01.application.service.optimizer;
 
 import io.github.kubyk01.domain.ir.BasicBlock;
@@ -238,7 +236,7 @@ public class DeadCodeEliminator {
                  FREE,
                  CHECKCAST,
                  JSR,
-                 NEW, NEW_ARRAY, MULTI_NEW_ARRAY -> true;
+                 NEW, NEW_ARRAY, MULTI_NEW_ARRAY, STORE -> true;
             case PUT_STATIC -> {
                 String name = extractFieldName(inst);
                 yield name != null && readStaticFields.contains(name);

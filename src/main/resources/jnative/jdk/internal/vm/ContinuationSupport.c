@@ -1,7 +1,7 @@
 #include <stdint.h>
 #include <stddef.h>
 
-__attribute__((noreturn)) void __jnative_throw_exception(void* exc);
+#include "jnative_runtime.h"
 
 int32_t __jnative_fn_jdk_internal_vm_ContinuationSupport_isSupported0___Z(void) {
     return 0;

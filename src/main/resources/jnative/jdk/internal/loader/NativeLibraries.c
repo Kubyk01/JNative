@@ -6,42 +6,22 @@
 #include <unistd.h>
 #include <dlfcn.h>
 
+#include "jnative_runtime.h"
+
 #ifndef PATH_MAX
 #define PATH_MAX 4096
 #endif
 
-extern const char* __jnative_read_string_bytes(void* s, int32_t* out_len);
-extern void* __jnative_make_string_obj(const char* bytes, int32_t len);
-
-/*
+/* --------------------------------------------------------------------------
  * static native String findBuiltinLib(String name);
  *
  * Returns the absolute path of the current process image when `name`
  * denotes a native library whose symbols are already available in the
  * running executable, or null otherwise.
- *
- * In this runtime every JDK native library's C implementation is
- * compiled and linked directly into the executable together with the
- * LLVM-generated code (see Analyzer.compileAndLink and the -rdynamic
- * linker flag it passes on Linux). There are no separate .so files on
- * disk for names such as "net", "nio" or "zip": all their symbols
- * already live in the executable and are reachable through
- * dlopen(NULL)/dlsym. The correct contract for the loader is therefore
- * to treat those names as built-in and hand back the executable path;
- * the loader's subsequent dlopen of that path succeeds and returns a
- * handle whose symbol table contains everything the JNI machinery
- * looks for.
- *
- * Any name that contains a path separator, an empty base after
- * stripping the platform suffix, or a name that does not match a
- * known JDK library is not built-in; the caller falls through to the
- * platform loader for those.
- */
+ * ------------------------------------------------------------------------ */
 void* __jnative_fn_jdk_internal_loader_NativeLibraries_findBuiltinLib__Ljava_lang_String__Ljava_lang_String_(
-        void* this_libs, void* name_str)
+        void* name_str)
 {
-    (void)this_libs;
-
     if (name_str == NULL) return NULL;
 
     int32_t nameLen = 0;

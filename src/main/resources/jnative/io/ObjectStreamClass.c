@@ -3,18 +3,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <dlfcn.h>
-
-struct ReflectionClass {
-    void* vtable;
-    void* name;                                 /* const char* */
-    struct ReflectionClass* superclass;
-    struct ReflectionClass** interfaces;
-    void** methods;
-    void** fields;
-    void** constructors;
-    int   modifiers;
-    int   object_size;
-};
+#include "jnative_runtime.h"
 
 void __jnative_fn_java_io_ObjectStreamClass_initNative___V(void) {
 }
@@ -25,7 +14,7 @@ int32_t __jnative_fn_java_io_ObjectStreamClass_hasStaticInitializer__Ljava_lang_
     if (class_obj == NULL) return 0;
 
     struct ReflectionClass* cls = (struct ReflectionClass*)class_obj;
-    const char* name = (const char*)cls->name;
+    const char* name = cls->cname;
     if (name == NULL || name[0] == '\0') return 0;
 
     /*

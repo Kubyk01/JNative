@@ -3,18 +3,18 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <unistd.h>
 #include <limits.h>
 #include <dlfcn.h>
+#include "jnative_runtime.h"
 
-extern void* __jnative_make_string_obj(const char* bytes, int32_t len);
-extern const char* __jnative_read_string_bytes(void* s, int32_t* out_len);
-
-__attribute__((noreturn)) void __jnative_throw_null_pointer_exception(void);
-__attribute__((noreturn)) void __jnative_throw_exception(void* exc);
-
-#define JAVA_ARR_HDR 8
-
+/*
+ * JAVA_ARR_HDR is taken from jnative_runtime.h. This file used to redefine
+ * it as 8 locally, which silently shadowed the real array header size and
+ * desynchronised every array built here from the one the LLVM emitter and
+ * the rest of the runtime use.
+ */
 #define PROPERTIES_TABLE_OFFSET      8
 #define PROPERTIES_COUNT_OFFSET     16
 #define PROPERTIES_THRESHOLD_OFFSET 20
@@ -41,25 +41,54 @@ __attribute__((noreturn)) void __jnative_throw_exception(void* exc);
 #define NODE_VAL_OFFSET  24
 #define NODE_NEXT_OFFSET 32
 
-struct ReflectionClass {
-    void* vtable;
-    void* name;
-    struct ReflectionClass* superclass;
-    struct ReflectionClass** interfaces;
-    void** methods;
-    void** fields;
-    void** constructors;
-    int   modifiers;
-    int   object_size;
-};
-
-extern struct ReflectionClass* reflect_all_classes[] __attribute__((weak));
+/* ------------------------------------------------------------------ *
+ * java.util.HashMap field offsets.
+ *
+ * The emitter builds the struct type by walking the class hierarchy
+ * superclass-first (LlvmGlobalEmitter.collectInstanceFields). For
+ * HashMap that gives, in this exact order:
+ *
+ *     AbstractMap:  keySet (reference), values (reference)
+ *     HashMap:      table (Node[]), entrySet (reference),
+ *                   size (int), modCount (int),
+ *                   threshold (int), loadFactor (float)
+ *
+ * so the emitted type is
+ *
+ *     %struct.java_util_HashMap =
+ *         { i8*, i8*, i8*, i8*, i8*, i32, i32, i32, float }
+ *           ^vt  ^kS  ^vl  ^tbl ^eS  ^sz  ^mc  ^thr  ^lf
+ *
+ * and the byte offsets are:
+ *
+ *     vtable        0    (8 bytes)
+ *     keySet        8    (8 bytes, inherited)
+ *     values       16    (8 bytes, inherited)
+ *     table        24    (8 bytes)
+ *     entrySet     32    (8 bytes)
+ *     size         40    (4 bytes)
+ *     modCount     44    (4 bytes)
+ *     threshold    48    (4 bytes)
+ *     loadFactor   52    (4 bytes)
+ *
+ * NOTE: These offsets are for HashMap only. Properties extends
+ * Hashtable, ConcurrentHashMap extends AbstractMap with its own set
+ * of shadowing fields, and both use their own explicitly-passed
+ * offset arguments in __jnative_make_bootstrap_props(). Do not reuse
+ * these constants for either of those maps.
+ * ------------------------------------------------------------------ */
+#define HASHMAP_TABLE_OFF       24
+#define HASHMAP_ENTRYSET_OFF    32
+#define HASHMAP_SIZE_OFF        40
+#define HASHMAP_MODCOUNT_OFF    44
+#define HASHMAP_THRESHOLD_OFF   48
+#define HASHMAP_LOADFACTOR_OFF  52
 
 static struct ReflectionClass* find_class(const char* name) {
     if (!name || reflect_all_classes == NULL) return NULL;
     struct ReflectionClass** pp = reflect_all_classes;
     while (*pp) {
-        const char* n = (const char*)(*pp)->name;
+        const char* n = (*pp)->cname;
         if (n && strcmp(n, name) == 0) return *pp;
         pp++;
     }
@@ -67,9 +96,9 @@ static struct ReflectionClass* find_class(const char* name) {
 }
 
 static void* lookup_class_vtable(struct ReflectionClass* cls) {
-    if (!cls || !cls->name) return NULL;
+    if (!cls || !cls->cname) return NULL;
     char buf[512];
-    snprintf(buf, sizeof(buf), "__type_info_%s", (const char*)cls->name);
+    snprintf(buf, sizeof(buf), "__type_info_%s", cls->cname);
     for (char* p = buf; *p; p++) {
         if (*p == '/' || *p == '.') *p = '_';
     }
@@ -95,11 +124,7 @@ static void* alloc_java_object(const char* class_name, size_t min_size) {
 }
 
 static void* make_empty_string_array(void) {
-    void* arr = malloc(JAVA_ARR_HDR);
-    if (arr == NULL) return NULL;
-    *(int32_t*)arr = 0;
-    *(int32_t*)((char*)arr + 4) = 8;
-    return arr;
+    return jnative_ref_array_of_class(NULL, 0, "[Ljava/lang/String;");
 }
 
 static const char* resolve_java_home(char* buf, size_t bufsz) {
@@ -141,6 +166,227 @@ static const char* resolve_java_home(char* buf, size_t bufsz) {
     return buf;
 }
 
+static const char* resolve_tmpdir(char* buf, size_t bufsz) {
+    if (bufsz == 0) return "/tmp";
+
+    const char* env = getenv("TMPDIR");
+    if (env != NULL && env[0] != '\0') {
+        size_t len = strlen(env);
+        if (len >= bufsz) len = bufsz - 1;
+        memcpy(buf, env, len);
+        buf[len] = '\0';
+        while (len > 1 && buf[len - 1] == '/') {
+            buf[--len] = '\0';
+        }
+        return buf;
+    }
+
+    strncpy(buf, "/tmp", bufsz - 1);
+    buf[bufsz - 1] = '\0';
+    return buf;
+}
+
+static const char* resolve_os_arch(void) {
+#if defined(__x86_64__)
+    return "amd64";
+#elif defined(__aarch64__)
+    return "aarch64";
+#elif defined(__i386__)
+    return "i386";
+#else
+    return "unknown";
+#endif
+}
+
+static const char* resolve_arch_abi(void) {
+#if defined(__x86_64__)
+    return "x86_64";
+#elif defined(__aarch64__)
+    return "aarch64";
+#elif defined(__i386__)
+    return "i386";
+#else
+    return "unknown";
+#endif
+}
+
+static const char* resolve_user_home(char* buf, size_t bufsz) {
+    if (bufsz == 0) return "";
+    const char* home = getenv("HOME");
+    if (home == NULL || home[0] == '\0') home = "/";
+    strncpy(buf, home, bufsz - 1);
+    buf[bufsz - 1] = '\0';
+    return buf;
+}
+
+static const char* resolve_user_name(char* buf, size_t bufsz) {
+    if (bufsz == 0) return "";
+    const char* user = getenv("USER");
+    if (user == NULL || user[0] == '\0') user = getenv("LOGNAME");
+    if (user == NULL || user[0] == '\0') user = "user";
+    strncpy(buf, user, bufsz - 1);
+    buf[bufsz - 1] = '\0';
+    return buf;
+}
+
+/* Reads the POSIX locale from the environment the same way the platform
+ * does: LC_ALL wins over LC_MESSAGES, which wins over LANG. Anything that
+ * is not a "ll" or "ll_CC" value leaves the corresponding output empty and
+ * lets the caller fall back. */
+static void resolve_locale(char* lang, size_t langsz,
+                           char* country, size_t countrysz) {
+    if (langsz == 0 || countrysz == 0) return;
+    lang[0] = '\0';
+    country[0] = '\0';
+
+    const char* loc = NULL;
+    const char* env = getenv("LC_ALL");
+    if (env != NULL && env[0] != '\0') loc = env;
+    if (loc == NULL) {
+        env = getenv("LC_MESSAGES");
+        if (env != NULL && env[0] != '\0') loc = env;
+    }
+    if (loc == NULL) {
+        env = getenv("LANG");
+        if (env != NULL && env[0] != '\0') loc = env;
+    }
+
+    if (loc != NULL) {
+        size_t i = 0;
+        while (loc[i] != '\0' && loc[i] != '_' && loc[i] != '.' && loc[i] != '@'
+               && i + 1 < langsz) {
+            lang[i] = (char)tolower((unsigned char)loc[i]);
+            i++;
+        }
+        lang[i] = '\0';
+        if (loc[i] == '_') {
+            size_t j = 0;
+            i++;
+            while (loc[i] != '\0' && loc[i] != '_' && loc[i] != '.' && loc[i] != '@'
+                   && j + 1 < countrysz) {
+                country[j] = (char)toupper((unsigned char)loc[i]);
+                j++;
+            }
+            country[j] = '\0';
+        }
+    }
+
+    if (lang[0] == '\0') {
+        strncpy(lang, "en", langsz - 1);
+        lang[langsz - 1] = '\0';
+    }
+    if (country[0] == '\0') {
+        strncpy(country, "US", countrysz - 1);
+        country[countrysz - 1] = '\0';
+    }
+}
+
+/* ------------------------------------------------------------------ *
+ * Raw.platformProperties()
+ *
+ * jdk.internal.util.SystemProps.Raw stores the String[] returned here in
+ * its final "platformProps" field and propDefault(int) is a plain
+ * platformProps[index] load. The indices below are the @Native _*_NDX
+ * constants of SystemProps.Raw; they are positional, so this table must
+ * stay in the exact declared order or every property silently resolves
+ * to the wrong value. FIXED_LENGTH is the array length the JDK expects.
+ * ------------------------------------------------------------------ */
+
+#define RAW_NDX_display_country           0
+#define RAW_NDX_display_language          1
+#define RAW_NDX_display_script            2
+#define RAW_NDX_display_variant           3
+#define RAW_NDX_file_encoding             4
+#define RAW_NDX_file_separator            5
+#define RAW_NDX_format_country            6
+#define RAW_NDX_format_language           7
+#define RAW_NDX_format_script             8
+#define RAW_NDX_format_variant            9
+#define RAW_NDX_ftp_nonProxyHosts        10
+#define RAW_NDX_ftp_proxyHost            11
+#define RAW_NDX_ftp_proxyPort            12
+#define RAW_NDX_http_nonProxyHosts       13
+#define RAW_NDX_http_proxyHost           14
+#define RAW_NDX_http_proxyPort           15
+#define RAW_NDX_https_proxyHost          16
+#define RAW_NDX_https_proxyPort          17
+#define RAW_NDX_java_io_tmpdir           18
+#define RAW_NDX_line_separator           19
+#define RAW_NDX_os_arch                  20
+#define RAW_NDX_os_name                  21
+#define RAW_NDX_os_version               22
+#define RAW_NDX_path_separator           23
+#define RAW_NDX_socksNonProxyHosts       24
+#define RAW_NDX_socksProxyHost           25
+#define RAW_NDX_socksProxyPort           26
+#define RAW_NDX_stderr_encoding          27
+#define RAW_NDX_stdout_encoding          28
+#define RAW_NDX_sun_arch_abi             29
+#define RAW_NDX_sun_arch_data_model      30
+#define RAW_NDX_sun_cpu_endian           31
+#define RAW_NDX_sun_cpu_isalist          32
+#define RAW_NDX_sun_io_unicode_encoding  33
+#define RAW_NDX_sun_jnu_encoding         34
+#define RAW_NDX_sun_os_patch_level       35
+#define RAW_NDX_user_dir                 36
+#define RAW_NDX_user_home                37
+#define RAW_NDX_user_name                38
+#define RAW_FIXED_LENGTH                 39
+
+static void* make_string_array(int32_t len) {
+    return jnative_ref_array_of_class(NULL, len, "[Ljava/lang/String;");
+}
+
+/* A null value is meaningful here: SystemProps.put/putIfAbsent skip null
+ * defaults, so leaving a slot empty is how "no proxy configured" and
+ * "no variant" are expressed. */
+static void string_array_set(void* arr, int32_t index, const char* value) {
+    if (arr == NULL || value == NULL) return;
+    *(void**)((char*)arr + JAVA_ARR_HDR + (size_t)index * sizeof(void*)) =
+        __jnative_make_string_obj(value, (int32_t)strlen(value));
+}
+
+/* String.hashCode() for a latin1 String. */
+static int32_t jnative_string_hash(const char* s, int32_t len) {
+    uint32_t h = 0;
+    for (int32_t i = 0; i < len; i++) {
+        h = 31u * h + (uint32_t)(uint8_t)s[i];
+    }
+    return (int32_t)h;
+}
+
+/* ConcurrentHashMap.spread(): additionally masks off the sign bit, because
+ * a CHM.Node.hash of 0 marks the reserved bin. */
+static uint32_t jnative_spread(int32_t h) {
+    uint32_t uh = (uint32_t)h;
+    return (uh ^ (uh >> 16)) & 0x7fffffff;
+}
+
+/* HashMap.hash(Object): the same fold WITHOUT the sign-bit mask. Using the
+ * CHM variant here would put the node in a different bucket than
+ * HashMap.getNode() looks in, and the lookup would always miss. */
+static uint32_t jnative_map_spread(int32_t h) {
+    uint32_t uh = (uint32_t)h;
+    return uh ^ (uh >> 16);
+}
+
+/* Raw.cmdProperties() models the properties the launcher passes on the
+ * command line. The HotSpot launcher always supplies java.home this way and
+ * SystemProps.initProperties() asserts on it, so the map must not be empty.
+ *
+ * The map is assembled field by field rather than through the generated
+ * java.util.HashMap.put(): the generated HashMap.putVal in this module
+ * allocates no nodes at all, so every put() into a HashMap is a silent
+ * no-op. The layout below matches
+ *     %struct.java_util_HashMap       = { i8*, i8*, i8*, i8*, i8*, i32, i32, i32, float }
+ *     %struct.java_util_HashMap_Node  = { i8*, i32, i8*, i8*, i8* }
+ * and HashMap.hash() = h ^ (h >>> 16), which is the same spread the
+ * ConcurrentHashMap bootstrap table below already relies on.
+ *
+ * The two inherited AbstractMap fields (keySet at +8, values at +16) are
+ * left null: HashMap.get() never dereferences them, and the Java-side
+ * caller treats a null keySet/values as "the view has not been created
+ * yet", which is the correct lazy state for a freshly constructed map. */
 void* __jnative_fn_jdk_internal_util_SystemProps_Raw_cmdProperties___Ljava_util_HashMap_(
         void* self)
 {
@@ -150,35 +396,130 @@ void* __jnative_fn_jdk_internal_util_SystemProps_Raw_cmdProperties___Ljava_util_
         fprintf(stderr, "jnative: fatal: HashMap not registered\n");
         abort();
     }
+
     void* handle = dlopen(NULL, RTLD_LAZY);
-    if (handle) {
-        typedef void (*ctor_t)(void*);
-        ctor_t hctor = (ctor_t)dlsym(handle, "fn_java_util_HashMap__init____V");
-        if (hctor) hctor(map);
-        dlclose(handle);
+    if (!handle) {
+        fprintf(stderr, "jnative: fatal: dlopen(NULL) failed\n");
+        abort();
     }
+    void** node_type_info = (void**)dlsym(handle, "__type_info_java_util_HashMap_Node");
+    void* node_vtable = (node_type_info && node_type_info[0])
+        ? node_type_info[0]
+        : lookup_class_vtable(find_class("java/lang/Object"));
+    if (!node_vtable) {
+        fprintf(stderr, "jnative: fatal: no vtable for HashMap.Node\n");
+        abort();
+    }
+
+    int table_size = 16;
+    /*
+     * HashMap.Node[] — the generated HashMap.get() reads this field with
+     * ARRAYLENGTH and ALOAD, so it must carry the standard array header.
+     * Routing it through jnative_ref_array_of_class() gives it the right
+     * length/elem_size words and payload offset; a hand-rolled
+     * calloc + two int32 stores would leave length at offset 0 and the
+     * payload at 8.
+     */
+    void* table = jnative_ref_array_of_class(NULL, table_size,
+                                             "[Ljava/util/HashMap$Node;");
+    if (table == NULL) abort();
+
+    char home_buf[PATH_MAX];
+    const char* java_home = resolve_java_home(home_buf, sizeof(home_buf));
+
+    void* key = __jnative_make_string_obj("java.home", 10);
+    void* value = __jnative_make_string_obj(java_home, (int32_t)strlen(java_home));
+
+    int32_t h = jnative_string_hash("java.home", 10);
+    uint32_t spread = jnative_map_spread(h);
+    int idx = (int)(spread & (uint32_t)(table_size - 1));
+
+    void* node = calloc(1, NODE_SIZE);
+    if (node == NULL) abort();
+    *(void**)((char*)node + 0) = node_vtable;
+    *(int32_t*)((char*)node + NODE_HASH_OFFSET) = (int32_t)spread;
+    *(void**)((char*)node + NODE_KEY_OFFSET) = key;
+    *(void**)((char*)node + NODE_VAL_OFFSET) = value;
+    *(void**)((char*)node + NODE_NEXT_OFFSET) = NULL;
+    *(void**)((char*)table + JAVA_ARR_HDR + (size_t)idx * sizeof(void*)) = node;
+
+    /* keySet (+8) and values (+16) are inherited AbstractMap slots.
+     * Leaving them null keeps the lazy-view semantics intact: the
+     * Java-side keySet()/values() methods create the view on first
+     * access. HashMap.get() and HashMap.put() never consult them. */
+    *(void**)((char*)map + 8)  = NULL;
+    *(void**)((char*)map + 16) = NULL;
+
+    *(void**)((char*)map + HASHMAP_TABLE_OFF)      = table;
+    *(void**)((char*)map + HASHMAP_ENTRYSET_OFF)   = NULL;
+    *(int32_t*)((char*)map + HASHMAP_SIZE_OFF)     = 1;
+    *(int32_t*)((char*)map + HASHMAP_MODCOUNT_OFF) = 1;
+    *(int32_t*)((char*)map + HASHMAP_THRESHOLD_OFF)= 12;
+    *(float*)((char*)map + HASHMAP_LOADFACTOR_OFF) = 0.75f;
+
+    dlclose(handle);
     return map;
 }
 
 void* __jnative_fn_jdk_internal_util_SystemProps_Raw_platformProperties____Ljava_lang_String_(void) {
-    return make_empty_string_array();
+    void* arr = make_string_array(RAW_FIXED_LENGTH);
+    if (arr == NULL) {
+        fprintf(stderr, "jnative: fatal: out of memory in platformProperties\n");
+        abort();
+    }
+
+    char home_buf[PATH_MAX];
+    char user_buf[256];
+    char tmpdir_buf[PATH_MAX];
+    char cwd_buf[PATH_MAX];
+    char lang_buf[32];
+    char country_buf[32];
+
+    resolve_locale(lang_buf, sizeof(lang_buf), country_buf, sizeof(country_buf));
+
+    const char* cwd = getcwd(cwd_buf, sizeof(cwd_buf));
+    if (cwd == NULL) cwd = "/";
+
+    string_array_set(arr, RAW_NDX_display_language, lang_buf);
+    string_array_set(arr, RAW_NDX_display_country,  country_buf);
+    string_array_set(arr, RAW_NDX_format_language,  lang_buf);
+    string_array_set(arr, RAW_NDX_format_country,   country_buf);
+    /* display_script / display_variant / format_script / format_variant
+     * stay null, which is how "no script, no variant" is reported. */
+
+    string_array_set(arr, RAW_NDX_file_encoding,   "UTF-8");
+    string_array_set(arr, RAW_NDX_file_separator,  "/");
+    string_array_set(arr, RAW_NDX_java_io_tmpdir,
+                     resolve_tmpdir(tmpdir_buf, sizeof(tmpdir_buf)));
+    string_array_set(arr, RAW_NDX_line_separator,  "\n");
+    string_array_set(arr, RAW_NDX_os_arch,         resolve_os_arch());
+    string_array_set(arr, RAW_NDX_os_name,         "Linux");
+    string_array_set(arr, RAW_NDX_os_version,      "");
+    string_array_set(arr, RAW_NDX_path_separator,  ":");
+
+    string_array_set(arr, RAW_NDX_stderr_encoding, "UTF-8");
+    string_array_set(arr, RAW_NDX_stdout_encoding, "UTF-8");
+    string_array_set(arr, RAW_NDX_sun_arch_abi,    resolve_arch_abi());
+    string_array_set(arr, RAW_NDX_sun_arch_data_model, "64");
+    string_array_set(arr, RAW_NDX_sun_cpu_endian,  "little");
+    string_array_set(arr, RAW_NDX_sun_io_unicode_encoding, "UnicodeLittle");
+    string_array_set(arr, RAW_NDX_sun_jnu_encoding, "UTF-8");
+    string_array_set(arr, RAW_NDX_sun_os_patch_level, "unknown");
+
+    string_array_set(arr, RAW_NDX_user_dir,        cwd);
+    string_array_set(arr, RAW_NDX_user_home,
+                     resolve_user_home(home_buf, sizeof(home_buf)));
+    string_array_set(arr, RAW_NDX_user_name,
+                     resolve_user_name(user_buf, sizeof(user_buf)));
+
+    /* The proxy and nonProxyHosts slots stay null: no proxy is configured,
+     * and SystemProps.putIfAbsent() drops null defaults. */
+
+    return arr;
 }
 
 void* __jnative_fn_jdk_internal_util_SystemProps_Raw_vmProperties____Ljava_lang_String_(void) {
     return make_empty_string_array();
-}
-
-static uint32_t jnative_spread(int32_t h) {
-    uint32_t uh = (uint32_t)h;
-    return (uh ^ (uh >> 16)) & 0x7fffffff;
-}
-
-static int32_t jnative_string_hash(const char* s, int32_t len) {
-    uint32_t h = 0;
-    for (int32_t i = 0; i < len; i++) {
-        h = 31u * h + (uint32_t)(uint8_t)s[i];
-    }
-    return (int32_t)h;
 }
 
 void* __jnative_make_bootstrap_props(
@@ -227,11 +568,10 @@ void* __jnative_make_bootstrap_props(
     }
 
     int table_size = 16;
-    size_t table_total = JAVA_ARR_HDR + (size_t)table_size * sizeof(void*);
-    void* chm_table = calloc(1, table_total);
+    /* ConcurrentHashMap.Node[] — see the HashMap.Node[] note above. */
+    void* chm_table = jnative_ref_array_of_class(NULL, table_size,
+        "[Ljava/util/concurrent/ConcurrentHashMap$Node;");
     if (!chm_table) abort();
-    *(int32_t*)chm_table = table_size;
-    *(int32_t*)((char*)chm_table + 4) = 8;
 
     *(void**)((char*)chm + 8)  = NULL;
     *(void**)((char*)chm + 16) = NULL;
@@ -270,7 +610,7 @@ void* __jnative_make_bootstrap_props(
         void* _k = __jnative_make_string_obj(_kc, _klen);                                \
         void* _v = __jnative_make_string_obj(_vc, (int32_t)strlen(_vc));                 \
         int32_t _hc = jnative_string_hash(_kc, _klen);                                   \
-        uint32_t _h = jnative_spread(_hc);                                                \
+        uint32_t _h = jnative_spread(_hc);                                               \
         int _idx = (int)(_h & (uint32_t)(table_size - 1));                               \
         void* _node = calloc(1, NODE_SIZE);                                              \
         if (_node) {                                                                      \
@@ -297,15 +637,23 @@ void* __jnative_make_bootstrap_props(
     char cwd_buf[PATH_MAX];
     const char* cwd = getcwd(cwd_buf, sizeof(cwd_buf));
     if (cwd == NULL) cwd = "/";
-    const char* user = getenv("USER");
-    if (user == NULL || user[0] == '\0') user = "user";
-    const char* home = getenv("HOME");
-    if (home == NULL || home[0] == '\0') home = "/";
+    char user_buf[256];
+    const char* user = resolve_user_name(user_buf, sizeof(user_buf));
+    char userhome_buf[PATH_MAX];
+    const char* home = resolve_user_home(userhome_buf, sizeof(userhome_buf));
+    char tmpdir_buf[PATH_MAX];
+    const char* tmpdir = resolve_tmpdir(tmpdir_buf, sizeof(tmpdir_buf));
+    char lang_buf[32];
+    char country_buf[32];
+    resolve_locale(lang_buf, sizeof(lang_buf), country_buf, sizeof(country_buf));
 
     JNATIVE_INSERT("java.home", java_home);
     JNATIVE_INSERT("user.home", home);
     JNATIVE_INSERT("user.dir",  cwd);
     JNATIVE_INSERT("user.name", user);
+    JNATIVE_INSERT("java.io.tmpdir", tmpdir);
+    JNATIVE_INSERT("user.language", lang_buf);
+    JNATIVE_INSERT("user.country",  country_buf);
 
     JNATIVE_INSERT("java.version",               "21.0.0");
     JNATIVE_INSERT("java.version.date",          "2023-09-19");
@@ -325,13 +673,7 @@ void* __jnative_make_bootstrap_props(
     JNATIVE_INSERT("jdk.debug",                  "release");
 
     JNATIVE_INSERT("os.name", "Linux");
-#if defined(__x86_64__)
-    JNATIVE_INSERT("os.arch", "amd64");
-#elif defined(__aarch64__)
-    JNATIVE_INSERT("os.arch", "aarch64");
-#else
-    JNATIVE_INSERT("os.arch", "unknown");
-#endif
+    JNATIVE_INSERT("os.arch", resolve_os_arch());
     JNATIVE_INSERT("os.version", "");
 
     JNATIVE_INSERT("file.separator",             "/");
@@ -344,6 +686,40 @@ void* __jnative_make_bootstrap_props(
     JNATIVE_INSERT("stderr.encoding",            "UTF-8");
     JNATIVE_INSERT("sun.jnu.encoding",           "UTF-8");
     JNATIVE_INSERT("sun.io.unicode.encoding",    "UnicodeLittle");
+
+    /* ------------------------------------------------------------------
+     * NEW: properties that VM.saveProperties() reads unconditionally.
+     *
+     * jdk.internal.misc.VM.saveProperties() is invoked from @main right
+     * after the bootstrap table is installed on java.lang.System. It
+     * reads three keys:
+     *
+     *   - "sun.nio.MaxDirectMemorySize"    — null-safe: an absent value
+     *     leaves directMemory at its "unlimited" default.
+     *
+     *   - "sun.nio.PageAlignDirectMemory"  — null-safe via
+     *     "true".equals(...): an absent value leaves the flag false.
+     *
+     *   - "java.class.version"             — NOT null-safe. The body is
+     *
+     *         s = (String)p.get("java.class.version");
+     *         int i = s.indexOf('.');       // NPE when s == null
+     *         classFileMajorVersion = Integer.parseInt(s.substring(0, i));
+     *
+     *     so the key must be present or VM.saveProperties itself aborts
+     *     with an NPE before System.initPhase1 ever runs. This is
+     *     exactly the failure mode reported at build-startup:
+     *
+     *         java.lang.NullPointerException: Cannot invoke
+     *         jdk.internal.misc.VM.saveProperties(Ljava_util_MapV)
+     *         because %tmp_63100 is null
+     *
+     *     The value is the class file format version, major.minor; "65.0"
+     *     is the JDK 21 value and matches the java.version string above.
+     * ------------------------------------------------------------------ */
+    JNATIVE_INSERT("java.class.version",         "65.0");
+    JNATIVE_INSERT("sun.nio.MaxDirectMemorySize", "-1");
+    JNATIVE_INSERT("sun.nio.PageAlignDirectMemory", "false");
 
     JNATIVE_INSERT("jdk.serialFilter",           "");
     JNATIVE_INSERT("sun.nio.MaxCachedBufferSize", "");

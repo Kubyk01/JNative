@@ -14,7 +14,13 @@ import io.github.kubyk01.domain.ir.Terminator;
 import io.github.kubyk01.domain.ir.Value;
 import lombok.extern.slf4j.Slf4j;
 
-import java.util.*;
+import java.util.ArrayDeque;
+import java.util.Deque;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
 import static io.github.kubyk01.util.LlvmUtil.extractCalleeName;
 import static io.github.kubyk01.util.LlvmUtil.extractFieldName;
@@ -24,11 +30,13 @@ import static io.github.kubyk01.util.LlvmUtil.isAllocation;
 @Slf4j
 public class InterproceduralPointsTo {
 
+    private static final long MAX_EVALUATIONS = 1_000_000L;
     private final Module module;
     private final Map<String, FunctionSummary> summaries;
     private final PointsToGraph graph = new PointsToGraph();
     private final Map<Value, AllocationSite> allocationSites = new HashMap<>();
-    private boolean changed = true;
+
+    private boolean changed;
 
     public InterproceduralPointsTo(Module module, Map<String, FunctionSummary> summaries) {
         this.module = module;
@@ -37,18 +45,78 @@ public class InterproceduralPointsTo {
 
     public PointsToGraph analyze() {
         collectAllocationSites();
+
         for (Function func : module.getFunctions()) {
             for (Parameter p : func.getParameters()) {
                 graph.get(p);
             }
         }
-        while (changed) {
-            changed = false;
-            for (Function func : module.getFunctions()) {
-                if (func.getEntryBlock() == null) continue;
-                processFunction(func);
+
+        // ---- Caller map: callee constant → set of caller functions. ----
+        Map<String, Set<Function>> callers = new HashMap<>();
+        for (Function func : module.getFunctions()) {
+            if (func.getEntryBlock() == null) continue;
+            for (BasicBlock block : func.getBlocks()) {
+                for (Instruction inst : block.getInstructions()) {
+                    String callee = extractCalleeName(inst);
+                    if (callee != null) {
+                        callers.computeIfAbsent(callee, k -> new HashSet<>()).add(func);
+                    }
+                }
             }
         }
+
+        // ---- Worklist initialisation ----------------------------------
+        Deque<Function> worklist = new ArrayDeque<>();
+        Set<Function> inWorklist = new HashSet<>();
+        for (Function func : module.getFunctions()) {
+            if (func.getEntryBlock() == null) continue;
+            worklist.add(func);
+            inWorklist.add(func);
+        }
+
+        long processed = 0;
+        long enqueued = 0;
+        long lastLogEvals = 0;
+
+        while (!worklist.isEmpty()) {
+            if (processed >= MAX_EVALUATIONS) {
+                System.err.println("PointsTo: WARNING: worklist exceeded "
+                    + MAX_EVALUATIONS + " evaluations; "
+                    + worklist.size() + " functions still queued. "
+                    + "Stopping (results may be imprecise).");
+                break;
+            }
+
+            Function func = worklist.poll();
+            inWorklist.remove(func);
+            processed++;
+
+            changed = false;
+            processFunction(func);
+
+            if (changed) {
+                Set<Function> funcCallers = callers.get(func.getName());
+                if (funcCallers != null) {
+                    for (Function caller : funcCallers) {
+                        if (inWorklist.add(caller)) {
+                            worklist.add(caller);
+                            enqueued++;
+                        }
+                    }
+                }
+            }
+
+            if (processed - lastLogEvals >= 100_000) {
+                lastLogEvals = processed;
+                System.out.println("PointsTo: " + processed
+                    + " evaluations, " + enqueued + " enqueues, "
+                    + worklist.size() + " queued");
+            }
+        }
+
+        System.out.println("PointsTo: converged after " + processed
+            + " function evaluations, " + enqueued + " enqueues");
         return graph;
     }
 
@@ -61,7 +129,6 @@ public class InterproceduralPointsTo {
                     if (isAllocation(inst.getOpcode())) {
                         AllocationSite site = AllocationSite.fromInstruction(inst, func.getName(), idx);
                         allocationSites.put(inst.getResult(), site);
-                        // keep the site -> value mapping
                         graph.putAllocationSite(site, inst.getResult());
                         graph.add(inst.getResult(), site);
                     }
@@ -136,7 +203,6 @@ public class InterproceduralPointsTo {
                 break;
             }
             case ALOAD: {
-                // array load: result = array[index]  (operands: array, index)
                 if (inst.getOperands().size() >= 2) {
                     Value array = inst.getOperands().getFirst();
                     Value result = inst.getResult();
@@ -149,7 +215,6 @@ public class InterproceduralPointsTo {
                 break;
             }
             case ASTORE: {
-                // array store: array[index] = value  (operands: array, index, value)
                 if (inst.getOperands().size() >= 3) {
                     Value array = inst.getOperands().get(0);
                     Value value = inst.getOperands().get(2);
@@ -175,7 +240,6 @@ public class InterproceduralPointsTo {
                 break;
             }
             case PUT_STATIC: {
-                // Layout PUT_STATIC: [fieldConst, val]
                 if (inst.getOperands().size() >= 2) {
                     Value rhs = inst.getOperands().get(1);
                     String field = extractFieldName(inst);
@@ -193,7 +257,6 @@ public class InterproceduralPointsTo {
                 break;
             }
             default:
-                // other instructions do not affect points-to
         }
     }
 
@@ -214,7 +277,7 @@ public class InterproceduralPointsTo {
         List<Value> args = getCallArguments(callInst);
         Value returnValue = callInst.getResult();
 
-        // 1. Handling of the return value
+        // 1. Return value
         if (returnValue != null) {
             PointsToSet resultPts = new PointsToSet();
             for (AllocationSite site : summary.getReturnedAllocations()) {
@@ -233,45 +296,34 @@ public class InterproceduralPointsTo {
             }
         }
 
-        // 2. Handling of writes to parameter fields with exact written sites
-        for (Map.Entry<Integer, Map<String, Set<AllocationSite>>> entry : summary.getParamsFieldWrites().entrySet()) {
+        // 2. Parameter field writes — coarsened summary.
+        //
+        // The callee's summary carries only the set of field names it
+        // writes into each parameter, not the exact set of sites. We
+        // therefore widen the field's points-to on every base site
+        // reachable from the caller's argument to UNKNOWN. This is
+        // sound (no site is ever omitted) and finite (a single UNKNOWN
+        // entry per (base site, field) pair).
+        for (Map.Entry<Integer, Set<String>> entry
+            : summary.getParamsFieldWrites().entrySet()) {
             int paramIndex = entry.getKey();
             if (paramIndex >= args.size()) continue;
             Value arg = args.get(paramIndex);
             PointsToSet argPts = graph.get(arg);
             if (argPts.isEmpty()) continue;
-            for (Map.Entry<String, Set<AllocationSite>> fe : entry.getValue().entrySet()) {
-                String field = fe.getKey();
-                Set<AllocationSite> writtenSites = fe.getValue();
+            for (String field : entry.getValue()) {
+                PointsToSet ptsToWrite = new PointsToSet();
+                ptsToWrite.add(AllocationSite.UNKNOWN);
                 for (AllocationSite baseSite : argPts.getSites()) {
-                    PointsToSet ptsToWrite = new PointsToSet();
-                    for (AllocationSite site : writtenSites) {
-                        ptsToWrite.add(site);
-                    }
-                    // If UNKNOWN is among the written sites - conservatively add all module sites
-                    if (writtenSites.contains(AllocationSite.UNKNOWN)) {
-                        for (AllocationSite site : allocationSites.values()) {
-                            ptsToWrite.add(site);
-                        }
-                    }
                     graph.mergeFieldPointsTo(baseSite, field, ptsToWrite);
                 }
             }
         }
 
-        // 3. Handling of writes to static fields with exact written sites
-        for (Map.Entry<String, Set<AllocationSite>> entry : summary.getStaticFieldWrites().entrySet()) {
-            String field = entry.getKey();
-            Set<AllocationSite> writtenSites = entry.getValue();
+        // 3. Static field writes — coarsened summary. Same widening.
+        for (String field : summary.getStaticFieldWrites()) {
             PointsToSet ptsToWrite = new PointsToSet();
-            for (AllocationSite site : writtenSites) {
-                ptsToWrite.add(site);
-            }
-            if (writtenSites.contains(AllocationSite.UNKNOWN)) {
-                for (AllocationSite site : allocationSites.values()) {
-                    ptsToWrite.add(site);
-                }
-            }
+            ptsToWrite.add(AllocationSite.UNKNOWN);
             graph.mergeStaticFieldPointsTo(field, ptsToWrite);
         }
     }

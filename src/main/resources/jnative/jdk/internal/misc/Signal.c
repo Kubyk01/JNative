@@ -5,10 +5,7 @@
 #include <signal.h>
 #include <errno.h>
 
-__attribute__((noreturn)) void __jnative_throw_exception(void* exc);
-__attribute__((noreturn)) void __jnative_throw_null_pointer_exception(void);
-
-extern const char* __jnative_read_string_bytes(void* s, int32_t* out_len);
+#include "jnative_runtime.h"
 
 /*
  * jdk.internal.misc.Signal — the VM-level entry points that back
@@ -50,7 +47,6 @@ extern const char* __jnative_read_string_bytes(void* s, int32_t* out_len);
  * — because the Java layer strips that prefix itself before invoking
  * this hook.
  *
- * A dedicated switch is used rather than <signal.h>'s SIG* constants
  * because several of those constants are not guaranteed to exist on
  * every platform. The numeric values below are the ones every POSIX
  * system assigns to the standard signals, which is what the Java API

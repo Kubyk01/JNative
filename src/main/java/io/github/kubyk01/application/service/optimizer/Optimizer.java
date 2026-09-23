@@ -45,6 +45,15 @@ public class Optimizer {
      * Runs all enabled optimizations.
      */
     public void optimize() {
+        // Validate the local-slot-width invariant before any
+        // transformation runs. A violation here means the IR builder or
+        // the SSA pass produced a slot whose write width differs from
+        // its read width — the failure mode that produced garbage bytes
+        // after a narrow store. Failing fast is strictly better than
+        // letting the malformed IR flow through the remaining passes
+        // and surface as a subtly wrong value at runtime.
+        LocalSlotWidthValidator.validate(module);
+
         if (enableScalarReplacement) {
             log.info("Running scalar replacement...");
             ScalarReplacer scalarReplacer = new ScalarReplacer(module, aliasResult, escapeResult, siteToValue);

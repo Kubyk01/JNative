@@ -1,32 +1,64 @@
 #include <string.h>
-#include <stdlib.h>
 #include <stdint.h>
-#include <stdio.h>
 #include <time.h>
 
-__attribute__((noreturn)) void __jnative_throw_null_pointer_exception(void);
-__attribute__((noreturn)) void __jnative_throw_array_index_out_of_bounds(void);
-__attribute__((noreturn)) void __jnative_throw_exception(void* exc);
+#include "jnative_runtime.h"
 
-extern void* __jnative_make_string_obj(const char* bytes, int32_t len);
-extern const char* __jnative_read_string_bytes(void* s, int32_t* out_len);
+/*
+ * java.lang.System — the native entry points that the class delegates
+ * to the runtime.
+ *
+ * The class declares a whole family of natives, all of which are small
+ * operations against process-level state (the standard streams, the
+ * system clock, the identity-hash code of an object, and the array
+ * copy primitive). The runtime also registers a shutdown hook through
+ * the class's static initializer, but that hook is established by
+ * LlvmGenerator.generateMain, not by any native in this file.
+ *
+ * The array helpers used below (jnative_array_length, _elem_size, and
+ * _data) come from jnative_runtime.h and match the runtime's standard
+ * Java-array layout: a 16-byte header holding the class mirror, the
+ * length and the element size, followed by the payload.
+ */
 
-#define ARRAY_HEADER_SIZE 8
-
-static inline int32_t array_length(void* arr) {
-    if (arr == NULL) return -1;
-    return *(int32_t*)arr;
-}
-
-static inline int32_t array_elem_size(void* arr) {
-    if (arr == NULL) return -1;
-    return *(int32_t*)((char*)arr + 4);
-}
-
-static inline void* array_data(void* arr) {
-    return (char*)arr + ARRAY_HEADER_SIZE;
-}
-
+/*
+ * public static native void arraycopy(Object src, int srcPos,
+ *                                     Object dest, int destPos,
+ *                                     int length);
+ *
+ * The bulk array-copy primitive behind System.arraycopy. The JDK's
+ * contract for this method is unusually strict: any of the following
+ * conditions must throw a specific exception, and the copy is
+ * guaranteed to be atomic with respect to any subsequent observation
+ * of the destination:
+ *
+ *   - src == null or dest == null   -> NullPointerException
+ *   - src or dest is not an array   -> ArrayStoreException
+ *   - length < 0                    -> IndexOutOfBoundsException
+ *   - srcPos < 0 or destPos < 0     -> IndexOutOfBoundsException
+ *   - srcPos + length > src.length  -> IndexOutOfBoundsException
+ *   - destPos + length > dst.length -> IndexOutOfBoundsException
+ *   - incompatible element types    -> ArrayStoreException
+ *
+ * The runtime's array representation does not carry the element type
+ * in a form that lets us check source-vs-destination compatibility
+ * without an additional indirection, so the two cross-type checks
+ * (element-type compatibility and the class-hierarchy-based
+ * ArrayStoreException) are performed only at the granularity of the
+ * element size: if the two arrays have different element sizes, the
+ * call is rejected with the generic throw helper, which the Java
+ * layer's caller has arranged to translate into ArrayStoreException
+ * at the reflection boundary. Same-size but incompatible reference
+ * types (for example, an Integer[] copied into a String[]) are not
+ * detected here; the caller's own ArrayStoreException is thrown at
+ * the next element-store fault, exactly as a naive memcpy-based
+ * implementation would produce.
+ *
+ * The actual copy uses memmove, not memcpy: source and destination
+ * may overlap, and the JDK's contract for System.arraycopy explicitly
+ * requires the overlapping case to be handled as if the source were
+ * first copied into an intermediate buffer.
+ */
 void __jnative_fn_java_lang_System_arraycopy__Ljava_lang_Object_ILjava_lang_Object_II_V(
     void* src, int32_t srcPos, void* dest, int32_t destPos, int32_t length)
 {
@@ -45,8 +77,8 @@ void __jnative_fn_java_lang_System_arraycopy__Ljava_lang_Object_ILjava_lang_Obje
         return;
     }
 
-    int32_t srcLen = array_length(src);
-    int32_t dstLen = array_length(dest);
+    int32_t srcLen = jnative_array_length(src);
+    int32_t dstLen = jnative_array_length(dest);
     if (srcLen < 0 || dstLen < 0) {
         __jnative_throw_array_index_out_of_bounds();
         return;
@@ -57,16 +89,16 @@ void __jnative_fn_java_lang_System_arraycopy__Ljava_lang_Object_ILjava_lang_Obje
         return;
     }
 
-    int32_t srcElemSize = array_elem_size(src);
-    int32_t dstElemSize = array_elem_size(dest);
+    int32_t srcElemSize = jnative_array_elem_size(src);
+    int32_t dstElemSize = jnative_array_elem_size(dest);
 
     if (srcElemSize != dstElemSize) {
         __jnative_throw_exception(NULL);
         return;
     }
 
-    char* srcPtr = (char*)array_data(src) + (size_t)srcPos * (size_t)srcElemSize;
-    char* dstPtr = (char*)array_data(dest) + (size_t)destPos * (size_t)dstElemSize;
+    char* srcPtr = (char*)jnative_array_data(src) + (size_t)srcPos * (size_t)srcElemSize;
+    char* dstPtr = (char*)jnative_array_data(dest) + (size_t)destPos * (size_t)dstElemSize;
     size_t bytes = (size_t)length * (size_t)srcElemSize;
 
     memmove(dstPtr, srcPtr, bytes);
@@ -112,7 +144,7 @@ void __jnative_fn_java_lang_System_initProperties__Ljava_util_Properties_(void* 
     (void)props;
 }
 
-/* --------------------------------------------------------------------------
+/*
  * private static native String mapLibraryName(String libname);
  *
  * The platform-specific translation from a Java library name (e.g.
@@ -133,16 +165,16 @@ void __jnative_fn_java_lang_System_initProperties__Ljava_util_Properties_(void* 
  * behaving exactly as they would under HotSpot, which is important for
  * error messages that user code might match on.
  *
- * The mapping is purely textual: no file-system lookup, no
- * dlopen, no version-suffix resolution. Java's own System.loadLibrary
- * already calls mapLibraryName before handing the result to the
- * platform loader, so the contract is just "given a bare name, produce
- * the canonical file name for this platform".
+ * The mapping is purely textual: no file-system lookup, no dlopen,
+ * no version-suffix resolution. Java's own System.loadLibrary already
+ * calls mapLibraryName before handing the result to the platform
+ * loader, so the contract is just "given a bare name, produce the
+ * canonical file name for this platform".
  *
  * A NULL argument raises NullPointerException, matching the reference
  * VM: System.mapLibraryName(null) is specified to throw NPE, and the
  * Java-side callers do not pre-check for null.
- * ------------------------------------------------------------------------ */
+ */
 void* __jnative_fn_java_lang_System_mapLibraryName__Ljava_lang_String__Ljava_lang_String_(
         void* libname_str)
 {
@@ -158,9 +190,11 @@ void* __jnative_fn_java_lang_System_mapLibraryName__Ljava_lang_String__Ljava_lan
         return NULL;
     }
 
-    /* Pick the platform prefix/suffix pair at compile time. The
+    /*
+     * Pick the platform prefix/suffix pair at compile time. The
      * preprocessor cannot see the running OS, but the compiler can:
-     * the target triple is fixed when this runtime is built. */
+     * the target triple is fixed when this runtime is built.
+     */
 #if defined(_WIN32)
     const char* prefix = "";
     const char* suffix = ".dll";

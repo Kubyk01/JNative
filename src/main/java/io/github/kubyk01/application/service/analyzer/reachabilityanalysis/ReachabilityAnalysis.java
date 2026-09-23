@@ -62,7 +62,7 @@ public class ReachabilityAnalysis {
 
     /**
      * All virtual/interface dispatch sites observed during analysis,
-     * keyed by {@code "owner.name(desc)"}.
+     * keyed by {@code "owner.name(descriptor)"}.
      *
      * <p>A dispatch site on an abstract class or interface cannot be
      * resolved to a concrete target until every subclass that could be
@@ -72,8 +72,9 @@ public class ReachabilityAnalysis {
      * {@code CharacterDataLatin1}, first touched by
      * {@code CharacterData.of(int)}) may not be in the class map at the
      * moment an earlier method dispatches on its abstract parent. The
-     * dispatch sites recorded here are re-resolved after the worklist has
-     * drained, once every transitively loaded class is visible. See
+     * dispatch sites recorded here are re-resolved after the worklist
+     * has drained, once every transitively loaded class is visible and
+     * every instantiation has been recorded. See
      * {@link #resolveVirtualDispatchFixedPoint()}.</p>
      */
     private final Set<String> virtualDispatchSites = new LinkedHashSet<>();
@@ -84,6 +85,13 @@ public class ReachabilityAnalysis {
      * exactly once, so the loop terminates.
      */
     private final Set<MethodReference> dispatchScanDone = new HashSet<>();
+
+    /**
+     * Classes for which the enum-method-forcing rule has already run.
+     * Keeps the check a one-time operation per class even when
+     * {@code addClassWithInit} is called repeatedly for the same class.
+     */
+    private final Set<String> enumMethodsProcessed = new HashSet<>();
 
     public void addInstantiatedClass(String className, boolean fromUser) {
         if (className == null || className.isEmpty()) return;
@@ -135,6 +143,20 @@ public class ReachabilityAnalysis {
         else if (term instanceof TableSwitchTerminator tst) out.add(tst.getKey());
         else if (term instanceof IndirectBranchTerminator ibt) out.add(ibt.getTargetBlock());
         return out;
+    }
+
+    Set<String> instantiatedSubclasses(String dispatchRoot) {
+        Set<String> result = new HashSet<>();
+        if (dispatchRoot == null) return result;
+        if (instantiatedClasses.contains(dispatchRoot)) {
+            result.add(dispatchRoot);
+        }
+        for (String sub : resolver.getSubclasses(dispatchRoot)) {
+            if (instantiatedClasses.contains(sub)) {
+                result.add(sub);
+            }
+        }
+        return result;
     }
 
     public void applyMetadata(ReachabilityMetadata metadata) {
@@ -201,6 +223,16 @@ public class ReachabilityAnalysis {
                         }
                     }
                 }
+                // Metadata that lists constructors or reflects a class as
+                // constructible is a genuine signal that the class is
+                // instantiated: it is what native-image reachability
+                // metadata is for. Record it so the virtual-dispatch
+                // candidate filter sees the class as a possible runtime
+                // type.
+                if (rc.isAllDeclaredConstructors() || rc.isAllPublicConstructors()
+                    || !rc.getConstructors().isEmpty()) {
+                    instantiatedClasses.add(className);
+                }
             }
         }
         for (ReachabilityMetadata.ProxyInterface pi : metadata.getProxyInterfaces()) {
@@ -218,6 +250,8 @@ public class ReachabilityAnalysis {
         for (ReachabilityMetadata.JniClass jc : metadata.getJniClasses()) {
             String className = jc.getName().replace('.', '/');
             addClassWithInit(className, true);
+            // A class handed to JNI is instantiated from native code.
+            instantiatedClasses.add(className);
         }
         log.info("Applied reachability metadata: {} reflect classes, {} proxy interfaces, {} jni classes",
             metadata.getReflectClasses().size(),
@@ -303,6 +337,132 @@ public class ReachabilityAnalysis {
         log.info("Instantiated classes: {}", instantiatedClasses.size());
     }
 
+    /**
+     * Adds one method to the reachable set and drives the analysis to its
+     * fixed point again.
+     *
+     * <p>For methods the code generator needs but that the ordinary closure
+     * cannot reach — the ones a native override calls directly from C, and
+     * which therefore have no {@code invokevirtual} in any bytecode to seed
+     * the worklist from. {@code java.io.ByteArrayInputStream.<init>([B)V} is
+     * the motivating case: it is invoked from
+     * {@code __jnative_make_byte_array_input_stream} in
+     * {@code jnative_runtime.c}, and without it the vtable slot would hold
+     * an unresolved thunk.</p>
+     *
+     * <p>The method is added as a system method, not a user one, so it does
+     * not show up in the user-facing class/method listings.</p>
+     *
+     * <p>Idempotent: re-adding a method that is already reachable is a
+     * no-op, and the fixed-point pass is skipped in that case.</p>
+     *
+     * <p>Must be called after {@link #analyzeFromEntry} — before it, the
+     * worklist has not been seeded with the entry point and driving the
+     * fixed point would discard the entry.</p>
+     */
+    public void addExtraReachableMethod(MethodReference ref) {
+        if (ref == null) return;
+        if (reachableMethods.contains(ref)) return;
+        addMethod(ref, false);
+        drainWorklist();
+        resolveVirtualDispatchFixedPoint();
+    }
+
+    /**
+     * Forces the {@code <clinit>} of every class in the transitive
+     * superclass chain of the current reachable set into the reachable
+     * set, then drives the analysis to a fixed point.
+     *
+     * <p>JVMS §5.5 step 5 requires that a class's superclass be initialized
+     * before the class itself. No bytecode site expresses that requirement
+     * directly — the superclass chain is implicit in the class hierarchy —
+     * so the ordinary active-use walk never adds a superclass's
+     * {@code <clinit>} to the worklist. A class that participates in the
+     * image only as an ancestor (it is abstract, or nothing references it
+     * directly) would therefore be missing from the module, and the JDK's
+     * own initialization-order invariants would be silently violated.</p>
+     *
+     * <p>The concrete failure this closes:</p>
+     * <pre>
+     *   java.security.SecureClassLoader           (abstract, unreferenced directly)
+     *       static { ClassLoader.registerAsParallelCapable(); }
+     *
+     *   jdk.internal.loader.BuiltinClassLoader    (extends SecureClassLoader)
+     *       static { ClassLoader.registerAsParallelCapable(); }
+     *
+     *   ClassLoader.registerAsParallelCapable()
+     *       consults ParallelLoaders.loaderTypes, whose contents are the
+     *       set of subclasses that have already run their own &lt;clinit&gt;.
+     * </pre>
+     *
+     * <p>With {@code SecureClassLoader.<clinit>} missing, the middle entry
+     * is never inserted, and {@code BuiltinClassLoader.<clinit>}'s own
+     * registration fails with
+     * {@code java.lang.InternalError: Unable to register as parallel capable}.
+     * Adding the superclass closure here makes the eager schedule in
+     * {@code LlvmGenerator.generateMain} complete without any post-hoc
+     * resurrection pass.</p>
+     *
+     * <p>Idempotent: if the closure is already present, the method returns
+     * without touching the worklist.</p>
+     */
+    public void ensureSuperclassClinitsReachable() {
+        final int MAX_PASSES = 8;
+        int pass = 0;
+        boolean changed = true;
+
+        while (changed && pass++ < MAX_PASSES) {
+            changed = false;
+
+            // Walk the superclass chain of every currently-reachable class
+            // and collect ancestors that are not yet in the reachable set.
+            // The walk is monotone (visited guards cycles) and starts from a
+            // snapshot so the iteration below sees a stable input.
+            Set<String> newClasses = new HashSet<>();
+            Deque<String> worklist = new ArrayDeque<>(reachableClasses);
+            Set<String> visited = new HashSet<>();
+
+            while (!worklist.isEmpty()) {
+                String cls = worklist.poll();
+                if (!visited.add(cls)) continue;
+
+                ClassNode cn = resolver.getClassNode(cls);
+                if (cn == null) continue;
+
+                String sup = cn.getSuperName();
+                if (sup == null
+                    || sup.isEmpty()
+                    || sup.equals(cls)
+                    || "java/lang/Object".equals(sup)) {
+                    continue;
+                }
+                if (!reachableClasses.contains(sup)) {
+                    newClasses.add(sup);
+                }
+                worklist.add(sup);
+            }
+
+            for (String cls : newClasses) {
+                // addClassWithInit enqueues the <clinit> only when the class
+                // actually declares one and its bytecode is available; the
+                // call is otherwise a no-op.
+                addClassWithInit(cls, false);
+                changed = true;
+            }
+
+            if (changed) {
+                drainWorklist();
+                resolveVirtualDispatchFixedPoint();
+            }
+        }
+
+        if (pass >= MAX_PASSES) {
+            log.warn("Superclass-clinit closure did not converge after {} passes; "
+                + "some class initializers may be missing from the image",
+                MAX_PASSES);
+        }
+    }
+
     private void drainWorklist() {
         while (!worklist.isEmpty()) {
             MethodReference current = worklist.poll();
@@ -314,11 +474,12 @@ public class ReachabilityAnalysis {
      * Virtual-dispatch fixed point.
      *
      * <p>Virtual and interface dispatches are resolved against the set of
-     * subclasses that are loaded at the moment the dispatching method is
-     * processed. The worklist is drained in call-discovery order, not in
-     * class-load order, so a class may be loaded only after an earlier
-     * method has already dispatched on its abstract parent. The canonical
-     * example in the JDK's start-up path:</p>
+     * subclasses that are loaded and instantiated at the moment the
+     * dispatching method is processed. The worklist is drained in
+     * call-discovery order, not in class-load order, so a class may be
+     * loaded only after an earlier method has already dispatched on its
+     * abstract parent. The canonical example in the JDK's start-up
+     * path:</p>
      *
      * <pre>
      *   Integer.parseInt(String,int)
@@ -345,12 +506,12 @@ public class ReachabilityAnalysis {
      * every method in {@link #reachableMethods} is scanned for
      * {@code INVOKEVIRTUAL}/{@code INVOKEINTERFACE} bytecodes; each unique
      * dispatch site is recorded in {@link #virtualDispatchSites}; every
-     * site is re-resolved against the now-current subclass map; any
-     * concrete override discovered this way is added to the worklist and
-     * the worklist is drained. The cycle repeats until neither a new
-     * dispatch site nor a new concrete target is produced, which is
-     * guaranteed because both {@link #reachableMethods} and the class map
-     * grow monotonically.</p>
+     * site is re-resolved against the now-current subclass and
+     * instantiation sets; any concrete override discovered this way is
+     * added to the worklist and the worklist is drained. The cycle
+     * repeats until neither a new dispatch site nor a new concrete target
+     * is produced, which is guaranteed because both
+     * {@link #reachableMethods} and the class map grow monotonically.</p>
      */
     private void resolveVirtualDispatchFixedPoint() {
         final int MAX_PASSES = 32;
@@ -367,8 +528,9 @@ public class ReachabilityAnalysis {
             }
 
             // Step 2: re-resolve every known site against the current
-            // class map. Any concrete override that has become visible
-            // since the previous pass is added to the worklist.
+            // class map and instantiation set. Any concrete override that
+            // has become visible since the previous pass is added to the
+            // worklist.
             boolean addedAny = false;
             for (String site : virtualDispatchSites) {
                 if (resolveVirtualDispatchSite(site)) {
@@ -438,13 +600,25 @@ public class ReachabilityAnalysis {
     }
 
     /**
-     * Resolves a single dispatch site against the current subclass map.
+     * Resolves a single dispatch site against the current subclass and
+     * instantiation maps.
      *
-     * <p>For every loaded subclass of the receiver's declared owner that
-     * provides a concrete (non-abstract) implementation of the dispatched
-     * method, the implementation's declaring class is added to the
-     * reachable set. Interfaces contributed by a subclass are walked
-     * transitively by {@link DependencyResolver#getSubclasses(String)}.</p>
+     * <p>For every <em>instantiated</em> subtype of the receiver's declared
+     * owner that provides a concrete (non-abstract) implementation of the
+     * dispatched method, the implementation's declaring class is added to
+     * the reachable set. The instantiation filter is the primary lever
+     * against the reachability walk's pessimism on a large image: without
+     * it, a dispatch on {@code Object} or on a broad interface expands
+     * into every loaded implementation of that method, most of which
+     * belong to JDK classes the walk incidentally loaded but that the
+     * program's own code never instantiates.</p>
+     *
+     * <p>The owner's own implementation is deliberately not revisited
+     * here. It was already added to the reachable set by
+     * {@code MethodBytecodeVisitor.visitMethodInsn} at the moment the
+     * dispatch site was first seen; re-adding it would be a no-op but
+     * would obscure the fact that the deferred pass exists solely to pick
+     * up overrides on subclasses.</p>
      *
      * @return {@code true} if at least one method was newly added to the
      *         worklist, {@code false} otherwise.
@@ -463,13 +637,12 @@ public class ReachabilityAnalysis {
         String name  = site.substring(lastDot + 1, parenIdx);
         String desc  = site.substring(parenIdx);
 
-        Set<String> subclasses = resolver.getSubclasses(owner);
-        if (subclasses.isEmpty()) return false;
+        Set<String> candidates = instantiatedSubclasses(owner);
+        candidates.remove(owner);
+        if (candidates.isEmpty()) return false;
 
         boolean added = false;
-        for (String target : subclasses) {
-            if (target.equals(owner)) continue;
-
+        for (String target : candidates) {
             String[] foundOwner = new String[1];
             MethodNode targetMethod = resolver.findMethodInHierarchy(
                 target, name, desc, foundOwner);
@@ -556,7 +729,7 @@ public class ReachabilityAnalysis {
         ClassNode classNode = resolver.getClassNode(owner);
 
         // A class that came from reflection (isExternal == false) has no
-        // bytecode.  Force a reload in that case as well, so the method
+        // bytecode. Force a reload in that case as well, so the method
         // bodies can actually be translated later.
         if (classNode.isExternal() || resolver.getClassBytes(owner) == null) {
             resolver.forceLoadSystemClass(owner);
@@ -627,6 +800,14 @@ public class ReachabilityAnalysis {
      * cached {@code classBytes}. Such a {@link ClassNode} is reloaded from
      * its actual {@code .class} payload before the {@code <clinit>} check,
      * so the initializer becomes visible and can be translated.</p>
+     *
+     * <p>Before the {@code <clinit>} handling below, this method also runs
+     * {@link #ensureEnumMethodsReachable}: an enum class's compiler-
+     * generated {@code values()} and {@code valueOf(String)} methods are
+     * not reachable through any ordinary bytecode path, but they are
+     * needed by {@code Class.getEnumConstantsShared()} (via the synthetic
+     * dispatcher emitted by {@code EnumConstantsSharedEmitter}) and by
+     * {@code Enum.valueOf}. See that method for the full rationale.</p>
      */
     void addClassWithInit(String className, boolean fromUser) {
         if (className == null || className.isEmpty()) return;
@@ -635,6 +816,12 @@ public class ReachabilityAnalysis {
         if (fromUser) {
             userReachedClasses.add(className);
         }
+
+        // Enum values()/valueOf(String) force. Runs before the clinit
+        // short-circuit so it executes exactly once per class, even on
+        // the many repeat calls that a class receives when it is used
+        // from several distinct bytecode sites.
+        ensureEnumMethodsReachable(className, fromUser);
 
         if (clinitProcessed.contains(className)) return;
         clinitProcessed.add(className);
@@ -668,34 +855,72 @@ public class ReachabilityAnalysis {
         addMethod(new MethodReference(className, "<clinit>", "()V"), fromUser);
     }
 
+    /**
+     * For an enum class, ensures that its compiler-generated
+     * {@code values()} and {@code valueOf(String)} static methods are
+     * placed in the reachable set.
+     *
+     * <p>The JDK's {@code Class.getEnumConstantsShared()} consults the
+     * enum's {@code values()} method. In the reference implementation this
+     * happens reflectively; in this runtime it happens through the
+     * synthetic dispatcher emitted by
+     * {@code io.github.kubyk01.application.service.analyzer.ssa.EnumConstantsSharedEmitter}.
+     * Either way the target function must exist in the module, and nothing
+     * in an enum's own bytecode — including its {@code <clinit>} — ever
+     * calls {@code values()}. Without this rule the method is never
+     * translated, and every enum-consuming JDK path that reaches
+     * {@code Class.getEnumConstantsShared} (EnumMap, EnumSet,
+     * {@code Enum.valueOf}, {@code Class.getEnumConstants}) observes
+     * {@code null}.</p>
+     *
+     * <p>{@code valueOf(String)} is forced for the same reason: it is the
+     * mirror of {@code values()} in the JDK's enum machinery, and forcing
+     * only one of the pair would leave {@code Enum.valueOf} broken for the
+     * same classes.</p>
+     *
+     * <p>The rule is a one-time operation per class, guarded by
+     * {@link #enumMethodsProcessed}, because {@code addClassWithInit} can
+     * be invoked many times for the same class from different bytecode
+     * sites.</p>
+     */
+    private void ensureEnumMethodsReachable(String className, boolean fromUser) {
+        if (!enumMethodsProcessed.add(className)) return;
+
+        ClassNode cn = resolver.getClassNode(className);
+        if (cn == null || cn.isExternal()) return;
+
+        // JVMS 4.1: an enum class carries ACC_ENUM in its access flags
+        // and has java.lang.Enum as its direct superclass. Both
+        // conditions are checked, mirroring Class.isEnum().
+        final int ACC_ENUM = 0x4000;
+        if ((cn.getAccess() & ACC_ENUM) == 0) return;
+        if (!"java/lang/Enum".equals(cn.getSuperName())) return;
+
+        for (MethodNode mn : cn.getMethods()) {
+            if (!mn.isStatic()) continue;
+
+            String name = mn.getName();
+            String desc = mn.getDescriptor();
+
+            boolean isValues =
+                "values".equals(name)
+                    && desc.startsWith("()[L");
+
+            boolean isValueOf =
+                "valueOf".equals(name)
+                    && desc.startsWith("(Ljava/lang/String;)L");
+
+            if (isValues || isValueOf) {
+                addMethod(new MethodReference(className, name, desc), fromUser);
+            }
+        }
+    }
+
     public void triggerClinit(String className, boolean fromUser) {
         addClassWithInit(className, fromUser);
     }
 
-    boolean isSystemClassName(String className) {
-        String dot = className.replace('/', '.');
-        return dot.startsWith("java.") ||
-            dot.startsWith("javax.") ||
-            dot.startsWith("sun.") ||
-            dot.startsWith("jdk.") ||
-            dot.startsWith("org.objectweb.asm.") ||
-            dot.startsWith("picocli.") ||
-            dot.startsWith("reactor.") ||
-            dot.startsWith("org.slf4j.") ||
-            dot.startsWith("org.reactivestreams.") ||
-            dot.startsWith("io.micrometer.") ||
-            dot.startsWith("org.junit.") ||
-            dot.startsWith("com.fasterxml.");
-    }
-
     void addMethod(MethodReference ref, boolean isUser) {
-        boolean isSystem = isSystemClassName(ref.getOwner());
-
-        if (!isUser && isSystem) {
-            addClass(ref.getOwner(), false);
-            return;
-        }
-
         if (reachableMethods.add(ref)) {
             worklist.add(ref);
             if (isUser) {

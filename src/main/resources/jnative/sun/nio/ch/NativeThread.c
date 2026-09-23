@@ -5,6 +5,8 @@
 #include <unistd.h>
 #include <errno.h>
 
+#include "jnative_runtime.h"
+
 /*
  * sun.nio.ch.NativeThread
  *
@@ -12,13 +14,13 @@
  * calling thread and delivers a POSIX signal to that thread on request.
  * The identifier is used as the thread handle stored by the async
  * I/O machinery (sun.nio.ch.NativeThreadSet) while a blocking
- * operation is in progress, and the signal is what wakes the thread out
- * of a blocking syscall so it can re-check the interrupt state.
+ * operation is in progress, and the signal is what wakes the thread
+ * out of a blocking syscall so it can re-check the interrupt state.
  *
  * In this runtime the blocking I/O primitives (read0/pread0/... in
  * UnixFileDispatcherImpl.c) never block indefinitely on an
- * uninterruptible kernel path: they retry only on EINTR and surface the
- * errno to Java in every other case, so the caller's normal
+ * uninterruptible kernel path: they retry only on EINTR and surface
+ * the errno to Java in every other case, so the caller's normal
  * interrupt-check path is reached without any external wake-up. The
  * signal-based preemption that HotSpot performs from
  * NativeThread.signal() is therefore unnecessary; NativeThread.signal()
@@ -31,62 +33,66 @@
  * thread is joined. On Linux/glibc it is already a 64-bit value.
  */
 
-/* ---------------------------------------------------------------------------
+/*
  * static native void init();
  *
- * Called from NativeThread.<clinit>. On HotSpot this hook installs the
- * per-thread signal handler used by NativeThread.signal. Because this
- * runtime never delivers such signals, there is nothing to install.
- * ------------------------------------------------------------------------- */
+ * Called from NativeThread.<clinit>. On HotSpot this hook installs
+ * the per-thread signal handler used by NativeThread.signal. Because
+ * this runtime never delivers such signals, there is nothing to
+ * install. The symbol must nevertheless exist because
+ * NativeThread.<clinit> emits a native call to it.
+ */
 void __jnative_fn_sun_nio_ch_NativeThread_init___V(void) {
 }
 
-/* ---------------------------------------------------------------------------
+/*
  * static native long current0();
  *
- * Returns the opaque identifier of the calling thread. Used by the Java
- * layer as the handle it stores in NativeThreadSet.
- * ------------------------------------------------------------------------- */
+ * Returns the opaque identifier of the calling thread. Used by the
+ * Java layer as the handle it stores in NativeThreadSet.
+ *
+ * The value is the pthread_t of the calling thread, reinterpreted as
+ * a 64-bit integer. pthread_t is already an unsigned long on every
+ * platform this runtime targets, so the reinterpretation is exact.
+ */
 int64_t __jnative_fn_sun_nio_ch_NativeThread_current0___J(void) {
     pthread_t self = pthread_self();
     return (int64_t)(uintptr_t)self;
 }
 
-/* ---------------------------------------------------------------------------
+/*
  * static native void signal(long nativeThread);
  *
- * On HotSpot this writes a specific byte to a self-pipe that the target
- * thread monitors, so that a blocking syscall aborts with EINTR and the
- * NIO layer can re-check the interrupt state. As explained above, this
- * runtime's blocking primitives retry only on EINTR and surface every
- * other errno immediately, so the Java interrupt path is always reached
- * without external wake-up. Delivering SIGUSR1 to an arbitrary thread
- * from within a signal-based runtime that also installs SIGSEGV/SIGBUS
- * handlers would risk unrelated interference, so the correct behaviour
- * is to leave the target thread alone.
- * ------------------------------------------------------------------------- */
+ * On HotSpot this writes a specific byte to a self-pipe that the
+ * target thread monitors, so that a blocking syscall aborts with
+ * EINTR and the NIO layer can re-check the interrupt state. As
+ * explained above, this runtime's blocking primitives retry only on
+ * EINTR and surface every other errno immediately, so the interrupt
+ * path is always reached without external wake-up. Delivering SIGUSR1
+ * to an arbitrary thread from within a signal-based runtime that also
+ * installs SIGSEGV/SIGBUS handlers would risk unrelated interference,
+ * so the correct behaviour is to leave the target thread alone.
+ *
+ * The argument is deliberately unused.
+ */
 void __jnative_fn_sun_nio_ch_NativeThread_signal__J_V(int64_t native_thread) {
     (void)native_thread;
 }
 
-/* ---------------------------------------------------------------------------
+/*
  * static native void signal0(long nativeThread);
  *
  * JDK 17+ name for NativeThread.signal. Same body as the legacy
- * signal(long) symbol above: on HotSpot this writes to a self-pipe that
- * the target thread monitors, so a blocking syscall aborts with EINTR
- * and the NIO layer can re-check the interrupt state. This runtime's
- * blocking primitives retry only on EINTR and surface every other errno
- * immediately, so the interrupt path is reached without external
- * wake-up; the call is a no-op for the same reason as the unsuffixed
- * variant.
+ * signal(long) symbol above. Keeping both symbols in the same file
+ * lets the same C body serve JDK 8 through 22 without conditional
+ * compilation. The JDK 17 rename wave touched this method the same
+ * way it touched Thread.sleep / Thread.start / Thread.interrupt, and
+ * every call site the LLVM backend emits uses whichever spelling the
+ * compiled JDK's class files carry.
  *
- * Keeping both symbols in the same file lets the same C body serve
- * JDK 8 through 22 without conditional compilation. The JDK 17 rename
- * wave touched this method the same way it touched Thread.sleep /
- * Thread.start / Thread.interrupt, and every call site the LLVM backend
- * emits uses whichever spelling the compiled JDK's class files carry.
- * ------------------------------------------------------------------------- */
+ * The body forwards to the legacy variant so there is a single
+ * implementation to update if the policy ever changes.
+ */
 void __jnative_fn_sun_nio_ch_NativeThread_signal0__J_V(int64_t native_thread) {
     __jnative_fn_sun_nio_ch_NativeThread_signal__J_V(native_thread);
 }

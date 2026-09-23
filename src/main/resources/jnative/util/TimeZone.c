@@ -8,26 +8,26 @@
 #include <limits.h>
 #include <sys/stat.h>
 
-extern void* __jnative_make_string_obj(const char* bytes, int32_t len);
-extern const char* __jnative_read_string_bytes(void* s, int32_t* out_len);
+#include "jnative_runtime.h"
 
 /*
  * java.util.TimeZone native methods.
  *
- * The Java layer's TimeZone.setDefaultZone()/getDefaultRef() chain reaches
- * these two natives when the user has not supplied an explicit time zone
- * (via the user.timezone system property or an explicit setDefault call).
- * The reference JDK consults the host OS's configured time zone — either
- * the TZ environment variable, or the /etc/localtime symlink, or the
- * platform's own time-zone database — and returns a canonical ID that the
- * Java layer then resolves through TimeZone.getTimeZone(id).
+ * The Java layer's TimeZone.setDefaultZone() / getDefaultRef() chain
+ * reaches these two natives when the user has not supplied an explicit
+ * time zone (via the user.timezone system property or an explicit
+ * setDefault call). The reference JDK consults the host OS's
+ * configured time zone — either the TZ environment variable, or the
+ * /etc/localtime symlink, or the platform's own time-zone database —
+ * and returns a canonical ID that the Java layer then resolves
+ * through TimeZone.getTimeZone(id).
  *
  * Resolution order (matches the Unix reference implementation):
  *
  *   1. The TZ environment variable. If set and not prefixed with ':',
- *      its value is used verbatim. A leading ':' means "use the file at
- *      the given path", which is not a valid zone ID; we skip it and
- *      fall through to the next source.
+ *      its value is used verbatim. A leading ':' means "use the file
+ *      at the given path", which is not a valid zone ID; we skip it
+ *      and fall through to the next source.
  *
  *   2. /etc/timezone (Debian/Ubuntu). A single line of text naming the
  *      system zone, e.g. "Europe/Warsaw".
@@ -37,35 +37,32 @@ extern const char* __jnative_read_string_bytes(void* s, int32_t* out_len);
  *      component after "zoneinfo/" is the zone ID.
  *
  *   4. A synthesised GMT offset, computed from the local machine's
- *      current UTC offset via localtime_r/tm_gmtoff. The result looks
- *      like "GMT+01:00" or "GMT-05:00", which TimeZone.getTimeZone()
- *      parses into a SimpleTimeZone with the correct offset.
+ *      current UTC offset via localtime_r / tm_gmtoff. The result
+ *      looks like "GMT+01:00" or "GMT-05:00", which
+ *      TimeZone.getTimeZone() parses into a SimpleTimeZone with the
+ *      correct offset.
  *
- * All four paths produce a string the Java layer's TimeZone.getTimeZone()
- * accepts, so the fallback chain never leaves the caller without a valid
- * zone.
+ * All four paths produce a string the Java layer's
+ * TimeZone.getTimeZone() accepts, so the fallback chain never leaves
+ * the caller without a valid zone.
  */
 
-/* --------------------------------------------------------------------------
- * Helper: build a Java String from a NUL-terminated C string.
- * ------------------------------------------------------------------------ */
-static void* make_string(const char* s) {
-    if (s == NULL) return NULL;
-    return __jnative_make_string_obj(s, (int32_t)strlen(s));
-}
-
-/* --------------------------------------------------------------------------
- * Helper: format the current UTC offset as "GMT+HH:MM" / "GMT-HH:MM".
+/*
+ * Format the current UTC offset as "GMT+HH:MM" / "GMT-HH:MM".
  *
  * The offset is read from the kernel on the local machine using
- * localtime_r(), whose tm_gmtoff field holds the number of seconds east
- * of UTC (positive for zones ahead of UTC). We cap the value to the
- * range the Java SimpleTimeZone parser accepts.
+ * localtime_r(), whose tm_gmtoff field holds the number of seconds
+ * east of UTC (positive for zones ahead of UTC). A zero offset is
+ * reported as the canonical "GMT" rather than as "GMT+00:00", matching
+ * the canonical name of the UTC zone and avoiding a needless "+00:00"
+ * suffix in stack traces and log lines.
  *
- * A zero offset is reported as "GMT" rather than "GMT+00:00", matching
- * the canonical name of the UTC zone and avoiding needless "+00:00"
- * suffixes in stack traces and log lines.
- * ------------------------------------------------------------------------ */
+ * On a target whose <time.h> does not expose tm_gmtoff (glibc and
+ * musl do; strictly conforming C does not), the offset is derived from
+ * the difference between localtime_r and gmtime_r instead. Both paths
+ * produce the same value for every time zone that a POSIX system can
+ * be configured with.
+ */
 static void format_gmt_offset(char* buf, size_t buf_size) {
     time_t now = time(NULL);
     struct tm local_tm;
@@ -76,7 +73,6 @@ static void format_gmt_offset(char* buf, size_t buf_size) {
 #if defined(__USE_MISC) || defined(__USE_BSD) || defined(__APPLE__)
         off_sec = (long)local_tm.tm_gmtoff;
 #else
-        /* Portable fallback: derive the offset from gmtime/localtime. */
         struct tm utc_tm;
         memset(&utc_tm, 0, sizeof(utc_tm));
         if (gmtime_r(&now, &utc_tm) != NULL) {
@@ -99,29 +95,42 @@ static void format_gmt_offset(char* buf, size_t buf_size) {
 
     char sign = (off_sec > 0) ? '+' : '-';
     long abs_sec = off_sec < 0 ? -off_sec : off_sec;
-
     long hh = abs_sec / 3600;
     long mm = (abs_sec % 3600) / 60;
 
     snprintf(buf, buf_size, "GMT%c%02ld:%02ld", sign, hh, mm);
 }
 
-/* --------------------------------------------------------------------------
- * Helper: try to resolve the system zone ID from a well-known source.
- * Returns 1 on success (name copied into buf), 0 otherwise.
- * ------------------------------------------------------------------------ */
+/*
+ * Try to resolve the system zone ID from a well-known source. Returns
+ * 1 on success (name copied into buf), 0 otherwise.
+ */
 
-/* 1. The TZ environment variable. */
+/*
+ * 1. The TZ environment variable.
+ *
+ * A leading ':' means "the value is a path to a file in the reference
+ * implementation's format", not a zone ID; that form is skipped so the
+ * caller can fall through to the next source. An empty TZ is likewise
+ * treated as "not set", matching the reference implementation.
+ */
 static int try_tz_env(char* buf, size_t buf_size) {
     const char* tz = getenv("TZ");
     if (tz == NULL || tz[0] == '\0') return 0;
-    if (tz[0] == ':') return 0;      /* POSIX path form, not a zone ID */
+    if (tz[0] == ':') return 0;
     if (strlen(tz) >= buf_size) return 0;
     strcpy(buf, tz);
     return 1;
 }
 
-/* 2. /etc/timezone — a single line of text. */
+/*
+ * 2. /etc/timezone — a single line of text naming the system zone.
+ *
+ * Used by Debian, Ubuntu, and their derivatives. The file is written by
+ * dpkg's tzdata postinst and contains exactly one line; trailing
+ * whitespace is stripped so the ID that reaches the Java layer has no
+ * stray control characters.
+ */
 static int try_etc_timezone(char* buf, size_t buf_size) {
     FILE* f = fopen("/etc/timezone", "r");
     if (f == NULL) return 0;
@@ -129,7 +138,6 @@ static int try_etc_timezone(char* buf, size_t buf_size) {
     char line[256];
     int got = 0;
     if (fgets(line, sizeof(line), f) != NULL) {
-        /* Strip trailing newline / whitespace. */
         size_t n = strlen(line);
         while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r'
                       || line[n - 1] == ' '  || line[n - 1] == '\t')) {
@@ -144,7 +152,19 @@ static int try_etc_timezone(char* buf, size_t buf_size) {
     return got;
 }
 
-/* 3. /etc/localtime — usually a symlink into /usr/share/zoneinfo/. */
+/*
+ * 3. The /etc/localtime symlink.
+ *
+ * On most distributions this is a symlink into
+ * /usr/share/zoneinfo/<Zone>/<Subzone>. The trailing component after
+ * "/zoneinfo/" is the zone ID, and it is exactly the string that the
+ * Java layer's TimeZone.getTimeZone() accepts.
+ *
+ * A regular-file /etc/localtime (which some hand-configured systems
+ * use to avoid depending on the zoneinfo tree) is not a symlink and
+ * therefore yields no ID; the caller falls through to the GMT-offset
+ * synthesiser below, which produces a valid zone for any offset.
+ */
 static int try_localtime_symlink(char* buf, size_t buf_size) {
     char target[PATH_MAX];
     ssize_t n = readlink("/etc/localtime", target, sizeof(target) - 1);
@@ -162,7 +182,7 @@ static int try_localtime_symlink(char* buf, size_t buf_size) {
     return 1;
 }
 
-/* --------------------------------------------------------------------------
+/*
  * static native String getSystemTimeZoneID(String javaHome);
  *
  * Returns the canonical zone ID of the host system's configured time
@@ -171,7 +191,7 @@ static int try_localtime_symlink(char* buf, size_t buf_size) {
  * runtime reads the OS's own configuration directly and does not need
  * the argument, but the symbol must accept it because the Java caller
  * passes it unconditionally.
- * ------------------------------------------------------------------------ */
+ */
 void* __jnative_fn_java_util_TimeZone_getSystemTimeZoneID__Ljava_lang_String__Ljava_lang_String_(
         void* java_home_str)
 {
@@ -179,34 +199,37 @@ void* __jnative_fn_java_util_TimeZone_getSystemTimeZoneID__Ljava_lang_String__Lj
 
     char buf[256];
 
-    if (try_tz_env(buf, sizeof(buf)))            return make_string(buf);
-    if (try_etc_timezone(buf, sizeof(buf)))      return make_string(buf);
-    if (try_localtime_symlink(buf, sizeof(buf))) return make_string(buf);
+    if (try_tz_env(buf, sizeof(buf)))            return jnative_string(buf);
+    if (try_etc_timezone(buf, sizeof(buf)))      return jnative_string(buf);
+    if (try_localtime_symlink(buf, sizeof(buf))) return jnative_string(buf);
 
-    /* Fallback: synthesise a GMT offset from the machine's current UTC
+    /*
+     * Fallback: synthesise a GMT offset from the machine's current UTC
      * offset. The Java layer's TimeZone.getTimeZone() parses this form
      * into a SimpleTimeZone with the matching offset, so the caller
-     * always ends up with a usable TimeZone. */
+     * always ends up with a usable TimeZone.
+     */
     format_gmt_offset(buf, sizeof(buf));
-    return make_string(buf);
+    return jnative_string(buf);
 }
 
-/* --------------------------------------------------------------------------
+/*
  * static native String getSystemGMTOffsetID();
  *
- * Returns a synthesised zone ID of the form "GMT[+-]HH:MM" that reflects
- * the local machine's current UTC offset. The Java caller uses this when
- * the canonical ID returned by getSystemTimeZoneID() is null or cannot
- * be resolved — the offset form is always parseable and never fails.
+ * Returns a synthesised zone ID of the form "GMT[+-]HH:MM" that
+ * reflects the local machine's current UTC offset. The Java caller
+ * uses this when the canonical ID returned by getSystemTimeZoneID()
+ * is null or cannot be resolved — the offset form is always parseable
+ * and never fails.
  *
  * The value is recomputed on every call rather than cached, matching
  * the reference implementation: DST transitions change the offset, and
  * the Java layer is free to call this after such a transition has
  * occurred.
- * ------------------------------------------------------------------------ */
+ */
 void* __jnative_fn_java_util_TimeZone_getSystemGMTOffsetID___Ljava_lang_String_(void)
 {
     char buf[32];
     format_gmt_offset(buf, sizeof(buf));
-    return make_string(buf);
+    return jnative_string(buf);
 }

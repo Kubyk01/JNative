@@ -3,6 +3,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#include "jnative_runtime.h"
+
 /* The traditional fallback range, matching the reference implementation. */
 #define PORT_CONFIG_DEFAULT_LOWER 32768
 #define PORT_CONFIG_DEFAULT_UPPER 65535
@@ -23,12 +25,6 @@ static int read_port_range(int32_t* lower, int32_t* upper) {
     int matched = fscanf(f, "%ld %ld", &lo, &hi);
     fclose(f);
 
-    /* Reject anything that is not exactly two integers, or that falls
-     * outside the valid TCP/UDP port range. A port number is 0..65535;
-     * the ephemeral range is further constrained to non-zero ports by
-     * the kernel, but a zero lower bound is technically observable in
-     * some configurations and is not by itself grounds for rejection.
-     */
     if (matched != 2
         || lo < 0 || lo > 65535
         || hi < 0 || hi > 65535
@@ -43,13 +39,18 @@ static int read_port_range(int32_t* lower, int32_t* upper) {
     return 1;
 }
 
-/* --------------------------------------------------------------------------
+/*
  * private static native int getLower0();
  *
  * Returns the lowest ephemeral port number the kernel will assign to a
  * socket that binds without specifying a port. Called from
  * PortConfig.<clinit> and cached in the class's static `lower` field.
- * ------------------------------------------------------------------------ */
+ *
+ * The `read_port_range` helper is called with two locals so that a
+ * caller that only wants one of the two bounds does not have to pay
+ * for a second native; both bounds are computed from the same file
+ * read regardless of which getter triggered it.
+ */
 int32_t __jnative_fn_sun_net_PortConfig_getLower0___I(void) {
     int32_t lower = PORT_CONFIG_DEFAULT_LOWER;
     int32_t upper = PORT_CONFIG_DEFAULT_UPPER;
@@ -57,13 +58,16 @@ int32_t __jnative_fn_sun_net_PortConfig_getLower0___I(void) {
     return lower;
 }
 
-/* --------------------------------------------------------------------------
+/*
  * private static native int getUpper0();
  *
- * Returns the highest ephemeral port number the kernel will assign to a
- * socket that binds without specifying a port. Called from
+ * Returns the highest ephemeral port number the kernel will assign to
+ * a socket that binds without specifying a port. Called from
  * PortConfig.<clinit> and cached in the class's static `upper` field.
- * ------------------------------------------------------------------------ */
+ *
+ * Same structure as getLower0 above: the two bounds are read together
+ * from the same procfs entry, and only the requested one is returned.
+ */
 int32_t __jnative_fn_sun_net_PortConfig_getUpper0___I(void) {
     int32_t lower = PORT_CONFIG_DEFAULT_LOWER;
     int32_t upper = PORT_CONFIG_DEFAULT_UPPER;

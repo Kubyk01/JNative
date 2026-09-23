@@ -21,4 +21,5 @@ public class MethodNode {
     private boolean isNative;
     private boolean isStatic;
     private boolean isPolymorphicSignature;
+    private boolean callerSensitive;
 }

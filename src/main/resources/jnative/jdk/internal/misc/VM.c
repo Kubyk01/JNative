@@ -1,6 +1,7 @@
 #include <stdint.h>
 #include <time.h>
 
+#include "jnative_runtime.h"
 /*
  * Returns the current wall-clock time in nanoseconds minus offset_sec*1e9.
  *

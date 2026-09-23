@@ -59,8 +59,34 @@ public class DestructorSimplifier {
     }
 
     private void eliminateDeadDestructors() {
+        // Sound over-approximation of "everything that might be needed at
+        // runtime": walk every function in the module and collect the set of
+        // destructors that appear as a STATIC_CALL callee anywhere. This
+        // includes __jnative_shutdown, which is registered with atexit and
+        // is therefore always live, and any user function that directly
+        // calls a destructor.
+        //
+        // The previous implementation seeded the walk only from
+        // lifetimeResult.getDestructionPoints() and from __jnative_shutdown.
+        // That missed destructors that are reachable only from
+        // __jnative_shutdown's guarded branches (which is the normal case
+        // when a static field's points-to set has no corresponding entry in
+        // the lifetime analysis). The result was that a referenced
+        // destructor was removed from the module while its call site
+        // remained in the emitted IR, and LLVM rejected the module with
+        // "use of undefined value '@__destruct_...'".
         Set<Function> called = new LinkedHashSet<>();
 
+        for (Function func : new ArrayList<>(module.getFunctions())) {
+            if (func.getEntryBlock() == null) continue;
+            collectCalls(func, called);
+        }
+
+        // Also walk from destruction points. Those are the sites where
+        // DestructorInserter will insert calls at analysis time, and they
+        // may reference destructors whose bodies the module-wide walk above
+        // has not yet seen (e.g. a destructor whose body was rebuilt by
+        // retranslateClinit and whose callers are not yet in the module).
         for (Map.Entry<AllocationSite, Set<DestructionPoint>> entry
             : lifetimeResult.getDestructionPoints().entrySet()) {
             Type type = entry.getKey().getType();
@@ -70,17 +96,17 @@ public class DestructorSimplifier {
             }
         }
 
-        Function shutdown = module.getFunction("__jnative_shutdown");
-        if (shutdown != null) {
-            collectCalls(shutdown, called);
-        }
-
-        // Remove destructors that are never called.
+        // Remove only functions that no surviving call site references, and
+        // remove them through Module.removeFunction so that both the list
+        // and the name->function map stay in sync. Removing only from the
+        // list (the previous behaviour) left the deleted function resolvable
+        // via Module.getFunction(name), which allowed a later pass to
+        // resurrect it into the IR while its body was no longer emitted.
         Set<Function> dead = new HashSet<>(destructors);
         dead.removeAll(called);
         for (Function func : dead) {
             log.debug("Removing dead destructor: {}", func.getName());
-            module.getFunctions().remove(func);
+            module.removeFunction(func);
             destructors.remove(func);
         }
     }

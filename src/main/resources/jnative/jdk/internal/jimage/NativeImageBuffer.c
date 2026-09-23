@@ -2,6 +2,8 @@
 #include <stdint.h>
 #include <stddef.h>
 
+#include "jnative_runtime.h"
+
 /*
  * jdk.internal.jimage.NativeImageBuffer
  *

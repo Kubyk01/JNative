@@ -4,7 +4,6 @@ import lombok.EqualsAndHashCode;
 import lombok.Getter;
 
 @Getter
-@EqualsAndHashCode
 public abstract class Type {
     public static final PrimitiveType VOID    = new PrimitiveType("void");
     public static final PrimitiveType BOOLEAN = new PrimitiveType("boolean");
@@ -80,15 +79,31 @@ public abstract class Type {
     @Override public String toString() { return kind.name(); }
 
     // ---- Nested classes ----
+
+    @Getter
+    @EqualsAndHashCode(callSuper = false)
     public static class PrimitiveType extends Type {
         private final String name;
-        private PrimitiveType(String name) { super(TypeKind.PRIMITIVE); this.name = name; }
+        private PrimitiveType(String name) {
+            super(TypeKind.PRIMITIVE);
+            this.name = name;
+        }
+
         @Override public String toString() { return name; }
     }
 
+    // ------------------------------------------------------------------
+    // ReferenceType — equality by class name. The previous Lombok default
+    // on the base class made every reference type equal to every other
+    // reference type (both have kind == REFERENCE).
+    // ------------------------------------------------------------------
+    @EqualsAndHashCode(callSuper = false)
     public static class ReferenceType extends Type {
         private final String className;
-        private ReferenceType(String className) { super(TypeKind.REFERENCE); this.className = className; }
+        private ReferenceType(String className) {
+            super(TypeKind.REFERENCE);
+            this.className = className;
+        }
         @Override public String getClassName() { return className; }
         @Override public String toString() { return "ref(" + className + ")"; }
 
@@ -97,9 +112,16 @@ public abstract class Type {
         }
     }
 
+    // ------------------------------------------------------------------
+    // ArrayType — equality by element type. Same rationale as above.
+    // ------------------------------------------------------------------
+    @EqualsAndHashCode(callSuper = false)
     public static class ArrayType extends Type {
         private final Type elementType;
-        private ArrayType(Type elementType) { super(TypeKind.ARRAY); this.elementType = elementType; }
+        private ArrayType(Type elementType) {
+            super(TypeKind.ARRAY);
+            this.elementType = elementType;
+        }
         @Override public Type getElementType() { return elementType; }
         @Override public String toString() { return "array[" + elementType + "]"; }
 
@@ -118,16 +140,24 @@ public abstract class Type {
         }
     }
 
+    // ------------------------------------------------------------------
+    // The three sentinel types are singletons; equality reduces to
+    // identity, but Lombok generates a matching equals/hashCode so that
+    // they behave consistently with the rest of the hierarchy.
+    // ------------------------------------------------------------------
+    @EqualsAndHashCode(callSuper = false)
     public static class NullType extends Type {
         private NullType() { super(TypeKind.NULL); }
         @Override public String toString() { return "null"; }
     }
 
+    @EqualsAndHashCode(callSuper = false)
     public static class BlockType extends Type {
         private BlockType() { super(TypeKind.BLOCK); }
         @Override public String toString() { return "block"; }
     }
 
+    @EqualsAndHashCode(callSuper = false)
     public static class UnknownType extends Type {
         private UnknownType() { super(TypeKind.UNKNOWN); }
         @Override public String toString() { return "unknown"; }

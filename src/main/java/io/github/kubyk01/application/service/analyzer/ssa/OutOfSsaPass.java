@@ -99,6 +99,19 @@ public final class OutOfSsaPass {
             List<BasicBlock> preds = parent.getPredecessors();
             List<Value> operands = phi.getOperands();
 
+            // The PHI's result type is the declared type of the slot that
+            // this PHI is being lowered into. Every store into that slot
+            // must use the same width as every load from it, so all of
+            // the stores below carry the PHI's type — not the individual
+            // incoming operand's type. Without this, an incoming operand
+            // that carries a narrow type (an i8 BALOAD result, an i1
+            // comparison, …) would produce a `store i8` into a slot that
+            // the loop-header load reads back as `load i32`, which is the
+            // exact width mismatch this pass must avoid.
+            Type slotType = (phi.getResult() != null)
+                ? phi.getResult().getType()
+                : Type.UNKNOWN;
+
             for (int i = 0; i < preds.size(); i++) {
                 BasicBlock pred = preds.get(i);
                 Value val = (i < operands.size()) ? operands.get(i) : null;
@@ -109,7 +122,7 @@ public final class OutOfSsaPass {
                 Instruction store = new Instruction(Opcode.STORE);
                 store.addOperand(val);
                 store.setLocalIndex(slot);
-                Temporary storeResult = new Temporary(val.getType());
+                Temporary storeResult = new Temporary(slotType);
                 store.setResult(storeResult);
                 storeResult.setDefiningInstruction(store);
                 store.setParent(pred);

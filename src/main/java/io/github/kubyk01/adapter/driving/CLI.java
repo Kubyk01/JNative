@@ -4,8 +4,8 @@ import io.github.kubyk01.domain.inspector.ClassInfo;
 import io.github.kubyk01.domain.inspector.FieldInfo;
 import io.github.kubyk01.domain.inspector.InspectionResult;
 import io.github.kubyk01.domain.inspector.MethodInfo;
-import io.github.kubyk01.port.primary.AnalyzerPort;
 import io.github.kubyk01.port.primary.InspectorPort;
+import io.github.kubyk01.port.primary.OrchestratorPort;
 import lombok.AllArgsConstructor;
 import picocli.CommandLine;
 import picocli.CommandLine.Command;
@@ -23,7 +23,7 @@ import java.util.jar.Manifest;
 public class CLI implements Runnable {
 
     private final InspectorPort inspector;
-    private final AnalyzerPort analyzer;
+    private final OrchestratorPort orchestrator;
 
     @Override
     public void run() {
@@ -34,7 +34,8 @@ public class CLI implements Runnable {
     @Command(name = "inspect", description = "Inspect a JAR or CLASS file")
     public void inspect(
         @CommandLine.Parameters(index = "0", description = "Path to JAR or CLASS file") File file,
-        @CommandLine.Option(names = "--bytecode", description = "Show bytecode instructions") boolean showBytecode) {
+        @CommandLine.Option(names = "--bytecode", description = "Show bytecode instructions")
+        boolean showBytecode) {
         Path path = file.toPath();
         String fileName = path.getFileName().toString().toLowerCase();
         Mono<InspectionResult> resultMono;
@@ -92,31 +93,54 @@ public class CLI implements Runnable {
 
     @Command(name = "analyze", description = "Perform dependency resolution and reachability analysis")
     public void analyze(
-        @CommandLine.Parameters(index = "0", description = "Path to JAR or directory containing .class files") File file,
-        @CommandLine.Option(names = "--entry", description = "Entry point class (fully qualified)") String entryClass,
-        @CommandLine.Option(names = "--method", description = "Entry method name", defaultValue = "main") String entryMethod,
-        @CommandLine.Option(names = "--descriptor", description = "Method descriptor", defaultValue = "([Ljava/lang/String;)V") String descriptor,
-        @CommandLine.Option(names = "--classes", description = "Show user classes and methods") boolean showClasses,
-        @CommandLine.Option(names = "--alias", description = "Show alias analysis") boolean showAlias,
-        @CommandLine.Option(names = "--escape", description = "Show escape analysis") boolean showEscape,
-        @CommandLine.Option(names = "--lifetime", description = "Show lifetime analysis") boolean showLifetime,
-        @CommandLine.Option(names = "--destructor", description = "Show destructor insertion") boolean showDestructor,
-        @CommandLine.Option(names = "--all", description = "Show all analysis stages (default if none specified)") boolean showAll,
-        @CommandLine.Option(names = "--output", description = "Output executable file name (default: a.out)") String outputFile,
-        @CommandLine.Option(names = "--no-compile", description = "Do not compile to native executable") boolean noCompile,
-        @CommandLine.Option(names = "--include-system", description = "Include system/library classes in output") boolean includeSystem,
-        @CommandLine.Option(names = "--debug-name", description = "Debug only this class or method (shows only matching items)") String debugName,
-        @CommandLine.Option(names = "--classes-graph", description = "Show call graph from entry point") boolean showClassesGraph) {
+        @CommandLine.Parameters(index = "0",
+            description = "Path to JAR or directory containing .class files") File file,
+        @CommandLine.Option(names = "--entry",
+            description = "Entry point class (fully qualified)") String entryClass,
+        @CommandLine.Option(names = "--method",
+            description = "Entry method name", defaultValue = "main") String entryMethod,
+        @CommandLine.Option(names = "--descriptor",
+            description = "Method descriptor",
+            defaultValue = "([Ljava/lang/String;)V") String descriptor,
+        @CommandLine.Option(names = "--classes",
+            description = "Show user classes and methods") boolean showClasses,
+        @CommandLine.Option(names = "--alias",
+            description = "Show alias analysis") boolean showAlias,
+        @CommandLine.Option(names = "--escape",
+            description = "Show escape analysis") boolean showEscape,
+        @CommandLine.Option(names = "--lifetime",
+            description = "Show lifetime analysis") boolean showLifetime,
+        @CommandLine.Option(names = "--destructor",
+            description = "Show destructor insertion") boolean showDestructor,
+        @CommandLine.Option(names = "--all",
+            description = "Show all analysis stages (default if none specified)")
+        boolean showAll,
+        @CommandLine.Option(names = "--output",
+            description = "Output executable file name (default: a.out)") String outputFile,
+        @CommandLine.Option(names = "--no-compile",
+            description = "Do not compile to native executable") boolean noCompile,
+        @CommandLine.Option(names = "--include-system",
+            description = "Include system/library classes in output") boolean includeSystem,
+        @CommandLine.Option(names = "--debug-name",
+            description = "Debug only this class or method (shows only matching items)")
+        String debugName,
+        @CommandLine.Option(names = "--classes-graph",
+            description = "Show call graph from entry point") boolean showClassesGraph,
+        @CommandLine.Option(names = "--cores",
+            description = "Maximum number of CPU cores this run may use. "
+                + "A value of 0 (the default) means: use every core "
+                + "reported by Runtime.getRuntime().availableProcessors().")
+        int cores) {
 
-        // If entryClass is not provided, try to read from JAR manifest
-        if (entryClass == null && file.isFile() && file.getName().toLowerCase().endsWith(".jar")) {
+        if (entryClass == null && file.isFile()
+            && file.getName().toLowerCase().endsWith(".jar")) {
             try (JarFile jar = new JarFile(file)) {
                 Manifest manifest = jar.getManifest();
                 if (manifest != null) {
                     Attributes mainAttrs = manifest.getMainAttributes();
                     String mainClass = mainAttrs.getValue("Main-Class");
                     if (mainClass != null && !mainClass.isEmpty()) {
-                        entryClass = mainClass.replace('.', '/'); // convert to internal format
+                        entryClass = mainClass.replace('.', '/');
                     }
                 }
             } catch (IOException e) {
@@ -125,12 +149,13 @@ public class CLI implements Runnable {
         }
 
         if (entryClass == null) {
-            System.err.println("Error: entry class not specified and could not be determined from manifest.");
+            System.err.println(
+                "Error: entry class not specified and could not be determined from manifest.");
             return;
         }
 
-        // If no flag is given, show everything (including classes)
-        boolean anyFlag = showClasses || showAlias || showEscape || showLifetime || showDestructor || showClassesGraph || showAll;
+        boolean anyFlag = showClasses || showAlias || showEscape || showLifetime
+            || showDestructor || showClassesGraph || showAll;
         if (!anyFlag) {
             showClasses = showAlias = showEscape = showLifetime = showDestructor = true;
         } else if (showAll) {
@@ -138,8 +163,9 @@ public class CLI implements Runnable {
         }
 
         Path path = file.toPath();
-        analyzer.analyze(path, entryClass, entryMethod, descriptor,
+        orchestrator.analyze(path, entryClass, entryMethod, descriptor,
             showClasses, showAlias, showEscape, showLifetime, showDestructor,
-            outputFile, noCompile, includeSystem, debugName, showClassesGraph);
+            outputFile, noCompile, includeSystem, debugName, showClassesGraph,
+            cores);
     }
 }

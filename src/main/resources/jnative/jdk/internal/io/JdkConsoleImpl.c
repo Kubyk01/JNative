@@ -4,6 +4,8 @@
 #include <termios.h>
 #include <errno.h>
 
+#include "jnative_runtime.h"
+
 /*
  * jdk.internal.io.JdkConsoleImpl — the native support behind
  * java.io.Console's password-prompt machinery.

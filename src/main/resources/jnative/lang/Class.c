@@ -5,18 +5,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <dlfcn.h>
-
-struct ReflectionClass {
-    void* vtable;
-    void* name;
-    struct ReflectionClass* superclass;
-    struct ReflectionClass** interfaces;
-    void** methods;
-    void** fields;
-    void** constructors;
-    int modifiers;
-    int object_size;
-};
+#include "jnative_runtime.h"
 
 extern struct ReflectionClass* reflect_all_classes[];
 extern int __jnative_instanceof(void* obj, void** type_info);
@@ -24,37 +13,55 @@ extern int __jnative_instanceof(void* obj, void** type_info);
 extern void* __jnative_make_string_obj(const char* bytes, int32_t len);
 extern const char* __jnative_read_string_bytes(void* s, int32_t* out_len);
 
-__attribute__((noreturn)) void __jnative_throw_exception(void* exc);
-__attribute__((noreturn)) void __jnative_throw_null_pointer_exception(void);
-
-/* Java array layout: [int32 length][payload] */
-#define JAVA_ARR_HDR 8
-
 /* --------------------------------------------------------------------------
  * Small helpers
  * ------------------------------------------------------------------------ */
 
+/*
+ * Class[] from a NULL-terminated mirror-pointer array. Routed through
+ * jnative_ref_array_of_class() so the result carries a real klass mirror
+ * and Class.getInterfaces()[i].getClass() resolves to java.lang.Class.
+ */
 static void* make_class_array(struct ReflectionClass** ptrs) {
     int count = 0;
     if (ptrs != NULL) {
         while (ptrs[count] != NULL) count++;
     }
-    size_t total = JAVA_ARR_HDR + (size_t)count * sizeof(void*);
-    void* arr = malloc(total);
-    if (arr == NULL) return NULL;
-    *(int32_t*)arr = count;
-    void** slots = (void**)((char*)arr + JAVA_ARR_HDR);
-    for (int i = 0; i < count; i++) {
-        slots[i] = (void*)ptrs[i];
-    }
-    return arr;
+    return jnative_ref_array_of_class((void**)ptrs, count,
+                                      "[Ljava/lang/Class;");
 }
 
-static void* make_empty_ref_array(void) {
-    void* arr = malloc(JAVA_ARR_HDR);
-    if (arr == NULL) return NULL;
-    *(int32_t*)arr = 0;
-    return arr;
+/*
+ * Empty [Ljava/lang/Class; array.
+ *
+ * Used as the fallback for any reflect-mirror slot that must present a
+ * non-null Class[] to the Java layer: Method.parameterTypes,
+ * Method.exceptionTypes, Constructor.parameterTypes,
+ * Constructor.exceptionTypes.
+ *
+ * Every java.lang.reflect.Executable consumer — sharedToString,
+ * toGenericString, getParameterTypes, getExceptionTypes, the access-check
+ * diagnostics in sun.invoke.util.VerifyAccess, Method.copy — iterates
+ * at least one of those arrays without a null check. A null slot turns
+ * the very first reflective toString into the
+ *
+ *     java.lang.NullPointerException: Cannot invoke
+ *     java.lang.reflect.Executable.sharedToString(...) because <array>
+ *     is null
+ *
+ * that aborted MethodHandleImpl$CountingWrapper.<clinit> during the
+ * VarHandle bootstrap. An empty array is indistinguishable from
+ * `new Class[0]`, so every consumer behaves as if the executable
+ * genuinely declared no parameters / no thrown exceptions.
+ *
+ * The array comes from jnative_ref_array_of_class() so it carries the
+ * standard runtime array header — the [Ljava/lang/Class; class mirror
+ * at JAVA_ARR_KLASS_OFFSET, length 0, elem_size 8 — which is exactly
+ * what the LLVM emitter would have produced for a NEW_ARRAY of the
+ * same descriptor.
+ */
+static void* empty_param_types_array(void) {
+    return jnative_ref_array_of_class(NULL, 0, "[Ljava/lang/Class;");
 }
 
 static struct ReflectionClass* find_registered_class(const char* name) {
@@ -62,7 +69,7 @@ static struct ReflectionClass* find_registered_class(const char* name) {
     struct ReflectionClass** pp = reflect_all_classes;
     while (*pp) {
         struct ReflectionClass* c = *pp;
-        const char* n = (const char*)c->name;
+        const char* n = c->cname;
         if (n && strcmp(n, name) == 0) return c;
         pp++;
     }
@@ -105,18 +112,21 @@ static int class_implements_interface(struct ReflectionClass* cls,
 }
 
 static char* build_type_info_symbol(const char* class_name) {
+    /*
+     * Delegates to the shared sanitizer in jnative_runtime.h so this file
+     * and __jnative_own_class_vtable() cannot drift apart from the
+     * Java-side LlvmTypeMapper.sanitizeIdentifier rule. The old local loop
+     * only folded '/' and '.', which missed the emitted @__type_info__B
+     * for the array descriptor "[B".
+     */
     static char buf[512];
-    if (!class_name) { buf[0] = '\0'; return buf; }
-    snprintf(buf, sizeof(buf), "__type_info_%s", class_name);
-    for (char* p = buf; *p; p++) {
-        if (*p == '/' || *p == '.') *p = '_';
-    }
+    jnative_type_info_name(class_name, buf, sizeof(buf));
     return buf;
 }
 
 static void** lookup_type_info(struct ReflectionClass* cls) {
-    if (!cls || !cls->name) return NULL;
-    const char* symbol = build_type_info_symbol((const char*)cls->name);
+    if (!cls || !cls->cname) return NULL;
+    const char* symbol = build_type_info_symbol(cls->cname);
     void* handle = dlopen(NULL, RTLD_LAZY);
     if (!handle) return NULL;
     void** type_info = (void**)dlsym(handle, symbol);
@@ -139,6 +149,299 @@ static void* allocate_reflection_object(struct ReflectionClass* cls) {
     }
     *(void**)obj = type_info[0];
     return obj;
+}
+
+/* ========================================================================
+ *  Reflection object construction
+ * ======================================================================== */
+
+/*
+ * Convert a JVM type descriptor into a registered Class mirror.
+ *
+ * Handles reference ("L...;"), array ("[...") and primitive ("I", "J",
+ * ...) descriptors. Returns NULL when the corresponding mirror is not
+ * present in reflect_all_classes[] — the caller treats that as "the
+ * type is not part of this image", which is the truthful answer for a
+ * reachability analysis that never pulled the type in.
+ */
+static ReflectionClass* descriptor_to_class_mirror(const char* desc)
+{
+    if (desc == NULL || desc[0] == '\0') return NULL;
+
+    if (desc[0] == 'L') {
+        size_t n = strlen(desc);
+        if (n < 3 || desc[n - 1] != ';') return NULL;
+        char buf[512];
+        if (n - 2 >= sizeof(buf)) return NULL;
+        memcpy(buf, desc + 1, n - 2);
+        buf[n - 2] = '\0';
+        return jnative_class_by_name(buf);
+    }
+
+    if (desc[0] == '[') {
+        return jnative_class_by_name(desc);
+    }
+
+    if (desc[1] == '\0') {
+        const char* prim = NULL;
+        switch (desc[0]) {
+            case 'Z': prim = "boolean"; break;
+            case 'B': prim = "byte";    break;
+            case 'S': prim = "short";   break;
+            case 'C': prim = "char";    break;
+            case 'I': prim = "int";     break;
+            case 'J': prim = "long";    break;
+            case 'F': prim = "float";   break;
+            case 'D': prim = "double";  break;
+            case 'V': prim = "void";    break;
+        }
+        if (prim != NULL) return jnative_class_by_name(prim);
+    }
+
+    return NULL;
+}
+
+/*
+ * Advance a descriptor cursor past exactly one type descriptor. Returns
+ * the new position, or -1 on a malformed descriptor. Shared by the
+ * counting pass and the filling pass of build_parameter_types_array() so
+ * the two can never disagree about how many slots a descriptor needs.
+ */
+static int descriptor_element_end(const char* desc, int i)
+{
+    if (desc[i] == '\0') return -1;
+
+    while (desc[i] == '[') {
+        i++;
+        if (desc[i] == '\0') return -1;
+    }
+
+    if (desc[i] == 'L') {
+        const char* semi = strchr(desc + i, ';');
+        if (semi == NULL) return -1;
+        return (int)(semi - desc) + 1;
+    }
+
+    return i + 1;
+}
+
+/*
+ * Build a Class[] from a JVM method descriptor's parameter list.
+ *
+ * The descriptor arrives as "(<params>)<ret>"; only the parameter
+ * section is consumed. Each parameter is turned into a Class mirror via
+ * descriptor_to_class_mirror(); a parameter whose mirror is not
+ * registered lands as NULL in the array, which is the documented "type
+ * unavailable" value that Class[] consumers already handle.
+ *
+ * Returns NULL if the descriptor is NULL, empty, or does not begin with
+ * '('. Callers that must hand a non-null array to Java code (see
+ * create_method_mirror / create_constructor_mirror) substitute
+ * empty_param_types_array() in that case.
+ */
+static void* build_parameter_types_array(const char* desc)
+{
+    if (desc == NULL || desc[0] != '(') return NULL;
+
+    int32_t count = 0;
+    int i = 1;
+    while (desc[i] != '\0' && desc[i] != ')') {
+        int next = descriptor_element_end(desc, i);
+        if (next < 0) break;
+        i = next;
+        count++;
+    }
+
+    void* array = jnative_ref_array_of_class(NULL, count,
+                                             "[Ljava/lang/Class;");
+    if (array == NULL) return NULL;
+
+    void** slots = (void**)((char*)array + JAVA_ARR_HDR);
+
+    int32_t idx = 0;
+    i = 1;
+    while (desc[i] != '\0' && desc[i] != ')' && idx < count) {
+        int next = descriptor_element_end(desc, i);
+        if (next < 0) break;
+
+        size_t len = (size_t)(desc + next - (desc + i));
+        if (len > 0 && len < 512) {
+            char buf[512];
+            memcpy(buf, desc + i, len);
+            buf[len] = '\0';
+            slots[idx] = descriptor_to_class_mirror(buf);
+        }
+        i = next;
+        idx++;
+    }
+
+    return array;
+}
+
+/*
+ * Build a java.lang.reflect.Field from a native ReflectionField
+ * descriptor. Every JDK-observable field of the mirror is populated:
+ * declaring class, name (as a Java String), type (as a Class mirror),
+ * modifiers, and the slot that Unsafe's objectFieldOffset reads.
+ *
+ * `slot` is what @reffield_<class>_<name> carries, i.e. exactly what
+ * LlvmGlobalEmitter.getFieldOffset() computed for this field, so
+ * Unsafe.objectFieldOffset(Field) hands the JDK back the same value
+ * Unsafe.objectFieldOffset(Class,String) would.
+ *
+ * The `type` slot is never left null. Field.toString() calls
+ * getType().getTypeName() without a null check, so a null there turns
+ * the first reflective stringification into an NPE. When the declared
+ * descriptor is missing or its class mirror is not registered, the
+ * slot falls back to java/lang/Object — the widest reference type —
+ * which is always present in the reflection table and always renders
+ * as "java.lang.Object" through Type.getTypeName().
+ */
+static void* create_field_mirror(ReflectionClass* declaring_cls,
+                                 ReflectionField* rf)
+{
+    if (declaring_cls == NULL || rf == NULL) return NULL;
+
+    ReflectionClass* field_cls =
+        jnative_class_by_name("java/lang/reflect/Field");
+    if (field_cls == NULL) return NULL;
+
+    void* field = jnative_alloc_object(field_cls);
+    if (field == NULL) return NULL;
+
+    const char* name = (const char*)rf->name;
+    void* name_str = (name != NULL)
+        ? __jnative_make_string_obj(name, (int32_t)strlen(name))
+        : NULL;
+
+    const char* desc = (const char*)rf->descriptor;
+    ReflectionClass* type_cls =
+        (desc != NULL && desc[0] != '\0')
+            ? descriptor_to_class_mirror(desc)
+            : NULL;
+    if (type_cls == NULL) {
+        type_cls = jnative_class_by_name("java/lang/Object");
+    }
+
+    *(void**)((char*)field + JNATIVE_FIELD_CLAZZ_OFFSET)       = declaring_cls;
+    *(int32_t*)((char*)field + JNATIVE_FIELD_SLOT_OFFSET)      = rf->offset;
+    *(void**)((char*)field + JNATIVE_FIELD_NAME_OFFSET)        = name_str;
+    *(void**)((char*)field + JNATIVE_FIELD_TYPE_OFFSET)        = type_cls;
+    *(int32_t*)((char*)field + JNATIVE_FIELD_MODIFIERS_OFFSET) = rf->modifiers;
+
+    return field;
+}
+
+/*
+ * Build a java.lang.reflect.Method from a native ReflectionMethod
+ * descriptor.
+ *
+ * Both parameterTypes and exceptionTypes are emitted as non-null arrays.
+ * Executable.sharedToString — the method behind Method.toString and every
+ * reflective access-check diagnostic — iterates exceptionTypes without a
+ * null test:
+ *
+ *     if (exceptionTypes.length > 0) { ... }
+ *
+ * and a null slot there produces the exact "Cannot invoke
+ * Executable.sharedToString because <array> is null" NPE that aborted
+ * MethodHandleImpl$CountingWrapper.<clinit>. The same is true for
+ * parameterTypes. Empty Class[] arrays are indistinguishable from
+ * `new Class[0]` on the Java side, so they are the correct "no data"
+ * value for both slots.
+ *
+ * The array is populated with mirrors of the method's declared
+ * parameters via build_parameter_types_array(); a parameter whose mirror
+ * is not registered lands as NULL in the array, which is the documented
+ * "type unavailable" value that Class[] consumers already handle.
+ */
+static void* create_method_mirror(ReflectionClass* declaring_cls,
+                                  ReflectionMethod* rm)
+{
+    if (declaring_cls == NULL || rm == NULL) return NULL;
+
+    ReflectionClass* method_cls =
+        jnative_class_by_name("java/lang/reflect/Method");
+    if (method_cls == NULL) return NULL;
+
+    void* method = jnative_alloc_object(method_cls);
+    if (method == NULL) return NULL;
+
+    const char* name = (const char*)rm->name;
+    const char* desc = (const char*)rm->descriptor;
+    void* name_str = (name != NULL)
+        ? __jnative_make_string_obj(name, (int32_t)strlen(name))
+        : NULL;
+
+    ReflectionClass* return_type = NULL;
+    void* param_types = NULL;
+    if (desc != NULL && desc[0] == '(') {
+        const char* close = strchr(desc, ')');
+        if (close != NULL && close[1] != '\0') {
+            return_type = descriptor_to_class_mirror(close + 1);
+        }
+        param_types = build_parameter_types_array(desc);
+    }
+    /*
+     * Never present a null parameterTypes or exceptionTypes to the
+     * Java layer — see the function header for the sharedToString
+     * failure this guards against.
+     */
+    if (param_types == NULL) {
+        param_types = empty_param_types_array();
+    }
+    void* exc_types = empty_param_types_array();
+
+    *(void**)((char*)method + JNATIVE_METHOD_CLAZZ_OFFSET)       = declaring_cls;
+    *(int32_t*)((char*)method + JNATIVE_METHOD_SLOT_OFFSET)      = 0;
+    *(void**)((char*)method + JNATIVE_METHOD_NAME_OFFSET)        = name_str;
+    *(void**)((char*)method + JNATIVE_METHOD_RETURN_TYPE_OFFSET) = return_type;
+    *(void**)((char*)method + JNATIVE_METHOD_PARAM_TYPES_OFFSET) = param_types;
+    *(void**)((char*)method + JNATIVE_METHOD_EXC_TYPES_OFFSET)   = exc_types;
+    *(int32_t*)((char*)method + JNATIVE_METHOD_MODIFIERS_OFFSET) = rm->modifiers;
+
+    return method;
+}
+
+/*
+ * Build a java.lang.reflect.Constructor from a native
+ * ReflectionConstructor descriptor.
+ *
+ * Same non-null contract for both parameterTypes and exceptionTypes as
+ * create_method_mirror above: Constructor.sharedToString has the
+ * identical unchecked `exceptionTypes.length` read, and Constructor's
+ * toString / toGenericString are reached from the same reflective
+ * diagnostic paths that stringify Method.
+ */
+static void* create_constructor_mirror(ReflectionClass* declaring_cls,
+                                       ReflectionConstructor* rc_ctor)
+{
+    if (declaring_cls == NULL || rc_ctor == NULL) return NULL;
+
+    ReflectionClass* ctor_cls =
+        jnative_class_by_name("java/lang/reflect/Constructor");
+    if (ctor_cls == NULL) return NULL;
+
+    void* ctor = jnative_alloc_object(ctor_cls);
+    if (ctor == NULL) return NULL;
+
+    const char* desc = (const char*)rc_ctor->descriptor;
+    void* param_types = NULL;
+    if (desc != NULL && desc[0] == '(') {
+        param_types = build_parameter_types_array(desc);
+    }
+    if (param_types == NULL) {
+        param_types = empty_param_types_array();
+    }
+    void* exc_types = empty_param_types_array();
+
+    *(void**)((char*)ctor + JNATIVE_CTOR_CLAZZ_OFFSET)       = declaring_cls;
+    *(int32_t*)((char*)ctor + JNATIVE_CTOR_SLOT_OFFSET)      = 0;
+    *(void**)((char*)ctor + JNATIVE_CTOR_PARAM_TYPES_OFFSET) = param_types;
+    *(void**)((char*)ctor + JNATIVE_CTOR_EXC_TYPES_OFFSET)   = exc_types;
+    *(int32_t*)((char*)ctor + JNATIVE_CTOR_MODIFIERS_OFFSET) = rc_ctor->modifiers;
+
+    return ctor;
 }
 
 /* --------------------------------------------------------------------------
@@ -167,14 +470,14 @@ int __jnative_fn_java_lang_Class_isInterface___Z(void* this_cls) {
 
 int __jnative_fn_java_lang_Class_isArray___Z(void* this_cls) {
     if (this_cls == NULL) return 0;
-    const char* name = (const char*)((struct ReflectionClass*)this_cls)->name;
+    const char* name = ((struct ReflectionClass*)this_cls)->cname;
     if (!name) return 0;
     return name[0] == '[';
 }
 
 int __jnative_fn_java_lang_Class_isPrimitive___Z(void* this_cls) {
     if (this_cls == NULL) return 0;
-    const char* name = (const char*)((struct ReflectionClass*)this_cls)->name;
+    const char* name = ((struct ReflectionClass*)this_cls)->cname;
     if (!name) return 0;
     return strcmp(name, "boolean") == 0 || strcmp(name, "byte") == 0 ||
            strcmp(name, "short")   == 0 || strcmp(name, "char") == 0 ||
@@ -185,14 +488,14 @@ int __jnative_fn_java_lang_Class_isPrimitive___Z(void* this_cls) {
 
 void* __jnative_fn_java_lang_Class_getName___Ljava_lang_String_(void* this_cls) {
     if (this_cls == NULL) return NULL;
-    const char* name = (const char*)((struct ReflectionClass*)this_cls)->name;
+    const char* name = ((struct ReflectionClass*)this_cls)->cname;
     if (name == NULL) return NULL;
     return __jnative_make_string_obj(name, (int32_t)strlen(name));
 }
 
 void* __jnative_fn_java_lang_Class_initClassName___Ljava_lang_String_(void* this_cls) {
     if (this_cls == NULL) return NULL;
-    const char* internal = (const char*)((struct ReflectionClass*)this_cls)->name;
+    const char* internal = ((struct ReflectionClass*)this_cls)->cname;
     if (internal == NULL) return NULL;
 
     size_t len = strlen(internal);
@@ -235,7 +538,7 @@ int __jnative_fn_java_lang_Class_isAssignableFrom__Ljava_lang_Class__Z(void* thi
 void* __jnative_fn_java_lang_Class_getDeclaringClass0___Ljava_lang_Class_(void* this_cls) {
     if (this_cls == NULL) return NULL;
     struct ReflectionClass* cls = (struct ReflectionClass*)this_cls;
-    const char* name = (const char*)cls->name;
+    const char* name = cls->cname;
     if (name == NULL) return NULL;
 
     const char* last_dollar = strrchr(name, '$');
@@ -410,43 +713,157 @@ void* __jnative_fn_java_lang_Class_getGenericSignature0___Ljava_lang_String_(voi
 /*
  * private native Method[] getDeclaredMethods0(boolean publicOnly);
  *
- * The runtime does not build Method objects from the class structure. An
- * empty array is a valid — and the only truthful — answer here.
+ * Walks ReflectionClass.methods and builds a java.lang.reflect.Method
+ * per entry. Returns a zero-length array only when the class genuinely
+ * has no methods in the emitted metadata.
+ *
+ * This is not optional. MethodHandles.Lookup.findVarHandle() resolves
+ * through MemberName.Factory.resolve -> MethodHandleNatives.resolve,
+ * which reports failure by way of a ReflectiveOperationException; the
+ * <clinit> of Striped64, Striped64$Cell, AtomicReference,
+ * AtomicBoolean, AtomicMarkableReference, ConcurrentSkipListMap,
+ * LinkedTransferQueue and FutureTask all catch exactly that and rethrow
+ * it as an ExceptionInInitializerError.
  */
 void* __jnative_fn_java_lang_Class_getDeclaredMethods0__Z__Ljava_lang_reflect_Method_(
         void* this_cls, int32_t public_only) {
-    (void)this_cls;
-    (void)public_only;
-    return make_empty_ref_array();
+    if (this_cls == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+
+    ReflectionClass* rc = (ReflectionClass*)this_cls;
+    ReflectionMethod** mp = rc->methods;
+
+    int32_t count = 0;
+    if (mp != NULL) {
+        for (ReflectionMethod** p = mp; *p != NULL; p++) {
+            if (public_only && !((*p)->modifiers & JNATIVE_ACC_PUBLIC)) continue;
+            count++;
+        }
+    }
+
+    void* array = jnative_ref_array_of_class(NULL, count,
+                                             "[Ljava/lang/reflect/Method;");
+    if (array == NULL) {
+        __jnative_throw_out_of_memory_error_ctx("Class.getDeclaredMethods0");
+    }
+
+    void** slots = (void**)((char*)array + JAVA_ARR_HDR);
+    int32_t i = 0;
+    if (mp != NULL) {
+        for (ReflectionMethod** p = mp; *p != NULL; p++) {
+            ReflectionMethod* rm = *p;
+            if (public_only && !(rm->modifiers & JNATIVE_ACC_PUBLIC)) continue;
+            slots[i++] = create_method_mirror(rc, rm);
+        }
+    }
+
+    return array;
 }
 
 /*
  * private native Field[] getDeclaredFields0(boolean publicOnly);
  *
- * Same rationale as getDeclaredMethods0: the class parser keeps only the
- * structural information required for code generation and never builds
- * Field objects. Every caller (Class.getDeclaredFields / getFields and
- * their internal users) handles a zero-length array as "no fields visible".
+ * Walks ReflectionClass.fields and builds a java.lang.reflect.Field per
+ * entry.
  *
- * The LLVM backend currently emits an external call to this symbol from
+ * This is the function the JDK's own <clinit>s depend on.
+ * Class.getDeclaredField(name) is implemented as
+ * privateGetDeclaredFields -> getDeclaredFields0 -> filterFields ->
+ * searchFields, and a zero-length array makes searchFields return NULL,
+ * which turns every lookup into a NoSuchFieldException. Two JDK 21
+ * <clinit>s catch that and rethrow it as an
+ * ExceptionInInitializerError, so an empty answer here is fatal at
+ * start-up rather than merely incomplete:
+ *
+ *   java.util.concurrent.ForkJoinPool.<clinit>
+ *       getDeclaredField("poolIds") + Unsafe.staticFieldBase/Offset
+ *   java.lang.Thread$ThreadNumbering.<clinit>
+ *       getDeclaredField("next") + Unsafe.staticFieldBase/Offset
+ *
+ * The metadata it reads from was already there — @reffield_* constants
+ * are emitted for both of those fields — it simply had no way to become
+ * a java.lang.reflect.Field.
+ *
+ * The LLVM backend also emits an external call to this symbol from
  * java.lang.Class's getFields path, so its presence is required for the
- * module to link.
+ * module to link regardless of whether any caller is reachable.
  */
 void* __jnative_fn_java_lang_Class_getDeclaredFields0__Z__Ljava_lang_reflect_Field_(
         void* this_cls, int32_t public_only) {
-    (void)this_cls;
-    (void)public_only;
-    return make_empty_ref_array();
+    if (this_cls == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+
+    ReflectionClass* rc = (ReflectionClass*)this_cls;
+    ReflectionField** fp = rc->fields;
+
+    int32_t count = 0;
+    if (fp != NULL) {
+        for (ReflectionField** p = fp; *p != NULL; p++) {
+            if (public_only && !((*p)->modifiers & JNATIVE_ACC_PUBLIC)) continue;
+            count++;
+        }
+    }
+
+    void* array = jnative_ref_array_of_class(NULL, count,
+                                             "[Ljava/lang/reflect/Field;");
+    if (array == NULL) {
+        __jnative_throw_out_of_memory_error_ctx("Class.getDeclaredFields0");
+    }
+
+    void** slots = (void**)((char*)array + JAVA_ARR_HDR);
+    int32_t i = 0;
+    if (fp != NULL) {
+        for (ReflectionField** p = fp; *p != NULL; p++) {
+            ReflectionField* rf = *p;
+            if (public_only && !(rf->modifiers & JNATIVE_ACC_PUBLIC)) continue;
+            slots[i++] = create_field_mirror(rc, rf);
+        }
+    }
+
+    return array;
 }
 
 /*
  * private native Constructor<T>[] getDeclaredConstructors0(boolean publicOnly);
+ *
+ * Same shape as getDeclaredMethods0, over ReflectionClass.constructors.
  */
 void* __jnative_fn_java_lang_Class_getDeclaredConstructors0__Z__Ljava_lang_reflect_Constructor_(
         void* this_cls, int32_t public_only) {
-    (void)this_cls;
-    (void)public_only;
-    return make_empty_ref_array();
+    if (this_cls == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+
+    ReflectionClass* rc = (ReflectionClass*)this_cls;
+    ReflectionConstructor** cp = rc->constructors;
+
+    int32_t count = 0;
+    if (cp != NULL) {
+        for (ReflectionConstructor** p = cp; *p != NULL; p++) {
+            if (public_only && !((*p)->modifiers & JNATIVE_ACC_PUBLIC)) continue;
+            count++;
+        }
+    }
+
+    void* array = jnative_ref_array_of_class(NULL, count,
+                                             "[Ljava/lang/reflect/Constructor;");
+    if (array == NULL) {
+        __jnative_throw_out_of_memory_error_ctx("Class.getDeclaredConstructors0");
+    }
+
+    void** slots = (void**)((char*)array + JAVA_ARR_HDR);
+    int32_t i = 0;
+    if (cp != NULL) {
+        for (ReflectionConstructor** p = cp; *p != NULL; p++) {
+            ReflectionConstructor* rc_ctor = *p;
+            if (public_only && !(rc_ctor->modifiers & JNATIVE_ACC_PUBLIC)) continue;
+            slots[i++] = create_constructor_mirror(rc, rc_ctor);
+        }
+    }
+
+    return array;
 }
 
 void* __jnative_fn_java_lang_Class_getSimpleBinaryName0___Ljava_lang_String_(void* this_cls) {

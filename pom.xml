@@ -12,7 +12,7 @@
   <url>https://github.com/Kubyk01/JNative</url>
 
   <properties>
-    <java.version>25</java.version>
+    <java.version>21</java.version>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <reactor.version>3.5.9</reactor.version>
     <junit.version>5.9.2</junit.version>

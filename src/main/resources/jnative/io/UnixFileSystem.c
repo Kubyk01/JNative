@@ -8,10 +8,7 @@
 #include <dirent.h>
 #include <sys/stat.h>
 
-__attribute__((noreturn)) void __jnative_throw_null_pointer_exception(void);
-
-extern const char* __jnative_read_string_bytes(void* s, int32_t* out_len);
-extern void* __jnative_make_string_obj(const char* bytes, int32_t len);
+#include "jnative_runtime.h"
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -63,15 +60,6 @@ extern void* __jnative_make_string_obj(const char* bytes, int32_t len);
 #ifndef X_OK
 #define X_OK 1
 #endif
-
-/*
- * Java array layout produced by this runtime:
- *
- *   [ int32 length ][ int32 element_size ][ payload ... ]
- *
- * The header is exactly 8 bytes; the payload begins at offset 8.
- */
-#define JAVA_ARR_HDR 8
 
 /* --------------------------------------------------------------------------
  * private static void initIDs();
@@ -480,21 +468,13 @@ void* __jnative_fn_java_io_UnixFileSystem_list0__Ljava_io_File___Ljava_lang_Stri
         return NULL;
     }
 
-    /* Build the Java String[] in the runtime's standard layout. */
-    size_t total = JAVA_ARR_HDR + count * sizeof(void*);
-    void* array = malloc(total);
-    if (array == NULL) {
-        free(names);
-        return NULL;
-    }
-    *(int32_t*)array = (int32_t)count;
-    *(int32_t*)((char*)array + 4) = (int32_t)sizeof(void*);
-
-    void** slots = (void**)((char*)array + JAVA_ARR_HDR);
-    for (size_t i = 0; i < count; i++) {
-        slots[i] = names[i];
-    }
-
+    /*
+     * Build the Java String[] through the shared allocator so its header
+     * carries the [Ljava/lang/String; class mirror alongside the length
+     * and element size.
+     */
+    void* array = jnative_ref_array_of_class((void**)names, (int32_t)count,
+                                             "[Ljava/lang/String;");
     free(names);
     return array;
 }

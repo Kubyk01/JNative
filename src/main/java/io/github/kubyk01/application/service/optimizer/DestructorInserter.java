@@ -1,4 +1,4 @@
-package io.github.kubyk01.application.service.analyzer;
+package io.github.kubyk01.application.service.optimizer;
 
 import io.github.kubyk01.application.service.analyzer.dependencyresolver.DependencyResolver;
 import io.github.kubyk01.application.service.codegen.llvm.LlvmRuntime;
@@ -8,6 +8,8 @@ import io.github.kubyk01.domain.analyzer.aliasanalysis.PointsToGraph;
 import io.github.kubyk01.domain.analyzer.aliasanalysis.PointsToSet;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.ClassNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.FieldNode;
+import io.github.kubyk01.domain.analyzer.lifetime.DestructionPoint;
+import io.github.kubyk01.domain.analyzer.lifetime.LifetimeAnalysisResult;
 import io.github.kubyk01.domain.ir.BasicBlock;
 import io.github.kubyk01.domain.ir.BranchTerminator;
 import io.github.kubyk01.domain.ir.CondBranchTerminator;
@@ -15,20 +17,26 @@ import io.github.kubyk01.domain.ir.Constant;
 import io.github.kubyk01.domain.ir.Function;
 import io.github.kubyk01.domain.ir.Instruction;
 import io.github.kubyk01.domain.ir.Module;
-import io.github.kubyk01.domain.analyzer.lifetime.DestructionPoint;
-import io.github.kubyk01.domain.analyzer.lifetime.LifetimeAnalysisResult;
 import io.github.kubyk01.domain.ir.Opcode;
 import io.github.kubyk01.domain.ir.Parameter;
 import io.github.kubyk01.domain.ir.ReturnTerminator;
 import io.github.kubyk01.domain.ir.Temporary;
 import io.github.kubyk01.domain.ir.Type;
 import io.github.kubyk01.domain.ir.Value;
+import io.github.kubyk01.util.LlvmUtil;
 import lombok.Getter;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.objectweb.asm.Opcodes;
 
-import java.util.*;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Queue;
+import java.util.Set;
 
 @Slf4j
 @RequiredArgsConstructor
@@ -51,7 +59,7 @@ public class DestructorInserter {
             }
         }
 
-        // 2. Generate destructors, including reference field types and array types (transitively)
+        // 2. Generate destructors, including reference field types and array types
         Map<String, Function> destructorMap = new HashMap<>();
         Queue<Type> worklist = new ArrayDeque<>(classTypes);
         Set<Type> processed = new HashSet<>();
@@ -62,7 +70,6 @@ public class DestructorInserter {
             if (dtor == null) continue;
             destructorMap.put(type.toString(), dtor);
 
-            // If this is a class, add reference fields and array fields
             if (!isArrayType(type)) {
                 String className = type.getClassName();
                 ClassNode classNode = resolver.getClassNode(className);
@@ -74,7 +81,6 @@ public class DestructorInserter {
                         }
                     }
                 }
-                // Also add superclass to worklist if it is managed
                 String superName = classNode.getSuperName();
                 if (superName != null && !superName.equals("java/lang/Object")) {
                     Type superType = Type.reference(superName);
@@ -92,7 +98,7 @@ public class DestructorInserter {
             AllocationSite site = entry.getKey();
             Type type = site.getType();
             if (type.isUnknown() || type.isNull()) continue;
-            if (!isManagedType(type)) continue;   // skip system types
+            if (!isManagedType(type)) continue;
             Function dtor = findDestructor(type);
             if (dtor == null) continue;
             for (DestructionPoint dp : entry.getValue()) {
@@ -103,7 +109,6 @@ public class DestructorInserter {
         log.info("Destructor insertion: {} destructors generated, {} calls inserted",
             destructorMap.size(), inserted);
 
-        // After inserting regular destructors, create the shutdown function
         createShutdownFunction();
     }
 
@@ -124,6 +129,8 @@ public class DestructorInserter {
 
         Set<AllocationSite> processedSites = new HashSet<>();
 
+        int uniqueBlockIndex = 0;
+
         for (Map.Entry<String, PointsToSet> entryStatic : staticFields.entrySet()) {
             String fieldName = entryStatic.getKey();
             PointsToSet pts = entryStatic.getValue();
@@ -131,7 +138,7 @@ public class DestructorInserter {
                 if (processedSites.contains(site)) continue;
                 Type type = site.getType();
                 if (type.isUnknown() || type.isNull()) continue;
-                if (!isManagedType(type)) continue;   // skip system types
+                if (!isManagedType(type)) continue;
                 Function dtor = findDestructor(type);
                 if (dtor == null) continue;
                 processedSites.add(site);
@@ -152,19 +159,21 @@ public class DestructorInserter {
                 isNullTmp.setDefiningInstruction(isNull);
                 current.addInstruction(isNull);
 
-                String sanitizedField = fieldName.replace('.', '_').replace('/', '_');
-                BasicBlock skipBlock = new BasicBlock(funcName + "_skip_" + sanitizedField);
-                BasicBlock callBlock = new BasicBlock(funcName + "_call_" + sanitizedField);
+                int blockTag = uniqueBlockIndex++;
+                BasicBlock skipBlock = new BasicBlock(funcName + "_skip_" + blockTag);
+                BasicBlock callBlock = new BasicBlock(funcName + "_call_" + blockTag);
                 func.addBlock(skipBlock);
                 func.addBlock(callBlock);
 
-                CondBranchTerminator cond = new CondBranchTerminator(isNullTmp, skipBlock, callBlock);
+                CondBranchTerminator cond =
+                    new CondBranchTerminator(isNullTmp, skipBlock, callBlock);
                 current.setTerminator(cond);
                 current.addSuccessor(skipBlock);
                 current.addSuccessor(callBlock);
 
                 Instruction callDtor = new Instruction(Opcode.STATIC_CALL);
-                callDtor.addOperand(new Constant(Type.reference(dtor.getName()), dtor.getName()));
+                callDtor.addOperand(new Constant(
+                    Type.reference(dtor.getName()), dtor.getName()));
                 callDtor.addOperand(staticVal);
                 callBlock.addInstruction(callDtor);
                 callBlock.setTerminator(new BranchTerminator(skipBlock));
@@ -177,22 +186,12 @@ public class DestructorInserter {
         current.setTerminator(new ReturnTerminator(null));
     }
 
-    private boolean isSystemClassName(String className) {
-        String dot = className.replace('/', '.');
-        return dot.startsWith("java.") ||
-            dot.startsWith("javax.") ||
-            dot.startsWith("sun.") ||
-            dot.startsWith("jdk.") ||
-            dot.startsWith("org.objectweb.asm.") ||
-            dot.startsWith("picocli.") ||
-            dot.startsWith("reactor.") ||
-            dot.startsWith("org.slf4j.") ||
-            dot.startsWith("org.reactivestreams.") ||
-            dot.startsWith("io.micrometer.") ||
-            dot.startsWith("org.junit.") ||
-            dot.startsWith("com.fasterxml.");
-    }
-
+    /**
+     * A type is "managed" if the destructor pass may generate a destructor for
+     * it: it is not unknown / null, it is not a JDK class, and it is not
+     * {@code java.lang.Object}. Arrays are managed if their base element type
+     * is itself managed.
+     */
     private boolean isManagedType(Type type) {
         if (type == null) return false;
         if (type.isUnknown() || type.isNull()) return false;
@@ -204,7 +203,7 @@ public class DestructorInserter {
         }
         if (type.isReference()) {
             String className = type.getClassName();
-            if (isSystemClassName(className)) return false;
+            if (LlvmUtil.isSystemClassName(className)) return false;
             ClassNode cn = resolver.getClassNode(className);
             if (cn != null && cn.isExternal()) return false;
             return !className.equals("java/lang/Object");
@@ -239,7 +238,7 @@ public class DestructorInserter {
 
     private Function createDestructor(Type type) {
         if (type == null) return null;
-        if (!isManagedType(type)) return null;   // never create destructors for system types
+        if (!isManagedType(type)) return null;
         if (type.isArray()) {
             return createArrayDestructor(type);
         } else if (type.isReference()) {
@@ -297,7 +296,9 @@ public class DestructorInserter {
 
             Instruction getField = new Instruction(Opcode.GET_FIELD);
             getField.addOperand(thisParam);
-            getField.addOperand(new Constant(Type.reference(className + "." + field.getName()), className + "." + field.getName()));
+            getField.addOperand(new Constant(
+                Type.reference(className + "." + field.getName()),
+                className + "." + field.getName()));
             Temporary fieldValue = new Temporary(fieldType);
             getField.setResult(fieldValue);
             fieldValue.setDefiningInstruction(getField);
@@ -323,7 +324,8 @@ public class DestructorInserter {
             Function fieldDtor = findDestructor(fieldType);
             if (fieldDtor != null) {
                 Instruction callDtor = new Instruction(Opcode.STATIC_CALL);
-                callDtor.addOperand(new Constant(Type.reference(fieldDtor.getName()), fieldDtor.getName()));
+                callDtor.addOperand(new Constant(
+                    Type.reference(fieldDtor.getName()), fieldDtor.getName()));
                 callDtor.addOperand(fieldValue);
                 callBlock.addInstruction(callDtor);
             }
@@ -340,7 +342,8 @@ public class DestructorInserter {
                 Function superDtor = findDestructor(superType);
                 if (superDtor != null) {
                     Instruction callSuper = new Instruction(Opcode.STATIC_CALL);
-                    callSuper.addOperand(new Constant(Type.reference(superDtor.getName()), superDtor.getName()));
+                    callSuper.addOperand(new Constant(
+                        Type.reference(superDtor.getName()), superDtor.getName()));
                     callSuper.addOperand(thisParam);
                     current.addInstruction(callSuper);
                 }
@@ -402,7 +405,6 @@ public class DestructorInserter {
 
         Function elementDtor = findDestructor(elementType);
         if (elementDtor == null) {
-            // fallback: only free the array itself
             Instruction freeInst = new Instruction(Opcode.FREE);
             freeInst.addOperand(arrParam);
             bodyBlock.addInstruction(freeInst);
@@ -410,7 +412,6 @@ public class DestructorInserter {
             return func;
         }
 
-        // Get array length
         Instruction lenInst = new Instruction(Opcode.ARRAYLENGTH);
         lenInst.addOperand(arrParam);
         Temporary lenVal = new Temporary(Type.INT);
@@ -418,7 +419,6 @@ public class DestructorInserter {
         lenVal.setDefiningInstruction(lenInst);
         bodyBlock.addInstruction(lenInst);
 
-        // Loop counter
         Temporary counter = new Temporary(Type.INT);
         Instruction counterInit = new Instruction(Opcode.LOAD);
         counterInit.setLocalIndex(0);
@@ -426,7 +426,6 @@ public class DestructorInserter {
         counter.setDefiningInstruction(counterInit);
         bodyBlock.addInstruction(counterInit);
 
-        // Loop header
         BasicBlock loopHeader = new BasicBlock(funcName + "_loop_header");
         BasicBlock loopBody = new BasicBlock(funcName + "_loop_body");
         BasicBlock loopAfter = new BasicBlock(funcName + "_loop_after");
@@ -437,7 +436,6 @@ public class DestructorInserter {
         bodyBlock.setTerminator(new BranchTerminator(loopHeader));
         bodyBlock.addSuccessor(loopHeader);
 
-        // Condition: counter < length
         Instruction cmpLoop = new Instruction(Opcode.LT);
         cmpLoop.addOperand(counter);
         cmpLoop.addOperand(lenVal);
@@ -449,7 +447,6 @@ public class DestructorInserter {
         loopHeader.addSuccessor(loopBody);
         loopHeader.addSuccessor(loopAfter);
 
-        // Load element
         Instruction loadElem = new Instruction(Opcode.ALOAD);
         loadElem.addOperand(arrParam);
         loadElem.addOperand(counter);
@@ -458,7 +455,6 @@ public class DestructorInserter {
         elemVal.setDefiningInstruction(loadElem);
         loopBody.addInstruction(loadElem);
 
-        // Check if element is not null
         Instruction isNullElem = new Instruction(Opcode.EQ);
         isNullElem.addOperand(elemVal);
         isNullElem.addOperand(nullConst);
@@ -476,15 +472,14 @@ public class DestructorInserter {
         loopBody.addSuccessor(skipElem);
         loopBody.addSuccessor(callElemDtor);
 
-        // Call element destructor
         Instruction callDtor = new Instruction(Opcode.STATIC_CALL);
-        callDtor.addOperand(new Constant(Type.reference(elementDtor.getName()), elementDtor.getName()));
+        callDtor.addOperand(new Constant(
+            Type.reference(elementDtor.getName()), elementDtor.getName()));
         callDtor.addOperand(elemVal);
         callElemDtor.addInstruction(callDtor);
         callElemDtor.setTerminator(new BranchTerminator(skipElem));
         callElemDtor.addSuccessor(skipElem);
 
-        // Increment counter
         Instruction inc = new Instruction(Opcode.ADD);
         inc.addOperand(counter);
         inc.addOperand(new Constant(Type.INT, 1));
@@ -493,7 +488,6 @@ public class DestructorInserter {
         newCounter.setDefiningInstruction(inc);
         skipElem.addInstruction(inc);
 
-        // Store new counter (simulate store to local)
         Instruction storeCounter = new Instruction(Opcode.STORE);
         storeCounter.addOperand(newCounter);
         storeCounter.setLocalIndex(0);
@@ -505,7 +499,6 @@ public class DestructorInserter {
         skipElem.setTerminator(new BranchTerminator(loopHeader));
         skipElem.addSuccessor(loopHeader);
 
-        // After loop: free the array itself
         Instruction freeArr = new Instruction(Opcode.FREE);
         freeArr.addOperand(arrParam);
         loopAfter.addInstruction(freeArr);
@@ -556,7 +549,7 @@ public class DestructorInserter {
     }
 
     private Function findDestructor(Type type) {
-        if (!isManagedType(type)) return null;   // never return destructor for system types
+        if (!isManagedType(type)) return null;
         String name = destructorName(type);
         if (name == null) return null;
         Function existing = module.getFunction(name);

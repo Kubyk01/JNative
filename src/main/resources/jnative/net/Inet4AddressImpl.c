@@ -4,117 +4,68 @@
 #include <string.h>
 #include <stdio.h>
 #include <unistd.h>
-#include <dlfcn.h>
 #include <netdb.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
-__attribute__((noreturn)) void __jnative_throw_exception(void* exc);
-
-struct ReflectionClass {
-    void* vtable;
-    void* name;
-    struct ReflectionClass* superclass;
-    struct ReflectionClass** interfaces;
-    void** methods;
-    void** fields;
-    void** constructors;
-    int modifiers;
-    int object_size;
-};
-
-extern struct ReflectionClass* reflect_all_classes[];
-
-extern void* __jnative_make_string_obj(const char* bytes, int32_t len);
-extern const char* __jnative_read_string_bytes(void* s, int32_t* out_len);
-
-#define JAVA_ARR_HDR 8
-#define JAVA_IPV4 1
-
-static struct ReflectionClass* find_class_by_name(const char* internal_name) {
-    if (!internal_name) return NULL;
-    if (reflect_all_classes[0] == NULL) return NULL;
-    struct ReflectionClass** pp = reflect_all_classes;
-    while (*pp) {
-        struct ReflectionClass* cls = *pp;
-        const char* n = (const char*)cls->name;
-        if (n && strcmp(n, internal_name) == 0) return cls;
-        pp++;
-    }
-    return NULL;
-}
-
-static void* lookup_class_vtable(struct ReflectionClass* cls) {
-    if (!cls || !cls->name) return NULL;
-    char buf[512];
-    snprintf(buf, sizeof(buf), "__type_info_%s", (const char*)cls->name);
-    for (char* p = buf; *p; p++) {
-        if (*p == '/' || *p == '.') *p = '_';
-    }
-    void* handle = dlopen(NULL, RTLD_LAZY);
-    if (!handle) return NULL;
-    void** type_info = (void**)dlsym(handle, buf);
-    dlclose(handle);
-    if (!type_info) return NULL;
-    return type_info[0];
-}
-
-static void* alloc_object(struct ReflectionClass* cls) {
-    if (!cls) return NULL;
-    int size = cls->object_size;
-    if (size <= 0) size = 8;
-    void* obj = calloc(1, (size_t)size);
-    if (!obj) return NULL;
-    void* vt = lookup_class_vtable(cls);
-    if (!vt) { free(obj); return NULL; }
-    *(void**)obj = vt;
-    return obj;
-}
-
-static void* make_byte_array(const uint8_t* data, int32_t len) {
-    size_t total = JAVA_ARR_HDR + (size_t)len;
-    void* arr = malloc(total);
-    if (!arr) return NULL;
-    *(int32_t*)arr = len;
-    if (data && len > 0) memcpy((char*)arr + JAVA_ARR_HDR, data, (size_t)len);
-    return arr;
-}
-
-static void* make_string(const char* s) {
-    if (!s) return NULL;
-    return __jnative_make_string_obj(s, (int32_t)strlen(s));
-}
+#include "jnative_runtime.h"
 
 /*
- * Object layouts used below (matching the LLVM emitter's field-offset
- * computation: vtable at offset 0, fields laid out at increasing byte
- * offsets with no padding):
+ * java.net.Inet4AddressImpl — the native entry points that back the
+ * IPv4 resolver. The class lives on top of the JDK's InetAddress
+ * hierarchy and is dispatched to only when the Java layer has already
+ * selected the IPv4 path (either because the resolver policy asks for
+ * IPv4 first, or because IPv6 support is not available on the host).
+ *
+ * The results produced here are fully-shaped java.net.InetAddress
+ * instances, not raw address bytes: every returned object carries a
+ * valid vtable, a canonical host name and an InetAddressHolder with
+ * the family and the address bytes already populated. Java callers can
+ * therefore invoke getAddress / getHostAddress / toString on the
+ * result without any further native assistance.
+ */
+
+/*
+ * The `family` value stored in InetAddressHolder. The numeric value
+ * matches the Java-side constant InetAddress.IPv4 (1) and is consumed
+ * by InetAddress itself, not by any native.
+ */
+#define JAVA_IPV4 1
+
+/*
+ * Build a fully-shaped java.net.InetAddress whose holder carries the
+ * given hostname, family and 4-byte IPv4 address. Returns NULL if
+ * either of the required classes is not in the reflection registry or
+ * if any allocation fails.
+ *
+ * The field layout used here matches LlvmGlobalEmitter.getFieldOffset
+ * for the two target classes:
  *
  *   java.net.InetAddress:
- *       offset  8 : canonicalHostName (String)
- *       offset 16 : holder (InetAddress$InetAddressHolder)
+ *       offset  8 : String canonicalHostName
+ *       offset 16 : InetAddressHolder holder
  *
  *   java.net.InetAddress$InetAddressHolder:
- *       offset  8 : hostName (String)
- *       offset 16 : family   (int)
- *       offset 20 : addressBytes (byte[])
+ *       offset  8 : String hostName
+ *       offset 16 : int    family
+ *       offset 20 : byte[] addressBytes
  */
 static void* make_inet4_address(const uint8_t* bytes, const char* hostname) {
-    struct ReflectionClass* ia_cls =
-        find_class_by_name("java/net/InetAddress");
-    struct ReflectionClass* h_cls =
-        find_class_by_name("java/net/InetAddress$InetAddressHolder");
+    ReflectionClass* ia_cls =
+        jnative_class_by_name("java/net/InetAddress");
+    ReflectionClass* h_cls =
+        jnative_class_by_name("java/net/InetAddress$InetAddressHolder");
     if (!ia_cls || !h_cls) return NULL;
 
-    void* holder = alloc_object(h_cls);
+    void* holder = jnative_alloc_object(h_cls);
     if (!holder) return NULL;
 
-    *(void**)((char*)holder + 8)    = make_string(hostname);
+    *(void**)((char*)holder + 8)    = jnative_string(hostname);
     *(int32_t*)((char*)holder + 16) = JAVA_IPV4;
-    *(void**)((char*)holder + 20)   = make_byte_array(bytes, 4);
+    *(void**)((char*)holder + 20)   = jnative_byte_array(bytes, 4);
 
-    void* ia = alloc_object(ia_cls);
+    void* ia = jnative_alloc_object(ia_cls);
     if (!ia) { free(holder); return NULL; }
 
     *(void**)((char*)ia + 8)  = NULL;
@@ -123,8 +74,8 @@ static void* make_inet4_address(const uint8_t* bytes, const char* hostname) {
     return ia;
 }
 
-/* --------------------------------------------------------------------------
- * lookupAllHostAddr — canonical single-argument implementation
+/*
+ * lookupAllHostAddr — canonical single-argument implementation.
  *
  *   private native InetAddress[] lookupAllHostAddr(String host)
  *       throws UnknownHostException;
@@ -135,12 +86,14 @@ static void* make_inet4_address(const uint8_t* bytes, const char* hostname) {
  * same body serves every JDK generation this runtime targets.
  *
  * The returned array is packed in the runtime's Java-array layout
- * (4-byte int length header, then pointer slots), and each element is a
- * fully-shaped InetAddress — vtable, canonical name, and an
- * InetAddressHolder carrying the hostname, family, and 4-byte address.
- * Java callers can therefore invoke getAddress / getHostAddress
- * without any further native assistance.
- * ------------------------------------------------------------------------ */
+ * (4-byte int length header, then pointer slots), and each element is
+ * a fully-shaped InetAddress as produced by make_inet4_address above.
+ *
+ * Every error path — a null host, a resolver failure, an empty result
+ * set — is reported through the generic throw helper, which the
+ * Java-side caller's UnknownHostException catch block converts into
+ * the appropriate checked exception.
+ */
 void* __jnative_fn_java_net_Inet4AddressImpl_lookupAllHostAddr__Ljava_lang_String___Ljava_net_InetAddress_(
         void* host_str)
 {
@@ -171,13 +124,15 @@ void* __jnative_fn_java_net_Inet4AddressImpl_lookupAllHostAddr__Ljava_lang_Strin
         __jnative_throw_exception(NULL);
     }
 
-    size_t total = JAVA_ARR_HDR + (size_t)count * sizeof(void*);
-    void* array = malloc(total);
+    /* InetAddress[] — the descriptor matches the declared Java return
+     * type, so getClass() on the result answers with
+     * [Ljava/net/InetAddress;. */
+    void* array = jnative_ref_array_of_class(NULL, count,
+                                             "[Ljava/net/InetAddress;");
     if (!array) {
         freeaddrinfo(res);
         __jnative_throw_exception(NULL);
     }
-    *(int32_t*)array = count;
 
     void** slots = (void**)((char*)array + JAVA_ARR_HDR);
     int i = 0;
@@ -191,8 +146,8 @@ void* __jnative_fn_java_net_Inet4AddressImpl_lookupAllHostAddr__Ljava_lang_Strin
     return array;
 }
 
-/* --------------------------------------------------------------------------
- * lookupAllHostAddr — pre-JDK-18 two-argument form
+/*
+ * lookupAllHostAddr — pre-JDK-18 two-argument form.
  *
  *   private native InetAddress[] lookupAllHostAddr(String host, int policy)
  *       throws UnknownHostException;
@@ -200,9 +155,9 @@ void* __jnative_fn_java_net_Inet4AddressImpl_lookupAllHostAddr__Ljava_lang_Strin
  * Some intermediate JDK versions carried an int policy argument whose
  * bit values selected the address-family ordering. Inet4AddressImpl is
  * selected only when the caller has already decided the IPv4 path
- * applies, so the policy is informational here; the IPv4-only resolution
- * is the correct answer regardless of which bits are set.
- * ------------------------------------------------------------------------ */
+ * applies, so the policy is informational here; the IPv4-only
+ * resolution is the correct answer regardless of which bits are set.
+ */
 void* __jnative_fn_java_net_Inet4AddressImpl_lookupAllHostAddr__Ljava_lang_String_I__Ljava_net_InetAddress_(
         void* host_str, int32_t policy)
 {
@@ -211,8 +166,8 @@ void* __jnative_fn_java_net_Inet4AddressImpl_lookupAllHostAddr__Ljava_lang_Strin
         host_str);
 }
 
-/* --------------------------------------------------------------------------
- * lookupAllHostAddr — JDK 18+ LookupPolicy form
+/*
+ * lookupAllHostAddr — JDK 18+ LookupPolicy form.
  *
  *   public native InetAddress[] lookupAllHostAddr(
  *           String host,
@@ -220,17 +175,18 @@ void* __jnative_fn_java_net_Inet4AddressImpl_lookupAllHostAddr__Ljava_lang_Strin
  *       throws UnknownHostException;
  *
  * The LookupPolicy object carries the caller's requested address-family
- * ordering. As with the int policy above, Inet4AddressImpl is only ever
- * dispatched to when the Java layer has already established that the
- * IPv4 path applies, so the argument is informational and the body
+ * ordering. As with the int policy above, Inet4AddressImpl is only
+ * ever dispatched to when the Java layer has already established that
+ * the IPv4 path applies, so the argument is informational and the body
  * forwards to the canonical single-argument implementation.
  *
  * The mangled symbol encodes the descriptor
- *   (Ljava/lang/String;Ljava/net/spi/InetAddressResolver$LookupPolicy;)[Ljava/net/InetAddress;
+ *   (Ljava/lang/String;Ljava/net/spi/InetAddressResolver$LookupPolicy;)
+ *       [Ljava/net/InetAddress;
  * exactly, with the three underscores between `Ljava_lang_String_` and
  * `Ljava_net_InetAddress_` coming from the `;`, `)`, and `[`
  * respectively.
- * ------------------------------------------------------------------------ */
+ */
 void* __jnative_fn_java_net_Inet4AddressImpl_lookupAllHostAddr__Ljava_lang_String_Ljava_net_spi_InetAddressResolver_LookupPolicy___Ljava_net_InetAddress_(
         void* host_str, void* lookup_policy)
 {
@@ -239,17 +195,25 @@ void* __jnative_fn_java_net_Inet4AddressImpl_lookupAllHostAddr__Ljava_lang_Strin
         host_str);
 }
 
-/* --------------------------------------------------------------------------
- * getHostByAddr — reverse DNS
- * ------------------------------------------------------------------------ */
+/*
+ * getHostByAddr — reverse DNS.
+ *
+ *   public native String getHostByAddr(byte[] addr)
+ *       throws UnknownHostException;
+ *
+ * Reverses the 4-byte address stored in the given byte array into a
+ * host name via getnameinfo(NI_NAMEREQD). A byte array whose length is
+ * not exactly 4 is reported as "no name available" by returning NULL;
+ * the Java-side caller translates that into UnknownHostException.
+ */
 void* __jnative_fn_java_net_Inet4AddressImpl_getHostByAddr___B_Ljava_lang_String_(
         void* addr_bytes)
 {
     if (!addr_bytes) return NULL;
 
-    int32_t len = *(int32_t*)addr_bytes;
+    int32_t len = jnative_array_length(addr_bytes);
     if (len != 4) return NULL;
-    uint8_t* bytes = (uint8_t*)addr_bytes + JAVA_ARR_HDR;
+    uint8_t* bytes = (uint8_t*)jnative_array_data(addr_bytes);
 
     struct sockaddr_in sin;
     memset(&sin, 0, sizeof(sin));
@@ -263,12 +227,20 @@ void* __jnative_fn_java_net_Inet4AddressImpl_getHostByAddr___B_Ljava_lang_String
     if (rc != 0) {
         return NULL;
     }
-    return make_string(hostbuf);
+    return jnative_string(hostbuf);
 }
 
-/* --------------------------------------------------------------------------
- * getLocalHostName
- * ------------------------------------------------------------------------ */
+/*
+ * getLocalHostName — the local machine's host name.
+ *
+ *   public native String getLocalHostName();
+ *
+ * Thin wrapper over gethostname(3), with a NUL terminator forced at
+ * the end of the buffer so the resulting String cannot include
+ * uninitialised bytes if the kernel filled the buffer completely. A
+ * failed gethostname returns NULL, which the Java-side caller treats
+ * as "no local host name available".
+ */
 void* __jnative_fn_java_net_Inet4AddressImpl_getLocalHostName___Ljava_lang_String_(void)
 {
     char buf[256];
@@ -276,5 +248,5 @@ void* __jnative_fn_java_net_Inet4AddressImpl_getLocalHostName___Ljava_lang_Strin
         return NULL;
     }
     buf[sizeof(buf) - 1] = '\0';
-    return make_string(buf);
+    return jnative_string(buf);
 }

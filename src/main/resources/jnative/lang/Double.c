@@ -1,5 +1,6 @@
 #include <stdint.h>
-#include <string.h>
+
+#include "jnative_runtime.h"
 
 int64_t __jnative_fn_java_lang_Double_doubleToRawLongBits__D_J(double value) {
     union { double d; int64_t i; } u;

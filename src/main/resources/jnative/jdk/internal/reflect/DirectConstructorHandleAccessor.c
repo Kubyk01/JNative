@@ -1,5 +1,7 @@
 #include <stdint.h>
 
+#include "jnative_runtime.h"
+
 extern void* __jnative_fn_jdk_internal_reflect_NativeConstructorAccessorImpl_newInstance0__Ljava_lang_reflect_Constructor__Ljava_lang_Object__Ljava_lang_Object_(
         void* constructor_obj, void* args_array);
 

@@ -1,8 +1,7 @@
 #define _GNU_SOURCE
-#include <stdint.h>
 #include <unistd.h>
 
-extern void* __jnative_make_string_obj(const char* bytes, int32_t len);
+#include "jnative_runtime.h"
 
 int32_t __jnative_fn_java_io_Console_istty___Z(void) {
     return (isatty(STDIN_FILENO) && isatty(STDOUT_FILENO)) ? 1 : 0;

@@ -2,6 +2,8 @@
 #include <stdlib.h>
 #include <time.h>
 
+#include "jnative_runtime.h"
+
 static int64_t perf_high_res_frequency_cached = 0;
 
 void* __jnative_fn_jdk_internal_perf_Perf_createLong__Ljava_lang_String_IIJ_Ljava_nio_ByteBuffer_(

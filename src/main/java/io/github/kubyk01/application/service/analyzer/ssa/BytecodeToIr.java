@@ -40,6 +40,14 @@ public class BytecodeToIr {
     }
 
     private void translateMethod(MethodReference methodRef) {
+        if ("java/lang/Class".equals(methodRef.getOwner())
+            && "getEnumConstantsShared".equals(methodRef.getName())
+            && "()[Ljava/lang/Object;".equals(methodRef.getDescriptor())) {
+            EnumConstantsSharedEmitter.emit(
+                methodRef, builder, resolver, reachability);
+            return;
+        }
+
         MethodNode methodNode = null;
         try {
             String owner = methodRef.getOwner();
@@ -94,7 +102,7 @@ public class BytecodeToIr {
                 // method leaves the mangled name out of the module, and the
                 // LLVM emitter will skip any call to it.
                 log.warn("No bytecode for class {}; method {}.{}{} will "
-                    + "be skipped (no body emitted)",
+                        + "be skipped (no body emitted)",
                     owner, owner, name, desc);
                 return;
             }

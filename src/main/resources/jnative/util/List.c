@@ -1,3 +1,4 @@
+#include "jnative_runtime.h"
 /*
  * java.util.List does not declare getClass() — it is a final method of
  * java.lang.Object. The reachability resolver nevertheless ends up calling

@@ -3,6 +3,8 @@
 #include <stdint.h>
 #include <string.h>
 
+#include "jnative_runtime.h"
+
 /*
  * ClassLoader native methods.
  *
@@ -14,61 +16,6 @@
  * only ones that the JDK's ClassLoader implementation actually reaches in
  * that setup.
  */
-
-struct ReflectionClass {
-    void* vtable;
-    void* name;
-    struct ReflectionClass* superclass;
-    struct ReflectionClass** interfaces;
-    void** methods;
-    void** fields;
-    void** constructors;
-    int modifiers;
-    int object_size;
-};
-
-extern struct ReflectionClass* reflect_all_classes[] __attribute__((weak));
-
-extern const char* __jnative_read_string_bytes(void* s, int32_t* out_len);
-
-/* --------------------------------------------------------------------------
- * Lookup helper — finds a ReflectionClass by its binary name. Accepts both
- * slash-separated ("java/lang/Object") and dot-separated ("java.lang.Object")
- * forms, because ClassLoader's natives receive the binary name as it was
- * spelled in the original source, whereas reflect_all_classes[] is keyed on
- * the internal slash form emitted by LlvmGlobalEmitter.
- * ------------------------------------------------------------------------ */
-static struct ReflectionClass* find_registered_class(const char* name) {
-    if (name == NULL || reflect_all_classes == NULL) return NULL;
-
-    struct ReflectionClass** pp = reflect_all_classes;
-    while (*pp) {
-        const char* cls_name = (const char*)(*pp)->name;
-        if (cls_name && strcmp(cls_name, name) == 0) {
-            return *pp;
-        }
-        pp++;
-    }
-    return NULL;
-}
-
-static struct ReflectionClass* find_registered_class_dotted(const char* name) {
-    if (name == NULL) return NULL;
-
-    struct ReflectionClass* cls = find_registered_class(name);
-    if (cls != NULL) return cls;
-
-    /* Convert '.' -> '/' in a stack buffer. Binary class names used by
-     * ClassLoader are short (well under 512 chars in practice). */
-    char buf[512];
-    size_t n = strlen(name);
-    if (n >= sizeof(buf)) return NULL;
-    memcpy(buf, name, n + 1);
-    for (char* p = buf; *p; p++) {
-        if (*p == '.') *p = '/';
-    }
-    return find_registered_class(buf);
-}
 
 /* --------------------------------------------------------------------------
  * protected final native Class<?> findLoadedClass0(String name);
@@ -87,7 +34,7 @@ void* __jnative_fn_java_lang_ClassLoader_findLoadedClass0__Ljava_lang_String__Lj
     int32_t len = 0;
     const char* name = __jnative_read_string_bytes(name_str, &len);
     (void)len;
-    return (void*)find_registered_class_dotted(name);
+    return (void*)jnative_class_by_dotted_name(name);
 }
 
 /* --------------------------------------------------------------------------
@@ -112,7 +59,7 @@ void* __jnative_fn_java_lang_ClassLoader_findBootstrapClass__Ljava_lang_String__
     int32_t len = 0;
     const char* name = __jnative_read_string_bytes(name_str, &len);
     (void)len;
-    return (void*)find_registered_class_dotted(name);
+    return (void*)jnative_class_by_dotted_name(name);
 }
 
 /* --------------------------------------------------------------------------

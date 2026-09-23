@@ -7,10 +7,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 
-__attribute__((noreturn)) void __jnative_throw_exception(void* exc);
-__attribute__((noreturn)) void __jnative_throw_null_pointer_exception(void);
-
-extern const char* __jnative_read_string_bytes(void* s, int32_t* out_len);
+#include "jnative_runtime.h"
 
 /*
  * Object layout used by this runtime for java.io.FileOutputStream:
@@ -34,11 +31,6 @@ extern const char* __jnative_read_string_bytes(void* s, int32_t* out_len);
 #define FOS_PATH_OFFSET         16
 #define FOS_APPEND_OFFSET       24
 
-#define FD_RAW_FD_OFFSET        8
-
-/* Java array layout: [ int32 length ][ payload ... ] */
-#define JAVA_ARR_HDR 8
-
 static inline void* fos_fd_object(void* this_fos) {
     return *(void**)((char*)this_fos + FOS_FD_OFFSET);
 }
@@ -46,7 +38,7 @@ static inline void* fos_fd_object(void* this_fos) {
 static inline int32_t fos_raw_fd(void* this_fos) {
     void* fd_obj = fos_fd_object(this_fos);
     if (fd_obj == NULL) return -1;
-    return *(int32_t*)((char*)fd_obj + FD_RAW_FD_OFFSET);
+    return *(int32_t*)((char*)fd_obj + FD_OFFSET);
 }
 
 /*
@@ -105,7 +97,7 @@ void __jnative_fn_java_io_FileOutputStream_open0__Ljava_lang_String_Z_V(
         return;
     }
 
-    *(int32_t*)((char*)fd_obj + FD_RAW_FD_OFFSET) = fd;
+    *(int32_t*)((char*)fd_obj + FD_OFFSET) = fd;
 }
 
 /*

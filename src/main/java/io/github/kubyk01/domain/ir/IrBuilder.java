@@ -118,15 +118,49 @@ public class IrBuilder {
         return load;
     }
 
-    public Instruction createStore(Value value, int localIndex) {
+    /**
+     * Creates a STORE into a JVM local slot, using an explicitly supplied
+     * slot type.
+     *
+     * <p>The type of a JVM local slot is fixed by the bytecode opcode that
+     * accesses it, not by the type of any single value that flows through
+     * it. ISTORE always targets an int slot, LSTORE always targets a long
+     * slot, and so on. There is no opcode that stores a byte, short, char,
+     * or boolean into a slot, even though the value being stored may carry
+     * one of those narrow types as a result of BALOAD/CALOAD/SALOAD, an
+     * explicit narrowing conversion (I2B/I2C/I2S), or a boolean-producing
+     * comparison.</p>
+     *
+     * <p>The slot type is therefore an intrinsic property of the access
+     * and must be passed in explicitly rather than inferred from the
+     * value. The single-argument overload below exists for callers that
+     * are not modelling a JVM local slot and for which the value's type
+     * really is the right answer.</p>
+     *
+     * @param value      the value to store into the slot
+     * @param localIndex the JVM local slot index
+     * @param localType  the slot's declared type (nullable: falls back to
+     *                   {@code value.getType()})
+     */
+    public Instruction createStore(Value value, int localIndex, Type localType) {
         Instruction store = new Instruction(Opcode.STORE);
         store.addOperand(value);
         store.setLocalIndex(localIndex);
-        Temporary tmp = newTemporary(value.getType());
+        Type slotType = (localType != null) ? localType : value.getType();
+        Temporary tmp = newTemporary(slotType);
         store.setResult(tmp);
         tmp.setDefiningInstruction(store);
         if (currentBlock != null) currentBlock.addInstruction(store);
         return store;
+    }
+
+    /**
+     * Creates a STORE using the type of {@code value} as the slot's
+     * declared type. Prefer {@link #createStore(Value, int, Type)} when
+     * the slot's declared type is known from the bytecode opcode.
+     */
+    public Instruction createStore(Value value, int localIndex) {
+        return createStore(value, localIndex, value.getType());
     }
 
     private boolean returnsValue(Opcode op) {
@@ -184,11 +218,41 @@ public class IrBuilder {
 
     private Type inferResultType(Opcode op, Value... operands) {
         return switch (op) {
+            case EQ, NE, LT, LE, GT, GE -> Type.BOOLEAN;
             case INSTANCEOF -> Type.BOOLEAN;
             case CHECKCAST -> {
+                // The descriptor constant's own type always stays
+                // Type.reference(...) — that is what LlvmUtil.extractTypeName
+                // looks for (isReference()), and what the CHECKCAST case in
+                // LlvmFunctionEmitter looks for (typeName.startsWith("[")).
+                // Only the RESULT type of the instruction changes.
+                //
+                // For a typeName starting with '[', the result must be
+                // Type.array(...), not Type.reference(...). The difference is
+                // observable:
+                //
+                //   - Type.isArray()     -> true for ARRAY, false for REFERENCE
+                //   - Type.isReference() -> false for ARRAY, true for REFERENCE
+                //   - LlvmTypeMapper.toLlvmType -> "i8*" in both cases
+                //
+                // In the VIRTUAL_CALL case of LlvmFunctionEmitter the
+                // direct-dispatch branch is chosen when receiverIsArray == true.
+                // If the checkcast result is typed as REFERENCE, receiverIsArray
+                // is false and the call goes down the vtable path instead. For
+                // an array obj[0] is a %ReflectionClass* (see
+                // JAVA_ARR_KLASS_OFFSET), not a %JNativeVTable*. Loading
+                // "%JNativeVTable*" out of obj[0] yields a pointer to the class
+                // mirror, and a getelementptr on it yields methods of class
+                // java.lang.Class rather than Object's. The result is dispatch
+                // through a foreign table with a garbage funcPtr and an
+                // infinite loop in foreign code.
                 if (operands.length > 1 && operands[1] instanceof Constant c) {
                     if (c.getType().isReference()) {
-                        yield Type.reference(c.getValue().toString());
+                        String typeName = String.valueOf(c.getValue());
+                        if (typeName.startsWith("[")) {
+                            yield Type.fromDescriptor(typeName);
+                        }
+                        yield Type.reference(typeName);
                     }
                 }
                 yield operands.length > 0 ? operands[0].getType() : Type.UNKNOWN;
@@ -222,11 +286,9 @@ public class IrBuilder {
                 }
                 yield Type.UNKNOWN;
             }
-            case ADD, SUB, MUL, DIV, REM, AND, OR, XOR, SHL, SHR, USHR -> {
+            case ADD, SUB, MUL, DIV, REM, AND, OR, XOR, SHL, SHR, USHR ->
                 // Compute the common numeric type
-                Type common = computeCommonArithmeticType(operands);
-                yield common;
-            }
+                computeCommonArithmeticType(operands);
             default -> {
                 if (operands.length > 0 && operands[0] != null) {
                     yield operands[0].getType();

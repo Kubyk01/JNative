@@ -9,10 +9,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 
-__attribute__((noreturn)) void __jnative_throw_exception(void* exc);
-__attribute__((noreturn)) void __jnative_throw_null_pointer_exception(void);
-
-extern const char* __jnative_read_string_bytes(void* s, int32_t* out_len);
+#include "jnative_runtime.h"
 
 /*
  * Object layout used by this runtime for java.io.RandomAccessFile:
@@ -38,16 +35,12 @@ extern const char* __jnative_read_string_bytes(void* s, int32_t* out_len);
 #define RAF_POSITION_OFFSET 16
 #define RAF_RW_OFFSET       24
 
-#define FD_RAW_FD_OFFSET    8
-
-#define JAVA_ARR_HDR 8
-
 static inline void* fd_object_of(void* this_file) {
     return *(void**)((char*)this_file + RAF_FD_OFFSET);
 }
 
 static inline int32_t fd_of_fd_object(void* fd_obj) {
-    return *(int32_t*)((char*)fd_obj + FD_RAW_FD_OFFSET);
+    return *(int32_t*)((char*)fd_obj + FD_OFFSET);
 }
 
 /* --------------------------------------------------------------------------
@@ -118,7 +111,7 @@ void __jnative_fn_java_io_RandomAccessFile_open0__Ljava_lang_String_I_V(
         return;
     }
 
-    *(int32_t*)((char*)fd_obj + FD_RAW_FD_OFFSET) = fd;
+    *(int32_t*)((char*)fd_obj + FD_OFFSET) = fd;
 }
 
 /* --------------------------------------------------------------------------

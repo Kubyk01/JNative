@@ -5,7 +5,7 @@
 #include <unistd.h>
 #include <sys/types.h>
 
-__attribute__((noreturn)) void __jnative_throw_exception(void* exc);
+#include "jnative_runtime.h"
 
 /*
  * sun.nio.fs.UnixFileSystem — the last-resort file-copy native.
@@ -23,7 +23,7 @@ __attribute__((noreturn)) void __jnative_throw_exception(void* exc);
  * the kernel-assisted fast paths, and this one is deliberately dumb.
  */
 
-/* -------------------------------------------------------------------------
+/*
  * static native void bufferedCopy0(int src, int dst, long position,
  *                                  int size, long address)
  *     throws IOException;
@@ -33,16 +33,16 @@ __attribute__((noreturn)) void __jnative_throw_exception(void* exc);
  * and continuing until the source reaches end-of-file. The intermediate
  * buffer is a native allocation whose address is `address` and whose
  * capacity is `size` bytes; both are provided by the Java caller (which
- * typically allocates a direct ByteBuffer for the purpose and passes its
- * base address and capacity).
+ * typically allocates a direct ByteBuffer for the purpose and passes
+ * its base address and capacity).
  *
  * Why a pread/write loop rather than read/write on a seeked fd:
  *
- *   - pread(2) reads from an explicit offset without touching the file's
- *     stored position. That means the source descriptor's position is
- *     unchanged by this call, which is important because the Java-side
- *     caller may be sharing the descriptor with other operations that
- *     track position through lseek;
+ *   - pread(2) reads from an explicit offset without touching the
+ *     file's stored position. That means the source descriptor's
+ *     position is unchanged by this call, which is important because
+ *     the Java-side caller may be sharing the descriptor with other
+ *     operations that track position through lseek;
  *
  *   - the destination descriptor's own position is not touched either,
  *     because plain write(2) is being used and the caller is expected
@@ -60,7 +60,7 @@ __attribute__((noreturn)) void __jnative_throw_exception(void* exc);
  * A partial write that returns 0 for a non-zero count is treated as
  * failure: for a regular file, write(2) returning 0 is not a legitimate
  * outcome, and looping on it would hang the copy forever.
- * ----------------------------------------------------------------------- */
+ */
 void __jnative_fn_sun_nio_fs_UnixFileSystem_bufferedCopy0__IIJIJ_V(
         int32_t src, int32_t dst, int64_t position, int32_t size, int64_t address)
 {
@@ -99,9 +99,11 @@ void __jnative_fn_sun_nio_fs_UnixFileSystem_bufferedCopy0__IIJIJ_V(
                 return;
             }
             if (w == 0) {
-                /* write(2) returning 0 for a non-zero count on a regular
-                 * file is not a legitimate outcome; treat it as failure
-                 * rather than looping forever. */
+                /*
+                 * write(2) returning 0 for a non-zero count on a
+                 * regular file is not a legitimate outcome; treat it
+                 * as failure rather than looping forever.
+                 */
                 __jnative_throw_exception(NULL);
                 return;
             }

@@ -107,6 +107,101 @@ public class MethodBytecodeVisitor extends ClassVisitor {
     }
 
     // ------------------------------------------------------------------
+    //  Recognizer for MethodHandles.Lookup.findXxx.
+    //
+    //  Lives on the outer class rather than on MethodVisitorImpl so that it
+    //  can be consulted from two different places (isReflectiveCall and
+    //  handleReflectiveCall) without duplication. It is static because it
+    //  touches no visitor state; all of its inputs arrive as arguments.
+    // ------------------------------------------------------------------
+
+    /**
+     * Recognises the {@code MethodHandles.Lookup.findXxx} family.
+     *
+     * <p>These methods are the standard mechanism by which modern JDK code
+     * obtains a {@code MethodHandle} or {@code VarHandle} for a field or
+     * method whose declaring class is known at compile time. Functionally
+     * they are equivalent to {@code Class.getDeclaredMethod} followed by
+     * {@code MethodHandles.unreflect} (or the corresponding pair for a
+     * field), but they skip the intermediate {@code Method}/{@code Field}
+     * mirror.</p>
+     *
+     * <p>They matter for reachability for exactly the same reason the
+     * {@code Class.getDeclaredMethod} family does: without registering the
+     * target in {@link ReflectInfo}, the native
+     * {@code Class.getDeclaredMethods0} hands the JDK an empty array, and
+     * any reflective lookup built on top of it fails with
+     * {@code NoSuchMethodException}.</p>
+     *
+     * <p>Recognised signatures (JDK 21):</p>
+     * <ul>
+     *   <li>{@code findStatic(Class<?>, String, MethodType)}</li>
+     *   <li>{@code findVirtual(Class<?>, String, MethodType)}</li>
+     *   <li>{@code findSpecial(Class<?>, String, MethodType, Class<?>)}</li>
+     *   <li>{@code findConstructor(Class<?>, MethodType)}</li>
+     *   <li>{@code findGetter(Class<?>, String, Class<?>)}</li>
+     *   <li>{@code findSetter(Class<?>, String, Class<?>)}</li>
+     *   <li>{@code findStaticGetter(Class<?>, String, Class<?>)}</li>
+     *   <li>{@code findStaticSetter(Class<?>, String, Class<?>)}</li>
+     *   <li>{@code findVarHandle(Class<?>, String, Class<?>)}</li>
+     *   <li>{@code findStaticVarHandle(Class<?>, String, Class<?>)}</li>
+     * </ul>
+     *
+     * <p>Matching is done on the exact descriptor, not on the method-name
+     * prefix. {@code Lookup} contains other {@code find}-prefixed methods
+     * ({@code findClass}, …) that are not reflective and must not reach
+     * the handler. An exact-signature match rules them out without any
+     * additional return-type analysis.</p>
+     */
+    private static boolean isLookupFindMethod(String owner, String name, String desc) {
+        if (!owner.equals("java/lang/invoke/MethodHandles$Lookup")) {
+            return false;
+        }
+
+        // findStatic / findVirtual take (Class, String, MethodType).
+        if (name.equals("findStatic") || name.equals("findVirtual")) {
+            return desc.equals(
+                "(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/invoke/MethodType;)"
+                    + "Ljava/lang/invoke/MethodHandle;");
+        }
+
+        // findSpecial adds a fourth argument — the class from which the
+        // "special" invocation is made (for super/private dispatch).
+        if (name.equals("findSpecial")) {
+            return desc.equals(
+                "(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/invoke/MethodType;"
+                    + "Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;");
+        }
+
+        // findConstructor has no method-name argument: a constructor is
+        // always <init>.
+        if (name.equals("findConstructor")) {
+            return desc.equals(
+                "(Ljava/lang/Class;Ljava/lang/invoke/MethodType;)"
+                    + "Ljava/lang/invoke/MethodHandle;");
+        }
+
+        // Field getter/setter — MethodHandle variants.
+        if (name.equals("findGetter") || name.equals("findSetter")
+            || name.equals("findStaticGetter") || name.equals("findStaticSetter")) {
+            return desc.equals(
+                "(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/Class;)"
+                    + "Ljava/lang/invoke/MethodHandle;");
+        }
+
+        // VarHandle variants. The return type differs (VarHandle rather
+        // than MethodHandle), and that is the only thing distinguishing
+        // them from the getter/setter family at the descriptor level.
+        if (name.equals("findVarHandle") || name.equals("findStaticVarHandle")) {
+            return desc.equals(
+                "(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/Class;)"
+                    + "Ljava/lang/invoke/VarHandle;");
+        }
+
+        return false;
+    }
+
+    // ------------------------------------------------------------------
     //  MethodVisitor
     // ------------------------------------------------------------------
 
@@ -143,9 +238,29 @@ public class MethodBytecodeVisitor extends ClassVisitor {
 
         @Override
         public void visitTypeInsn(int opcode, String type) {
-            if (opcode == Opcodes.NEW || opcode == Opcodes.ANEWARRAY || opcode == Opcodes.MULTIANEWARRAY) {
-                // new X / new X[] / new X[][] — active use of X.
+            if (opcode == Opcodes.NEW) {
+                // `new X` is an active use of X: JLS §12.4.1 requires
+                // X's <clinit> to run before the constructor is invoked.
                 analysis.addInstantiatedClass(type, reachableFromUser);
+            } else if (opcode == Opcodes.ANEWARRAY) {
+                // `new X[n]` does NOT trigger initialization of X.
+                // JLS §12.4.1: array creation is not an active use of
+                // the element type; only the array class itself is
+                // created, and it has no <clinit>. The element type
+                // must merely be loadable — its Class mirror has to
+                // exist for getClass()/instanceof on the resulting
+                // array — so the reference is registered as passive.
+                addClass(type);
+            } else if (opcode == Opcodes.MULTIANEWARRAY) {
+                // `type` is an array descriptor such as
+                // "[[Ljava/lang/String;". The only non-array class
+                // that needs a mirror is the innermost reference
+                // component; a fully primitive descriptor such as
+                // "[[I" needs no class at all.
+                String elem = elementClassOfArrayDescriptor(type);
+                if (elem != null) {
+                    addClass(elem);
+                }
             }
             simulator.visitTypeInsn(opcode, type);
             super.visitTypeInsn(opcode, type);
@@ -161,7 +276,7 @@ public class MethodBytecodeVisitor extends ClassVisitor {
                 analysis.triggerClinit(owner, reachableFromUser);
             }
             simulator.visitFieldInsn(opcode, descriptor);
-            super.visitFieldInsn(opcode, owner, name, descriptor);
+            super.visitFieldInsn(opcode, owner, name == null ? name : name, name);
         }
 
         @Override
@@ -175,10 +290,20 @@ public class MethodBytecodeVisitor extends ClassVisitor {
                 for (int i = 0; i < argCount; i++) {
                     args.addFirst(simulator.pop());
                 }
+                // Capture the receiver instead of discarding it. For the
+                // Class.getDeclaredMethod / getMethod / getDeclaredField /
+                // getField / newInstance families the *receiver* is the
+                // class whose members are being looked up, and for
+                // varargs forms the receiver's class literal is not the
+                // last LDC class literal in the bytecode (parameter class
+                // literals between it and INVOKEVIRTUAL overwrite
+                // `lastLoadedClass`). Passing the receiver explicitly is
+                // therefore the only reliable source for the target class.
+                TypedValue receiver = null;
                 if (opcode != Opcodes.INVOKESTATIC) {
-                    simulator.pop();
+                    receiver = simulator.pop();
                 }
-                handleReflectiveCall(owner, mName, mDesc, args);
+                handleReflectiveCall(owner, mName, mDesc, receiver, args);
                 Type retType = TypeResolver.descToReturnType(mDesc);
                 if (!retType.isVoid()) {
                     simulator.push(TypedValue.fromType(retType));
@@ -190,56 +315,91 @@ public class MethodBytecodeVisitor extends ClassVisitor {
                         ? rawReceiverType
                         : null;
 
-                // Always add the method for the owner
+                // Always add the method for the owner.
                 MethodReference ownerRef = new MethodReference(owner, mName, mDesc);
                 addMethodWithContext(ownerRef, reachableFromUser);
 
-                // invokestatic triggers class initialization of the owner
-                // ONLY when the target Java method actually has a body that
-                // could read Java-side static state. A native method's
-                // implementation lives in C and is completely independent
-                // of the class's <clinit>; forcing <clinit> for it would
-                // pull in e.g. Thread.<clinit> (registerNatives) just
-                // because someone called Thread.currentThread().
+                // invokestatic triggers class initialization of the
+                // class that *declares* the target method, not of the
+                // class through which the call site refers to it. JLS
+                // §12.4.1 initializes the declaring class; a static
+                // method inherited from Super and invoked as Sub.m()
+                // initializes Super, not Sub.
+                //
+                // A native method's implementation lives in C and is
+                // independent of the class's <clinit>; forcing <clinit>
+                // for it would pull in e.g. Thread.<clinit>
+                // (registerNatives) just because someone called
+                // Thread.currentThread().
                 if (opcode == Opcodes.INVOKESTATIC) {
                     String[] foundOwner = new String[1];
                     MethodNode target = resolver.findMethodInHierarchy(
                         owner, mName, mDesc, foundOwner);
                     if (target == null || !target.isNative()) {
-                        analysis.triggerClinit(owner, reachableFromUser);
+                        String declOwner = (foundOwner[0] != null && !foundOwner[0].isEmpty())
+                            ? foundOwner[0]
+                            : owner;
+                        analysis.triggerClinit(declOwner, reachableFromUser);
                     }
                 }
 
                 if (opcode == Opcodes.INVOKEVIRTUAL || opcode == Opcodes.INVOKEINTERFACE) {
-                    Set<String> candidateTypes = new HashSet<>();
+                    Set<String> candidateTypes;
 
                     if (receiverType != null && isConcreteClass(receiverType)) {
                         // The simulator pinned the receiver to an exact
                         // concrete class: register that class passively
                         // and use it as the sole dispatch candidate.
                         addClass(receiverType);
-                        candidateTypes.add(receiverType);
+                        candidateTypes = Collections.singleton(receiverType);
                     } else {
                         String dispatchRoot = receiverType != null ? receiverType : owner;
-                        Set<String> subclasses = new HashSet<>(
-                            resolver.getSubclasses(dispatchRoot));
-                        if (subclasses.isEmpty()) {
-                            subclasses.add(owner);
-                        }
-                        candidateTypes.addAll(subclasses);
-                        if (receiverType != null) {
-                            candidateTypes.add(receiverType);
-                        }
+
+                        // Primary optimisation: the dynamic type of a
+                        // receiver is, by construction, an instantiated
+                        // class. Only classes that have been observed
+                        // being created (via NEW, a tracked reflective
+                        // factory, or an allocator the runtime emits) can
+                        // be the runtime type of a receiver, so the
+                        // candidate set is the intersection of
+                        // "subtypes of dispatchRoot" with "instantiated".
+                        //
+                        // Correctness: the set of instantiated classes
+                        // grows monotonically as the worklist processes
+                        // NEW instructions, and the deferred fixed-point
+                        // pass in ReachabilityAnalysis
+                        // (resolveVirtualDispatchFixedPoint)
+                        // re-resolves every recorded dispatch site
+                        // against the final instantiation set. A
+                        // subclass that becomes instantiated after this
+                        // site was first recorded is still picked up on
+                        // a later pass of that loop.
+                        //
+                        // The previous revision fell back to the full
+                        // resolver.getSubclasses(dispatchRoot) set
+                        // whenever no instantiated subtype was known yet.
+                        // For dispatchRoot == java/lang/Object — the
+                        // static type of every argument to
+                        // String.valueOf, every element of an Object[]
+                        // iteration, and every generic-typed receiver —
+                        // that fallback expands to every loaded class in
+                        // the image. On a three-class input it turned a
+                        // handful of reachable methods into ~27k by
+                        // pulling in every unrelated override of
+                        // toString / hashCode / equals that happens to
+                        // be present in the JDK. It has been removed.
+                        candidateTypes = analysis.instantiatedSubclasses(dispatchRoot);
                     }
 
-                    // For each candidate receiver, resolve to the class that
-                    // actually declares the dispatched implementation. Only
-                    // that declaring class (if different from `owner`) is a
-                    // genuinely new reachable target. Subclasses that simply
-                    // inherit the owner's implementation contribute nothing
-                    // and must not be registered as reachable — otherwise a
-                    // single virtual call on an unknown receiver pulls in
-                    // every loaded subclass.
+                    // For each candidate receiver, resolve to the class
+                    // that actually declares the dispatched
+                    // implementation. Only that declaring class (if
+                    // different from `owner`) is a genuinely new
+                    // reachable target. Subclasses that simply inherit
+                    // the owner's implementation contribute nothing and
+                    // must not be registered as reachable — otherwise a
+                    // single virtual call on an unknown receiver pulls
+                    // in every loaded subclass.
                     Set<String> addedDeclaringClasses = new HashSet<>();
                     for (String target : candidateTypes) {
                         if (target.equals(owner)) continue;
@@ -258,7 +418,7 @@ public class MethodBytecodeVisitor extends ClassVisitor {
                         }
                     }
                 }
-                // For INVOKESPECIAL we already added ownerRef above
+                // For INVOKESPECIAL we already added ownerRef above.
                 simulator.visitMethodInsn(opcode, mDesc);
             }
             super.visitMethodInsn(opcode, owner, mName, mDesc, isInterface);
@@ -358,6 +518,11 @@ public class MethodBytecodeVisitor extends ClassVisitor {
                 return true;
             if (owner.equals("java/lang/ClassLoader") && name.equals("loadClass") && desc.equals("(Ljava/lang/String;)Ljava/lang/Class;"))
                 return true;
+            // NOTE: no closing parenthesis in the prefix. The descriptor of
+            // the varargs forms is
+            //     (Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;
+            // so a prefix that included the ')' would never match, and the
+            // entire handler below would be dead code.
             if (owner.equals("java/lang/Class") && (name.equals("getMethod") || name.equals("getDeclaredMethod"))
                 && desc.startsWith("(Ljava/lang/String;")) {
                 return true;
@@ -404,13 +569,69 @@ public class MethodBytecodeVisitor extends ClassVisitor {
                 && desc.equals("(Ljava/lang/Class;Ljava/lang/String;)J")) {
                 return true;
             }
+            // ------------------------------------------------------------------
+            // jdk.internal.misc.Unsafe.allocateInstance(Class<?>)
+            //
+            // Allocates an instance of the given class without invoking a
+            // constructor. Used by ReflectionFactory for deserialisation
+            // and by a handful of JDK classes that need to bypass the
+            // no-arg-constructor requirement. The class argument is
+            // always an LDC of a class literal in JDK call sites, so
+            // lastLoadedClass holds the target. Registering the class as
+            // instantiated is what keeps the virtual-dispatch candidate
+            // filter from dropping overrides on the class.
+            // ------------------------------------------------------------------
+            if (owner.equals("jdk/internal/misc/Unsafe")
+                && name.equals("allocateInstance")
+                && desc.equals("(Ljava/lang/Class;)Ljava/lang/Object;")) {
+                return true;
+            }
+            // ------------------------------------------------------------------
+            // MethodHandles.Lookup.findStatic / findVirtual / findSpecial /
+            // findConstructor / findGetter / findSetter / findStaticGetter /
+            // findStaticSetter / findVarHandle / findStaticVarHandle.
+            //
+            // These calls are the primary mechanism by which JDK 9+
+            // resolves MethodHandles and VarHandles for fields and methods
+            // known at compile time. They were not recognised by previous
+            // revisions of this visitor, and that is precisely why
+            // @refmethods_* for
+            // java.lang.invoke.MethodHandleImpl$CountingWrapper ended up
+            // empty and the class's <clinit> failed with a
+            // NoSuchMethodException wrapped in an InternalError.
+            // ------------------------------------------------------------------
+            if (isLookupFindMethod(owner, name, desc)) {
+                return true;
+            }
             return false;
         }
 
         private void handleReflectiveCall(String owner, String mName, String mDesc,
-                                          List<TypedValue> args) {
+                                          TypedValue receiver, List<TypedValue> args) {
             MethodReference reflectiveRef = new MethodReference(owner, mName, mDesc);
             addMethodWithContext(reflectiveRef, reachableFromUser);
+
+            // ------------------------------------------------------------------
+            // Lookup.findXxx is handled BEFORE the reachableFromUser check.
+            //
+            // Reflective calls issued from a system <clinit> — for example,
+            // from java.lang.invoke.MethodHandleImpl$CountingWrapper.<clinit>
+            // — are executed at run time regardless of whether the <clinit>
+            // itself was reached directly from user code or through a chain
+            // of system initializers. Registering the target in ReflectInfo
+            // is a run-time artefact that must be produced in both cases;
+            // otherwise Class.getDeclaredMethods0 returns an empty array and
+            // the reflective lookup fails with NoSuchMethodException.
+            //
+            // That is why the reachableFromUser guard is skipped for this
+            // family. The only thing the guard would have limited here is
+            // the growth of the reflection table, and correctness outweighs
+            // that concern.
+            // ------------------------------------------------------------------
+            if (isLookupFindMethod(owner, mName, mDesc)) {
+                handleLookupFindCall(mName, args);
+                return;
+            }
 
             if (!reachableFromUser) return;
 
@@ -438,6 +659,28 @@ public class MethodBytecodeVisitor extends ClassVisitor {
                 return;
             }
 
+            // ------------------------------------------------------------------
+            // Unsafe.allocateInstance(Class<?>)
+            //
+            // The class argument is a class literal whose internal name
+            // has already been stashed in lastLoadedClass. Recording the
+            // class as instantiated keeps the virtual-dispatch candidate
+            // filter from dropping overrides that live exclusively on it.
+            // ------------------------------------------------------------------
+            if (owner.equals("jdk/internal/misc/Unsafe")
+                && mName.equals("allocateInstance")
+                && mDesc.equals("(Ljava/lang/Class;)Ljava/lang/Object;")) {
+                String target = resolveClassNameFromValue(
+                    args.isEmpty() ? null : args.getFirst());
+                if (target == null) {
+                    target = lastLoadedClass;
+                }
+                if (target != null) {
+                    analysis.addInstantiatedClass(target, reachableFromUser);
+                }
+                return;
+            }
+
             if (owner.equals("java/lang/Class") && mName.equals("forName")
                 && mDesc.equals("(Ljava/lang/String;)Ljava/lang/Class;")) {
                 if (!args.isEmpty()) {
@@ -462,12 +705,70 @@ public class MethodBytecodeVisitor extends ClassVisitor {
                 }
                 return;
             }
-            if (owner.equals("java/lang/Class") && (mName.equals("getMethod") || mName.equals("getDeclaredMethod"))
+
+            // ------------------------------------------------------------------
+            // Class.getMethod / Class.getDeclaredMethod.
+            //
+            // Both are declared as varargs:
+            //
+            //     Method getDeclaredMethod(String name, Class<?>... parameterTypes)
+            //     Method getMethod        (String name, Class<?>... parameterTypes)
+            //
+            // When the call site supplies one or more parameter types, javac
+            // wraps them into a synthetic Class[]:
+            //
+            //     LDC Target.class           ; <- receiver (loaded FIRST)
+            //     LDC "name"
+            //     ICONST_N
+            //     ANEWARRAY java/lang/Class
+            //     DUP
+            //     ICONST_0
+            //     LDC Param0.class           ; <- overwrites lastLoadedClass
+            //     AASTORE
+            //     ...
+            //     INVOKEVIRTUAL Class.getDeclaredMethod
+            //
+            // Two consequences:
+            //
+            //   1. The target class is the *receiver*, not `lastLoadedClass`.
+            //      Between the receiver's class literal and the call site,
+            //      every parameter's class literal is also loaded via LDC,
+            //      so `lastLoadedClass` ends up being the last parameter's
+            //      class. The concrete failure was
+            //      java.lang.invoke.MethodHandleImpl$CountingWrapper.<clinit>,
+            //      whose getDeclaredMethod("maybeStopCounting", Object.class)
+            //      left lastLoadedClass = "java/lang/Object" and never
+            //      registered the target method.
+            //
+            //   2. The parameter list arrives as a single opaque array from
+            //      the TypeSimulator's point of view, so it cannot be used
+            //      to select a specific overload. The exact-match pass is
+            //      attempted first and, when the list cannot be recovered,
+            //      the code falls back to name-only registration — the
+            //      JDK's own Class.getDeclaredMethod re-checks the exact
+            //      signature at run time from the caller's Class[], so
+            //      registering extra overloads costs nothing in correctness.
+            //
+            // The prefix check intentionally omits the closing parenthesis,
+            // because the varargs descriptor continues with '[' immediately
+            // after the String argument. A prefix that included ')' would
+            // never match any real Class.getDeclaredMethod call site.
+            // ------------------------------------------------------------------
+            if (owner.equals("java/lang/Class")
+                && (mName.equals("getMethod") || mName.equals("getDeclaredMethod"))
                 && mDesc.startsWith("(Ljava/lang/String;")) {
                 if (args.isEmpty()) return;
+
                 TypedValue nameArg = args.getFirst();
                 if (!nameArg.isConstant() || !(nameArg.getValue() instanceof String methodName)) return;
+                if (methodName.isEmpty()) return;
+                // <clinit> is never requested reflectively; <init> is
+                // requested only through the constructor APIs.
+                if (methodName.equals("<clinit>")) return;
+                if (methodName.equals("<init>")) return;
+
                 List<String> paramClassNames = new ArrayList<>();
+                boolean paramsFullyResolved = true;
                 for (int i = 1; i < args.size(); i++) {
                     TypedValue param = args.get(i);
                     if (param.isConstant() && param.getValue() instanceof String) {
@@ -476,40 +777,91 @@ public class MethodBytecodeVisitor extends ClassVisitor {
                         paramClassNames.add(param.getClassName());
                     } else if (param.getType().isReference()) {
                         String cls = param.getType().getClassName();
-                        if (cls != null) paramClassNames.add(cls);
+                        if (cls != null) {
+                            paramClassNames.add(cls);
+                        } else {
+                            paramsFullyResolved = false;
+                        }
+                    } else {
+                        // Array argument — the common varargs Class[] form.
+                        // Its elements are not visible through the
+                        // simulator, so the list cannot be completed.
+                        paramsFullyResolved = false;
+                        break;
                     }
                 }
-                if (lastLoadedClass == null) return;
-                String targetClass = lastLoadedClass;
+
+                // Target class = receiver of the INVOKEVIRTUAL. Fall back to
+                // lastLoadedClass only when the receiver was not statically
+                // resolvable (for example, it was stored into a local under
+                // an opaque type).
+                String targetClass = null;
+                if (receiver != null) {
+                    targetClass = resolveClassNameFromValue(receiver);
+                }
+                if (targetClass == null) {
+                    targetClass = lastLoadedClass;
+                }
+                if (targetClass == null) return;
+
                 ClassNode cn = resolver.getClassNode(targetClass);
                 if (cn == null || cn.isExternal()) return;
-                for (MethodNode mn : cn.getMethods()) {
-                    if (mn.getName().equals(methodName) && !mn.getName().equals("<init>")) {
+
+                boolean anyRegistered = false;
+
+                if (paramsFullyResolved) {
+                    for (MethodNode mn : cn.getMethods()) {
+                        if (!mn.getName().equals(methodName)) continue;
+                        if (mn.getName().equals("<clinit>")) continue;
+                        if (mn.getName().equals("<init>")) continue;
+
                         List<Type> paramTypes = mn.getParameterTypes();
-                        if (paramTypes.size() == paramClassNames.size()) {
-                            boolean match = true;
-                            for (int i = 0; i < paramTypes.size(); i++) {
-                                Type pt = paramTypes.get(i);
-                                String expected = paramClassNames.get(i);
-                                if (!typeMatches(expected, pt)) { match = false; break; }
+                        if (paramTypes.size() != paramClassNames.size()) continue;
+
+                        boolean match = true;
+                        for (int i = 0; i < paramTypes.size(); i++) {
+                            Type pt = paramTypes.get(i);
+                            String expected = paramClassNames.get(i);
+                            if (!typeMatches(expected, pt)) {
+                                match = false;
+                                break;
                             }
-                            if (match) {
-                                MethodReference ref = new MethodReference(targetClass, mn.getName(), mn.getDescriptor());
-                                reflectInfo.addMethod(targetClass, ref);
-                                addMethodWithContext(ref, true);
-                            }
+                        }
+                        if (match) {
+                            MethodReference ref = new MethodReference(
+                                targetClass, mn.getName(), mn.getDescriptor());
+                            reflectInfo.addMethod(targetClass, ref);
+                            addMethodWithContext(ref, true);
+                            anyRegistered = true;
                         }
                     }
                 }
+
+                if (!anyRegistered) {
+                    registerAllMethodsByName(targetClass, cn, methodName);
+                }
                 return;
             }
-            if (owner.equals("java/lang/Class") && (mName.equals("getField") || mName.equals("getDeclaredField"))
+
+            if (owner.equals("java/lang/Class")
+                && (mName.equals("getField") || mName.equals("getDeclaredField"))
                 && mDesc.startsWith("(Ljava/lang/String;)")) {
                 if (!args.isEmpty()) {
                     TypedValue arg = args.getFirst();
                     if (arg.isConstant() && arg.getValue() instanceof String fieldName) {
-                        if (lastLoadedClass != null) {
-                            String targetClass = lastLoadedClass;
+                        // Receiver is the class the field is looked up on.
+                        // Same reasoning as getDeclaredMethod above: the
+                        // lastLoadedClass fallback is unsafe when the call
+                        // site has any other class literal between the
+                        // receiver's literal and the reflective invocation.
+                        String targetClass = null;
+                        if (receiver != null) {
+                            targetClass = resolveClassNameFromValue(receiver);
+                        }
+                        if (targetClass == null) {
+                            targetClass = lastLoadedClass;
+                        }
+                        if (targetClass != null) {
                             FieldReference ref = new FieldReference(targetClass, fieldName, null);
                             reflectInfo.addField(targetClass, ref);
                             addClassWithInit(targetClass);
@@ -541,8 +893,14 @@ public class MethodBytecodeVisitor extends ClassVisitor {
             }
             if (owner.equals("java/lang/Class") && mName.equals("newInstance")
                 && mDesc.equals("()Ljava/lang/Object;")) {
-                if (lastLoadedClass != null) {
-                    String targetClass = lastLoadedClass;
+                String targetClass = null;
+                if (receiver != null) {
+                    targetClass = resolveClassNameFromValue(receiver);
+                }
+                if (targetClass == null) {
+                    targetClass = lastLoadedClass;
+                }
+                if (targetClass != null) {
                     ClassNode cn = resolver.getClassNode(targetClass);
                     if (cn != null && !cn.isExternal()) {
                         for (MethodNode mn : cn.getMethods()) {
@@ -556,6 +914,248 @@ public class MethodBytecodeVisitor extends ClassVisitor {
                     }
                 }
             }
+        }
+
+        /**
+         * Handles a single call site of the
+         * {@code MethodHandles.Lookup.findXxx} family: determines the
+         * target class and registers in {@link #reflectInfo} every
+         * method or field that could be the subject of the call.
+         *
+         * <p>Unlike {@code Class.getDeclaredMethod}, which takes a
+         * {@code Class[]} of parameter types and allows the specific
+         * overload to be identified exactly when that array is
+         * statically resolvable, the {@code findXxx} family takes a
+         * {@code MethodType} — an object whose contents are opaque at
+         * the bytecode level. The handler therefore matches by name:
+         * every declared method (or field) of the target class whose
+         * name equals the string-literal argument is registered. The
+         * JDK's own reflective search ({@code getDeclaredMethods0}
+         * followed by {@code searchMethods}) then selects the correct
+         * overload at run time from the actual {@code MethodType}, so
+         * the over-approximation is safe: it can only make the
+         * reflection table more complete, never less.</p>
+         *
+         * <p>Argument positions (JDK 21):</p>
+         * <ul>
+         *   <li>{@code findStatic}, {@code findVirtual}:
+         *       {@code [0]=Class, [1]=String, [2]=MethodType}</li>
+         *   <li>{@code findSpecial}:
+         *       {@code [0]=Class, [1]=String, [2]=MethodType, [3]=Class}</li>
+         *   <li>{@code findConstructor}: {@code [0]=Class, [1]=MethodType}</li>
+         *   <li>{@code findGetter}, {@code findSetter}, {@code findStaticGetter},
+         *       {@code findStaticSetter}, {@code findVarHandle},
+         *       {@code findStaticVarHandle}:
+         *       {@code [0]=Class, [1]=String, [2]=Class}</li>
+         * </ul>
+         *
+         * <p>If the target class or the name cannot be resolved as a
+         * constant (for example, the class is held in a local variable,
+         * or the name is computed at run time), the handler silently
+         * returns. This is a deliberate compromise: the JDK uses
+         * constant names at the overwhelming majority of call sites,
+         * and handling the dynamic case correctly would require a data
+         * flow trace across method boundaries, which is outside the
+         * scope of a single visitor.</p>
+         */
+        private void handleLookupFindCall(String mName, List<TypedValue> args) {
+            if (args.isEmpty()) return;
+
+            String targetClass = resolveClassNameFromValue(args.getFirst());
+            if (targetClass == null || targetClass.isEmpty()) return;
+
+            // Arrays have no methods of their own in this model;
+            // everything resolvable against an array is inherited from
+            // java/lang/Object and is already covered by the ordinary
+            // Object handling. Skip without loss of correctness.
+            if (targetClass.charAt(0) == '[') return;
+
+            ClassNode cn = resolver.getClassNode(targetClass);
+            if (cn == null || cn.isExternal() || resolver.getClassBytes(targetClass) == null) {
+                resolver.forceLoadSystemClass(targetClass);
+                cn = resolver.getClassNode(targetClass);
+            }
+            if (cn == null || cn.isExternal()) return;
+
+            if (mName.equals("findStatic") || mName.equals("findVirtual")
+                || mName.equals("findSpecial")) {
+                if (args.size() < 2) return;
+                TypedValue nameArg = args.get(1);
+                if (!nameArg.isConstant() || !(nameArg.getValue() instanceof String methodName)) return;
+                if (methodName.isEmpty()) return;
+                // <clinit> is never requested reflectively; <init> is
+                // requested only through findConstructor.
+                if (methodName.equals("<clinit>")) return;
+                if (methodName.equals("<init>")) return;
+
+                registerAllMethodsByName(targetClass, cn, methodName);
+                return;
+            }
+
+            if (mName.equals("findConstructor")) {
+                registerAllMethodsByName(targetClass, cn, "<init>");
+                return;
+            }
+
+            // Field getter/setter/VarHandle: [0]=Class, [1]=String.
+            if (args.size() < 2) return;
+            TypedValue nameArg = args.get(1);
+            if (!nameArg.isConstant() || !(nameArg.getValue() instanceof String fieldName)) return;
+            if (fieldName.isEmpty()) return;
+
+            registerAllFieldsByName(targetClass, cn, fieldName);
+        }
+
+        /**
+         * Registers in {@link #reflectInfo} every declared method named
+         * {@code methodName} and makes them reachable.
+         *
+         * <p>Matching by name alone is required for the
+         * {@code MethodHandles.Lookup.findXxx} family and for the
+         * varargs form of {@code Class.getDeclaredMethod} /
+         * {@code Class.getMethod}: in both cases the overload selector
+         * is an object whose contents are not visible at the bytecode
+         * level. The former passes a {@code MethodType}; the latter
+         * passes a compiler-generated {@code Class[]}. Registering
+         * every overload with a matching name guarantees that the
+         * reflective lookup performed at run time finds whatever
+         * overload the caller actually requests; the JDK rejects the
+         * call itself if no such overload exists, so the
+         * over-approximation costs nothing in correctness.</p>
+         *
+         * <p>For ordinary (non-{@code <init>}) methods the walk proceeds
+         * up the superclass chain and stops at the first class that
+         * declares at least one method of that name. This mirrors the
+         * semantics of the JDK's own {@code getMethod} /
+         * {@code findVirtual}: the search starts with the class itself
+         * and then ascends. Including superclass methods when the
+         * target class already holds a match would only inflate the
+         * reflection table without benefit.</p>
+         *
+         * <p>For {@code <init>} no such walk is performed: constructors
+         * are not inherited, and
+         * {@code findConstructor(X.class, ...)} resolves only against
+         * {@code <init>} of {@code X} itself. Constructors are recorded
+         * through {@link ReflectInfo#addConstructor}, not
+         * {@link ReflectInfo#addMethod}: they live in a separate bucket
+         * of {@link ReflectClassInfo} that {@code generateReflectionData}
+         * consumes to emit {@code @refctor_*} constants. Routing them
+         * into the {@code methods} bucket would make
+         * {@code emitAdaptorForMethod} try to build an adaptor symbol
+         * from the raw method name {@code "<init>"} — the angle brackets
+         * are not legal LLVM symbol characters and clang rejects the
+         * whole module with "expected '(' in function argument list".
+         * Independently, the JDK's own {@code getDeclaredMethods0}
+         * would start returning constructors from
+         * {@code Class.getDeclaredMethods()}, which is a separate
+         * semantic error.</p>
+         *
+         * <p>{@code addMethodWithContext} is called in both branches:
+         * it is what adds the target to the reachability worklist so
+         * that {@code BytecodeToIr} translates it into an IR
+         * {@code Function}. Registering the reference in
+         * {@code ReflectInfo} alone is not sufficient — without the
+         * reachability edge, {@code generateReflectionData} would find
+         * the entry in the reflection table but no corresponding
+         * function body to point the adaptor at, and would emit
+         * {@code i8* null} for that slot.</p>
+         */
+        private void registerAllMethodsByName(String targetClass, ClassNode cn, String methodName) {
+            if ("<init>".equals(methodName)) {
+                for (MethodNode mn : cn.getMethods()) {
+                    if (!mn.getName().equals("<init>")) continue;
+                    MethodReference ref = new MethodReference(
+                        targetClass, mn.getName(), mn.getDescriptor());
+                    // Constructor bucket: consumed by
+                    // emitAdaptorForConstructor, whose symbol-name
+                    // construction goes through mangleMethod and
+                    // therefore sanitises <init> correctly.
+                    reflectInfo.addConstructor(targetClass, ref);
+                    // Reachability edge: forces BytecodeToIr to emit
+                    // the constructor's body into the module.
+                    addMethodWithContext(ref, true);
+                }
+                return;
+            }
+
+            Set<String> visited = new HashSet<>();
+            ClassNode current = cn;
+            while (current != null
+                && !current.isExternal()
+                && visited.add(current.getName())) {
+
+                boolean found = false;
+                for (MethodNode mn : current.getMethods()) {
+                    if (!mn.getName().equals(methodName)) continue;
+                    if (mn.getName().equals("<clinit>")) continue;
+                    if (mn.getName().equals("<init>")) continue;
+
+                    MethodReference ref = new MethodReference(
+                        current.getName(), mn.getName(), mn.getDescriptor());
+                    reflectInfo.addMethod(current.getName(), ref);
+                    addMethodWithContext(ref, true);
+                    found = true;
+                }
+
+                // Stop at the first class in the chain that declares at
+                // least one overload with this name. There is no reason
+                // to continue: the JDK's own getMethod / findVirtual
+                // does the same — it returns the first match it finds,
+                // not the union of all ancestors' overloads.
+                if (found) break;
+
+                String superName = current.getSuperName();
+                if (superName == null || superName.equals(current.getName())) break;
+
+                ClassNode superNode = resolver.getClassNode(superName);
+                if (superNode == null || superNode.isExternal()) break;
+                current = superNode;
+            }
+        }
+
+        /**
+         * Registers in {@link #reflectInfo} every declared field named
+         * {@code fieldName} and makes the target class reachable.
+         *
+         * <p>Same reasoning as {@link #registerAllMethodsByName}: the
+         * {@code Class} argument that names the field's type cannot be
+         * used reliably to select a specific field, so every field with
+         * a matching name is registered. The run-time selection in
+         * {@code Unsafe.objectFieldOffset(Class, String)} then finds
+         * whatever field the caller actually requests.</p>
+         *
+         * <p>No superclass-chain walk is performed: both
+         * {@code findGetter}/{@code findSetter} and
+         * {@code findVarHandle} search for the field starting from the
+         * class itself and stop at the first name match. A field is
+         * either declared in the class itself or in one of its
+         * ancestors, and if it is in an ancestor it is already
+         * registered under the ancestor's name (the JDK's
+         * {@code getDeclaredField} for the ancestor returns it), while
+         * {@code getField} on the target class will itself ascend the
+         * chain and find the ancestor's entry.</p>
+         *
+         * <p>{@code addClass} is called without initialization:
+         * {@code findXxx} does not require the target class to be
+         * initialized, only loaded. Forcing its {@code <clinit>} would
+         * be a mistake — it could trigger recursive initialization when
+         * the call originates inside the class's own {@code <clinit>}
+         * (as happens with {@code ConcurrentHashMap.<clinit>} and its
+         * VarHandle fields).</p>
+         */
+        private void registerAllFieldsByName(String targetClass, ClassNode cn, String fieldName) {
+            for (FieldNode f : cn.getFields()) {
+                if (!f.getName().equals(fieldName)) continue;
+                FieldReference ref = new FieldReference(
+                    targetClass, fieldName, f.getDescriptor());
+                reflectInfo.addField(targetClass, ref);
+            }
+            addClass(targetClass);
+            // Guarantees that a ReflectClassInfo exists even when no
+            // matching field was found. That makes it possible for a
+            // later addition (for example from applyMetadata) to land in
+            // an existing class entry.
+            reflectInfo.getOrCreateClassInfo(targetClass);
         }
 
         private void registerUnsafeObjectFieldOffset(List<TypedValue> args) {
@@ -667,6 +1267,26 @@ public class MethodBytecodeVisitor extends ClassVisitor {
             }
             return false;
         }
+    }
+
+    /**
+     * Returns the internal name of the innermost reference component of
+     * an array descriptor, or {@code null} if the component is primitive
+     * or the descriptor is malformed.
+     *
+     * <p>"[[Ljava/lang/String;" yields "java/lang/String";
+     * "[[I" yields {@code null};
+     * "[Ljava/lang/Object;" yields "java/lang/Object".</p>
+     */
+    private static String elementClassOfArrayDescriptor(String desc) {
+        if (desc == null || desc.length() < 2 || desc.charAt(0) != '[') return null;
+        int i = 0;
+        while (i < desc.length() && desc.charAt(i) == '[') i++;
+        if (i >= desc.length()) return null;
+        if (desc.charAt(i) == 'L' && desc.charAt(desc.length() - 1) == ';') {
+            return desc.substring(i + 1, desc.length() - 1);
+        }
+        return null;
     }
 
     // ------------------------------------------------------------------

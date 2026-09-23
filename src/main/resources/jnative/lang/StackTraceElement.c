@@ -3,7 +3,7 @@
 #include <stddef.h>
 #include <string.h>
 
-__attribute__((noreturn)) void __jnative_throw_null_pointer_exception(void);
+#include "jnative_runtime.h"
 
 /*
  * java.lang.StackTraceElement — native support for StackWalker frame
@@ -54,7 +54,7 @@ __attribute__((noreturn)) void __jnative_throw_null_pointer_exception(void);
  * computed by the LLVM backend from each individual build's class file).
  */
 
-/* --------------------------------------------------------------------------
+/*
  * private static native void initStackTraceElement(StackTraceElement ste,
  *                                                  StackFrameInfo frame);
  *
@@ -62,7 +62,11 @@ __attribute__((noreturn)) void __jnative_throw_null_pointer_exception(void);
  * error at the Java level — the call sites both allocate a fresh
  * StackTraceElement immediately before invoking the native — so it must
  * still surface as an NPE rather than a silent success.
- * ------------------------------------------------------------------------ */
+ *
+ * The `frame` argument is unused: the runtime cannot reconstruct a
+ * StackFrameInfo from native stack metadata, so there is nothing to
+ * copy into the target element.
+ */
 void __jnative_fn_java_lang_StackTraceElement_initStackTraceElement__Ljava_lang_StackTraceElement_Ljava_lang_StackFrameInfo__V(
         void* ste, void* frame)
 {
@@ -70,11 +74,9 @@ void __jnative_fn_java_lang_StackTraceElement_initStackTraceElement__Ljava_lang_
         __jnative_throw_null_pointer_exception();
     }
     (void)frame;
-    /* Intentionally empty: the runtime cannot reconstruct a StackFrameInfo
-     * from native stack metadata, so there is nothing to copy. */
 }
 
-/* --------------------------------------------------------------------------
+/*
  * private static native void initStackTraceElements(StackTraceElement[] stes,
  *                                                   Object backtrace,
  *                                                   int depth);
@@ -82,7 +84,13 @@ void __jnative_fn_java_lang_StackTraceElement_initStackTraceElement__Ljava_lang_
  * No-op. Called from Throwable.getOurStackTrace and the batch-collection
  * path of StackWalker; both are reached only after a successful
  * VM-side backtrace capture, which this runtime never performs.
- * ------------------------------------------------------------------------ */
+ *
+ * All three arguments are deliberately unused. The bulk-fill path
+ * relies on a JVM-side backtrace record that this runtime does not
+ * produce, and on per-frame metadata that does not exist. There is no
+ * meaningful way to populate the array, and silently leaving it at its
+ * Java-level zero values is the only truthful answer.
+ */
 void __jnative_fn_java_lang_StackTraceElement_initStackTraceElements___Ljava_lang_StackTraceElement_Ljava_lang_Object_I_V(
         void* stes,
         void* backtrace,

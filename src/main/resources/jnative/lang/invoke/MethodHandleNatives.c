@@ -1,6 +1,9 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
+#include <dlfcn.h>
+
+#include "jnative_runtime.h"
 
 /*
  * --------------------------------------------------------------------------
@@ -18,6 +21,8 @@
  *   +24  type
  *   +32  flags
  *   +40  resolution
+ *   +48  vmtarget
+ *   +56  vmindex
  *
  * The actual JDK MemberName layout contains more VM-specific state, but
  * this runtime only needs the fields above for the compatibility paths
@@ -42,6 +47,72 @@
 #define MN_REFERENCE_KIND_SHIFT 24
 #define MN_REFERENCE_KIND_MASK  0x0F000000
 
+/* ACC_STATIC, matching the JVM access-flag bit. */
+#ifndef JNATIVE_ACC_STATIC
+#define JNATIVE_ACC_STATIC 0x0008
+#endif
+
+/*
+ * --------------------------------------------------------------------------
+ * Helpers
+ * --------------------------------------------------------------------------
+ */
+
+/*
+ * Returns the internal name of the class a vtable belongs to, or NULL.
+ * Used to distinguish Method / Constructor / Field reflect objects when
+ * MethodHandleNatives.init receives an opaque Object.
+ */
+static const char* reflect_kind_of(void* obj) {
+    if (obj == NULL) return NULL;
+    void* vtable = *(void**)obj;
+    if (vtable == NULL) return NULL;
+    return ((JNativeVTable*)vtable)->name;
+}
+
+/*
+ * Invoke Method.getType() to obtain a MethodType for the given reflect
+ * Method. The call is attempted through two independent channels:
+ *
+ *   1. The reflection adaptor emitted by LlvmGlobalEmitter for
+ *      java/lang/reflect/Method.getType. It exists only when the method
+ *      was explicitly registered in the reflection table.
+ *
+ *   2. The direct mangled symbol fn_java_lang_reflect_Method_getType__
+ *      Ljava_lang_invoke_MethodType_, which exists whenever the method
+ *      body was translated into the module at all.
+ *
+ * Returns NULL when neither channel yields a MethodType. Callers then
+ * leave MemberName.type null; MemberName.<init>(Method) in the JDK
+ * treats that as "unresolved" and continues (it only throws when clazz
+ * is also null).
+ */
+static void* method_get_type(void* method_obj) {
+    ReflectionClass* mc = jnative_class_by_name("java/lang/reflect/Method");
+    if (mc != NULL && mc->methods != NULL) {
+        ReflectionMethod** mp = mc->methods;
+        while (*mp != NULL) {
+            ReflectionMethod* m = *mp;
+            if (m->name && strcmp((const char*)m->name, "getType") == 0) {
+                if (m->adaptor != NULL) {
+                    typedef void* (*adaptor_t)(void*, void**);
+                    adaptor_t fn = (adaptor_t)m->adaptor;
+                    return fn(method_obj, NULL);
+                }
+            }
+            mp++;
+        }
+    }
+
+    typedef void* (*get_type_fn)(void*);
+    get_type_fn fn = (get_type_fn)dlsym(RTLD_DEFAULT,
+        "fn_java_lang_reflect_Method_getType__Ljava_lang_invoke_MethodType_");
+    if (fn != NULL) {
+        return fn(method_obj);
+    }
+
+    return NULL;
+}
 
 /*
  * ==========================================================================
@@ -52,33 +123,76 @@
  *
  *   static native void init(MemberName self, Object ref);
  *
- * The runtime stores the supplied target in the MemberName's type slot.
- * This is the same representation used by the existing MethodHandle
- * implementation.
+ * Initializes a MemberName from a reflect Method, Constructor or Field.
+ * In HotSpot this is a VM-level call that reads the internal VM
+ * representation of the reflect object and populates the MemberName with
+ * the declaring class, the member name, the type, the access flags, and
+ * the vmtarget/vmindex pair that marks the MemberName as resolved.
+ *
+ * This runtime has no VM-internal representation of reflect mirrors, so
+ * the fields are read directly from the reflect object that Class.c
+ * produced (see create_method_mirror / create_constructor_mirror /
+ * create_field_mirror in jnative/lang/Class.c) using the layout published
+ * by LlvmGenerator.generateMain through __jnative_reflect_set_layout.
+ *
+ * For a Method, the MemberName's `type` field must be a MethodType, not a
+ * Class[]. The MethodType is obtained by calling Method.getType(); when
+ * neither the reflection adaptor nor the mangled symbol is available, the
+ * field is left null. The caller — MemberName.<init>(Method) in the JDK —
+ * only throws when `clazz` is null, so as long as clazz is set the
+ * constructor completes. A MemberName built this way reports itself as
+ * unresolved, which matches the JDK's own "VM cannot use MethodHandles
+ * in this case" branch.
  */
 void __jnative_fn_java_lang_invoke_MethodHandleNatives_init__Ljava_lang_invoke_MemberName_Ljava_lang_Object__V(
         void* self,
         void* target)
 {
-    if (self == NULL) {
+    if (self == NULL || target == NULL) {
         return;
     }
 
-    *(void**)((char*)self + MEMBERNAME_FIELD_TYPE) = target;
+    const char* kind = reflect_kind_of(target);
+    if (kind == NULL) {
+        return;
+    }
 
-    /*
-     * Mark the MemberName as an initialized method reference.
-     */
-    *(int32_t*)((char*)self + MEMBERNAME_FIELD_FLAGS) = MN_IS_METHOD;
+    if (strcmp(kind, "java/lang/reflect/Method") == 0) {
+        void* clazz     = *(void**)((char*)target + JNATIVE_METHOD_CLAZZ_OFFSET);
+        void* name      = *(void**)((char*)target + JNATIVE_METHOD_NAME_OFFSET);
+        int32_t modifiers = *(int32_t*)((char*)target + JNATIVE_METHOD_MODIFIERS_OFFSET);
+        void* method_type = method_get_type(target);
 
-    /*
-     * Clear fields which this runtime does not populate.
-     */
-    *(void**)((char*)self + MEMBERNAME_FIELD_CLAZZ) = NULL;
-    *(void**)((char*)self + MEMBERNAME_FIELD_NAME) = NULL;
-    *(void**)((char*)self + MEMBERNAME_FIELD_RESOLUTION) = NULL;
+        *(void**)((char*)self + MEMBERNAME_FIELD_CLAZZ)  = clazz;
+        *(void**)((char*)self + MEMBERNAME_FIELD_NAME)   = name;
+        *(void**)((char*)self + MEMBERNAME_FIELD_TYPE)   = method_type;
+        *(int32_t*)((char*)self + MEMBERNAME_FIELD_FLAGS) = modifiers | MN_IS_METHOD;
+        return;
+    }
+
+    if (strcmp(kind, "java/lang/reflect/Constructor") == 0) {
+        void* clazz     = *(void**)((char*)target + JNATIVE_CTOR_CLAZZ_OFFSET);
+        int32_t modifiers = *(int32_t*)((char*)target + JNATIVE_CTOR_MODIFIERS_OFFSET);
+
+        *(void**)((char*)self + MEMBERNAME_FIELD_CLAZZ)  = clazz;
+        *(void**)((char*)self + MEMBERNAME_FIELD_NAME)   = NULL;
+        *(void**)((char*)self + MEMBERNAME_FIELD_TYPE)   = NULL;
+        *(int32_t*)((char*)self + MEMBERNAME_FIELD_FLAGS) = modifiers | MN_IS_CONSTRUCTOR;
+        return;
+    }
+
+    if (strcmp(kind, "java/lang/reflect/Field") == 0) {
+        void* clazz     = *(void**)((char*)target + JNATIVE_FIELD_CLAZZ_OFFSET);
+        void* name      = *(void**)((char*)target + JNATIVE_FIELD_NAME_OFFSET);
+        int32_t modifiers = *(int32_t*)((char*)target + JNATIVE_FIELD_MODIFIERS_OFFSET);
+
+        *(void**)((char*)self + MEMBERNAME_FIELD_CLAZZ)  = clazz;
+        *(void**)((char*)self + MEMBERNAME_FIELD_NAME)   = name;
+        *(void**)((char*)self + MEMBERNAME_FIELD_TYPE)   = NULL;
+        *(int32_t*)((char*)self + MEMBERNAME_FIELD_FLAGS) = modifiers | MN_IS_FIELD;
+        return;
+    }
 }
-
 
 /*
  * ==========================================================================
@@ -96,14 +210,12 @@ void __jnative_fn_java_lang_invoke_MethodHandleNatives_init__Ljava_lang_invoke_M
         return;
     }
 
-    *(void**)((char*)self + MEMBERNAME_FIELD_TYPE) = target;
+    *(void**)((char*)self + MEMBERNAME_FIELD_TYPE)   = target;
     *(int32_t*)((char*)self + MEMBERNAME_FIELD_FLAGS) = MN_IS_METHOD;
-
-    *(void**)((char*)self + MEMBERNAME_FIELD_CLAZZ) = NULL;
-    *(void**)((char*)self + MEMBERNAME_FIELD_NAME) = NULL;
+    *(void**)((char*)self + MEMBERNAME_FIELD_CLAZZ)   = NULL;
+    *(void**)((char*)self + MEMBERNAME_FIELD_NAME)    = NULL;
     *(void**)((char*)self + MEMBERNAME_FIELD_RESOLUTION) = NULL;
 }
-
 
 /*
  * ==========================================================================
@@ -144,44 +256,17 @@ void* __jnative_fn_java_lang_invoke_MethodHandleNatives_resolve__BLjava_lang_inv
         return NULL;
     }
 
-    /*
-     * If init() stored a target, the MemberName is already resolved from
-     * the point of view of this runtime.
-     */
-    void* target =
-        *(void**)((char*)member + MEMBERNAME_FIELD_TYPE);
-
+    void* target = *(void**)((char*)member + MEMBERNAME_FIELD_TYPE);
     if (target != NULL) {
         return member;
     }
-
-    /*
-     * There is no VM symbol table available here from which to perform a
-     * real resolution.
-     *
-     * Returning the original MemberName is preferable to fabricating a
-     * target or dereferencing invalid metadata.
-     */
     return member;
 }
-
 
 /*
  * ==========================================================================
  * resolve(MemberName, Class, int, boolean)
  * ==========================================================================
- *
- * Compatibility overload reached through java.lang.invoke.MemberName$Factory
- * in some JDK versions, where the byte refKind argument is folded into the
- * MemberName itself before the JVM entry point is invoked.
- *
- * The mangled symbol the LLVM emitter produces for this call site is:
- *
- *   __jnative_fn_java_lang_invoke_MethodHandleNatives_resolve__Ljava_lang_invoke_MemberName_Ljava_lang_Class_IZ_Ljava_lang_invoke_MemberName_
- *
- * which is exactly the symbol the linker was previously unable to find.
- * The body simply forwards to the canonical (byte, MemberName, Class, int,
- * boolean) implementation with a neutral refKind of 0.
  */
 void* __jnative_fn_java_lang_invoke_MethodHandleNatives_resolve__Ljava_lang_invoke_MemberName_Ljava_lang_Class_IZ_Ljava_lang_invoke_MemberName_(
         void* member,
@@ -193,51 +278,26 @@ void* __jnative_fn_java_lang_invoke_MethodHandleNatives_resolve__Ljava_lang_invo
         (int8_t)0, member, lookup_class, allowed_modes, speculative_resolve);
 }
 
-
 /*
  * ==========================================================================
  * resolve(MemberName, Class)
  * ==========================================================================
- *
- * Legacy overload used by some JDK versions / generated call paths.
- *
- * The LLVM emitter produces the symbol:
- *
- *   __jnative_fn_java_lang_invoke_MethodHandleNatives_resolve__Ljava_lang_invoke_MemberName_Ljava_lang_Class__Ljava_lang_Object_
- *
- * (note the Object return type) for call sites compiled against JDK 8.
  */
 void* __jnative_fn_java_lang_invoke_MethodHandleNatives_resolve__Ljava_lang_invoke_MemberName_Ljava_lang_Class__Ljava_lang_Object_(
         void* self,
         void* caller)
 {
     (void)caller;
-
     if (self == NULL) {
         return NULL;
     }
-
     return *(void**)((char*)self + MEMBERNAME_FIELD_TYPE);
 }
-
 
 /*
  * ==========================================================================
  * objectFieldOffset(MemberName)
  * ==========================================================================
- *
- * Java:
- *
- *   static native long objectFieldOffset(MemberName field);
- *
- * A full HotSpot implementation would resolve the MemberName to a field
- * descriptor and return the VM-computed instance-field offset.
- *
- * This runtime does not keep that VM-side field metadata inside
- * MemberName. Instance field offsets are calculated by the LLVM/code-
- * generation side from the Java class layout.
- *
- * Therefore this native entry point returns zero as a safe typed default.
  */
 int64_t __jnative_fn_java_lang_invoke_MethodHandleNatives_objectFieldOffset__Ljava_lang_invoke_MemberName__J(
         void* member)
@@ -246,14 +306,10 @@ int64_t __jnative_fn_java_lang_invoke_MethodHandleNatives_objectFieldOffset__Lja
     return 0;
 }
 
-
 /*
  * ==========================================================================
  * staticFieldBase(MemberName)
  * ==========================================================================
- *
- * Static fields are emitted as LLVM globals by this runtime, so there is
- * no Java object that has to be used as the static-field base.
  */
 void* __jnative_fn_java_lang_invoke_MethodHandleNatives_staticFieldBase__Ljava_lang_invoke_MemberName__Ljava_lang_Object_(
         void* member)
@@ -262,13 +318,10 @@ void* __jnative_fn_java_lang_invoke_MethodHandleNatives_staticFieldBase__Ljava_l
     return NULL;
 }
 
-
 /*
  * ==========================================================================
  * staticFieldOffset(MemberName)
  * ==========================================================================
- *
- * Static accesses in generated code are resolved directly to LLVM globals.
  */
 int64_t __jnative_fn_java_lang_invoke_MethodHandleNatives_staticFieldOffset__Ljava_lang_invoke_MemberName__J(
         void* member)
@@ -276,7 +329,6 @@ int64_t __jnative_fn_java_lang_invoke_MethodHandleNatives_staticFieldOffset__Lja
     (void)member;
     return 0;
 }
-
 
 /*
  * ==========================================================================
@@ -288,7 +340,6 @@ void __jnative_fn_java_lang_invoke_MethodHandleNatives_expand__Ljava_lang_invoke
 {
     (void)self;
 }
-
 
 /*
  * ==========================================================================
@@ -315,7 +366,6 @@ int32_t __jnative_fn_java_lang_invoke_MethodHandleNatives_getMembers__Ljava_lang
     return 0;
 }
 
-
 /*
  * ==========================================================================
  * getMemberVMInfo(MemberName)
@@ -328,14 +378,11 @@ void* __jnative_fn_java_lang_invoke_MethodHandleNatives_getMemberVMInfo__Ljava_l
     return NULL;
 }
 
-
 /*
  * ==========================================================================
  * setCallSiteTargetNormal(CallSite, MethodHandle)
  * ==========================================================================
  */
-#define OBJECT_HEADER_SIZE 8
-
 void __jnative_fn_java_lang_invoke_MethodHandleNatives_setCallSiteTargetNormal__Ljava_lang_invoke_CallSite_Ljava_lang_invoke_MethodHandle__V(
         void* site,
         void* target)
@@ -346,7 +393,6 @@ void __jnative_fn_java_lang_invoke_MethodHandleNatives_setCallSiteTargetNormal__
 
     *(void**)((char*)site + OBJECT_HEADER_SIZE) = target;
 }
-
 
 /*
  * ==========================================================================
@@ -368,7 +414,6 @@ void __jnative_fn_java_lang_invoke_MethodHandleNatives_setCallSiteTargetVolatile
     );
 }
 
-
 /*
  * ==========================================================================
  * getNamedCon(int, Object[])
@@ -384,7 +429,6 @@ int32_t __jnative_fn_java_lang_invoke_MethodHandleNatives_getNamedCon__I_Ljava_l
     return 0;
 }
 
-
 /*
  * ==========================================================================
  * registerNatives()
@@ -393,7 +437,6 @@ int32_t __jnative_fn_java_lang_invoke_MethodHandleNatives_getNamedCon__I_Ljava_l
 void __jnative_fn_java_lang_invoke_MethodHandleNatives_registerNatives___V(void)
 {
 }
-
 
 /*
  * ==========================================================================
@@ -407,10 +450,7 @@ void __jnative_fn_java_lang_invoke_MethodHandleNatives_clearCallerSensitive__Lja
         return;
     }
 
-    int32_t flags =
-        *(int32_t*)((char*)member + MEMBERNAME_FIELD_FLAGS);
-
+    int32_t flags = *(int32_t*)((char*)member + MEMBERNAME_FIELD_FLAGS);
     flags &= ~MN_CALLER_SENSITIVE;
-
     *(int32_t*)((char*)member + MEMBERNAME_FIELD_FLAGS) = flags;
 }

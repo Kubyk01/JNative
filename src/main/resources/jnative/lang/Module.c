@@ -1,7 +1,9 @@
 #include <stdint.h>
 
+#include "jnative_runtime.h"
+
 /*
- * java.lang.Module native methods.
+ * java.lang.Module — native methods.
  *
  * This runtime has a single, flat universe of classes: the reachability
  * analysis pulls every class that the entry point can observe into one
@@ -29,7 +31,7 @@
  * sequence run to completion without touching uninitialised VM state.
  */
 
-/* --------------------------------------------------------------------------
+/*
  * private static native void defineModule0(Module module,
  *                                          boolean isOpen,
  *                                          String version,
@@ -43,7 +45,7 @@
  * already carries everything Java code can observe (name, descriptor,
  * and the exports/opens/reads maps that initExports/initReads filled in
  * from the descriptor at construction time). Nothing to install.
- * ------------------------------------------------------------------------ */
+ */
 void __jnative_fn_java_lang_Module_defineModule0__Ljava_lang_Module_ZLjava_lang_String_Ljava_lang_String__Ljava_lang_Object__V(
         void* module,
         int32_t is_open,
@@ -58,7 +60,7 @@ void __jnative_fn_java_lang_Module_defineModule0__Ljava_lang_Module_ZLjava_lang_
     (void)pkg_names;
 }
 
-/* --------------------------------------------------------------------------
+/*
  * private static native void addReads0(Module from, Module to);
  *
  * Installs a reads edge from `from` to `to` in the VM's module graph.
@@ -67,7 +69,7 @@ void __jnative_fn_java_lang_Module_defineModule0__Ljava_lang_Module_ZLjava_lang_
  * updates the Module object's own reads set before calling this native,
  * so callers that query the reads set at the Java level observe the
  * correct answer regardless.
- * ------------------------------------------------------------------------ */
+ */
 void __jnative_fn_java_lang_Module_addReads0__Ljava_lang_Module_Ljava_lang_Module__V(
         void* from,
         void* to)
@@ -76,7 +78,7 @@ void __jnative_fn_java_lang_Module_addReads0__Ljava_lang_Module_Ljava_lang_Modul
     (void)to;
 }
 
-/* --------------------------------------------------------------------------
+/*
  * private static native void addExports0(Module from,
  *                                        String pn,
  *                                        Module to);
@@ -88,7 +90,7 @@ void __jnative_fn_java_lang_Module_addReads0__Ljava_lang_Module_Ljava_lang_Modul
  * java.lang.Module's own observers (Module.getExports / isExported)
  * consult; this native only feeds the VM-side mirror of that map, which
  * nothing reads.
- * ------------------------------------------------------------------------ */
+ */
 void __jnative_fn_java_lang_Module_addExports0__Ljava_lang_Module_Ljava_lang_String_Ljava_lang_Module__V(
         void* from,
         void* pn,
@@ -99,7 +101,7 @@ void __jnative_fn_java_lang_Module_addExports0__Ljava_lang_Module_Ljava_lang_Str
     (void)to;
 }
 
-/* --------------------------------------------------------------------------
+/*
  * private static native void addExportsToAll0(Module from, String pn);
  *
  * Unqualified counterpart of addExports0: package `pn` of module `from`
@@ -107,7 +109,7 @@ void __jnative_fn_java_lang_Module_addExports0__Ljava_lang_Module_Ljava_lang_Str
  * package-visibility gate that would need the entry, so the call is a
  * no-op. The Java-level export map is updated by the caller before the
  * native is invoked.
- * ------------------------------------------------------------------------ */
+ */
 void __jnative_fn_java_lang_Module_addExportsToAll0__Ljava_lang_Module_Ljava_lang_String__V(
         void* from,
         void* pn)
@@ -116,7 +118,7 @@ void __jnative_fn_java_lang_Module_addExportsToAll0__Ljava_lang_Module_Ljava_lan
     (void)pn;
 }
 
-/* --------------------------------------------------------------------------
+/*
  * private static native void addExportsToAllUnnamed0(Module from, String pn);
  *
  * The third member of the addExports family: package `pn` of module
@@ -145,7 +147,7 @@ void __jnative_fn_java_lang_Module_addExportsToAll0__Ljava_lang_Module_Ljava_lan
  * The arguments are captured but not consulted. `from` is the source
  * module, `pn` is the package name in internal form (slashes, not
  * dots). Neither participates in any state this runtime maintains.
- * ------------------------------------------------------------------------ */
+ */
 void __jnative_fn_java_lang_Module_addExportsToAllUnnamed0__Ljava_lang_Module_Ljava_lang_String__V(
         void* from,
         void* pn)

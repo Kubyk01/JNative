@@ -1,5 +1,7 @@
 #include <stdint.h>
 
+#include "jnative_runtime.h"
+
 /*
  * static native boolean isPreviewEnabled();
  *

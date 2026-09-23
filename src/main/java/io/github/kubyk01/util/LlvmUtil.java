@@ -13,19 +13,49 @@ import java.util.ArrayList;
 import java.util.List;
 
 public class LlvmUtil {
+
     public static Type inferLocalType(Function func, int idx) {
         for (Parameter p : func.getParameters()) {
             if (p.getIndex() == idx) return p.getType();
         }
+
+        // Prefer a STORE result: after IrBuilder.createStore was changed
+        // to take an explicit slot type, the result carries the type that
+        // the bytecode opcode mandated for the slot (ISTORE -> INT, &c),
+        // not the type of the value being stored. Falling back to the
+        // operand's type keeps this correct on IR produced by an older
+        // build, where the result was stamped with the stored value's own
+        // type.
         for (BasicBlock block : func.getBlocks()) {
             for (Instruction inst : block.getInstructions()) {
-                if (inst.getOpcode() == Opcode.STORE && inst.getLocalIndex() == idx) {
-                    if (!inst.getOperands().isEmpty()) {
-                        return inst.getOperands().getFirst().getType();
-                    }
+                if (inst.getOpcode() != Opcode.STORE) continue;
+                if (inst.getLocalIndex() != idx) continue;
+
+                if (inst.getResult() != null
+                    && !inst.getResult().getType().isUnknown()) {
+                    return inst.getResult().getType();
+                }
+                if (!inst.getOperands().isEmpty()) {
+                    Type operandType = inst.getOperands().getFirst().getType();
+                    if (!operandType.isUnknown()) return operandType;
                 }
             }
         }
+
+        // No STORE at all: the slot can only be set outside the function
+        // body (JSR/RET) or is a never-reassigned parameter that already
+        // matched above. Fall back to whatever the LOADs declare.
+        for (BasicBlock block : func.getBlocks()) {
+            for (Instruction inst : block.getInstructions()) {
+                if (inst.getOpcode() != Opcode.LOAD) continue;
+                if (inst.getLocalIndex() != idx) continue;
+                if (inst.getResult() != null
+                    && !inst.getResult().getType().isUnknown()) {
+                    return inst.getResult().getType();
+                }
+            }
+        }
+
         return Type.UNKNOWN;
     }
 
@@ -43,17 +73,18 @@ public class LlvmUtil {
     }
 
     /**
-     * The field name depends on the opcode: for GET_FIELD/PUT_FIELD the field constant is in operand 1,
-     * for GET_STATIC/PUT_STATIC – in operand 0.
-     * The full name (including the class) is returned, which prevents name collisions
-     * between static fields of different classes.
+     * The field name depends on the opcode: for GET_FIELD/PUT_FIELD the field
+     * constant is in operand 1, for GET_STATIC/PUT_STATIC - in operand 0.
+     * The full name (including the class) is returned, which prevents name
+     * collisions between static fields of different classes.
      */
     public static String extractFieldName(Instruction inst) {
-        int fieldIdx = (inst.getOpcode() == Opcode.GET_STATIC || inst.getOpcode() == Opcode.PUT_STATIC) ? 0 : 1;
+        int fieldIdx = (inst.getOpcode() == Opcode.GET_STATIC
+            || inst.getOpcode() == Opcode.PUT_STATIC) ? 0 : 1;
         if (inst.getOperands().size() > fieldIdx) {
             Value v = inst.getOperands().get(fieldIdx);
             if (v instanceof Constant c && c.getType().isReference()) {
-                return c.getValue().toString(); // full name, e.g. "java/lang/System.out"
+                return c.getValue().toString();
             }
         }
         return "unknown";
@@ -130,4 +161,32 @@ public class LlvmUtil {
         return new String[]{"", full};
     }
 
+    /**
+     * Returns {@code true} for class names that belong to the JDK, to the
+     * runtime's own third-party dependencies, or to any other package that is
+     * not part of the user's program.
+     *
+     * <p>Callers use this predicate to distinguish "user code" (the classes
+     * the user actually wrote, which are of primary interest for the
+     * analysis reports and the destructor pass) from the JDK and library
+     * classes that the reachability walk also drags in. It is intentionally
+     * a simple prefix test on a fixed list of package roots: the classifier
+     * is about provenance, not about VM semantics, and a heuristic is enough
+     * for every caller that consults it.</p>
+     */
+    public static boolean isSystemClassName(String className) {
+        String dot = className.replace('/', '.');
+        return dot.startsWith("java.") ||
+            dot.startsWith("javax.") ||
+            dot.startsWith("sun.") ||
+            dot.startsWith("jdk.") ||
+            dot.startsWith("org.objectweb.asm.") ||
+            dot.startsWith("picocli.") ||
+            dot.startsWith("reactor.") ||
+            dot.startsWith("org.slf4j.") ||
+            dot.startsWith("org.reactivestreams.") ||
+            dot.startsWith("io.micrometer.") ||
+            dot.startsWith("org.junit.") ||
+            dot.startsWith("com.fasterxml.");
+    }
 }

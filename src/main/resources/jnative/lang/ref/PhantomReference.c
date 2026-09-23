@@ -2,7 +2,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-__attribute__((noreturn)) void __jnative_throw_null_pointer_exception(void);
+#include "jnative_runtime.h"
 
 /*
  * java.lang.ref.PhantomReference — native `refersTo0`.
@@ -22,8 +22,7 @@ __attribute__((noreturn)) void __jnative_throw_null_pointer_exception(void);
  * non-null referent continues to refer to it forever — which is the correct
  * behaviour for a runtime without a garbage collector.
  */
-#define OBJECT_HEADER_SIZE 8
-#define REFERENT_OFFSET    OBJECT_HEADER_SIZE
+#define REFERENT_OFFSET OBJECT_HEADER_SIZE
 
 static inline void** referent_slot(void* ref) {
     return (void**)((char*)ref + REFERENT_OFFSET);

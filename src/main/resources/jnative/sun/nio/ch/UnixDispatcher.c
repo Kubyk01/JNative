@@ -5,19 +5,7 @@
 #include <errno.h>
 #include <sys/socket.h>
 
-__attribute__((noreturn)) void __jnative_throw_null_pointer_exception(void);
-
-/*
- * FileDescriptor layout in this runtime:
- *   [ 8 bytes vtable ][ int32 fd ][ long handle ]
- *
- * The raw kernel fd is the first instance field, at offset 8.
- */
-#define FD_OFFSET 8
-
-static inline int32_t fd_of(void* fd_obj) {
-    return *(int32_t*)((char*)fd_obj + FD_OFFSET);
-}
+#include "jnative_runtime.h"
 
 /*
  * sun.nio.ch.UnixDispatcher — shared base class for the platform's
@@ -26,9 +14,9 @@ static inline int32_t fd_of(void* fd_obj) {
  *
  * The class contributes three natives:
  *
- *   init()                       -- called once from <clinit>
- *   preClose0(FileDescriptor fd) -- called from preClose before close
- *   close0(FileDescriptor fd)    -- the terminal close operation
+ *   init()                       — called once from <clinit>
+ *   preClose0(FileDescriptor fd) — called from preClose before close
+ *   close0(FileDescriptor fd)    — the terminal close operation
  *
  * init and preClose0 do no HotSpot-specific work in this runtime.
  * close0 is the one that actually releases the descriptor; it is
@@ -36,19 +24,19 @@ static inline int32_t fd_of(void* fd_obj) {
  * to the same body.
  */
 
-/* -------------------------------------------------------------------------
+/*
  * static native void init();
  *
- * Called from UnixDispatcher.<clinit>. On HotSpot this hook installs the
- * platform-specific pre-close actions that preClose0 dispatches to.
- * This runtime does not use any of those actions — see preClose0 below —
- * so the hook is a strict no-op. The symbol must exist because
+ * Called from UnixDispatcher.<clinit>. On HotSpot this hook installs
+ * the platform-specific pre-close actions that preClose0 dispatches
+ * to. This runtime does not use any of those actions — see preClose0
+ * below — so the hook is a strict no-op. The symbol must exist because
  * UnixDispatcher.<clinit> emits a native call to it.
- * ----------------------------------------------------------------------- */
+ */
 void __jnative_fn_sun_nio_ch_UnixDispatcher_init___V(void) {
 }
 
-/* -------------------------------------------------------------------------
+/*
  * static native void preClose0(FileDescriptor fd);
  *
  * Called from UnixDispatcher.preClose and inherited unchanged by
@@ -78,7 +66,7 @@ void __jnative_fn_sun_nio_ch_UnixDispatcher_init___V(void) {
  * implementation and every other native in this runtime that receives
  * a FileDescriptor. A null receiver is a genuine programming error at
  * the Java level and must surface as an NPE, not as a silent no-op.
- * ----------------------------------------------------------------------- */
+ */
 void __jnative_fn_sun_nio_ch_UnixDispatcher_preClose0__Ljava_io_FileDescriptor__V(
         void* fd_obj)
 {
@@ -86,10 +74,10 @@ void __jnative_fn_sun_nio_ch_UnixDispatcher_preClose0__Ljava_io_FileDescriptor__
         __jnative_throw_null_pointer_exception();
     }
     /* Intentionally empty: on Linux no pre-close work is required. */
-    (void)fd_of(fd_obj);
+    (void)jnative_fd_of(fd_obj);
 }
 
-/* -------------------------------------------------------------------------
+/*
  * static native void close0(FileDescriptor fd);
  *
  * The terminal close operation for a channel's underlying descriptor.
@@ -105,12 +93,12 @@ void __jnative_fn_sun_nio_ch_UnixDispatcher_preClose0__Ljava_io_FileDescriptor__
  *         close(fd);
  *     }
  *
- * That is exactly the behaviour implemented below, with two adjustments
- * for this runtime's conventions:
+ * That is exactly the behaviour implemented below, with two
+ * adjustments for this runtime's conventions:
  *
  *   1. The raw fd is read from the FileDescriptor object's first
- *      instance field (offset 8), the same layout used by every other
- *      native in this runtime that takes a FileDescriptor.
+ *      instance field (offset FD_OFFSET), the same layout used by every
+ *      other native in this runtime that takes a FileDescriptor.
  *
  *   2. A negative fd value means "already closed". FileDescriptor is
  *      specified to be idempotent under close: calling close() twice is
@@ -130,7 +118,7 @@ void __jnative_fn_sun_nio_ch_UnixDispatcher_preClose0__Ljava_io_FileDescriptor__
  * release has already been unlinked from the process's descriptor
  * table, and the value is best-effort from the Java layer's point of
  * view. Swallowing errno here matches that contract exactly.
- * ----------------------------------------------------------------------- */
+ */
 void __jnative_fn_sun_nio_ch_UnixDispatcher_close0__Ljava_io_FileDescriptor__V(
         void* fd_obj)
 {
@@ -138,7 +126,7 @@ void __jnative_fn_sun_nio_ch_UnixDispatcher_close0__Ljava_io_FileDescriptor__V(
         __jnative_throw_null_pointer_exception();
     }
 
-    int32_t fd = fd_of(fd_obj);
+    int32_t fd = jnative_fd_of(fd_obj);
     if (fd >= 0) {
         (void)close(fd);
     }

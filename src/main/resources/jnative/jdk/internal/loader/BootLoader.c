@@ -2,31 +2,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-struct ReflectionClass {
-    void* vtable;
-    void* name;
-    struct ReflectionClass* superclass;
-    struct ReflectionClass** interfaces;
-    void** methods;
-    void** fields;
-    void** constructors;
-    int modifiers;
-    int object_size;
-};
+#include "jnative_runtime.h"
 
-extern struct ReflectionClass* reflect_all_classes[];
-
-extern const char* __jnative_read_string_bytes(void* s, int32_t* out_len);
-
-/* Java array layout: [int32 length][pointer elements] (see create_string_array) */
-#define JAVA_ARR_HDR 8
-
-/*
- * Returns a String[] of unique package names derived from every registered
- * class name. Class names use '/' as separator; package names use '.'.
- * Top-level classes (no '/' in the name) belong to the unnamed package and
- * are skipped, matching the JDK's behaviour of not returning "".
- */
 void* __jnative_fn_jdk_internal_loader_BootLoader_getSystemPackageNames____Ljava_lang_String_(void)
 {
     /* Worst case: every class has a distinct package. */
@@ -37,9 +14,9 @@ void* __jnative_fn_jdk_internal_loader_BootLoader_getSystemPackageNames____Ljava
         return NULL;
     }
 
-    struct ReflectionClass** pp = reflect_all_classes;
+    ReflectionClass** pp = reflect_all_classes;
     while (pp != NULL && *pp != NULL) {
-        const char* clsName = (const char*)(*pp)->name;
+        const char* clsName = (*pp)->cname;
         pp++;
 
         if (clsName == NULL) continue;
@@ -85,20 +62,29 @@ void* __jnative_fn_jdk_internal_loader_BootLoader_getSystemPackageNames____Ljava
         packages[count++] = pkg;
     }
 
-    /* Pack result into a Java String[] object. */
-    size_t totalBytes = JAVA_ARR_HDR + count * sizeof(void*);
-    void* array = malloc(totalBytes);
-    if (array == NULL) {
-        for (size_t i = 0; i < count; i++) free(packages[i]);
-        free(packages);
-        return NULL;
+    /*
+     * Pack the result into a Java String[]. The slots must hold real
+     * java.lang.String objects, not the raw C names collected above —
+     * the JDK reads these through String.length()/charAt(). Each name is
+     * converted first, and the array itself is allocated through
+     * jnative_ref_array_of_class() so that its header carries the
+     * [Ljava/lang/String; class mirror.
+     */
+    if (count > 0) {
+        for (size_t i = 0; i < count; i++) {
+            void* str = jnative_string(packages[i]);
+            if (str == NULL) {
+                /* Release the names gathered so far and give up. */
+                for (size_t j = 0; j < count; j++) free(packages[j]);
+                free(packages);
+                return NULL;
+            }
+            packages[i] = (char*)str;
+        }
     }
-    *(int32_t*)array = (int32_t)count;
 
-    void** slots = (void**)((char*)array + JAVA_ARR_HDR);
-    for (size_t i = 0; i < count; i++) {
-        slots[i] = packages[i];
-    }
+    void* array = jnative_ref_array_of_class((void**)packages, (int32_t)count,
+                                             "[Ljava/lang/String;");
     free(packages);
     return array;
 }

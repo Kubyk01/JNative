@@ -1,5 +1,3 @@
-/* path: src/main/java/io/github/kubyk01/application/service/analyzer/ssa/MethodTranslator.java */
-
 package io.github.kubyk01.application.service.analyzer.ssa;
 
 import io.github.kubyk01.application.service.analyzer.dependencyresolver.DependencyResolver;
@@ -32,6 +30,7 @@ import org.objectweb.asm.MethodVisitor;
 import org.objectweb.asm.Opcodes;
 
 import java.util.*;
+import java.util.concurrent.atomic.AtomicInteger;
 
 @Slf4j
 public class MethodTranslator extends MethodVisitor {
@@ -46,8 +45,25 @@ public class MethodTranslator extends MethodVisitor {
     private final Map<Integer, Set<BasicBlock>> jsrReturnBlocks = new HashMap<>();
     private final List<IndirectBranchTerminator> indirectBranches = new ArrayList<>();
     private final Set<Label> handlerLabels = new HashSet<>();
-    private int lambdaCounter = 0;
     private final DependencyResolver resolver;
+
+    /**
+     * Process-wide source of unique lambda identifiers.
+     *
+     * <p>{@code LlvmGenerator.createLambdaAdaptor} derives the adaptor
+     * function name from the lambda id and skips generation when a
+     * function with that name already exists in the module. That
+     * de-duplication is only sound if lambda ids are unique across every
+     * {@link MethodTranslator} instance contributing to one module. A
+     * per-instance counter combined with {@code
+     * System.identityHashCode(this)} made uniqueness depend on object
+     * identity, which is not part of the contract and collides whenever
+     * identity hash codes repeat — silently merging two distinct adaptors
+     * into one function. A single static counter removes the dependency
+     * entirely, and {@link AtomicInteger} keeps the increment correct if
+     * translation ever runs concurrently.</p>
+     */
+    private static final AtomicInteger GLOBAL_LAMBDA_COUNTER = new AtomicInteger();
 
     private final Map<Label, Integer> labelStackBase = new HashMap<>();
     private final Map<Label, Integer> labelStackHeight = new HashMap<>();
@@ -179,19 +195,19 @@ public class MethodTranslator extends MethodVisitor {
                 handlers.pushDouble(1.0);
                 break;
 
-            case Opcodes.IADD:
+            case Opcodes.IADD, Opcodes.DADD, Opcodes.FADD:
                 handlers.binaryOp(Opcode.ADD);
                 break;
-            case Opcodes.ISUB:
+            case Opcodes.ISUB, Opcodes.DSUB:
                 handlers.binaryOp(Opcode.SUB);
                 break;
-            case Opcodes.IMUL:
+            case Opcodes.IMUL, Opcodes.DMUL, Opcodes.FMUL:
                 handlers.binaryOp(Opcode.MUL);
                 break;
-            case Opcodes.IDIV:
+            case Opcodes.IDIV, Opcodes.DDIV:
                 handlers.binaryOp(Opcode.DIV);
                 break;
-            case Opcodes.IREM:
+            case Opcodes.IREM, Opcodes.DREM:
                 handlers.binaryOp(Opcode.REM);
                 break;
             case Opcodes.INEG:
@@ -252,15 +268,8 @@ public class MethodTranslator extends MethodVisitor {
             case Opcodes.LXOR:
                 handlers.binaryOp(Opcode.XOR);
                 break;
-
-            case Opcodes.FADD:
-                handlers.binaryOp(Opcode.ADD);
-                break;
             case Opcodes.FSUB:
                 handlers.binaryOp(Opcode.SUB);
-                break;
-            case Opcodes.FMUL:
-                handlers.binaryOp(Opcode.MUL);
                 break;
             case Opcodes.FDIV:
                 handlers.binaryOp(Opcode.DIV);
@@ -270,22 +279,6 @@ public class MethodTranslator extends MethodVisitor {
                 break;
             case Opcodes.FNEG:
                 handlers.unaryNeg(Type.FLOAT);
-                break;
-
-            case Opcodes.DADD:
-                handlers.binaryOp(Opcode.ADD);
-                break;
-            case Opcodes.DSUB:
-                handlers.binaryOp(Opcode.SUB);
-                break;
-            case Opcodes.DMUL:
-                handlers.binaryOp(Opcode.MUL);
-                break;
-            case Opcodes.DDIV:
-                handlers.binaryOp(Opcode.DIV);
-                break;
-            case Opcodes.DREM:
-                handlers.binaryOp(Opcode.REM);
                 break;
             case Opcodes.DNEG:
                 handlers.unaryNeg(Type.DOUBLE);
@@ -308,41 +301,17 @@ public class MethodTranslator extends MethodVisitor {
             case Opcodes.I2S:
                 handlers.convertTo(Type.SHORT);
                 break;
-            case Opcodes.I2L:
+            case Opcodes.I2L, Opcodes.F2L, Opcodes.D2L:
                 handlers.convertTo(Type.LONG);
                 break;
-            case Opcodes.I2F:
+            case Opcodes.I2F, Opcodes.L2F, Opcodes.D2F:
                 handlers.convertTo(Type.FLOAT);
                 break;
-            case Opcodes.I2D:
+            case Opcodes.I2D, Opcodes.L2D, Opcodes.F2D:
                 handlers.convertTo(Type.DOUBLE);
                 break;
-            case Opcodes.L2I:
+            case Opcodes.L2I, Opcodes.F2I, Opcodes.D2I:
                 handlers.convertTo(Type.INT);
-                break;
-            case Opcodes.L2F:
-                handlers.convertTo(Type.FLOAT);
-                break;
-            case Opcodes.L2D:
-                handlers.convertTo(Type.DOUBLE);
-                break;
-            case Opcodes.F2I:
-                handlers.convertTo(Type.INT);
-                break;
-            case Opcodes.F2L:
-                handlers.convertTo(Type.LONG);
-                break;
-            case Opcodes.F2D:
-                handlers.convertTo(Type.DOUBLE);
-                break;
-            case Opcodes.D2I:
-                handlers.convertTo(Type.INT);
-                break;
-            case Opcodes.D2L:
-                handlers.convertTo(Type.LONG);
-                break;
-            case Opcodes.D2F:
-                handlers.convertTo(Type.FLOAT);
                 break;
 
             case Opcodes.POP:
@@ -456,7 +425,7 @@ public class MethodTranslator extends MethodVisitor {
             case Opcodes.FLOAD:
             case Opcodes.DLOAD:
             case Opcodes.ALOAD: {
-                Type type = typeOfLoad(opcode);
+                Type type = typeOfLoad(opcode, var);
                 Instruction load = builder.createLoad(var, type);
                 frame.push(load.getResult());
                 break;
@@ -467,7 +436,8 @@ public class MethodTranslator extends MethodVisitor {
             case Opcodes.DSTORE:
             case Opcodes.ASTORE: {
                 Value val = frame.pop();
-                Instruction store = builder.createStore(val, var);
+                Type localType = typeOfStore(opcode, val);
+                Instruction store = builder.createStore(val, var, localType);
                 frame.setLocal(var, store.getResult());
                 if (val instanceof Temporary t
                     && t.getDefiningInstruction() != null
@@ -501,7 +471,7 @@ public class MethodTranslator extends MethodVisitor {
         Instruction add = builder.addInstruction(Opcode.ADD, loaded, incConst);
         Temporary sum = add.getResult();
 
-        Instruction store = builder.createStore(sum, var);
+        Instruction store = builder.createStore(sum, var, Type.INT);
         frame.setLocal(var, store.getResult());
     }
 
@@ -790,7 +760,7 @@ public class MethodTranslator extends MethodVisitor {
             org.objectweb.asm.Type samType = (org.objectweb.asm.Type) bsmArgs[0];
             String interfaceMethodSig = samName + samType.getDescriptor();
 
-            String lambdaId = "lambda_" + (++lambdaCounter) + "_" + System.identityHashCode(this);
+            String lambdaId = "lambda_" + GLOBAL_LAMBDA_COUNTER.incrementAndGet();
 
             List<Type> capturedTypes = captured.stream()
                 .map(Value::getType)
@@ -862,12 +832,25 @@ public class MethodTranslator extends MethodVisitor {
 
     private void addExceptionalEdges() {
         for (TryCatchRange range : tryCatchRanges) {
-            BasicBlock startBlock = labelToBlock.get(range.start);
-            BasicBlock endBlock = labelToBlock.get(range.end);
+            BasicBlock startBlock   = labelToBlock.get(range.start);
+            BasicBlock endBlock     = labelToBlock.get(range.end);
             BasicBlock handlerBlock = labelToBlock.get(range.handler);
             if (startBlock == null || endBlock == null || handlerBlock == null) continue;
-            List<BasicBlock> blocksInRange = GraphUtils.getBlocksBetween(startBlock, endBlock);
+
+            // The handler is reached from the body by an exceptional edge,
+            // not by normal flow, so it must not be enumerated as part of
+            // the body. Excluding it here also prevents the handler from
+            // being given an exceptional self-edge when it contains a
+            // throwing instruction — the emitter would then wrap the
+            // handler's instructions in the try-guard of the range whose
+            // handler is the handler itself, and the guard's chit block
+            // would branch straight back to the handler's own LLVM label,
+            // producing a structural livelock with no exit.
+            List<BasicBlock> blocksInRange =
+                GraphUtils.getBlocksBetween(startBlock, endBlock, handlerBlock);
+
             for (BasicBlock block : blocksInRange) {
+                if (block == handlerBlock) continue;   // explicit, belt-and-braces
                 for (Instruction inst : block.getInstructions()) {
                     if (inst.canThrow()) {
                         block.addExceptionalSuccessor(handlerBlock);
@@ -946,14 +929,60 @@ public class MethodTranslator extends MethodVisitor {
         return block;
     }
 
-    private Type typeOfLoad(int opcode) {
+    private Type typeOfLoad(int opcode, int var) {
         return switch (opcode) {
             case Opcodes.ILOAD -> Type.INT;
             case Opcodes.LLOAD -> Type.LONG;
             case Opcodes.FLOAD -> Type.FLOAT;
             case Opcodes.DLOAD -> Type.DOUBLE;
-            case Opcodes.ALOAD -> Type.reference("java/lang/Object");
+            case Opcodes.ALOAD -> {
+                Value local = frame.getLocal(var);
+                if (local != null) {
+                    Type lt = local.getType();
+                    if (!lt.isUnknown() && !lt.isNull()) {
+                        yield lt;
+                    }
+                }
+                yield Type.reference("java/lang/Object");
+            }
             default -> Type.UNKNOWN;
+        };
+    }
+
+    /**
+     * Returns the declared type of the JVM local slot written by
+     * {@code opcode}.
+     *
+     * <p>The JVM has exactly five store opcodes, one per declared slot
+     * type, and no others: ISTORE (int), LSTORE (long), FSTORE (float),
+     * DSTORE (double), ASTORE (reference). A slot written by ISTORE is an
+     * int slot for the rest of its live range, regardless of whether the
+     * value being stored came from an arithmetic op, an I2B narrowing, a
+     * BALOAD, or a literal. Symmetrically, a slot is always read back
+     * through the load opcode that corresponds to its declared type, and
+     * the two must agree on the width of the value that flows through.</p>
+     *
+     * <p>ASTORE is the one case where the opcode does not pin the slot to
+     * a single concrete reference type: every reference, array, and null
+     * shares the same LLVM representation, and the value's own type is
+     * preserved when it is a real reference. For null and for the rare
+     * UNKNOWN placeholder the fallback is {@code java/lang/Object}, which
+     * is what {@link #typeOfLoad} already uses for the same cases.</p>
+     */
+    private Type typeOfStore(int opcode, Value val) {
+        return switch (opcode) {
+            case Opcodes.ISTORE -> Type.INT;
+            case Opcodes.LSTORE -> Type.LONG;
+            case Opcodes.FSTORE -> Type.FLOAT;
+            case Opcodes.DSTORE -> Type.DOUBLE;
+            case Opcodes.ASTORE -> {
+                Type vt = val.getType();
+                if (vt.isNull() || vt.isUnknown()) {
+                    yield Type.reference("java/lang/Object");
+                }
+                yield vt;
+            }
+            default -> val.getType();
         };
     }
 

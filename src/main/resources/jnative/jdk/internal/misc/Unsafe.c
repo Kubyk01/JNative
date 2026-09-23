@@ -7,11 +7,10 @@
 #include <stdatomic.h>
 #include <time.h>
 #include <unistd.h>
-
-__attribute__((noreturn)) void __jnative_throw_null_pointer_exception(void);
-__attribute__((noreturn)) void __jnative_throw_exception(void* exc);
-
-extern const char* __jnative_read_string_bytes(void* s, int32_t* out_len);
+#include <ctype.h>
+#include <dlfcn.h>
+#include <inttypes.h>
+#include "jnative_runtime.h"
 
 /*
  * ABI convention for every instance native in this file:
@@ -458,27 +457,9 @@ void __jnative_fn_jdk_internal_misc_Unsafe_putDoubleRelease__Ljava_lang_Object_J
 /* ---- Opaque variants ---- */
 int32_t __jnative_fn_jdk_internal_misc_Unsafe_getIntOpaque__Ljava_lang_Object_J_I(void* this_unsafe, void* obj, int64_t offset) {
     (void)this_unsafe;
-    int32_t v; __atomic_load((int32_t*)effective_address(obj, offset), &v, __ATOMIC_RELAXED); return v;
-}
-void __jnative_fn_jdk_internal_misc_Unsafe_putIntOpaque__Ljava_lang_Object_JI_V(void* this_unsafe, void* obj, int64_t offset, int32_t x) {
-    (void)this_unsafe;
-    __atomic_store((int32_t*)effective_address(obj, offset), &x, __ATOMIC_RELAXED);
-}
-int64_t __jnative_fn_jdk_internal_misc_Unsafe_getLongOpaque__Ljava_lang_Object_J_J(void* this_unsafe, void* obj, int64_t offset) {
-    (void)this_unsafe;
-    int64_t v; __atomic_load((int64_t*)effective_address(obj, offset), &v, __ATOMIC_RELAXED); return v;
-}
-void __jnative_fn_jdk_internal_misc_Unsafe_putLongOpaque__Ljava_lang_Object_JJ_V(void* this_unsafe, void* obj, int64_t offset, int64_t x) {
-    (void)this_unsafe;
-    __atomic_store((int64_t*)effective_address(obj, offset), &x, __ATOMIC_RELAXED);
-}
-void* __jnative_fn_jdk_internal_misc_Unsafe_getReferenceOpaque__Ljava_lang_Object_J_Ljava_lang_Object_(void* this_unsafe, void* obj, int64_t offset) {
-    (void)this_unsafe;
-    void* v; __atomic_load((void**)effective_address(obj, offset), &v, __ATOMIC_RELAXED); return v;
-}
-void __jnative_fn_jdk_internal_misc_Unsafe_putReferenceOpaque__Ljava_lang_Object_JLjava_lang_Object__V(void* this_unsafe, void* obj, int64_t offset, void* x) {
-    (void)this_unsafe;
-    __atomic_store((void**)effective_address(obj, offset), &x, __ATOMIC_RELAXED);
+    int32_t v;
+    __atomic_load((int32_t*)effective_address(obj, offset), &v, __ATOMIC_RELAXED);
+    return v;
 }
 
 /* ---- Direct absolute-address access ---- */
@@ -648,22 +629,132 @@ struct ReflectionFieldLayout {
     int   modifiers;
 };
 
-struct ReflectionClassLayout {
-    void* vtable;
-    void* name;                                 /* const char* */
-    struct ReflectionClassLayout* superclass;
-    struct ReflectionClassLayout** interfaces;
-    void** methods;
-    void** fields;                              /* ReflectionField** */
-    void** constructors;
-    int   modifiers;
-    int   object_size;
-};
+/* ========================================================================
+ *  Field offset resolution
+ *
+ *  Instance fields: the java.lang.reflect.Field mirror's `slot` field
+ *  holds the byte offset computed by LlvmGlobalEmitter.getFieldOffset
+ *  and emitted into @reffield_<class>_<name>. The mirror is created by
+ *  __jnative_fn_java_lang_Class_getDeclaredFields0, which copies that
+ *  offset into the slot during construction.
+ *
+ *  The mirror is a real java.lang.reflect.Field object, not a
+ *  ReflectionField descriptor, so the previous `((ReflectionField*)field)
+ *  ->offset` cast was reading bytes 16..19 of an unrelated object. The
+ *  offsets below are the ones in the java.lang.reflect.{Field,Method,
+ *  Constructor} layout table in jnative_runtime.h, and they must stay
+ *  equal to what LlvmGlobalEmitter.getFieldOffset computes for
+ *  java/lang/reflect/Field.
+ *
+ *  Static fields: this runtime emits each static field as an LLVM
+ *  global @gv_<sanitized(owner.name)>. The address of that global is
+ *  what the (base, offset) pair must yield, so staticFieldOffset
+ *  resolves it through dlsym(RTLD_DEFAULT) and staticFieldBase returns
+ *  NULL. The runtime's effective_address(NULL, addr) then evaluates to
+ *  (void*)addr, which is exactly the global's address.
+ * ======================================================================== */
+
+/*
+ * Build the LLVM global symbol name for a static field, matching
+ * LlvmTypeMapper.sanitizeIdentifier byte-for-byte:
+ *
+ *     "gv_" + sanitize(owner + "." + name)
+ *
+ * where sanitize replaces every character outside [a-zA-Z0-9_] with a
+ * single underscore. '/' and '.' are both outside that set, so
+ * "java/util/concurrent/ForkJoinPool.poolIds" becomes
+ * "gv_java_util_concurrent_ForkJoinPool_poolIds".
+ */
+static int build_static_field_symbol(const char* owner,
+                                     const char* name,
+                                     int32_t name_len,
+                                     char* out, size_t out_size)
+{
+    if (owner == NULL || name == NULL || out_size < 8) return 0;
+
+    size_t pos = 0;
+    out[pos++] = 'g';
+    out[pos++] = 'v';
+    out[pos++] = '_';
+
+    for (const char* p = owner; *p; p++) {
+        if (pos + 2 >= out_size) return 0;
+        unsigned char c = (unsigned char)*p;
+        out[pos++] = (isalnum(c) || c == '_') ? (char)c : '_';
+    }
+    if (pos + 2 >= out_size) return 0;
+    out[pos++] = '_';
+
+    for (int32_t i = 0; i < name_len; i++) {
+        if (pos + 2 >= out_size) return 0;
+        unsigned char c = (unsigned char)name[i];
+        out[pos++] = (isalnum(c) || c == '_') ? (char)c : '_';
+    }
+
+    out[pos] = '\0';
+    return 1;
+}
 
 int64_t __jnative_fn_jdk_internal_misc_Unsafe_objectFieldOffset__Ljava_lang_reflect_Field_J(void* this_unsafe, void* field) {
     (void)this_unsafe;
     if (!field) return 0;
-    return (int64_t)((struct ReflectionFieldLayout*)field)->offset;
+    return (int64_t)*(int32_t*)((char*)field + JNATIVE_FIELD_SLOT_OFFSET);
+}
+
+int64_t __jnative_fn_jdk_internal_misc_Unsafe_staticFieldOffset__Ljava_lang_reflect_Field_J(void* this_unsafe, void* field) {
+    (void)this_unsafe;
+    if (field == NULL) return 0;
+
+    void* clazz     = *(void**)((char*)field + JNATIVE_FIELD_CLAZZ_OFFSET);
+    void* name_str  = *(void**)((char*)field + JNATIVE_FIELD_NAME_OFFSET);
+    if (clazz == NULL || name_str == NULL) return 0;
+
+    int32_t name_len = 0;
+    const char* name = __jnative_read_string_bytes(name_str, &name_len);
+    if (name == NULL || name_len <= 0) return 0;
+
+    void* handle = dlopen(NULL, RTLD_LAZY);
+    if (handle == NULL) return 0;
+
+    /*
+     * Walk the superclass chain. A field queried through a subclass
+     * mirror still has its global emitted under the *declaring* class's
+     * name, so the symbol lookup must try each ancestor until one
+     * resolves. The walk stops at the first hit; a miss on the last
+     * ancestor returns 0.
+     */
+    ReflectionClass* cur = (ReflectionClass*)clazz;
+    int64_t result = 0;
+    char symbol[1024];
+
+    while (cur != NULL) {
+        const char* cls_name = cur->cname;
+        if (cls_name != NULL
+            && build_static_field_symbol(cls_name, name, name_len,
+                                         symbol, sizeof(symbol))) {
+            void* addr = dlsym(handle, symbol);
+            if (addr != NULL) {
+                result = (int64_t)(intptr_t)addr;
+                break;
+            }
+        }
+        cur = cur->superclass;
+    }
+
+    dlclose(handle);
+    return result;
+}
+
+void* __jnative_fn_jdk_internal_misc_Unsafe_staticFieldBase__Ljava_lang_reflect_Field_Ljava_lang_Object_(void* this_unsafe, void* field) {
+    (void)this_unsafe;
+    (void)field;
+    /*
+     * staticFieldOffset already returns the absolute address of the
+     * emitted LLVM global. The runtime's effective_address(NULL, addr)
+     * evaluates to (void*)addr, so returning NULL here makes the
+     * (base, offset) pair resolve to the global's address directly.
+     */
+    return NULL;
 }
 
 int64_t __jnative_fn_jdk_internal_misc_Unsafe_objectFieldOffset1__Ljava_lang_Class_Ljava_lang_String__J(
@@ -680,14 +771,14 @@ int64_t __jnative_fn_jdk_internal_misc_Unsafe_objectFieldOffset1__Ljava_lang_Cla
         return 0;
     }
 
-    struct ReflectionClassLayout* rc = (struct ReflectionClassLayout*)cls;
-    struct ReflectionFieldLayout** fp = (struct ReflectionFieldLayout**)rc->fields;
+    ReflectionClass* rc = (ReflectionClass*)cls;
+    ReflectionField** fp = rc->fields;
     if (fp == NULL) {
         return 0;
     }
 
     while (*fp != NULL) {
-        struct ReflectionFieldLayout* f = *fp;
+        ReflectionField* f = *fp;
         if (f->name != NULL) {
             const char* fname = (const char*)f->name;
             size_t flen = strlen(fname);
@@ -700,30 +791,110 @@ int64_t __jnative_fn_jdk_internal_misc_Unsafe_objectFieldOffset1__Ljava_lang_Cla
     return 0;
 }
 
-int64_t __jnative_fn_jdk_internal_misc_Unsafe_staticFieldOffset__Ljava_lang_reflect_Field_J(void* this_unsafe, void* field) {
-    return __jnative_fn_jdk_internal_misc_Unsafe_objectFieldOffset__Ljava_lang_reflect_Field_J(this_unsafe, field);
-}
-void* __jnative_fn_jdk_internal_misc_Unsafe_staticFieldBase__Ljava_lang_reflect_Field_Ljava_lang_Object_(void* this_unsafe, void* field) {
-    (void)this_unsafe;
-    (void)field;
-    return NULL;
-}
-int32_t __jnative_fn_jdk_internal_misc_Unsafe_arrayBaseOffset__Ljava_lang_Class_I(void* this_unsafe, void* arrayClass) {
+/*
+ * static native int arrayBaseOffset(Class<?> arrayClass);
+ *
+ * Returns the byte offset of the first element of a Java array. This is
+ * the value the JDK's concurrent collections (ConcurrentHashMap,
+ * ConcurrentSkipListMap, ThreadLocalRandom, Striped64, …) fold into
+ * every Unsafe read/write against an array:
+ *
+ *     tabAt(tab, i) == U.getReferenceAcquire(tab, (i << ASHIFT) + ABASE)
+ *     casTabAt(tab, i, c, v)
+ *         == U.compareAndSetReference(tab, (i << ASHIFT) + ABASE, c, v)
+ *
+ * The offset is a property of the runtime's array layout, not of the
+ * array type, so the function ignores its `arrayClass` argument and
+ * returns the single canonical value.
+ *
+ * The value MUST be JAVA_ARR_HDR from jnative_runtime.h — the payload
+ * offset of the runtime's Java-array layout:
+ *
+ *     offset  0 : ReflectionClass* klass
+ *     offset  8 : int32_t         length
+ *     offset 12 : int32_t         elem_size
+ *     offset 16 : payload
+ *
+ * Historically this function returned the literal 8, which was correct
+ * under the earlier 8-byte header (length@0, elem_size@4, payload@8).
+ * After the array layout was corrected to the 16-byte header, this
+ * literal was left behind, and every array access through Unsafe read
+ * the wrong slot: for i == 0 it read length|elem_size as a pointer, for
+ * i == 1 it read the element at index 0, and so on. On
+ * ConcurrentHashMap.get this presented as a null result for keys that
+ * were demonstrably present in the table (the "java.class.version"
+ * lookup inside VM.saveProperties was the first one to dereference the
+ * null).
+ *
+ * Using JAVA_ARR_HDR directly rather than a literal makes the drift
+ * impossible to reintroduce: the compiler reads the same constant the
+ * rest of the runtime uses.
+ */
+int32_t __jnative_fn_jdk_internal_misc_Unsafe_arrayBaseOffset__Ljava_lang_Class_I(
+        void* this_unsafe, void* arrayClass) {
     (void)this_unsafe;
     (void)arrayClass;
-    return 8;
+    return (int32_t)JAVA_ARR_HDR;
 }
 
-int32_t __jnative_fn_jdk_internal_misc_Unsafe_arrayIndexScale__Ljava_lang_Class_I(void* this_unsafe, void* arrayClass) {
+/*
+ * static native int arrayIndexScale(Class<?> arrayClass);
+ *
+ * Returns the stride, in bytes, between consecutive elements of a Java
+ * array, so that the JDK can compute an element's byte offset as
+ * (index << ASHIFT) + ABASE. The value is a property of the array's
+ * element type:
+ *
+ *     boolean[]  byte[]   -> 1
+ *     short[]    char[]   -> 2
+ *     int[]      float[]  -> 4
+ *     long[]     double[] -> 8
+ *     T[]        T[][]    -> 8   (reference / sub-array pointer)
+ *
+ * The class argument is the ARRAY class, and its internal name — the
+ * ReflectionClass->cname field — is the array's JVM descriptor, not the
+ * element type's internal name:
+ *
+ *     int[].class          -> "[I"
+ *     byte[].class         -> "[B"
+ *     String[].class       -> "[Ljava/lang/String;"
+ *     int[][].class        -> "[[I"
+ *
+ * The earlier revision compared cname against the *primitive* class
+ * names ("int", "float", …). Those names are never produced for an
+ * array class, so every primitive array fell through to the reference
+ * case and reported a stride of 8 — correct by accident for long[] and
+ * double[], wrong for everything else. This was latent because the only
+ * caller in the bootstrap path is ConcurrentHashMap.<clinit>, whose
+ * Node[] has an 8-byte element anyway.
+ *
+ * The implementation below switches on the descriptor's first two
+ * characters. The first character must be '['; for a name that is not
+ * an array descriptor the function returns 8 as a conservative default,
+ * matching the reference implementation's behaviour for a
+ * reference-typed array.
+ */
+int32_t __jnative_fn_jdk_internal_misc_Unsafe_arrayIndexScale__Ljava_lang_Class_I(
+        void* this_unsafe, void* arrayClass) {
     (void)this_unsafe;
-    if (!arrayClass) return 1;
-    const char* n = (const char*)((struct ReflectionClassLayout*)arrayClass)->name;
-    if (!n) return 1;
-    if (strcmp(n, "boolean") == 0 || strcmp(n, "byte") == 0) return 1;
-    if (strcmp(n, "short") == 0 || strcmp(n, "char") == 0) return 2;
-    if (strcmp(n, "int") == 0 || strcmp(n, "float") == 0) return 4;
-    if (strcmp(n, "long") == 0 || strcmp(n, "double") == 0) return 8;
-    return 8;
+    if (arrayClass == NULL) return 1;
+
+    const char* n = ((ReflectionClass*)arrayClass)->cname;
+    if (n == NULL || n[0] != '[' || n[1] == '\0') return 8;
+
+    switch (n[1]) {
+        case 'Z': return 1;   /* boolean[] */
+        case 'B': return 1;   /* byte[]    */
+        case 'C': return 2;   /* char[]    */
+        case 'S': return 2;   /* short[]   */
+        case 'I': return 4;   /* int[]     */
+        case 'F': return 4;   /* float[]   */
+        case 'J': return 8;   /* long[]    */
+        case 'D': return 8;   /* double[]  */
+        case 'L': return 8;   /* T[]       */
+        case '[': return 8;   /* T[][]     */
+        default:  return 8;
+    }
 }
 
 /* ---- Misc ---- */
@@ -734,7 +905,7 @@ void* __jnative_fn_jdk_internal_misc_Unsafe_allocateInstance__Ljava_lang_Class__
         __jnative_throw_null_pointer_exception();
         return NULL;
     }
-    int size = ((struct ReflectionClassLayout*)cls)->object_size;
+    int size = ((ReflectionClass*)cls)->object_size;
     if (size <= 0) size = 8;
     return calloc(1, (size_t)size);
 }
@@ -816,9 +987,17 @@ void* __jnative_fn_jdk_internal_misc_Unsafe_staticFieldBase0__Ljava_lang_reflect
     return __jnative_fn_jdk_internal_misc_Unsafe_staticFieldBase__Ljava_lang_reflect_Field_Ljava_lang_Object_(this_unsafe, field);
 }
 
-int32_t __jnative_fn_jdk_internal_misc_Unsafe_arrayBaseOffset0__Ljava_lang_Class__I(void* arrayClass) {
+/*
+ * static native int arrayBaseOffset0(Class<?> arrayClass);
+ *
+ * JDK 17+ spelling of arrayBaseOffset. Same body, same rationale — see
+ * the comment on __jnative_fn_jdk_internal_misc_Unsafe_arrayBaseOffset__
+ * Ljava_lang_Class_I above.
+ */
+int32_t __jnative_fn_jdk_internal_misc_Unsafe_arrayBaseOffset0__Ljava_lang_Class__I(
+        void* arrayClass) {
     (void)arrayClass;
-    return 8;
+    return (int32_t)JAVA_ARR_HDR;
 }
 
 int32_t __jnative_fn_jdk_internal_misc_Unsafe_arrayIndexScale0__Ljava_lang_Class__I(void* this_unsafe, void* arrayClass) {

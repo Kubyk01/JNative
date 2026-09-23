@@ -1,5 +1,7 @@
 #include <stdint.h>
 
+#include "jnative_runtime.h"
+
 int __jnative_fn_java_lang_StringUTF16_isBigEndian___Z(void) {
     union { uint16_t v; uint8_t b[2]; } u;
     u.v = 0x0100u;

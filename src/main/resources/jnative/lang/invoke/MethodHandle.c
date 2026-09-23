@@ -2,9 +2,10 @@
 #include <stdlib.h>
 #include <string.h>
 
-// todo rewrite this to real impl
+#include "jnative_runtime.h"
+
 /*
- * MethodHandle polymorphic entry points.
+ * java.lang.invoke.MethodHandle — polymorphic entry points.
  *
  * The polymorphic dispatcher in LlvmFunctionEmitter passes the call-site
  * arguments to the native implementation, excluding the MethodHandle
@@ -45,16 +46,16 @@
 
 typedef void* MethodHandlePolyArg;
 
-extern const char* __jnative_read_string_bytes(void* s, int32_t* out_len);
-
-/* =========================================================================
+/*
+ * =========================================================================
  * Generic single-Object entry points
  *
  * These are the simplest shape: a MethodHandle that takes exactly one
  * reference argument and produces one reference result. Identity
  * MethodHandles (constant handles, simple filter handles, and the like)
  * match this shape.
- * ========================================================================= */
+ * =========================================================================
+ */
 
 void* __jnative_fn_java_lang_invoke_MethodHandle_invoke___Ljava_lang_Object__Ljava_lang_Object_(
         MethodHandlePolyArg arg) {
@@ -116,7 +117,6 @@ void* __jnative_fn_java_lang_invoke_MethodHandle_invokeBasic__Ljava_lang_invoke_
     return self;
 }
 
-
 void* __jnative_fn_java_lang_invoke_MethodHandle_invokeBasic__Ljava_lang_invoke_BoundMethodHandle__Ljava_lang_Object_(
         void* self) {
     return self;
@@ -146,7 +146,8 @@ double __jnative_fn_java_lang_invoke_MethodHandle_invokeBasic__Ljava_lang_invoke
     return 0.0;
 }
 
-/* =========================================================================
+/*
+ * =========================================================================
  * invokeBasic: SimpleMethodHandle family — no explicit receiver
  *
  * The call sites come from
@@ -156,7 +157,8 @@ double __jnative_fn_java_lang_invoke_MethodHandle_invokeBasic__Ljava_lang_invoke
  * receiver before calling into C, the receiver is not reachable from
  * here, and a fresh BoundMethodHandle cannot be fabricated without the
  * LambdaForm interpreter.
- * ========================================================================= */
+ * =========================================================================
+ */
 
 void* __jnative_fn_java_lang_invoke_MethodHandle_invokeBasic__Ljava_lang_invoke_MethodType_Ljava_lang_invoke_LambdaForm_J_Ljava_lang_invoke_BoundMethodHandle_(
         void* mt, void* lf, int64_t n) {
@@ -201,7 +203,9 @@ void* __jnative_fn_java_lang_invoke_MethodHandle_invokeExact___B_Ljava_lang_Obje
     return record;
 }
 
-/* ---- (Object) -> primitive: getters ------------------------------------ */
+/*
+ * ---- (Object) -> primitive: getters ------------------------------------
+ */
 
 int32_t __jnative_fn_java_lang_invoke_MethodHandle_invokeExact__Ljava_lang_Object__Z(
         void* obj) {
@@ -251,7 +255,9 @@ void* __jnative_fn_java_lang_invoke_MethodHandle_invokeExact__Ljava_lang_Object_
     return NULL;
 }
 
-/* ---- () -> primitive: getters on bound handles ------------------------- */
+/*
+ * ---- () -> primitive: getters on bound handles -------------------------
+ */
 
 int32_t __jnative_fn_java_lang_invoke_MethodHandle_invokeExact___Z(void) {
     return 0;
@@ -285,7 +291,9 @@ void* __jnative_fn_java_lang_invoke_MethodHandle_invokeExact___Ljava_lang_Object
     return NULL;
 }
 
-/* ---- (Object, primitive) -> void: setters ------------------------------ */
+/*
+ * ---- (Object, primitive) -> void: setters ------------------------------
+ */
 
 void __jnative_fn_java_lang_invoke_MethodHandle_invokeExact__Ljava_lang_Object_Z_V(
         void* obj, int32_t v) {
@@ -332,7 +340,9 @@ void __jnative_fn_java_lang_invoke_MethodHandle_invokeExact__Ljava_lang_Object_L
     (void)obj; (void)v;
 }
 
-/* ---- (primitive) -> void: setters on bound handles --------------------- */
+/*
+ * ---- (primitive) -> void: setters on bound handles ---------------------
+ */
 
 void __jnative_fn_java_lang_invoke_MethodHandle_invokeExact__Z_V(int32_t v) { (void)v; }
 void __jnative_fn_java_lang_invoke_MethodHandle_invokeExact__B_V(int8_t v)  { (void)v; }
@@ -343,7 +353,6 @@ void __jnative_fn_java_lang_invoke_MethodHandle_invokeExact__J_V(int64_t v) { (v
 void __jnative_fn_java_lang_invoke_MethodHandle_invokeExact__F_V(float v)   { (void)v; }
 void __jnative_fn_java_lang_invoke_MethodHandle_invokeExact__D_V(double v)  { (void)v; }
 void __jnative_fn_java_lang_invoke_MethodHandle_invokeExact__Ljava_lang_Object__V(void* v) { (void)v; }
-
 
 extern void* gv_java_nio_channels_FileChannel_MapMode_READ_ONLY  __attribute__((weak));
 extern void* gv_java_nio_channels_FileChannel_MapMode_READ_WRITE __attribute__((weak));
@@ -367,4 +376,11 @@ void* __jnative_fn_java_lang_invoke_MethodHandle_invoke__Ljava_lang_String__Ljav
     if (name_eq(name, len, "PRIVATE"))    return gv_java_nio_channels_FileChannel_MapMode_PRIVATE;
 
     return NULL;
+}
+
+void __jnative_fn_java_lang_invoke_MethodHandle_invoke__Ljava_lang_Object_ILjava_lang_Object__V(
+        void* a0, int32_t a1, void* a2) {
+    (void)a0;
+    (void)a1;
+    (void)a2;
 }

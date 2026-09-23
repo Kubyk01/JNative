@@ -4,6 +4,8 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 
+#include "jnative_runtime.h"
+
 static int __jnative_inet6_init_done = 0;
 
 void __jnative_fn_java_net_Inet6Address_init___V(void) {

@@ -3,7 +3,7 @@
 #include <unistd.h>
 #include <errno.h>
 
-__attribute__((noreturn)) void __jnative_throw_exception(void* exc);
+#include "jnative_runtime.h"
 
 void __jnative_fn_java_io_FileCleanable_initIDs___V(void) {
 }

@@ -2,35 +2,59 @@
 #include <stddef.h>
 #include <stdint.h>
 
-struct JNativeIfaceMapEntry {
-    int32_t id;
-    void** itable;
-};
+#include "jnative_runtime.h"
 
-struct JNativeIfaceMap {
-    int32_t count;
-    struct JNativeIfaceMapEntry* entries;
-};
+/*
+ * java.security.AccessController — the native entry points behind the
+ * doPrivileged family.
+ *
+ * In HotSpot, AccessController.doPrivileged wraps the caller's action
+ * in a Java-level privileged frame that the security manager consults
+ * during subsequent permission checks. This runtime has no security
+ * manager and no per-thread AccessControlContext stack: every
+ * permission check that reaches the Java layer is answered with the
+ * default "allowed" (see checkPermission below), so the privileged
+ * frame has no observable effect on access decisions.
+ *
+ * What remains meaningful is that doPrivileged must still *invoke* the
+ * caller's action — the action's own body is what the caller actually
+ * wanted to run — and it must do so through the correct interface
+ * dispatch (PrivilegedAction.run() returning Object, or
+ * PrivilegedExceptionAction.run() returning Object). Both of those are
+ * ordinary interface calls, and the runtime has a canonical itable
+ * lookup for that (__jnative_lookup_itable in jnative_runtime.c).
+ *
+ * The four iface_id/run_slot globals below are emitted by
+ * LlvmGenerator.generateMain as @__jnative_privilegedaction_iface_id,
+ * @__jnative_privilegedaction_run_slot, and their
+ * PrivilegedExceptionAction counterparts. They carry the numeric
+ * interface id and method slot that the runtime's interface-dispatch
+ * machinery needs to resolve the action's run() method.
+ */
 
-struct JNativeVTable {
-    void** methods;
-    struct JNativeIfaceMap* ifacemap;
-    const char* name;
-};
-
-extern void** __jnative_lookup_itable(struct JNativeIfaceMap* ifacemap, int32_t iface_id);
 extern const int32_t __jnative_privilegedaction_iface_id;
 extern const int32_t __jnative_privilegedaction_run_slot;
 extern const int32_t __jnative_privilegedexceptionaction_iface_id;
 extern const int32_t __jnative_privilegedexceptionaction_run_slot;
 
-__attribute__((noreturn)) void __jnative_throw_null_pointer_exception(void);
-
+/*
+ * Common dispatch helper: resolve the action's run() method through the
+ * runtime's interface-table lookup and invoke it. Returns whatever the
+ * action's run() returns.
+ *
+ * A NULL action, a NULL vtable, a missing itable for the given
+ * interface id, or a NULL entry in the resolved slot are all treated
+ * as NullPointerException. Each of them is a genuine programming error
+ * at the Java level — the caller either passed null where a non-null
+ * action was required, or the action's class does not actually
+ * implement the interface it was declared to implement — and none of
+ * them has a more specific recovery path.
+ */
 static void* invoke_action_run(void* action, int32_t iface_id, int32_t slot) {
     if (action == NULL) {
         __jnative_throw_null_pointer_exception();
     }
-    struct JNativeVTable* vt = *(struct JNativeVTable**)action;
+    JNativeVTable* vt = *(JNativeVTable**)action;
     if (vt == NULL) {
         __jnative_throw_null_pointer_exception();
     }

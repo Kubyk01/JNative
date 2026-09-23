@@ -2,7 +2,11 @@ package io.github.kubyk01.domain.analyzer.aliasanalysis;
 
 import lombok.Builder;
 import lombok.Data;
-import java.util.*;
+
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Map;
+import java.util.Set;
 
 @Data
 @Builder
@@ -21,6 +25,7 @@ public class FunctionSummary {
     private Set<String> fieldsRead = new HashSet<>();
     @Builder.Default
     private Set<String> fieldsWritten = new HashSet<>();
+
     private boolean returnsObject;
     private boolean readsStaticFields;
     private boolean writesStaticFields;
@@ -29,9 +34,9 @@ public class FunctionSummary {
     @Builder.Default
     private Set<AllocationSite> returnedAllocations = new HashSet<>();
     @Builder.Default
-    private Map<Integer, Map<String, Set<AllocationSite>>> paramsFieldWrites = new HashMap<>();
+    private Map<Integer, Set<String>> paramsFieldWrites = new HashMap<>();
     @Builder.Default
-    private Map<String, Set<AllocationSite>> staticFieldWrites = new HashMap<>();
+    private Set<String> staticFieldWrites = new HashSet<>();
 
     public void merge(FunctionSummary other) {
         paramsRead.addAll(other.paramsRead);
@@ -43,15 +48,11 @@ public class FunctionSummary {
         fieldsWritten.addAll(other.fieldsWritten);
         returnedAllocations.addAll(other.returnedAllocations);
 
-        for (Map.Entry<Integer, Map<String, Set<AllocationSite>>> e : other.paramsFieldWrites.entrySet()) {
-            Map<String, Set<AllocationSite>> map = paramsFieldWrites.computeIfAbsent(e.getKey(), k -> new HashMap<>());
-            for (Map.Entry<String, Set<AllocationSite>> fe : e.getValue().entrySet()) {
-                map.computeIfAbsent(fe.getKey(), k -> new HashSet<>()).addAll(fe.getValue());
-            }
+        for (Map.Entry<Integer, Set<String>> e : other.paramsFieldWrites.entrySet()) {
+            paramsFieldWrites.computeIfAbsent(e.getKey(), k -> new HashSet<>())
+                .addAll(e.getValue());
         }
-        for (Map.Entry<String, Set<AllocationSite>> e : other.staticFieldWrites.entrySet()) {
-            staticFieldWrites.computeIfAbsent(e.getKey(), k -> new HashSet<>()).addAll(e.getValue());
-        }
+        staticFieldWrites.addAll(other.staticFieldWrites);
 
         returnsObject = returnsObject || other.returnsObject;
         readsStaticFields = readsStaticFields || other.readsStaticFields;

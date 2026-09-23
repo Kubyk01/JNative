@@ -1,5 +1,3 @@
-/* src/main/resources/jnative/sun/nio/fs/UnixNativeDispatcher.c */
-
 #define _GNU_SOURCE
 #include <stdint.h>
 #include <stdlib.h>
@@ -18,22 +16,28 @@
 #include <sys/un.h>
 #include <sys/xattr.h>
 
-__attribute__((noreturn)) void __jnative_throw_exception(void* exc);
-__attribute__((noreturn)) void __jnative_throw_null_pointer_exception(void);
-
-/* Java array layout: [ int32 length ][ payload ... ] */
-#define JAVA_ARR_HDR 8
+#include "jnative_runtime.h"
 
 /*
- * Object layout constants.
+ * sun.nio.fs.UnixNativeDispatcher — the low-level filesystem syscall
+ * bindings that every Unix file-system provider in java.nio.file uses.
  *
- * The LLVM backend computes instance-field offsets from the declaration
- * order of each class (see LlvmGlobalEmitter.getFieldOffset), starting
- * from OBJECT_HEADER_SIZE = 8. The numbers below match exactly that
- * computation for the two JDK classes whose fields this file writes:
+ * The class contributes a broad family of entry points: stat/lstat/fstat,
+ * statvfs, open/openat/close/dup, directory streams, mkdir/rmdir/unlink,
+ * symlink/readlink, access, chmod/chown, timestamp setters, and the
+ * Linux extended-attribute accessors. Each method is a thin wrapper
+ * around exactly one syscall, with the error handling the JDK's
+ * Java-side callers expect: a hard failure surfaces as an IOException
+ * through the generic throw helper, while "the query succeeded but the
+ * answer is negative" is reported via the return value.
  *
- *   sun.nio.fs.UnixFileAttributes         (15 instance fields)
- *   sun.nio.fs.UnixFileStoreAttributes    ( 5 instance fields)
+ * The two custom classes whose fields this file writes are
+ * sun.nio.fs.UnixFileAttributes (15 instance fields) and
+ * sun.nio.fs.UnixFileStoreAttributes (5 instance fields). The offsets
+ * below are the ones LlvmGlobalEmitter.getFieldOffset computes from the
+ * JDK's declared field order and the runtime's alignment rules, and
+ * they are frozen by that computation: any change to the layout of
+ * either class must be mirrored here synchronously.
  *
  * Layout for UnixFileAttributes:
  *    0 : vtable
@@ -85,10 +89,13 @@ __attribute__((noreturn)) void __jnative_throw_null_pointer_exception(void);
 #define UFSA_F_BFREE  32
 #define UFSA_F_BAVAIL 40
 
-/* --------------------------------------------------------------------------
- * Helpers
- * ------------------------------------------------------------------------ */
-
+/*
+ * The path and pointer arguments arrive as jlong addresses that the
+ * Java layer has obtained from a direct ByteBuffer. On every platform
+ * this runtime targets, a jlong is exactly as wide as a pointer, so a
+ * plain cast through intptr_t recovers the original C pointer without
+ * any loss.
+ */
 static inline const char* path_of(int64_t address) {
     return (const char*)(intptr_t)address;
 }
@@ -97,10 +104,6 @@ static inline void* ptr_of(int64_t address) {
     return (void*)(intptr_t)address;
 }
 
-/*
- * Copies a struct stat into the instance fields of a
- * sun.nio.fs.UnixFileAttributes object. Called by stat0/lstat0/fstat0.
- */
 static void fill_attrs(void* attrs, const struct stat* st) {
     if (attrs == NULL) return;
     char* p = (char*)attrs;
@@ -121,26 +124,37 @@ static void fill_attrs(void* attrs, const struct stat* st) {
     *(int64_t*)(p + UFA_ST_CTIME_SEC)  = (int64_t)st->st_ctim.tv_sec;
     *(int64_t*)(p + UFA_ST_CTIME_NSEC) = (int64_t)st->st_ctim.tv_nsec;
 
-    /* Linux does not expose a birth time; the JDK leaves the field at 0. */
     *(int64_t*)(p + UFA_ST_BIRTHTIME_SEC) = 0;
 }
 
 static void* make_byte_array(const void* data, size_t len) {
-    void* arr = malloc(JAVA_ARR_HDR + len);
-    if (arr == NULL) {
+    if (len > (size_t)INT32_MAX) {
         __jnative_throw_exception(NULL);
     }
-    *(int32_t*)arr = (int32_t)len;
-    if (len > 0 && data != NULL) {
-        memcpy((char*)arr + JAVA_ARR_HDR, data, len);
+    /*
+     * jnative_byte_array() builds the whole header — [B class mirror,
+     * length and elem_size — so the result is indistinguishable from one
+     * the LLVM emitter allocated via NEW_ARRAY.
+     */
+    void* arr = jnative_byte_array(data, (int32_t)len);
+    if (arr == NULL) {
+        __jnative_throw_exception(NULL);
     }
     return arr;
 }
 
-/* --------------------------------------------------------------------------
- * Initialization
- * ------------------------------------------------------------------------ */
-
+/*
+ * static native int init();
+ *
+ * Called from UnixNativeDispatcher.<clinit>. In HotSpot this hook
+ * probes for the availability of various Unix system calls and caches
+ * the results in static Java fields. This runtime performs the same
+ * probes lazily inside the functions that need them, so <clinit> has
+ * nothing to install.
+ *
+ * Returns -1 to signal "no capability flags cached". The Java layer
+ * checks for that sentinel and takes the conservative path.
+ */
 int32_t __jnative_fn_sun_nio_fs_UnixNativeDispatcher_init___I(void) {
     return -1;
 }
@@ -152,17 +166,19 @@ int32_t __jnative_fn_sun_nio_fs_UnixNativeDispatcher_exists0__J_Z(
     return (stat(path_of(pathAddress), &st) == 0) ? 1 : 0;
 }
 
-/* --------------------------------------------------------------------------
- * getcwd / strerror — the two functions that return byte[]
- * ------------------------------------------------------------------------ */
-
+/*
+ * static native byte[] getcwd();
+ *
+ * Returns the current working directory as a byte[]. Uses getcwd(3) with
+ * a buffer large enough for any path the kernel will report. Failures —
+ * ENOENT after a concurrent rmdir, EACCES after a chdir into a
+ * now-unreadable directory, ENOMEM for an over-long path — surface as
+ * an IOException through the generic throw helper.
+ */
 void* __jnative_fn_sun_nio_fs_UnixNativeDispatcher_getcwd____B(void) {
     char buf[65536];
 
     if (getcwd(buf, sizeof(buf)) == NULL) {
-        /* ENOENT after a concurrent rmdir, EACCES after a chdir into a
-         * now-unreadable directory, ENOMEM for an over-long path — all
-         * surface to Java as IOException. */
         __jnative_throw_exception(NULL);
         return NULL;
     }
@@ -178,10 +194,13 @@ void* __jnative_fn_sun_nio_fs_UnixNativeDispatcher_strerror__I__B(int32_t errnum
     return make_byte_array(msg, strlen(msg));
 }
 
-/* --------------------------------------------------------------------------
- * stat / lstat / fstat
- * ------------------------------------------------------------------------ */
-
+/*
+ * static native int stat0(long pathAddress, UnixFileAttributes attrs);
+ *
+ * Populates `attrs` from stat(2) on the given path. Symlinks are
+ * followed. Returns 0 on success; any failure surfaces as an
+ * IOException.
+ */
 int32_t __jnative_fn_sun_nio_fs_UnixNativeDispatcher_stat0__JLsun_nio_fs_UnixFileAttributes__I(
         int64_t pathAddress, void* attrs)
 {
@@ -216,10 +235,14 @@ void __jnative_fn_sun_nio_fs_UnixNativeDispatcher_fstat0__ILsun_nio_fs_UnixFileA
     fill_attrs(attrs, &st);
 }
 
-/* --------------------------------------------------------------------------
- * statvfs — fills a UnixFileStoreAttributes
- * ------------------------------------------------------------------------ */
-
+/*
+ * static native void statvfs0(long pathAddress,
+ *                             UnixFileStoreAttributes attrs);
+ *
+ * Populates `attrs` from statvfs(2) on the given path. The result
+ * describes the mounted filesystem that contains the path, which is
+ * what FileStore queries need.
+ */
 void __jnative_fn_sun_nio_fs_UnixNativeDispatcher_statvfs0__JLsun_nio_fs_UnixFileStoreAttributes__V(
         int64_t pathAddress, void* attrs)
 {
@@ -237,10 +260,12 @@ void __jnative_fn_sun_nio_fs_UnixNativeDispatcher_statvfs0__JLsun_nio_fs_UnixFil
     *(int64_t*)(p + UFSA_F_BAVAIL) = (int64_t)vfs.f_bavail;
 }
 
-/* --------------------------------------------------------------------------
- * open / openat / close / dup
- * ------------------------------------------------------------------------ */
-
+/*
+ * static native int open0(long pathAddress, int flags, int mode);
+ *
+ * Thin wrapper around open(2). Returns the raw kernel descriptor on
+ * success; any failure surfaces as an IOException.
+ */
 int32_t __jnative_fn_sun_nio_fs_UnixNativeDispatcher_open0__JII_I(
         int64_t pathAddress, int32_t flags, int32_t mode)
 {
@@ -274,10 +299,14 @@ int32_t __jnative_fn_sun_nio_fs_UnixNativeDispatcher_dup__I_I(int32_t fd) {
     return (int32_t)newfd;
 }
 
-/* --------------------------------------------------------------------------
- * Directory streams
- * ------------------------------------------------------------------------ */
-
+/*
+ * static native long opendir0(long pathAddress);
+ *
+ * Opens a directory stream via opendir(3). Returns the directory
+ * stream pointer as a jlong on success; any failure surfaces as an
+ * IOException. The pointer is only valid until the matching
+ * closedir / fdopendir pair is invoked.
+ */
 int64_t __jnative_fn_sun_nio_fs_UnixNativeDispatcher_opendir0__J_J(
         int64_t pathAddress)
 {
@@ -302,9 +331,15 @@ void __jnative_fn_sun_nio_fs_UnixNativeDispatcher_closedir__J_V(int64_t dirp) {
 }
 
 /*
- * sun.nio.fs.UnixNativeDispatcher.readdir0(long dp) returns the raw
- * d_name bytes of the next directory entry, or null at end of stream.
- * The caller (UnixDirectoryStream) turns the byte array into a String.
+ * static native byte[] readdir0(long dirp);
+ *
+ * Returns the raw d_name bytes of the next directory entry, or null
+ * at end of stream. The caller (UnixDirectoryStream) turns the byte
+ * array into a String.
+ *
+ * A readdir failure after the end of stream is signalled by a non-zero
+ * errno; that is translated into an IOException rather than being
+ * conflated with the normal end-of-directory case.
  */
 void* __jnative_fn_sun_nio_fs_UnixNativeDispatcher_readdir0__J__B(int64_t dirp) {
     DIR* d = (DIR*)(intptr_t)dirp;
@@ -322,10 +357,12 @@ void* __jnative_fn_sun_nio_fs_UnixNativeDispatcher_readdir0__J__B(int64_t dirp) 
     return make_byte_array(entry->d_name, strlen(entry->d_name));
 }
 
-/* --------------------------------------------------------------------------
- * mkdir / rmdir / unlink / unlinkat / symlink
- * ------------------------------------------------------------------------ */
-
+/*
+ * static native void mkdir0(long pathAddress, int mode);
+ *
+ * Creates a directory via mkdir(2). Any failure surfaces as an
+ * IOException.
+ */
 void __jnative_fn_sun_nio_fs_UnixNativeDispatcher_mkdir0__JI_V(
         int64_t pathAddress, int32_t mode)
 {
@@ -362,10 +399,13 @@ void __jnative_fn_sun_nio_fs_UnixNativeDispatcher_symlink0__JJ_V(
     }
 }
 
-/* --------------------------------------------------------------------------
- * readlink
- * ------------------------------------------------------------------------ */
-
+/*
+ * static native byte[] readlink0(long pathAddress);
+ *
+ * Returns the target of a symbolic link as a byte[]. A symlink whose
+ * target is longer than PATH_MAX is reported as ENAMETOOLONG by the
+ * kernel and surfaces as an IOException.
+ */
 void* __jnative_fn_sun_nio_fs_UnixNativeDispatcher_readlink0__J__B(
         int64_t pathAddress)
 {
@@ -378,10 +418,13 @@ void* __jnative_fn_sun_nio_fs_UnixNativeDispatcher_readlink0__J__B(
     return make_byte_array(buf, (size_t)n);
 }
 
-/* --------------------------------------------------------------------------
- * access
- * ------------------------------------------------------------------------ */
-
+/*
+ * static native void access0(long pathAddress, int amode);
+ *
+ * Tests accessibility of the given path via access(2). The `amode`
+ * argument carries one or more of R_OK / W_OK / X_OK, or F_OK for an
+ * existence-only query. Any failure surfaces as an IOException.
+ */
 void __jnative_fn_sun_nio_fs_UnixNativeDispatcher_access0__JI_V(
         int64_t pathAddress, int32_t amode)
 {
@@ -390,10 +433,12 @@ void __jnative_fn_sun_nio_fs_UnixNativeDispatcher_access0__JI_V(
     }
 }
 
-/* --------------------------------------------------------------------------
- * chmod / chown family
- * ------------------------------------------------------------------------ */
-
+/*
+ * static native void chmod0(long pathAddress, int mode);
+ *
+ * Changes the permission bits of the given path via chmod(2). Any
+ * failure surfaces as an IOException.
+ */
 void __jnative_fn_sun_nio_fs_UnixNativeDispatcher_chmod0__JI_V(
         int64_t pathAddress, int32_t mode)
 {
@@ -434,13 +479,15 @@ void __jnative_fn_sun_nio_fs_UnixNativeDispatcher_fchown0__III_V(
     }
 }
 
-/* --------------------------------------------------------------------------
- * Times
+/*
+ * =========================================================================
+ * Timestamp setters.
  *
  * The Java layer converts every timestamp to a single long before the
- * call, splitting it into seconds/nanoseconds (or seconds/microseconds
- * for the *utimes family) on the native side.
- * ------------------------------------------------------------------------ */
+ * call; the native side splits it into seconds/nanoseconds (or
+ * seconds/microseconds for the *utimes family).
+ * =========================================================================
+ */
 
 void __jnative_fn_sun_nio_fs_UnixNativeDispatcher_futimes0__IJJ_V(
         int32_t fd, int64_t atime_usec, int64_t mtime_usec)
@@ -473,19 +520,11 @@ void __jnative_fn_sun_nio_fs_UnixNativeDispatcher_utimes0__JJJ_V(
 void __jnative_fn_sun_nio_fs_UnixNativeDispatcher_lutimes0__JJJ_V(
         int64_t pathAddress, int64_t atime_usec, int64_t mtime_usec)
 {
-    struct timeval times[2];
-    times[0].tv_sec  = (time_t)(atime_usec / 1000000);
-    times[0].tv_usec = (suseconds_t)(atime_usec % 1000000);
-    times[1].tv_sec  = (time_t)(mtime_usec / 1000000);
-    times[1].tv_usec = (suseconds_t)(mtime_usec % 1000000);
-
-    /* Linux does not provide lutimes(3); emulate it by calling utimensat
-     * with AT_SYMLINK_NOFOLLOW, which is the semantic equivalent. */
     struct timespec ts[2];
-    ts[0].tv_sec  = times[0].tv_sec;
-    ts[0].tv_nsec = times[0].tv_usec * 1000;
-    ts[1].tv_sec  = times[1].tv_sec;
-    ts[1].tv_nsec = times[1].tv_usec * 1000;
+    ts[0].tv_sec  = (time_t)(atime_usec / 1000000);
+    ts[0].tv_nsec = (long)((atime_usec % 1000000) * 1000);
+    ts[1].tv_sec  = (time_t)(mtime_usec / 1000000);
+    ts[1].tv_nsec = (long)((mtime_usec % 1000000) * 1000);
 
     if (utimensat(AT_FDCWD, path_of(pathAddress), ts, AT_SYMLINK_NOFOLLOW) < 0) {
         __jnative_throw_exception(NULL);
@@ -506,9 +545,17 @@ void __jnative_fn_sun_nio_fs_UnixNativeDispatcher_futimens0__IJJ_V(
     }
 }
 
-/* --------------------------------------------------------------------------
- * Extended attributes (Linux)
- * ------------------------------------------------------------------------ */
+/*
+ * =========================================================================
+ * Extended attributes (Linux only).
+ *
+ * These are reached from the UnixUserDefinedFileAttributeView
+ * implementation and operate on the xattr namespace of the given
+ * descriptor. The `name` and `value` arguments are native addresses
+ * pointing into a direct ByteBuffer; the length arguments are
+ * explicit because the buffers themselves carry no length.
+ * =========================================================================
+ */
 
 int32_t __jnative_fn_sun_nio_fs_UnixNativeDispatcher_fgetxattr0__IJJI_I(
         int32_t fd, int64_t nameAddress, int64_t valueAddress, int32_t valueLen)
@@ -534,8 +581,6 @@ void __jnative_fn_sun_nio_fs_UnixNativeDispatcher_fsetxattr0__IJJI_V(
     const void* value = ptr_of(valueAddress);
 
     if (value == NULL) {
-        /* Remove the attribute by setting an empty value, matching the
-         * JDK's UnixUserDefinedFileAttributeView.delete behaviour. */
         if (fsetxattr((int)fd, name, "", 0, 0) < 0) {
             __jnative_throw_exception(NULL);
         }

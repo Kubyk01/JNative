@@ -11,4 +11,5 @@ public class FieldNode {
     private String descriptor;
     private Type type;          // resolved type
     private int access;
+    private String owner;
 }

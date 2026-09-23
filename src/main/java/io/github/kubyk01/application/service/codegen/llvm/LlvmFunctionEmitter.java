@@ -4,6 +4,7 @@ import io.github.kubyk01.application.service.analyzer.dependencyresolver.Depende
 import io.github.kubyk01.application.service.analyzer.ssa.GraphUtils;
 import io.github.kubyk01.application.service.analyzer.ssa.TypeResolver;
 import io.github.kubyk01.application.service.codegen.llvm.nativepolymorphicfunctionresolver.PolymorphicResolver;
+import io.github.kubyk01.domain.analyzer.dependencyresolver.MethodNode;
 import io.github.kubyk01.domain.ir.BasicBlock;
 import io.github.kubyk01.domain.ir.BranchTerminator;
 import io.github.kubyk01.domain.ir.CondBranchTerminator;
@@ -19,6 +20,7 @@ import io.github.kubyk01.domain.ir.Parameter;
 import io.github.kubyk01.domain.ir.ResolvedCall;
 import io.github.kubyk01.domain.ir.ReturnTerminator;
 import io.github.kubyk01.domain.ir.TableSwitchTerminator;
+import io.github.kubyk01.domain.ir.Temporary;
 import io.github.kubyk01.domain.ir.Terminator;
 import io.github.kubyk01.domain.ir.ThrowTerminator;
 import io.github.kubyk01.domain.ir.TryCatchRange;
@@ -27,6 +29,7 @@ import io.github.kubyk01.domain.ir.Value;
 import io.github.kubyk01.util.parserC.ParserC.NativeMethodInfo;
 import lombok.RequiredArgsConstructor;
 
+import java.lang.reflect.Modifier;
 import java.util.*;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
@@ -40,6 +43,49 @@ import static io.github.kubyk01.util.LlvmUtil.getElementSizeOfType;
 
 @RequiredArgsConstructor
 public class LlvmFunctionEmitter {
+
+    /**
+     * Name prefix of every lazy-{@code <clinit>} guard wrapper emitted by
+     * {@link io.github.kubyk01.application.service.optimizer.LazyClinitInstrumenter}.
+     *
+     * <p>Duplicated here as a string literal rather than imported so that
+     * the codegen layer stays free of a dependency on the optimizer
+     * layer. The value must stay in lockstep with the constant of the
+     * same name in {@code LazyClinitInstrumenter}; the prefix is part of
+     * the two classes' contract.</p>
+     *
+     * <p>Functions whose mangled name starts with this prefix are emitted
+     * with the {@code noinline} attribute so that LLVM does not inline
+     * the wrapper — and with it the {@code __jnative_clinit_enter}/
+     * {@code __jnative_clinit_exit} state machine — into every active-use
+     * call site. See the comment at the emission site in
+     * {@link #emitFunction} for the full rationale.</p>
+     */
+    private static final String LAZY_CLINIT_WRAPPER_PREFIX = "fn___lazy_clinit_run_";
+
+    /**
+     * Suffix of the mangled name of every {@code <clinit>} body.
+     *
+     * <p>{@code LlvmRuntime.mangleMethod("…", "<clinit>", "()V")} produces
+     * {@code fn_<sanitised-class>___clinit____V}; the three underscores
+     * before the {@code V} come from {@code _} terminating the mangled
+     * {@code <clinit>} name, the separator {@code _}, and the {@code __}
+     * that mangles {@code ()}. The suffix below is therefore the exact
+     * tail every {@code <clinit>} function carries and no other function
+     * does.</p>
+     *
+     * <p>{@link #emitFunction} emits the definition of every function whose
+     * name ends with this suffix with the {@code noinline} attribute. See
+     * the comment at the emission site for the full rationale — briefly:
+     * {@code Reflection.getCallerClass()} identifies "the class whose
+     * {@code <clinit>} is currently running" by the name of the stack
+     * frame that called the caller-sensitive method. If LLVM inlines a
+     * {@code <clinit>} body into its lazy wrapper, that frame disappears,
+     * the walk skips the wrapper (which is itself a service frame), and
+     * returns the class of the next surviving frame — which is some outer
+     * class unrelated to the one whose initializer actually made the call.</p>
+     */
+    private static final String CLINIT_SUFFIX = "__clinit____V";
 
     @FunctionalInterface
     private interface CallEmitter {
@@ -130,7 +176,59 @@ public class LlvmFunctionEmitter {
             signature.append(LlvmTypeMapper.toLlvmType(params.get(i).getType()))
                 .append(" %param_").append(i);
         }
-        signature.append(") {\n");
+        signature.append(")");
+        // Function attributes go AFTER the parameter list in LLVM IR — they
+        // are not modifiers of the return type. The earlier revision emitted
+        // `define noinline void @name(...)`, which clang rejects with
+        //     error: this attribute does not apply to return values
+        // because the parser is looking at `noinline` where it expects a
+        // type. The `noinline` here keeps LLVM from inlining two
+        // categories of function that the runtime depends on being
+        // present as separate stack frames, or that the runtime depends
+        // on being called exactly once:
+        //
+        //   1. The lazy-<clinit> guard wrappers, whose body contains the
+        //      __jnative_clinit_enter/__jnative_clinit_exit state machine
+        //      (pthread_mutex_lock + linear strcmp walk over
+        //      clinit_table). Inlining the wrapper into every active-use
+        //      call site — of which a large image has tens of thousands —
+        //      duplicates the state machine, bloats the binary, and buries
+        //      the surrounding CFG under a heavyweight instruction
+        //      sequence, turning any control-flow defect in that function
+        //      into a hot spot inside the state machine instead of a
+        //      structural problem in the guarded regions.
+        //
+        //   2. The <clinit> bodies themselves. Reflection.getCallerClass()
+        //      identifies "the class whose <clinit> is currently running"
+        //      by the name of the stack frame that called the
+        //      caller-sensitive method: the symbol is looked up in
+        //      @jnative_symbol_class_map, which maps
+        //      fn_<class>___clinit____V back to the class name. If the
+        //      backend inlines a <clinit> body into its lazy wrapper, that
+        //      frame disappears; the walk then sees only the wrapper
+        //      (a service frame, skipped by rule 1 of the walk) and
+        //      continues to the next surviving Java frame, which is some
+        //      unrelated outer class. The concrete failure that motivated
+        //      marking these noinline:
+        //
+        //          java.lang.IllegalCallerException:
+        //              class jdk.internal.loader.ClassLoaders not a
+        //              subclass of ClassLoader
+        //
+        //      raised from ClassLoader.registerAsParallelCapable called by
+        //      SecureClassLoader.<clinit>, whose body had been inlined into
+        //      fn___lazy_clinit_run_java_security_SecureClassLoader.
+        //
+        // The two checks are independent: a wrapper is not a <clinit> body
+        // and vice versa, and either one being inlined away breaks a
+        // different invariant. Both constants (LAZY_CLINIT_WRAPPER_PREFIX
+        // and CLINIT_SUFFIX) are stable parts of the contract with
+        // LazyClinitInstrumenter and LlvmRuntime.mangleMethod.
+        if (funcName.startsWith(LAZY_CLINIT_WRAPPER_PREFIX)
+            || funcName.endsWith(CLINIT_SUFFIX)) {
+            signature.append(" noinline");
+        }
+        signature.append(" {\n");
 
         for (int i = 0; i < params.size(); i++) {
             valueMapper.setValue(params.get(i), "%param_" + i);
@@ -154,7 +252,6 @@ public class LlvmFunctionEmitter {
                 entryIdx = i;
             } else if (isEntry && currentEntryBlock == null) {
                 entryIdx = i;
-                firstBlock = false;
             }
             bodies.add(emitBlock(block, isEntry));
             firstBlock = false;
@@ -167,6 +264,19 @@ public class LlvmFunctionEmitter {
         Set<Integer> usedLocals = collectUsedLocals(func);
         for (int idx : usedLocals) {
             sb.append("  %local_").append(idx).append(" = alloca i64, align 8\n");
+            // Zero-initialise the slot. The per-slot width invariant
+            // (enforced by LocalSlotWidthValidator) guarantees that no
+            // correct code ever reads a slot at a width greater than the
+            // width it was written at, so this initialisation is not
+            // observable when the invariant holds. Its purpose is to
+            // remove nondeterminism when the invariant is violated by a
+            // bug in an earlier pass: reading a narrower-written slot
+            // yields the sign/zero-extended form of the written value
+            // instead of whatever happened to be in the stack frame at
+            // process start. Note that this does NOT replace the
+            // sign-extension performed by the STORE case — a negative
+            // byte must still produce a negative int, not 0x000000FF.
+            sb.append("  store i64 0, i64* %local_").append(idx).append("\n");
         }
 
         for (int i = 0; i < params.size(); i++) {
@@ -220,16 +330,67 @@ public class LlvmFunctionEmitter {
 
         int ordinal = 0;
         for (TryCatchRange range : ranges) {
-            BasicBlock startBlock = byLabel.get("L" + range.start);
-            BasicBlock endBlock = byLabel.get("L" + range.end);
+            BasicBlock startBlock   = byLabel.get("L" + range.start);
+            BasicBlock endBlock     = byLabel.get("L" + range.end);
             BasicBlock handlerBlock = byLabel.get("L" + range.handler);
             if (startBlock == null || endBlock == null || handlerBlock == null) continue;
-            for (BasicBlock b : GraphUtils.getBlocksBetween(startBlock, endBlock)) {
+
+            // Body of the try range = normal-flow reachable from start up
+            // to (and including) end, minus the handler block. The handler
+            // is the entry of the catch body, not a member of the try body:
+            // if it were treated as such, its own instructions would be
+            // wrapped in guarded regions for this range, and the chit
+            // blocks of those guards branch back to the handler — the
+            // structural livelock diagnosed in the ICU NormalizerImpl.load
+            // and ScopedMemoryAccess.copyMemoryInternal IR.
+            //
+            // The belt-and-braces `if (b == handlerBlock) continue;` guards
+            // against the case where the handler block is also the start
+            // block of its own range (a pattern that appears in some
+            // synthetic `finally` layouts): GraphUtils.getBlocksBetween
+            // already excludes it, but the explicit check here makes the
+            // invariant independent of that helper.
+            for (BasicBlock b : GraphUtils.getBlocksBetween(startBlock, endBlock, handlerBlock)) {
+                if (b == handlerBlock) continue;
                 blockToTryRanges.computeIfAbsent(b, x -> new ArrayList<>()).add(range);
             }
+
             handlerBlockByRange.put(range, handlerBlock);
             rangeOrdinals.put(range, ordinal++);
         }
+    }
+
+    /**
+     * Returns the try ranges that may be emitted as guards for the
+     * instructions of {@code block}.
+     *
+     * <p>Filters out any range whose handler is {@code block} itself.
+     * Emitting such a range's guard on the handler's own instructions
+     * produces a structural livelock: the guard's catch-successor
+     * branches to the handler's LLVM label, which is the block currently
+     * being emitted, so control re-enters the guard on every exception
+     * and nothing in the guarded region can break the cycle.</p>
+     *
+     * <p>The primary defence against this pattern lives in
+     * {@link #buildTryCatchInfo}, in {@code TryCatchHandler.handle} and in
+     * {@code MethodTranslator.addExceptionalEdges}, all of which exclude
+     * the handler from the body of the range it handles. This method is
+     * the last line of defence at emission time: whatever upstream
+     * produced {@code blockToTryRanges}, a block never wraps its own
+     * instructions in a guard that would catch and jump back to itself.</p>
+     */
+    private List<TryCatchRange> effectiveRangesFor(BasicBlock block) {
+        List<TryCatchRange> all = blockToTryRanges.get(block);
+        if (all == null || all.isEmpty()) {
+            return List.of();
+        }
+        List<TryCatchRange> filtered = new ArrayList<>(all.size());
+        for (TryCatchRange r : all) {
+            BasicBlock h = handlerBlockByRange.get(r);
+            if (h == block) continue;
+            filtered.add(r);
+        }
+        return filtered;
     }
 
     private Set<Integer> collectUsedLocals(Function func) {
@@ -250,7 +411,10 @@ public class LlvmFunctionEmitter {
             sb.append(llvmLabel(block)).append(":\n");
         }
 
-        List<TryCatchRange> ranges = blockToTryRanges.getOrDefault(block, List.of());
+        // Ranges that must be guarded in this block, filtered so that a
+        // block is never wrapped in the guard of a range whose handler is
+        // the block itself. See effectiveRangesFor() for the reasoning.
+        List<TryCatchRange> ranges = effectiveRangesFor(block);
 
         for (Instruction inst : block.getInstructions()) {
             sb.append(emitInstruction(inst, ranges));
@@ -347,24 +511,44 @@ public class LlvmFunctionEmitter {
         }
     }
 
+    /**
+     * Emits a call to {@code __jnative_throw_null_pointer_exception_ctx}
+     * (or its guarded equivalent), followed by {@code unreachable}.
+     *
+     * <p>{@code context} is a human-readable Java-level description of
+     * what was being dereferenced — a field name, a method name, the
+     * literal string {@code "monitor"}, the literal string
+     * {@code "<array>"}, or anything else the caller knows about the
+     * failing instruction — or {@code null} when no extra detail is
+     * available.</p>
+     *
+     * <p>The value is passed through as-is into the runtime's
+     * NullPointerException message, together with the mangled name of the
+     * enclosing method. SSA register names, temporary identifiers, and any
+     * other emitter-internal value must NOT be passed here: they render as
+     * {@code "%tmp_NNNNN"} in the eventual exception message, which is
+     * meaningless to a Java programmer reading a stack trace. The runtime
+     * side has no way to tell one string from another, so the contract is
+     * enforced purely by the discipline of the callers below.</p>
+     */
     private void emitNpeThrowHelper(StringBuilder sb,
-                                    String varDesc,
+                                    String context,
                                     List<TryCatchRange> ranges) {
         String ctxCallee   = "@__jnative_throw_null_pointer_exception_ctx";
         String funcNameRef = stringRef(currentFunctionName);
 
         String extraRef;
-        if (varDesc != null && varDesc.startsWith("%")) {
-            globalEmitter.registerDeferredString(varDesc);
-            extraRef = stringRef(varDesc);
+        if (context != null && !context.isEmpty()) {
+            globalEmitter.registerDeferredString(context);
+            extraRef = stringRef(context);
         } else {
             extraRef = "null";
         }
 
         if (ranges.isEmpty()) {
             sb.append("  call void ").append(ctxCallee)
-              .append("(i8* ").append(funcNameRef)
-              .append(", i8* ").append(extraRef).append(")\n");
+                .append("(i8* ").append(funcNameRef)
+                .append(", i8* ").append(extraRef).append(")\n");
             sb.append("  unreachable\n");
         } else {
             String finalExtraRef = extraRef;
@@ -376,7 +560,38 @@ public class LlvmFunctionEmitter {
         }
     }
 
+    /**
+     * Emits a null check on {@code obj} with no additional context. The
+     * resulting NullPointerException names only the enclosing method.
+     * Prefer {@link #emitNullCheck(StringBuilder, Value, List, String)}
+     * when the caller knows the Java-level construct it is lowering — a
+     * field name, a method name, {@code "monitor"}, {@code "<array>"} —
+     * because a message that names the dereferenced construct is
+     * dramatically easier to diagnose than one that names only the
+     * enclosing method.
+     */
     private void emitNullCheck(StringBuilder sb, Value obj, List<TryCatchRange> ranges) {
+        emitNullCheck(sb, obj, ranges, null);
+    }
+
+    /**
+     * Emits a null check on {@code obj}. When the check fails, the
+     * runtime throws a NullPointerException whose message names the
+     * enclosing method and, if {@code context} is non-null, the
+     * Java-level construct that was dereferenced.
+     *
+     * <p>{@code context} must be a Java-level description — a field
+     * name, a method name, {@code "monitor"}, {@code "<array>"}, etc. —
+     * or {@code null}. It must never be an SSA register name or any
+     * other emitter-internal identifier; see
+     * {@link #emitNpeThrowHelper} for the reasoning.</p>
+     *
+     * <p>The null check is skipped for non-pointer types, because an
+     * {@code icmp ne i32, null} is not a well-typed LLVM comparison and
+     * the emitter never needs one for a primitive.</p>
+     */
+    private void emitNullCheck(StringBuilder sb, Value obj, List<TryCatchRange> ranges,
+                               String context) {
         // Skip null check for non‑pointer types to avoid invalid LLVM (e.g., icmp ne i32, null)
         if (!(obj.getType().isReference()
             || obj.getType().isArray()
@@ -400,17 +615,24 @@ public class LlvmFunctionEmitter {
             .append(", label %").append(throwBlk).append("\n");
         sb.append(throwBlk).append(":\n");
 
-        emitNpeThrowHelper(sb, objRef, ranges);
+        emitNpeThrowHelper(sb, context, ranges);
 
         sb.append(cont).append(":\n");
     }
 
     private void emitBoundsCheck(StringBuilder sb, Value arr, String idxI32, List<TryCatchRange> ranges) {
         String arrRef = getLlvmValue(sb, arr);
+        // length lives at JAVA_ARR_LENGTH_OFFSET (8) in the array header.
         String lenPtr = newAux("lenptr");
         String len = newAux("len");
-        sb.append("  ").append(lenPtr).append(" = bitcast i8* ").append(arrRef).append(" to i32*\n");
-        sb.append("  ").append(len).append(" = load i32, i32* ").append(lenPtr).append("\n");
+        sb.append("  ").append(lenPtr)
+            .append(" = getelementptr inbounds i8, i8* ").append(arrRef)
+            .append(", i64 8\n");
+        String lenPtrI32 = newAux("lenptr_i32");
+        sb.append("  ").append(lenPtrI32).append(" = bitcast i8* ").append(lenPtr)
+            .append(" to i32*\n");
+        sb.append("  ").append(len).append(" = load i32, i32* ")
+            .append(lenPtrI32).append("\n");
 
         String chk1 = newAux("bnd_chk1");
         String chk2 = newAux("bnd_chk2");
@@ -459,6 +681,34 @@ public class LlvmFunctionEmitter {
         };
     }
 
+    /**
+     * Maps the element-type operand of NEW_ARRAY (a primitive name, a
+     * class internal name, or an already-array descriptor) to the JVM
+     * array descriptor of the array being allocated. That descriptor is
+     * what identifies the {@code @refclass_*} mirror stored in the array
+     * header at offset 0, so it must match the descriptor
+     * LlvmGlobalEmitter emits a mirror for.
+     *
+     * @return the array descriptor, or {@code null} for an unusable
+     *         element-type name (the caller then falls back to
+     *         {@code [Ljava/lang/Object;})
+     */
+    private static String arrayClassDescriptorFor(String elemTypeName) {
+        if (elemTypeName == null) return null;
+        switch (elemTypeName) {
+            case "boolean": return "[Z";
+            case "byte":    return "[B";
+            case "short":   return "[S";
+            case "char":    return "[C";
+            case "int":     return "[I";
+            case "long":    return "[J";
+            case "float":   return "[F";
+            case "double":  return "[D";
+        }
+        if (elemTypeName.startsWith("[")) return "[" + elemTypeName;
+        return "[L" + elemTypeName + ";";
+    }
+
     private String emitInstruction(Instruction inst, List<TryCatchRange> ranges) {
         StringBuilder sb = new StringBuilder();
         Opcode op = inst.getOpcode();
@@ -471,7 +721,9 @@ public class LlvmFunctionEmitter {
         switch (op) {
             case LOAD: {
                 int idx = inst.getLocalIndex();
-                String llvmType = LlvmTypeMapper.toLlvmType(inst.getResult().getType());
+                Type loadType = inst.getResult().getType();
+
+                String llvmType = LlvmTypeMapper.toLlvmType(loadType);
                 String ptr = newAux("ptrcast");
                 sb.append("  ").append(ptr).append(" = bitcast i64* %local_").append(idx)
                     .append(" to ").append(llvmType).append("*\n");
@@ -483,17 +735,30 @@ public class LlvmFunctionEmitter {
             case STORE: {
                 Value stored = inst.getOperands().getFirst();
                 int idx = inst.getLocalIndex();
-                String valRef = getLlvmValue(sb, stored);
+
                 Type storedType = stored.getType();
-                Type localType = storedType;
+                Type localType = (inst.getResult() != null)
+                    ? inst.getResult().getType()
+                    : storedType;
+                if (localType.isUnknown()) {
+                    localType = storedType;
+                }
+
+                String valRef = getLlvmValue(sb, stored);
+                String valConverted = castValueToType(sb, valRef, storedType, localType);
+
                 String llvmType = LlvmTypeMapper.toLlvmType(localType);
                 String ptr = newAux("ptrcast");
                 sb.append("  ").append(ptr).append(" = bitcast i64* %local_").append(idx)
                     .append(" to ").append(llvmType).append("*\n");
-                sb.append("  store ").append(llvmType).append(" ").append(valRef)
+                sb.append("  store ").append(llvmType).append(" ").append(valConverted)
                     .append(", ").append(llvmType).append("* ").append(ptr).append("\n");
+
                 if (inst.getResult() != null) {
-                    valueMapper.setValue(inst.getResult(), valRef);
+                    if (inst.getResult() instanceof Temporary resultTmp) {
+                        resultTmp.setType(localType);
+                    }
+                    valueMapper.setValue(inst.getResult(), valConverted);
 
                     String storedSlot = valueSlots.get(stored);
                     if (storedSlot != null) {
@@ -565,6 +830,7 @@ public class LlvmFunctionEmitter {
                     .append(" ").append(l).append(", ").append(r).append("\n");
                 break;
             }
+
             case EQ: case NE: case LT: case LE: case GT: case GE: {
                 Value left = inst.getOperands().get(0);
                 Value right = inst.getOperands().get(1);
@@ -623,6 +889,7 @@ public class LlvmFunctionEmitter {
                 valueMapper.setValue(inst.getResult(), casted);
                 break;
             }
+
             case GET_FIELD: {
                 Value base = inst.getOperands().getFirst();
                 Value fieldOperand = inst.getOperands().size() > 1 ? inst.getOperands().get(1) : null;
@@ -630,7 +897,7 @@ public class LlvmFunctionEmitter {
                 if (fieldOperand instanceof Constant offc && offc.getType() == Type.INT) {
                     int offset = ((Number) offc.getValue()).intValue();
 
-                    emitNullCheck(sb, base, ranges);
+                    emitNullCheck(sb, base, ranges, "captured field at offset " + offset);
 
                     String baseI8 = emitBaseToI8Pointer(sb, base);
 
@@ -662,7 +929,8 @@ public class LlvmFunctionEmitter {
 
                 int offset = globalEmitter.getFieldOffset(owner, fieldName);
 
-                emitNullCheck(sb, base, ranges);
+                emitNullCheck(sb, base, ranges,
+                    "field '" + owner + "." + fieldName + "'");
 
                 String baseI8 = emitBaseToI8Pointer(sb, base);
 
@@ -692,7 +960,7 @@ public class LlvmFunctionEmitter {
                 if (fieldOperand instanceof Constant offc && offc.getType() == Type.INT) {
                     int offset = ((Number) offc.getValue()).intValue();
 
-                    emitNullCheck(sb, base, ranges);
+                    emitNullCheck(sb, base, ranges, "captured field at offset " + offset);
 
                     String baseI8 = emitBaseToI8Pointer(sb, base);
 
@@ -726,7 +994,8 @@ public class LlvmFunctionEmitter {
 
                 int offset = globalEmitter.getFieldOffset(owner, fieldName);
 
-                emitNullCheck(sb, base, ranges);
+                emitNullCheck(sb, base, ranges,
+                    "field '" + owner + "." + fieldName + "'");
 
                 String baseI8 = emitBaseToI8Pointer(sb, base);
 
@@ -827,6 +1096,81 @@ public class LlvmFunctionEmitter {
 
                 Type retType = inst.getResult() != null ? inst.getResult().getType() : Type.VOID;
 
+                {
+                    String[] foundOwner = new String[1];
+                    io.github.kubyk01.domain.analyzer.dependencyresolver.MethodNode targetMethod =
+                        resolver.findMethodInHierarchy(owner, methodName, methodDesc, foundOwner);
+                    if (targetMethod != null && targetMethod.isStatic()) {
+                        String actualOwner = foundOwner[0] != null ? foundOwner[0] : owner;
+                        String directMangled =
+                            LlvmRuntime.mangleMethod(actualOwner, methodName, methodDesc);
+
+                        if (module.getFunction(directMangled) == null
+                            || module.getFunction(directMangled).getEntryBlock() == null) {
+                            ensureFunctionDeclared(actualOwner, methodName, methodDesc);
+                        }
+
+                        Function directFunc = module.getFunction(directMangled);
+                        if (directFunc == null || directFunc.getEntryBlock() == null) {
+                            String nativeCandidate =
+                                "__jnative_" + LlvmRuntime.mangleMethod(actualOwner, methodName, methodDesc);
+                            Function nativeFunc = module.getFunction(nativeCandidate);
+                            if (nativeFunc != null) {
+                                directFunc = nativeFunc;
+                                directMangled = nativeCandidate;
+                            }
+                        }
+
+                        if (directFunc == null) {
+                            throw new IllegalStateException(
+                                "VIRTUAL_CALL / INTERFACE_CALL to a static method '"
+                                    + actualOwner + "." + methodName + methodDesc
+                                    + "' has no IR definition and no native declaration. "
+                                    + "Either the resolver fabricated a virtual call for a "
+                                    + "static target, or the target was never translated. "
+                                    + "The vtable-dispatch fallback would produce a call "
+                                    + "with a shifted argument list — refusing to emit it.");
+                        }
+
+                        List<Value> args = new ArrayList<>(operands.size() - 1);
+                        for (int i = 2; i < operands.size(); i++) {
+                            args.add(operands.get(i));
+                        }
+
+                        final List<Value> argsForCall = args;
+                        final Function calleeForCall = directFunc;
+                        final String directMangledFinal = directMangled;
+                        final Type retTypeForCall = retType;
+                        emitCall(sb, retTypeForCall, inst.getResult(), resultName, ranges, (callSb, resultReg) -> {
+                            StringBuilder argList = new StringBuilder();
+                            for (int i = 0; i < argsForCall.size(); i++) {
+                                if (i > 0) argList.append(", ");
+                                Value arg = argsForCall.get(i);
+                                Type paramType = (calleeForCall != null
+                                    && i < calleeForCall.getParameters().size())
+                                    ? calleeForCall.getParameters().get(i).getType()
+                                    : arg.getType();
+                                String val = castValueToType(callSb, getLlvmValue(callSb, arg),
+                                    arg.getType(), paramType);
+                                argList.append(LlvmTypeMapper.toLlvmType(paramType))
+                                    .append(" ").append(val);
+                            }
+                            if (resultReg != null) {
+                                callSb.append("  ").append(resultReg).append(" = call ")
+                                    .append(LlvmTypeMapper.toLlvmType(retTypeForCall))
+                                    .append(" @").append(directMangledFinal)
+                                    .append("(").append(argList).append(")\n");
+                            } else {
+                                callSb.append("  call ")
+                                    .append(LlvmTypeMapper.toLlvmType(retTypeForCall))
+                                    .append(" @").append(directMangledFinal)
+                                    .append("(").append(argList).append(")\n");
+                            }
+                        });
+                        break;
+                    }
+                }
+
                 // ---------- Polymorphic signature handling ----------
                 if (inst.isPolymorphicSignature()) {
                     List<Value> allArgs = new ArrayList<>();
@@ -918,7 +1262,10 @@ public class LlvmFunctionEmitter {
 
                 // ---------- Native candidate (direct resolution, bypasses vtable) ----------
                 String nativeCandidate = "__jnative_" + LlvmRuntime.mangleCallable(calleeName);
-                Function nativeFunc = module.getFunction(nativeCandidate);
+                Function nativeFunc = null;
+                if (isVirtualCallDirectNativeSafe(owner, methodName, methodDesc)) {
+                    nativeFunc = module.getFunction(nativeCandidate);
+                }
                 if (nativeFunc != null) {
                     List<Value> args = new ArrayList<>();
                     args.add(receiver);
@@ -962,6 +1309,8 @@ public class LlvmFunctionEmitter {
                     || receiver.getType().isBlock()
                     || receiver.getType().isUnknown();
 
+                boolean receiverIsArray = receiver.getType().isArray();
+
                 boolean isInterfaceCall = (op == Opcode.INTERFACE_CALL);
 
                 int dispatchSlot;
@@ -973,23 +1322,58 @@ public class LlvmFunctionEmitter {
                     dispatchSlot = globalEmitter.getVirtualSlot(owner, methodName, methodDesc);
                 }
 
-                if (!receiverIsRef || dispatchSlot < 0 || (isInterfaceCall && interfaceId < 0)) {
-                    String directMangled = LlvmRuntime.mangleMethod(owner, methodName, methodDesc);
-                    Function concrete = module.getFunction(directMangled);
+                if (!receiverIsRef || dispatchSlot < 0 || (isInterfaceCall && interfaceId < 0)
+                    || receiverIsArray) {
 
-                    if (concrete != null && concrete.getEntryBlock() != null) {
+                    // If owner is an array name ("[I", "[Ljava/lang/Object;",
+                    // "[[I", ...), the actual method is inherited from
+                    // java.lang.Object: no array declares methods of its own.
+                    // MethodTranslator usually resolves owner to
+                    // java/lang/Object by itself, but the fallback is
+                    // mandatory: when findMethodInHierarchy declines (e.g. for
+                    // a non-standard array descriptor) without it we would look
+                    // for
+                    //     fn__Ljava_lang_Object__clone___...
+                    // and find neither a body nor a native — landing in
+                    // unresolved_slot.
+                    String directOwner = owner;
+                    if (directOwner != null && !directOwner.isEmpty()
+                        && directOwner.charAt(0) == '[') {
+                        directOwner = "java/lang/Object";
+                    }
+
+                    String directMangled = LlvmRuntime.mangleMethod(
+                        directOwner, methodName, methodDesc);
+                    String callTarget = null;
+                    Function calleeForCall = null;
+
+                    Function plainConcrete = module.getFunction(directMangled);
+                    if (plainConcrete != null && plainConcrete.getEntryBlock() != null) {
+                        callTarget = directMangled;
+                        calleeForCall = plainConcrete;
+                    } else {
+                        String nativeMangled = "__jnative_" + directMangled;
+                        Function nativeTarget = module.getFunction(nativeMangled);
+                        if (nativeTarget != null) {
+                            callTarget = nativeMangled;
+                            calleeForCall = nativeTarget;
+                        }
+                    }
+
+                    if (callTarget != null) {
                         final List<Value> argsForCall = allArgs;
-                        final Function calleeForCall = concrete;
+                        final Function calleeForCallFinal = calleeForCall;
                         final Type receiverTypeFinal = receiverType;
                         final List<Type> paramTypesFinal = paramTypes;
+                        final String callTargetFinal = callTarget;
                         emitCall(sb, retType, inst.getResult(), resultName, ranges, (callSb, resultReg) -> {
                             StringBuilder argList = new StringBuilder();
                             for (int i = 0; i < argsForCall.size(); i++) {
                                 if (i > 0) argList.append(", ");
                                 Value arg = argsForCall.get(i);
                                 Type paramType;
-                                if (calleeForCall != null && i < calleeForCall.getParameters().size()) {
-                                    paramType = calleeForCall.getParameters().get(i).getType();
+                                if (calleeForCallFinal != null && i < calleeForCallFinal.getParameters().size()) {
+                                    paramType = calleeForCallFinal.getParameters().get(i).getType();
                                 } else if (i == 0) {
                                     paramType = receiverTypeFinal;
                                 } else if (i - 1 < paramTypesFinal.size()) {
@@ -1005,29 +1389,23 @@ public class LlvmFunctionEmitter {
                             if (resultReg != null) {
                                 callSb.append("  ").append(resultReg).append(" = call ")
                                     .append(LlvmTypeMapper.toLlvmType(retType))
-                                    .append(" @").append(directMangled)
+                                    .append(" @").append(callTargetFinal)
                                     .append("(").append(argList).append(")\n");
                             } else {
                                 callSb.append("  call ")
                                     .append(LlvmTypeMapper.toLlvmType(retType))
-                                    .append(" @").append(directMangled)
+                                    .append(" @").append(callTargetFinal)
                                     .append("(").append(argList).append(")\n");
                             }
                         });
                         break;
                     }
 
-                    // No concrete body in the module.  Emit an unconditional
-                    // call to the runtime's trap helper and mark the block
-                    // unreachable.  The trap is not covered by the enclosing
-                    // try-guards: it represents a codegen / link-time error,
-                    // not a Java exception, and must abort rather than be
-                    // catchable from Java code.
                     String msg = (isInterfaceCall
                         ? "interface '" + owner + "'"
                         : "class '" + owner + "'")
                         + ", method '" + methodName + methodDesc + "'"
-                        + " (no dispatch slot; no direct body)";
+                        + " (no dispatch slot; no direct body, no native declaration)";
                     String msgRef = stringRef(msg);
                     sb.append("  call void @__jnative_unresolved_slot(i8* ")
                         .append(msgRef).append(")\n");
@@ -1039,17 +1417,43 @@ public class LlvmFunctionEmitter {
                     break;
                 }
 
-                emitNullCheck(sb, receiver, ranges);
+                // -------- vtable / itable dispatch --------
+                emitNullCheck(sb, receiver, ranges,
+                    "receiver of " + owner + "." + methodName + methodDesc);
                 String receiverRef = getLlvmValue(sb, receiver);
 
-                String vtSlotPtr = newAux("vtslot");
-                sb.append("  ").append(vtSlotPtr).append(" = bitcast ")
-                    .append(LlvmTypeMapper.toLlvmType(receiver.getType())).append(" ").append(receiverRef)
-                    .append(" to %JNativeVTable**\n");
-
+                // Resolve the vtable through the runtime helper instead of
+                // reading obj[0] inline.
+                //
+                // For an ordinary object obj[0] is a %JNativeVTable*, but for
+                // an array it is a %ReflectionClass* (JAVA_ARR_KLASS_OFFSET == 0,
+                // see jnative_runtime.h). An array only reaches this point when
+                // its STATIC type is Object or an interface: in that case
+                // receiverIsArray is false (see how receiverIsArray is derived
+                // from receiver.getType().isArray()) and the direct-dispatch
+                // branch does not fire. Reading obj[0] as a vtable made the
+                // emitter treat the class mirror as a %JNativeVTable, the
+                // mirror's 'methods' field as methods of class
+                // java.lang.Class, and the call went out through a foreign slot
+                // with a garbage receiver. Observable symptom:
+                // fn_java_lang_Class_3_run calls itself through jmp *0x58(%rax).
+                //
+                // __jnative_resolve_dispatch_vtable does exactly what the
+                // emitter should have done:
+                //
+                //   * ordinary object -> returns obj[0] unchanged;
+                //   * array           -> returns @vtable_java_lang_Object
+                //     (arrays inherit all of their methods from Object);
+                //   * obj[0] == NULL or unregistered -> throws a diagnostic
+                //     exception instead of calling into garbage.
+                //
+                // The distinction is made with a precomputed hash set of the
+                // reflect_all_classes[] pointers; the cost is O(1) per call.
                 String vtableStruct = newAux("vtable_struct");
                 sb.append("  ").append(vtableStruct)
-                    .append(" = load %JNativeVTable*, %JNativeVTable** ").append(vtSlotPtr).append("\n");
+                    .append(" = call %JNativeVTable* "
+                        + "@__jnative_resolve_dispatch_vtable(i8* ")
+                    .append(receiverRef).append(")\n");
 
                 String funcPtr;
                 if (isInterfaceCall) {
@@ -1134,7 +1538,9 @@ public class LlvmFunctionEmitter {
                 String calleeName = extractCalleeName(inst);
                 if (calleeName == null) break;
 
-                if (op == Opcode.STATIC_CALL) {
+                String[] foundOwner = new String[1];
+                boolean calleeIsStatic = false;
+                {
                     int dotIdx = calleeName.lastIndexOf('.');
                     int parenIdx = calleeName.indexOf('(');
                     if (dotIdx > 0 && parenIdx > dotIdx) {
@@ -1143,12 +1549,45 @@ public class LlvmFunctionEmitter {
                         int localParenIdx = parenIdx - dotIdx - 1;
                         String methodName = methodPart.substring(0, localParenIdx);
                         String descriptor = methodPart.substring(localParenIdx);
-                        String[] foundOwner = new String[1];
+
                         io.github.kubyk01.domain.analyzer.dependencyresolver.MethodNode mn =
                             resolver.findMethodInHierarchy(owner, methodName, descriptor, foundOwner);
-                        if (mn != null && mn.isStatic()
-                            && foundOwner[0] != null && !foundOwner[0].equals(owner)) {
-                            calleeName = foundOwner[0] + "." + methodName + descriptor;
+                        if (mn != null && mn.isStatic()) {
+                            calleeIsStatic = true;
+                            String actualOwner =
+                                (foundOwner[0] != null && !foundOwner[0].isEmpty())
+                                    ? foundOwner[0]
+                                    : owner;
+                            if (!actualOwner.equals(owner)) {
+                                calleeName = actualOwner + "." + methodName + descriptor;
+                            }
+                        }
+                    }
+                }
+
+                if (!calleeIsStatic) {
+                    int dotIdx = calleeName.lastIndexOf('.');
+                    int parenIdx = calleeName.indexOf('(');
+                    if (dotIdx > 0 && parenIdx > dotIdx) {
+                        String owner = calleeName.substring(0, dotIdx);
+                        String methodPart = calleeName.substring(dotIdx + 1);
+                        int localParenIdx = parenIdx - dotIdx - 1;
+                        String methodName = methodPart.substring(0, localParenIdx);
+                        String descriptor = methodPart.substring(localParenIdx);
+
+                        String[] look = new String[1];
+                        io.github.kubyk01.domain.analyzer.dependencyresolver.MethodNode mn =
+                            resolver.findMethodInHierarchy(owner, methodName, descriptor, look);
+                        if (mn != null && !mn.isStatic()
+                            && !owner.startsWith("java/lang/invoke")
+                            && !"__jnative_get_exception_object".equals(calleeName)
+                            && !calleeName.startsWith("__jnative_")) {
+                            throw new IllegalStateException(
+                                "STATIC_CALL / CALL opcode carries an instance-method "
+                                    + "target '" + owner + "." + methodName + descriptor
+                                    + "'.  The reachability analysis or the IR builder "
+                                    + "mis-classified the call site; refusing to emit "
+                                    + "a direct call with a mismatched calling convention.");
                         }
                     }
                 }
@@ -1207,6 +1646,9 @@ public class LlvmFunctionEmitter {
                 }
 
                 Function calleeFunc = module.getFunction(calleeName);
+                if (calleeFunc == null) {
+                    calleeFunc = module.getFunction(LlvmRuntime.mangleCallable(calleeName));
+                }
                 String mangledCallee;
                 if (calleeFunc != null) {
                     mangledCallee = calleeFunc.getName();
@@ -1227,12 +1669,12 @@ public class LlvmFunctionEmitter {
                             String methodName = methodPart.substring(0, localParenIdx);
                             String descriptor = methodPart.substring(localParenIdx);
 
-                            String[] foundOwner = new String[1];
+                            String[] nativeLookup = new String[1];
                             io.github.kubyk01.domain.analyzer.dependencyresolver.MethodNode mn =
-                                resolver.findMethodInHierarchy(owner, methodName, descriptor, foundOwner);
+                                resolver.findMethodInHierarchy(owner, methodName, descriptor, nativeLookup);
                             if (mn != null && mn.isNative()) {
                                 String actualOwner =
-                                    foundOwner[0] != null ? foundOwner[0] : owner;
+                                    nativeLookup[0] != null ? nativeLookup[0] : owner;
                                 nativeSymbol = "__jnative_"
                                     + LlvmRuntime.mangleMethod(actualOwner, methodName, descriptor);
                             }
@@ -1395,6 +1837,9 @@ public class LlvmFunctionEmitter {
                 }
 
                 Function calleeFunc = module.getFunction(calleeName);
+                if (calleeFunc == null) {
+                    calleeFunc = module.getFunction(LlvmRuntime.mangleCallable(calleeName));
+                }
                 String mangledCallee;
                 if (calleeFunc != null) {
                     mangledCallee = calleeFunc.getName();
@@ -1413,12 +1858,12 @@ public class LlvmFunctionEmitter {
                             String methodName = methodPart.substring(0, localParenIdx);
                             String descriptor = methodPart.substring(localParenIdx);
 
-                            String[] foundOwner = new String[1];
+                            String[] nativeLookup = new String[1];
                             io.github.kubyk01.domain.analyzer.dependencyresolver.MethodNode mn =
-                                resolver.findMethodInHierarchy(owner, methodName, descriptor, foundOwner);
+                                resolver.findMethodInHierarchy(owner, methodName, descriptor, nativeLookup);
                             if (mn != null && mn.isNative()) {
                                 String actualOwner =
-                                    foundOwner[0] != null ? foundOwner[0] : owner;
+                                    nativeLookup[0] != null ? nativeLookup[0] : owner;
                                 nativeSymbol = "__jnative_"
                                     + LlvmRuntime.mangleMethod(actualOwner, methodName, descriptor);
                             }
@@ -1541,26 +1986,72 @@ public class LlvmFunctionEmitter {
                 Value sizeVal = inst.getOperands().get(0);
                 Value elemTypeConst = inst.getOperands().get(1);
                 if (!(elemTypeConst instanceof Constant)) break;
-                Type elemType = elemTypeFromConst(((Constant) elemTypeConst).getValue().toString());
+                String elemTypeName = ((Constant) elemTypeConst).getValue().toString();
+                Type elemType = elemTypeFromConst(elemTypeName);
                 int elemSize = getElementSizeOfType(elemType);
+
                 String sizeRef = coerceSizeToInt(sb, sizeVal, getLlvmValue(sb, sizeVal));
+
                 String totalSize = newAux("total_size");
                 sb.append("  ").append(totalSize).append(" = mul i32 ")
                     .append(sizeRef).append(", ").append(elemSize).append("\n");
+
                 String totalSize64 = newAux("total_size64");
-                sb.append("  ").append(totalSize64).append(" = zext i32 ").append(totalSize).append(" to i64\n");
+                sb.append("  ").append(totalSize64).append(" = zext i32 ")
+                    .append(totalSize).append(" to i64\n");
+
                 String allocSize = newAux("alloc_size");
-                sb.append("  ").append(allocSize).append(" = add i64 ").append(totalSize64).append(", 8\n");
+                sb.append("  ").append(allocSize).append(" = add i64 ")
+                    .append(totalSize64).append(", 16\n");
+
                 String allocReg = newAux("alloc");
-                sb.append("  ").append(allocReg).append(" = call i8* @calloc(i64 1, i64 ").append(allocSize).append(")\n");
+                sb.append("  ").append(allocReg)
+                    .append(" = call i8* @calloc(i64 1, i64 ")
+                    .append(allocSize).append(")\n");
+
+                // ----  klass @ 0 ----
+                // A mirror of the array's own class, so that
+                // Object.getClass() and instanceof can tell an array
+                // apart from an ordinary object (whose first word is a
+                // vtable). Offsets 0..15 must match
+                // JAVA_ARR_KLASS_OFFSET / _LENGTH_ / _ELEM_SIZE_ and
+                // JAVA_ARR_HDR in jnative_runtime.h.
+                String arrClassName = arrayClassDescriptorFor(elemTypeName);
+                if (arrClassName == null) arrClassName = "[Ljava/lang/Object;";
+                String arrClassRef = globalEmitter.getRefClassGlobalName(arrClassName);
+
+                String klassPtr = newAux("klass_ptr");
+                sb.append("  ").append(klassPtr).append(" = bitcast i8* ").append(allocReg)
+                    .append(" to %ReflectionClass**\n");
+                sb.append("  store %ReflectionClass* ").append(arrClassRef)
+                    .append(", %ReflectionClass** ").append(klassPtr).append("\n");
+
+                // ----  length @ 8 ----
                 String lenPtr = newAux("lenptr");
-                sb.append("  ").append(lenPtr).append(" = bitcast i8* ").append(allocReg).append(" to i32*\n");
-                sb.append("  store i32 ").append(sizeRef).append(", i32* ").append(lenPtr).append("\n");
+                sb.append("  ").append(lenPtr)
+                    .append(" = getelementptr inbounds i8, i8* ").append(allocReg)
+                    .append(", i64 8\n");
+                String lenPtrI32 = newAux("lenptr_i32");
+                sb.append("  ").append(lenPtrI32).append(" = bitcast i8* ").append(lenPtr)
+                    .append(" to i32*\n");
+                sb.append("  store i32 ").append(sizeRef).append(", i32* ")
+                    .append(lenPtrI32).append("\n");
+
+                // ----  elem_size @ 12 ----
                 String esPtr = newAux("esptr");
-                sb.append("  ").append(esPtr).append(" = getelementptr i32, i32* ").append(lenPtr).append(", i32 1\n");
-                sb.append("  store i32 ").append(elemSize).append(", i32* ").append(esPtr).append("\n");
+                sb.append("  ").append(esPtr)
+                    .append(" = getelementptr inbounds i8, i8* ").append(allocReg)
+                    .append(", i64 12\n");
+                String esPtrI32 = newAux("esptr_i32");
+                sb.append("  ").append(esPtrI32).append(" = bitcast i8* ").append(esPtr)
+                    .append(" to i32*\n");
+                sb.append("  store i32 ").append(elemSize).append(", i32* ")
+                    .append(esPtrI32).append("\n");
+
+                // ----  payload @ 16 (implicit: calloc zeroed it) ----
                 sb.append("  ").append(resultName).append(" = bitcast i8* ").append(allocReg)
-                    .append(" to ").append(LlvmTypeMapper.toLlvmType(inst.getResult().getType())).append("\n");
+                    .append(" to ")
+                    .append(LlvmTypeMapper.toLlvmType(inst.getResult().getType())).append("\n");
                 break;
             }
 
@@ -1638,8 +2129,8 @@ public class LlvmFunctionEmitter {
 
             case MONITOR_ENTER: {
                 Value obj = inst.getOperands().getFirst();
-                emitNullCheck(sb, obj, ranges);
-                String objRef = getPointerOperand(sb, obj); // hoist
+                emitNullCheck(sb, obj, ranges, "monitor");
+                String objRef = getPointerOperand(sb, obj);
                 sb.append("  call void @__jnative_monitor_enter(i8* ")
                     .append(objRef).append(")\n");
                 break;
@@ -1647,8 +2138,8 @@ public class LlvmFunctionEmitter {
 
             case MONITOR_EXIT: {
                 Value obj = inst.getOperands().getFirst();
-                emitNullCheck(sb, obj, ranges);
-                String objRef = getPointerOperand(sb, obj); // hoist
+                emitNullCheck(sb, obj, ranges, "monitor");
+                String objRef = getPointerOperand(sb, obj);
                 sb.append("  call void @__jnative_monitor_exit(i8* ")
                     .append(objRef).append(")\n");
                 break;
@@ -1659,21 +2150,6 @@ public class LlvmFunctionEmitter {
                 String typeName = extractTypeName(inst);
                 String objRef = getPointerOperand(sb, obj);
 
-                // ------------------------------------------------------------------
-                // Array instanceof. See the CHECKCAST comment above for why a
-                // vtable-based check is impossible. The bytecode verifier guarantees
-                // that the object's static type is either exactly the target array
-                // type or a supertype of it, so the only piece of information that a
-                // runtime check can legitimately contribute is the null test — a
-                // null reference is never an instance of any type, including an array
-                // type.
-                //
-                // Returning `obj != null` matches the reference implementation for
-                // the code paths that actually reach this instruction in the JDK's
-                // startup: every one of them tests a value whose static type is the
-                // target array type (or a supertype), on which the Java compiler has
-                // already folded the test to `true`.
-                // ------------------------------------------------------------------
                 if (typeName != null && typeName.startsWith("[")) {
                     sb.append("  ").append(resultName).append(" = icmp ne i8* ")
                         .append(objRef).append(", null\n");
@@ -1696,21 +2172,9 @@ public class LlvmFunctionEmitter {
 
             case CHECKCAST: {
                 Value obj = inst.getOperands().getFirst();
-                String typeName    = extractTypeName(inst);
-                String objRef      = getPointerOperand(sb, obj);
+                String typeName = extractTypeName(inst);
+                String objRef = getPointerOperand(sb, obj);
 
-                // ------------------------------------------------------------------
-                // Array cast. The runtime has no per-array type metadata: the first
-                // bytes of a Java array are the length header, not a vtable pointer,
-                // so __jnative_instanceof cannot produce a meaningful answer for an
-                // array type. The bytecode verifier has already established that the
-                // cast is type-compatible at the static level (the JDK's own compilers
-                // only emit `checkcast [X` when the expression's static type is `[X`
-                // or a supertype), and there is no runtime check that could add
-                // information beyond what the verifier already proved. The cast is
-                // therefore materialised as an unconditional bitcast, matching the
-                // behaviour the runtime already used for null typeInfos.
-                // ------------------------------------------------------------------
                 if (typeName != null && typeName.startsWith("[")) {
                     sb.append("  ").append(resultName).append(" = bitcast i8* ").append(objRef)
                         .append(" to ").append(LlvmTypeMapper.toLlvmType(inst.getResult().getType()))
@@ -1753,10 +2217,17 @@ public class LlvmFunctionEmitter {
             case ARRAYLENGTH: {
                 Value arr = inst.getOperands().getFirst();
                 String arrRef = getLlvmValue(sb, arr);
-                emitNullCheck(sb, arr, ranges);
+                emitNullCheck(sb, arr, ranges, "<array>");
+                // length lives at JAVA_ARR_LENGTH_OFFSET (8) in the array header.
                 String lenPtr = newAux("lenptr");
-                sb.append("  ").append(lenPtr).append(" = bitcast i8* ").append(arrRef).append(" to i32*\n");
-                sb.append("  ").append(resultName).append(" = load i32, i32* ").append(lenPtr).append("\n");
+                sb.append("  ").append(lenPtr)
+                    .append(" = getelementptr inbounds i8, i8* ").append(arrRef)
+                    .append(", i64 8\n");
+                String lenPtrI32 = newAux("lenptr_i32");
+                sb.append("  ").append(lenPtrI32).append(" = bitcast i8* ").append(lenPtr)
+                    .append(" to i32*\n");
+                sb.append("  ").append(resultName).append(" = load i32, i32* ")
+                    .append(lenPtrI32).append("\n");
                 break;
             }
 
@@ -1765,13 +2236,27 @@ public class LlvmFunctionEmitter {
                 Value arr = inst.getOperands().get(0);
                 Value idx = inst.getOperands().get(1);
 
-                emitNullCheck(sb, arr, ranges);
+                emitNullCheck(sb, arr, ranges, "<array>");
 
                 String arrPtr = asPointer(sb, arr);
                 String idxRef = getLlvmValue(sb, idx);
                 String idxI32 = castValueToType(sb, idxRef, idx.getType(), Type.INT);
                 emitBoundsCheck(sb, arrPtr, idxI32, ranges);
-                Type elemType = inst.getResult().getType();
+
+                Type declaredElemType = inst.getResult().getType();
+                Type elemType = declaredElemType;
+                if (arr.getType().isArray()) {
+                    Type arrElem = arr.getType().getElementType();
+                    if (!arrElem.isUnknown()) {
+                        elemType = arrElem;
+                    }
+                }
+
+                if (!elemType.equals(declaredElemType)
+                    && inst.getResult() instanceof Temporary resultTmp) {
+                    resultTmp.setType(elemType);
+                }
+
                 int elemSize = getElementSizeOfType(elemType);
                 String offset = newAux("offset");
                 sb.append("  ").append(offset).append(" = mul i32 ")
@@ -1780,7 +2265,7 @@ public class LlvmFunctionEmitter {
                 sb.append("  ").append(offset64).append(" = zext i32 ").append(offset).append(" to i64\n");
                 String basePtr = newAux("baseptr");
                 sb.append("  ").append(basePtr).append(" = getelementptr i8, i8* ").append(arrPtr)
-                    .append(", i64 8\n");
+                    .append(", i64 16\n");
                 String elemPtr = newAux("elemptr");
                 sb.append("  ").append(elemPtr).append(" = getelementptr i8, i8* ").append(basePtr)
                     .append(", i64 ").append(offset64).append("\n");
@@ -1799,7 +2284,7 @@ public class LlvmFunctionEmitter {
                     Value idx = inst.getOperands().get(1);
                     Value val = inst.getOperands().get(2);
 
-                    emitNullCheck(sb, arr, ranges);
+                    emitNullCheck(sb, arr, ranges, "<array>");
 
                     String arrPtr = asPointer(sb, arr);
                     String idxRef = getLlvmValue(sb, idx);
@@ -1821,7 +2306,7 @@ public class LlvmFunctionEmitter {
                     sb.append("  ").append(offset64).append(" = zext i32 ").append(offset).append(" to i64\n");
                     String basePtr = newAux("baseptr");
                     sb.append("  ").append(basePtr).append(" = getelementptr i8, i8* ").append(arrPtr)
-                        .append(", i64 8\n");
+                        .append(", i64 16\n");
                     String elemPtr = newAux("elemptr");
                     sb.append("  ").append(elemPtr).append(" = getelementptr i8, i8* ").append(basePtr)
                         .append(", i64 ").append(offset64).append("\n");
@@ -1841,11 +2326,6 @@ public class LlvmFunctionEmitter {
 
                 List<BasicBlock> preds = parent.getPredecessors();
 
-                // LLVM requires exactly one incoming edge entry per CFG predecessor of
-                // the phi's block. A mismatch means the SSA transformer and the CFG
-                // disagree about the predecessor list — most likely a lost or extra
-                // edge added after the phis were renamed. Reject it here rather than
-                // shipping invalid IR downstream.
                 if (preds.size() != inst.getOperands().size()) {
                     throw new IllegalStateException(
                         "PHI operand count (" + inst.getOperands().size()
@@ -1862,13 +2342,6 @@ public class LlvmFunctionEmitter {
                     if (i > 0) sb.append(", ");
                     Value phiOp = inst.getOperands().get(i);
 
-                    // Type safety net. The SSA transformer's renameBlock is responsible
-                    // for guaranteeing that every phi operand has a type compatible with
-                    // the phi's result type (see SSATransformer.typesCompatible). If a
-                    // mismatch slips through, the LLVM parser will report a confusing
-                    // error like "integer constant must have integer type" far from the
-                    // real source. Catching it here turns that into a precise,
-                    // actionable diagnostic pointing at the offending block and operand.
                     String opLlvm = LlvmTypeMapper.toLlvmType(phiOp.getType());
                     if (!opLlvm.equals(phiLlvm)) {
                         throw new IllegalStateException(
@@ -1883,12 +2356,6 @@ public class LlvmFunctionEmitter {
                     if (preloads != null && preloads.containsKey(i)) {
                         valRef = preloads.get(i);
                     } else if (valueSlots.containsKey(phiOp)) {
-                        // Slot-based but not preloaded — the predecessor block has not been
-                        // emitted yet, or the value flows in from a path we cannot rewrite.
-                        // Fall back to the register the value was originally defined with.
-                        // If even that is unavailable, use a typed default. This is a
-                        // last-resort case; on a correct CFG every slot-based phi operand
-                        // will have been preloaded by its predecessor.
                         String mapped = valueMapper.getValue(phiOp);
                         valRef = mapped != null ? mapped : getDefaultValue(phiOp.getType());
                     } else {
@@ -2349,32 +2816,42 @@ public class LlvmFunctionEmitter {
                               boolean neverReturnsNormally) {
         int k = ranges.size();
         String guardBlk = newLabel("guard");
-        String bodyBlk = newLabel("guarded_body");
+        String bodyBlk  = newLabel("guarded_body");
         String catchBlk = newLabel("guarded_catch");
-        String contBlk = neverReturnsNormally ? null : newLabel("guarded_cont");
+        String contBlk  = neverReturnsNormally ? null : newLabel("guarded_cont");
 
         sb.append("  br label %").append(guardBlk).append("\n");
 
         sb.append(guardBlk).append(":\n");
+
         for (int i = k - 1; i >= 0; i--) {
             TryCatchRange r = ranges.get(i);
-            String bufPtr = newAux("push_jb");
+
+            String bufPtr = newAux("sj_jb");
             sb.append("  ").append(bufPtr).append(" = bitcast [").append(JMP_BUF_SIZE)
-                .append(" x i8]* %jmp_buf_").append(rangeOrdinals.get(r)).append(" to i8*\n");
+                .append(" x i8]* %jmp_buf_").append(rangeOrdinals.get(r))
+                .append(" to i8*\n");
+
+            String sjRet = newAux("sj_ret");
+            sb.append("  ").append(sjRet)
+                .append(" = call i32 @_setjmp(i8* ").append(bufPtr).append(")\n");
+
+            String isZero = newAux("sj_zero");
+            sb.append("  ").append(isZero).append(" = icmp eq i32 ").append(sjRet)
+                .append(", 0\n");
+
+            String armContBlk = newLabel("arm_cont");
+            sb.append("  br i1 ").append(isZero)
+                .append(", label %").append(armContBlk)
+                .append(", label %").append(catchBlk).append("\n");
+
+            sb.append(armContBlk).append(":\n");
+            // The buffer is now armed. Copy it into the runtime context chain.
             sb.append("  call void @__jnative_push_catch(i8* ").append(bufPtr)
                 .append(", i8** ").append(catchTypeInfoOperand(r)).append(")\n");
         }
-        TryCatchRange top = ranges.getFirst();
-        String topBufPtr = newAux("sj_jb");
-        sb.append("  ").append(topBufPtr).append(" = bitcast [").append(JMP_BUF_SIZE)
-            .append(" x i8]* %jmp_buf_").append(rangeOrdinals.get(top)).append(" to i8*\n");
-        String sjRet = newAux("sj_ret");
-        sb.append("  ").append(sjRet).append(" = call i32 @_setjmp(i8* ").append(topBufPtr).append(")\n");
-        String isZero = newAux("sj_zero");
-        sb.append("  ").append(isZero).append(" = icmp eq i32 ").append(sjRet).append(", 0\n");
-        sb.append("  br i1 ").append(isZero)
-            .append(", label %").append(bodyBlk)
-            .append(", label %").append(catchBlk).append("\n");
+
+        sb.append("  br label %").append(bodyBlk).append("\n");
 
         sb.append(bodyBlk).append(":\n");
         body.accept(sb);
@@ -2388,10 +2865,15 @@ public class LlvmFunctionEmitter {
         sb.append(catchBlk).append(":\n");
         String exc = newAux("caught_exc");
         sb.append("  ").append(exc).append(" = call i8* @__jnative_get_exception_object()\n");
+
         String[] missLabels = new String[k];
         for (int i = 0; i < k; i++) {
             missLabels[i] = newLabel("cmiss");
         }
+
+        // Dispatch by type, innermost-first. On a match at index i we have
+        // already popped i contexts along the miss chain; the hit block
+        // pops the remaining (k - i) so that the total is always k.
         for (int i = 0; i < k; i++) {
             TryCatchRange r = ranges.get(i);
             if (i > 0) {
@@ -2415,6 +2897,7 @@ public class LlvmFunctionEmitter {
             BasicBlock handler = handlerBlockByRange.get(r);
             sb.append("  br label %").append(llvmLabel(handler)).append("\n");
         }
+
         sb.append(missLabels[k - 1]).append(":\n");
         sb.append("  call void @__jnative_pop_catch()\n");
         sb.append("  call void @__jnative_throw_exception(i8* ").append(exc).append(")\n");
@@ -2571,7 +3054,8 @@ public class LlvmFunctionEmitter {
     }
 
     private String getCastOp(Type src, Type dest) {
-        if (src.equals(dest)) return null;
+        if (src == dest) return null;
+        if (!src.isPrimitive() && src.equals(dest)) return null;
 
         if ((src.isReference() || src.isArray() || src.isNull()) &&
             (dest.isReference() || dest.isArray() || dest.isNull())) {
@@ -2623,12 +3107,13 @@ public class LlvmFunctionEmitter {
     }
 
     private int getPrimitiveSize(Type type) {
-        if (type == Type.BOOLEAN || type == Type.BYTE) return 8;
+        if (type == Type.BOOLEAN) return 1;
+        if (type == Type.BYTE)    return 8;
         if (type == Type.SHORT || type == Type.CHAR) return 16;
-        if (type == Type.INT) return 32;
-        if (type == Type.LONG) return 64;
-        if (type == Type.FLOAT) return 32;
-        if (type == Type.DOUBLE) return 64;
+        if (type == Type.INT)     return 32;
+        if (type == Type.LONG)    return 64;
+        if (type == Type.FLOAT)   return 32;
+        if (type == Type.DOUBLE)  return 64;
         return 0;
     }
 
@@ -2935,8 +3420,20 @@ public class LlvmFunctionEmitter {
         Type retType = TypeResolver.descToReturnType(descriptor);
         List<Type> paramTypes = TypeResolver.descToParamTypes(descriptor);
 
+        boolean isStatic = false;
+        {
+            String[] foundOwner = new String[1];
+            MethodNode target = resolver.findMethodInHierarchy(
+                owner, methodName, descriptor, foundOwner);
+            if (target != null) {
+                isStatic = target.isStatic();
+            }
+        }
+
         List<Type> allParams = new ArrayList<>();
-        allParams.add(Type.reference(owner));
+        if (!isStatic) {
+            allParams.add(Type.reference(owner));
+        }
         allParams.addAll(paramTypes);
 
         Function func = new Function(mangled, retType);
@@ -2982,10 +3479,17 @@ public class LlvmFunctionEmitter {
     }
 
     private void emitBoundsCheck(StringBuilder sb, String arrPtr, String idxI32, List<TryCatchRange> ranges) {
+        // length lives at JAVA_ARR_LENGTH_OFFSET (8) in the array header.
         String lenPtr = newAux("lenptr");
         String len = newAux("len");
-        sb.append("  ").append(lenPtr).append(" = bitcast i8* ").append(arrPtr).append(" to i32*\n");
-        sb.append("  ").append(len).append(" = load i32, i32* ").append(lenPtr).append("\n");
+        sb.append("  ").append(lenPtr)
+            .append(" = getelementptr inbounds i8, i8* ").append(arrPtr)
+            .append(", i64 8\n");
+        String lenPtrI32 = newAux("lenptr_i32");
+        sb.append("  ").append(lenPtrI32).append(" = bitcast i8* ").append(lenPtr)
+            .append(" to i32*\n");
+        sb.append("  ").append(len).append(" = load i32, i32* ")
+            .append(lenPtrI32).append("\n");
         String chk1 = newAux("bnd_chk1");
         String chk2 = newAux("bnd_chk2");
         String ok = newAux("bnd_ok");
@@ -3090,5 +3594,38 @@ public class LlvmFunctionEmitter {
             return "null";
         }
         return val;
+    }
+
+    /**
+     * A direct {@code __jnative_} call that bypasses the vtable is only
+     * correct when no reachable subclass can override the target method.
+     * Otherwise the call must go through the dispatch slot so that a true
+     * override (e.g. {@code String.hashCode()}) is honored at runtime.
+     */
+    private boolean isVirtualCallDirectNativeSafe(String owner, String methodName, String methodDesc) {
+        String ownerInternal = owner.replace('.', '/');
+        String[] foundOwner = new String[1];
+        io.github.kubyk01.domain.analyzer.dependencyresolver.MethodNode mn =
+            resolver.findMethodInHierarchy(ownerInternal, methodName, methodDesc, foundOwner);
+        if (mn == null) return false;
+
+        if (Modifier.isPrivate(mn.getAccess())) return true;
+
+        String declaringClass = foundOwner[0] != null ? foundOwner[0] : ownerInternal;
+        io.github.kubyk01.domain.analyzer.dependencyresolver.ClassNode declaringCn =
+            resolver.getClassNode(declaringClass);
+        if (declaringCn != null && Modifier.isFinal(declaringCn.getAccess())) return true;
+
+        if (Modifier.isFinal(mn.getAccess())) return true;
+
+        for (String subclass : resolver.getSubclasses(declaringClass)) {
+            if (subclass.equals(declaringClass)) continue;
+            io.github.kubyk01.domain.analyzer.dependencyresolver.MethodNode override =
+                resolver.getMethodNode(subclass, methodName, methodDesc);
+            if (override != null && !override.isStatic() && !override.isAbstract()) {
+                return false;
+            }
+        }
+        return true;
     }
 }

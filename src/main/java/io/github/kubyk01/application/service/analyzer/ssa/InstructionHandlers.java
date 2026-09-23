@@ -73,8 +73,19 @@ public class InstructionHandlers {
     public void cmpOp() {
         Value right = frame.pop();
         Value left = frame.pop();
-        Instruction cmp = builder.addInstruction(Opcode.SUB, left, right);
-        frame.push(cmp.getResult());
+
+        // lt = (left < right)   : i1
+        Instruction lt = builder.addInstruction(Opcode.LT, left, right);
+        // gt = (left > right)   : i1
+        Instruction gt = builder.addInstruction(Opcode.GT, left, right);
+
+        Instruction ltInt = builder.addInstruction(Opcode.CAST, Type.INT, lt.getResult());
+        Instruction gtInt = builder.addInstruction(Opcode.CAST, Type.INT, gt.getResult());
+
+        Instruction result = builder.addInstruction(
+            Opcode.SUB, gtInt.getResult(), ltInt.getResult());
+
+        frame.push(result.getResult());
     }
 
     public void convert() {
@@ -181,6 +192,17 @@ public class InstructionHandlers {
         frame.push(inst.getResult());
     }
 
+    private String resolveDeclaringOwner(String owner, String name) {
+        if (owner == null || name == null) return owner;
+
+        FieldNode field = resolver.getField(owner, name);
+        if (field == null) return owner;
+
+        String declaring = field.getOwner();
+        if (declaring == null || declaring.isEmpty()) return owner;
+        return declaring;
+    }
+
     public void getField(String owner, String name) {
         Value obj = frame.pop();
         Type fieldType;
@@ -190,9 +212,13 @@ public class InstructionHandlers {
         } else {
             fieldType = Type.reference("java/lang/Object");
         }
+
+        String declaringOwner = resolveDeclaringOwner(owner, name);
+        String canonicalKey = declaringOwner + "." + name;
+
         Instruction inst = new Instruction(Opcode.GET_FIELD);
         inst.addOperand(obj);
-        inst.addOperand(new Constant(Type.reference(owner + "." + name), owner + "." + name));
+        inst.addOperand(new Constant(Type.reference(canonicalKey), canonicalKey));
         Temporary tmp = builder.newTemporary(fieldType);
         inst.setResult(tmp);
         tmp.setDefiningInstruction(inst);
@@ -203,9 +229,17 @@ public class InstructionHandlers {
     public void putField(String owner, String name) {
         Value val = frame.pop();
         Value obj = frame.pop();
+
+        String declaringOwner = resolveDeclaringOwner(owner, name);
+        String canonicalKey = declaringOwner + "." + name;
+
         builder.addInstruction(Opcode.PUT_FIELD, obj,
-            new Constant(Type.reference(owner + "." + name), owner + "." + name), val);
+            new Constant(Type.reference(canonicalKey), canonicalKey), val);
     }
+
+    // ------------------------------------------------------------------
+    //  Static field access
+    // ------------------------------------------------------------------
 
     public void getStatic(String owner, String name) {
         Type fieldType;
@@ -215,8 +249,12 @@ public class InstructionHandlers {
         } else {
             fieldType = Type.reference("java/lang/Object");
         }
+
+        String declaringOwner = resolveDeclaringOwner(owner, name);
+        String canonicalKey = declaringOwner + "." + name;
+
         Instruction inst = new Instruction(Opcode.GET_STATIC);
-        inst.addOperand(new Constant(Type.reference(owner + "." + name), owner + "." + name));
+        inst.addOperand(new Constant(Type.reference(canonicalKey), canonicalKey));
         Temporary tmp = builder.newTemporary(fieldType);
         inst.setResult(tmp);
         tmp.setDefiningInstruction(inst);
@@ -226,10 +264,60 @@ public class InstructionHandlers {
 
     public void putStatic(String owner, String name) {
         Value val = frame.pop();
+
+        String declaringOwner = resolveDeclaringOwner(owner, name);
+        String canonicalKey = declaringOwner + "." + name;
+
         builder.addInstruction(Opcode.PUT_STATIC,
-            new Constant(Type.reference(owner + "." + name), owner + "." + name), val);
+            new Constant(Type.reference(canonicalKey), canonicalKey), val);
     }
 
+    // ------------------------------------------------------------------
+    //  Method calls
+    // ------------------------------------------------------------------
+
+    /**
+     * Lowers one method-call bytecode into an IR call instruction.
+     *
+     * <p>The IR opcode is chosen from the <em>resolved</em> owner, not
+     * from the bytecode opcode alone. That distinction matters because the
+     * bytecode opcode and the class that actually declares the resolved
+     * target can disagree:</p>
+     *
+     * <ul>
+     *   <li>{@code INVOKEVIRTUAL} whose resolved target is a
+     *       <em>default method</em> on an interface. The JVM's own
+     *       vtable layout handles this transparently, but this emitter
+     *       does not: the class vtable of the concrete receiver and the
+     *       interface itable do not share slot numbering, so a
+     *       {@code VIRTUAL_CALL} with an interface owner reads the
+     *       receiver's class vtable at the interface's slot index and
+     *       lands on an unrelated method or on an unresolved thunk.
+     *       {@code INTERFACE_CALL} routes the dispatch through
+     *       {@code __jnative_lookup_itable}, which finds the correct
+     *       entry in the receiver's interface map.</li>
+     *
+     *   <li>{@code INVOKEINTERFACE} whose resolved target is declared on
+     *       a class — the common case being a method inherited from
+     *       {@code java/lang/Object} through an interface, or a covariant
+     *       override whose erasure lives on the class. Here the correct
+     *       opcode is {@code VIRTUAL_CALL}: the receiver has no itable
+     *       entry for the interface in question, so interface dispatch
+     *       would look up a table that does not exist.</li>
+     * </ul>
+     *
+     * <p>Concrete failure the {@code INVOKEVIRTUAL -> interface} branch
+     * closes: {@code sun.security.util.DisabledAlgorithmConstraints
+     * .DenyAfterConstraint.<init>} contains
+     * {@code INVOKEVIRTUAL java/time/ZonedDateTime.getSecond()I}, and
+     * {@code getSecond()} is a default method on the interface
+     * {@code java/time/chrono/ChronoZonedDateTime}. Without this branch
+     * the emitter classified the call as {@code VIRTUAL_CALL} with owner
+     * {@code java/time/chrono/ChronoZonedDateTime}, read the receiver's
+     * class vtable at the interface's slot index, hit the null thunk
+     * {@code __jnative_vtable_missing_java_time_ZonedDateTime_getSecond__I},
+     * and aborted with {@code JNative unresolved vtable/itable slot}.</p>
+     */
     public void callMethod(int opcode, String owner, String name, String desc, boolean polymorphic) {
         List<Type> paramTypes = TypeResolver.descToParamTypes(desc);
         Type retType = TypeResolver.descToReturnType(desc);
@@ -242,6 +330,39 @@ public class InstructionHandlers {
         irOpcode = switch (opcode) {
             case Opcodes.INVOKEVIRTUAL -> {
                 receiver = frame.pop();
+                // An INVOKEVIRTUAL whose resolved owner is an interface
+                // means the target is a default method inherited from
+                // that interface by the compile-time receiver class.
+                // The JVM handles this transparently in its own vtable,
+                // but this emitter does not: the class vtable of the
+                // concrete receiver and the interface itable do not
+                // share slot numbering, so a VIRTUAL_CALL with an
+                // interface owner reads the receiver's class vtable at
+                // the interface's slot index and lands on an unrelated
+                // method or on an unresolved thunk.
+                //
+                // Concretely,
+                //     sun.security.util.DisabledAlgorithmConstraints
+                //         .DenyAfterConstraint.<init>
+                // contains
+                //     INVOKEVIRTUAL java/time/ZonedDateTime.getSecond()I
+                // getSecond() is a default method on ChronoZonedDateTime;
+                // the constant-pool owner is ZonedDateTime.
+                // findMethodInHierarchy resolves the call to
+                // ChronoZonedDateTime, and this method receives that
+                // interface name as `owner`. Classifying the IR opcode
+                // from the bytecode opcode alone would produce
+                // VIRTUAL_CALL with an interface owner, and the emitter
+                // would then read the receiver's class vtable at the
+                // interface's own slot index — the wrong slot. Emitting
+                // INTERFACE_CALL routes the dispatch through
+                // __jnative_lookup_itable, which finds the correct entry
+                // in the receiver's interface map and returns the itable
+                // the interface layout was built for.
+                ClassNode resolvedOwnerNode = resolver.getClassNode(owner);
+                if (resolvedOwnerNode != null && resolvedOwnerNode.isInterface()) {
+                    yield Opcode.INTERFACE_CALL;
+                }
                 yield Opcode.VIRTUAL_CALL;
             }
             case Opcodes.INVOKEINTERFACE -> {

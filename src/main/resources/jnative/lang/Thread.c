@@ -2,30 +2,184 @@
 #include <pthread.h>
 #include <time.h>
 #include <sched.h>
-#include <stdlib.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <errno.h>
 #include <unistd.h>
-#include <signal.h>
-#include <sys/time.h>
 
-__attribute__((noreturn)) void __jnative_throw_exception(void* exc);
-__attribute__((noreturn)) void __jnative_throw_null_pointer_exception(void);
-void* __jnative_get_exception_object(void);
-void __jnative_monitor_enter(void* obj);
-void __jnative_monitor_exit(void* obj);
+#include "jnative_runtime.h"
+
+/* ============================================================================
+ * Thread object layout handoff
+ * ============================================================================
+ *
+ * The C runtime synthesises the "main" java.lang.Thread object lazily, the
+ * first time the Java layer reaches Thread.currentThread() or
+ * Thread.currentCarrierThread(). That happens before any Java-level Thread
+ * constructor has run -- inside jdk.internal.misc.CarrierThread.<clinit> --
+ * so the object has to be fully valid from C.
+ *
+ * The offsets below are NOT hard-coded. They are pushed in from @main by
+ * LlvmGenerator.generateMain() through __jnative_thread_set_layout(). The
+ * values come from LlvmGlobalEmitter.getFieldOffset() and
+ * computeObjectSize(), which are the same functions that produced the
+ * %struct.java_lang_Thread* LLVM types in the compiled module. Any JDK
+ * field reordering changes both sides in lockstep.
+ *
+ * Until __jnative_thread_set_layout() runs, every offset is -1 and the
+ * synthesiser refuses to build an object rather than building one with
+ * guessed offsets. This is a hard fail-safe: the alternative is producing
+ * an object whose layout silently disagrees with the emitted bytecode.
+ * ========================================================================== */
+
+static int32_t THREAD_OBJECT_SIZE    = -1;
+static int32_t THREAD_HOLDER_OFFSET  = -1;
+static int32_t THREAD_TID_OFFSET     = -1;
+static int32_t THREAD_NAME_OFFSET    = -1;
+
+static int32_t FH_OBJECT_SIZE        = -1;
+static int32_t FH_GROUP_OFFSET       = -1;
+static int32_t FH_PRIORITY_OFFSET    = -1;
+static int32_t FH_DAEMON_OFFSET      = -1;
+static int32_t FH_STATUS_OFFSET      = -1;
+
+static int32_t TG_OBJECT_SIZE        = -1;
+static int32_t TG_NAME_OFFSET        = -1;
+static int32_t TG_MAXPRIORITY_OFFSET = -1;
+static int32_t TG_VMALLOW_OFFSET     = -1;
+
+/*
+ * JVMTI thread-status bits, as consumed by jdk.internal.misc.VM.toThreadState.
+ * A RUNNABLE|ALIVE combination is what Thread.State.RUNNABLE maps to; it
+ * makes isTerminated() == false, so getThreadGroup() does not short-circuit
+ * to null on a still-initialising thread.
+ */
+#define JVMTI_THREAD_STATE_ALIVE      0x0001
+#define JVMTI_THREAD_STATE_TERMINATED 0x0002
+#define JVMTI_THREAD_STATE_RUNNABLE   0x0004
+
+#define JNATIVE_THREAD_NORM_PRIORITY  5
+#define JNATIVE_THREAD_MAX_PRIORITY   10
+
+/**
+ * Hand-off from LlvmGenerator.generateMain. Idempotent: a second call with
+ * the same values is a no-op, a second call with different values is a
+ * programming error and is reported to stderr.
+ */
+void __jnative_thread_set_layout(
+    int32_t thread_object_size,
+    int32_t thread_holder_offset,
+    int32_t thread_tid_offset,
+    int32_t thread_name_offset,
+    int32_t fh_object_size,
+    int32_t fh_group_offset,
+    int32_t fh_priority_offset,
+    int32_t fh_daemon_offset,
+    int32_t fh_status_offset,
+    int32_t tg_object_size,
+    int32_t tg_name_offset,
+    int32_t tg_maxpriority_offset,
+    int32_t tg_vmallow_offset)
+{
+    if (THREAD_OBJECT_SIZE > 0) {
+        if (THREAD_OBJECT_SIZE    != thread_object_size
+            || THREAD_HOLDER_OFFSET != thread_holder_offset
+            || THREAD_TID_OFFSET    != thread_tid_offset
+            || THREAD_NAME_OFFSET   != thread_name_offset
+            || FH_OBJECT_SIZE       != fh_object_size
+            || FH_GROUP_OFFSET      != fh_group_offset
+            || FH_PRIORITY_OFFSET   != fh_priority_offset
+            || FH_DAEMON_OFFSET     != fh_daemon_offset
+            || FH_STATUS_OFFSET     != fh_status_offset
+            || TG_OBJECT_SIZE       != tg_object_size
+            || TG_NAME_OFFSET       != tg_name_offset
+            || TG_MAXPRIORITY_OFFSET!= tg_maxpriority_offset
+            || TG_VMALLOW_OFFSET    != tg_vmallow_offset) {
+            fprintf(stderr,
+                "jnative: warning: __jnative_thread_set_layout called twice "
+                "with different values; ignoring the second call\n");
+            return;
+        }
+        return;
+    }
+
+    THREAD_OBJECT_SIZE    = thread_object_size;
+    THREAD_HOLDER_OFFSET  = thread_holder_offset;
+    THREAD_TID_OFFSET     = thread_tid_offset;
+    THREAD_NAME_OFFSET    = thread_name_offset;
+    FH_OBJECT_SIZE        = fh_object_size;
+    FH_GROUP_OFFSET       = fh_group_offset;
+    FH_PRIORITY_OFFSET    = fh_priority_offset;
+    FH_DAEMON_OFFSET      = fh_daemon_offset;
+    FH_STATUS_OFFSET      = fh_status_offset;
+    TG_OBJECT_SIZE        = tg_object_size;
+    TG_NAME_OFFSET        = tg_name_offset;
+    TG_MAXPRIORITY_OFFSET = tg_maxpriority_offset;
+    TG_VMALLOW_OFFSET     = tg_vmallow_offset;
+}
 
 extern const void* vtable_java_lang_Thread[];
 
-extern void* __jnative_make_string_obj(const char* bytes, int32_t len);
-extern const char* __jnative_read_string_bytes(void* s, int32_t* out_len);
+/* ============================================================================
+ * Global monotonic TID counter.
+ * ============================================================================
+ *
+ * This is the counter that backs Thread.getNextThreadIdOffset() and, through
+ * it, java.lang.Thread$ThreadIdentifiers.next(). The Java-side caller does:
+ *
+ *     U.getAndAddLong(null, NEXT_TID_OFFSET, 1)
+ *
+ * and Unsafe.getAndAddLong, when its obj argument is the compile-time null
+ * literal, treats the offset argument as an absolute address (see
+ * effective_address() in Unsafe.c and the contract documented there and in
+ * Unsafe.staticFieldOffset / staticFieldBase).
+ *
+ * The value returned by Thread.getNextThreadIdOffset() must therefore be the
+ * ADDRESS of this counter, not the byte offset of Thread.tid inside a Thread
+ * object. Returning the field offset (16) produces NULL + 16 = 0x10 and a
+ * SIGSEGV on the first Thread construction; returning the address produces
+ * NULL + &counter, i.e. &counter, which is exactly what the counter's own
+ * increment path needs.
+ *
+ * Alignment is 8 bytes so the compiler can emit a single `lock xadd` on
+ * x86_64 or a single `ldaxr/stlxr` pair on aarch64 without any extra
+ * alignment path. Access is exclusively through JNATIVE_NEXT_TID(); no other
+ * code path may read or write this variable directly.
+ *
+ * Starting value is 1: HotSpot's own TID counter also starts at 1, and every
+ * observable tid in the runtime (Thread.threadId(), ThreadState.tid, the id
+ * returned by Unsafe.getAndAddLong) must be non-zero. A value of 0 is
+ * reserved as the "uninitialised slot" sentinel that get_or_create_thread_state
+ * uses below.
+ * ========================================================================== */
+static _Alignas(8) int64_t jnative_next_tid = 1;
 
-#define JLTHREAD_OBJECT_SIZE 200
-#define JLTHREAD_NAME_OFFSET 24
-#define JLTHREAD_TID_OFFSET  32
+/* Atomically reserve and return the next TID.
+ *
+ * The C side (create_thread_object, get_or_create_thread_state) and the Java
+ * side (ThreadIdentifiers.next, via Unsafe.getAndAddLong) both increment this
+ * counter. The atomic RMW in this macro and the atomic RMW in
+ * Unsafe.getAndAddLong (__atomic_fetch_add on int64_t) are mutually
+ * consistent: both use sequential consistency and both operate on the same
+ * 8-byte aligned word, so concurrent Java-created and C-synthesised threads
+ * receive distinct, strictly monotonic IDs.
+ *
+ * The value returned is the pre-increment value, matching the semantics of
+ * Unsafe.getAndAddLong and of the previous (non-atomic) next_tid++ code path
+ * this macro replaces.
+ */
+#define JNATIVE_NEXT_TID() \
+    ((int64_t)__atomic_fetch_add(&jnative_next_tid, 1, __ATOMIC_SEQ_CST))
 
+/*
+ * One ThreadState per live java.lang.Thread. The state holds the pthread
+ * handle, a per-thread mutex and condition variable used for join/interrupt,
+ * and the Java-level bookkeeping (priority, daemon flag, name, context class
+ * loader) that does not map onto pthread primitives. Entries are never freed
+ * until the process image is torn down; the runtime has no way to know when
+ * a Thread object has become unreachable.
+ */
 typedef struct ThreadState {
     void* java_thread;
     void* carrier_thread;
@@ -52,16 +206,119 @@ static pthread_mutex_t thread_table_lock = PTHREAD_MUTEX_INITIALIZER;
 static ThreadState* thread_table = NULL;
 static _Thread_local ThreadState* tls_state = NULL;
 static ThreadState* main_thread_state = NULL;
-static int64_t next_tid = 1;
 
-static void* create_thread_object(void) {
-    void* t = calloc(1, JLTHREAD_OBJECT_SIZE);
-    if (t == NULL) {
-        return NULL;
+/* ---------------------------------------------------------------------------
+ * Placeholder ThreadGroup for the main thread.
+ *
+ * The reference JDK creates the root "main" ThreadGroup from the VM bootstrap
+ * sequence. This runtime does not run that sequence, so the first caller of
+ * Thread.currentThread() -- jdk.internal.misc.CarrierThread from inside its
+ * own <clinit> -- would otherwise observe a main Thread whose
+ * holder.group is NULL and fail with an NPE inside
+ * `new ThreadGroup(parent, "CarrierThreads")`.
+ *
+ * The placeholder must satisfy exactly the reads the ThreadGroup constructor
+ * performs on its parent:
+ *
+ *     parent.checkAccess()          -> no-op when no SecurityManager
+ *     parent.maxPriority            -> copied into the new group
+ *     parent.daemon                 -> copied into the new group
+ *     parent.vmAllowSuspension      -> copied into the new group
+ *     parent.add(child)             -> synchronized, checks destroyed,
+ *                                      lazily allocates groups[]
+ *
+ * Every other field of ThreadGroup (parent, nthreads, threads, ngroups,
+ * groups, nUnstartedThreads) is left at zero/NULL from calloc and is not read
+ * by that constructor.
+ * ------------------------------------------------------------------------- */
+static void* create_main_thread_group(void) {
+    if (TG_OBJECT_SIZE < 0) return NULL;
+
+    void* vtable = __jnative_own_class_vtable("java/lang/ThreadGroup");
+    if (vtable == NULL) return NULL;
+
+    void* tg = calloc(1, (size_t)TG_OBJECT_SIZE);
+    if (tg == NULL) return NULL;
+
+    *(void**)tg = vtable;
+    *(void**)((char*)tg + TG_NAME_OFFSET) =
+        __jnative_make_string_obj("main", 4);
+    *(int32_t*)((char*)tg + TG_MAXPRIORITY_OFFSET) =
+        JNATIVE_THREAD_MAX_PRIORITY;
+    /* vmAllowSuspension only exists on JDKs that predate JDK-8283117; on
+     * newer JDKs the emitter reports -1 and the field is simply absent. */
+    if (TG_VMALLOW_OFFSET >= 0) {
+        *(uint8_t*)((char*)tg + TG_VMALLOW_OFFSET) = 1;
     }
-    *(const void**)t = (const void*)vtable_java_lang_Thread;
-    *(const char**)((char*)t + JLTHREAD_NAME_OFFSET) = "main";
-    *(int64_t*)((char*)t + JLTHREAD_TID_OFFSET) = next_tid++;
+
+    return tg;
+}
+
+/* ---------------------------------------------------------------------------
+ * Thread$FieldHolder for the main thread.
+ *
+ * The JDK's Thread.threadState()/getPriority()/isDaemon()/getThreadGroup()
+ * read the corresponding fields from this holder. A NULL holder is the exact
+ * condition that produced the NPE reported in fun.txt.
+ * ------------------------------------------------------------------------- */
+static void* create_main_thread_field_holder(void* group) {
+    if (FH_OBJECT_SIZE < 0) return NULL;
+
+    void* vtable = __jnative_own_class_vtable("java/lang/Thread$FieldHolder");
+    if (vtable == NULL) return NULL;
+
+    void* fh = calloc(1, (size_t)FH_OBJECT_SIZE);
+    if (fh == NULL) return NULL;
+
+    *(void**)fh = vtable;
+    *(void**)((char*)fh + FH_GROUP_OFFSET)    = group;
+    *(int32_t*)((char*)fh + FH_PRIORITY_OFFSET) =
+        JNATIVE_THREAD_NORM_PRIORITY;
+    *(uint8_t*)((char*)fh + FH_DAEMON_OFFSET) = 0;
+    *(int32_t*)((char*)fh + FH_STATUS_OFFSET) =
+        JVMTI_THREAD_STATE_ALIVE | JVMTI_THREAD_STATE_RUNNABLE;
+
+    return fh;
+}
+
+/* ---------------------------------------------------------------------------
+ * The main Thread object itself.
+ *
+ * Every field that Java code can observe before the real Thread constructor
+ * has had a chance to run must already be populated:
+ *
+ *   vtable          -> vtable_java_lang_Thread
+ *   tid             -> JNATIVE_NEXT_TID()  (ThreadIdentifiers reads this)
+ *   name            -> a real java.lang.String (Thread.getName returns it)
+ *   holder          -> FieldHolder whose group is a valid ThreadGroup
+ * ------------------------------------------------------------------------- */
+static void* create_thread_object(void) {
+    if (THREAD_OBJECT_SIZE < 0) return NULL;
+
+    void* vtable = __jnative_own_class_vtable("java/lang/Thread");
+    if (vtable == NULL) return NULL;
+
+    void* t = calloc(1, (size_t)THREAD_OBJECT_SIZE);
+    if (t == NULL) return NULL;
+
+    *(void**)t = vtable;
+
+    if (THREAD_NAME_OFFSET >= 0) {
+        *(void**)((char*)t + THREAD_NAME_OFFSET) =
+            __jnative_make_string_obj("main", 4);
+    }
+
+    if (THREAD_TID_OFFSET >= 0) {
+        int64_t tid = JNATIVE_NEXT_TID();
+        *(int64_t*)((char*)t + THREAD_TID_OFFSET) = tid;
+    }
+
+    if (THREAD_HOLDER_OFFSET >= 0) {
+        void* group  = create_main_thread_group();
+        void* holder = create_main_thread_field_holder(group);
+        *(void**)((char*)t + THREAD_HOLDER_OFFSET) = holder;
+    }
+
     return t;
 }
 
@@ -94,10 +351,27 @@ static ThreadState* get_or_create_thread_state(void* java_thread) {
     }
     s->java_thread = java_thread;
     s->priority = 5;
-    s->tid = *(int64_t*)((char*)java_thread + JLTHREAD_TID_OFFSET);
+    /* Guard: if the runtime has not received its layout yet, do not
+     * fabricate a tid. The Java caller would read garbage from a
+     * non-existent field. Returning 0 keeps the ThreadState consistent
+     * and the layout is guaranteed to arrive before any user-visible
+     * thread operation. */
+    if (THREAD_TID_OFFSET < 0) {
+        pthread_mutex_unlock(&thread_table_lock);
+        return s;
+    }
+    s->tid = *(int64_t*)((char*)java_thread + THREAD_TID_OFFSET);
     if (s->tid == 0) {
-        s->tid = next_tid++;
-        *(int64_t*)((char*)java_thread + JLTHREAD_TID_OFFSET) = s->tid;
+        /*
+         * Zero means the Java-level Thread constructor has not yet stored
+         * a tid into the object — that is the normal state for a Thread
+         * whose <init> has not run (the C-synthesised main thread) or for
+         * a Thread created before the counter was reachable from Java.
+         * Reserve a fresh id atomically so a concurrent Java-level
+         * ThreadIdentifiers.next() cannot hand out the same value.
+         */
+        s->tid = JNATIVE_NEXT_TID();
+        *(int64_t*)((char*)java_thread + THREAD_TID_OFFSET) = s->tid;
     }
     pthread_mutex_init(&s->mutex, NULL);
     pthread_cond_init(&s->cond, NULL);
@@ -107,20 +381,11 @@ static ThreadState* get_or_create_thread_state(void* java_thread) {
     return s;
 }
 
-static void remove_thread_state(ThreadState* s) {
-    if (!s) return;
-    pthread_mutex_lock(&thread_table_lock);
-    ThreadState** pp = &thread_table;
-    while (*pp) {
-        if (*pp == s) {
-            *pp = s->next;
-            break;
-        }
-        pp = &(*pp)->next;
-    }
-    pthread_mutex_unlock(&thread_table_lock);
-}
-
+/*
+ * Synthesise the state for the process's real main thread. Called lazily the
+ * first time Thread.currentThread() is reached, which can happen before any
+ * Java-level Thread constructor has run.
+ */
 static ThreadState* ensure_main_thread(void) {
     if (main_thread_state) return main_thread_state;
     pthread_mutex_lock(&thread_table_lock);
@@ -139,7 +404,9 @@ static ThreadState* ensure_main_thread(void) {
     s->running = 1;
     s->started = 1;
     s->priority = 5;
-    s->tid = *(int64_t*)((char*)s->java_thread + JLTHREAD_TID_OFFSET);
+    if (THREAD_TID_OFFSET >= 0) {
+        s->tid = *(int64_t*)((char*)s->java_thread + THREAD_TID_OFFSET);
+    }
     pthread_mutex_init(&s->mutex, NULL);
     pthread_cond_init(&s->cond, NULL);
     s->next = thread_table;
@@ -155,6 +422,11 @@ typedef struct StartArgs {
     void* runnable;
 } StartArgs;
 
+/*
+ * pthread entry point. Publishes the ThreadState into the thread-local slot,
+ * marks the thread running, invokes the Java-level Runnable, and on return
+ * marks the thread finished and wakes any joiner.
+ */
 static void* thread_entry(void* arg) {
     StartArgs* sa = (StartArgs*)arg;
     ThreadState* s = sa->state;
@@ -181,6 +453,12 @@ static void* thread_entry(void* arg) {
     return NULL;
 }
 
+/*
+ * =========================================================================
+ * Current-thread identification
+ * =========================================================================
+ */
+
 void* __jnative_fn_java_lang_Thread_currentThread___Ljava_lang_Thread_(void) {
     ThreadState* s = tls_state;
     if (!s) s = ensure_main_thread();
@@ -202,6 +480,12 @@ void* __jnative_fn_java_lang_Thread_currentCarrierThread___Ljava_lang_Thread_(vo
     return s ? s->java_thread : NULL;
 }
 
+/*
+ * =========================================================================
+ * sleep / yield
+ * =========================================================================
+ */
+
 void __jnative_fn_java_lang_Thread_sleep__J(long millis) {
     if (millis < 0) millis = 0;
     struct timespec req, rem;
@@ -221,14 +505,21 @@ void __jnative_fn_java_lang_Thread_yield__V(void) {
 }
 
 /*
- * JDK 17+ renamed several Thread natives by appending a '0' to the
- * Java-visible name. The bodies are identical to their un-suffixed
- * counterparts; we keep both symbol families present so the same C file
- * works across JDK 8 — 22 build targets.
+ * JDK 17+ rename: yield0() forwards to the legacy yield().
  */
 void __jnative_fn_java_lang_Thread_yield0___V(void) {
     __jnative_fn_java_lang_Thread_yield__V();
 }
+
+void __jnative_fn_java_lang_Thread_sleep0__J_V(long millis) {
+    __jnative_fn_java_lang_Thread_sleep__J(millis);
+}
+
+/*
+ * =========================================================================
+ * start
+ * =========================================================================
+ */
 
 void __jnative_fn_java_lang_Thread_start__V(void* this_thread) {
     if (!this_thread) {
@@ -270,21 +561,19 @@ void __jnative_fn_java_lang_Thread_start__V(void* this_thread) {
     }
 }
 
-/* JDK 17+ name for Thread.start(). Forward to the legacy implementation. */
+/*
+ * JDK 17+ rename: start0() forwards to the legacy start().
+ */
 void __jnative_fn_java_lang_Thread_start0___V(void* this_thread) {
     __jnative_fn_java_lang_Thread_start__V(this_thread);
 }
 
 /*
- * void interrupt0();
- *
- * The actual native hook that java.lang.Thread.interrupt() dispatches to.
- * Sets the per-thread interrupt flag and wakes any thread blocked in
- * Object.wait()/Thread.join() so it can re-check the flag on the next
- * iteration of its wait loop. This is the same body as the legacy
- * interrupt() native — kept as a separate symbol because the JDK's Java
- * source calls interrupt0(), not interrupt().
+ * =========================================================================
+ * interrupt
+ * =========================================================================
  */
+
 void __jnative_fn_java_lang_Thread_interrupt0___V(void* this_thread) {
     if (!this_thread) {
         __jnative_throw_null_pointer_exception();
@@ -298,7 +587,6 @@ void __jnative_fn_java_lang_Thread_interrupt0___V(void* this_thread) {
     pthread_mutex_unlock(&s->mutex);
 }
 
-/* Legacy alias for callers that still resolve interrupt() directly. */
 void __jnative_fn_java_lang_Thread_interrupt__V(void* this_thread) {
     __jnative_fn_java_lang_Thread_interrupt0___V(this_thread);
 }
@@ -323,13 +611,38 @@ int __jnative_fn_java_lang_Thread_isInterrupted__Z(void* this_thread, int clearI
     return old;
 }
 
+void __jnative_fn_java_lang_Thread_clearInterrupt__V(void* this_thread) {
+    if (!this_thread) return;
+    ThreadState* s = find_thread_state(this_thread);
+    if (!s) return;
+    pthread_mutex_lock(&s->mutex);
+    s->interrupted = 0;
+    pthread_mutex_unlock(&s->mutex);
+}
+
+/*
+ * JDK 17+ rename for Thread.clearInterrupt(). The reference implementation
+ * additionally clears a per-thread interrupt event object on Windows; this
+ * runtime has no such object, and the blocking primitives (Object.wait,
+ * Thread.sleep, Thread.join) re-check the flag on every wake-up, so clearing
+ * the flag is all that is required.
+ */
+void __jnative_fn_java_lang_Thread_clearInterruptEvent___V(void* this_thread) {
+    __jnative_fn_java_lang_Thread_clearInterrupt__V(this_thread);
+}
+
+/*
+ * =========================================================================
+ * priority / daemon / context class loader
+ * =========================================================================
+ */
+
 void __jnative_fn_java_lang_Thread_setPriority__I(void* this_thread, int newPriority) {
     if (!this_thread) return;
     ThreadState* s = find_thread_state(this_thread);
     if (s) s->priority = newPriority;
 }
 
-/* JDK 17+ name for setPriority. Forward to the legacy implementation. */
 void __jnative_fn_java_lang_Thread_setPriority0__I_V(void* this_thread, int newPriority) {
     __jnative_fn_java_lang_Thread_setPriority__I(this_thread, newPriority);
 }
@@ -367,6 +680,12 @@ void* __jnative_fn_java_lang_Thread_getContextClassLoader__Ljava_lang_ClassLoade
 void __jnative_fn_java_lang_Thread_ensureMaterializedForStackWalk__Ljava_lang_Object__V(void* o) {
     (void)o;
 }
+
+/*
+ * =========================================================================
+ * tid / name
+ * =========================================================================
+ */
 
 int64_t __jnative_fn_java_lang_Thread_getId___J(void* this_thread) {
     if (!this_thread) return 0;
@@ -407,6 +726,12 @@ void __jnative_fn_java_lang_Thread_setNativeName__Ljava_lang_String__V(void* thi
     __jnative_fn_java_lang_Thread_setName__Ljava_lang_String__V(this_thread, name);
 }
 
+/*
+ * =========================================================================
+ * state queries
+ * =========================================================================
+ */
+
 int __jnative_fn_java_lang_Thread_isAlive___Z(void* this_thread) {
     if (!this_thread) return 0;
     ThreadState* s = find_thread_state(this_thread);
@@ -417,6 +742,12 @@ int __jnative_fn_java_lang_Thread_isVirtual___Z(void* this_thread) {
     (void)this_thread;
     return 0;
 }
+
+/*
+ * =========================================================================
+ * join
+ * =========================================================================
+ */
 
 void __jnative_fn_java_lang_Thread_join__J_V(void* this_thread, int64_t millis) {
     if (!this_thread) return;
@@ -438,6 +769,12 @@ void __jnative_fn_java_lang_Thread_join__J_V(void* this_thread, int64_t millis) 
     pthread_mutex_unlock(&s->mutex);
 }
 
+/*
+ * =========================================================================
+ * misc
+ * =========================================================================
+ */
+
 int __jnative_fn_java_lang_Thread_holdsLock__Ljava_lang_Object__Z(void* obj) {
     (void)obj;
     return 0;
@@ -445,32 +782,6 @@ int __jnative_fn_java_lang_Thread_holdsLock__Ljava_lang_Object__Z(void* obj) {
 
 void __jnative_fn_java_lang_Thread_onSpinWait___V(void) {
     __asm__ __volatile__("pause" ::: "memory");
-}
-
-void __jnative_fn_java_lang_Thread_clearInterrupt__V(void* this_thread) {
-    if (!this_thread) return;
-    ThreadState* s = find_thread_state(this_thread);
-    if (!s) return;
-    pthread_mutex_lock(&s->mutex);
-    s->interrupted = 0;
-    pthread_mutex_unlock(&s->mutex);
-}
-
-/*
- * JDK 17+ name for Thread.clearInterrupt(). The reference implementation
- * additionally clears the per-thread interrupt *event* (the Windows-style
- * event object that Thread.interrupt() signals to wake a blocked I/O
- * operation). This runtime has no such event object — interrupt state
- * lives entirely in the ThreadState.interrupted flag, and the blocking
- * primitives (Object.wait, Thread.sleep, Thread.join) re-check the flag
- * on every wake-up. Clearing the flag is therefore all that is required.
- *
- * Both the legacy clearInterrupt() and the modern getAndClearInterrupt()
- * paths reach this symbol, so it must forward to the same flag-clearing
- * body.
- */
-void __jnative_fn_java_lang_Thread_clearInterruptEvent___V(void* this_thread) {
-    __jnative_fn_java_lang_Thread_clearInterrupt__V(this_thread);
 }
 
 void __jnative_fn_java_lang_Thread_exit__V(void* this_thread) {
@@ -485,6 +796,12 @@ void __jnative_fn_java_lang_Thread_exit__V(void* this_thread) {
     }
 }
 
+/*
+ * =========================================================================
+ * scoped-value cache (ScopedValue / StructuredTaskScope)
+ * =========================================================================
+ */
+
 void* __jnative_fn_java_lang_Thread_scopedValueCache____Ljava_lang_Object_(void* this_thread) {
     if (!this_thread) return NULL;
     ThreadState* s = find_thread_state(this_thread);
@@ -497,13 +814,99 @@ void __jnative_fn_java_lang_Thread_setScopedValueCache___Ljava_lang_Object__V(vo
     if (s) s->scoped_value_cache = cache;
 }
 
+/* ---------------------------------------------------------------------------
+ * java.lang.Thread.getNextThreadIdOffset() -> long
+ *
+ * This method exists to answer a single question for
+ * java.lang.Thread$ThreadIdentifiers:
+ *
+ *     "What address do I pass to Unsafe.getAndAddLong with a NULL base
+ *      in order to increment the VM's global thread-ID counter?"
+ *
+ * The Java-side consumer is (JDK 21, java.base/java/lang/Thread.java):
+ *
+ *     private static class ThreadIdentifiers {
+ *         private static final Unsafe U;
+ *         private static final long NEXT_TID_OFFSET;
+ *         static {
+ *             U = Unsafe.getUnsafe();
+ *             NEXT_TID_OFFSET = Thread.getNextThreadIdOffset();
+ *         }
+ *         static long next() {
+ *             return U.getAndAddLong(null, NEXT_TID_OFFSET, 1);
+ *         }
+ *     }
+ *
+ * The base argument is a compile-time `null` literal in the bytecode. The
+ * runtime's Unsafe.getAndAddLong (see Unsafe.c) and HotSpot's
+ * Unsafe_NativeGetAndAddLong both compute:
+ *
+ *     effective_address(NULL, offset) = (void*)(uintptr_t)offset
+ *
+ * i.e. with a NULL base, the offset value IS the address. The contract is
+ * documented in Unsafe.c:effective_address and is the same one
+ * Unsafe.staticFieldOffset / Unsafe.staticFieldBase rely on.
+ *
+ * HotSpot satisfies this contract by returning the address of the
+ * VM-internal TID counter. This runtime must do the same: return
+ * &jnative_next_tid, which is the exact counter that C-synthesised threads
+ * (main thread, JDK-internal helper threads) draw their IDs from via
+ * JNATIVE_NEXT_TID(). Returning the byte offset of Thread.tid inside the
+ * Thread object instead produces NULL + 16 = 0x10 and a SIGSEGV on the very
+ * first Thread construction — precisely the crash this method was fixed to
+ * eliminate.
+ *
+ * ---------------------------------------------------------------------------
+ * Why the previous THREAD_TID_OFFSET >= 0 gate has been removed
+ * ---------------------------------------------------------------------------
+ *
+ * The previous revision returned -1 when the layout handoff had not run, on
+ * the theory that ThreadIdentifiers.<clinit> would "fall back to a
+ * conservative path". That theory is false. The actual bytecode of
+ * ThreadIdentifiers.next() reads:
+ *
+ *     return U.getAndAddLong(null, NEXT_TID_OFFSET, 1);
+ *
+ * There is no check of NEXT_TID_OFFSET anywhere in the JDK. -1 would have
+ * produced effective_address(NULL, -1) = (void*)-1, i.e. a SIGSEGV at
+ * 0xFFFFFFFFFFFFFFFF, which is no better than 0x10 and strictly harder to
+ * diagnose.
+ *
+ * The gate is not just unhelpful — it is wrong in principle, because the
+ * value this method returns is a link-time constant. The address of
+ * jnative_next_tid is valid before __jnative_thread_set_layout has ever been
+ * called, during it, and after it. There is no state the layout handoff can
+ * be in that would make the answer different, and therefore no reason to
+ * gate on it.
+ *
+ * ---------------------------------------------------------------------------
+ * Why the previous `(int64_t)THREAD_TID_OFFSET` was wrong
+ * ---------------------------------------------------------------------------
+ *
+ * THREAD_TID_OFFSET is the byte offset of the Thread.tid field inside a
+ * Thread object, computed by LlvmGlobalEmitter.getFieldOffset(). That offset
+ * is consumed by every direct GET_FIELD / PUT_FIELD that reads or writes tid
+ * from generated bytecode, and by the C accessors in this file:
+ *
+ *     *(int64_t*)((char*)t + THREAD_TID_OFFSET) = tid;
+ *     s->tid = *(int64_t*)((char*)java_thread + THREAD_TID_OFFSET);
+ *
+ * It is not an address and cannot be interpreted as one. Passing it to
+ * Unsafe.getAndAddLong with a NULL base dereferences address 16. The two
+ * meanings ("field offset inside an object" vs. "absolute address of a
+ * VM-owned counter") are incompatible and must be kept in separate
+ * variables; this method's job is to bridge from the latter meaning to the
+ * Java side.
+ * ------------------------------------------------------------------------- */
 int64_t __jnative_fn_java_lang_Thread_getNextThreadIdOffset___J(void) {
-    return (int64_t)JLTHREAD_TID_OFFSET;
+    return (int64_t)(uintptr_t)&jnative_next_tid;
 }
 
-void __jnative_fn_java_lang_Thread_sleep0__J_V(long millis) {
-    __jnative_fn_java_lang_Thread_sleep__J(millis);
-}
+/*
+ * =========================================================================
+ * registerNatives
+ * =========================================================================
+ */
 
 void __jnative_fn_java_lang_Thread_registerNatives___V(void* arg) {
     (void)arg;
