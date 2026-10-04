@@ -74,7 +74,7 @@ int32_t JNATIVE_CTOR_EXC_TYPES_OFFSET   = -1;
 int32_t JNATIVE_CTOR_MODIFIERS_OFFSET   = -1;
 
 /* ============================================================================
- * Reflect-mirror layout handoff
+ * Reflect-mirror layout hand-off
  *
  * Idempotent. A second call with the same values is a no-op; a second call
  * with different values is a programming error and is reported to stderr
@@ -709,6 +709,27 @@ static void* __jnative_make_exception_object(const char* vtable_symbol,
         *(void**)((char*)exc + JNATIVE_THROWABLE_MESSAGE_OFFSET) = msg;
     }
     return exc;
+}
+
+/*
+ * Public wrapper around __jnative_make_exception_object.
+ *
+ * Used by per-class native files (for example jnative/lang/Class.c's
+ * forName0) that must construct a specific exception object whose type
+ * is not one of the fixed set the runtime builds internally.
+ *
+ * Returns NULL when the requested vtable is not present in the image.
+ * The caller is expected to either substitute a different exception
+ * type or pass NULL into __jnative_throw_exception_ctx, in which case
+ * the generic substitution path in that function fires and produces a
+ * Throwable whose message names the missing vtable. Returning NULL is
+ * therefore never a silent failure: it always produces a diagnostic
+ * exception with a message that identifies the problem.
+ */
+void* __jnative_construct_exception(const char* vtable_symbol,
+                                    const char* message) {
+    if (vtable_symbol == NULL) return NULL;
+    return __jnative_make_exception_object(vtable_symbol, message);
 }
 
 static void* __jnative_make_null_pointer_exception(const char* caller,

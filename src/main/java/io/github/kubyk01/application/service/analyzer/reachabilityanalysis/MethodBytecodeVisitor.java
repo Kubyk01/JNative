@@ -514,10 +514,52 @@ public class MethodBytecodeVisitor extends ClassVisitor {
         }
 
         private boolean isReflectiveCall(String owner, String name, String desc) {
-            if (owner.equals("java/lang/Class") && name.equals("forName") && desc.equals("(Ljava/lang/String;)Ljava/lang/Class;"))
+            // ----------------------------------------------------------------
+            // Class.forName — both the one-argument form and the
+            // three-argument form.
+            //
+            // Class.forName(String) is the classic reflective entry point.
+            // Class.forName(String, boolean, ClassLoader) is the modern
+            // overload that the JDK's own service-provider machinery uses:
+            // java.security.Provider$Service.newInstance calls it to resolve
+            // the provider implementation class whose name is stored in the
+            // Service's `className` field. The class-name argument sits at
+            // parameter slot 0 in both forms, so the handler below extracts
+            // it identically; the boolean and ClassLoader arguments do not
+            // affect reachability.
+            //
+            // Without recognition of the three-argument form, a class that
+            // is named only through such a call is not registered with the
+            // reachability walk, never enters the class map, and the
+            // runtime's Class.forName0 fails to find it. This was the exact
+            // failure behind the "NULL exception object substituted by
+            // __jnative_throw_exception_ctx" crash inside
+            // java.security.SecureRandom.getDefaultPRNG: the class
+            // java.security.SecureRandomParameters was reachable only
+            // through the three-argument form.
+            // ----------------------------------------------------------------
+            if (owner.equals("java/lang/Class") && name.equals("forName")
+                && (desc.equals("(Ljava/lang/String;)Ljava/lang/Class;")
+                || desc.equals("(Ljava/lang/String;ZLjava/lang/ClassLoader;)Ljava/lang/Class;"))) {
                 return true;
-            if (owner.equals("java/lang/ClassLoader") && name.equals("loadClass") && desc.equals("(Ljava/lang/String;)Ljava/lang/Class;"))
+            }
+
+            // ----------------------------------------------------------------
+            // ClassLoader.loadClass — one-argument and two-argument forms.
+            //
+            // ClassLoader.loadClass(String) is the classic reflective entry
+            // point on the class-loader hierarchy. ClassLoader.loadClass
+            // (String, boolean) is the internal form the JDK's own
+            // ClassLoader.loadClass delegates to; it appears in bytecode
+            // whenever a subclass overrides loadClass and forwards to
+            // super.loadClass(name, resolve).
+            // ----------------------------------------------------------------
+            if (owner.equals("java/lang/ClassLoader") && name.equals("loadClass")
+                && (desc.equals("(Ljava/lang/String;)Ljava/lang/Class;")
+                || desc.equals("(Ljava/lang/String;Z)Ljava/lang/Class;"))) {
                 return true;
+            }
+
             // NOTE: no closing parenthesis in the prefix. The descriptor of
             // the varargs forms is
             //     (Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;
@@ -681,24 +723,56 @@ public class MethodBytecodeVisitor extends ClassVisitor {
                 return;
             }
 
+            // ------------------------------------------------------------------
+            // Class.forName — both forms.
+            //
+            // The class-name argument is parameter slot 0 in both the
+            // one-argument and three-argument forms. When it is a string
+            // constant — the case that matters for every JDK call site
+            // that resolves a class by name known at compile time — the
+            // target is registered as an active use so its <clinit> runs
+            // and it becomes a first-class member of the image: its
+            // vtable, struct type, and reflection record are all emitted,
+            // and the runtime's Class.forName0 will find it at run time.
+            //
+            // The three-argument form is what
+            // java.security.Provider$Service.newInstance uses to resolve
+            // a provider implementation whose name is stored in a String
+            // field. Without recognising this form the target class was
+            // invisible to the reachability walk and Class.forName0
+            // failed with a "class not found" against a name that was in
+            // fact present in the bytecode as a string constant.
+            // ------------------------------------------------------------------
             if (owner.equals("java/lang/Class") && mName.equals("forName")
-                && mDesc.equals("(Ljava/lang/String;)Ljava/lang/Class;")) {
+                && (mDesc.equals("(Ljava/lang/String;)Ljava/lang/Class;")
+                || mDesc.equals("(Ljava/lang/String;ZLjava/lang/ClassLoader;)Ljava/lang/Class;"))) {
                 if (!args.isEmpty()) {
                     TypedValue arg = args.getFirst();
-                    if (arg.isConstant() && arg.getValue() instanceof String) {
-                        String className = ((String) arg.getValue()).replace('.', '/');
+                    if (arg.isConstant() && arg.getValue() instanceof String s) {
+                        String className = s.replace('.', '/');
                         addClassWithInit(className);
                         analysis.addInstantiatedClass(className, reachableFromUser);
                     }
                 }
                 return;
             }
+
+            // ------------------------------------------------------------------
+            // ClassLoader.loadClass — both forms.
+            //
+            // Same reasoning as Class.forName above. The class-name
+            // argument is parameter slot 0 in both forms. The
+            // two-argument form (String, boolean) is what a subclass's
+            // overridden loadClass forwards to when it delegates to
+            // super.loadClass(name, resolve).
+            // ------------------------------------------------------------------
             if (owner.equals("java/lang/ClassLoader") && mName.equals("loadClass")
-                && mDesc.equals("(Ljava/lang/String;)Ljava/lang/Class;")) {
+                && (mDesc.equals("(Ljava/lang/String;)Ljava/lang/Class;")
+                || mDesc.equals("(Ljava/lang/String;Z)Ljava/lang/Class;"))) {
                 if (!args.isEmpty()) {
                     TypedValue arg = args.getFirst();
-                    if (arg.isConstant() && arg.getValue() instanceof String) {
-                        String className = ((String) arg.getValue()).replace('.', '/');
+                    if (arg.isConstant() && arg.getValue() instanceof String s) {
+                        String className = s.replace('.', '/');
                         addClassWithInit(className);
                         analysis.addInstantiatedClass(className, reachableFromUser);
                     }

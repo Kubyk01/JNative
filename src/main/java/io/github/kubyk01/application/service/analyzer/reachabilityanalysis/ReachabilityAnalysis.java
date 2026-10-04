@@ -2,6 +2,7 @@ package io.github.kubyk01.application.service.analyzer.reachabilityanalysis;
 
 import io.github.kubyk01.application.service.analyzer.dependencyresolver.DependencyResolver;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.ClassNode;
+import io.github.kubyk01.domain.analyzer.dependencyresolver.FieldNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.FieldReference;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.MethodNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.MethodReference;
@@ -20,6 +21,7 @@ import io.github.kubyk01.domain.ir.ReturnTerminator;
 import io.github.kubyk01.domain.ir.TableSwitchTerminator;
 import io.github.kubyk01.domain.ir.Terminator;
 import io.github.kubyk01.domain.ir.ThrowTerminator;
+import io.github.kubyk01.domain.ir.Type;
 import io.github.kubyk01.domain.ir.Value;
 import lombok.Getter;
 import lombok.RequiredArgsConstructor;
@@ -458,9 +460,151 @@ public class ReachabilityAnalysis {
 
         if (pass >= MAX_PASSES) {
             log.warn("Superclass-clinit closure did not converge after {} passes; "
-                + "some class initializers may be missing from the image",
+                    + "some class initializers may be missing from the image",
                 MAX_PASSES);
         }
+    }
+
+    /**
+     * Expands the class map to a fixed point over the relation
+     * "descriptor type of a member of a class already present".
+     *
+     * <p>The reachability walk loads a class only when it appears as the
+     * owner of a reachable method, as the target of an active use
+     * ({@code NEW} / {@code getstatic} / {@code putstatic} /
+     * {@code invokestatic}), or as an ancestor of such a class. Classes
+     * that appear exclusively in descriptors — parameter types, return
+     * types, field types, catch types, class literals — are recorded in
+     * {@link #reachableClasses} but never loaded, and therefore never
+     * receive a vtable or a reflection record.</p>
+     *
+     * <p>At run time a class without a reflection record cannot be produced
+     * by {@code Class.forName}. That is the exact failure this pass exists
+     * to close: {@code Provider.Service.newInstance} resolves the provider
+     * implementation through {@code Class.forName(className)}, where
+     * {@code className} is a String field populated at run time by the
+     * provider's static initializer, and the class referenced by that field
+     * is visible to the reachability walk only as a descriptor type — the
+     * return type of {@code SecureRandom.getParameters}, the parameter type
+     * of {@code SecureRandomSpi.engineGetParameters}, and so on.</p>
+     *
+     * <p>The traversal is a worklist algorithm over the growing class map.
+     * Every class is visited once; every type its members reference through
+     * a descriptor is enqueued if not yet loaded. Because the class map is
+     * finite and its growth is monotone, the loop terminates. The result is
+     * a class map closed under the descriptor-of-member relation, which is
+     * the smallest superset of the class graph that guarantees a
+     * {@code Class.forName} lookup for any name reachable code can
+     * encounter will succeed.</p>
+     *
+     * <p>Array descriptors are skipped: an array type is represented at
+     * runtime by a {@code @refclass_*} constant emitted by
+     * {@code LlvmGlobalEmitter.generateReflectionData}, not by a
+     * {@code ClassNode}, and the resolver has no entry for it. For an
+     * array of reference type the innermost element class is enqueued
+     * instead, because that is the class whose mirror appears as the
+     * component-type of the array mirror.</p>
+     *
+     * <p>Classes discovered by this pass are added to
+     * {@link #reachableClasses} but not to {@link #userReachedClasses}:
+     * they are part of the runtime image, not of the user's program.
+     * Their {@code <clinit>} is not scheduled here — that is a separate
+     * concern, handled by {@link #ensureSuperclassClinitsReachable} for
+     * ancestors and by the ordinary active-use rules for classes that
+     * appear in code. A class pulled in only by this pass is loaded and
+     * reflected on, but is not initialized until something actually uses
+     * it, which is exactly the semantics of {@code Class.forName(name,
+     * false, loader)}.</p>
+     */
+    public void expandClassMapToDescriptorClosure() {
+        Set<String> visited = new HashSet<>();
+        Deque<String> worklist = new ArrayDeque<>();
+
+        // Seed with every class currently in the map. The map can grow
+        // during the loop as new classes are loaded; the worklist is what
+        // drives that growth, so no additional snapshotting is required
+        // beyond the initial one.
+        for (String cls : new ArrayList<>(resolver.getClassMap().keySet())) {
+            if (cls != null && !cls.isEmpty() && cls.charAt(0) != '[') {
+                worklist.add(cls);
+            }
+        }
+
+        int initialCount = resolver.getClassMap().size();
+
+        while (!worklist.isEmpty()) {
+            String cls = worklist.poll();
+            if (!visited.add(cls)) continue;
+
+            ClassNode cn = resolver.getClassNode(cls);
+            if (cn == null || cn.isExternal()) continue;
+
+            for (MethodNode mn : cn.getMethods()) {
+                List<Type> params = mn.getParameterTypes();
+                if (params != null) {
+                    for (Type t : params) {
+                        enqueueDescriptorType(t, visited, worklist);
+                    }
+                }
+                enqueueDescriptorType(mn.getReturnType(), visited, worklist);
+            }
+            for (FieldNode fn : cn.getFields()) {
+                enqueueDescriptorType(fn.getType(), visited, worklist);
+            }
+        }
+
+        int finalCount = resolver.getClassMap().size();
+        if (finalCount > initialCount) {
+            log.info("Class-map descriptor closure: {} -> {} classes ({} added)",
+                initialCount, finalCount, finalCount - initialCount);
+        } else {
+            log.info("Class-map descriptor closure: {} classes (no additions)",
+                finalCount);
+        }
+    }
+
+    private void enqueueDescriptorType(Type t,
+                                       Set<String> visited,
+                                       Deque<String> worklist) {
+        if (t == null) return;
+
+        String name = null;
+        if (t.isReference()) {
+            name = t.getClassName();
+        } else if (t.isArray()) {
+            // Peel the array layers down to the innermost element type.
+            // Only a reference element type contributes a class to the
+            // closure: a primitive element type has a primitive mirror
+            // (emitted unconditionally by generateReflectionData) and no
+            // ClassNode of its own.
+            Type elem = t.getElementType();
+            while (elem != null && elem.isArray()) {
+                elem = elem.getElementType();
+            }
+            if (elem != null && elem.isReference()) {
+                name = elem.getClassName();
+            }
+        }
+
+        if (name == null || name.isEmpty()) return;
+        if (name.charAt(0) == '[') return;
+        if (visited.contains(name)) return;
+        if (resolver.getClassMap().containsKey(name)) return;
+
+        // getClassNode is responsible for forcing a system class load
+        // when the class is not yet present; a class whose bytecode
+        // cannot be located anywhere is materialised as an external stub
+        // and does not participate in further descriptor traversal.
+        ClassNode cn = resolver.getClassNode(name);
+        if (cn == null || cn.isExternal()) return;
+
+        // Record the class as reachable so downstream consumers that
+        // iterate reachableClasses — native-library collection in
+        // Compiler, the enum-method forcing in
+        // EnumConstantsSharedEmitter, the user-facing class listing —
+        // observe it as part of the image.
+        reachableClasses.add(name);
+        worklist.add(name);
     }
 
     private void drainWorklist() {
@@ -783,12 +927,54 @@ public class ReachabilityAnalysis {
         visitor.parse(bytes);
     }
 
+    /**
+     * Marks a class as reachable, materialises it into the class map, and
+     * records it as user-reached when the caller supplies that flag.
+     *
+     * <p>Materialising the class into the resolver's class map is what
+     * makes its vtable, struct type, and reflection record appear in the
+     * emitted module. {@link #reachableClasses} alone is only a name — a
+     * class that is reachable but not materialised is invisible to
+     * {@code LlvmGlobalEmitter.generateVtables()}, which iterates the
+     * class map, not the reachable set. That in turn means the class
+     * cannot be the receiver of a virtual call, the target of
+     * {@code instanceof}, or the result of a run-time
+     * {@code Class.forName} lookup. The materialisation here is the
+     * single point at which the two sets are kept consistent.</p>
+     *
+     * <p>Array descriptors are deliberately skipped: an array type is
+     * represented at runtime by a {@code @refclass_*} constant emitted
+     * by {@code LlvmGlobalEmitter.generateReflectionData}, not by a
+     * {@code ClassNode}, and the resolver has no entry for it. The
+     * innermost element class of a reference array is materialised
+     * separately by the descriptor-closure pass.</p>
+     *
+     * <p>{@code getClassNode} is idempotent and handles the case where
+     * the class is a system class that has not yet been loaded from the
+     * JRT image: it forces the load internally. A class whose bytecode
+     * cannot be located anywhere is materialised as an external stub,
+     * which {@code LlvmGlobalEmitter} skips when emitting vtables and
+     * reflection records — no invalid output is produced for such a
+     * class, and no further descriptor traversal is performed on it.</p>
+     */
     void addClass(String className, boolean fromUser) {
         if (className == null || className.isEmpty()) return;
         reachableClasses.add(className);
         if (fromUser) {
             userReachedClasses.add(className);
         }
+        materialiseClass(className);
+    }
+
+    private void materialiseClass(String className) {
+        if (className == null || className.isEmpty()) return;
+        if (className.charAt(0) == '[') return;
+        // Short-circuit for classes already in the map: getClassNode is
+        // idempotent but synchronises internally, and the reachability
+        // walk touches this method on every class reference in every
+        // scanned method.
+        if (resolver.getClassMap().containsKey(className)) return;
+        resolver.getClassNode(className);
     }
 
     /**
@@ -816,6 +1002,8 @@ public class ReachabilityAnalysis {
         if (fromUser) {
             userReachedClasses.add(className);
         }
+
+        materialiseClass(className);
 
         // Enum values()/valueOf(String) force. Runs before the clinit
         // short-circuit so it executes exactly once per class, even on

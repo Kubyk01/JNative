@@ -627,15 +627,44 @@ void __jnative_fn_java_lang_Class_registerNatives___V(void) {
  * The runtime's universe of classes is fixed at build time and lives in the
  * reflect_all_classes[] table. There is no bytecode-loaded-at-runtime path
  * and no user class loader hierarchy, so the loader and caller arguments
- * are ignored. A name that is not present in the table causes the generic
- * throw helper to fire, which the Java side's ClassNotFoundException catch
- * block converts into the appropriate checked exception.
+ * are ignored. A name that is not present in the table causes a genuine
+ * ClassNotFoundException to be thrown, which the Java side's catch block
+ * converts into the checked exception the API promises.
  *
  * The `initialize` flag is likewise ignored: the runtime eagerly initialises
  * every reachable class from @main (see LlvmGenerator.generateMain), so a
  * class is either already initialised by the time forName0 runs or it is not
  * part of the compiled image at all.
+ *
+ * The exception is constructed by name through the runtime's
+ * __jnative_construct_exception() entry point rather than by a direct call
+ * to the internal exception factory, because the factory is static to
+ * jnative_runtime.c and the ClassNotFoundException mirror is only present
+ * in the image when the reachability walk happened to pull it in. If the
+ * mirror is absent, __jnative_construct_exception() returns NULL and the
+ * subsequent __jnative_throw_exception(NULL) falls through to the generic
+ * substitution in __jnative_throw_exception_ctx, which produces a Throwable
+ * whose message names the missing vtable. Either way the caller of
+ * Class.forName() observes a thrown exception rather than a NULL Class
+ * return, and any Java-level `catch (ClassNotFoundException e)` on the
+ * caller's frame is given an object that __jnative_catch_matches() can
+ * match against the ClassNotFoundException type-info.
  */
+static void* make_class_not_found_exception(const char* name, int32_t len) {
+    char buf[512];
+    if (name != NULL && len > 0 && (size_t)len < sizeof(buf)) {
+        memcpy(buf, name, (size_t)len);
+        buf[len] = '\0';
+    } else {
+        /* The message is a diagnostic aid, not a contract: an empty or
+         * overlong name is still a ClassNotFoundException. */
+        strncpy(buf, "<unknown>", sizeof(buf) - 1);
+        buf[sizeof(buf) - 1] = '\0';
+    }
+    return __jnative_construct_exception(
+        "vtable_java_lang_ClassNotFoundException", buf);
+}
+
 void* __jnative_fn_java_lang_Class_forName0__Ljava_lang_String_ZLjava_lang_ClassLoader_Ljava_lang_Class__Ljava_lang_Class_(
         void* name_str,
         int32_t initialize,
@@ -654,15 +683,13 @@ void* __jnative_fn_java_lang_Class_forName0__Ljava_lang_String_ZLjava_lang_Class
     int32_t len = 0;
     const char* name = __jnative_read_string_bytes(name_str, &len);
     if (name == NULL || len <= 0) {
-        /* ClassNotFoundException */
-        __jnative_throw_exception(NULL);
+        __jnative_throw_exception(make_class_not_found_exception(name, len));
         return NULL;
     }
 
     struct ReflectionClass* cls = find_registered_class_dotted(name);
     if (cls == NULL) {
-        /* ClassNotFoundException */
-        __jnative_throw_exception(NULL);
+        __jnative_throw_exception(make_class_not_found_exception(name, len));
         return NULL;
     }
     return (void*)cls;

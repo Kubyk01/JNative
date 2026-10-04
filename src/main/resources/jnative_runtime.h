@@ -83,7 +83,7 @@
  *     superclass               @ +16   (%ReflectionClass*)
  *     interfaces               @ +24
  *     ...
- *     cname                    @ +64   (C-строка; используется native)
+ *     cname                    @ +64   (C string; used by natives)
  *     classLoader              @ +72   (always null)
  *     module                   @ +80   (@jnative_unnamed_module)
  *     componentType            @ +88   (always null)
@@ -123,19 +123,19 @@
  * classes, no pre-cached enum constant arrays, no annotation metadata
  * store, no per-class value map, and no class-value registry. Null is
  * the truthful value and matches the behaviour of the corresponding
- * native accessors (Class.getClassLoader → NULL, Class.getComponent
- * Type → NULL on a non-array class, Class.getEnumConstantsShared → null
- * until the JDK's own reflection code populates the array).
+ * native accessors (Class.getClassLoader -> NULL, Class.getComponent
+ * Type -> NULL on a non-array class, Class.getEnumConstantsShared ->
+ * null until the JDK's own reflection code populates the array).
  *
  * `module` cannot be null. Class.getModule() is a plain read of that
  * slot, and Class.getResourceAsStream dereferences the result without
- * a null test (`thisModule.isNamed()`) — a null slot makes every such
+ * a null test (`thisModule.isNamed()`), so a null slot makes every such
  * call die with an NPE. The JDK's unnamed module is exactly a Module
  * with all fields zeroed (name == null, loader == null, no
  * descriptor), which is the state Module.isNamed() tests and the state
  * that steers Class.getResourceAsStream into its "unnamed module"
  * branch. LlvmGlobalEmitter.generateUnnamedModule() emits that object
- * as a constant; every @refclass_* mirror points at it. See fun.txt.
+ * as a constant; every @refclass_* mirror points at it.
  *
  * The eight reserved slots are a stable landing pad for any
  * java.lang.Class field the emitter has not enumerated yet. An
@@ -405,7 +405,7 @@ struct ReflectionConstructor {
  *
  * `module` cannot be null: Class.getModule() is a plain read of that
  * slot and Class.getResourceAsStream dereferences the result without a
- * null test. See the class-level javadoc above and fun.txt.
+ * null test. See the class-level javadoc above.
  *
  * The eight reserved slots give a stable landing pad to any
  * java.lang.Class field the emitter has not enumerated yet. An unknown
@@ -428,7 +428,7 @@ struct ReflectionClass {
     ReflectionConstructor** constructors;               /* +48                   */
     int                     modifiers;                  /* +56                   */
     int                     object_size;                /* +60                   */
-    const char*             cname;                      /* +64   C-строка        */
+    const char*             cname;                      /* +64   C string        */
     void*                   class_loader;               /* +72   always NULL     */
     void*                   module;                     /* +80   unnamed module  */
     void*                   component_type;             /* +88   always NULL     */
@@ -577,7 +577,31 @@ extern void** __jnative_lookup_itable(JNativeIfaceMap* ifacemap, int32_t iface_i
 extern void __jnative_monitor_enter(void* obj);
 extern void __jnative_monitor_exit(void* obj);
 
-/* ---- Exception throwers -------------------------------------------- */
+/* ---- Exception construction and throwers --------------------------- */
+
+/**
+ * Constructs a Java exception object of the class named by
+ * `vtable_symbol`, with `message` as its detail message.
+ *
+ * <p>The vtable is looked up by symbol name through dlsym. If the class
+ * is not present in the compiled image, the lookup returns NULL and so
+ * does this function; the caller must decide whether to substitute a
+ * different exception type or pass NULL on to
+ * __jnative_throw_exception_ctx, which will install a generic Throwable
+ * with a diagnostic message.</p>
+ *
+ * <p>`vtable_symbol` is the mangled form emitted by
+ * LlvmGlobalEmitter.generateVtables(), e.g.
+ * "vtable_java_lang_ClassNotFoundException". `message` may be NULL, in
+ * which case the constructed exception has no detail message.</p>
+ *
+ * <p>Use this function to raise well-typed checked exceptions from
+ * native code — most notably ClassNotFoundException from Class.forName0
+ * — so that Java-level `catch` clauses see the exception class the
+ * specification requires, rather than a substituted Throwable.</p>
+ */
+extern void* __jnative_construct_exception(const char* vtable_symbol,
+                                           const char* message);
 
 JNATIVE_NORETURN extern void __jnative_throw_exception(void* exc);
 JNATIVE_NORETURN extern void __jnative_throw_null_pointer_exception(void);

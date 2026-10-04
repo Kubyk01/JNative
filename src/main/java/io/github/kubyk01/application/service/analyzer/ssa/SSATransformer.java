@@ -25,7 +25,7 @@ import java.util.*;
 public class SSATransformer {
 
     // ------------------------------------------------------------------
-    //  Классы типов доступа к локальному слоту.
+    //  Local-slot access type buckets.
     // ------------------------------------------------------------------
 
     /** {@code ILOAD/ISTORE}: boolean, byte, short, char, int. */
@@ -36,7 +36,7 @@ public class SSATransformer {
     private static final int BUCKET_FLOAT  = 2;
     /** {@code DLOAD/DSTORE}. */
     private static final int BUCKET_DOUBLE = 3;
-    /** {@code ALOAD/ASTORE}: ссылки, массивы, null, block, unknown. */
+    /** {@code ALOAD/ASTORE}: references, arrays, null, block, unknown. */
     private static final int BUCKET_REF    = 4;
 
     private static int typeBucket(Type t) {
@@ -48,9 +48,9 @@ public class SSATransformer {
         if (t == Type.LONG)   return BUCKET_LONG;
         if (t == Type.FLOAT)  return BUCKET_FLOAT;
         if (t == Type.DOUBLE) return BUCKET_DOUBLE;
-        // reference, array, null, block, unknown, void — всё это в LLVM
-        // либо i8*, либо (для void, которого в слотах не бывает) тоже
-        // нормализуется в ref-бакет.
+        // reference, array, null, block, unknown, void — all of these are
+        // either i8* in LLVM, or (for void, which never appears in a slot)
+        // also normalised into the ref bucket.
         return BUCKET_REF;
     }
 
@@ -68,29 +68,29 @@ public class SSATransformer {
     private record SlotKey(int index, int typeClass) {}
 
     // ------------------------------------------------------------------
-    //  Состояние трансформации.
+    //  Transformation state.
     // ------------------------------------------------------------------
 
-    /** Один стек версий на каждый (слот, класс типа). */
+    /** One version stack per (slot, type class). */
     private final Map<SlotKey, Deque<Value>> versionStacks = new HashMap<>();
-    /** Счётчик версий на каждый (слот, класс типа). */
+    /** Version counter per (slot, type class). */
     private final Map<SlotKey, Integer> versionCounters = new HashMap<>();
-    /** Карта подстановок «старое значение → актуальная SSA-версия». */
+    /** Substitution map: "old value -> current SSA version". */
     private final Map<Value, Value> replacements = new HashMap<>();
 
     private DominatorTree domTree;
     private Function currentFunction;
 
     /**
-     * Множество слотов, которые по тем или иным причинам остаются в
-     * памяти и не участвуют в SSA. Ключ — только номер слота: признак
-     * «небезопасности» относится к слоту как к ячейке, а не к его
-     * текущему типу.
+     * The set of slots that, for one reason or another, remain in
+     * memory and do not participate in SSA. The key is just the slot
+     * number: the "unsafe" attribute belongs to the slot as a cell,
+     * not to its current type.
      */
     private Set<Integer> unsafeLocals = new HashSet<>();
 
     // ------------------------------------------------------------------
-    //  Точка входа.
+    //  Entry point.
     // ------------------------------------------------------------------
 
     public void transform(Function function) {
@@ -109,7 +109,7 @@ public class SSATransformer {
     }
 
     // ------------------------------------------------------------------
-    //  Идентификация «небезопасных» слотов (без изменений по существу).
+    //  Identification of "unsafe" slots (essentially unchanged).
     // ------------------------------------------------------------------
 
     private Set<Integer> identifyUnsafeLocals(Function function) {
@@ -132,19 +132,20 @@ public class SSATransformer {
     }
 
     // ------------------------------------------------------------------
-    //  Инициализация стеков версий.
+    //  Initialization of version stacks.
     // ------------------------------------------------------------------
 
     /**
-     * Кладёт каждый параметр на стек версий своего бакета.
+     * Pushes every parameter onto the version stack of its bucket.
      *
-     * <p>Для бакетов, чей канонический тип отличается от типа
-     * параметра (это возможно только в int-бакете — параметр
-     * {@code BOOLEAN}/{@code BYTE}/{@code SHORT}/{@code CHAR}), в entry-блок
-     * вставляется одна инструкция {@code CAST}, приводящая параметр к
-     * каноническому типу. Без этой нормализации PHI, чей результат
-     * всегда имеет канонический тип, получил бы на входе значение
-     * другого LLVM-типа и упал бы в эмиттере.</p>
+     * <p>For buckets whose canonical type differs from the parameter's
+     * type (which is only possible in the int bucket — a parameter of
+     * type {@code BOOLEAN}/{@code BYTE}/{@code SHORT}/{@code CHAR}), a
+     * single {@code CAST} instruction is inserted into the entry block
+     * to coerce the parameter to the canonical type. Without this
+     * normalisation, a PHI whose result always carries the canonical
+     * type would receive an incoming value of a different LLVM type and
+     * would fail in the emitter.</p>
      */
     private void initializeStacks(Function function) {
         BasicBlock entry = function.getEntryBlock();
@@ -155,7 +156,7 @@ public class SSATransformer {
 
             Value version = param;
 
-            // int-бакет — единственный, где возможны разные LLVM-ширины.
+            // The int bucket is the only one where different LLVM widths are possible.
             if (bucket == BUCKET_INT && param.getType() != Type.INT) {
                 Type canonical = canonicalTypeForBucket(bucket);
                 Instruction cast = new Instruction(Opcode.CAST);
@@ -176,19 +177,19 @@ public class SSATransformer {
     }
 
     // ------------------------------------------------------------------
-    //  Вставка PHI.
+    //  Phi insertion.
     // ------------------------------------------------------------------
 
     /**
-     * Вставляет PHI в итеративный доминаторный фронтир блоков,
-     * определяющих каждую (слот, бакет)-версию.
+     * Inserts PHIs on the iterated dominance frontier of the blocks that
+     * define each (slot, bucket) version.
      *
-     * <p>PHI добавляется в начало списка инструкций блока напрямую
-     * ({@link List#addFirst(Object)}), а не через
-     * {@link BasicBlock#addInstruction(Instruction)}; поэтому
-     * {@code setParent(frontier)} обязателен — эмиттер использует
-     * {@code inst.getParent()} для получения списка предшественников
-     * при печати входящих рёбер PHI.</p>
+     * <p>A PHI is added directly at the head of the block's instruction
+     * list via {@link List#addFirst(Object)}, not through
+     * {@link BasicBlock#addInstruction(Instruction)}; that is why
+     * {@code setParent(frontier)} is mandatory — the emitter uses
+     * {@code inst.getParent()} to obtain the predecessor list when it
+     * prints the incoming edges of a PHI.</p>
      */
     private void insertPhiFunctions(Function function) {
         Map<SlotKey, Set<BasicBlock>> defs = collectDefBlocks(function);
@@ -224,13 +225,13 @@ public class SSATransformer {
     }
 
     /**
-     * Собирает блоки-определения для каждого (слот, бакет)-ключа.
+     * Collects the definition blocks for each (slot, bucket) key.
      *
-     * <p>Параметры дают определение в entry-блоке своего бакета. STORE
-     * даёт определение в своём блоке под ключом, чей бакет вычислен по
-     * объявленному типу STORE-результата (для {@code ISTORE} — INT, для
-     * {@code LSTORE} — LONG, ...). Слоты из {@link #unsafeLocals}
-     * пропускаются.</p>
+     * <p>Parameters define their slot in the entry block of their
+     * bucket. A STORE defines its slot in its own block, under the key
+     * whose bucket is computed from the declared type of the STORE's
+     * result (INT for {@code ISTORE}, LONG for {@code LSTORE}, ...).
+     * Slots in {@link #unsafeLocals} are skipped.</p>
      */
     private Map<SlotKey, Set<BasicBlock>> collectDefBlocks(Function function) {
         Map<SlotKey, Set<BasicBlock>> defs = new HashMap<>();
@@ -265,15 +266,16 @@ public class SSATransformer {
     }
 
     /**
-     * Возвращает IR-тип, которым должен быть помечен результат PHI для
-     * данного (слот, бакет)-ключа.
+     * Returns the IR type that the result of a PHI must carry for the
+     * given (slot, bucket) key.
      *
-     * <p>Для не-ref бакетов тип однозначен. Для ref-бакета
-     * предпочитается тип параметра того же слота, если он есть; иначе
-     * берётся первый reference-тип, встреченный среди LOAD/STORE этого
-     * слота; иначе — {@code java/lang/Object}. В любом случае это
-     * reference-тип, и все ссылки совместимы и в IR-семантике
-     * ({@code typesCompatible}), и в LLVM ({@code i8*}).</p>
+     * <p>For non-ref buckets the type is unambiguous. For the ref
+     * bucket, the type of the parameter of the same slot is preferred
+     * when available; otherwise the first reference type encountered
+     * among the LOAD/STORE instructions of this slot is used; otherwise
+     * {@code java/lang/Object}. In every case the result is a reference
+     * type, and all references are compatible both in the IR semantics
+     * ({@code typesCompatible}) and in LLVM ({@code i8*}).</p>
      */
     private Type inferSlotTypeForBucket(Function func, int localIndex, int bucket) {
         switch (bucket) {
@@ -310,30 +312,33 @@ public class SSATransformer {
     }
 
     // ------------------------------------------------------------------
-    //  Переименование.
+    //  Renaming.
     // ------------------------------------------------------------------
 
     /**
-     * Рекурсивный обход дерева доминаторов с переименованием версий.
+     * Recursive traversal of the dominator tree with renaming of
+     * versions.
      *
-     * <p>Порядок обработки блока:</p>
+     * <p>The processing order within a block is:</p>
      * <ol>
-     *   <li>PHI — порождают новые версии в начале блока;</li>
-     *   <li>остальные инструкции — LOAD подменяются на актуальную
-     *       версию, STORE порождают новые;</li>
-     *   <li>терминатор — в него подставляются актуальные версии;</li>
-     *   <li>входящие значения PHI у преемников заполняются версиями,
-     *       актуальными на выходе из текущего блока;</li>
-     *   <li>рекурсивный спуск в детей по дереву доминаторов;</li>
-     *   <li>восстановление стеков до размера на входе в блок.</li>
+     *   <li>PHIs — create new versions at the beginning of the block;</li>
+     *   <li>the remaining instructions — LOADs are replaced with the
+     *       current version, STOREs create new versions;</li>
+     *   <li>the terminator — the current versions are substituted in;</li>
+     *   <li>the incoming values of the successors' PHIs are filled in
+     *       with the versions that are current at the exit of the
+     *       current block;</li>
+     *   <li>a recursive descent into the dominator-tree children;</li>
+     *   <li>restoration of the stacks to the size they had on entry to
+     *       the block.</li>
      * </ol>
      */
     private void renameBlock(BasicBlock block) {
-        // savedSizes фиксирует размер стека каждого ключа ДО того, как
-        // этот блок положит на него свои версии. Восстановление в конце
-        // метода снимет ровно то, что положил этот блок, и ничего
-        // больше — в частности, ничего не оставит «в наследство»
-        // сиблингам по дереву доминаторов.
+        // savedSizes records the size of each stack BEFORE this block
+        // pushes its own versions. The restoration at the end of this
+        // method pops exactly what this block pushed and nothing else —
+        // in particular, it leaves nothing behind for the dominator-tree
+        // siblings.
         Map<SlotKey, Integer> savedSizes = new HashMap<>();
 
         // --- PHI ---
@@ -355,7 +360,7 @@ public class SSATransformer {
             newVer.setDefiningInstruction(inst);
         }
 
-        // --- остальные инструкции ---
+        // --- remaining instructions ---
         for (Instruction inst : block.getInstructions()) {
             Opcode op = inst.getOpcode();
             if (op == Opcode.PHI) continue;
@@ -385,11 +390,11 @@ public class SSATransformer {
                     versionCounters.putIfAbsent(key, 0);
                 }
 
-                // Внутри бакета типы совместимы по построению, поэтому
-                // никакой подстановки константы здесь быть не должно.
-                // Если это условие когда-нибудь нарушится — это баг в
-                // самой трансформации, и он должен падать громко, а не
-                // тихо портить значение.
+                // Within a bucket the types are compatible by
+                // construction, so no constant substitution should
+                // happen here. If that invariant is ever violated, it is
+                // a bug in the transformation itself, and it must fail
+                // loudly rather than silently corrupting the value.
                 if (!typesCompatible(curVer.getType(), loadResultType)) {
                     throw new IllegalStateException(
                         "SSA slot-type invariant violated: LOAD of local "
@@ -413,18 +418,19 @@ public class SSATransformer {
 
                 savedSizes.putIfAbsent(
                     new SlotKey(idx, BUCKET_INT), stackSize(new SlotKey(idx, BUCKET_INT)));
-                // ^ сохранить на всякий случай; фактический ключ ниже.
+                // ^ save just in case; the actual key is computed below.
 
                 Value operand = inst.getOperands().isEmpty()
                     ? new UndefinedValue(Type.UNKNOWN)
                     : resolve(inst.getOperands().getFirst());
 
-                // Объявленный тип слота — это тип результата STORE,
-                // проставленный IrBuilder.createStore из опкода
-                // байткода (ISTORE → INT, LSTORE → LONG, ...). Именно
-                // он, а не тип сохраняемого значения, определяет бакет
-                // и — что важнее — ширину, с которой слот будет читаться
-                // всеми последующими LOAD.
+                // The declared type of the slot is the result type of
+                // the STORE, set by IrBuilder.createStore from the
+                // bytecode opcode (ISTORE -> INT, LSTORE -> LONG, ...).
+                // It is this type — not the type of the stored value —
+                // that determines both the bucket and, more importantly,
+                // the width with which the slot will be read by every
+                // subsequent LOAD.
                 Type declaredType = (inst.getResult() != null)
                     ? inst.getResult().getType()
                     : operand.getType();
@@ -447,7 +453,7 @@ public class SSATransformer {
 
         renameTerminator(block);
 
-        // --- входящие значения PHI у преемников ---
+        // --- incoming PHI values of the successors ---
         for (BasicBlock succ : block.getSuccessors()) {
             int predIdx = succ.getPredecessors().indexOf(block);
             if (predIdx < 0) continue;
@@ -486,26 +492,27 @@ public class SSATransformer {
             }
         }
 
-        // --- рекурсия по дереву доминаторов ---
+        // --- recursion into the dominator tree ---
         for (BasicBlock child : domTree.getChildren(block)) {
             renameBlock(child);
         }
 
-        // --- восстановление стеков ---
+        // --- restoration of the stacks ---
         for (Map.Entry<SlotKey, Integer> entry : savedSizes.entrySet()) {
             restoreStack(entry.getKey(), entry.getValue());
         }
     }
 
     /**
-     * Проверяет, что два IR-типа совместимы с точки зрения SSA-слияния
-     * в рамках одного бакета.
+     * Checks whether two IR types are compatible from the point of view
+     * of SSA merging within a single bucket.
      *
-     * <p>При корректном ключевании эта функция не должна возвращать
-     * {@code false} никогда: в int-бакете лежат только целочисленные
-     * типы, в ref-бакете — только ссылочные. Функция оставлена как
-     * защитный инвариант и триггер для {@link IllegalStateException} в
-     * {@link #renameBlock}, а не как «разрешение» подставить дефолт.</p>
+     * <p>With correct keying this function should never return
+     * {@code false}: the int bucket contains only integer types, the
+     * ref bucket contains only reference types. The function is kept as
+     * a defensive invariant and as a trigger for the
+     * {@link IllegalStateException} in {@link #renameBlock}, not as a
+     * license to substitute a default.</p>
      */
     private static boolean typesCompatible(Type a, Type b) {
         if (a == null || b == null) return true;
@@ -545,7 +552,7 @@ public class SSATransformer {
     }
 
     // ------------------------------------------------------------------
-    //  Управление стеками версий.
+    //  Version-stack management.
     // ------------------------------------------------------------------
 
     private Temporary newVersion(SlotKey key, Type type) {
@@ -582,7 +589,7 @@ public class SSATransformer {
     }
 
     // ------------------------------------------------------------------
-    //  Оптимизации PHI и чистка NOP.
+    //  PHI optimization and NOP cleanup.
     // ------------------------------------------------------------------
 
     private void optimizePhis(Function function) {

@@ -146,6 +146,27 @@ public class Orchestrator implements OrchestratorPort {
         // ------------------------------------------------------------------
         analysis.ensureSuperclassClinitsReachable();
 
+        // ------------------------------------------------------------------
+        // Descriptor-type closure.
+        //
+        // Pull in every class referenced only from a parameter type,
+        // return type, or field type of a class already in the class map.
+        // Without this pass a class that is referenced only through such
+        // a descriptor — the canonical case being a provider
+        // implementation whose name is read from a String field at run
+        // time and handed to Class.forName — is present in the reachable
+        // set as a name but absent from the class map, and therefore has
+        // no vtable, no struct type, and no reflection record. At run
+        // time Class.forName0 then fails to find it, and any Java-level
+        // catch (ClassNotFoundException) or NoSuchAlgorithmException on
+        // the caller's frame receives NULL rather than an exception
+        // object.
+        //
+        // The concrete failure this closes is documented on
+        // ReachabilityAnalysis.expandClassMapToDescriptorClosure().
+        // ------------------------------------------------------------------
+        analysis.expandClassMapToDescriptorClosure();
+
         Set<String> allClasses = analysis.getReachableClasses();
         Set<MethodReference> allMethods = analysis.getReachableMethods();
 
