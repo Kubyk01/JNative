@@ -179,6 +179,7 @@ public class LlvmUtil {
         return dot.startsWith("java.") ||
             dot.startsWith("javax.") ||
             dot.startsWith("sun.") ||
+            dot.startsWith("com.sun.") ||
             dot.startsWith("jdk.") ||
             dot.startsWith("org.objectweb.asm.") ||
             dot.startsWith("picocli.") ||
