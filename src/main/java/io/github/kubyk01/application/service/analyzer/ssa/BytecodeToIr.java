@@ -2,6 +2,7 @@ package io.github.kubyk01.application.service.analyzer.ssa;
 
 import io.github.kubyk01.application.service.analyzer.dependencyresolver.DependencyResolver;
 import io.github.kubyk01.application.service.analyzer.reachabilityanalysis.ReachabilityAnalysis;
+import io.github.kubyk01.application.service.codegen.NativeOverride;
 import io.github.kubyk01.application.service.codegen.llvm.LlvmRuntime;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.ClassNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.MethodNode;
@@ -11,7 +12,6 @@ import io.github.kubyk01.domain.ir.IrBuilder;
 import io.github.kubyk01.domain.ir.Module;
 import io.github.kubyk01.domain.ir.Parameter;
 import io.github.kubyk01.domain.ir.Type;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.objectweb.asm.ClassReader;
 import org.objectweb.asm.ClassVisitor;
@@ -24,7 +24,6 @@ import java.util.List;
 import java.util.Map;
 
 @Slf4j
-@RequiredArgsConstructor
 public class BytecodeToIr {
 
     private final DependencyResolver resolver;
@@ -32,11 +31,72 @@ public class BytecodeToIr {
     private final IrBuilder builder = new IrBuilder();
     private final Map<MethodReference, Function> functionMap = new HashMap<>();
 
+    /** Mangling of a Java method -> the C override that replaces it. */
+    private final Map<String, NativeOverride> overrides = new HashMap<>();
+
+    public BytecodeToIr(DependencyResolver resolver,
+                        ReachabilityAnalysis reachability,
+                        List<NativeOverride> nativeOverrides) {
+        this.resolver = resolver;
+        this.reachability = reachability;
+        for (NativeOverride o : nativeOverrides) {
+            overrides.put(mangledKey(o), o);
+        }
+    }
+
     public Module translate() {
-        for (MethodReference methodRef : reachability.getReachableMethods()) {
-            translateMethod(methodRef);
+        // 1. Register every override function up front, before any
+        //    Java method is translated. This makes the alias resolvable
+        //    from the very first call site that the translator emits.
+        Module module = builder.getModule();
+        registerOverrides();
+
+        // 2. Translate every reachable method, skipping those that have
+        //    an override.
+        for (MethodReference ref : reachability.getReachableMethods()) {
+            NativeOverride match = findOverride(ref);
+            if (match != null) {
+                // Alias every reachable overload onto the single C function.
+                String key = LlvmRuntime.mangleMethod(
+                    ref.getOwner(), ref.getName(), ref.getDescriptor());
+                Function target = module.getFunction(match.getCFunctionName());
+                module.registerAlias(key, target);
+                continue;
+            }
+            translateMethod(ref);
         }
         return builder.getModule();
+    }
+
+    private NativeOverride findOverride(MethodReference ref) {
+        for (NativeOverride o : overrides.values()) {
+            if (!o.getClassName().equals(ref.getOwner()))       continue;
+            if (!o.getMethodName().equals(ref.getName()))       continue;
+            if (o.getDescriptor() != null
+                && !o.getDescriptor().equals(ref.getDescriptor())) continue;
+            return o;
+        }
+        return null;
+    }
+
+    private void registerOverrides() {
+        Module module = builder.getModule();
+        for (NativeOverride o : overrides.values()) {
+            if (module.getFunction(o.getCFunctionName()) == null) {
+                Function f = new Function(o.getCFunctionName(), o.getReturnType());
+                for (Parameter p : o.toParameters()) {
+                    f.addParameter(p);
+                }
+                module.addFunction(f);
+            }
+            Function f = module.getFunction(o.getCFunctionName());
+            module.registerAlias(mangledKey(o), f);
+        }
+    }
+
+    private static String mangledKey(NativeOverride o) {
+        return LlvmRuntime.mangleMethod(o.getClassName(), o.getMethodName(),
+            o.getDescriptor() != null ? o.getDescriptor() : "()V");
     }
 
     private void translateMethod(MethodReference methodRef) {

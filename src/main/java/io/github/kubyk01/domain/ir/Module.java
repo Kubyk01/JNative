@@ -30,6 +30,18 @@ public class Module {
         return functionMap.get(name);
     }
 
+    /**
+     * Registers {@code aliasName} as an additional lookup key for
+     * {@code target}. The target itself must already have been added via
+     * {@link #addFunction}. Used by the override machinery to make the
+     * mangled name of a Java method resolve to a C override function whose
+     * own mangled name is different.
+     */
+    public void registerAlias(String aliasName, Function target) {
+        if (aliasName == null || target == null) return;
+        functionMap.put(aliasName, target);
+    }
+
     @Override
     public String toString() {
         StringBuilder sb = new StringBuilder();

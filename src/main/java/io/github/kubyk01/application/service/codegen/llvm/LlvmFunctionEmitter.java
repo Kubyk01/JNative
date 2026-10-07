@@ -506,6 +506,16 @@ public class LlvmFunctionEmitter {
         return "lbl_" + prefix + "_" + (labelCounter++);
     }
     private String stringRef(String s) {
+        if (s == null || s.isEmpty()) {
+            return "null";
+        }
+        // Register the string with the global emitter so it is emitted
+        // into the module's constant section. Without this, any stringRef
+        // call site that does not go through globalEmitter's own
+        // registration path produces a forward reference to a global that
+        // is never defined, and the LLVM parser rejects the module with
+        // "use of undefined value".
+        globalEmitter.registerDeferredString(s);
         int len = LlvmRuntime.typeStringArrayLength(s);
         String g = LlvmRuntime.typeStringGlobalName(s);
         return "getelementptr inbounds ([" + len + " x i8], [" + len + " x i8]* "
@@ -1364,11 +1374,24 @@ public class LlvmFunctionEmitter {
                     String callTarget = null;
                     Function calleeForCall = null;
 
+                    // Look up the direct target. If `directMangled` is registered as an
+                    // alias — either to a real IR definition or to a C-side override
+                    // declaration — the returned Function's name differs from
+                    // `directMangled` and its target is callable even without an entry
+                    // block in this module. The previous check required
+                    // `getEntryBlock() != null`, which rejected every alias to a
+                    // declaration (native overrides, __jnative_* externs) and pushed the
+                    // call into the unresolved-slot path.
                     Function plainConcrete = module.getFunction(directMangled);
-                    if (plainConcrete != null && plainConcrete.getEntryBlock() != null) {
-                        callTarget = directMangled;
-                        calleeForCall = plainConcrete;
-                    } else {
+                    if (plainConcrete != null) {
+                        boolean isAlias = !plainConcrete.getName().equals(directMangled);
+                        if (isAlias || plainConcrete.getEntryBlock() != null) {
+                            callTarget = plainConcrete.getName();
+                            calleeForCall = plainConcrete;
+                        }
+                    }
+
+                    if (callTarget == null) {
                         String nativeMangled = "__jnative_" + directMangled;
                         Function nativeTarget = module.getFunction(nativeMangled);
                         if (nativeTarget != null) {

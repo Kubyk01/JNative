@@ -6,6 +6,8 @@ import io.github.kubyk01.application.service.analyzer.reachabilityanalysis.Reach
 import io.github.kubyk01.application.service.analyzer.ssa.BytecodeToIr;
 import io.github.kubyk01.application.service.analyzer.ssa.OutOfSsaPass;
 import io.github.kubyk01.application.service.analyzer.ssa.SSATransformer;
+import io.github.kubyk01.application.service.codegen.NativeOverride;
+import io.github.kubyk01.application.service.codegen.NativeOverrideScanner;
 import io.github.kubyk01.application.service.codegen.ResourceEmbedder;
 import io.github.kubyk01.application.service.codegen.llvm.LlvmGenerator;
 import io.github.kubyk01.application.service.codegen.llvm.nativepolymorphicfunctionresolver.PolymorphicResolver;
@@ -32,8 +34,10 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -67,14 +71,14 @@ public class Orchestrator implements OrchestratorPort {
                         int cores) {
 
         final int effectiveCores = (cores <= 0)
-            ? Runtime.getRuntime().availableProcessors()
-            : cores;
+                ? Runtime.getRuntime().availableProcessors()
+                : cores;
 
         System.out.println("Using " + effectiveCores + " core(s)"
-            + (cores <= 0
-            ? " (auto-detected via Runtime.availableProcessors())"
-            : " (user-specified via --cores)")
-            + " for parallel work");
+                + (cores <= 0
+                ? " (auto-detected via Runtime.availableProcessors())"
+                : " (user-specified via --cores)")
+                + " for parallel work");
 
         // Single, explicit, lifecycle-managed Reactor scheduler replaces
         // ForkJoinPool.commonPool(). All parallel work in the analysis
@@ -83,9 +87,9 @@ public class Orchestrator implements OrchestratorPort {
 
         try {
             runAnalysis(path, entryClass, entryMethod, entryDescriptor,
-                showClasses, showAlias, showEscape, showLifetime, showDestructor,
-                outputFile, noCompile, includeSystem, debugName, showClassesGraph,
-                effectiveCores, scheduler);
+                    showClasses, showAlias, showEscape, showLifetime, showDestructor,
+                    outputFile, noCompile, includeSystem, debugName, showClassesGraph,
+                    effectiveCores, scheduler);
         } finally {
             scheduler.dispose();
         }
@@ -184,7 +188,7 @@ public class Orchestrator implements OrchestratorPort {
         for (String cls : allClasses) {
             ClassNode node = resolver.getClassNode(cls);
             if (node != null && node.getPolymorphicMethodNames() != null
-                && !node.getPolymorphicMethodNames().isEmpty()) {
+                    && !node.getPolymorphicMethodNames().isEmpty()) {
                 polymorphicClasses.add(cls);
             }
         }
@@ -201,44 +205,68 @@ public class Orchestrator implements OrchestratorPort {
             methodsToShow = allMethods;
         } else {
             classesToShow = allClasses.stream()
-                .filter(c -> !LlvmUtil.isSystemClassName(c))
-                .collect(Collectors.toSet());
+                    .filter(c -> !LlvmUtil.isSystemClassName(c))
+                    .collect(Collectors.toSet());
             methodsToShow = allMethods.stream()
-                .filter(m -> !LlvmUtil.isSystemClassName(
-                    m.getOwner() + "." + m.getName()))
-                .collect(Collectors.toSet());
+                    .filter(m -> !LlvmUtil.isSystemClassName(
+                            m.getOwner() + "." + m.getName()))
+                    .collect(Collectors.toSet());
         }
 
         // --- 5. Optional prints -------------------------------------------
         if (showClassesGraph) {
             printCallGraph(analysis, entryClass, entryMethod, entryDescriptor,
-                includeSystem, debugName);
+                    includeSystem, debugName);
         }
 
         if (showClasses) {
             Set<String> filteredClasses = classesToShow.stream()
-                .filter(c -> matchesDebug(debugName, c))
-                .collect(Collectors.toSet());
+                    .filter(c -> matchesDebug(debugName, c))
+                    .collect(Collectors.toSet());
             Set<MethodReference> filteredMethods = methodsToShow.stream()
-                .filter(m -> matchesDebug(debugName, m.getOwner())
-                    || matchesDebug(debugName, m.getName()))
-                .collect(Collectors.toSet());
+                    .filter(m -> matchesDebug(debugName, m.getOwner())
+                            || matchesDebug(debugName, m.getName()))
+                    .collect(Collectors.toSet());
 
             System.out.println("\nClasses (" + filteredClasses.size() + "):");
             filteredClasses.stream().sorted().forEach(c -> System.out.println("  " + c));
 
             System.out.println("\nMethods (" + filteredMethods.size() + "):");
             filteredMethods.stream()
-                .sorted(Comparator.comparing(MethodReference::getOwner)
-                    .thenComparing(MethodReference::getName))
-                .forEach(m -> System.out.println("  " + m));
+                    .sorted(Comparator.comparing(MethodReference::getOwner)
+                            .thenComparing(MethodReference::getName))
+                    .forEach(m -> System.out.println("  " + m));
         }
 
         // --- 6. IR translation + SSA --------------------------------------
         System.out.println("\n--- Translating to IR and applying SSA ---");
         System.out.println("Total methods to translate: " + allMethods.size());
 
-        BytecodeToIr translator = new BytecodeToIr(resolver, analysis);
+        // ------------------------------------------------------------------
+        // Native overrides.
+        //
+        // Scan every reachable class's C source file (under jnative/) for
+        // functions named __jnative_override_<Class>_<method>. Each one
+        // replaces the Java body of the corresponding method: the Java
+        // bytecode is not translated into IR at all, and every call site
+        // — direct, virtual, or reflective — is aliased onto the C symbol.
+        //
+        // The C resource path is derived with exactly the same rule
+        // Compiler.getNativeResourcePath uses: strip a leading "java/"
+        // from the class name and prepend "jnative/". So for
+        // java.security.SecureRandom the path is
+        // "jnative/security/SecureRandom.c".
+        // ------------------------------------------------------------------
+        List<NativeOverride> nativeOverrides = collectNativeOverrides(analysis);
+
+        System.out.println("Native overrides discovered: " + nativeOverrides.size());
+        for (NativeOverride o : nativeOverrides) {
+            System.out.println("  " + o.getClassName() + "." + o.getMethodName()
+                    + (o.getDescriptor() != null ? o.getDescriptor() : "(all overloads)")
+                    + " -> " + o.getCFunctionName());
+        }
+
+        BytecodeToIr translator = new BytecodeToIr(resolver, analysis, nativeOverrides);
         Module module = translator.translate();
 
         SSATransformer ssaTransformer = new SSATransformer();
@@ -250,10 +278,10 @@ public class Orchestrator implements OrchestratorPort {
         Analyzer analyzer = new Analyzer();
         analyzer.setScheduler(scheduler);
         AnalyzerResult analysisResult = analyzer.analyze(
-            module, resolver,
-            entryClass, entryMethod, entryDescriptor,
-            includeSystem, debugName,
-            showAlias, showEscape, showLifetime);
+                module, resolver,
+                entryClass, entryMethod, entryDescriptor,
+                includeSystem, debugName,
+                showAlias, showEscape, showLifetime);
 
         AliasAnalysisResult aliasResult = analysisResult.aliasResult();
         EscapeAnalysisResult escapeResult = analysisResult.escapeResult();
@@ -261,12 +289,12 @@ public class Orchestrator implements OrchestratorPort {
 
         // --- 8. Destructor insertion + optimization -----------------------
         DestructorInserter inserter = new DestructorInserter(module, resolver, lifetimeResult,
-            aliasResult.getAllocationSiteToValue(), aliasResult);
+                aliasResult.getAllocationSiteToValue(), aliasResult);
         inserter.insert();
 
         System.out.println("\n--- Running Optimizations ---");
         Optimizer optimizer = new Optimizer(module, aliasResult, escapeResult,
-            lifetimeResult, aliasResult.getAllocationSiteToValue());
+                lifetimeResult, aliasResult.getAllocationSiteToValue());
         optimizer.setEnableScalarReplacement(true);
         optimizer.setEnableDestructorSimplification(true);
         optimizer.setEnableDestructorInlining(true);
@@ -290,8 +318,8 @@ public class Orchestrator implements OrchestratorPort {
         System.out.println("Embedding " + embedded.size() + " built-in resource(s).");
 
         LlvmGenerator llvmGen = new LlvmGenerator(module, resolver, aliasResult,
-            entryClass, entryMethod, entryDescriptor, analysis.getReflectInfo(),
-            polymorphicResolver);
+                entryClass, entryMethod, entryDescriptor, analysis.getReflectInfo(),
+                polymorphicResolver);
         llvmGen.setClinitFunctions(analysisResult.clinitFunctions());
         llvmGen.setClinitWrappers(analysisResult.clinitWrappers());
         llvmGen.setEmbeddedResources(embedded);
@@ -311,9 +339,9 @@ public class Orchestrator implements OrchestratorPort {
             Path exePath = outputFile != null ? Paths.get(outputFile) : Paths.get("a.out");
             try {
                 compiler.compileAndLink(llPath, exePath, usedSystemClasses, module,
-                    resolver, effectiveCores);
+                        resolver, effectiveCores);
                 System.out.println("Native executable built successfully: "
-                    + exePath.toAbsolutePath());
+                        + exePath.toAbsolutePath());
             } catch (IOException | InterruptedException e) {
                 log.error("Failed to build native executable", e);
                 System.err.println("Build failed: " + e.getMessage());
@@ -324,6 +352,82 @@ public class Orchestrator implements OrchestratorPort {
         } else {
             System.out.println("Skipping native compilation (--no-compile specified)");
         }
+    }
+
+    // =====================================================================
+    //  Native override discovery
+    // =====================================================================
+
+    /**
+     * Scans the C runtime source of every reachable class for
+     * {@code __jnative_override_*} functions and returns them as
+     * {@link NativeOverride} records.
+     *
+     * <p>Two properties of this method matter to its correctness:</p>
+     *
+     * <ul>
+     *   <li>The C resource path is derived with the same rule
+     *       {@link io.github.kubyk01.application.service.compiler.Compiler#hasNativeSupport}
+     *       uses: a leading {@code "java/"} is stripped and the path is
+     *       rebased under {@code "jnative/"}. For
+     *       {@code java.security.SecureRandom} the resulting path is
+     *       {@code "jnative/security/SecureRandom.c"}, which is where
+     *       the file actually lives. Using
+     *       {@code ParserC.getResourcePathForClass} here produces
+     *       {@code "jnative/java/security/SecureRandom.c"}, which does
+     *       not exist, the scan silently returns an empty list, and the
+     *       override is never applied.</li>
+     *
+     *   <li>The scan runs over every reachable class, not only those
+     *       that {@code Compiler.hasNativeSupport} reports — a class
+     *       may have an override file without having a
+     *       {@code __jnative_fn_*} file, and vice versa. Attempting to
+     *       read a file that does not exist is a cheap miss:
+     *       {@code NativeOverrideScanner.scan} returns an empty list.</li>
+     * </ul>
+     *
+     * <p>Duplicates are collapsed by
+     * {@code (className, methodName, descriptor)}. The last entry wins,
+     * which lets a later class in iteration order override an earlier
+     * one — an unusual case, but one that has a well-defined outcome
+     * rather than an exception.</p>
+     */
+    private List<NativeOverride> collectNativeOverrides(ReachabilityAnalysis analysis) {
+        List<NativeOverride> discovered = new ArrayList<>();
+
+        for (String cls : analysis.getReachableClasses()) {
+            String cResourcePath = cResourcePathForClass(cls);
+            List<NativeOverride> found = NativeOverrideScanner.scan(cResourcePath);
+            if (!found.isEmpty()) {
+                discovered.addAll(found);
+                System.out.println("Native overrides in " + cResourcePath
+                        + ": " + found.size());
+            }
+        }
+
+        Map<String, NativeOverride> byKey = new LinkedHashMap<>();
+        for (NativeOverride o : discovered) {
+            String key = o.getClassName() + "." + o.getMethodName()
+                    + "#" + o.getDescriptor();
+            byKey.put(key, o);
+        }
+        return new ArrayList<>(byKey.values());
+    }
+
+    /**
+     * Maps an internal class name to the classpath-relative path of its
+     * C runtime source.
+     *
+     * <p>This is byte-for-byte the same mapping
+     * {@link io.github.kubyk01.application.service.compiler.Compiler#getNativeResourcePath}
+     * performs, and it must stay that way: the override scanner and the
+     * native compiler must find the same files.</p>
+     */
+    private static String cResourcePathForClass(String internalName) {
+        if (internalName.startsWith("java/")) {
+            return "jnative/" + internalName.substring("java/".length()) + ".c";
+        }
+        return "jnative/" + internalName + ".c";
     }
 
     // =====================================================================
@@ -346,21 +450,21 @@ public class Orchestrator implements OrchestratorPort {
     private void forceResourceStreamMethods(ReachabilityAnalysis analysis) {
         String owner = "java/io/ByteArrayInputStream";
         analysis.addExtraReachableMethod(
-            new MethodReference(owner, "<init>", "([B)V"));
+                new MethodReference(owner, "<init>", "([B)V"));
         analysis.addExtraReachableMethod(
-            new MethodReference(owner, "available", "()I"));
+                new MethodReference(owner, "available", "()I"));
         analysis.addExtraReachableMethod(
-            new MethodReference(owner, "read", "([BII)I"));
+                new MethodReference(owner, "read", "([BII)I"));
         analysis.addExtraReachableMethod(
-            new MethodReference(owner, "read", "()I"));
+                new MethodReference(owner, "read", "()I"));
         analysis.addExtraReachableMethod(
-            new MethodReference(owner, "skip", "(J)J"));
+                new MethodReference(owner, "skip", "(J)J"));
         analysis.addExtraReachableMethod(
-            new MethodReference(owner, "mark", "(I)V"));
+                new MethodReference(owner, "mark", "(I)V"));
         analysis.addExtraReachableMethod(
-            new MethodReference(owner, "reset", "()V"));
+                new MethodReference(owner, "reset", "()V"));
         analysis.addExtraReachableMethod(
-            new MethodReference(owner, "close", "()V"));
+                new MethodReference(owner, "close", "()V"));
     }
 
     private void forceProviderServiceClasses(ReachabilityAnalysis analysis,
@@ -431,7 +535,7 @@ public class Orchestrator implements OrchestratorPort {
         }
         if (cn == null || cn.isExternal()) {
             log.debug("registerConstructorForReflection: {} is not available "
-                + "in the class map after a forced load; skipping", className);
+                    + "in the class map after a forced load; skipping", className);
             return;
         }
 
@@ -440,7 +544,7 @@ public class Orchestrator implements OrchestratorPort {
             if (mn.getDescriptor() == null || mn.getDescriptor().isEmpty()) continue;
 
             MethodReference ref = new MethodReference(
-                className, mn.getName(), mn.getDescriptor());
+                    className, mn.getName(), mn.getDescriptor());
 
             analysis.getReflectInfo().addConstructor(className, ref);
             analysis.addExtraReachableMethod(ref);
@@ -455,7 +559,7 @@ public class Orchestrator implements OrchestratorPort {
                                 String entryMethod, String entryDescriptor,
                                 boolean includeSystem, String debugName) {
         MethodReference entry = new MethodReference(
-            entryClass.replace('.', '/'), entryMethod, entryDescriptor);
+                entryClass.replace('.', '/'), entryMethod, entryDescriptor);
         Map<MethodReference, Set<MethodReference>> graph = analysis.getCallGraph();
         Set<MethodReference> visited = new HashSet<>();
         Predicate<MethodReference> filter = mr -> {

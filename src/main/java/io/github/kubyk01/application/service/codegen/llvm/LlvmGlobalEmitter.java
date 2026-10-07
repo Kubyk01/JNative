@@ -1033,8 +1033,9 @@ public class LlvmGlobalEmitter {
         String nativeName = "__jnative_" + baseName;
 
         String funcName;
-        if (module.getFunction(baseName) != null) {
-            funcName = baseName;
+        Function target = module.getFunction(baseName);
+        if (target != null) {
+            funcName = target.getName();
         } else if (module.getFunction(nativeName) != null) {
             funcName = nativeName;
         } else if (mn.isNative()) {
