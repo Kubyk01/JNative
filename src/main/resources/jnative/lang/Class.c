@@ -728,6 +728,8 @@ void __jnative_fn_java_lang_Class_registerNatives___V(void) {
  * caller's frame is given an object that __jnative_catch_matches() can
  * match against the ClassNotFoundException type-info.
  */
+
+ // todo make forName0 be able make linking just in time
 static void* make_class_not_found_exception(const char* name, int32_t len) {
     char buf[512];
     if (name != NULL && len > 0 && (size_t)len < sizeof(buf)) {

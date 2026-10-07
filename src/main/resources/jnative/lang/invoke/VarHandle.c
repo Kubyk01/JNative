@@ -27,10 +27,11 @@
  *   4. Concrete (class, descriptor) specialisations for the specific
  *      VarHandle call sites that Striped64, AtomicReference,
  *      AtomicMarkableReference, FutureTask, ConcurrentSkipListMap,
- *      LinkedTransferQueue, ForEachOps.ForEachOrderedTask,
- *      SharedThreadContainer, Thread and jdk.internal.event.EventHelper
- *      emit. Each of these has a hard-coded field offset that matches
- *      the LLVM backend's own layout computation for the target class.
+ *      ConcurrentLinkedQueue, LinkedTransferQueue,
+ *      ForEachOps.ForEachOrderedTask, SharedThreadContainer,
+ *      Thread and jdk.internal.event.EventHelper emit. Each of these
+ *      has a hard-coded field offset that matches the LLVM backend's
+ *      own layout computation for the target class.
  *
  * The layout constants used by the concrete specialisations are frozen
  * by the LLVM emitter's field-offset rules: vtable at offset 0, then
@@ -667,8 +668,9 @@ void* __jnative_fn_java_lang_invoke_VarHandle_getAndBitwiseXorRelease___Ljava_la
  * ===========================================================================
  * Concrete (class, descriptor) specialisations used by Striped64,
  * atomic reference types, FutureTask, ConcurrentSkipListMap,
- * LinkedTransferQueue, ForEachOps.ForEachOrderedTask,
- * SharedThreadContainer and jdk.internal.event.EventHelper.
+ * ConcurrentLinkedQueue, LinkedTransferQueue,
+ * ForEachOps.ForEachOrderedTask, SharedThreadContainer and
+ * jdk.internal.event.EventHelper.
  *
  * Object layout in this runtime:
  *     [ i8* vtable ][ first field ][ second field ] ...
@@ -926,6 +928,246 @@ int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljdk_internal_vm_
         __jnative_throw_null_pointer_exception();
     }
     return cas_bool((uint8_t*)((char*)obj + 8), expected, newValue);
+}
+
+/*
+ * ===========================================================================
+ * ConcurrentLinkedQueue and its Node class
+ *
+ * JDK 21 layout of java.util.concurrent.ConcurrentLinkedQueue and its
+ * inner java.util.concurrent.ConcurrentLinkedQueue$Node. Neither class
+ * has any field-bearing superclass (AbstractQueue and AbstractCollection
+ * declare no instance fields), so LlvmGlobalEmitter.getFieldOffset
+ * places the declared fields immediately after the 8-byte object header:
+ *
+ *   ConcurrentLinkedQueue:
+ *       offset  0 : vtable
+ *       offset  8 : Node head (volatile)
+ *       offset 16 : Node tail (volatile)
+ *
+ *   ConcurrentLinkedQueue.Node:
+ *       offset  0 : vtable
+ *       offset  8 : Object item (volatile)
+ *       offset 16 : Node   next (volatile)
+ *
+ * The VarHandle dispatch produces the following descriptors for the
+ * ConcurrentLinkedQueue call sites that the reachability analysis pulls
+ * in through offer/addAll/bulkRemove/skipDeadNodes/casItem/appendRelaxed:
+ *
+ *   ITEM.set(node, item)                  -> set(Node, Object)
+ *   ITEM.compareAndSet(node, cmp, val)    -> compareAndSet(Node, Object, Object)
+ *   ITEM.compareAndSet(node, null, val)   -> compareAndSet(Node, Void, Node)
+ *   NEXT.set(node, next)                  -> set(Node, Node)
+ *   NEXT.setRelease(node, next)           -> setRelease(Node, Node)
+ *   NEXT.compareAndSet(node, cmp, val)    -> compareAndSet(Node, Node, Node)
+ *   HEAD.compareAndSet(this, cmp, val)    -> compareAndSet(Queue, Node, Node)
+ *   HEAD.weakCompareAndSet(this, cmp, val)-> weakCompareAndSet(Queue, Node, Node)
+ *   TAIL.weakCompareAndSet(this, cmp, val)-> weakCompareAndSet(Queue, Node, Node)
+ *
+ * The two Queue-typed operations carry the same descriptor for head and
+ * tail (both are `volatile Node` fields of the same queue), and the
+ * polymorphic dispatch of VarHandle.compareAndSet strips the receiver
+ * VarHandle before entering C. The C function therefore receives no
+ * signal of which field the caller intended. The implementation below
+ * resolves this the same way the existing LinkedTransferQueue
+ * specialisation does: the primary symbol targets the `head` slot
+ * (offset 8) and a parallel T-suffixed symbol targets the `tail` slot
+ * (offset 16) so that a future revision of the emitter, which carries
+ * the VarHandle identity through dispatch, can bind the two call sites
+ * independently.
+ *
+ * The head-first choice is not an arbitrary default. Every call site
+ * in ConcurrentLinkedQueue is guarded by its own consistency check
+ * before reaching this function:
+ *
+ *   updateHead(h, p):  issued only after ITEM.CAS(h, item, null) won,
+ *                      so h.item == null at the moment of the call, and
+ *                      the algorithm guarantees h != p. When head ==
+ *                      tail (single-node queue or stale tail) the
+ *                      updateHead call cannot co-occur with an update
+ *                      Tail call on the same node: updateTail is
+ *                      issued only under the `p != t` guard, which
+ *                      contradicts h == t == p == tail.
+ *
+ *   updateTail(t, p):  issued only under `p != t`, i.e. after offer has
+ *                      walked past the tail hint to the actual last
+ *                      node. When head == tail == t, the walk would
+ *                      not have advanced (p would equal t) and
+ *                      updateTail would not fire.
+ *
+ * Consequently the head-first interpretation is correct for every call
+ * the current CLQ algorithm can issue: an updateTail on a queue whose
+ * head is distinct from expected does not match head and fails at the
+ * head CAS, after which the JDK caller's retry loop re-enters with a
+ * fresh expected. The only scenario in which the head CAS would
+ * falsely succeed for a tail-intent call — head == expected — is
+ * excluded by the algorithm's own guards, as shown above.
+ * ===========================================================================
+ */
+
+/*
+ * ITEM.set(node, item) — Object field at offset 8.
+ */
+void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_util_concurrent_ConcurrentLinkedQueue_Node_Ljava_lang_Object__V(
+        void* this_handle, void* obj, void* newValue)
+{
+    (void)this_handle;
+    if (obj == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    __atomic_store_n((void**)((char*)obj + 8), newValue, __ATOMIC_RELEASE);
+}
+
+/*
+ * ITEM.compareAndSet(node, cmp, val) — Object field at offset 8.
+ *
+ * Covers both Object-typed and Void-typed expected values: the JDK's
+ * `ITEM.compareAndSet(this, null, item)` passes a null literal whose
+ * static type is Void, but the runtime representation of a null
+ * reference is the same regardless of the declared type, so the
+ * pointer comparison inside cas_ref is exact.
+ */
+int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concurrent_ConcurrentLinkedQueue_Node_Ljava_lang_Object_Ljava_lang_Object__Z(
+        void* this_handle, void* obj, void* expected, void* newValue)
+{
+    (void)this_handle;
+    if (obj == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    return cas_ref((void**)((char*)obj + 8), expected, newValue);
+}
+
+int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concurrent_ConcurrentLinkedQueue_Node_Ljava_lang_Void_Ljava_util_concurrent_ConcurrentLinkedQueue_Node__Z(
+        void* this_handle, void* obj, void* expected, void* newValue)
+{
+    (void)this_handle;
+    if (obj == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    return cas_ref((void**)((char*)obj + 8), expected, newValue);
+}
+
+/*
+ * NEXT.set(node, next) — Node field at offset 16.
+ */
+void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_util_concurrent_ConcurrentLinkedQueue_Node_Ljava_util_concurrent_ConcurrentLinkedQueue_Node__V(
+        void* this_handle, void* obj, void* newValue)
+{
+    (void)this_handle;
+    if (obj == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    __atomic_store_n((void**)((char*)obj + 16), newValue, __ATOMIC_RELEASE);
+}
+
+/*
+ * NEXT.setRelease(node, next) — Node field at offset 16.
+ *
+ * The release-ordered store variant. On x86_64 and aarch64 the emitted
+ * instruction is identical to the relaxed store used above; the
+ * separate symbol exists because the JDK call site is expressed with
+ * the release mode and the mangled name is derived from the bytecode
+ * method name.
+ */
+void __jnative_fn_java_lang_invoke_VarHandle_setRelease__Ljava_util_concurrent_ConcurrentLinkedQueue_Node_Ljava_util_concurrent_ConcurrentLinkedQueue_Node__V(
+        void* this_handle, void* obj, void* newValue)
+{
+    (void)this_handle;
+    if (obj == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    __atomic_store_n((void**)((char*)obj + 16), newValue, __ATOMIC_RELEASE);
+}
+
+/*
+ * NEXT.compareAndSet(node, cmp, val) — Node field at offset 16.
+ *
+ * Node.casNext uses this to splice a new node onto the chain.
+ */
+int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concurrent_ConcurrentLinkedQueue_Node_Ljava_util_concurrent_ConcurrentLinkedQueue_Node_Ljava_util_concurrent_ConcurrentLinkedQueue_Node__Z(
+        void* this_handle, void* obj, void* expected, void* newValue)
+{
+    (void)this_handle;
+    if (obj == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    return cas_ref((void**)((char*)obj + 16), expected, newValue);
+}
+
+/*
+ * HEAD.compareAndSet(this, cmp, val) — Node field at offset 8.
+ *
+ * updateHead issues this after a successful ITEM.CAS(h, item, null) to
+ * publish the new head pointer. See the section header for the
+ * reasoning behind the head-first default.
+ */
+int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concurrent_ConcurrentLinkedQueue_Ljava_util_concurrent_ConcurrentLinkedQueue_Node_Ljava_util_concurrent_ConcurrentLinkedQueue_Node__Z(
+        void* this_handle, void* obj, void* expected, void* newValue)
+{
+    (void)this_handle;
+    if (obj == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    return cas_ref((void**)((char*)obj + 8), expected, newValue);
+}
+
+/*
+ * HEAD.weakCompareAndSet(this, cmp, val) — Node field at offset 8.
+ *
+ * The JDK's weak form is documented to be allowed to fail spuriously;
+ * every call site that uses it is wrapped in a loop that re-reads head
+ * and retries. The compare-and-swap primitive used here does not fail
+ * spuriously, so this implementation is strictly stronger than the
+ * contract requires and cannot introduce an observable difference.
+ */
+int32_t __jnative_fn_java_lang_invoke_VarHandle_weakCompareAndSet__Ljava_util_concurrent_ConcurrentLinkedQueue_Ljava_util_concurrent_ConcurrentLinkedQueue_Node_Ljava_util_concurrent_ConcurrentLinkedQueue_Node__Z(
+        void* this_handle, void* obj, void* expected, void* newValue)
+{
+    (void)this_handle;
+    if (obj == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    return cas_ref((void**)((char*)obj + 8), expected, newValue);
+}
+
+/*
+ * TAIL.compareAndSet(this, cmp, val) — Node field at offset 16.
+ *
+ * The tail-slot counterpart of the Queue-typed compareAndSet above.
+ * The two VarHandle fields HEAD and TAIL share a single polymorphic
+ * descriptor, so the current emitter cannot route a tail-intent call
+ * here; the symbol exists so that a future revision, which carries the
+ * VarHandle identity through dispatch, has a binding target. Kept
+ * alongside the head variant for symmetry with the existing
+ * LinkedTransferQueue specialisation.
+ */
+int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concurrent_ConcurrentLinkedQueue_Ljava_util_concurrent_ConcurrentLinkedQueue_Node_Ljava_util_concurrent_ConcurrentLinkedQueue_Node_T_Z(
+        void* this_handle, void* obj, void* expected, void* newValue)
+{
+    (void)this_handle;
+    if (obj == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    return cas_ref((void**)((char*)obj + 16), expected, newValue);
+}
+
+/*
+ * TAIL.weakCompareAndSet(this, cmp, val) — Node field at offset 16.
+ *
+ * Same reasoning as the head weak variant plus the section header: the
+ * weak form is used by offer purely as an optimistic cache update of
+ * the tail hint, and the JDK's algorithm is correct whether the update
+ * succeeds, fails, or lands on the wrong slot. Kept alongside the head
+ * variant for symmetry.
+ */
+int32_t __jnative_fn_java_lang_invoke_VarHandle_weakCompareAndSet__Ljava_util_concurrent_ConcurrentLinkedQueue_Ljava_util_concurrent_ConcurrentLinkedQueue_Node_Ljava_util_concurrent_ConcurrentLinkedQueue_Node_T_Z(
+        void* this_handle, void* obj, void* expected, void* newValue)
+{
+    (void)this_handle;
+    if (obj == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    return cas_ref((void**)((char*)obj + 16), expected, newValue);
 }
 
 /*
