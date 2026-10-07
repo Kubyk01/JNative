@@ -130,6 +130,7 @@ public class Orchestrator implements OrchestratorPort {
         // method listings would be missing them and the vtable slots would
         // hold unresolved thunks.
         forceResourceStreamMethods(analysis);
+        forceProviderServiceClasses(analysis);
 
         // ------------------------------------------------------------------
         // Superclass-<clinit> closure.
@@ -359,6 +360,19 @@ public class Orchestrator implements OrchestratorPort {
             new MethodReference(owner, "reset", "()V"));
         analysis.addExtraReachableMethod(
             new MethodReference(owner, "close", "()V"));
+    }
+
+    private void forceProviderServiceClasses(ReachabilityAnalysis analysis) {
+        for (String cn : new String[] {
+                "sun/security/provider/DRBG",
+                "sun/security/provider/SecureRandom",
+                "sun/security/provider/SHA1PRNG",   // pre-17 fallback
+                "sun/security/provider/NativePRNG",
+                "java/security/SecureRandomParameters",
+                "java/security/DrbgParameters",
+        }) {
+            analysis.addInstantiatedClass(cn, /* fromUser */ false);
+        }
     }
 
     // =====================================================================

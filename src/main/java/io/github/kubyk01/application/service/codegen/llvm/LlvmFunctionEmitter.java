@@ -330,27 +330,44 @@ public class LlvmFunctionEmitter {
 
         int ordinal = 0;
         for (TryCatchRange range : ranges) {
-            BasicBlock startBlock   = byLabel.get("L" + range.start);
-            BasicBlock endBlock     = byLabel.get("L" + range.end);
             BasicBlock handlerBlock = byLabel.get("L" + range.handler);
-            if (startBlock == null || endBlock == null || handlerBlock == null) continue;
+            if (handlerBlock == null) continue;
 
-            // Body of the try range = normal-flow reachable from start up
-            // to (and including) end, minus the handler block. The handler
-            // is the entry of the catch body, not a member of the try body:
-            // if it were treated as such, its own instructions would be
-            // wrapped in guarded regions for this range, and the chit
-            // blocks of those guards branch back to the handler — the
-            // structural livelock diagnosed in the ICU NormalizerImpl.load
-            // and ScopedMemoryAccess.copyMemoryInternal IR.
+            // -----------------------------------------------------------------
+            // Read the frozen snapshot, do NOT recompute.
             //
-            // The belt-and-braces `if (b == handlerBlock) continue;` guards
-            // against the case where the handler block is also the start
-            // block of its own range (a pattern that appears in some
-            // synthetic `finally` layouts): GraphUtils.getBlocksBetween
-            // already excludes it, but the explicit check here makes the
-            // invariant independent of that helper.
-            for (BasicBlock b : GraphUtils.getBlocksBetween(startBlock, endBlock, handlerBlock)) {
+            // range.body was captured by MethodTranslator.visitEnd() before
+            // any handler edge existed in the CFG. Recomputing here — as the
+            // previous revision did — is exactly the code path that produced
+            // the infinite ping-pong between sibling handlers in
+            // java.security.Provider$Service.newInstance: by the time codegen
+            // runs, the CFG carries every body -> handler edge inserted by
+            // MethodTranslator, and a BFS from the body therefore walks into
+            // the handlers of all sibling ranges of the same try statement.
+            // Each such handler then gets wrapped in the try-guard of every
+            // OTHER sibling range, whose own handler is a rethrow, and the
+            // pair loops forever inside longjmp.
+            //
+            // The snapshot fixes this at the source and cannot be defeated by
+            // any subsequent IR pass, because it is a plain list of
+            // BasicBlock references and no IR pass mutates it.
+            // -----------------------------------------------------------------
+            List<BasicBlock> body = range.body;
+
+            if (body == null) {
+                // Defensive fallback for ranges whose labels did not resolve
+                // during translation. Under normal compilation this branch is
+                // unreachable: MethodTranslator always populates range.body
+                // for every range whose start/end/handler labels exist in
+                // labelToBlock, and the codegen only sees ranges whose
+                // handler block is present in func.
+                BasicBlock startBlock = byLabel.get("L" + range.start);
+                BasicBlock endBlock   = byLabel.get("L" + range.end);
+                if (startBlock == null || endBlock == null) continue;
+                body = GraphUtils.getBlocksBetween(startBlock, endBlock, handlerBlock);
+            }
+
+            for (BasicBlock b : body) {
                 if (b == handlerBlock) continue;
                 blockToTryRanges.computeIfAbsent(b, x -> new ArrayList<>()).add(range);
             }

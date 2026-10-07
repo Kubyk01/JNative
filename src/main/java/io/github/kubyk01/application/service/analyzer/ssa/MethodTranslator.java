@@ -807,24 +807,36 @@ public class MethodTranslator extends MethodVisitor {
                 handlers.returnVoid();
             } else {
                 log.warn(
-                    "Method {} ended with an unterminated block {} "
-                        + "(return type {}); leaving the terminator empty so "
-                        + "the CFG stays honest",
-                    methodRef, currentBlock.getLabel(), returnType);
+                        "Method {} ended with an unterminated block {} "
+                                + "(return type {}); leaving the terminator empty so "
+                                + "the CFG stays honest",
+                        methodRef, currentBlock.getLabel(), returnType);
             }
         }
 
         for (IndirectBranchTerminator ibt : indirectBranches) {
             int var = -1;
             if (ibt.getTargetBlock() instanceof Temporary t
-                && t.getDefiningInstruction() != null) {
+                    && t.getDefiningInstruction() != null) {
                 var = t.getDefiningInstruction().getLocalIndex();
             }
             if (var >= 0) {
                 ibt.getPossibleTargets().addAll(
-                    jsrReturnBlocks.getOrDefault(var, Collections.emptySet()));
+                        jsrReturnBlocks.getOrDefault(var, Collections.emptySet()));
             }
         }
+
+        for (TryCatchRange range : tryCatchRanges) {
+            BasicBlock rangeStart   = labelToBlock.get(range.start);
+            BasicBlock rangeEnd     = labelToBlock.get(range.end);
+            BasicBlock rangeHandler = labelToBlock.get(range.handler);
+            if (rangeStart == null || rangeEnd == null || rangeHandler == null) {
+                continue;
+            }
+            range.body = GraphUtils.getBlocksBetween(
+                    rangeStart, rangeEnd, rangeHandler);
+        }
+
         tryCatchHandler.handle();
         currentFunction.setTryCatchRanges(tryCatchRanges);
         addExceptionalEdges();
@@ -832,25 +844,29 @@ public class MethodTranslator extends MethodVisitor {
 
     private void addExceptionalEdges() {
         for (TryCatchRange range : tryCatchRanges) {
-            BasicBlock startBlock   = labelToBlock.get(range.start);
-            BasicBlock endBlock     = labelToBlock.get(range.end);
             BasicBlock handlerBlock = labelToBlock.get(range.handler);
-            if (startBlock == null || endBlock == null || handlerBlock == null) continue;
+            if (handlerBlock == null) continue;
 
-            // The handler is reached from the body by an exceptional edge,
-            // not by normal flow, so it must not be enumerated as part of
-            // the body. Excluding it here also prevents the handler from
-            // being given an exceptional self-edge when it contains a
-            // throwing instruction — the emitter would then wrap the
-            // handler's instructions in the try-guard of the range whose
-            // handler is the handler itself, and the guard's chit block
-            // would branch straight back to the handler's own LLVM label,
-            // producing a structural livelock with no exit.
-            List<BasicBlock> blocksInRange =
-                GraphUtils.getBlocksBetween(startBlock, endBlock, handlerBlock);
+            // range.body was computed in visitEnd() before any handler edge
+            // existed in the CFG, so it does not contain this handler nor any
+            // sibling handler. Recomputing the body here — as the previous
+            // revision did — would escape into the handlers of every range
+            // that was processed before this one, because by now those
+            // handlers are reachable from the body via exceptional edges.
+            if (range.body == null) {
+                // Defensive: a TryCatchRange with no precomputed body can only
+                // arise if the translator was constructed outside the normal
+                // visitEnd() path. Recompute from the current CFG — best
+                // effort, and still guarded by the handler exclusion below.
+                BasicBlock startBlock = labelToBlock.get(range.start);
+                BasicBlock endBlock   = labelToBlock.get(range.end);
+                if (startBlock == null || endBlock == null) continue;
+                range.body = GraphUtils.getBlocksBetween(
+                        startBlock, endBlock, handlerBlock);
+            }
 
-            for (BasicBlock block : blocksInRange) {
-                if (block == handlerBlock) continue;   // explicit, belt-and-braces
+            for (BasicBlock block : range.body) {
+                if (block == handlerBlock) continue;
                 for (Instruction inst : block.getInstructions()) {
                     if (inst.canThrow()) {
                         block.addExceptionalSuccessor(handlerBlock);
