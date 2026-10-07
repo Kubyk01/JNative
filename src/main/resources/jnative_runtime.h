@@ -510,12 +510,14 @@ extern int32_t JNATIVE_METHOD_RETURN_TYPE_OFFSET;
 extern int32_t JNATIVE_METHOD_PARAM_TYPES_OFFSET;
 extern int32_t JNATIVE_METHOD_EXC_TYPES_OFFSET;
 extern int32_t JNATIVE_METHOD_MODIFIERS_OFFSET;
+extern int32_t JNATIVE_METHOD_ROOT_OFFSET;
 
 extern int32_t JNATIVE_CTOR_CLAZZ_OFFSET;
 extern int32_t JNATIVE_CTOR_SLOT_OFFSET;
 extern int32_t JNATIVE_CTOR_PARAM_TYPES_OFFSET;
 extern int32_t JNATIVE_CTOR_EXC_TYPES_OFFSET;
 extern int32_t JNATIVE_CTOR_MODIFIERS_OFFSET;
+extern int32_t JNATIVE_CTOR_ROOT_OFFSET;
 
 /* JVM access-flag bits used by the reflection filter paths. */
 #ifndef JNATIVE_ACC_PUBLIC
@@ -842,7 +844,9 @@ extern void __jnative_reflect_set_layout(
         int32_t ctor_slot_offset,
         int32_t ctor_param_types_offset,
         int32_t ctor_exc_types_offset,
-        int32_t ctor_modifiers_offset);
+        int32_t ctor_modifiers_offset,
+        int32_t ctor_root_offset,        /* NEW */
+        int32_t method_root_offset);     /* NEW */
 
 /* ========================================================================
  *  Inline helpers

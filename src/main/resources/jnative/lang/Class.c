@@ -400,6 +400,52 @@ static void* create_method_mirror(ReflectionClass* declaring_cls,
     *(void**)((char*)method + JNATIVE_METHOD_EXC_TYPES_OFFSET)   = exc_types;
     *(int32_t*)((char*)method + JNATIVE_METHOD_MODIFIERS_OFFSET) = rm->modifiers;
 
+    /*
+     * Mark the mirror as its own root, exactly as Constructor.copy()
+     * does for the first copy it ever produces. The JDK 21
+     * Method.copy() is:
+     *
+     *     if (this.root != null)
+     *         return new Method(this.root);
+     *     if (this.methodAccessor != null)
+     *         throw new IllegalArgumentException(
+     *             "Can not copy a non-root Method");
+     *     Method res = this.clone();
+     *     res.root = this;
+     *     res.methodAccessor = methodAccessor;
+     *     return res;
+     *
+     * The mirrors built here are cached in Class.reflectionData() and
+     * survive across calls. The moment anything -- newInstance() through
+     * acquireMethodAccessor(), the shared-accessor propagation in
+     * Method.copy() itself, or a later call to Method.setAccessible --
+     * sets methodAccessor on one of them, the *next* copy() on the same
+     * mirror takes the throw path. The concrete failure that motivated
+     * this write was:
+     *
+     *     java.lang.IllegalArgumentException:
+     *         Can not copy a non-root Method
+     *     at (lazy_clinit_run_java_lang_invoke_MethodHandleImplCountingWrapper)
+     *
+     * raised from MethodHandleImpl$CountingWrapper.<clinit> while it
+     * resolved its findStatic/findVirtual targets through
+     * MethodHandles.Lookup.
+     *
+     * Setting root = self makes the first branch of copy() succeed
+     * unconditionally, which is the state Constructor.copy() itself
+     * would have established for the first copy it produced. Later
+     * copies then share this mirror as their root, which is exactly
+     * the sharing design copy() documents.
+     *
+     * A negative offset means the layout handoff could not resolve
+     * Method.root; in that case writing at that address would corrupt
+     * an unrelated field, so the write is skipped and the diagnostic
+     * is left to the caller. This is strictly better than guessing.
+     */
+    if (JNATIVE_METHOD_ROOT_OFFSET > 0) {
+        *(void**)((char*)method + JNATIVE_METHOD_ROOT_OFFSET) = method;
+    }
+
     return method;
 }
 
@@ -440,6 +486,38 @@ static void* create_constructor_mirror(ReflectionClass* declaring_cls,
     *(void**)((char*)ctor + JNATIVE_CTOR_PARAM_TYPES_OFFSET) = param_types;
     *(void**)((char*)ctor + JNATIVE_CTOR_EXC_TYPES_OFFSET)   = exc_types;
     *(int32_t*)((char*)ctor + JNATIVE_CTOR_MODIFIERS_OFFSET) = rc_ctor->modifiers;
+
+    /*
+     * Make the mirror its own root.
+     *
+     * The JDK's Constructor.copy() distinguishes "root" objects
+     * (root != null) from "seed" objects (root == null). Seeds are
+     * legal only while constructorAccessor is also null, because
+     * copy() rejects a seed whose accessor has already been set:
+     *
+     *     if (this.root != null)
+     *         return new Constructor<>(root);
+     *     if (this.constructorAccessor != null)
+     *         throw new IllegalArgumentException(
+     *             "Can not copy a non-root Constructor");
+     *
+     * The mirrors built here are cached by Class.reflectionData() and
+     * survive across calls, so once anything -- newInstance() through
+     * acquireConstructorAccessor(), or the shared-accessor propagation
+     * path in Constructor.copy()/setConstructorAccessor -- has set
+     * constructorAccessor on the mirror, the *next* copy() on that
+     * same mirror takes the throw path.
+     *
+     * Marking the mirror as its own root makes copy() short-circuit
+     * into the first branch on every call, which is exactly the state
+     * Constructor.copy() would have produced for the first copy it
+     * ever made. Subsequent copies then point at this mirror as their
+     * shared root, which is precisely the sharing design copy()
+     * documents.
+     */
+    if (JNATIVE_CTOR_ROOT_OFFSET > 0) {
+        *(void**)((char*)ctor + JNATIVE_CTOR_ROOT_OFFSET) = ctor;
+    }
 
     return ctor;
 }

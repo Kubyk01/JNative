@@ -569,6 +569,48 @@ public class MethodBytecodeVisitor extends ClassVisitor {
                 && desc.startsWith("(Ljava/lang/String;")) {
                 return true;
             }
+            // ------------------------------------------------------------------
+            // Class.getConstructor / Class.getDeclaredConstructor.
+            //
+            // The constructor-lookup counterparts of getMethod / getDeclaredMethod.
+            // They are just as important for reachability: the JDK resolves many
+            // security-critical implementations (NativePRNG, DRBG, SHA1PRNG,
+            // any ServiceLoader-loaded SPI) exclusively through
+            // Class.getConstructor(Class[]) inside
+            // java.security.Provider$Service.newInstanceUtil.
+            //
+            // Without recognising them here:
+            //
+            //   - Provider$Service.newInstanceUtil's reflective call is invisible
+            //     to the walk, so nothing is registered in ReflectInfo;
+            //   - LlvmGlobalEmitter.generateReflectionData then emits
+            //     @refctors_<target> = [1 x i8*] [i8* null] for every such target;
+            //   - at run time, Class.getConstructor0 -> getDeclaredConstructors0
+            //     returns an empty array, the reflective lookup fails with
+            //     NoSuchMethodException even for a public constructor, and the
+            //     caller's "should not happen" fallback is what surfaces:
+            //
+            //       NoSuchAlgorithmException: Error constructing implementation
+            //         (algorithm: NativePRNG, provider: SUN,
+            //          class: sun.security.provider.NativePRNG)
+            //         ... caused by
+            //       NoSuchMethodException:
+            //         sun.security.provider.NativePRNG.<init>(
+            //             java.security.SecureRandomParameters)
+            //
+            // The descriptor has no name argument (constructors are always named
+            // <init>); the Class[] carries only the parameter types, whose
+            // individual elements are not visible through the TypeSimulator's
+            // array handling. The handler therefore registers every declared
+            // constructor of the target class — the same conservative policy
+            // that registerAllMethodsByName already uses for
+            // getDeclaredMethod's varargs form.
+            // ------------------------------------------------------------------
+            if (owner.equals("java/lang/Class")
+                && (name.equals("getConstructor") || name.equals("getDeclaredConstructor"))
+                && desc.equals("([Ljava/lang/Class;)Ljava/lang/reflect/Constructor;")) {
+                return true;
+            }
             if (owner.equals("java/lang/Class") && (name.equals("getField") || name.equals("getDeclaredField"))
                 && desc.startsWith("(Ljava/lang/String;)")) {
                 return true;
@@ -914,6 +956,83 @@ public class MethodBytecodeVisitor extends ClassVisitor {
                 if (!anyRegistered) {
                     registerAllMethodsByName(targetClass, cn, methodName);
                 }
+                return;
+            }
+
+            // ------------------------------------------------------------------
+            // Class.getConstructor / Class.getDeclaredConstructor.
+            //
+            // The receiver is the class whose constructors are being looked up,
+            // exactly as with getDeclaredMethod. The descriptor is varargs
+            // (Class<?>...), so the parameter list arrives as a single opaque
+            // Class[] — the same limitation that forces the getDeclaredMethod
+            // handler into its name-only fallback. The conservative answer here
+            // is the same: register every declared constructor of the target.
+            //
+            // Two things must happen for the target to become usable:
+            //
+            //   1. reflectInfo.addConstructor(targetClass, <init>desc). This is
+            //      what makes @refctors_<target> carry a real entry for the
+            //      constructor. Constructors live in a separate bucket of
+            //      ReflectClassInfo from methods, and they are consumed by
+            //      emitAdaptorForConstructor, whose symbol-name construction
+            //      goes through LlvmRuntime.mangleMethod and therefore sanitises
+            //      <init> correctly. Routing them into the methods bucket would
+            //      make emitAdaptorForMethod try to build an adaptor symbol from
+            //      the raw name "<init>" — the angle brackets are not legal LLVM
+            //      symbol characters and clang rejects the whole module.
+            //
+            //   2. addMethodWithContext(<init>desc, true). This is what pulls the
+            //      constructor's bytecode into the module as an IR Function.
+            //      Without it, generateReflectionData would find the entry in the
+            //      reflection table but no function body to point the adaptor at,
+            //      and the @refctor_* constant would carry i8* null in its adaptor
+            //      slot — Constructor.newInstance() would then NPE on the null
+            //      target at run time.
+            //
+            // registerAllMethodsByName already handles the "<init>" case
+            // correctly: it routes through reflectInfo.addConstructor, not
+            // addMethod, and it calls addMethodWithContext for each one. We just
+            // dispatch into it.
+            //
+            // The public/declared distinction (publicOnly=true vs false) is not
+            // modelled at the visitor level on purpose: the C side
+            // (Class.getDeclaredConstructors0 in Class.c) applies the public-only
+            // filter itself, and registering all constructors is what lets the
+            // two forms of the lookup — getConstructor(Class[]) and
+            // getDeclaredConstructor(Class[]) — share one reflection table.
+            // ------------------------------------------------------------------
+            if (owner.equals("java/lang/Class")
+                && (mName.equals("getConstructor") || mName.equals("getDeclaredConstructor"))
+                && mDesc.equals("([Ljava/lang/Class;)Ljava/lang/reflect/Constructor;")) {
+
+                // The target is the receiver, not lastLoadedClass: for the varargs
+                // form with explicit parameter classes the last class literal LDC'd
+                // is one of the parameter types, not the class the lookup is
+                // performed on. See the identical reasoning in the getDeclaredMethod
+                // handler above.
+                String targetClass = null;
+                if (receiver != null) {
+                    targetClass = resolveClassNameFromValue(receiver);
+                }
+                if (targetClass == null) {
+                    targetClass = lastLoadedClass;
+                }
+                if (targetClass == null) return;
+
+                // Arrays have no constructors in this model — everything they
+                // inherit is from java/lang/Object and is already covered by the
+                // ordinary Object handling. Skip without loss of correctness.
+                if (targetClass.charAt(0) == '[') return;
+
+                ClassNode cn = resolver.getClassNode(targetClass);
+                if (cn == null || cn.isExternal() || resolver.getClassBytes(targetClass) == null) {
+                    resolver.forceLoadSystemClass(targetClass);
+                    cn = resolver.getClassNode(targetClass);
+                }
+                if (cn == null || cn.isExternal()) return;
+
+                registerAllMethodsByName(targetClass, cn, "<init>");
                 return;
             }
 

@@ -66,12 +66,14 @@ int32_t JNATIVE_METHOD_RETURN_TYPE_OFFSET  = -1;
 int32_t JNATIVE_METHOD_PARAM_TYPES_OFFSET  = -1;
 int32_t JNATIVE_METHOD_EXC_TYPES_OFFSET    = -1;
 int32_t JNATIVE_METHOD_MODIFIERS_OFFSET    = -1;
+int32_t JNATIVE_METHOD_ROOT_OFFSET         = -1;
 
 int32_t JNATIVE_CTOR_CLAZZ_OFFSET       = -1;
 int32_t JNATIVE_CTOR_SLOT_OFFSET        = -1;
 int32_t JNATIVE_CTOR_PARAM_TYPES_OFFSET = -1;
 int32_t JNATIVE_CTOR_EXC_TYPES_OFFSET   = -1;
 int32_t JNATIVE_CTOR_MODIFIERS_OFFSET   = -1;
+int32_t JNATIVE_CTOR_ROOT_OFFSET        = -1;
 
 /* ============================================================================
  * Reflect-mirror layout hand-off
@@ -98,7 +100,9 @@ void __jnative_reflect_set_layout(
     int32_t ctor_slot_offset,
     int32_t ctor_param_types_offset,
     int32_t ctor_exc_types_offset,
-    int32_t ctor_modifiers_offset)
+    int32_t ctor_modifiers_offset,
+    int32_t ctor_root_offset,
+    int32_t method_root_offset)
 {
     /* First call wins. Everything after is either a no-op (identical
      * values, the common case in a well-formed image where @main runs
@@ -117,11 +121,13 @@ void __jnative_reflect_set_layout(
          || JNATIVE_METHOD_PARAM_TYPES_OFFSET  != method_param_types_offset
          || JNATIVE_METHOD_EXC_TYPES_OFFSET    != method_exc_types_offset
          || JNATIVE_METHOD_MODIFIERS_OFFSET    != method_modifiers_offset
+         || JNATIVE_METHOD_ROOT_OFFSET         != method_root_offset
          || JNATIVE_CTOR_CLAZZ_OFFSET       != ctor_clazz_offset
          || JNATIVE_CTOR_SLOT_OFFSET        != ctor_slot_offset
          || JNATIVE_CTOR_PARAM_TYPES_OFFSET != ctor_param_types_offset
          || JNATIVE_CTOR_EXC_TYPES_OFFSET   != ctor_exc_types_offset
-         || JNATIVE_CTOR_MODIFIERS_OFFSET   != ctor_modifiers_offset) {
+         || JNATIVE_CTOR_MODIFIERS_OFFSET   != ctor_modifiers_offset
+         || JNATIVE_CTOR_ROOT_OFFSET        != ctor_root_offset) {
             fprintf(stderr,
                 "jnative: warning: __jnative_reflect_set_layout called "
                 "twice with different values; ignoring the second call\n");
@@ -142,12 +148,14 @@ void __jnative_reflect_set_layout(
     JNATIVE_METHOD_PARAM_TYPES_OFFSET  = method_param_types_offset;
     JNATIVE_METHOD_EXC_TYPES_OFFSET    = method_exc_types_offset;
     JNATIVE_METHOD_MODIFIERS_OFFSET    = method_modifiers_offset;
+    JNATIVE_METHOD_ROOT_OFFSET         = method_root_offset;
 
     JNATIVE_CTOR_CLAZZ_OFFSET       = ctor_clazz_offset;
     JNATIVE_CTOR_SLOT_OFFSET        = ctor_slot_offset;
     JNATIVE_CTOR_PARAM_TYPES_OFFSET = ctor_param_types_offset;
     JNATIVE_CTOR_EXC_TYPES_OFFSET   = ctor_exc_types_offset;
     JNATIVE_CTOR_MODIFIERS_OFFSET   = ctor_modifiers_offset;
+    JNATIVE_CTOR_ROOT_OFFSET        = ctor_root_offset;
 }
 
 /* ============================================================================

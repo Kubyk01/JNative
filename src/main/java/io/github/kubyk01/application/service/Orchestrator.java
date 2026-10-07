@@ -15,6 +15,7 @@ import io.github.kubyk01.application.service.optimizer.Optimizer;
 import io.github.kubyk01.domain.analyzer.AnalyzerResult;
 import io.github.kubyk01.domain.analyzer.aliasanalysis.AliasAnalysisResult;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.ClassNode;
+import io.github.kubyk01.domain.analyzer.dependencyresolver.MethodNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.MethodReference;
 import io.github.kubyk01.domain.analyzer.escapeanalysis.EscapeAnalysisResult;
 import io.github.kubyk01.domain.analyzer.lifetime.LifetimeAnalysisResult;
@@ -130,7 +131,7 @@ public class Orchestrator implements OrchestratorPort {
         // method listings would be missing them and the vtable slots would
         // hold unresolved thunks.
         forceResourceStreamMethods(analysis);
-        forceProviderServiceClasses(analysis);
+        forceProviderServiceClasses(analysis, resolver);
 
         // ------------------------------------------------------------------
         // Superclass-<clinit> closure.
@@ -362,16 +363,87 @@ public class Orchestrator implements OrchestratorPort {
             new MethodReference(owner, "close", "()V"));
     }
 
-    private void forceProviderServiceClasses(ReachabilityAnalysis analysis) {
+    private void forceProviderServiceClasses(ReachabilityAnalysis analysis,
+                                             DependencyResolver resolver) {
         for (String cn : new String[] {
                 "sun/security/provider/DRBG",
                 "sun/security/provider/SecureRandom",
-                "sun/security/provider/SHA1PRNG",   // pre-17 fallback
+                "sun/security/provider/SHA1PRNG",
                 "sun/security/provider/NativePRNG",
+                "sun/security/provider/NativePRNG$Blocking",
+                "sun/security/provider/NativePRNG$NonBlocking",
+                "sun/security/provider/NativePRNG$RandomIO",
+                "sun/security/provider/NativePRNG$Variant",
                 "java/security/SecureRandomParameters",
                 "java/security/DrbgParameters",
+                "java/security/DrbgParameters$Instantiation",
+                "java/security/DrbgParameters$Reseed",
+                "java/security/DrbgParameters$NextBytes",
         }) {
             analysis.addInstantiatedClass(cn, /* fromUser */ false);
+            registerConstructorForReflection(analysis, resolver, cn);
+        }
+    }
+
+    /**
+     * Makes every declared {@code <init>} of {@code className} reachable
+     * and registers it in the reflection table.
+     *
+     * <p>The instantiation of secure-random providers happens
+     * reflectively — see {@code java.security.Provider$Service
+     * .newInstanceUtil} and {@code Class.getConstructor(Class[])}.
+     * Fix #1 in {@code MethodBytecodeVisitor} makes that lookup visible
+     * to the reachability walk, so under normal circumstances these
+     * constructors would already be registered by the time this method
+     * runs. The two operations below are a deliberate belt-and-braces:
+     * they cover the corner case where the reflective call site is not
+     * reached (for example because a JDK optimisation short-circuits a
+     * path this build's reachability walk did not anticipate), and they
+     * cost nothing when Fix #1 has already done the work — both stores
+     * below use set semantics, so re-registering an already-present
+     * constructor is a no-op.</p>
+     *
+     * <p>These two operations are independent and both required:</p>
+     *
+     * <ul>
+     *   <li>{@link ReachabilityAnalysis#getReflectInfo()}
+     *       {@code .addConstructor(...)} is what makes the constructor
+     *       appear in {@code @refctors_<class>}. The C side's
+     *       {@code Class.getDeclaredConstructors0} walks that array to
+     *       build a {@code Constructor[]} for the Java layer.</li>
+     *
+     *   <li>{@link ReachabilityAnalysis#addExtraReachableMethod} is what
+     *       pulls the constructor's bytecode into the module as an IR
+     *       {@code Function}. Without it, {@code @refctors_<class>} would
+     *       contain entries but their adaptor slot would be
+     *       {@code i8* null} — see {@code generateReflectionData} — and
+     *       {@code Constructor.newInstance()} would dereference a null
+     *       target at run time.</li>
+     * </ul>
+     */
+    private void registerConstructorForReflection(ReachabilityAnalysis analysis,
+                                                  DependencyResolver resolver,
+                                                  String className) {
+        ClassNode cn = resolver.getClassNode(className);
+        if (cn == null || cn.isExternal() || resolver.getClassBytes(className) == null) {
+            resolver.forceLoadSystemClass(className);
+            cn = resolver.getClassNode(className);
+        }
+        if (cn == null || cn.isExternal()) {
+            log.debug("registerConstructorForReflection: {} is not available "
+                + "in the class map after a forced load; skipping", className);
+            return;
+        }
+
+        for (MethodNode mn : cn.getMethods()) {
+            if (!"<init>".equals(mn.getName())) continue;
+            if (mn.getDescriptor() == null || mn.getDescriptor().isEmpty()) continue;
+
+            MethodReference ref = new MethodReference(
+                className, mn.getName(), mn.getDescriptor());
+
+            analysis.getReflectInfo().addConstructor(className, ref);
+            analysis.addExtraReachableMethod(ref);
         }
     }
 
