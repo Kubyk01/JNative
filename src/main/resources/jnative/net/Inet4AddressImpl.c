@@ -4,8 +4,10 @@
 #include <string.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <errno.h>
 #include <netdb.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
@@ -249,4 +251,65 @@ void* __jnative_fn_java_net_Inet4AddressImpl_getLocalHostName___Ljava_lang_Strin
     }
     buf[sizeof(buf) - 1] = '\0';
     return jnative_string(buf);
+}
+
+/*
+ * private native boolean isReachable0(byte[] addr, int timeout,
+ *                                     byte[] inf, int ttl)
+ *     throws IOException;
+ *
+ * IPv4 counterpart of Inet6AddressImpl.isReachable0. The four-argument
+ * form is the JDK 21 IPv4 signature; the arguments are the 4-byte
+ * network-order address, the timeout in milliseconds, an optional
+ * 4-byte local-interface address, and the TTL for the echo probe.
+ *
+ * The same TCP-connect fallback that the IPv6 implementation uses
+ * applies here: the raw-socket ICMP path requires root and is not
+ * available in this runtime, so the fallback is what actually runs.
+ * A successful connect or a refused connect both prove the host is
+ * on a working path; an unreachable or timed-out attempt proves the
+ * opposite.
+ */
+int32_t __jnative_fn_java_net_Inet4AddressImpl_isReachable0___BI_BI_Z(
+        void* addr_bytes, int32_t timeout,
+        void* inf_bytes, int32_t ttl)
+{
+    (void)inf_bytes; (void)ttl;
+
+    if (addr_bytes == NULL) {
+        __jnative_throw_null_pointer_exception();
+        return 0;
+    }
+    int32_t addr_len = jnative_array_length(addr_bytes);
+    if (addr_len != 4) {
+        return 0;
+    }
+    const uint8_t* addr = (const uint8_t*)jnative_array_data(addr_bytes);
+
+    struct sockaddr_in sin;
+    memset(&sin, 0, sizeof(sin));
+    sin.sin_family = AF_INET;
+    memcpy(&sin.sin_addr, addr, 4);
+    sin.sin_port = htons(7);
+
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return 0;
+    }
+
+    if (timeout > 0) {
+        struct timeval tv;
+        tv.tv_sec  = timeout / 1000;
+        tv.tv_usec = (timeout % 1000) * 1000;
+        (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    }
+
+    int rc;
+    do {
+        rc = connect(fd, (struct sockaddr*)&sin, sizeof(sin));
+    } while (rc < 0 && errno == EINTR);
+
+    int reachable = (rc == 0 || errno == ECONNREFUSED) ? 1 : 0;
+    close(fd);
+    return reachable;
 }

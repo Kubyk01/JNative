@@ -4,8 +4,10 @@
 #include <string.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <errno.h>
 #include <netdb.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
@@ -194,4 +196,103 @@ void* __jnative_fn_java_net_Inet6AddressImpl_getLocalHostName___Ljava_lang_Strin
     }
     buf[sizeof(buf) - 1] = '\0';
     return jnative_string(buf);
+}
+
+/*
+ * private native boolean isReachable0(byte[] addr, int scope,
+ *                                     int timeout, byte[] inf,
+ *                                     int ttl, int if_scope)
+ *     throws IOException;
+ *
+ * Probes reachability of a remote IPv6 or IPv4 address. The `addr`
+ * argument is the 4- or 16-byte network-order address, `inf` is an
+ * optional 4- or 16-byte local-interface address, and the remaining
+ * arguments are the ICMP/echo parameters that the reference
+ * implementation passes to the platform's reachability mechanism.
+ *
+ * The reference implementation builds a raw socket or uses the
+ * platform's ping equivalent. Raw-socket ICMP requires root, uses
+ * SOCK_RAW which the runtime's ordinary socket machinery cannot
+ * emulate, and is not part of any code path the image exercises
+ * except via InetAddress.isReachable, which itself is specified to
+ * have a fallback when ICMP is unavailable.
+ *
+ * The runtime therefore implements the fallback directly: a TCP
+ * connect(2) to port 7 (echo) with the caller-supplied timeout. Any
+ * successful connect — including ECONNREFUSED, which proves a
+ * listener-reachable host exists on the path — reports the address
+ * as reachable. A timeout or an EHOSTUNREACH / ENETUNREACH reports
+ * unreachable. This matches the reference implementation's own
+ * documented fallback behaviour for the case where the ICMP path is
+ * unavailable, and satisfies the Java-level contract of
+ * InetAddress.isReachable(timeout).
+ */
+int32_t __jnative_fn_java_net_Inet6AddressImpl_isReachable0___BII_BII_Z(
+        void* addr_bytes, int32_t scope, int32_t timeout,
+        void* inf_bytes, int32_t ttl, int32_t if_scope)
+{
+    (void)scope; (void)inf_bytes; (void)ttl; (void)if_scope;
+
+    if (addr_bytes == NULL) {
+        __jnative_throw_null_pointer_exception();
+        return 0;
+    }
+
+    int32_t addr_len = jnative_array_length(addr_bytes);
+    const uint8_t* addr = (const uint8_t*)jnative_array_data(addr_bytes);
+
+    struct sockaddr_storage ss;
+    memset(&ss, 0, sizeof(ss));
+    socklen_t sslen;
+
+    if (addr_len == 4) {
+        struct sockaddr_in* sin = (struct sockaddr_in*)&ss;
+        sin->sin_family = AF_INET;
+        memcpy(&sin->sin_addr, addr, 4);
+        sin->sin_port = htons(7);
+        sslen = sizeof(*sin);
+    } else if (addr_len == 16) {
+        struct sockaddr_in6* sin6 = (struct sockaddr_in6*)&ss;
+        sin6->sin6_family = AF_INET6;
+        memcpy(&sin6->sin6_addr, addr, 16);
+        sin6->sin6_port = htons(7);
+        sslen = sizeof(*sin6);
+    } else {
+        return 0;
+    }
+
+    int fd = socket(ss.ss_family, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return 0;
+    }
+
+    /* Apply the caller's timeout to the connect attempt. A zero or
+     * negative timeout means "use the platform default", which for a
+     * blocking connect is roughly the kernel's SYN retry window; the
+     * Java-level isReachable(0) means "use the default timeout", so
+     * leaving SO_SNDTIMEO unset in that case is correct. */
+    if (timeout > 0) {
+        struct timeval tv;
+        tv.tv_sec  = timeout / 1000;
+        tv.tv_usec = (timeout % 1000) * 1000;
+        (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    }
+
+    int rc;
+    do {
+        rc = connect(fd, (struct sockaddr*)&ss, sslen);
+    } while (rc < 0 && errno == EINTR);
+
+    int reachable = 0;
+    if (rc == 0) {
+        reachable = 1;
+    } else if (errno == ECONNREFUSED) {
+        /* The host answered — it is reachable even though nothing
+         * is listening on port 7. This is the same reasoning the
+         * reference implementation uses for its TCP fallback. */
+        reachable = 1;
+    }
+
+    close(fd);
+    return reachable;
 }

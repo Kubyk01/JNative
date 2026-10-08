@@ -15,6 +15,9 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/xattr.h>
+#include <grp.h>
+#include <pwd.h>
+#include <stdio.h>
 
 #include "jnative_runtime.h"
 
@@ -606,4 +609,141 @@ int32_t __jnative_fn_sun_nio_fs_UnixNativeDispatcher_flistxattr__IJI_I(
         return 0;
     }
     return (int32_t)res;
+}
+
+/*
+ * ===================================================================
+ * Additional entry points required by JDK 21's UnixUserPrincipals
+ * and by the extended-attribute view.
+ * ===================================================================
+ *
+ *   getgrgid(int gid) -> byte[]
+ *       Resolves a numeric group id to the group's name via getgrgid(3).
+ *       Called from UnixUserPrincipals.fromGid when the Java layer needs
+ *       to render a GroupPrincipal's name. A NULL result means the gid
+ *       has no entry in /etc/group; the caller treats that as "unknown
+ *       group" and falls back to the numeric form.
+ *
+ *   fremovexattr0(int fd, long nameAddress) -> void
+ *       Removes an extended attribute from the file descriptor. Called
+ *       from UnixUserDefinedFileAttributeView.delete when a caller
+ *       removes a user-defined attribute. ENOATTR (the attribute does
+ *       not exist) is reported through the generic throw helper, which
+ *       the Java layer translates into the appropriate IOException.
+ *
+ *   fstatat0(int dfd, long pathAddress, int flags,
+ *            UnixFileAttributes attrs) -> void
+ *       fstatat(2) with an explicit directory descriptor. Called from
+ *       UnixFileSystemProvider.readAttributesIfExists and from the
+ *       readAttributes(Path, Class, LinkOption...) path when a
+ *       relative path is resolved against a directory stream.
+ *       Reuses the same fill_attrs() that stat0/lstat0/fstat0 use so
+ *       every accessor produces an identical UnixFileAttributes.
+ */
+
+void* __jnative_fn_sun_nio_fs_UnixNativeDispatcher_getgrgid__I__B(int32_t gid) {
+    struct group* gr = getgrgid((gid_t)gid);
+    if (gr == NULL || gr->gr_name == NULL) {
+        return NULL;
+    }
+    return make_byte_array(gr->gr_name, strlen(gr->gr_name));
+}
+
+void __jnative_fn_sun_nio_fs_UnixNativeDispatcher_fremovexattr0__IJ_V(
+        int32_t fd, int64_t nameAddress)
+{
+    if (fremovexattr((int)fd, path_of(nameAddress)) < 0) {
+        __jnative_throw_exception(NULL);
+    }
+}
+
+void __jnative_fn_sun_nio_fs_UnixNativeDispatcher_fstatat0__IJILsun_nio_fs_UnixFileAttributes__V(
+        int32_t dfd, int64_t pathAddress, int32_t flags, void* attrs)
+{
+    struct stat st;
+    if (fstatat((int)dfd, path_of(pathAddress), &st, (int)flags) < 0) {
+        __jnative_throw_exception(NULL);
+        return;
+    }
+    fill_attrs(attrs, &st);
+}
+
+/*
+ * static native byte[] getpwuid(int uid);
+ *
+ * Resolves a numeric user id to the user's name via getpwuid(3). Called
+ * from UnixUserPrincipals.fromUid when the Java layer needs to render a
+ * UserPrincipal's name. A NULL result means the uid has no entry in
+ * /etc/passwd; the caller treats that as "unknown user" and falls back
+ * to the numeric form, exactly as it does for getgrgid.
+ */
+void* __jnative_fn_sun_nio_fs_UnixNativeDispatcher_getpwuid__I__B(int32_t uid) {
+    struct passwd* pw = getpwuid((uid_t)uid);
+    if (pw == NULL || pw->pw_name == NULL) {
+        return NULL;
+    }
+    return make_byte_array(pw->pw_name, strlen(pw->pw_name));
+}
+
+/*
+ * static native void renameat0(int oldfd, long oldpath,
+ *                              int newfd, long newpath);
+ *
+ * renameat(2) with explicit directory descriptors. Called from
+ * UnixCopyFile.move when the source and destination live in the same
+ * mounted filesystem and the move can be performed as a single
+ * rename; the two directory descriptors come from the open
+ * directory streams that the Java-side Files.move keeps alive for the
+ * duration of the operation.
+ *
+ * Any failure — EXDEV (cross-filesystem), ENOENT, EACCES, EISDIR when
+ * the source is a directory and the destination exists as a
+ * non-directory — is routed through the generic throw helper. The
+ * Java-side caller catches that as an IOException and falls back to
+ * the copy-then-delete path.
+ */
+void __jnative_fn_sun_nio_fs_UnixNativeDispatcher_renameat0__IJIJ_V(
+        int32_t oldfd, int64_t oldpath, int32_t newfd, int64_t newpath)
+{
+    if (renameat((int)oldfd, path_of(oldpath),
+                 (int)newfd, path_of(newpath)) < 0) {
+        __jnative_throw_exception(NULL);
+    }
+}
+
+/*
+ * static native byte[] realpath0(long pathAddress);
+ *
+ * Canonicalises the given path via realpath(3), which:
+ *
+ *   1. makes the path absolute by prepending the current working
+ *      directory if it is relative;
+ *   2. resolves every symbolic link along the way;
+ *   3. collapses "." and ".." components;
+ *   4. requires the result to name an existing file — realpath fails
+ *      with ENOENT if any intermediate component does not exist.
+ *
+ * The result is returned as a byte[] rather than as a Java String,
+ * matching the convention every other path-returning native in this
+ * file uses: the Java layer converts the bytes into the platform's
+ * native charset itself, which it has to do anyway because the
+ * canonical form is defined to be in the *native* encoding rather
+ * than in whatever charset the JVM happens to have been started with.
+ *
+ * A failed realpath — ENOENT, EACCES, ENAMETOOLONG, a symlink loop —
+ * surfaces as an IOException through the generic throw helper.
+ * UnixPath.toRealPath's contract is to throw NoSuchFileException,
+ * FileSystemException or IOException depending on the errno, and the
+ * Java side inspects the exception it catches to pick the right one.
+ */
+void* __jnative_fn_sun_nio_fs_UnixNativeDispatcher_realpath0__J__B(
+        int64_t pathAddress)
+{
+    char buf[PATH_MAX];
+    char* resolved = realpath(path_of(pathAddress), buf);
+    if (resolved == NULL) {
+        __jnative_throw_exception(NULL);
+        return NULL;
+    }
+    return make_byte_array(resolved, strlen(resolved));
 }

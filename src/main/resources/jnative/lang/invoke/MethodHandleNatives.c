@@ -656,3 +656,30 @@ void __jnative_fn_java_lang_invoke_MethodHandleNatives_clearCallerSensitive__Lja
     flags &= ~MN_CALLER_SENSITIVE;
     *(int32_t*)((char*)member + MEMBERNAME_FIELD_FLAGS) = flags;
 }
+
+/*
+ * static native void clearCallSiteContext(CallSiteContext context);
+ *
+ * Called from CallSiteContext.run() as the last step of the context's
+ * cleanup. A CallSiteContext is created once per CallSite by
+ * MethodHandleNatives.makeCallSiteContext and holds whatever
+ * VM-specific resources the CallSite's lifetime needs to release
+ * (in HotSpot, a per-call-site dependency list for the JIT's
+ * speculative inlining).
+ *
+ * This runtime has no JIT, no speculative inlining, and no
+ * per-call-site metadata: a CallSite is just a java.lang.invoke.CallSite
+ * object whose target MethodHandle can be replaced at will. There is
+ * nothing to release, so the call is a strict no-op.
+ *
+ * The symbol must nevertheless exist because CallSiteContext.run is
+ * reachable from the JDK's own cleanup path (the
+ * CleanerFactory.cleaner() chain pulls it in), and the linker needs a
+ * body. Making it a no-op is the only correct behaviour for a runtime
+ * that has no VM-side resource to clear.
+ */
+void __jnative_fn_java_lang_invoke_MethodHandleNatives_clearCallSiteContext__Ljava_lang_invoke_MethodHandleNatives_CallSiteContext__V(
+        void* context)
+{
+    (void)context;
+}

@@ -911,3 +911,61 @@ int64_t __jnative_fn_java_lang_Thread_getNextThreadIdOffset___J(void) {
 void __jnative_fn_java_lang_Thread_registerNatives___V(void* arg) {
     (void)arg;
 }
+
+/*
+ * private static native Thread[] getThreads();
+ *
+ * Snapshot of every java.lang.Thread object known to the runtime's
+ * ThreadState table. The table is process-wide and is populated by
+ * get_or_create_thread_state() the first time a Thread object is seen
+ * by any of the natives in this file; the synthetic main thread is
+ * inserted at process start-up by ensure_main_thread().
+ *
+ * The Java-side callers are Thread.getAllStackTraces() and
+ * System$2.getAllThreads() (the jdk.internal.misc.JavaLangAccess
+ * implementation). Both iterate the result and query per-thread state
+ * through the other natives in this file, so the objects returned here
+ * need only be the same Thread instances the other natives will
+ * recognise.
+ *
+ * A thread whose ThreadState has already been reaped (finished == 1
+ * and running == 0) is included in the snapshot: Thread.getAllStackTraces
+ * is specified to return every live thread, and a thread whose Java-level
+ * run() has returned is still "live" in the language sense until it has
+ * been joined or GCed. Filtering it out here would make the result of
+ * getAllStackTraces disagree with Thread.isAlive().
+ *
+ * The result is always non-null. When the ThreadState table is empty —
+ * which can only happen if neither currentThread() nor any of the
+ * constructors have run yet — the function returns an empty Thread[]
+ * rather than null, matching the Java-level contract of
+ * Thread.getAllStackTraces being defined for every program state.
+ */
+void* __jnative_fn_java_lang_Thread_getThreads____Ljava_lang_Thread_(void) {
+    pthread_mutex_lock(&thread_table_lock);
+
+    int32_t count = 0;
+    for (ThreadState* s = thread_table; s; s = s->next) {
+        if (s->java_thread != NULL) count++;
+    }
+
+    void* array = jnative_ref_array_of_class(
+        NULL, count, "[Ljava/lang/Thread;");
+
+    if (array != NULL) {
+        void** slots = (void**)((char*)array + JAVA_ARR_HDR);
+        int32_t i = 0;
+        for (ThreadState* s = thread_table; s && i < count; s = s->next) {
+            if (s->java_thread != NULL) {
+                slots[i++] = s->java_thread;
+            }
+        }
+    }
+
+    pthread_mutex_unlock(&thread_table_lock);
+
+    if (array == NULL) {
+        __jnative_throw_out_of_memory_error_ctx("Thread.getThreads");
+    }
+    return array;
+}

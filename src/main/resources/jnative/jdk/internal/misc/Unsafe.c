@@ -1076,3 +1076,44 @@ void __jnative_fn_jdk_internal_misc_Unsafe_freeMemory0__J_V(void* this_unsafe, v
  */
 void __jnative_fn_jdk_internal_misc_Unsafe_registerNatives___V(void) {
 }
+
+/* ===================================================================
+ * Cache-line writeback primitives.
+ * ===================================================================
+ *
+ * These three entry points are the PowerPC cache-flush sequence that
+ * Unsafe.writebackMemory uses when the VM was built with a non-zero
+ * DATA_CACHE_LINE_FLUSH_SIZE. The Java-side method reads that
+ * constant through Unsafe.dataCacheLineFlushSize() and short-circuits
+ * the whole writeback path when it is 0 -- which is exactly what the
+ * UnsafeConstants fix in this build makes it.
+ *
+ * The symbols must nevertheless exist because Unsafe.writebackMemory
+ * itself is reachable (the DirectByteBuffer cleaner pulls it in), the
+ * emitter therefore declares all three in the module, and the linker
+ * requires a body for each. Because the runtime never executes the
+ * PPC sequence -- it has no PowerPC target and the Java side never
+ * calls into it on x86_64 or aarch64 -- the correct body is the one
+ * that matches the "no cache-flush primitive" state the VM already
+ * reports: a no-op that leaves the memory subsystem to the ordinary
+ * store instructions the surrounding code already issued.
+ *
+ * Writeback0 is the actual flush of a single cache line; it is
+ * declared to take the address of the line's first byte. On every
+ * platform this runtime targets, the store instructions that preceded
+ * the call have already committed the line to the cache hierarchy,
+ * and the CPU handles the eventual write-back to DRAM on its own. No
+ * additional instruction is required to preserve the semantics the
+ * caller relies on (the store is visible to any subsequent read on the
+ * same thread, which is all writebackMemory promises).
+ */
+
+void __jnative_fn_jdk_internal_misc_Unsafe_writebackPreSync0___V(void) {
+}
+
+void __jnative_fn_jdk_internal_misc_Unsafe_writeback0__J_V(int64_t address) {
+    (void)address;
+}
+
+void __jnative_fn_jdk_internal_misc_Unsafe_writebackPostSync0___V(void) {
+}

@@ -94,3 +94,63 @@ int32_t __jnative_fn_java_util_zip_CRC32_updateBytes0__I_BII_I(
     }
     return (int32_t)(c ^ 0xFFFFFFFFu);
 }
+
+/*
+ * private static native int updateByteBuffer0(int crc, long addr,
+ *                                             int off, int len);
+ *
+ * Identical arithmetic to updateBytes0 above; the only difference is
+ * that the input is the raw address of a direct ByteBuffer's payload
+ * rather than a Java byte[]'s payload. `addr` is the base address of
+ * the buffer as returned by DirectBuffer.address(), and `off` is the
+ * caller's byte offset within that buffer. The payload slice being
+ * hashed is therefore exactly [addr + off, addr + off + len).
+ *
+ * The CRC32.update(ByteBuffer) overload reaches this path whenever the
+ * caller supplies a direct buffer, and the checksummed bytes are
+ * identical to what the array-based path would compute over the same
+ * content — the two entry points share the same table-driven inner
+ * loop for exactly that reason.
+ */
+int32_t __jnative_fn_java_util_zip_CRC32_updateByteBuffer0__IJII_I(
+        int32_t crc, int64_t addr, int32_t off, int32_t len)
+{
+    if (addr == 0 || len <= 0) {
+        return crc;
+    }
+
+    if (!crc_table_ready) {
+        build_crc_table();
+    }
+
+    const uint8_t* data = (const uint8_t*)(intptr_t)(addr + off);
+
+    uint32_t c = (uint32_t)crc ^ 0xFFFFFFFFu;
+    for (int32_t i = 0; i < len; i++) {
+        c = crc_table[(c ^ data[i]) & 0xFFu] ^ (c >> 8);
+    }
+    return (int32_t)(c ^ 0xFFFFFFFFu);
+}
+
+/*
+ * private static native int update(int crc, int b);
+ *
+ * Single-byte continuation of a CRC-32 computation. The Java-level
+ * CRC32.update(int b) masks the byte to 8 bits and calls this; the
+ * arithmetic is exactly the same inner step the bulk updateBytes0
+ * performs, just with a single byte. Extracted into its own entry
+ * point because the caller is on the critical path of the
+ * DeflaterOutputStream / GZIPOutputStream write(int) path, and
+ * routing it through the bulk API would require synthesising a
+ * one-element byte array per call.
+ */
+int32_t __jnative_fn_java_util_zip_CRC32_update__II_I(
+        int32_t crc, int32_t b)
+{
+    if (!crc_table_ready) {
+        build_crc_table();
+    }
+    uint32_t c = (uint32_t)crc ^ 0xFFFFFFFFu;
+    c = crc_table[(c ^ (uint8_t)b) & 0xFFu] ^ (c >> 8);
+    return (int32_t)(c ^ 0xFFFFFFFFu);
+}

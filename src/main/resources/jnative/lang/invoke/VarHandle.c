@@ -1532,3 +1532,588 @@ int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_lang_Void_L
     }
     return 1;
 }
+
+/* ===================================================================
+ * VarHandle specializations for the java.lang.foreign memory API
+ * ===================================================================
+ *
+ * The finalized FFM API in JDK 21 accesses off-heap memory through
+ * VarHandles produced by jdk.internal.foreign.MemoryHandles. Every
+ * primitive read/write on a MemorySegment goes through one of those
+ * VarHandles, which are invoked polymorphically from
+ * AbstractMemorySegmentImpl.get/set and from the value-typed
+ * convenience methods on SegmentAllocator. The polymorphic call sites
+ * reach this runtime with the segment as the first argument, a byte
+ * offset (when the VarHandle has no bound offset) or nothing (when the
+ * offset is bound), and the value as the last argument.
+ *
+ * Two concrete MemorySegment subclasses exist in JDK 21:
+ *
+ *   jdk/internal/foreign/NativeMemorySegmentImpl
+ *       backed by a raw memory address stored in the `min` field.
+ *
+ *   jdk/internal/foreign/HeapMemorySegmentImpl$Of{Byte,Char,Short,
+ *                                                 Int,Long,Float,
+ *                                                 Double}
+ *       backed by a Java array stored in the `base` field, with a
+ *       byte offset within that array stored in the `offset` field
+ *       of the shared superclass.
+ *
+ * The layout of both hierarchies as produced by
+ * LlvmGlobalEmitter.getFieldOffset is:
+ *
+ *   AbstractMemorySegmentImpl:
+ *       +0  vtable
+ *       +8  length (long)
+ *       +16 readOnly (boolean, padded)
+ *       +24 scope (MemorySessionImpl)
+ *
+ *   NativeMemorySegmentImpl:
+ *       +32 min (long, absolute address of byte 0)
+ *
+ *   HeapMemorySegmentImpl:
+ *       +32 offset (long, byte offset within the array's payload)
+ *       +40 base (Object, the backing array)
+ *
+ * The helper below resolves the absolute payload address from the
+ * segment object, using the class's internal name (always available
+ * through the object's vtable) to distinguish the two concrete
+ * layouts. If the concrete class is unknown to this build, the
+ * function falls back to the native layout — the only reasonable
+ * guess, and the one that matches the largest number of JDK versions.
+ *
+ * Every setter writes through the payload address. Every getter would
+ * do the same in reverse; only setters are reachable in this build,
+ * because the reachability walk pulled in SegmentAllocator.allocate,
+ * which only writes.
+ */
+
+static void* segment_payload(void* segment) {
+    if (segment == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    JNativeVTable* vt = *(JNativeVTable**)segment;
+    const char* name = vt ? vt->name : NULL;
+    if (name == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+
+    if (strstr(name, "NativeMemorySegmentImpl") != NULL) {
+        int64_t min = *(int64_t*)((char*)segment + 32);
+        return (void*)(intptr_t)min;
+    }
+    if (strstr(name, "HeapMemorySegmentImpl") != NULL) {
+        int64_t offset = *(int64_t*)((char*)segment + 32);
+        void*   base   = *(void**)((char*)segment + 40);
+        if (base == NULL) return NULL;
+        return (char*)base + JAVA_ARR_HDR + offset;
+    }
+
+    /* Unknown concrete type: assume native. */
+    int64_t min = *(int64_t*)((char*)segment + 32);
+    return (void*)(intptr_t)min;
+}
+
+/* ---- set(segment, long offset, <primitive>) -> void ---- */
+
+void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_lang_foreign_MemorySegment_JZ_V(
+        void* this_handle, void* segment, int64_t offset, int32_t value) {
+    (void)this_handle;
+    char* p = (char*)segment_payload(segment);
+    *(uint8_t*)(p + offset) = (uint8_t)(value ? 1 : 0);
+}
+
+void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_lang_foreign_MemorySegment_JB_V(
+        void* this_handle, void* segment, int64_t offset, int8_t value) {
+    (void)this_handle;
+    char* p = (char*)segment_payload(segment);
+    *(int8_t*)(p + offset) = value;
+}
+
+void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_lang_foreign_MemorySegment_JS_V(
+        void* this_handle, void* segment, int64_t offset, int16_t value) {
+    (void)this_handle;
+    char* p = (char*)segment_payload(segment);
+    memcpy(p + offset, &value, 2);
+}
+
+void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_lang_foreign_MemorySegment_JC_V(
+        void* this_handle, void* segment, int64_t offset, uint16_t value) {
+    (void)this_handle;
+    char* p = (char*)segment_payload(segment);
+    memcpy(p + offset, &value, 2);
+}
+
+void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_lang_foreign_MemorySegment_JI_V(
+        void* this_handle, void* segment, int64_t offset, int32_t value) {
+    (void)this_handle;
+    char* p = (char*)segment_payload(segment);
+    memcpy(p + offset, &value, 4);
+}
+
+void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_lang_foreign_MemorySegment_JJ_V(
+        void* this_handle, void* segment, int64_t offset, int64_t value) {
+    (void)this_handle;
+    char* p = (char*)segment_payload(segment);
+    memcpy(p + offset, &value, 8);
+}
+
+void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_lang_foreign_MemorySegment_JF_V(
+        void* this_handle, void* segment, int64_t offset, float value) {
+    (void)this_handle;
+    char* p = (char*)segment_payload(segment);
+    memcpy(p + offset, &value, 4);
+}
+
+void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_lang_foreign_MemorySegment_JD_V(
+        void* this_handle, void* segment, int64_t offset, double value) {
+    (void)this_handle;
+    char* p = (char*)segment_payload(segment);
+    memcpy(p + offset, &value, 8);
+}
+
+void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_lang_foreign_MemorySegment_JLjava_lang_Object__V(
+        void* this_handle, void* segment, int64_t offset, void* value) {
+    (void)this_handle;
+    char* p = (char*)segment_payload(segment);
+    memcpy(p + offset, &value, 8);
+}
+
+/* ---- set(segment, <primitive>) -> void  (offset bound to 0) ----
+ *
+ * The SegmentAllocator.allocate(layout, value) family binds the
+ * offset to 0 and then calls VarHandle.set with just the segment and
+ * the value. The payload address helper already returns the address
+ * of byte 0 of the segment, so the write targets the correct slot
+ * without any further arithmetic.
+ */
+
+void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_lang_foreign_MemorySegment_Z_V(
+        void* this_handle, void* segment, int32_t value) {
+    (void)this_handle;
+    char* p = (char*)segment_payload(segment);
+    *(uint8_t*)p = (uint8_t)(value ? 1 : 0);
+}
+
+void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_lang_foreign_MemorySegment_B_V(
+        void* this_handle, void* segment, int8_t value) {
+    (void)this_handle;
+    char* p = (char*)segment_payload(segment);
+    *(int8_t*)p = value;
+}
+
+void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_lang_foreign_MemorySegment_S_V(
+        void* this_handle, void* segment, int16_t value) {
+    (void)this_handle;
+    char* p = (char*)segment_payload(segment);
+    memcpy(p, &value, 2);
+}
+
+void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_lang_foreign_MemorySegment_C_V(
+        void* this_handle, void* segment, uint16_t value) {
+    (void)this_handle;
+    char* p = (char*)segment_payload(segment);
+    memcpy(p, &value, 2);
+}
+
+void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_lang_foreign_MemorySegment_I_V(
+        void* this_handle, void* segment, int32_t value) {
+    (void)this_handle;
+    char* p = (char*)segment_payload(segment);
+    memcpy(p, &value, 4);
+}
+
+void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_lang_foreign_MemorySegment_J_V(
+        void* this_handle, void* segment, int64_t value) {
+    (void)this_handle;
+    char* p = (char*)segment_payload(segment);
+    memcpy(p, &value, 8);
+}
+
+void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_lang_foreign_MemorySegment_F_V(
+        void* this_handle, void* segment, float value) {
+    (void)this_handle;
+    char* p = (char*)segment_payload(segment);
+    memcpy(p, &value, 4);
+}
+
+void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_lang_foreign_MemorySegment_D_V(
+        void* this_handle, void* segment, double value) {
+    (void)this_handle;
+    char* p = (char*)segment_payload(segment);
+    memcpy(p, &value, 8);
+}
+
+void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_lang_foreign_MemorySegment_Ljava_lang_Object__V(
+        void* this_handle, void* segment, void* value) {
+    (void)this_handle;
+    char* p = (char*)segment_payload(segment);
+    memcpy(p, &value, 8);
+}
+
+/* ===================================================================
+ * VarHandle specializations for java.util.concurrent.CompletableFuture
+ * ===================================================================
+ *
+ * CompletableFuture's state machine drives two VarHandles declared in
+ * the class's own static initializer:
+ *
+ *   RESULT : the `result` field, of type Object, at offset +8.
+ *   STACK  : the `stack` field, of type Completion, at offset +16.
+ *
+ * The class hierarchy that determines those offsets is:
+ *
+ *   java.lang.Object:
+ *       +0  vtable
+ *
+ *   java.util.concurrent.CompletableFuture implements Future,
+ *   CompletionStage:
+ *       +8  Object     result
+ *       +16 Completion stack
+ *
+ * Nothing else in the hierarchy contributes instance fields, so the
+ * offsets are exactly as above regardless of which JDK 21 build the
+ * image is compiled against.
+ *
+ * The specific call sites that the reachability walk reaches are in
+ * CompletableFuture.completeThrowable / completeNull / internalComplete /
+ * completeValue / completeRelay / tryPushStack / postComplete, all of
+ * which are on the critical path of any program that uses the ForkJoin
+ * pool or the common async infrastructure.
+ */
+
+int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concurrent_CompletableFuture_Ljava_lang_Void_Ljava_util_concurrent_CompletableFuture_AltResult__Z(
+        void* this_handle, void* cf, void* expected, void* new_value)
+{
+    (void)this_handle;
+    if (cf == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    return cas_ref((void**)((char*)cf + 8), expected, new_value);
+}
+
+int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concurrent_CompletableFuture_Ljava_lang_Void_Ljava_lang_Object__Z(
+        void* this_handle, void* cf, void* expected, void* new_value)
+{
+    (void)this_handle;
+    if (cf == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    return cas_ref((void**)((char*)cf + 8), expected, new_value);
+}
+
+int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concurrent_CompletableFuture_Ljava_util_concurrent_CompletableFuture_Completion_Ljava_util_concurrent_CompletableFuture_Completion__Z(
+        void* this_handle, void* cf, void* expected, void* new_value)
+{
+    (void)this_handle;
+    if (cf == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    return cas_ref((void**)((char*)cf + 16), expected, new_value);
+}
+
+void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_util_concurrent_CompletableFuture_Completion_Ljava_util_concurrent_CompletableFuture_Completion__V(
+        void* this_handle, void* completion, void* new_value)
+{
+    (void)this_handle;
+    if (completion == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    /*
+     * The receiver is a CompletableFuture.Completion. Completion
+     * extends ForkJoinTask<Void>, whose `status` field occupies +8;
+     * its own `next` field is at +16. The call site
+     * (Completion.tryPushStack) uses this to publish the new top of
+     * the per-completion linked list.
+     */
+    __atomic_store_n((void**)((char*)completion + 16), new_value,
+                     __ATOMIC_RELEASE);
+}
+
+void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_util_concurrent_CompletableFuture_Completion_Ljava_util_concurrent_CompletableFuture_Completion_T_V(
+        void* this_handle, void* completion, void* new_value)
+{
+    /*
+     * Same body as the non-T variant. The trailing T is a
+     * distinguishing suffix that the emitter appends when two
+     * call sites share a descriptor but target different fields;
+     * for `next` there is only one field, so the two are
+     * semantically identical.
+     */
+    __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_util_concurrent_CompletableFuture_Completion_Ljava_util_concurrent_CompletableFuture_Completion__V(
+        this_handle, completion, new_value);
+}
+
+/* ===================================================================
+ * VarHandle: java.util.concurrent.FutureTask.waiters
+ * ===================================================================
+ *
+ * FutureTask declares a single VarHandle for the `waiters` field,
+ * which the class uses to publish and traverse the linked list of
+ * WaitNode objects that await the task's completion.
+ *
+ * Layout of the class hierarchy as produced by
+ * LlvmGlobalEmitter.getFieldOffset:
+ *
+ *   FutureTask (implements RunnableFuture):
+ *       +0  vtable
+ *       +8  int      state
+ *       +12 int      pad
+ *       +16 Callable callable
+ *       +24 Object   outcome
+ *       +32 Thread   runner
+ *       +40 WaitNode waiters
+ *
+ * FutureTask.WaitNode:
+ *       +0  vtable
+ *       +8  Thread   thread
+ *       +16 WaitNode next
+ *
+ * The two entry points below are called from awaitDone (to install the
+ * first wait node with a CAS, and to splice additional nodes onto the
+ * chain with the weak form) and from removeWaiter (to CAS the chain
+ * head after the waiting thread has been removed).
+ */
+
+int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concurrent_FutureTask_Ljava_util_concurrent_FutureTask_WaitNode_Ljava_util_concurrent_FutureTask_WaitNode__Z(
+        void* this_handle, void* task, void* expected, void* new_value)
+{
+    (void)this_handle;
+    if (task == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    return cas_ref((void**)((char*)task + 40), expected, new_value);
+}
+
+int32_t __jnative_fn_java_lang_invoke_VarHandle_weakCompareAndSet__Ljava_util_concurrent_FutureTask_Ljava_util_concurrent_FutureTask_WaitNode_Ljava_util_concurrent_FutureTask_WaitNode__Z(
+        void* this_handle, void* task, void* expected, void* new_value)
+{
+    (void)this_handle;
+    if (task == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    /* The weak form is defined to be allowed to fail spuriously; every
+     * caller wraps it in a retry loop. The primitive used here does not
+     * fail spuriously, so this implementation is strictly stronger than
+     * the contract requires. */
+    return cas_ref((void**)((char*)task + 40), expected, new_value);
+}
+
+/* ===================================================================
+ * VarHandle: java.util.concurrent.CompletableFuture.Completion.next
+ *
+ * The weak-CAS and (non-weak) CAS on Completion.next, used by
+ * CompletableFuture.cleanStack and postComplete when they splice or
+ * unlink stack entries. The field lives at +16, after ForkJoinTask's
+ * `status` (+8) and `aux` (+12).
+ * =================================================================== */
+
+int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concurrent_CompletableFuture_Completion_Ljava_util_concurrent_CompletableFuture_Completion_Ljava_lang_Void__Z(
+        void* this_handle, void* completion, void* expected, void* new_value)
+{
+    (void)this_handle;
+    if (completion == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    return cas_ref((void**)((char*)completion + 16), expected, new_value);
+}
+
+int32_t __jnative_fn_java_lang_invoke_VarHandle_weakCompareAndSet__Ljava_util_concurrent_CompletableFuture_Ljava_util_concurrent_CompletableFuture_Completion_Ljava_util_concurrent_CompletableFuture_Completion__Z(
+        void* this_handle, void* cf, void* expected, void* new_value)
+{
+    (void)this_handle;
+    if (cf == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    return cas_ref((void**)((char*)cf + 16), expected, new_value);
+}
+
+int32_t __jnative_fn_java_lang_invoke_VarHandle_weakCompareAndSet__Ljava_util_concurrent_CompletableFuture_Completion_Ljava_util_concurrent_CompletableFuture_Completion_Ljava_util_concurrent_CompletableFuture_Completion__Z(
+        void* this_handle, void* completion, void* expected, void* new_value)
+{
+    (void)this_handle;
+    if (completion == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    return cas_ref((void**)((char*)completion + 16), expected, new_value);
+}
+
+/* ===================================================================
+ * VarHandle: java.util.concurrent.CompletableFuture.result
+ *
+ * The result field is at +8. The release-ordered store form is used by
+ * the CompletableFuture constructor and by MinimalStage.toCompletableFuture
+ * to publish an already-computed result. The compareAndSet forms with
+ * Void / Object expected values are used by internalComplete and
+ * completeRelay.
+ * =================================================================== */
+
+void __jnative_fn_java_lang_invoke_VarHandle_setRelease__Ljava_util_concurrent_CompletableFuture_Ljava_lang_Object__V(
+        void* this_handle, void* cf, void* new_value)
+{
+    (void)this_handle;
+    if (cf == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    __atomic_store_n((void**)((char*)cf + 8), new_value, __ATOMIC_RELEASE);
+}
+
+/* ===================================================================
+ * VarHandle: java.nio.channels.spi.AbstractSelector.closed
+ *
+ * A boolean field toggled by AbstractSelector.close through a CAS so
+ * that a second concurrent close observes the already-closed state
+ * without re-entering the close path. The class hierarchy is:
+ *
+ *   AbstractSelector:
+ *       +0  vtable
+ *       +8  SelectorProvider provider
+ *       +16 Set<SelectionKey>   keys
+ *       +24 boolean             closed
+ *       +32 Object              closeLock
+ *       +40 Thread              blockedThread
+ * =================================================================== */
+
+int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_nio_channels_spi_AbstractSelector_ZZ_Z(
+        void* this_handle, void* selector, int32_t expected, int32_t new_value)
+{
+    (void)this_handle;
+    if (selector == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    return cas_bool((uint8_t*)((char*)selector + 24), expected, new_value);
+}
+
+/* ===================================================================
+ * VarHandle: foreign MemorySegment (AddressLayout)
+ *
+ * AddressLayout.set(MemorySegment, long, MemorySegment) stores the
+ * payload address of the value segment into the target segment at the
+ * given offset. The value's payload address is obtained through the
+ * same segment_payload helper the primitive setters use; the target
+ * segment's payload address is the write destination.
+ * =================================================================== */
+
+void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_lang_foreign_MemorySegment_JLjava_lang_foreign_MemorySegment__V(
+        void* this_handle, void* target_segment, int64_t offset,
+        void* value_segment)
+{
+    (void)this_handle;
+    char* dst = (char*)segment_payload(target_segment);
+    void* src = segment_payload(value_segment);
+    memcpy(dst + offset, &src, sizeof(src));
+}
+
+/* ===================================================================
+ * VarHandle: java.util.concurrent.CompletableFuture.Completion.next
+ *            (set-to-null variants)
+ * ===================================================================
+ *
+ * The two entry points below are the null-writing counterparts of the
+ * CAS operations added in the previous revision. `unipush` and
+ * `orPush` both invoke VarHandle.set with a null value to break the
+ * stack linkage after the completion has been consumed; the field is
+ * `Completion.next`, at offset +16 (after ForkJoinTask's `status` at
+ * +8 and its pad to 8-byte alignment).
+ *
+ * Because the value being written is typed as Void at the call site,
+ * the polymorphic dispatcher produces a distinct mangled name from
+ * the one that carries a Completion-typed value, even though both
+ * write to the same slot. The two symbols below supply the missing
+ * variants.
+ */
+
+void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_util_concurrent_CompletableFuture_Completion_Ljava_lang_Void__V(
+        void* this_handle, void* completion, void* value)
+{
+    (void)this_handle;
+    if (completion == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    __atomic_store_n((void**)((char*)completion + 16), value,
+                     __ATOMIC_RELEASE);
+}
+
+void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_util_concurrent_CompletableFuture_BiCompletion_Ljava_lang_Void__V(
+        void* this_handle, void* bicomp, void* value)
+{
+    (void)this_handle;
+    if (bicomp == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    /*
+     * BiCompletion extends UniCompletion extends Completion; the
+     * `next` field lives on Completion and its offset does not move
+     * when the more-derived subclasses add their own fields
+     * afterwards. The offset is therefore the same +16 that the
+     * Completion variant above uses.
+     */
+    __atomic_store_n((void**)((char*)bicomp + 16), value,
+                     __ATOMIC_RELEASE);
+}
+
+/* ===================================================================
+ * VarHandle: java.net.Socket.state
+ * ===================================================================
+ *
+ * Socket uses a VarHandle over its `state` field to publish the
+ * closed bit atomically. The call site is Socket.close, which does
+ *
+ *     if ((getAndBitwiseOrState(STATE_CLOSED) & STATE_CLOSED) != 0)
+ *         return;
+ *
+ * to make a second concurrent close a no-op.
+ *
+ * Layout of java.net.Socket as produced by
+ * LlvmGlobalEmitter.getFieldOffset for the JDK 21 / 22 declaration
+ * order:
+ *
+ *     offset  0 : vtable
+ *     offset  8 : boolean created
+ *     offset  9 : boolean bound
+ *     offset 10 : boolean connected
+ *     offset 11 : boolean closed
+ *     offset 16 : Object  closeLock       (8-aligned)
+ *     offset 24 : boolean shutIn
+ *     offset 25 : boolean shutOut
+ *     offset 32 : SocketImpl impl         (8-aligned)
+ *     offset 40 : int      state          (4-aligned)
+ *
+ * The 40 is derived from the alignment rules the emitter applies to
+ * every class: each field is padded to its own alignment, and the
+ * reference-typed fields (closeLock, impl) are 8-aligned. If the JDK
+ * ever inserts a field ahead of `state`, this offset must be
+ * recomputed -- but the failure mode of a stale offset is a wrong
+ * read, not a linker error, so the entry point exists regardless.
+ */
+
+int32_t __jnative_fn_java_lang_invoke_VarHandle_getAndBitwiseOr__Ljava_net_Socket_I_I(
+        void* this_handle, void* socket, int32_t mask)
+{
+    (void)this_handle;
+    if (socket == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    return __atomic_fetch_or((int32_t*)((char*)socket + 40), mask,
+                             __ATOMIC_SEQ_CST);
+}
+
+/* ===================================================================
+ * VarHandle: foreign MemorySegment (AddressLayout, no explicit offset)
+ * ===================================================================
+ *
+ * The bound-offset variant of the AddressLayout setter. The Java-level
+ * SegmentAllocator.allocate(AddressLayout, MemorySegment) binds the
+ * offset to 0 and then calls set(segment, value); the payload address
+ * returned by segment_payload already points at byte 0 of the target,
+ * so no arithmetic is needed on top.
+ */
+
+void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_lang_foreign_MemorySegment_Ljava_lang_foreign_MemorySegment__V(
+        void* this_handle, void* target_segment, void* value_segment)
+{
+    (void)this_handle;
+    char* dst = (char*)segment_payload(target_segment);
+    void* src = segment_payload(value_segment);
+    memcpy(dst, &src, sizeof(src));
+}

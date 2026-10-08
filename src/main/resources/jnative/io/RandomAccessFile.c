@@ -351,3 +351,51 @@ void __jnative_fn_java_io_RandomAccessFile_writeBytes0___BII_V(
  * ------------------------------------------------------------------------ */
 void __jnative_fn_java_io_RandomAccessFile_initIDs___V(void) {
 }
+
+/*
+ * private native void write0(int b) throws IOException;
+ *
+ * Single-byte write at the file's current position. The Java-level
+ * RandomAccessFile.write(int) calls this directly; RandomAccessFile
+ * does not maintain a shadow of the file position (unlike its own
+ * `position` field on the FileChannel side), so the kernel's own
+ * offset is authoritative and advances by one byte on each call.
+ *
+ * After the byte has been committed, the cached `position` field is
+ * incremented so that a subsequent getFilePointer() reflects the
+ * write. The order is significant: the kernel write must succeed
+ * before the cache is updated, otherwise a failed write would leave
+ * the cache ahead of the true offset.
+ */
+void __jnative_fn_java_io_RandomAccessFile_write0__I_V(
+        void* this_file, int32_t b)
+{
+    if (this_file == NULL) {
+        __jnative_throw_null_pointer_exception();
+        return;
+    }
+
+    void* fd_obj = fd_object_of(this_file);
+    if (fd_obj == NULL) {
+        __jnative_throw_exception(NULL);
+        return;
+    }
+    int32_t fd = fd_of_fd_object(fd_obj);
+    if (fd < 0) {
+        __jnative_throw_exception(NULL);
+        return;
+    }
+
+    uint8_t byte = (uint8_t)b;
+    ssize_t n;
+    do {
+        n = write(fd, &byte, 1);
+    } while (n < 0 && errno == EINTR);
+
+    if (n < 0) {
+        __jnative_throw_exception(NULL);
+        return;
+    }
+
+    *(int64_t*)((char*)this_file + RAF_POSITION_OFFSET) += 1;
+}
