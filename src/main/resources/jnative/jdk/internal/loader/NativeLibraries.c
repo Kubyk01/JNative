@@ -24,14 +24,14 @@ void* __jnative_fn_jdk_internal_loader_NativeLibraries_findBuiltinLib__Ljava_lan
 {
     if (name_str == NULL) return NULL;
 
-    int32_t nameLen = 0;
-    const char* name = __jnative_read_string_bytes(name_str, &nameLen);
-    if (name[0] == '\0' || nameLen <= 0) return NULL;
-
+    char name[512];
+    int32_t name_len = __jnative_read_string_into(name_str, name,
+                                                  (int32_t)sizeof(name));
+    if (name_len <= 0) return NULL;
     if (strchr(name, '/') != NULL) return NULL;
 
     char base[256];
-    size_t n = (size_t)nameLen;
+    size_t n = (size_t)name_len;
     if (n >= sizeof(base)) return NULL;
     memcpy(base, name, n + 1);
 

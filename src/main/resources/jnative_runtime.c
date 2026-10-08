@@ -1428,7 +1428,101 @@ const char* __jnative_read_string_bytes(void* s, int32_t* out_len) {
     return (const char*)value + JAVA_ARR_HDR;
 }
 
+/*
+ * Safe read of a Java string's payload into a caller-supplied C buffer.
+ *
+ * Returns:
+ *   >= 0 : the number of bytes copied (excluding the NUL terminator)
+ *   -1   : error (s == NULL, out == NULL, out_cap <= 0,
+ *          or the string's length does not fit in the buffer)
+ */
+int32_t __jnative_read_string_into(void* s, char* out, int32_t out_cap) {
+    if (out == NULL || out_cap <= 0) return -1;
+    out[0] = '\0';
+    if (s == NULL) return -1;
+
+    void* value = *(void**)((char*)s + 8);
+    if (value == NULL) return 0;
+
+    int32_t len = *(int32_t*)((char*)value + JAVA_ARR_LENGTH_OFFSET);
+    if (len < 0) return -1;
+    if (len >= out_cap) return -1;
+
+    const char* src = (const char*)value + JAVA_ARR_HDR;
+    if (len > 0) memcpy(out, src, (size_t)len);
+    out[len] = '\0';
+    return len;
+}
+
+/* ------------------------------------------------------------------
+ * Per-thread copy buffer for __jnative_read_string_cstr.
+ *
+ * Released by the pthread-key destructor when the thread exits, so there
+ * is no per-thread leak. The buffer grows as needed and never shrinks —
+ * a deliberate trade-off to avoid reallocating on every call.
+ * ------------------------------------------------------------------ */
+static pthread_key_t tls_cstr_key;
+static pthread_once_t tls_cstr_key_once = PTHREAD_ONCE_INIT;
+
+typedef struct {
+    char*  buf;
+    size_t cap;
+} TlsCstrBuf;
+
+static void tls_cstr_destroy(void* p) {
+    if (p != NULL) {
+        TlsCstrBuf* t = (TlsCstrBuf*)p;
+        free(t->buf);
+        free(t);
+    }
+}
+
+static void tls_cstr_key_init(void) {
+    pthread_key_create(&tls_cstr_key, tls_cstr_destroy);
+}
+
+const char* __jnative_read_string_cstr(void* s, int32_t* out_len) {
+    if (out_len != NULL) *out_len = 0;
+    if (s == NULL) return "";
+
+    void* value = *(void**)((char*)s + 8);
+    if (value == NULL) return "";
+
+    int32_t len = *(int32_t*)((char*)value + JAVA_ARR_LENGTH_OFFSET);
+    if (len < 0) len = 0;
+
+    pthread_once(&tls_cstr_key_once, tls_cstr_key_init);
+    TlsCstrBuf* tls = (TlsCstrBuf*)pthread_getspecific(tls_cstr_key);
+    if (tls == NULL) {
+        tls = (TlsCstrBuf*)calloc(1, sizeof(TlsCstrBuf));
+        if (tls == NULL) return NULL;
+        pthread_setspecific(tls_cstr_key, tls);
+    }
+
+    size_t need = (size_t)len + 1;
+    if (tls->cap < need) {
+        size_t new_cap = tls->cap ? tls->cap : 256;
+        while (new_cap < need) new_cap <<= 1;
+        char* nb = (char*)realloc(tls->buf, new_cap);
+        if (nb == NULL) return NULL;
+        tls->buf = nb;
+        tls->cap = new_cap;
+    }
+
+    const char* src = (const char*)value + JAVA_ARR_HDR;
+    if (len > 0) memcpy(tls->buf, src, (size_t)len);
+    tls->buf[len] = '\0';
+    if (out_len != NULL) *out_len = len;
+    return tls->buf;
+}
+
 static int32_t __jnative_string_eq(void* a, void* b) {
+    /*
+     * memcmp is length-bounded, so the lack of an in-bounds NUL
+     * terminator in the string payload is irrelevant here. Do not switch
+     * to __jnative_read_string_cstr: two consecutive calls overwrite the
+     * same thread-local buffer, and memcmp would compare b against itself.
+     */
     int32_t la = 0, lb = 0;
     const char* ba = __jnative_read_string_bytes(a, &la);
     const char* bb = __jnative_read_string_bytes(b, &lb);

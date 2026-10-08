@@ -563,9 +563,70 @@ extern const int32_t jnative_builtin_resources_count             JNATIVE_WEAK;
 
 /* ---- Strings -------------------------------------------------------- */
 
+/*
+ * __jnative_read_string_bytes returns a pointer DIRECTLY INTO the payload
+ * of a Java string's backing byte array. For strings constructed by
+ * compiled Java code (Arrays.copyOf and its derivatives), that array has
+ * NO in-bounds NUL terminator: the emitter's allocator reserves exactly
+ * `len` bytes of payload. Therefore the returned pointer must never be
+ * used as a C string (strlen/strcmp/strchr/open/stat/access/...): the
+ * read escapes into the next heap chunk, and the first byte of that chunk
+ * (usually a glibc size word, e.g. 0x21) ends up appended to the string.
+ *
+ * That is exactly what happened to the path ".../lib/tzdb.dat": the
+ * 56-byte string was read as a 57-byte ".../lib/tzdb.dat!", the memcmp
+ * suffix check failed, open(2) returned ENOENT, and FileInputStream.c
+ * threw a NULL exception that catch(Exception) did not handle.
+ *
+ * The two helpers below are the safe replacement for any site that needs
+ * the string's bytes as an actual C string.
+ */
+
+/**
+ * Copies the payload of Java String `s` into the caller's buffer `out` and
+ * NUL-terminates the copy. Returns the number of bytes copied (not counting
+ * the terminator), or -1 on error.
+ *
+ * On error (s == NULL, buffer too small, invalid length) `out[0]` is set
+ * to '\0' (if out_cap > 0), the remaining buffer bytes are untouched, and
+ * -1 is returned.
+ *
+ * This is the only safe way to obtain a Java string's contents as a C
+ * string. The buffer size should be at least PATH_MAX (4096) for paths
+ * and 8192 for arbitrary names.
+ */
+extern int32_t __jnative_read_string_into(void* s, char* out, int32_t out_cap);
+
+/**
+ * Convenience wrapper around __jnative_read_string_into using a per-thread
+ * dynamically growing buffer. The returned pointer stays valid until the
+ * next call to this function on the same thread.
+ *
+ * IMPORTANT: two results of __jnative_read_string_cstr must not be alive
+ * at the same time — the second call overwrites the first. If two live
+ * pointers are needed, use __jnative_read_string_into with two separate
+ * buffers.
+ *
+ * Returns a pointer to an empty string when `s` == NULL. Returns NULL only
+ * if the internal buffer allocation itself failed.
+ */
+extern const char* __jnative_read_string_cstr(void* s, int32_t* out_len);
+
 extern void* __jnative_make_string_obj(const char* bytes, int32_t len);
 extern const char* __jnative_read_string_bytes(void* s, int32_t* out_len);
 extern void* __jnative_string_intern(void* this_str);
+
+/* ---- Exception construction ---------------------------------------- */
+
+/*
+ * __jnative_construct_exception (see the "Exception construction and
+ * throwers" section below) materialises real exception objects. Use it
+ * instead of __jnative_throw_exception(NULL) everywhere the JDK spec
+ * requires a concrete checked class: __jnative_catch_matches compares the
+ * exception vtable against the @__type_info_X tables, and a generic
+ * Throwable is not a subclass of Exception, so catch (Exception) will not
+ * catch it. A real FileNotFoundException will.
+ */
 
 /* ---- Type identity and dispatch ------------------------------------ */
 
