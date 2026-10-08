@@ -1251,9 +1251,26 @@ int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concur
  *   set(Node, Object)  — item, offset 16
  *   set(Node, Node)    — next, offset 24
  *   set(Node, Void)    — item, offset 16 (null write)
+ *
+ * The three overloads write to the same two slots through three
+ * distinct mangled names. The `Void` variant is emitted because the
+ * JDK source writes `item` with a null literal whose static type is
+ * Void — the runtime value is NULL, but the compiler-mangled name is
+ * different from the Object-typed form. Both must exist so the LLVM
+ * backend's emitted call sites resolve.
  */
 
 void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_util_concurrent_LinkedTransferQueue_Node_Ljava_lang_Object__V(
+        void* this_handle, void* obj, void* newValue)
+{
+    (void)this_handle;
+    if (obj == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    __atomic_store_n((void**)((char*)obj + 16), newValue, __ATOMIC_RELEASE);
+}
+
+void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_util_concurrent_LinkedTransferQueue_Node_Ljava_lang_Void__V(
         void* this_handle, void* obj, void* newValue)
 {
     (void)this_handle;
@@ -1271,16 +1288,6 @@ void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_util_concurrent_LinkedTr
         __jnative_throw_null_pointer_exception();
     }
     __atomic_store_n((void**)((char*)obj + 24), newValue, __ATOMIC_RELEASE);
-}
-
-void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_util_concurrent_LinkedTransferQueue_Node_Ljava_lang_Void__V(
-        void* this_handle, void* obj, void* newValue)
-{
-    (void)this_handle;
-    if (obj == NULL) {
-        __jnative_throw_null_pointer_exception();
-    }
-    __atomic_store_n((void**)((char*)obj + 16), newValue, __ATOMIC_RELEASE);
 }
 
 void __jnative_fn_java_lang_invoke_VarHandle_setRelease__Ljava_util_concurrent_LinkedTransferQueue_Node_Ljava_util_concurrent_LinkedTransferQueue_Node__V(
@@ -1310,7 +1317,7 @@ void __jnative_fn_java_lang_invoke_VarHandle_setRelease__Ljava_util_concurrent_L
  * LinkedTransferQueue rewrite are:
  *
  *   DualNode.next  (offset 24)  — CAS and plain set
- *   DualNode.item  (offset 16)  — CAS
+ *   DualNode.item  (offset 16)  — CAS and plain set (Object / Void)
  *   DualNode.prev  (offset 40)  — set (used by selfLink / unlink)
  * ===========================================================================
  */
@@ -1361,12 +1368,45 @@ void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_util_concurrent_LinkedTr
 }
 
 /*
+ * set(DualNode, Void) — the null-writing counterpart of the Object
+ * overload. Same slot (item, offset 16); kept as a distinct symbol
+ * because the compiler mangles the two call shapes differently, and
+ * the LLVM backend emits both.
+ */
+void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_util_concurrent_LinkedTransferQueue_DualNode_Ljava_lang_Void__V(
+        void* this_handle, void* obj, void* newValue)
+{
+    (void)this_handle;
+    if (obj == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    __atomic_store_n((void**)((char*)obj + 16), newValue, __ATOMIC_RELEASE);
+}
+
+/*
  * compareAndExchange(DualNode, Object, Object) -> Object
  *
  * Used by `cmpExItem` — the CAS on the inherited `item` slot at
  * offset 16. Returns the witness value (the old item pointer).
  */
 void* __jnative_fn_java_lang_invoke_VarHandle_compareAndExchange__Ljava_util_concurrent_LinkedTransferQueue_DualNode_Ljava_lang_Object_Ljava_lang_Object__Ljava_lang_Object_(
+        void* this_handle, void* obj, void* expected, void* newValue)
+{
+    (void)this_handle;
+    if (obj == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    return cax_ref((void**)((char*)obj + 16), expected, newValue);
+}
+
+/*
+ * compareAndExchange(DualNode, Object, Void) -> Object
+ *
+ * Used by `cmpExItem` when the expected value is a null literal typed
+ * as Void. Same slot (item, offset 16) as the Object/Object variant
+ * above; kept as a distinct symbol because the mangled name differs.
+ */
+void* __jnative_fn_java_lang_invoke_VarHandle_compareAndExchange__Ljava_util_concurrent_LinkedTransferQueue_DualNode_Ljava_lang_Object_Ljava_lang_Void__Ljava_lang_Object_(
         void* this_handle, void* obj, void* expected, void* newValue)
 {
     (void)this_handle;

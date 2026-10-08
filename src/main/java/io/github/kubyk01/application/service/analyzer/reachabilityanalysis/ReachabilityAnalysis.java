@@ -1205,18 +1205,18 @@ public class ReachabilityAnalysis {
         clinitProcessed.add(className);
 
         ClassNode cn = resolver.getClassNode(className);
-        if (cn == null || cn.isInterface()) return;
+        if (cn == null) return;
 
         if (!cn.isExternal() && resolver.getClassBytes(className) == null) {
             resolver.reloadSystemClass(className);
             cn = resolver.getClassNode(className);
-            if (cn == null || cn.isInterface()) return;
+            if (cn == null) return;
         }
 
         if (cn.isExternal()) {
             resolver.forceLoadSystemClass(className);
             cn = resolver.getClassNode(className);
-            if (cn == null || cn.isInterface()) return;
+            if (cn == null) return;
         }
 
         boolean hasClinit = false;
