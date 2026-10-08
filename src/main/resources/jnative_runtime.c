@@ -932,6 +932,32 @@ int __jnative_catch_matches(void* exc, void* type_info) {
         if (*ti == vtable) return 1;
         ti++;
     }
+
+    /*
+     * Diagnostics: enabled with JNATIVE_DEBUG_CATCH=1. Prints which
+     * exception class was not found in the type_info table, plus the
+     * first few vtables from that table. Helps explain why
+     * catch (Exception) does not fire. No effect on production
+     * behaviour.
+     */
+    if (getenv("JNATIVE_DEBUG_CATCH") != NULL) {
+        const char* exc_name = "?";
+        if (vtable != NULL) {
+            const char* n = ((JNativeVTable*)vtable)->name;
+            if (n != NULL) exc_name = n;
+        }
+        fprintf(stderr, "[catch] MISS: exception class '%s' (vtable=%p) not in type_info %p\n",
+                exc_name, vtable, type_info);
+        fprintf(stderr, "[catch] type_info contains:\n");
+        ti = (void**)type_info;
+        int i = 0;
+        while (*ti != NULL && i < 16) {
+            const char* n = ((JNativeVTable*)*ti)->name;
+            fprintf(stderr, "  [%d] %s (vtable=%p)\n", i, n ? n : "?", *ti);
+            ti++;
+            i++;
+        }
+    }
     return 0;
 }
 
