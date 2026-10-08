@@ -698,6 +698,174 @@ public class ReachabilityAnalysis {
     }
 
     /**
+     * Closes the reachable set under the relation "C implements I, I declares
+     * M, C provides a concrete M".
+     *
+     * <p>{@link #resolveVirtualDispatchFixedPoint()} resolves only those
+     * interface slots for which a dispatch site was actually observed in the
+     * bytecode of a reachable method. That is not sufficient, because the
+     * code generator emits an itable entry for <em>every</em> method of
+     * <em>every</em> interface that <em>every</em> non-external class in the
+     * class map implements — regardless of whether any reachable bytecode
+     * dispatches through that slot. A slot whose implementation was never
+     * added to the reachable set is emitted as {@code i8* null}, and the
+     * first caller that does dispatch through it at run time traps in
+     * {@code __jnative_unresolved_slot}.</p>
+     *
+     * <p>The concrete failure that motivated this pass:</p>
+     *
+     * <pre>
+     *   javax.crypto.JceSecurity.setupJurisdictionPolicies()
+     *       for (Path entry : stream)              // stream: DirectoryStream&lt;Path&gt;
+     *           -&gt; INVOKEINTERFACE java/nio/file/DirectoryStream.iterator()
+     *
+     *   codegen:
+     *       itable for sun/nio/fs/UnixSecureDirectoryStream / DirectoryStream
+     *       slot 'iterator()Ljava/util/Iterator;' resolves through
+     *       DependencyResolver.findMethodInHierarchy to
+     *       sun/nio/fs/UnixDirectoryStream.iterator(), but the IR function
+     *       fn_sun_nio_fs_UnixDirectoryStream_iterator___Ljava_util_Iterator_
+     *       is absent from the module, so the slot is emitted as null and
+     *       the call traps at run time.
+     * </pre>
+     *
+     * <p>The pass is a fixed point over the whole class map. Each pass walks
+     * every non-external, non-interface class in the class map, computes its
+     * transitive interface closure, and for each interface method finds the
+     * concrete implementation on the class through
+     * {@link DependencyResolver#findMethodInHierarchy}. Every implementation
+     * that is not yet in {@link #reachableMethods} is added; if anything was
+     * added, the worklist is drained and the ordinary dispatch-site fixed
+     * point is run again, because the newly added method may itself contain
+     * dispatch sites that were not previously observable.</p>
+     *
+     * <p>The pass is bounded by {@code MAX_IMPLEMENTATION_PASSES}. In
+     * practice it converges in one pass on any real image; the bound exists
+     * only so that a pathological class map cannot hang code generation.</p>
+     */
+    public void ensureInterfaceImplementationsReachable() {
+        final int MAX_IMPLEMENTATION_PASSES = 16;
+        int pass = 0;
+        boolean changed = true;
+
+        while (changed && pass++ < MAX_IMPLEMENTATION_PASSES) {
+            changed = false;
+
+            // Snapshot the class-map keys. The map grows during the loop
+            // as DependencyResolver loads classes that were previously only
+            // referenced by name, and iterating a live map while it grows is
+            // exactly the kind of race that produced the bug this method
+            // exists to close.
+            List<String> classNames =
+                new ArrayList<>(resolver.getClassMap().keySet());
+
+            for (String cls : classNames) {
+                if (cls == null || cls.isEmpty()) continue;
+                // Array pseudo-classes have no interfaces of their own and
+                // no vtable of their own (they inherit java/lang/Object's).
+                if (cls.charAt(0) == '[') continue;
+
+                ClassNode cn = resolver.getClassNode(cls);
+                if (cn == null) continue;
+                if (cn.isInterface()) continue;
+                if (cn.isExternal()) continue;
+
+                Set<String> ifaces = new LinkedHashSet<>();
+                collectAllInterfacesRec(cn, ifaces);
+                if (ifaces.isEmpty()) continue;
+
+                for (String iface : ifaces) {
+                    ClassNode ifaceNode = resolver.getClassNode(iface);
+                    if (ifaceNode == null) continue;
+                    if (!ifaceNode.isInterface()) continue;
+                    if (ifaceNode.isExternal()) continue;
+
+                    for (MethodNode im : ifaceNode.getMethods()) {
+                        if (im.isStatic()) continue;
+                        String mName = im.getName();
+                        if (mName == null || mName.isEmpty()) continue;
+                        // Constructors and class initializers are never
+                        // interface members; the JDK class-file format does
+                        // not allow them in an interface.
+                        if (mName.equals("<init>") || mName.equals("<clinit>")) continue;
+                        String mDesc = im.getDescriptor();
+                        if (mDesc == null || mDesc.isEmpty()) continue;
+
+                        String[] foundOwner = new String[1];
+                        MethodNode concrete = resolver.findMethodInHierarchy(
+                            cls, mName, mDesc, foundOwner);
+                        if (concrete == null) continue;
+                        if (concrete.isAbstract()) continue;
+                        // Native methods have their implementation in C,
+                        // which is emitted separately; adding them here
+                        // would just produce an external declaration with
+                        // no body.
+                        if (concrete.isNative()) continue;
+
+                        String decl = foundOwner[0];
+                        if (decl == null || decl.isEmpty()) continue;
+
+                        ClassNode declNode = resolver.getClassNode(decl);
+                        if (declNode == null) continue;
+                        if (declNode.isExternal()) continue;
+
+                        MethodReference ref =
+                            new MethodReference(decl, mName, mDesc);
+                        if (!reachableMethods.contains(ref)) {
+                            addMethod(ref, true);
+                            changed = true;
+                        }
+                    }
+                }
+            }
+
+            if (changed) {
+                drainWorklist();
+                resolveVirtualDispatchFixedPoint();
+            }
+        }
+
+        if (pass > MAX_IMPLEMENTATION_PASSES) {
+            log.warn("Interface-implementation closure did not converge after "
+                + "{} passes; some itable slots may remain unresolved",
+                MAX_IMPLEMENTATION_PASSES);
+        } else if (pass > 1) {
+            log.info("Interface-implementation closure converged after {} pass(es)",
+                pass - 1);
+        }
+    }
+
+    /**
+     * Populates {@code out} with the transitive closure of every interface
+     * declared by {@code cls} or by any of its superclasses.
+     *
+     * <p>The traversal visits each interface at most once and each class in
+     * the chain at most once, so it terminates on any hierarchy the JVM
+     * accepts (JVMS §4.3 forbids cycles in the interface hierarchy; the
+     * visited-set also protects against the class-side cycles that a
+     * corrupted class file could introduce).</p>
+     */
+    private void collectAllInterfacesRec(ClassNode cls, Set<String> out) {
+        if (cls == null) return;
+
+        for (String i : cls.getInterfaces()) {
+            if (!out.add(i)) continue;
+            ClassNode in = resolver.getClassNode(i);
+            if (in != null && !in.isExternal()) {
+                collectAllInterfacesRec(in, out);
+            }
+        }
+
+        String sn = cls.getSuperName();
+        if (sn != null && !sn.equals(cls.getName())) {
+            ClassNode snNode = resolver.getClassNode(sn);
+            if (snNode != null && !snNode.isExternal()) {
+                collectAllInterfacesRec(snNode, out);
+            }
+        }
+    }
+
+    /**
      * Reads the bytecode of {@code ref} and records every
      * {@code INVOKEVIRTUAL}/{@code INVOKEINTERFACE} site it contains in
      * {@link #virtualDispatchSites}, keyed as
@@ -713,7 +881,29 @@ public class ReachabilityAnalysis {
      */
     private void collectDispatchSitesFromMethod(MethodReference ref) {
         byte[] bytes = resolver.getClassBytes(ref.getOwner());
-        if (bytes == null) return;
+        if (bytes == null) {
+            /*
+             * The class was materialised without its bytecode: it is either
+             * an external stub installed by getClassNode for a name that
+             * could not be loaded, or a reflection-only entry with no cached
+             * .class payload. Either way, retry the load before giving up.
+             *
+             * The previous revision returned immediately, which silently
+             * missed every dispatch site in the method and, worse, left the
+             * reference marked as scanned in dispatchScanDone so it was never
+             * retried. On a class that genuinely has no bytecode (a pure
+             * interface stub, an external library class) the retry is a
+             * cheap no-op; on a class whose bytecode merely had not been
+             * fetched yet it is what makes the scan happen at all.
+             */
+            resolver.forceLoadSystemClass(ref.getOwner());
+            bytes = resolver.getClassBytes(ref.getOwner());
+        }
+        if (bytes == null) {
+            log.debug("No bytecode for {}; cannot scan for virtual-dispatch sites",
+                ref.getOwner());
+            return;
+        }
 
         try {
             ClassReader reader = new ClassReader(bytes);

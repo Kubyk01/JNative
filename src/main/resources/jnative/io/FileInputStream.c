@@ -1,12 +1,14 @@
 #define _GNU_SOURCE
 #include <stdint.h>
 #include <stddef.h>
+#include <stdlib.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 
 #include "jnative_runtime.h"
 
@@ -40,6 +42,115 @@ static inline int32_t fis_raw_fd(void* this_fis) {
 }
 
 /*
+ * Serve the JDK's compiled TZDB from the embedded resource table.
+ *
+ * ZoneInfoFile.<clinit> opens <java.home>/lib/tzdb.dat through an
+ * ordinary FileInputStream. In an AOT image the executable may be
+ * running on a machine with no JDK, or with a different JDK release
+ * whose tzdb.dat uses a newer binary format than the ZoneInfoFile
+ * class compiled into the image was written to parse. Both produce
+ * the same StreamCorruptedException("File format not recognised")
+ * from ZoneInfoFile.load(DataInputStream).
+ *
+ * The fix is to intercept the open of any path ending in
+ * "/lib/tzdb.dat" and hand the caller an anonymous file descriptor
+ * backed by the build JDK's copy of that file. The bytes are looked
+ * up by a fixed key ("__jdk_internal__/tzdb.dat") in the runtime's
+ * resource table, so the same hand-off works no matter what
+ * java.home resolves to at run time.
+ *
+ * On Linux the anonymous descriptor is a memfd (memfd_create(2)),
+ * which is a real file descriptor that supports read(2), lseek(2)
+ * and mmap(2) with no backing filesystem entry. On every other
+ * platform the fallback is mkstemp(3) followed by an immediate
+ * unlink(2): the descriptor stays valid for its holder and the
+ * filesystem entry disappears the moment it is created, so nothing
+ * leaks if the process crashes before the descriptor is closed.
+ *
+ * Returns a non-negative file descriptor positioned at offset 0 on
+ * success, or -1 if the resource is absent or any step failed. A -1
+ * return is not an error: the caller falls through to the ordinary
+ * open(2) path and lets the filesystem produce whatever answer it
+ * would have produced anyway.
+ */
+static int try_open_embedded_tzdb(const char* path) {
+    if (path == NULL) {
+        return -1;
+    }
+
+    /*
+     * Match the exact suffix "/lib/tzdb.dat". The JDK's own
+     * ZoneInfoFile always constructs the path as
+     * <java.home> + File.separator + "lib" + File.separator + "tzdb.dat",
+     * so this suffix is the tightest possible match that does not
+     * require the C side to know java.home.
+     */
+    static const char SUFFIX[] = "/lib/tzdb.dat";
+    size_t plen = strlen(path);
+    size_t slen = sizeof(SUFFIX) - 1;
+    if (plen < slen) {
+        return -1;
+    }
+    if (memcmp(path + plen - slen, SUFFIX, slen) != 0) {
+        return -1;
+    }
+
+    static const char KEY[] = "__jdk_internal__/tzdb.dat";
+    const JNativeResourceEntry* res =
+        jnative_find_resource(KEY, (int32_t)(sizeof(KEY) - 1));
+    if (res == NULL || res->data == NULL || res->size <= 0) {
+        return -1;
+    }
+
+    int fd;
+#if defined(__linux__) && defined(MFD_CLOEXEC)
+    fd = memfd_create("jnative-tzdb", MFD_CLOEXEC);
+    if (fd < 0) {
+        return -1;
+    }
+#else
+    char tmpl[] = "/tmp/jnative_tzdb_XXXXXX";
+    fd = mkstemp(tmpl);
+    if (fd < 0) {
+        return -1;
+    }
+    /* Unlink immediately: the descriptor keeps the file alive, and
+     * nothing in the filesystem can observe it. */
+    (void)unlink(tmpl);
+    /* Clear FD_CLOEXEC only if mkstemp did not already set it; the
+     * descriptor is meant to outlive any child process. Actually we
+     * want CLOEXEC on, matching memfd_create's flag, so nothing to
+     * do here. */
+#endif
+
+    const uint8_t* p = (const uint8_t*)res->data;
+    size_t remaining = (size_t)res->size;
+    while (remaining > 0) {
+        ssize_t n = write(fd, p, remaining);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            close(fd);
+            return -1;
+        }
+        if (n == 0) {
+            /* write(2) returning 0 for a non-zero count on a regular
+             * file is not a legitimate outcome; treat it as failure
+             * rather than looping forever. */
+            close(fd);
+            return -1;
+        }
+        p += n;
+        remaining -= (size_t)n;
+    }
+
+    if (lseek(fd, 0, SEEK_SET) < 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+/*
  * private native void open0(String name) throws FileNotFoundException;
  *
  * Opens the named file read-only and stores the resulting kernel fd in the
@@ -66,8 +177,23 @@ void __jnative_fn_java_io_FileInputStream_open0__Ljava_lang_String__V(
     int32_t nameLen = 0;
     const char* path = __jnative_read_string_bytes(name_str, &nameLen);
     (void)nameLen;
+    if (path == NULL) {
+        __jnative_throw_null_pointer_exception();
+        return;
+    }
 
-    int fd = open(path, O_RDONLY);
+    /*
+     * Serve the JDK's compiled time-zone database from the embedded
+     * resource table. The check is a cheap suffix comparison; a miss
+     * falls straight through to the ordinary open(2). See the
+     * try_open_embedded_tzdb comment for the full reasoning and for
+     * why the file descriptor this returns is indistinguishable from
+     * one open(2) produced.
+     */
+    int fd = try_open_embedded_tzdb(path);
+    if (fd < 0) {
+        fd = open(path, O_RDONLY);
+    }
     if (fd < 0) {
         __jnative_throw_exception(NULL);
         return;

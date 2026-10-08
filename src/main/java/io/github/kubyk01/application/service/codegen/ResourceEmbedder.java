@@ -179,6 +179,98 @@ public final class ResourceEmbedder {
     }
 
     /**
+     * Key under which the build JDK's {@code lib/tzdb.dat} is embedded.
+     *
+     * <p>The name intentionally contains a package segment that cannot be
+     * produced by {@code Class.getResourceAsStream} — the Java language
+     * forbids {@code __jdk_internal__} as a package name, and the JDK's
+     * own resource lookup strips any leading '/', so no caller can ever
+     * collide with this key by accident. The suffix is nevertheless
+     * {@code tzdb.dat} so that a diagnostic dump of the resource table
+     * still tells the reader what the entry holds.</p>
+     */
+    private static final String EMBEDDED_TZDB_KEY = "__jdk_internal__/tzdb.dat";
+
+    /**
+     * Extracts the runtime data files that {@code java.base} reads from
+     * the JDK installation rather than from its own module image, so
+     * they can be baked into the executable alongside the ICU data and
+     * the rest of the {@code java.base} resources.
+     *
+     * <p>Today that set is exactly one file: {@code $JAVA_HOME/lib/tzdb.dat},
+     * the compiled TZDB used by {@code sun.util.calendar.ZoneInfoFile}.</p>
+     *
+     * <p>{@code ZoneInfoFile.<clinit>} opens the file through an ordinary
+     * {@code FileInputStream} on
+     * {@code StaticProperty.javaHome() + "/lib/tzdb.dat"} — not through
+     * {@code Class.getResourceAsStream}, and not through any native the
+     * runtime already overrides. On a HotSpot installation the file is
+     * present by construction; in a JNative image the executable may be
+     * running on a machine with no JDK installed at all, and even when
+     * one is present it can be a different release whose {@code tzdb.dat}
+     * uses a newer binary format than the {@code ZoneInfoFile} class
+     * compiled into the image was written to parse. Both cases produce
+     * the same {@code StreamCorruptedException("File format not
+     * recognised")} from {@code ZoneInfoFile.load(DataInputStream)}.</p>
+     *
+     * <p>Embedding the build JDK's copy removes both failure modes: the
+     * executable carries the exact bytes the compiled {@code
+     * ZoneInfoFile} was written against, and no filesystem access is
+     * required at run time.</p>
+     *
+     * <p>The caller is {@link io.github.kubyk01.application.service.Orchestrator},
+     * which merges this list with {@link #collectJavaBaseResources()}
+     * before handing the combined list to
+     * {@link io.github.kubyk01.application.service.codegen.llvm.LlvmGenerator#setEmbeddedResources(List)}.
+     * The C side of the hand-off is in
+     * {@code jnative/io/FileInputStream.c}: a special case in the
+     * {@code open0} native materialises this resource into an anonymous
+     * file descriptor whenever a caller tries to open a path ending in
+     * {@code /lib/tzdb.dat}.</p>
+     *
+     * @return a single-entry list holding the embedded TZDB, or an empty
+     *         list when {@code java.home} is unset or the file is
+     *         unreadable. An empty return is reported loudly: the runtime
+     *         consequence is a fatal {@code StreamCorruptedException} in
+     *         {@code ZoneInfoFile.<clinit>}, and a warning at build time
+     *         is far easier to act on than that.
+     */
+    public static List<Map.Entry<String, byte[]>> collectJdkRuntimeData() {
+        String javaHome = System.getProperty("java.home");
+        if (javaHome == null || javaHome.isEmpty()) {
+            System.err.println(
+                "ResourceEmbedder: java.home is not set; cannot embed "
+                    + "$JAVA_HOME/lib/tzdb.dat. The generated image will "
+                    + "fail at run time inside ZoneInfoFile.<clinit> with "
+                    + "StreamCorruptedException: File format not recognised.");
+            return List.of();
+        }
+
+        Path tzdb = Paths.get(javaHome, "lib", "tzdb.dat");
+        if (!Files.isRegularFile(tzdb)) {
+            System.err.println(
+                "ResourceEmbedder: " + tzdb + " not found; the generated "
+                    + "image will fail at run time inside "
+                    + "ZoneInfoFile.<clinit>. Point java.home at a complete "
+                    + "JDK installation before building.");
+            return List.of();
+        }
+
+        try {
+            byte[] bytes = Files.readAllBytes(tzdb);
+            return List.of(new AbstractMap.SimpleImmutableEntry<>(
+                EMBEDDED_TZDB_KEY, bytes));
+        } catch (IOException e) {
+            System.err.println(
+                "ResourceEmbedder: failed to read " + tzdb + ": "
+                    + e.getMessage()
+                    + ". The generated image will fail at run time inside "
+                    + "ZoneInfoFile.<clinit>.");
+            return List.of();
+        }
+    }
+
+    /**
      * Collects the bytes of <em>every</em> resource of the
      * {@code java.base} module except compiled bytecode.
      *

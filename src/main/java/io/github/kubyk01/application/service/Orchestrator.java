@@ -172,6 +172,38 @@ public class Orchestrator implements OrchestratorPort {
         // ------------------------------------------------------------------
         analysis.expandClassMapToDescriptorClosure();
 
+        // ------------------------------------------------------------------
+        // Interface-implementation closure.
+        //
+        // The reachability walk reaches a class only through NEW, GETSTATIC /
+        // PUTSTATIC, INVOKESTATIC, or a resolved virtual/interface dispatch.
+        // A class that participates in the image only as the runtime type of
+        // an interface-typed receiver is reached, but its concrete
+        // implementations of the interface's methods may not be — because
+        // resolveVirtualDispatchFixedPoint only resolves slots whose dispatch
+        // site was actually observed, and by the time that site is resolved
+        // the concrete class may not yet be in instantiatedClasses.
+        //
+        // Codegen emits an itable entry for every method of every interface
+        // that every non-external class implements, so any implementation
+        // that is missing from reachableMethods becomes a NULL function
+        // pointer in the itable, and the first caller that dispatches
+        // through it traps with __jnative_unresolved_slot.
+        //
+        // The concrete failure this closes: JceSecurity.<clinit> ->
+        // JceSecurity.setupJurisdictionPolicies -> for (Path p : stream)
+        // -> DirectoryStream.iterator(), where stream's runtime type is
+        // sun/nio/fs/UnixSecureDirectoryStream. The implementation of
+        // iterator() is inherited from sun/nio/fs/UnixDirectoryStream, and
+        // that method had never been added to the reachable set.
+        //
+        // The pass must run *before* the snapshots of allClasses/allMethods
+        // below, so that the newly-added methods are picked up by
+        // BytecodeToIr.translate() and receive the ordinary SSA / analysis
+        // pipeline.
+        // ------------------------------------------------------------------
+        analysis.ensureInterfaceImplementationsReachable();
+
         Set<String> allClasses = analysis.getReachableClasses();
         Set<MethodReference> allMethods = analysis.getReachableMethods();
 
@@ -317,10 +349,29 @@ public class Orchestrator implements OrchestratorPort {
         // client outside it — MimeTable.load() — turns that null into
         // InternalError: default mime table not found. An empty result is
         // reported loudly rather than producing an empty table.
-        List<Map.Entry<String, byte[]>> embedded =
-            ResourceEmbedder.collectJavaBaseResources();
+        // Resources the JDK reads at run time from outside its own
+        // module image. Two sources contribute:
+        //
+        //   * java.base's own resources (ICU data, META-INF/services,
+        //     content-types.properties, ...) — every non-.class entry of
+        //     the module, minus the module's classes which are already in
+        //     the IR;
+        //
+        //   * the runtime data files that live under $JAVA_HOME/lib/
+        //     rather than under $JAVA_HOME/lib/modules — today that is
+        //     exactly lib/tzdb.dat, consumed by
+        //     sun.util.calendar.ZoneInfoFile.<clinit>.
+        //
+        // The two lists are merged before the emitter sees them so a
+        // single flat lookup table (jnative_builtin_resources) covers
+        // both kinds. The C-side dispatch is by resource key, not by
+        // kind, so no consumer needs to know which source an entry came
+        // from.
+        List<Map.Entry<String, byte[]>> embedded = new ArrayList<>();
+        embedded.addAll(ResourceEmbedder.collectJavaBaseResources());
+        embedded.addAll(ResourceEmbedder.collectJdkRuntimeData());
         System.out.println("Embedding " + embedded.size()
-            + " built-in resource(s) from java.base.");
+            + " built-in resource(s) from java.base and JDK runtime data.");
 
         LlvmGenerator llvmGen = new LlvmGenerator(module, resolver, aliasResult,
                 entryClass, entryMethod, entryDescriptor, analysis.getReflectInfo(),
