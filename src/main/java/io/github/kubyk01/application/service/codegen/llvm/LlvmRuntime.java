@@ -103,6 +103,12 @@ public class LlvmRuntime {
             declare i32 @__jnative_clinit_enter(i8*)
             declare void @__jnative_clinit_exit(i8*)
 
+            declare i32 @__jnative_unsafe_address_size()
+            declare i32 @__jnative_unsafe_page_size()
+            declare i32 @__jnative_unsafe_big_endian()
+            declare i32 @__jnative_unsafe_unaligned_access()
+            declare i32 @__jnative_unsafe_data_cache_line_flush_size()
+
             declare i8* @__jnative_concat_strings(i32, ...)
 
             declare i8* @__jnative_value_to_string_int(i32)

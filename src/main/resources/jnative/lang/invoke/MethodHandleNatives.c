@@ -53,6 +53,140 @@
 #endif
 
 /*
+ * Reference-kind values, mirroring java.lang.invoke.MethodHandleInfo.*.
+ * Only the static / non-static distinction matters to this file; the
+ * remaining kinds are enumerated for completeness so the switch below
+ * reads against the same alphabet the JDK's own Constants define.
+ */
+#define JN_REF_getField        1
+#define JN_REF_getStatic       2
+#define JN_REF_putField        3
+#define JN_REF_putStatic       4
+#define JN_REF_invokeVirtual   5
+#define JN_REF_invokeStatic    6
+#define JN_REF_invokeSpecial   7
+#define JN_REF_newInvokeSpecial 8
+#define JN_REF_invokeInterface 9
+
+/*
+ * --------------------------------------------------------------------------
+ * TODO(jnative): MethodHandleNatives.resolve is a stub, and that stub is
+ * the reason MethodHandles.Lookup.findXxx fails its own validation.
+ * --------------------------------------------------------------------------
+ *
+ * WHAT THE HOTSPOT NATIVE DOES
+ *
+ * The JVM-side implementation of MethodHandleNatives.resolve is not an
+ * ordinary "return the input" helper: it is the VM's entry point into
+ * the symbolic-resolution machinery. Given a MemberName that carries a
+ * (class, name, type, refKind) tuple but no resolved target yet, it:
+ *
+ *   1. looks the member up in the VM's own symbol tables using the
+ *      class, name and type;
+ *
+ *   2. merges the resolved member's real access flags into
+ *      MemberName.flags. In particular it sets ACC_STATIC, the
+ *      visibility bits (public / private / protected), ACC_FINAL,
+ *      ACC_VOLATILE and the rest of the JVM flag word;
+ *
+ *   3. fills in vmtarget / vmindex with the linkage information the
+ *      interpreter and the JIT need to invoke the member directly.
+ *
+ * WHAT THIS RUNTIME DOES INSTEAD
+ *
+ * This runtime has no VM symbol tables and no interpreter: every call
+ * site that the LLVM backend emits is resolved at codegen time, so a
+ * MemberName never needs a vmtarget to be dispatchable. The
+ * vmtarget / vmindex slots can therefore stay NULL / 0 and every call
+ * site that goes through a MemberName will find a working body anyway.
+ *
+ * The flag merge, however, is NOT optional. It is not a linkage hint;
+ * it is what MethodHandles.Lookup.findXxx reads on the way out.
+ *
+ * HOW THE STUB BREAKS findStatic TODAY
+ *
+ * MemberName's constructor (the one Lookup.findStatic invokes) stores
+ *
+ *     flags = MN_IS_METHOD | (refKind << MN_REFERENCE_KIND_SHIFT)
+ *
+ * into the freshly allocated MemberName. For a REF_invokeStatic call
+ * site that is
+ *
+ *     flags = 0x00010000 | (6 << 24) = 0x06010000
+ *
+ * — note that ACC_STATIC is NOT set. The constructor cannot set it:
+ * it has no way to know whether the named method is actually static;
+ * that is exactly what the VM-side resolve is supposed to discover.
+ *
+ * Lookup.findStatic then calls checkMethod, which for REF_invokeStatic
+ * asserts `member.isStatic()` — i.e. it reads `flags & ACC_STATIC` off
+ * the same MemberName. Because our stub returned the MemberName with
+ * the constructor's flag word untouched, that test reads 0 and throws
+ *
+ *     java.lang.IllegalAccessException: expected a static method:
+ *         sun.invoke.util.ValueConversions.ignore(Object)void/invokeStatic,
+ *         from class sun.invoke.util.ValueConversions
+ *
+ * The failure surfaces inside
+ * sun.invoke.util.ValueConversions$Handles.<clinit>, which is the
+ * first reachable caller of findStatic in the bootstrap path, but any
+ * other findStatic / findVirtual / findGetter / findSetter call site
+ * would hit the same wall.
+ *
+ * WHY THE FIX BELOW IS SUFFICIENT
+ *
+ * Of all the flags the VM-side resolve merges in, the only one that
+ * any caller of a MemberName reachable from this runtime actually
+ * inspects is ACC_STATIC:
+ *
+ *   - the Lookup.findXxx family reads exactly this bit through
+ *     checkMethod;
+ *
+ *   - MemberName.isStatic() is the single accessor that other
+ *     reachable code paths call.
+ *
+ * The visibility bits are not read: access checks in this runtime are
+ * answered at the Java level by VerifyAccess and by
+ * Reflection.areNestMates, both of which consult Class mirrors rather
+ * than MemberName.flags. ACC_FINAL, ACC_VOLATILE and the rest are read
+ * only by the interpreter, which does not exist here.
+ *
+ * So the minimal correct fix is to derive ACC_STATIC from refKind —
+ * the one piece of information the caller has already told us, and the
+ * one piece the VM would have used anyway. That is what
+ * jnative_refkind_is_static() and the resolve implementation below do.
+ *
+ * --------------------------------------------------------------------------
+ * TODO(jnative): if a future revision of this runtime starts emitting
+ * call sites that go through a MemberName rather than through a
+ * statically resolved target, the flag word will have to be filled
+ * completely, not just the ACC_STATIC bit. The full merge would look
+ * like this:
+ *
+ *   1. read MemberName.clazz (a ReflectionClass*);
+ *   2. read MemberName.name as a C string via
+ *      __jnative_read_string_bytes;
+ *   3. convert MemberName.type (a MethodType) into a JVM descriptor.
+ *      There is no direct native for this today; the cleanest path is
+ *      to call MethodType.toMethodDescriptorString() through the
+ *      reflection adaptor that LlvmGlobalEmitter already emits, the
+ *      same way MemberName.init(Method) recovers a MethodType from a
+ *      reflect Method (see method_get_type below);
+ *   4. walk ReflectionClass.methods / .fields for the (name, descriptor)
+ *      pair and take the matching ReflectionMethod->modifiers or
+ *      ReflectionField->modifiers;
+ *   5. splice those bits into MemberName.flags, preserving the
+ *      MN_IS_METHOD / MN_IS_FIELD kind bit and the refKind nibble that
+ *      the constructor already stored.
+ *
+ * Step 3 is the only nontrivial one, and it is why the full merge was
+ * not written preemptively: reconstructing a descriptor from a
+ * MethodType requires a working reflection round-trip, which this file
+ * deliberately avoids for the bootstrap path.
+ * --------------------------------------------------------------------------
+ */
+
+/*
  * --------------------------------------------------------------------------
  * Helpers
  * --------------------------------------------------------------------------
@@ -68,6 +202,28 @@ static const char* reflect_kind_of(void* obj) {
     void* vtable = *(void**)obj;
     if (vtable == NULL) return NULL;
     return ((JNativeVTable*)vtable)->name;
+}
+
+/*
+ * True iff refKind selects a static member. Matches the mapping the
+ * JVM's own MemberName constructor uses when it classifies a
+ * reference kind.
+ *
+ * The function is deliberately a switch rather than an arithmetic
+ * predicate on the refKind value: the current JDK numbering happens to
+ * put the three static kinds at even indices, but that is an accident
+ * of the current table and arithmetic on it would break silently if
+ * the alphabet is ever reordered.
+ */
+static int jnative_refkind_is_static(int32_t ref_kind) {
+    switch (ref_kind) {
+        case JN_REF_getStatic:      /* 2 */
+        case JN_REF_putStatic:      /* 4 */
+        case JN_REF_invokeStatic:   /* 6 */
+            return 1;
+        default:
+            return 0;
+    }
 }
 
 /*
@@ -231,14 +387,32 @@ void __jnative_fn_java_lang_invoke_MethodHandleNatives_init__Ljava_lang_invoke_M
  *       int allowedModes,
  *       boolean speculativeResolve);
  *
- * IMPORTANT:
- *
  * The exact LLVM symbol expected by the linker for this overload is:
  *
  *   __jnative_fn_java_lang_invoke_MethodHandleNatives_resolve__BLjava_lang_invoke_MemberName_Ljava_lang_Class_IZ_Ljava_lang_invoke_MemberName_
  *
- * This runtime has no HotSpot symbol-table resolution phase. If the
- * MemberName already contains a target, return it unchanged.
+ * See the long TODO block at the top of this file for why this is not a
+ * faithful port of the HotSpot native, and for what a full implementation
+ * would need to do. The short version: this runtime has no VM symbol
+ * tables and no interpreter, so the vmtarget / vmindex half of the
+ * HotSpot behaviour is unnecessary, but the access-flag merge is not —
+ * it is the one thing MethodHandles.Lookup.findXxx actually reads back
+ * out of the MemberName.
+ *
+ * The fix below is the minimal merge that keeps every reachable caller
+ * of a MemberName well behaved:
+ *
+ *   - ACC_STATIC is set when (and only when) refKind selects a static
+ *     member. This is the bit Lookup.checkMethod reads, and it is the
+ *     bit that MemberName.isStatic() reads;
+ *
+ *   - ACC_STATIC is cleared in every other case, so a stale static bit
+ *     can never survive a virtual / interface / special resolution and
+ *     make isStatic() lie;
+ *
+ *   - every other flag bit the constructor placed into the word (the
+ *     MN_IS_METHOD kind bit and the refKind nibble) is preserved
+ *     untouched.
  */
 void* __jnative_fn_java_lang_invoke_MethodHandleNatives_resolve__BLjava_lang_invoke_MemberName_Ljava_lang_Class_IZ_Ljava_lang_invoke_MemberName_(
         int8_t ref_kind,
@@ -247,7 +421,6 @@ void* __jnative_fn_java_lang_invoke_MethodHandleNatives_resolve__BLjava_lang_inv
         int32_t allowed_modes,
         int32_t speculative_resolve)
 {
-    (void)ref_kind;
     (void)lookup_class;
     (void)allowed_modes;
     (void)speculative_resolve;
@@ -256,10 +429,25 @@ void* __jnative_fn_java_lang_invoke_MethodHandleNatives_resolve__BLjava_lang_inv
         return NULL;
     }
 
-    void* target = *(void**)((char*)member + MEMBERNAME_FIELD_TYPE);
-    if (target != NULL) {
-        return member;
+    int32_t flags = *(int32_t*)((char*)member + MEMBERNAME_FIELD_FLAGS);
+
+    if (jnative_refkind_is_static(ref_kind)) {
+        flags |= JNATIVE_ACC_STATIC;
+    } else {
+        flags &= ~JNATIVE_ACC_STATIC;
     }
+
+    *(int32_t*)((char*)member + MEMBERNAME_FIELD_FLAGS) = flags;
+
+    /*
+     * The MemberName is returned with its (clazz, name, type) tuple
+     * intact and its vmtarget / vmindex slots still empty. No caller in
+     * this runtime dereferences those slots, because every dispatch
+     * goes through the LLVM backend's statically emitted call sites
+     * rather than through the MemberName. See the TODO at the top of
+     * this file for what would have to change if that ever stops being
+     * true.
+     */
     return member;
 }
 
@@ -267,6 +455,12 @@ void* __jnative_fn_java_lang_invoke_MethodHandleNatives_resolve__BLjava_lang_inv
  * ==========================================================================
  * resolve(MemberName, Class, int, boolean)
  * ==========================================================================
+ *
+ * The overload without the leading `byte refKind`. The JDK's own
+ * MemberName carries the refKind in the high nibble of its flags word
+ * (bits 24..27), so the value is recoverable without a separate
+ * argument. Recovering it here and delegating to the five-argument form
+ * keeps the two entry points on exactly the same code path.
  */
 void* __jnative_fn_java_lang_invoke_MethodHandleNatives_resolve__Ljava_lang_invoke_MemberName_Ljava_lang_Class_IZ_Ljava_lang_invoke_MemberName_(
         void* member,
@@ -274,8 +468,16 @@ void* __jnative_fn_java_lang_invoke_MethodHandleNatives_resolve__Ljava_lang_invo
         int32_t allowed_modes,
         int32_t speculative_resolve)
 {
+    if (member == NULL) {
+        return NULL;
+    }
+
+    int32_t flags = *(int32_t*)((char*)member + MEMBERNAME_FIELD_FLAGS);
+    int8_t ref_kind = (int8_t)((flags & MN_REFERENCE_KIND_MASK)
+                               >> MN_REFERENCE_KIND_SHIFT);
+
     return __jnative_fn_java_lang_invoke_MethodHandleNatives_resolve__BLjava_lang_invoke_MemberName_Ljava_lang_Class_IZ_Ljava_lang_invoke_MemberName_(
-        (int8_t)0, member, lookup_class, allowed_modes, speculative_resolve);
+        ref_kind, member, lookup_class, allowed_modes, speculative_resolve);
 }
 
 /*

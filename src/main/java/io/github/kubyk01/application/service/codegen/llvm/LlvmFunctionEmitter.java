@@ -159,6 +159,43 @@ public class LlvmFunctionEmitter {
                 + "}\n\n";
         }
 
+        /*
+         * jdk.internal.misc.UnsafeConstants is the one class in the JDK
+         * whose static fields are *injected* by the VM after the class
+         * file's <clinit> has run. HotSpot overwrites the placeholder
+         * values (0, 0, false, false, 0) with platform-specific values
+         * before any Java code observes them; Unsafe.<clinit> reads
+         * them a few instructions later and derives ADDRESS_SIZE,
+         * PAGE_SIZE, unalignedAccess() and friends from them.
+         *
+         * A JNative image has no VM step to perform that injection, so
+         * the compiled UnsafeConstants.<clinit> body writes the
+         * placeholders verbatim and every consumer of the fields reads
+         * zero. The concrete failure is documented at length in
+         * UnsafeConstants.c: Unsafe.allocateMemory ends up returning 0
+         * for every non-negative request because its alignment mask
+         * degenerates to zero, and the first NativeBuffers.newNativeBuffer
+         * call hands a NULL address to Unsafe.copyMemory.
+         *
+         * Rather than let that happen, emit a replacement body for
+         * UnsafeConstants.<clinit> that queries the platform through
+         * the runtime helpers declared in LlvmRuntime.getDeclarations()
+         * and stores the results into the same globals the placeholder
+         * stores targeted. The names of those globals are fixed by
+         * LlvmGlobalEmitter.generateStaticFields: "gv_" followed by
+         * LlvmTypeMapper.sanitizeIdentifier applied to the fully
+         * qualified field name
+         * "jdk/internal/misc/UnsafeConstants.<FIELD>".
+         *
+         * The IR below must stay in lockstep with that emitter:
+         * the boolean fields BIG_ENDIAN and UNALIGNED_ACCESS are stored
+         * as i1 (Type.BOOLEAN maps to i1 in LlvmTypeMapper), and the
+         * three int fields are stored as i32.
+         */
+        if ("fn_jdk_internal_misc_UnsafeConstants__clinit____V".equals(funcName)) {
+            return emitUnsafeConstantsClinit();
+        }
+
         this.currentFunctionName = func.getName();
 
         valueMapper.clear();
@@ -489,6 +526,82 @@ public class LlvmFunctionEmitter {
         }
         if (type == Type.BOOLEAN) return "false";
         return "0";
+    }
+
+    /**
+     * Emits the replacement body for {@code
+     * jdk.internal.misc.UnsafeConstants.<clinit>}.
+     *
+     * <p>The body overwrites the placeholder values that the class file
+     * supplies ({@code 0, 0, false, false, 0}) with the values HotSpot's
+     * VM start-up step would have injected. Each value comes from a
+     * runtime helper that queries the executing platform; nothing is
+     * hard-coded except the choice of which platform capability each
+     * field describes.</p>
+     *
+     * <p>The store targets are the {@code @gv_*} globals produced by
+     * {@link LlvmGlobalEmitter#generateStaticFields()} for the five
+     * fields of {@code UnsafeConstants}. Their names are
+     * {@code gv_} concatenated with
+     * {@link LlvmTypeMapper#sanitizeIdentifier(String)} applied to
+     * {@code "jdk/internal/misc/UnsafeConstants.<FIELD>"}, which
+     * collapses to
+     * {@code gv_jdk_internal_misc_UnsafeConstants_<FIELD>} for every
+     * field. If that naming convention ever changes, this method and
+     * the emitter must change together.</p>
+     *
+     * <p>The two boolean fields are stored as {@code i1} because that
+     * is what {@link LlvmTypeMapper#toLlvmType(Type)} produces for
+     * {@link Type#BOOLEAN}, and the emitter's own {@code STORE}
+     * lowering uses the same mapping for those fields. The runtime
+     * helpers return {@code i32} so the C side is uniform, and the
+     * {@code icmp ne ... , 0} here performs the conversion. The three
+     * {@code int} fields are stored as {@code i32} unchanged.</p>
+     *
+     * <p>This function is emitted unconditionally, without going
+     * through the module's IR at all. Its {@link Function} entry in
+     * the module is not consulted; the eager {@code <clinit>} schedule
+     * in {@link LlvmGenerator#generateMain()} calls it by name, and
+     * {@link LlvmFunctionEmitter#emitFunction} reaches this method
+     * before touching any of the per-function state, so a later
+     * decision to add IR-level instrumentation to this class will not
+     * collide with the state this method deliberately does not use.</p>
+     */
+    private String emitUnsafeConstantsClinit() {
+        StringBuilder sb = new StringBuilder();
+        sb.append("define void @fn_jdk_internal_misc_UnsafeConstants__clinit____V() {\n");
+        sb.append("entry:\n");
+
+        /* ADDRESS_SIZE0 : int */
+        sb.append("  %addr_size = call i32 @__jnative_unsafe_address_size()\n");
+        sb.append("  store i32 %addr_size, i32* ")
+          .append("@gv_jdk_internal_misc_UnsafeConstants_ADDRESS_SIZE0, align 4\n");
+
+        /* PAGE_SIZE : int */
+        sb.append("  %page_size = call i32 @__jnative_unsafe_page_size()\n");
+        sb.append("  store i32 %page_size, i32* ")
+          .append("@gv_jdk_internal_misc_UnsafeConstants_PAGE_SIZE, align 4\n");
+
+        /* BIG_ENDIAN : boolean  -> i1 */
+        sb.append("  %be_i32 = call i32 @__jnative_unsafe_big_endian()\n");
+        sb.append("  %be = icmp ne i32 %be_i32, 0\n");
+        sb.append("  store i1 %be, i1* ")
+          .append("@gv_jdk_internal_misc_UnsafeConstants_BIG_ENDIAN, align 1\n");
+
+        /* UNALIGNED_ACCESS : boolean  -> i1 */
+        sb.append("  %ua_i32 = call i32 @__jnative_unsafe_unaligned_access()\n");
+        sb.append("  %ua = icmp ne i32 %ua_i32, 0\n");
+        sb.append("  store i1 %ua, i1* ")
+          .append("@gv_jdk_internal_misc_UnsafeConstants_UNALIGNED_ACCESS, align 1\n");
+
+        /* DATA_CACHE_LINE_FLUSH_SIZE : int */
+        sb.append("  %flush = call i32 @__jnative_unsafe_data_cache_line_flush_size()\n");
+        sb.append("  store i32 %flush, i32* ")
+          .append("@gv_jdk_internal_misc_UnsafeConstants_DATA_CACHE_LINE_FLUSH_SIZE, align 4\n");
+
+        sb.append("  ret void\n");
+        sb.append("}\n\n");
+        return sb.toString();
     }
 
     private String llvmLabel(BasicBlock block) {

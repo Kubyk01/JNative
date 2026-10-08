@@ -652,6 +652,8 @@ public class LlvmGenerator {
         String systemClinitName = "fn_java_lang_System__clinit____V";
         String propsClinitName  = "fn_java_util_Properties__clinit____V";
         String unsafeClinitName = "fn_jdk_internal_misc_Unsafe__clinit____V";
+        String unsafeConstantsClinitName =
+            "fn_jdk_internal_misc_UnsafeConstants__clinit____V";
         String chmClinitName    = "fn_java_util_concurrent_ConcurrentHashMap__clinit____V";
         String arraysClinitName = "fn_jdk_internal_util_ArraysSupport__clinit____V";
         String setJlaName       = "fn_java_lang_System_setJavaLangAccess___V";
@@ -678,28 +680,63 @@ public class LlvmGenerator {
         // static-field read it performs will see the JVM default (null, 0,
         // false) instead of the value its own <clinit> would have installed.
         //
-        // CharacterDataLatin1 is the newest addition. VM.saveProperties()
-        // parses the "java.class.version" entry we install in
-        // __jnative_make_bootstrap_props() via Integer.parseInt("65"), and
-        // Integer.parseInt calls Character.digit(int, int), which calls
-        // CharacterData.of(int). The ASCII fast path in CharacterData.of is
+        // UnsafeConstants is listed *before* Unsafe and must stay that
+        // way. Unsafe.<clinit> reads ADDRESS_SIZE0, PAGE_SIZE,
+        // BIG_ENDIAN, UNALIGNED_ACCESS and DATA_CACHE_LINE_FLUSH_SIZE
+        // out of UnsafeConstants and folds them into Unsafe.ADDRESS_SIZE,
+        // Unsafe.PAGE_SIZE, Unsafe.unalignedAccess() and the rest of
+        // the derived static state. If UnsafeConstants.<clinit> has not
+        // run by then, Unsafe caches the placeholder zeros forever and
+        // every Unsafe.allocateMemory() call returns NULL. See
+        // UnsafeConstants.c for the full failure chain.
+        //
+        // CharacterDataLatin1 is the newest addition to the non-Unsafe
+        // part of this list. VM.saveProperties() parses the
+        // "java.class.version" entry we install in
+        // __jnative_make_bootstrap_props() via Integer.parseInt("65"),
+        // and Integer.parseInt calls Character.digit(int, int), which
+        // calls CharacterData.of(int). The ASCII fast path in
+        // CharacterData.of is
         //
         //     if (ch >>> 8 == 0) return CharacterDataLatin1.instance;
         //
-        // so it reads a static field of CharacterDataLatin1. If that class's
-        // <clinit> has not run yet, `instance` is still null and the
-        // subsequent virtual call NPEs on the null receiver. The same
-        // Character.digit path is reached by Long.parseLong("-1") for
-        // "sun.nio.MaxDirectMemorySize", so one entry covers both parses.
+        // so it reads a static field of CharacterDataLatin1. If that
+        // class's <clinit> has not run yet, `instance` is still null
+        // and the subsequent virtual call NPEs on the null receiver.
+        // The same Character.digit path is reached by Long.parseLong("-1")
+        // for "sun.nio.MaxDirectMemorySize", so one entry covers both
+        // parses.
         // ------------------------------------------------------------------
         String[] bootstrapPrereqClinits = {
             accessibleObjectClinitName,
             characterDataLatin1ClinitName,
+            unsafeConstantsClinitName,   // MUST precede unsafeClinitName
             unsafeClinitName,
             chmClinitName,
             propsClinitName,
             arraysClinitName,
         };
+
+        // ------------------------------------------------------------------
+        // Fail loudly if UnsafeConstants was somehow left out of the
+        // module. This can only happen if the reachability analysis
+        // stopped triggering clinit on UnsafeConstants when
+        // Unsafe.<clinit> reads its fields — which would itself be a
+        // bug — but the failure mode it prevents is a silent
+        // Unsafe.allocateMemory() == NULL, which is far harder to
+        // diagnose at run time than a build-time warning.
+        // ------------------------------------------------------------------
+        {
+            Function ucc = module.getFunction(unsafeConstantsClinitName);
+            if (ucc == null || ucc.getEntryBlock() == null) {
+                log.warn("jdk.internal.misc.UnsafeConstants.<clinit> is "
+                    + "missing from the module; Unsafe.ADDRESS_SIZE will "
+                    + "be read as 0 and every Unsafe.allocateMemory() call "
+                    + "will return NULL. Check that ReachabilityAnalysis "
+                    + "triggers clinit on UnsafeConstants when Unsafe.<clinit> "
+                    + "reads its fields.");
+            }
+        }
 
         for (String prereq : bootstrapPrereqClinits) {
             Function f = module.getFunction(prereq);
@@ -804,6 +841,7 @@ public class LlvmGenerator {
             if (name.equals(stringClinitName))  continue;
             if (name.equals(systemClinitName))  continue;
             if (name.equals(unsafeClinitName))  continue;
+            if (name.equals(unsafeConstantsClinitName)) continue;
             if (name.equals(chmClinitName))     continue;
             if (name.equals(propsClinitName))   continue;
             if (name.equals(arraysClinitName))  continue;

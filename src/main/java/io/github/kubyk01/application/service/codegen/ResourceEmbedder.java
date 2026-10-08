@@ -36,13 +36,28 @@ import java.util.zip.ZipFile;
  *
  * <h2>Which files</h2>
  *
- * <p>Everything under {@code jdk/internal/icu/impl/data/icudt<NN>b/} in the
- * {@code java.base} module. On JDK 21 that is exactly four files —
- * {@code nfc.nrm}, {@code nfkc.nrm}, {@code ubidi.icu}, {@code uprops.icu}
- * — but the version number ({@code 72} on JDK 21, {@code 76} on JDK 23, …)
- * and the exact file set change from release to release. Rather than
- * spell out a list that is correct on exactly one JDK, this class
- * <em>enumerates</em> the ICU data directory and takes whatever is there.</p>
+ * <p>Two collections are offered:</p>
+ *
+ * <ul>
+ *   <li>{@link #collectJavaBaseResources()} — everything in the
+ *       {@code java.base} module except {@code .class} files. This is the
+ *       entry point the build uses, because statically deciding which
+ *       resource a reachable path will request is not possible: names are
+ *       often assembled from strings or read from fields. The first such
+ *       client was {@code sun.net.www.MimeTable.load()}, which throws
+ *       {@code InternalError: default mime table not found} when
+ *       {@code content-types.properties} is missing.</li>
+ *
+ *   <li>{@link #collectIcuResources()} — only what lives under
+ *       {@code jdk/internal/icu/impl/data/icudt<NN>b/}. On JDK 21 that is
+ *       exactly four files — {@code nfc.nrm}, {@code nfkc.nrm},
+ *       {@code ubidi.icu}, {@code uprops.icu} — but the version number
+ *       ({@code 72} on JDK 21, {@code 76} on JDK 23, …) and the exact file
+ *       set change from release to release. Rather than spell out a list
+ *       that is correct on exactly one JDK, this class <em>enumerates</em>
+ *       the ICU data directory and takes whatever is there. Kept for
+ *       callers that want the minimal set.</li>
+ * </ul>
  *
  * <h2>Where the bytes come from</h2>
  *
@@ -52,9 +67,9 @@ import java.util.zip.ZipFile;
  * <ol>
  *   <li><b>{@code $JAVA_HOME/jmods/java.base.jmod}</b> — a plain zip whose
  *       entries are prefixed with {@code classes/}. The zip API reads it
- *       without any JDK internals, and the class-file payload of
- *       {@code ICUBinary} is irrelevant here: only the {@code .nrm} /
- *       {@code .icu} resource entries are consulted.</li>
+ *       without any JDK internals, and the class-file payload is dropped by
+ *       {@code keepAsResource(String)}: only non-bytecode entries are
+ *       kept.</li>
  *
  *   <li><b>{@code jrt:/modules/java.base}</b> — the running JVM's view of
  *       the same module contents, mounted as a read-only filesystem. Used
@@ -70,14 +85,21 @@ import java.util.zip.ZipFile;
  *
  * <h2>Failure policy</h2>
  *
- * <p>An empty result is a hard error, not an empty table. A silently empty
+ * <p>The two collectors differ on purpose. {@link #collectIcuResources()}
+ * treats an empty result as a hard error, because a silently empty
  * {@code jnative_builtin_resources} array means every
  * {@code Class.getResourceAsStream} on an ICU resource returns null, which
  * in turn means {@code ICUBinary.getRequiredData} throws
  * {@code InternalError: Missing resource: ...} on the first
- * {@code Norm2AllModes} class load. Failing at code-generation time with a
+ * {@code Norm2AllModes} class load; failing at code-generation time with a
  * message that names both attempted sources is strictly more useful than
  * failing at run time inside an unrelated JDK class.</p>
+ *
+ * <p>{@link #collectJavaBaseResources()} only warns, because its clients
+ * (starting with {@code MimeTable.load()}) already report the missing
+ * resource themselves, and an environment without {@code jmods/} is a
+ * legitimate one for a runtime-image-only JDK. The warning still names both
+ * attempted sources.</p>
  */
 public final class ResourceEmbedder {
 
@@ -154,6 +176,172 @@ public final class ResourceEmbedder {
         }
 
         return resources;
+    }
+
+    /**
+     * Collects the bytes of <em>every</em> resource of the
+     * {@code java.base} module except compiled bytecode.
+     *
+     * <p>The previous version embedded only the ICU data directory. That was
+     * enough until the first client asked for a resource outside
+     * {@code jdk/internal/icu/impl/data/}. That client turned out to be
+     * {@code sun.net.www.MimeTable.load()}, which does
+     * {@code MimeTable.class.getResourceAsStream("content-types.properties")}
+     * and throws
+     * {@code InternalError: default mime table not found} on {@code null}.</p>
+     *
+     * <p>{@code .class} files are excluded: their content is already compiled
+     * into the LLVM IR, and no reachable path in this runtime requests
+     * {@code getResourceAsStream("Foo.class")}. Everything else —
+     * {@code .properties}, {@code .xml}, {@code .json}, {@code .nrm},
+     * {@code .icu}, {@code .dat}, {@code META-INF/services/*} and so on — goes
+     * into the table, because statically determining which resource the
+     * runtime will need is impossible: names are often assembled from
+     * strings or read from fields.</p>
+     *
+     * <p>Roughly 200 files totalling ~3-5 MB on JDK 21. That is a fair price
+     * for {@code Class.getResourceAsStream} no longer returning
+     * {@code null} silently.</p>
+     *
+     * <p>Unlike {@link #collectIcuResources()}, an empty result is a warning,
+     * not a hard error: callers such as {@code MimeTable.load()} fail in
+     * their own error branches with a message that names the missing
+     * resource, which is strictly more useful than aborting code generation.
+     * The warning still names both attempted sources so the "built on an
+     * image without jmods/ and without java.base" case is not discovered by
+     * a crash in MimeTable two days later.</p>
+     *
+     * @return the resources, sorted by path, or an empty list when neither
+     *         source yielded anything
+     */
+    public static List<Map.Entry<String, byte[]>> collectJavaBaseResources() {
+        List<Map.Entry<String, byte[]>> resources = readAllFromJmod();
+
+        if (resources.isEmpty()) {
+            resources = readAllFromJrt();
+        }
+
+        if (resources.isEmpty()) {
+            System.err.println(
+                "ResourceEmbedder: no java.base resources could be collected. "
+                    + "Tried $JAVA_HOME/" + JMOD_RELATIVE_PATH
+                    + " and jrt:/modules/" + MODULE_NAME + ". "
+                    + "Class.getResourceAsStream will return null for every "
+                    + "resource, and callers like MimeTable.load() will fail "
+                    + "with their own error branches (e.g. "
+                    + "InternalError: default mime table not found).");
+            return List.of();
+        }
+
+        return resources;
+    }
+
+    /**
+     * Whether {@code strippedPath} (the path with the {@code classes/} jmod
+     * prefix removed, or the path relative to {@code /modules/java.base/})
+     * should be embedded as a resource.
+     *
+     * <p>Compiled bytecode is already in the image; embedding it a second
+     * time buys nothing. An empty string is an artefact of the jmod walk, not
+     * a real resource.</p>
+     */
+    private static boolean keepAsResource(String strippedPath) {
+        if (strippedPath.endsWith(".class")) return false;
+        if (strippedPath.isEmpty()) return false;
+        return true;
+    }
+
+    /**
+     * Reads every non-class entry of {@code $JAVA_HOME/jmods/java.base.jmod}
+     * after stripping the {@code classes/} prefix, sorted by path.
+     *
+     * <p>Returns an empty list when the jmod is absent or unreadable; the
+     * caller then falls back to the jrt source.</p>
+     */
+    private static List<Map.Entry<String, byte[]>> readAllFromJmod() {
+        Path jmod = locateJmod();
+        if (jmod == null) {
+            return List.of();
+        }
+
+        List<Map.Entry<String, byte[]>> out = new ArrayList<>();
+        try (ZipFile zip = new ZipFile(jmod.toFile())) {
+            Enumeration<? extends ZipEntry> entries = zip.entries();
+            while (entries.hasMoreElements()) {
+                ZipEntry entry = entries.nextElement();
+                if (entry.isDirectory()) {
+                    continue;
+                }
+
+                String name = entry.getName();
+                if (!name.startsWith(JMOD_CLASSES_PREFIX)) {
+                    continue;
+                }
+                String stripped = name.substring(JMOD_CLASSES_PREFIX.length());
+                if (!keepAsResource(stripped)) {
+                    continue;
+                }
+
+                byte[] data;
+                try (InputStream is = zip.getInputStream(entry)) {
+                    data = is.readAllBytes();
+                }
+
+                out.add(new AbstractMap.SimpleImmutableEntry<>(stripped, data));
+            }
+        } catch (IOException e) {
+            return List.of();
+        }
+
+        out.sort(Map.Entry.comparingByKey());
+        return out;
+    }
+
+    /**
+     * Reads every non-class file under {@code jrt:/modules/java.base},
+     * keyed by the path relative to that root, sorted by path.
+     *
+     * <p>Used when the JDK ships only a runtime image and no
+     * {@code jmods/} directory.</p>
+     */
+    private static List<Map.Entry<String, byte[]>> readAllFromJrt() {
+        FileSystem fs;
+        try {
+            fs = getJrtFileSystem();
+        } catch (IOException e) {
+            return List.of();
+        }
+
+        Path root = fs.getPath("/modules/" + MODULE_NAME);
+        if (!Files.isDirectory(root)) {
+            return List.of();
+        }
+
+        List<Map.Entry<String, byte[]>> out = new ArrayList<>();
+        try {
+            Files.walk(root)
+                .filter(Files::isRegularFile)
+                .forEach(p -> {
+                    // p = /modules/java.base/sun/net/www/content-types.properties
+                    // Strip the module root and the leading '/'.
+                    String full = p.toString();
+                    String marker = "/modules/" + MODULE_NAME + "/";
+                    int idx = full.indexOf(marker);
+                    if (idx < 0) return;
+                    String stripped = full.substring(idx + marker.length());
+                    if (!keepAsResource(stripped)) return;
+                    try {
+                        out.add(new AbstractMap.SimpleImmutableEntry<>(
+                            stripped, Files.readAllBytes(p)));
+                    } catch (IOException ignored) {
+                    }
+                });
+        } catch (IOException e) {
+            return List.of();
+        }
+
+        out.sort(Map.Entry.comparingByKey());
+        return out;
     }
 
     // =====================================================================

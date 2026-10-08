@@ -311,10 +311,16 @@ public class Orchestrator implements OrchestratorPort {
         // Resources the JDK reads through Class.getResourceAsStream. They
         // live in the java.base module image and never reach the image on
         // their own, so their bytes are collected here and emitted as a
-        // lookup table the native override indexes. Collection fails loudly
-        // rather than producing an empty table.
-        List<Map.Entry<String, byte[]>> embedded = ResourceEmbedder.collectIcuResources();
-        System.out.println("Embedding " + embedded.size() + " built-in resource(s).");
+        // lookup table the native override indexes. The whole module is
+        // embedded (minus .class files): a narrow set such as the ICU data
+        // alone silently returns null for everything else, and the first
+        // client outside it — MimeTable.load() — turns that null into
+        // InternalError: default mime table not found. An empty result is
+        // reported loudly rather than producing an empty table.
+        List<Map.Entry<String, byte[]>> embedded =
+            ResourceEmbedder.collectJavaBaseResources();
+        System.out.println("Embedding " + embedded.size()
+            + " built-in resource(s) from java.base.");
 
         LlvmGenerator llvmGen = new LlvmGenerator(module, resolver, aliasResult,
                 entryClass, entryMethod, entryDescriptor, analysis.getReflectInfo(),
