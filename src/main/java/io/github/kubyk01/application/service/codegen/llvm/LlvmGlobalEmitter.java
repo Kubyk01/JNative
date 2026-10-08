@@ -1445,9 +1445,9 @@ public class LlvmGlobalEmitter {
             }
 
             String methodsName = "@vtable_methods_"
-                + LlvmTypeMapper.sanitizeIdentifier(lambdaClassName);
+                    + LlvmTypeMapper.sanitizeIdentifier(lambdaClassName);
             sb.append(methodsName).append(" = private constant [")
-                .append(methodLen).append(" x i8*] [");
+                    .append(methodLen).append(" x i8*] [");
             for (int i = 0; i < methodLen; i++) {
                 if (i > 0) sb.append(", ");
                 sb.append(methodEntries.get(i));
@@ -1470,12 +1470,36 @@ public class LlvmGlobalEmitter {
              * DisabledAlgorithmConstraints$Constraints.<init> reject its
              * own `denyAfter\s+(\d{4})-(\d{2})-(\d{2})` regex with
              * "Constraint unknown: denyAfter 2019-01-01".
+             *
+             * Every non-SAM slot is resolved through resolveVtableEntry()
+             * rather than being filled with an unresolved thunk. The
+             * lookup starts at the SAM interface — the most-derived
+             * interface in the closure — so findMethodInHierarchy walks
+             * the whole chain from there and returns the maximally-
+             * specific default, matching what the JVM's own resolution
+             * would pick. For a lambda whose SAM is BmpCharPredicate (which
+             * extends CharPredicate), a dispatch through
+             * CharPredicate.union(CharPredicate) therefore lands on
+             * BmpCharPredicate's own override of that method, not on
+             * CharPredicate's base default — which is exactly the semantics
+             * of default-method resolution in JVMS §5.4.3.3.
+             *
+             * Only if both lookups fail (no body was ever translated into
+             * the module for this slot) does the emitter fall back to the
+             * diagnostic thunk, which fires only if a call site ever
+             * actually lands on the slot at run time.
+             *
+             * The SAM slot itself is skipped in the loop and filled in with
+             * the adaptor afterwards. That keeps the slot bound to the
+             * lambda's own body rather than to any inherited default, and
+             * it avoids emitting an unreachable thunk that would have been
+             * immediately overwritten.
              */
             if (info.superInterfaces == null || info.superInterfaces.isEmpty()) {
                 throw new IllegalStateException(
-                    "Lambda '" + info.lambdaId + "' has an empty "
-                        + "super-interface closure; registerLambdaClass "
-                        + "must never produce this state");
+                        "Lambda '" + info.lambdaId + "' has an empty "
+                                + "super-interface closure; registerLambdaClass "
+                                + "must never produce this state");
             }
 
             List<String>  ifaceNames  = new ArrayList<>(info.superInterfaces);
@@ -1487,43 +1511,80 @@ public class LlvmGlobalEmitter {
                 Integer ifaceId = interfaceIds.get(iface);
                 if (ifaceId == null) {
                     throw new IllegalStateException(
-                        "Lambda '" + info.lambdaId + "' super-interface '"
-                            + iface + "' has no global interface id; "
-                            + "registerLambdaClass's closure pass missed it");
+                            "Lambda '" + info.lambdaId + "' super-interface '"
+                                    + iface + "' has no global interface id; "
+                                    + "registerLambdaClass's closure pass missed it");
                 }
 
                 VtableLayout ifaceLayout = getOrBuildInterfaceLayout(iface);
                 int len = Math.max(ifaceLayout.slots.size(), 1);
 
                 /*
-                 * The SAM signature may be absent from a given ancestor's
-                 * layout — for example when the SAM method is declared
-                 * only on the most-derived interface and we are building
-                 * the itable for one of its parents. In that case the
-                 * slot stays as a null thunk, which is correct: the
-                 * method is simply not reachable through that interface.
+                 * Locate the SAM method inside this interface's own layout.
+                 * For the SAM interface itself this is the abstract method
+                 * the lambda implements; for an ancestor the slot exists
+                 * only when the ancestor also declares (or inherits) the
+                 * same signature — otherwise the ancestor simply has no
+                 * entry for it and the adaptor is not placed here.
                  */
                 Integer slotObj = ifaceLayout.slotBySignature.get(info.samSig);
                 int adaptorSlot = (slotObj != null) ? slotObj : -1;
 
                 List<String> entries = new ArrayList<>(len);
                 for (int i = 0; i < len; i++) {
+                    // SAM slot: filled in below with the adaptor. Leaving
+                    // it out of the resolution loop avoids emitting an
+                    // unused thunk for the slot that the adaptor is about
+                    // to overwrite.
+                    if (i == adaptorSlot) {
+                        entries.add(null);
+                        continue;
+                    }
+
                     String sig = i < ifaceLayout.slots.size()
-                        ? ifaceLayout.slots.get(i)
-                        : "<unknown>";
-                    entries.add(vtableSlotEntry(lambdaClassName, iface, sig, null, sb));
+                            ? ifaceLayout.slots.get(i)
+                            : "<unknown>";
+
+                    ResolvedFn fn = null;
+                    if (!"<unknown>".equals(sig)) {
+                        // First try the SAM interface — the most-derived
+                        // interface of the closure — so that the
+                        // maximally-specific default wins, matching the
+                        // JVM's own resolution rule.
+                        fn = resolveVtableEntry(samInterface, sig);
+
+                        // Fall back to the interface whose itable we are
+                        // currently emitting.  With a correctly built
+                        // closure this should never be necessary (the SAM
+                        // hierarchy reaches every ancestor interface), but
+                        // the second lookup costs nothing and makes the
+                        // emitter robust against a closure that was built
+                        // from an incomplete class map.
+                        if (fn == null) {
+                            fn = resolveVtableEntry(iface, sig);
+                        }
+                    }
+
+                    entries.add(vtableSlotEntry(lambdaClassName, iface, sig, fn, sb));
                 }
+
+                // Bind the SAM slot to the lambda's own adaptor. The
+                // adaptor's calling convention is the generic
+                // `i8* (i8*, ...) *` shape, which the emitter's
+                // INTERFACE_CALL path is prepared to accept (it bitcasts
+                // the slot back to the concrete function-pointer type
+                // derived from the callee signature before invoking).
                 if (adaptorSlot >= 0) {
                     entries.set(adaptorSlot,
-                        "i8* bitcast (i8* (i8*, ...)* @" + info.adaptorName
-                            + " to i8*)");
+                            "i8* bitcast (i8* (i8*, ...)* @" + info.adaptorName
+                                    + " to i8*)");
                 }
 
                 String itableName = "@itable_"
-                    + LlvmTypeMapper.sanitizeIdentifier(lambdaClassName) + "_"
-                    + LlvmTypeMapper.sanitizeIdentifier(iface);
+                        + LlvmTypeMapper.sanitizeIdentifier(lambdaClassName) + "_"
+                        + LlvmTypeMapper.sanitizeIdentifier(iface);
                 sb.append(itableName).append(" = private constant [")
-                    .append(len).append(" x i8*] [");
+                        .append(len).append(" x i8*] [");
                 for (int i = 0; i < len; i++) {
                     if (i > 0) sb.append(", ");
                     sb.append(entries.get(i));
@@ -1536,37 +1597,37 @@ public class LlvmGlobalEmitter {
             }
 
             String ifacemapEntriesName = "@ifacemap_entries_"
-                + LlvmTypeMapper.sanitizeIdentifier(lambdaClassName);
+                    + LlvmTypeMapper.sanitizeIdentifier(lambdaClassName);
             String ifacemapName = "@ifacemap_"
-                + LlvmTypeMapper.sanitizeIdentifier(lambdaClassName);
+                    + LlvmTypeMapper.sanitizeIdentifier(lambdaClassName);
 
             sb.append(ifacemapEntriesName)
-                .append(" = private constant [")
-                .append(ifaceNames.size())
-                .append(" x %JNativeIfaceMapEntry] [");
+                    .append(" = private constant [")
+                    .append(ifaceNames.size())
+                    .append(" x %JNativeIfaceMapEntry] [");
             for (int i = 0; i < ifaceNames.size(); i++) {
                 if (i > 0) sb.append(", ");
                 sb.append("%JNativeIfaceMapEntry { i32 ").append(ifaceIds.get(i))
-                    .append(", i8** bitcast ([").append(itableLens.get(i))
-                    .append(" x i8*]* ").append(itableNames.get(i))
-                    .append(" to i8**) }");
+                        .append(", i8** bitcast ([").append(itableLens.get(i))
+                        .append(" x i8*]* ").append(itableNames.get(i))
+                        .append(" to i8**) }");
             }
             sb.append("]\n");
 
             sb.append(ifacemapName)
-                .append(" = constant %JNativeIfaceMap { i32 ")
-                .append(ifaceNames.size())
-                .append(", %JNativeIfaceMapEntry* ")
-                .append(ifacemapEntriesName).append(" }\n");
+                    .append(" = constant %JNativeIfaceMap { i32 ")
+                    .append(ifaceNames.size())
+                    .append(", %JNativeIfaceMapEntry* ")
+                    .append(ifacemapEntriesName).append(" }\n");
 
             String vtableName = vtableNames.get(lambdaClassName);
             String lambdaNameRef = ensureStringConstantPtr(sb, lambdaClassName);
             sb.append(vtableName).append(" = constant %JNativeVTable {\n")
-                .append("  i8** bitcast ([").append(methodLen).append(" x i8*]* ")
-                .append(methodsName).append(" to i8**),\n")
-                .append("  %JNativeIfaceMap* ").append(ifacemapName).append(",\n")
-                .append("  i8* ").append(lambdaNameRef).append("\n")
-                .append("}\n");
+                    .append("  i8** bitcast ([").append(methodLen).append(" x i8*]* ")
+                    .append(methodsName).append(" to i8**),\n")
+                    .append("  %JNativeIfaceMap* ").append(ifacemapName).append(",\n")
+                    .append("  i8* ").append(lambdaNameRef).append("\n")
+                    .append("}\n");
 
             vtableLengths.put(lambdaClassName, methodLen);
             lambdaVtableLengths.put(info.lambdaId, methodLen);
@@ -1896,8 +1957,84 @@ public class LlvmGlobalEmitter {
      * <ul>
      *   <li>{@code @jstr_<hex>} — the {@link String} object itself, whose
      *       {@code value} field points at the matching {@code @strbytes_*}
-     *       global.</li>
+     *       global, and whose {@code coder} field selects the interpretation
+     *       of that array.</li>
      * </ul>
+     *
+     * <h2>Compact-string encoding of the payload</h2>
+     *
+     * <p>A {@link String} does not store characters directly. Its
+     * {@code value} field is a {@code byte[]}, and the {@code coder} field
+     * selects how those bytes are to be interpreted:</p>
+     *
+     * <ul>
+     *   <li>{@code coder == 0} — <b>LATIN1</b>. One byte per character;
+     *       the byte value is the character's low 8 bits. Valid only when
+     *       every character of the string is in {@code U+0000..U+00FF}.</li>
+     *
+     *   <li>{@code coder == 1} — <b>UTF-16</b>. Two bytes per character,
+     *       high byte first (big-endian), one pair per {@code char} code
+     *       unit. Surrogate pairs are therefore two consecutive code units
+     *       in the array, exactly as they appear in the Java {@code String}.</li>
+     * </ul>
+     *
+     * <p>This is the same representation that {@code java.lang.String} uses
+     * internally when {@code String.COMPACT_STRINGS} is {@code true} — the
+     * flag that {@code String.<clinit>} installs, and that
+     * {@code String.coder()} reads before returning either the byte at
+     * offset 16 of the object or the UTF-16 sentinel {@code 1}. The
+     * {@code @jstr_*} globals emitted below must therefore carry the same
+     * {@code coder} value the corresponding {@code @strbytes_*} payload was
+     * encoded with; the emitter cannot choose one and the runtime the
+     * other.</p>
+     *
+     * <p>The {@code length} word at offset 8 of {@code @strbytes_*} is the
+     * <b>byte</b> count of the payload, not the character count. That is
+     * what {@code String.length()} and every other length-sensitive method
+     * of {@code String} ultimately reads, via
+     *
+     * <pre>
+     *     length() == value.length &gt;&gt; coder
+     * </pre>
+     *
+     * For the LATIN1 branch the stored word equals the character count; for
+     * the UTF-16 branch it equals twice the character count, and the
+     * right-shift recovers the character count exactly.</p>
+     *
+     * <h2>Why the previous UTF-8 encoding was wrong</h2>
+     *
+     * <p>The earlier revision of this method encoded every literal as UTF-8
+     * bytes and hard-coded {@code coder == 0} in {@code @jstr_*}. That made
+     * the two halves of the runtime's {@code String} contract disagree
+     * whenever a literal contained a character above {@code U+007F}:</p>
+     *
+     * <ul>
+     *   <li>UTF-8 is not Latin-1, so a character such as {@code "\uFFFD"}
+     *       occupies three bytes in the array while {@code coder} still
+     *       claims one byte per character;</li>
+     *   <li>the {@code length} word therefore reports the UTF-8 byte count
+     *       (3 for {@code "\uFFFD"}), and {@code String.length()} returns
+     *       {@code 3 >> 0 == 3} instead of {@code 1};</li>
+     *   <li>every consumer of {@code length()}, {@code charAt()},
+     *       {@code substring()}, {@code indexOf()}, {@code hashCode()} and
+     *       the {@code makeConcatWithConstants} machinery is then wrong by
+     *       the ratio between the UTF-8 length and the character count.</li>
+     * </ul>
+     *
+     * <p>The concrete failure that motivated the change was a {@code
+     * java.lang.IllegalArgumentException: Replacement too long} raised from
+     * {@code CharsetDecoder.replaceWith} while
+     * {@code javax.crypto.JceSecurity.<clinit>} was initialising: the
+     * literal {@code "\uFFFD"} passed to the three-argument
+     * {@code CharsetDecoder} constructor reported a length of {@code 3}
+     * against a {@code maxCharsPerByte} of {@code 1.0}, and the
+     * {@code len > maxCharsPerByte} check rejected it.</p>
+     *
+     * <p>Encoding the payload as one of the two compact-string forms
+     * restores the invariant {@code length() == value.length >> coder} for
+     * every literal, including the ones that contain characters above
+     * {@code U+007F}, and leaves ASCII-only literals byte-identical to
+     * what the previous revision emitted.</p>
      *
      * <h2>Why the backing array is emitted as an anonymous struct</h2>
      *
@@ -1905,7 +2042,6 @@ public class LlvmGlobalEmitter {
      * {@code JAVA_ARR_LENGTH_OFFSET}, {@code JAVA_ARR_ELEM_SIZE_OFFSET} and
      * {@code JAVA_ARR_HDR} in {@code jnative_runtime.h}, and every other
      * array-producing site in this codebase writes those exact offsets:</p>
-     *
      *
      * <p>The earlier revision of this method emitted the backing array as
      * {@code [N x i8] c"..."} with the header laid out at
@@ -1942,7 +2078,7 @@ public class LlvmGlobalEmitter {
         String vtableName = vtableNames.get("java/lang/String");
         if (vtableName == null) {
             throw new IllegalStateException(
-                "vtable_java_lang_String must be emitted before string literals");
+                    "vtable_java_lang_String must be emitted before string literals");
         }
 
         /*
@@ -1961,7 +2097,77 @@ public class LlvmGlobalEmitter {
         Collections.sort(literals);
 
         for (String s : literals) {
-            byte[] bytes = s.getBytes(StandardCharsets.UTF_8);
+            /*
+             * Decide which of the two compact-string encodings the literal
+             * must use.
+             *
+             * The decision is made per character code unit, not per code
+             * point. A supplementary character (U+10000..U+10FFFF) is
+             * represented in the Java String as two surrogate code units
+             * in the range U+DC80..U+DFFF, both of which are greater than
+             * 0xFF; a string containing one therefore lands in the UTF-16
+             * branch automatically, with no separate surrogate-pair test
+             * required.
+             *
+             * A string consisting entirely of characters in U+0000..U+00FF
+             * is encoded in the compact LATIN1 form: one byte per character
+             * code unit, equal to the character's low 8 bits. This is the
+             * same representation java.lang.String uses internally when
+             * String.COMPACT_STRINGS is true.
+             *
+             * Every other string is encoded as UTF-16BE: two bytes per
+             * character code unit, high byte first. This is the same
+             * representation java.lang.String uses internally when the
+             * compact-string optimisation is not in effect.
+             */
+            boolean latin1 = true;
+            int charCount = s.length();
+            for (int i = 0; i < charCount; i++) {
+                if (s.charAt(i) > 0xFF) {
+                    latin1 = false;
+                    break;
+                }
+            }
+
+            byte[] bytes;
+            int coder;
+            int lengthField;
+
+            if (latin1) {
+                /*
+                 * Compact LATIN1 form. One byte per character code unit;
+                 * the byte value is the low 8 bits of the char, which for
+                 * a char <= 0xFF is the char itself.
+                 */
+                bytes = new byte[charCount];
+                for (int i = 0; i < charCount; i++) {
+                    bytes[i] = (byte) s.charAt(i);
+                }
+                coder = 0;
+                lengthField = charCount;
+            } else {
+                /*
+                 * UTF-16BE form. Two bytes per character code unit, high
+                 * byte first. Surrogate pairs are emitted as two
+                 * consecutive code units, exactly as they appear in the
+                 * Java String.
+                 *
+                 * The charCount used here is String.length(), i.e. the
+                 * number of char code units, not the number of Unicode
+                 * code points. That is the number of elements that
+                 * String.length() must report, and it is the number the
+                 * length word below is derived from.
+                 */
+                bytes = new byte[charCount * 2];
+                for (int i = 0; i < charCount; i++) {
+                    char ch = s.charAt(i);
+                    bytes[i * 2]     = (byte) (ch >>> 8);
+                    bytes[i * 2 + 1] = (byte) (ch & 0xFF);
+                }
+                coder = 1;
+                lengthField = charCount * 2;
+            }
+
             int len = bytes.length;
 
             /*
@@ -1971,7 +2177,9 @@ public class LlvmGlobalEmitter {
              * uppercase two-digit hex. A trailing NUL byte is appended so
              * that C-side consumers can treat the payload as a C string;
              * it is C-side slack, not a Java element — the `length` field
-             * below is the true Java-visible length.
+             * below is the true Java-visible byte count, and the NUL is
+             * never observed by String.length(), String.charAt() or any
+             * other method of String.
              */
             StringBuilder escaped = new StringBuilder();
             for (byte b : bytes) {
@@ -2009,19 +2217,25 @@ public class LlvmGlobalEmitter {
              * `align 8` matches the natural alignment of the i8* header
              * word; the alignment does not change the field offsets but
              * does keep the pointer slot addressable as a pointer.
+             *
+             * The value written into the length word is `lengthField`,
+             * which is the character count in the LATIN1 branch and twice
+             * the character count in the UTF-16 branch. That is the value
+             * String.length() derives the Java-level length from, via
+             * `value.length >> coder`.
              */
             int payloadLen = len + 1;   // NUL terminator is part of the array
 
             sb.append("@").append(bytesGlobal)
-                .append(" = private unnamed_addr constant { i8*, i32, i32, [")
-                .append(payloadLen).append(" x i8] } {\n")
-                .append("  i8* bitcast (%ReflectionClass* ").append(byteArrayKlassRef)
-                .append(" to i8*),\n")
-                .append("  i32 ").append(len).append(",\n")
-                .append("  i32 1,\n")
-                .append("  [").append(payloadLen).append(" x i8] c\"")
-                .append(escaped).append("\"\n")
-                .append("}, align 8\n");
+                    .append(" = private unnamed_addr constant { i8*, i32, i32, [")
+                    .append(payloadLen).append(" x i8] } {\n")
+                    .append("  i8* bitcast (%ReflectionClass* ").append(byteArrayKlassRef)
+                    .append(" to i8*),\n")
+                    .append("  i32 ").append(lengthField).append(",\n")
+                    .append("  i32 1,\n")
+                    .append("  [").append(payloadLen).append(" x i8] c\"")
+                    .append(escaped).append("\"\n")
+                    .append("}, align 8\n");
 
             /*
              * The String object. Its `value` field is a bitcast of the
@@ -2029,16 +2243,31 @@ public class LlvmGlobalEmitter {
              * for that field in %struct.java_lang_String. The bitcast is
              * necessary because the struct type is anonymous and therefore
              * not nameable in the field declaration.
+             *
+             * The `coder` field carries the same value the payload was
+             * encoded with:
+             *
+             *     coder == 0  ->  LATIN1  (one byte per character)
+             *     coder == 1  ->  UTF-16  (two bytes per character)
+             *
+             * String.coder() reads it (after checking
+             * @gv_java_lang_String_COMPACT_STRINGS, which String.<clinit>
+             * sets to true) and String.length() applies it as the
+             * right-shift amount.
+             *
+             * The `hash` field is left at zero so the first hashCode()
+             * call computes and caches the real value lazily. The trailing
+             * i1 is left false for the same reason.
              */
             sb.append("@").append(objGlobal)
-                .append(" = global %struct.java_lang_String {\n")
-                .append("  i8* bitcast (%JNativeVTable* ").append(vtableName).append(" to i8*),\n")
-                .append("  i8* bitcast ({ i8*, i32, i32, [").append(payloadLen)
-                .append(" x i8] }* @").append(bytesGlobal).append(" to i8*),\n")
-                .append("  i8 0,\n")
-                .append("  i32 0,\n")
-                .append("  i1 false\n")
-                .append("}, align 8\n");
+                    .append(" = global %struct.java_lang_String {\n")
+                    .append("  i8* bitcast (%JNativeVTable* ").append(vtableName).append(" to i8*),\n")
+                    .append("  i8* bitcast ({ i8*, i32, i32, [").append(payloadLen)
+                    .append(" x i8] }* @").append(bytesGlobal).append(" to i8*),\n")
+                    .append("  i8 ").append(coder).append(",\n")
+                    .append("  i32 0,\n")
+                    .append("  i1 false\n")
+                    .append("}, align 8\n");
 
             stringLiteralPool.add(objGlobal);
         }
