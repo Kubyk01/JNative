@@ -68,7 +68,8 @@ public class Orchestrator implements OrchestratorPort {
                         boolean includeSystem,
                         String debugName,
                         boolean showClassesGraph,
-                        int cores) {
+                        int cores,
+                        int optimizationLevel) {
 
         final int effectiveCores = (cores <= 0)
                 ? Runtime.getRuntime().availableProcessors()
@@ -89,7 +90,7 @@ public class Orchestrator implements OrchestratorPort {
             runAnalysis(path, entryClass, entryMethod, entryDescriptor,
                     showClasses, showAlias, showEscape, showLifetime, showDestructor,
                     outputFile, noCompile, includeSystem, debugName, showClassesGraph,
-                    effectiveCores, scheduler);
+                    effectiveCores, optimizationLevel, scheduler);
         } finally {
             scheduler.dispose();
         }
@@ -110,6 +111,7 @@ public class Orchestrator implements OrchestratorPort {
                              String debugName,
                              boolean showClassesGraph,
                              int effectiveCores,
+                             int optimizationLevel,
                              Scheduler scheduler) {
 
         // --- 1. Dependency resolution -------------------------------------
@@ -395,7 +397,7 @@ public class Orchestrator implements OrchestratorPort {
             Path exePath = outputFile != null ? Paths.get(outputFile) : Paths.get("a.out");
             try {
                 compiler.compileAndLink(llPath, exePath, usedSystemClasses, module,
-                        resolver, effectiveCores);
+                        resolver, effectiveCores, optimizationLevel);
                 System.out.println("Native executable built successfully: "
                         + exePath.toAbsolutePath());
             } catch (IOException | InterruptedException e) {

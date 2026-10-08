@@ -36,6 +36,25 @@ import java.util.concurrent.atomic.AtomicInteger;
  * everything with {@code clang} (falling back to {@code gcc}), and links
  * the final executable.</p>
  *
+ * <h2>Optimization level</h2>
+ *
+ * <p>The level passed to clang as {@code -O<level>} is user-supplied
+ * through the CLI's {@code -O} option (see
+ * {@link io.github.kubyk01.adapter.driving.CLI}). The same level is used
+ * for both stages of the build:</p>
+ *
+ * <ol>
+ *   <li>the single-threaded IR-to-bitcode compilation step, and</li>
+ *   <li>the ThinLTO link step, where the optimizations are distributed
+ *       across {@code --thinlto-jobs} worker threads.</li>
+ * </ol>
+ *
+ * <p>The default of {@code 2} matches the previous hard-coded value.
+ * The value is clamped to {@code [0, 3]} before use, so a caller that
+ * passes an out-of-range value (or the interface's implicit default of
+ * {@code 0} when no explicit choice was made) still gets a valid clang
+ * invocation.</p>
+ *
  * <h2>Parallelism</h2>
  *
  * <p>Two parallel phases are involved:</p>
@@ -47,19 +66,19 @@ import java.util.concurrent.atomic.AtomicInteger;
  *       concurrent compiler processes is bounded by the caller-supplied
  *       {@code cores} value.</li>
  *
- *   <li>The heavy {@code -O3} optimization runs at link time via
- *       ThinLTO. Because the whole module is a single LLVM translation
- *       unit, {@code clang -O3 file.ll} cannot parallelize on its own;
+ *   <li>The heavy link-time optimization runs via ThinLTO. Because the
+ *       whole module is a single LLVM translation unit,
+ *       {@code clang -O<n> file.ll} cannot parallelize on its own;
  *       {@code -flto=thin -Wl,--thinlto-jobs=N} hands the optimization
  *       to the ThinLTO backend, which splits the module into partitions
  *       and optimizes them across {@code N} worker threads.</li>
  * </ol>
  *
- * <p>The generated {@code .ll} is emitted to bitcode with {@code -O2}
- * (fast, single-threaded); the expensive passes run only during the
- * link step, where they are parallelized. This two-stage arrangement is
- * what turns a single-threaded {@code clang -O3} invocation into a
- * fully parallel build.</p>
+ * <p>The generated {@code .ll} is emitted to bitcode with the
+ * user-supplied {@code -O<level>}; the expensive passes run only during
+ * the link step, where they are parallelized. This two-stage
+ * arrangement is what turns a single-threaded {@code clang} invocation
+ * into a fully parallel build.</p>
  */
 @Slf4j
 public class Compiler implements CompilerPort {
@@ -75,13 +94,29 @@ public class Compiler implements CompilerPort {
      */
     private static final String BUILD_ROOT_NAME = "jnative_build_";
 
+    /**
+     * Lower bound of the optimization level that clang accepts on its
+     * command line. {@code -O0} disables optimization entirely.
+     */
+    private static final int MIN_OPT_LEVEL = 0;
+
+    /**
+     * Upper bound of the optimization level that clang accepts on its
+     * command line. {@code -O3} is the highest level clang recognizes;
+     * passing {@code -O4} or higher is silently treated as {@code -O3}
+     * by the driver, but emitting the wrong literal on the command line
+     * is still a build-log defect, so the clamp normalizes it here.
+     */
+    private static final int MAX_OPT_LEVEL = 3;
+
     @Override
     public void compileAndLink(Path llPath,
                                Path exePath,
                                Set<String> usedClasses,
                                Module module,
                                DependencyResolver resolver,
-                               int cores)
+                               int cores,
+                               int optimizationLevel)
         throws IOException, InterruptedException {
 
         // The caller (Orchestrator) is the single source of truth for the
@@ -90,6 +125,13 @@ public class Compiler implements CompilerPort {
         // thread rather than calling availableProcessors() again and
         // reintroducing a second decision point.
         final int effectiveCores = (cores <= 0) ? 1 : cores;
+
+        // Clamp the optimization level into the range clang accepts. The
+        // Orchestrator already does this, but the port is also used
+        // directly from tests and from any future embedder, so the guard
+        // is repeated here at the single point where the value actually
+        // becomes an argument to clang.
+        final int effectiveOptLevel = clampOptLevel(optimizationLevel);
 
         Path tempDir = Files.createTempDirectory(BUILD_ROOT_NAME);
         tempDir.toFile().deleteOnExit();
@@ -130,20 +172,23 @@ public class Compiler implements CompilerPort {
             int toCompile = srcToObj.size();
             int threadCount = Math.min(effectiveCores, toCompile);
             System.out.println("Compiling " + toCompile + " C source(s) using "
-                + threadCount + " thread(s) (ThinLTO bitcode)...");
+                + threadCount + " thread(s) (ThinLTO bitcode, -O"
+                + effectiveOptLevel + ")...");
 
-            compileAllSources(compiler, srcToObj, tempDir, threadCount);
+            compileAllSources(compiler, srcToObj, tempDir, threadCount, effectiveOptLevel);
 
             // ------------------------------------------------------------------
-            // 4. Compile the generated LLVM IR to bitcode. -O2 is a cheap
-            //    single-threaded pass that only normalizes the IR; the
-            //    expensive -O3 runs at link time under ThinLTO.
+            // 4. Compile the generated LLVM IR to bitcode. The
+            //    optimization level is user-controlled; the default of 2
+            //    is a cheap pass that mostly normalizes the IR so the
+            //    expensive work can be scheduled at link time under
+            //    ThinLTO.
             // ------------------------------------------------------------------
             Path objPath = tempDir.resolve(exePath.getFileName().toString() + ".o");
             List<String> irCommand = new ArrayList<>();
             irCommand.add(compiler);
             irCommand.add("-c");
-            irCommand.add("-O2");
+            irCommand.add("-O" + effectiveOptLevel);
             irCommand.add("-flto=thin");
             irCommand.add("-g");
             irCommand.add("-fno-omit-frame-pointer");
@@ -163,14 +208,15 @@ public class Compiler implements CompilerPort {
             // ------------------------------------------------------------------
             // 5. Link with ThinLTO. The link driver reads every bitcode
             //    object, hands the merged module to the ThinLTO backend,
-            //    and the backend splits it into partitions and runs -O3
-            //    over them across --thinlto-jobs worker threads.
+            //    and the backend splits it into partitions and runs the
+            //    requested optimization level over them across
+            //    --thinlto-jobs worker threads.
             // ------------------------------------------------------------------
             List<String> linkCmd = new ArrayList<>();
             linkCmd.add(compiler);
             linkCmd.add("-flto=thin");
             linkCmd.add("-fuse-ld=lld");
-            linkCmd.add("-O3");
+            linkCmd.add("-O" + effectiveOptLevel);
             linkCmd.add("-Wl,--thinlto-jobs=" + effectiveCores);
             linkCmd.add(objPath.toString());
             for (Path obj : srcToObj.values()) {
@@ -219,6 +265,22 @@ public class Compiler implements CompilerPort {
         }
     }
 
+    /**
+     * Normalizes a user-supplied optimization level into the range
+     * clang accepts on its command line ({@code [0, 3]}).
+     *
+     * <p>The clamp is deliberately silent: passing an out-of-range
+     * value to the CLI is not an error condition worth aborting the
+     * build for, because the resulting behaviour is well defined
+     * (anything below {@code 0} becomes {@code -O0}, anything above
+     * {@code 3} becomes {@code -O3}). The compiler driver handles the
+     * same inputs the same way.</p>
+     */
+    private static int clampOptLevel(int level) {
+        if (level < MIN_OPT_LEVEL) return MIN_OPT_LEVEL;
+        return Math.min(level, MAX_OPT_LEVEL);
+    }
+
     // =========================================================================
     //  Parallel compilation
     // =========================================================================
@@ -241,14 +303,16 @@ public class Compiler implements CompilerPort {
     private void compileAllSources(String compiler,
                                    Map<Path, Path> srcToObj,
                                    Path includeDir,
-                                   int threadCount)
+                                   int threadCount,
+                                   int optimizationLevel)
         throws IOException, InterruptedException {
 
         List<Map.Entry<Path, Path>> tasks = new ArrayList<>(srcToObj.entrySet());
 
         if (threadCount <= 1 || tasks.size() <= 1) {
             for (Map.Entry<Path, Path> e : tasks) {
-                compileCSource(compiler, e.getKey(), e.getValue(), includeDir);
+                compileCSource(compiler, e.getKey(), e.getValue(), includeDir,
+                    optimizationLevel);
             }
             return;
         }
@@ -270,7 +334,8 @@ public class Compiler implements CompilerPort {
                 while ((idx = nextTask.getAndIncrement()) < tasks.size()) {
                     Map.Entry<Path, Path> e = tasks.get(idx);
                     try {
-                        compileCSource(compiler, e.getKey(), e.getValue(), includeDir);
+                        compileCSource(compiler, e.getKey(), e.getValue(),
+                            includeDir, optimizationLevel);
                     } catch (Throwable t) {
                         failures.add(t);
                     }
@@ -340,13 +405,14 @@ public class Compiler implements CompilerPort {
     //  Compilation of a single C source
     // =========================================================================
 
-    private void compileCSource(String compiler, Path src, Path obj, Path includeDir)
+    private void compileCSource(String compiler, Path src, Path obj, Path includeDir,
+                                int optimizationLevel)
         throws IOException, InterruptedException {
 
         List<String> command = new ArrayList<>();
         command.add(compiler);
         command.add("-c");
-        command.add("-O2");
+        command.add("-O" + optimizationLevel);
         // Emit LLVM bitcode for ThinLTO. Every translation unit (including
         // the runtime itself) participates in the same link-time
         // optimization pipeline.

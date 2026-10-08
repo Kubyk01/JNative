@@ -14,7 +14,8 @@ public interface CompilerPort {
                         Set<String> usedSystemClasses,
                         Module module,
                         DependencyResolver resolver,
-                        int cores)
+                        int cores,
+                        int optimizationLevel)
         throws IOException, InterruptedException;
 
     boolean hasNativeSupport(String className);
