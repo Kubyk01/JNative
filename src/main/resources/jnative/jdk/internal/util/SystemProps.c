@@ -656,7 +656,7 @@ void* __jnative_make_bootstrap_props(
     JNATIVE_INSERT("user.country",  country_buf);
 
     JNATIVE_INSERT("java.version",               "21.0.0");
-    JNATIVE_INSERT("java.version.date",          "2023-09-19");
+    JNATIVE_INSERT("java.version.date",          "2026-09-19");
     JNATIVE_INSERT("java.vendor",                "jnative");
     JNATIVE_INSERT("java.vendor.url",            "https://github.com/kubyk01/jnative");
     JNATIVE_INSERT("java.vendor.version",        "jnative");

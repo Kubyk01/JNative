@@ -249,8 +249,12 @@ public class Analyzer {
             }
         }
 
+        List<String> bootstrapPhaseFunctions =
+            collectBootstrapPhaseFunctions(resolver);
+
         return new AnalyzerResult(
-            clinitFunctions, clinitWrappers, aliasResult, escapeResult, lifetimeResult);
+            clinitFunctions, clinitWrappers, bootstrapPhaseFunctions,
+            aliasResult, escapeResult, lifetimeResult);
     }
 
     // =====================================================================
@@ -822,6 +826,40 @@ public class Analyzer {
     // =====================================================================
     //  <clinit> sorting
     // =====================================================================
+
+    /**
+     * Collects the mangled names of all static bootstrap phases declared in
+     * java.lang.System: initPhase1, initPhase2, initPhase3.
+     *
+     * <p>Discovery is driven by the "initPhase" prefix among the static
+     * methods of System rather than by a hard-coded list. A JDK that renames
+     * or adds a phase is picked up automatically.</p>
+     *
+     * <p>The returned names match what {@link LlvmRuntime#mangleMethod}
+     * produces, so the caller can look them up in
+     * {@link Module#getFunction(String)} without further conversion. The list
+     * is sorted so that initPhase1 runs before initPhase2, and initPhase2
+     * before initPhase3, independently of the method traversal order.</p>
+     */
+    private List<String> collectBootstrapPhaseFunctions(DependencyResolver resolver) {
+        List<String> phases = new ArrayList<>();
+        ClassNode systemNode = resolver.getClassNode("java/lang/System");
+        if (systemNode == null || systemNode.isExternal()) {
+            log.warn("java.lang.System is not loaded; no bootstrap phases "
+                + "will be scheduled and System.out/err/in may stay unset");
+            return phases;
+        }
+        for (MethodNode mn : systemNode.getMethods()) {
+            if (!mn.isStatic()) continue;
+            String n = mn.getName();
+            if (!n.startsWith("initPhase")) continue;
+            if (n.equals("<clinit>") || n.equals("<init>")) continue;
+            phases.add(LlvmRuntime.mangleMethod(
+                "java/lang/System", n, mn.getDescriptor()));
+        }
+        phases.sort(Comparator.naturalOrder());
+        return phases;
+    }
 
     private List<Function> sortClinitFunctions(List<Function> clinitFunctions,
                                                DependencyResolver resolver,

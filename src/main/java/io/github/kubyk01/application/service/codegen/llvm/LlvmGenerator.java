@@ -66,6 +66,7 @@ public class LlvmGenerator {
 
     private List<Function> clinitFunctions = new ArrayList<>();
     private Map<String, String> clinitWrappers = new HashMap<>();
+    private List<String> bootstrapPhaseFunctions = new ArrayList<>();
 
     /**
      * Maximum number of CPU cores the generator may use for the parallel
@@ -102,6 +103,10 @@ public class LlvmGenerator {
 
     public void setClinitWrappers(Map<String, String> wrappers) {
         this.clinitWrappers = wrappers != null ? wrappers : new HashMap<>();
+    }
+
+    public void setBootstrapPhaseFunctions(List<String> funcs) {
+        this.bootstrapPhaseFunctions = (funcs != null) ? funcs : new ArrayList<>();
     }
 
     /**
@@ -906,32 +911,60 @@ public class LlvmGenerator {
         }
 
         // ------------------------------------------------------------------
-        // Stage 5: VM bootstrap phases (initPhase1/2/3).
+        // Stage 5: JVM bootstrap phases (dynamic).
         //
-        // NOTE: these run last, exactly as before. System.initPhase1()
-        // calls SystemProps.initProperties(), which allocates a
-        // java.util.HashMap and fills it through putIfAbsent/put. The
-        // generated HashMap.putVal in this module contains no node
-        // allocation at all (see output.ll), so those inserts are silently
-        // dropped and initProperties() trips
-        // "assert java.home not set". That is a HashMap codegen defect,
-        // not an ordering problem, and moving the phases earlier does not
-        // help - it only makes the failure surface sooner. Only
-        // VM.saveProperties() is safe to hoist, which is stage 3 above.
+        // The phase list is assembled by
+        // Analyzer.collectBootstrapPhaseFunctions(), which scans the static
+        // methods of java.lang.System by the "initPhase" prefix. No method
+        // name is hard-coded here.
+        //
+        // Why this position:
+        //
+        //   * by the time any phase starts, the whole eager <clinit>
+        //     schedule has already run, so SystemProps.cmdProperties() and
+        //     Raw.platformProperties() return fully constructed objects,
+        //   * the IR-callee closure (see BytecodeToIr.closeOverIrCallees)
+        //     guarantees that the bodies of HashMap.putVal / newNode /
+        //     HashMap$Node.<init> are present in the module, otherwise
+        //     copying cmdProps into the new HashMap inside initProperties
+        //     silently loses the "java.home" entry,
+        //   * initPhase1 installs System.out / System.err / System.in, and
+        //     any <clinit> that could have printed diagnostics earlier has
+        //     already completed.
+        //
+        // Arguments are zero; the return value (i32 for initPhase2) is
+        // discarded.
         // ------------------------------------------------------------------
-        Function initPhase1 = module.getFunction("fn_java_lang_System_initPhase1___V");
-        if (initPhase1 != null && initPhase1.getEntryBlock() != null) {
-            sb.append("  call void @fn_java_lang_System_initPhase1___V()\n");
-        }
+        int bootstrapPhaseIdx = 0;
+        for (String phaseName : bootstrapPhaseFunctions) {
+            Function phase = module.getFunction(phaseName);
+            if (phase == null || phase.getEntryBlock() == null) {
+                log.warn("bootstrap phase {} not present in the module; skipping",
+                    phaseName);
+                continue;
+            }
+            String target = eagerTarget(phaseName);
+            Type retType = phase.getReturnType();
+            String retLlvm = LlvmTypeMapper.toLlvmType(retType);
 
-        Function initPhase2 = module.getFunction("fn_java_lang_System_initPhase2__ZZ_I");
-        if (initPhase2 != null && initPhase2.getEntryBlock() != null) {
-            sb.append("  call i32 @fn_java_lang_System_initPhase2__ZZ_I(i1 false, i1 false)\n");
-        }
+            StringBuilder args = new StringBuilder();
+            List<Parameter> params = phase.getParameters();
+            for (int i = 0; i < params.size(); i++) {
+                if (i > 0) args.append(", ");
+                Type pt = params.get(i).getType();
+                args.append(LlvmTypeMapper.toLlvmType(pt))
+                    .append(" ").append(zeroLiteralForType(pt));
+            }
 
-        Function initPhase3 = module.getFunction("fn_java_lang_System_initPhase3___V");
-        if (initPhase3 != null && initPhase3.getEntryBlock() != null) {
-            sb.append("  call void @fn_java_lang_System_initPhase3___V()\n");
+            if (retType.isVoid()) {
+                sb.append("  call void @").append(target)
+                  .append("(").append(args).append(")\n");
+            } else {
+                sb.append("  %bootstrap_phase_result_").append(bootstrapPhaseIdx++)
+                  .append(" = call ").append(retLlvm)
+                  .append(" @").append(target)
+                  .append("(").append(args).append(")\n");
+            }
         }
 
         // ------------------------------------------------------------------
@@ -1047,6 +1080,21 @@ public class LlvmGenerator {
         sb.append("  call void @__jnative_debug_clinit(i8* getelementptr inbounds ([")
             .append(len).append(" x i8], [").append(len)
             .append(" x i8]* ").append(g).append(", i32 0, i32 0))\n");
+    }
+
+    /**
+     * LLVM literal "zero" for an IR type. Bootstrap phases are invoked with
+     * zero arguments; the returned result is discarded.
+     */
+    private String zeroLiteralForType(Type type) {
+        if (type == null) return "null";
+        if (type == Type.BOOLEAN) return "false";
+        if (type == Type.FLOAT || type == Type.DOUBLE) return "0.0";
+        if (type.isReference() || type.isArray() || type.isNull()
+            || type.isBlock() || type.isUnknown()) {
+            return "null";
+        }
+        return "0";
     }
 
     private void generateLambdaAdaptors() {

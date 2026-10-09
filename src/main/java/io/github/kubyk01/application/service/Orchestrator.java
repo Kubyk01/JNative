@@ -381,6 +381,7 @@ public class Orchestrator implements OrchestratorPort {
                 polymorphicResolver);
         llvmGen.setClinitFunctions(analysisResult.clinitFunctions());
         llvmGen.setClinitWrappers(analysisResult.clinitWrappers());
+        llvmGen.setBootstrapPhaseFunctions(analysisResult.bootstrapPhaseFunctions());
         llvmGen.setEmbeddedResources(embedded);
         llvmGen.setCores(effectiveCores);
 

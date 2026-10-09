@@ -565,40 +565,39 @@ public class LlvmFunctionEmitter {
      * collide with the state this method deliberately does not use.</p>
      */
     private String emitUnsafeConstantsClinit() {
-        StringBuilder sb = new StringBuilder();
-        sb.append("define void @fn_jdk_internal_misc_UnsafeConstants__clinit____V() {\n");
-        sb.append("entry:\n");
 
-        /* ADDRESS_SIZE0 : int */
-        sb.append("  %addr_size = call i32 @__jnative_unsafe_address_size()\n");
-        sb.append("  store i32 %addr_size, i32* ")
-          .append("@gv_jdk_internal_misc_UnsafeConstants_ADDRESS_SIZE0, align 4\n");
+        String sb = "define void @fn_jdk_internal_misc_UnsafeConstants__clinit____V() {\n" +
+                "entry:\n" +
 
-        /* PAGE_SIZE : int */
-        sb.append("  %page_size = call i32 @__jnative_unsafe_page_size()\n");
-        sb.append("  store i32 %page_size, i32* ")
-          .append("@gv_jdk_internal_misc_UnsafeConstants_PAGE_SIZE, align 4\n");
+                /* ADDRESS_SIZE0 : int */
+                "  %addr_size = call i32 @__jnative_unsafe_address_size()\n" +
+                "  store i32 %addr_size, i32* " +
+                "@gv_jdk_internal_misc_UnsafeConstants_ADDRESS_SIZE0, align 4\n" +
 
-        /* BIG_ENDIAN : boolean  -> i1 */
-        sb.append("  %be_i32 = call i32 @__jnative_unsafe_big_endian()\n");
-        sb.append("  %be = icmp ne i32 %be_i32, 0\n");
-        sb.append("  store i1 %be, i1* ")
-          .append("@gv_jdk_internal_misc_UnsafeConstants_BIG_ENDIAN, align 1\n");
+                /* PAGE_SIZE : int */
+                "  %page_size = call i32 @__jnative_unsafe_page_size()\n" +
+                "  store i32 %page_size, i32* " +
+                "@gv_jdk_internal_misc_UnsafeConstants_PAGE_SIZE, align 4\n" +
 
-        /* UNALIGNED_ACCESS : boolean  -> i1 */
-        sb.append("  %ua_i32 = call i32 @__jnative_unsafe_unaligned_access()\n");
-        sb.append("  %ua = icmp ne i32 %ua_i32, 0\n");
-        sb.append("  store i1 %ua, i1* ")
-          .append("@gv_jdk_internal_misc_UnsafeConstants_UNALIGNED_ACCESS, align 1\n");
+                /* BIG_ENDIAN : boolean  -> i1 */
+                "  %be_i32 = call i32 @__jnative_unsafe_big_endian()\n" +
+                "  %be = icmp ne i32 %be_i32, 0\n" +
+                "  store i1 %be, i1* " +
+                "@gv_jdk_internal_misc_UnsafeConstants_BIG_ENDIAN, align 1\n" +
 
-        /* DATA_CACHE_LINE_FLUSH_SIZE : int */
-        sb.append("  %flush = call i32 @__jnative_unsafe_data_cache_line_flush_size()\n");
-        sb.append("  store i32 %flush, i32* ")
-          .append("@gv_jdk_internal_misc_UnsafeConstants_DATA_CACHE_LINE_FLUSH_SIZE, align 4\n");
+                /* UNALIGNED_ACCESS : boolean  -> i1 */
+                "  %ua_i32 = call i32 @__jnative_unsafe_unaligned_access()\n" +
+                "  %ua = icmp ne i32 %ua_i32, 0\n" +
+                "  store i1 %ua, i1* " +
+                "@gv_jdk_internal_misc_UnsafeConstants_UNALIGNED_ACCESS, align 1\n" +
 
-        sb.append("  ret void\n");
-        sb.append("}\n\n");
-        return sb.toString();
+                /* DATA_CACHE_LINE_FLUSH_SIZE : int */
+                "  %flush = call i32 @__jnative_unsafe_data_cache_line_flush_size()\n" +
+                "  store i32 %flush, i32* " +
+                "@gv_jdk_internal_misc_UnsafeConstants_DATA_CACHE_LINE_FLUSH_SIZE, align 4\n" +
+                "  ret void\n" +
+                "}\n\n";
+        return sb;
     }
 
     private String llvmLabel(BasicBlock block) {
@@ -688,11 +687,10 @@ public class LlvmFunctionEmitter {
                 .append(", i8* ").append(extraRef).append(")\n");
             sb.append("  unreachable\n");
         } else {
-            String finalExtraRef = extraRef;
             emitTryGuard(sb, ranges,
                 inner -> inner.append("  call void ").append(ctxCallee)
                     .append("(i8* ").append(funcNameRef)
-                    .append(", i8* ").append(finalExtraRef).append(")\n"),
+                    .append(", i8* ").append(extraRef).append(")\n"),
                 true);
         }
     }
@@ -1534,12 +1532,12 @@ public class LlvmFunctionEmitter {
                         break;
                     }
 
-                    String msg = (isInterfaceCall
-                        ? "interface '" + owner + "'"
-                        : "class '" + owner + "'")
-                        + ", method '" + methodName + methodDesc + "'"
-                        + " (no dispatch slot; no direct body, no native declaration)";
-                    String msgRef = stringRef(msg);
+                    String diag = "unresolved call target '" + directMangled
+                        + "' (original: " + owner + "." + methodName + methodDesc
+                        + ") — the method is referenced by reachable bytecode "
+                        + "but has no body in the module. "
+                        + "This is a reachability-analysis gap.";
+                    String msgRef = stringRef(diag);
                     sb.append("  call void @__jnative_unresolved_slot(i8* ")
                         .append(msgRef).append(")\n");
                     sb.append("  unreachable\n");
@@ -1854,8 +1852,14 @@ public class LlvmFunctionEmitter {
                 }
 
                 if (!isCallableSymbolDefined(mangledCallee)) {
-                    System.err.println("[jnative] WARN: skipping call to undefined symbol '"
-                        + mangledCallee + "' (original: " + calleeName + ")");
+                    String diag = "unresolved call target '" + mangledCallee
+                        + "' (original: " + calleeName + ") — the method is referenced "
+                        + "by reachable bytecode but was never translated into the module. "
+                        + "This is almost always a reachability-analysis gap.";
+                    String msgRef = stringRef(diag);
+                    sb.append("  call void @__jnative_unresolved_slot(i8* ")
+                      .append(msgRef).append(")\n");
+                    sb.append("  unreachable\n");
                     if (inst.getResult() != null) {
                         valueMapper.setValue(inst.getResult(),
                             getDefaultValue(inst.getResult().getType()));
@@ -2051,8 +2055,14 @@ public class LlvmFunctionEmitter {
                 }
 
                 if (!isCallableSymbolDefined(mangledCallee)) {
-                    System.err.println("[jnative] WARN: skipping SPECIAL_CALL to undefined symbol '"
-                        + mangledCallee + "' (original: " + calleeName + ")");
+                    String diag = "unresolved call target '" + mangledCallee
+                        + "' (original: " + calleeName + ") — the method is referenced "
+                        + "by reachable bytecode but was never translated into the module. "
+                        + "This is almost always a reachability-analysis gap.";
+                    String msgRef = stringRef(diag);
+                    sb.append("  call void @__jnative_unresolved_slot(i8* ")
+                      .append(msgRef).append(")\n");
+                    sb.append("  unreachable\n");
                     if (inst.getResult() != null) {
                         valueMapper.setValue(inst.getResult(),
                             getDefaultValue(inst.getResult().getType()));

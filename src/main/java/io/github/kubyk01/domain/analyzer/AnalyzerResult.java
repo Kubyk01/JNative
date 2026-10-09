@@ -11,6 +11,7 @@ import java.util.Map;
 public record AnalyzerResult(
     List<Function> clinitFunctions,
     Map<String, String> clinitWrappers,
+    List<String> bootstrapPhaseFunctions,
     AliasAnalysisResult aliasResult,
     EscapeAnalysisResult escapeResult,
     LifetimeAnalysisResult lifetimeResult

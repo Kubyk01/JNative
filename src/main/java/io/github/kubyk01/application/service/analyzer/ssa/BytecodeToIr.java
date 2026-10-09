@@ -7,9 +7,12 @@ import io.github.kubyk01.application.service.codegen.llvm.LlvmRuntime;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.ClassNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.MethodNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.MethodReference;
+import io.github.kubyk01.domain.ir.BasicBlock;
 import io.github.kubyk01.domain.ir.Function;
+import io.github.kubyk01.domain.ir.Instruction;
 import io.github.kubyk01.domain.ir.IrBuilder;
 import io.github.kubyk01.domain.ir.Module;
+import io.github.kubyk01.domain.ir.Opcode;
 import io.github.kubyk01.domain.ir.Parameter;
 import io.github.kubyk01.domain.ir.Type;
 import lombok.extern.slf4j.Slf4j;
@@ -20,8 +23,12 @@ import org.objectweb.asm.Opcodes;
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+
+import static io.github.kubyk01.util.LlvmUtil.extractCalleeName;
 
 @Slf4j
 public class BytecodeToIr {
@@ -65,7 +72,124 @@ public class BytecodeToIr {
             }
             translateMethod(ref);
         }
+
+        closeOverIrCallees();
+
         return builder.getModule();
+    }
+
+    /**
+     * Transitively closes the module with respect to the relation
+     * "there is a call to callee in the IR -> callee must be in the module".
+     *
+     * <p>The main reachability walk runs over bytecode and fills the
+     * worklist. It can miss a target in a narrow set of situations — the
+     * visitor did not look far enough into a method, the class was still a
+     * stub at traversal time, or the caller was synthesized after the walk
+     * finished. In each of those cases the caller ends up in the module, its
+     * call instruction references the callee by mangled name, and the
+     * callee's body is not in the module.</p>
+     *
+     * <p>The IR itself is a precise record of what is called: every
+     * {@code SPECIAL_CALL / STATIC_CALL / CALL} instruction carries the
+     * mangled name of its callee in a constant operand, and that name is
+     * built by the same
+     * {@link io.github.kubyk01.application.service.codegen.llvm.LlvmRuntime#mangleMethod}
+     * used for the target function's name. Walking the IR and translating
+     * everything that is missing closes the gap without duplicating the
+     * bytecode walk.</p>
+     *
+     * <p>Iterates to a fixed point: a translated callee may itself contain
+     * calls to new callees.</p>
+     */
+    private void closeOverIrCallees() {
+        Module module = builder.getModule();
+        final int MAX_PASSES = 64;
+        int pass = 0;
+
+        while (pass++ < MAX_PASSES) {
+            List<MethodReference> missing = new ArrayList<>();
+            Set<MethodReference> seen = new HashSet<>();
+
+            for (Function func : module.getFunctions()) {
+                if (func.getEntryBlock() == null) continue;
+                for (BasicBlock block : func.getBlocks()) {
+                    for (Instruction inst : block.getInstructions()) {
+                        Opcode op = inst.getOpcode();
+                        if (op != Opcode.CALL
+                            && op != Opcode.STATIC_CALL
+                            && op != Opcode.VIRTUAL_CALL
+                            && op != Opcode.INTERFACE_CALL
+                            && op != Opcode.SPECIAL_CALL) {
+                            continue;
+                        }
+                        String callee = extractCalleeName(inst);
+                        if (callee == null) continue;
+
+                        int dotIdx   = callee.lastIndexOf('.');
+                        int parenIdx = callee.indexOf('(');
+                        if (dotIdx <= 0 || parenIdx <= dotIdx) continue;
+
+                        String owner      = callee.substring(0, dotIdx);
+                        String methodPart = callee.substring(dotIdx + 1);
+                        int    localParen = parenIdx - dotIdx - 1;
+                        String name       = methodPart.substring(0, localParen);
+                        String desc       = methodPart.substring(localParen);
+
+                        MethodReference ref = new MethodReference(owner, name, desc);
+                        if (!seen.add(ref)) continue;
+
+                        String mangled = LlvmRuntime.mangleMethod(owner, name, desc);
+                        Function existing = module.getFunction(mangled);
+                        if (existing != null && existing.getEntryBlock() != null) {
+                            continue;
+                        }
+
+                        // Force-load the class if it is still an external stub
+                        // or has no bytecode at all.
+                        ClassNode cn = resolver.getClassNode(owner);
+                        if (cn == null || cn.isExternal()
+                            || resolver.getClassBytes(owner) == null) {
+                            resolver.forceLoadSystemClass(owner);
+                            cn = resolver.getClassNode(owner);
+                        }
+                        // If the class really is external (C helper, JNI
+                        // symbol, runtime function) skip it: such calls are
+                        // emitted as declarations and resolved by the linker.
+                        if (cn == null || cn.isExternal()) continue;
+
+                        // Check once more after forceLoad: the function may
+                        // have been registered as an alias.
+                        existing = module.getFunction(mangled);
+                        if (existing != null && existing.getEntryBlock() != null) {
+                            continue;
+                        }
+
+                        missing.add(ref);
+                    }
+                }
+            }
+
+            if (missing.isEmpty()) return;
+
+            for (MethodReference ref : missing) {
+                NativeOverride match = findOverride(ref);
+                if (match != null) {
+                    String key = LlvmRuntime.mangleMethod(
+                        ref.getOwner(), ref.getName(), ref.getDescriptor());
+                    Function target = module.getFunction(match.getCFunctionName());
+                    if (target != null) {
+                        module.registerAlias(key, target);
+                    }
+                    continue;
+                }
+                translateMethod(ref);
+            }
+        }
+
+        log.warn("IR-callee closure did not converge after {} passes; "
+                + "some call targets may still be missing from the module",
+            MAX_PASSES);
     }
 
     private NativeOverride findOverride(MethodReference ref) {
