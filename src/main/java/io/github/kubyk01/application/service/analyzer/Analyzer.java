@@ -4,6 +4,7 @@ import io.github.kubyk01.application.service.analyzer.aliasanalysis.AliasAnalyze
 import io.github.kubyk01.application.service.analyzer.dependencyresolver.DependencyResolver;
 import io.github.kubyk01.application.service.analyzer.escapeanalysis.EscapeAnalyzer;
 import io.github.kubyk01.application.service.analyzer.lifetime.LifetimeAnalyzer;
+import io.github.kubyk01.application.service.analyzer.ssa.BytecodeToIr;
 import io.github.kubyk01.application.service.analyzer.ssa.MethodTranslator;
 import io.github.kubyk01.application.service.analyzer.ssa.SSATransformer;
 import io.github.kubyk01.application.service.analyzer.ssa.TypeResolver;
@@ -112,6 +113,30 @@ public class Analyzer {
         }
     }
 
+    /**
+     * Optional IR translator that produced the module being analyzed.
+     *
+     * <p>When non-null, {@link #analyze} uses it to close over the IR
+     * callees of every function it resurrects — most importantly the
+     * {@code <clinit>} bodies added by
+     * {@link #resurrectRemovedClinits} and
+     * {@link #ensureReferencedClinitsPresent}. Those bodies call their
+     * class's constructor and the synthetic {@code $values()} method,
+     * and those callees may not be in the module yet; without closing
+     * over them the LLVM emitter turns every such call into a runtime
+     * {@code __jnative_unresolved_slot} trap.</p>
+     *
+     * <p>The orchestrator always sets this before invoking
+     * {@link #analyze}. The default of {@code null} keeps the class
+     * usable from unit tests that construct a module by hand and do not
+     * care about the closure.</p>
+     */
+    private BytecodeToIr translator;
+
+    public void setTranslator(BytecodeToIr translator) {
+        this.translator = translator;
+    }
+
     public AnalyzerResult analyze(Module module,
                                   DependencyResolver resolver,
                                   String entryClass,
@@ -142,6 +167,45 @@ public class Analyzer {
         if (declaredNatives > 0) {
             System.out.println("Declared " + declaredNatives
                 + " missing native-method symbol(s).");
+        }
+
+        // ------------------------------------------------------------------
+        // Close over the IR callees of every function resurrected above.
+        //
+        // resurrectRemovedClinits and ensureReferencedClinitsPresent add
+        // <clinit> bodies directly to the module via retranslateClinit,
+        // which builds only the one function it is asked for and does not
+        // walk its outgoing call graph. The bodies it produces therefore
+        // reference their class's constructor <init>(...)V and the
+        // synthetic $values() method by mangled name, without either
+        // method having been translated into the module.
+        //
+        // The orchestrator's initial translate() pass would normally have
+        // caught those missing callees through closeOverIrCallees(), but
+        // that pass has already completed by the time this code runs: it
+        // executes inside BytecodeToIr.translate(), long before Analyzer
+        // is constructed. Without a second closure pass here, every call
+        // site inside a resurrected <clinit> reaches the LLVM emitter
+        // with a callee that has no body, and the emitter converts each
+        // one into a call to __jnative_unresolved_slot followed by
+        // unreachable.
+        //
+        // The concrete failure this closes is documented in the fun.txt
+        // report: a resurrected
+        // java/net/Authenticator$RequestorType.<clinit> called both
+        // RequestorType.<init>(Ljava/lang/String;I)V and
+        // RequestorType.$values(), neither of which was in the module,
+        // and the resulting trap fired before main() had produced any
+        // observable output.
+        //
+        // The closure is applied unconditionally rather than only when
+        // resurrected + ensured > 0: it is a no-op when there is nothing
+        // to translate, and gating it on a counter would silently miss a
+        // future caller that adds functions to the module by another
+        // route.
+        // ------------------------------------------------------------------
+        if (translator != null) {
+            translator.closeOverIrCalleesWithSsa();
         }
 
         // --- 2. Collect + sort <clinit> functions -------------------------

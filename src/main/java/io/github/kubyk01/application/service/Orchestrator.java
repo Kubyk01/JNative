@@ -311,6 +311,7 @@ public class Orchestrator implements OrchestratorPort {
         // --- 7. Analysis pipeline -----------------------------------------
         Analyzer analyzer = new Analyzer();
         analyzer.setScheduler(scheduler);
+        analyzer.setTranslator(translator);
         AnalyzerResult analysisResult = analyzer.analyze(
                 module, resolver,
                 entryClass, entryMethod, entryDescriptor,

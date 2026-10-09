@@ -101,8 +101,17 @@ public class BytecodeToIr {
      *
      * <p>Iterates to a fixed point: a translated callee may itself contain
      * calls to new callees.</p>
+     *
+     * <p><b>Visibility.</b> This method is {@code public} so that
+     * {@link io.github.kubyk01.application.service.analyzer.Analyzer} can
+     * invoke it (through {@link #closeOverIrCalleesWithSsa()}) after
+     * resurrecting missing {@code <clinit>} functions. The orchestrator
+     * drives the initial pass; the analyzer drives the post-resurrection
+     * pass. Both walk the same module through the same method, so the
+     * reachability invariant "every call target has a body" is enforced
+     * from both ends.</p>
      */
-    private void closeOverIrCallees() {
+    public void closeOverIrCallees() {
         Module module = builder.getModule();
         final int MAX_PASSES = 64;
         int pass = 0;
@@ -190,6 +199,62 @@ public class BytecodeToIr {
         log.warn("IR-callee closure did not converge after {} passes; "
                 + "some call targets may still be missing from the module",
             MAX_PASSES);
+    }
+
+    /**
+     * Closes over IR callees and applies SSA to every function this call
+     * translated.
+     *
+     * <p>The initial {@link #translate()} pass closes over callees
+     * <em>before</em> the orchestrator's SSA loop runs, so the functions
+     * it adds are SSA-transformed by that external loop along with the
+     * rest of the module. Callers that execute after the loop — most
+     * notably
+     * {@link io.github.kubyk01.application.service.analyzer.Analyzer}
+     * after {@code resurrectRemovedClinits} and
+     * {@code ensureReferencedClinitsPresent} have added
+     * {@code <clinit>} bodies — cannot rely on that external pass: it
+     * has already completed, and any function added afterwards would
+     * reach the LLVM emitter without PHIs and without the local-slot
+     * renaming that SSA performs.</p>
+     *
+     * <p>The concrete failure this method exists to close is documented
+     * in the fun.txt report. A resurrected
+     * {@code java/net/Authenticator$RequestorType.<clinit>} emitted two
+     * calls — to the enum constructor
+     * {@code <init>(Ljava/lang/String;I)V} and to the synthetic
+     * {@code $values()} — neither of which had been translated into the
+     * module. Without this pass, the LLVM emitter converted both calls
+     * into {@code __jnative_unresolved_slot} traps and the executable
+     * aborted before {@code main} had produced any output.</p>
+     *
+     * <p>The function set is snapshotted before the closure, and only
+     * functions that appear in the module <em>after</em> the closure
+     * and <em>not before</em> are SSA-transformed. Functions that were
+     * already present are left alone: they have already been
+     * SSA-transformed by the orchestrator, and re-transforming them
+     * would be a no-op at best and a corruption at worst.</p>
+     */
+    public void closeOverIrCalleesWithSsa() {
+        Set<String> preexisting = new HashSet<>();
+        for (Function f : builder.getModule().getFunctions()) {
+            preexisting.add(f.getName());
+        }
+
+        closeOverIrCallees();
+
+        SSATransformer ssa = new SSATransformer();
+        for (Function f : builder.getModule().getFunctions()) {
+            if (preexisting.contains(f.getName())) continue;
+            if (f.getEntryBlock() == null) continue;
+            try {
+                ssa.transform(f);
+            } catch (Exception e) {
+                log.warn("SSA transform failed for callee {} translated "
+                        + "by closeOverIrCalleesWithSsa: {}",
+                    f.getName(), e.getMessage());
+            }
+        }
     }
 
     private NativeOverride findOverride(MethodReference ref) {
