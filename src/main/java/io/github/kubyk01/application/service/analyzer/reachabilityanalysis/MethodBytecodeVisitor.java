@@ -159,46 +159,41 @@ public class MethodBytecodeVisitor extends ClassVisitor {
         }
 
         // findStatic / findVirtual take (Class, String, MethodType).
-        if (name.equals("findStatic") || name.equals("findVirtual")) {
-            return desc.equals(
-                "(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/invoke/MethodType;)"
-                    + "Ljava/lang/invoke/MethodHandle;");
-        }
+        return switch (name) {
+            case "findStatic", "findVirtual" -> desc.equals(
+                    "(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/invoke/MethodType;)"
+                            + "Ljava/lang/invoke/MethodHandle;");
 
-        // findSpecial adds a fourth argument — the class from which the
-        // "special" invocation is made (for super/private dispatch).
-        if (name.equals("findSpecial")) {
-            return desc.equals(
-                "(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/invoke/MethodType;"
-                    + "Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;");
-        }
 
-        // findConstructor has no method-name argument: a constructor is
-        // always <init>.
-        if (name.equals("findConstructor")) {
-            return desc.equals(
-                "(Ljava/lang/Class;Ljava/lang/invoke/MethodType;)"
-                    + "Ljava/lang/invoke/MethodHandle;");
-        }
+            // findSpecial adds a fourth argument — the class from which the
+            // "special" invocation is made (for super/private dispatch).
+            case "findSpecial" -> desc.equals(
+                    "(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/invoke/MethodType;"
+                            + "Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;");
 
-        // Field getter/setter — MethodHandle variants.
-        if (name.equals("findGetter") || name.equals("findSetter")
-            || name.equals("findStaticGetter") || name.equals("findStaticSetter")) {
-            return desc.equals(
-                "(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/Class;)"
-                    + "Ljava/lang/invoke/MethodHandle;");
-        }
 
-        // VarHandle variants. The return type differs (VarHandle rather
-        // than MethodHandle), and that is the only thing distinguishing
-        // them from the getter/setter family at the descriptor level.
-        if (name.equals("findVarHandle") || name.equals("findStaticVarHandle")) {
-            return desc.equals(
-                "(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/Class;)"
-                    + "Ljava/lang/invoke/VarHandle;");
-        }
+            // findConstructor has no method-name argument: a constructor is
+            // always <init>.
+            case "findConstructor" -> desc.equals(
+                    "(Ljava/lang/Class;Ljava/lang/invoke/MethodType;)"
+                            + "Ljava/lang/invoke/MethodHandle;");
 
-        return false;
+
+            // Field getter/setter — MethodHandle variants.
+            case "findGetter", "findSetter", "findStaticGetter", "findStaticSetter" -> desc.equals(
+                    "(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/Class;)"
+                            + "Ljava/lang/invoke/MethodHandle;");
+
+
+            // VarHandle variants. The return type differs (VarHandle rather
+            // than MethodHandle), and that is the only thing distinguishing
+            // them from the getter/setter family at the descriptor level.
+            case "findVarHandle", "findStaticVarHandle" -> desc.equals(
+                    "(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/Class;)"
+                            + "Ljava/lang/invoke/VarHandle;");
+            default -> false;
+        };
+
     }
 
     // ------------------------------------------------------------------
@@ -303,10 +298,31 @@ public class MethodBytecodeVisitor extends ClassVisitor {
                 if (opcode != Opcodes.INVOKESTATIC) {
                     receiver = simulator.pop();
                 }
-                handleReflectiveCall(owner, mName, mDesc, receiver, args);
+                TypedValue reflectiveResult =
+                    handleReflectiveCall(owner, mName, mDesc, receiver, args);
                 Type retType = TypeResolver.descToReturnType(mDesc);
                 if (!retType.isVoid()) {
-                    simulator.push(TypedValue.fromType(retType));
+                    // If the handler produced a value with more information
+                    // than the plain declared return type, use it. For
+                    // Class.forName and ClassLoader.loadClass with a
+                    // constant class-name argument the handler returns a
+                    // TypedValue whose `value` field carries the internal
+                    // name of the looked-up class (same encoding LDC
+                    // X.class uses). Downstream reflective calls — most
+                    // importantly Class.getDeclaredConstructor and
+                    // Class.getConstructor — recover that name through
+                    // resolveClassNameFromValue(receiver) and register the
+                    // correct constructors in the reflection table. Without
+                    // this the receiver would be an ordinary Class TypedValue
+                    // with no class-name information, the handler would fall
+                    // back to the unsafe `lastLoadedClass`, and the target
+                    // would be whatever class literal happened to be LDC'd
+                    // last (for the DirectByteBufferR / DirectByteBuffer
+                    // constructor lookups that is MemorySegment, an interface
+                    // with no constructors at all).
+                    simulator.push(reflectiveResult != null
+                        ? reflectiveResult
+                        : TypedValue.fromType(retType));
                 }
             } else {
                 String rawReceiverType = simulator.getReceiverType(opcode, mDesc);
@@ -684,14 +700,33 @@ public class MethodBytecodeVisitor extends ClassVisitor {
             // empty and the class's <clinit> failed with a
             // NoSuchMethodException wrapped in an InternalError.
             // ------------------------------------------------------------------
-            if (isLookupFindMethod(owner, name, desc)) {
-                return true;
-            }
-            return false;
+            return isLookupFindMethod(owner, name, desc);
         }
 
-        private void handleReflectiveCall(String owner, String mName, String mDesc,
-                                          TypedValue receiver, List<TypedValue> args) {
+        /**
+         * Handles a single reflective call site.
+         *
+         * <p>Returns the {@link TypedValue} to push onto the simulated operand
+         * stack as the result of the call, or {@code null} if the caller should
+         * fall back to the method's declared return type. Only the handlers for
+         * {@code Class.forName} and {@code ClassLoader.loadClass} return a
+         * non-null value: for those two, and only when the class-name argument
+         * is a compile-time constant, the result is a {@code TypedValue} whose
+         * {@code value} field carries the internal name of the looked-up class
+         * (exactly the encoding {@code LDC X.class} already uses). That name is
+         * what downstream reflective calls — {@code getDeclaredConstructor},
+         * {@code getDeclaredMethod}, {@code getField}, {@code newInstance} —
+         * read back through {@link #resolveClassNameFromValue(TypedValue)} to
+         * determine their target class.</p>
+         *
+         * <p>Returning {@code null} from every other branch preserves the
+         * previous behaviour exactly: the caller pushes a plain
+         * {@code TypedValue.fromType(retType)} and any downstream handler that
+         * needs a class name has to rely on the historical {@code lastLoadedClass}
+         * fallback.</p>
+         */
+        private TypedValue handleReflectiveCall(String owner, String mName, String mDesc,
+                                                TypedValue receiver, List<TypedValue> args) {
             MethodReference reflectiveRef = new MethodReference(owner, mName, mDesc);
             addMethodWithContext(reflectiveRef, reachableFromUser);
 
@@ -714,10 +749,10 @@ public class MethodBytecodeVisitor extends ClassVisitor {
             // ------------------------------------------------------------------
             if (isLookupFindMethod(owner, mName, mDesc)) {
                 handleLookupFindCall(mName, args);
-                return;
+                return null;
             }
 
-            if (!reachableFromUser) return;
+            if (!reachableFromUser) return null;
 
             // ------------------------------------------------------------------
             // Unsafe.objectFieldOffset(Class, String) /
@@ -740,7 +775,7 @@ public class MethodBytecodeVisitor extends ClassVisitor {
                 && (mName.equals("objectFieldOffset") || mName.equals("objectFieldOffset1"))
                 && mDesc.equals("(Ljava/lang/Class;Ljava/lang/String;)J")) {
                 registerUnsafeObjectFieldOffset(args);
-                return;
+                return null;
             }
 
             // ------------------------------------------------------------------
@@ -762,7 +797,7 @@ public class MethodBytecodeVisitor extends ClassVisitor {
                 if (target != null) {
                     analysis.addInstantiatedClass(target, reachableFromUser);
                 }
-                return;
+                return null;
             }
 
             // ------------------------------------------------------------------
@@ -770,20 +805,33 @@ public class MethodBytecodeVisitor extends ClassVisitor {
             //
             // The class-name argument is parameter slot 0 in both the
             // one-argument and three-argument forms. When it is a string
-            // constant — the case that matters for every JDK call site
-            // that resolves a class by name known at compile time — the
-            // target is registered as an active use so its <clinit> runs
-            // and it becomes a first-class member of the image: its
-            // vtable, struct type, and reflection record are all emitted,
-            // and the runtime's Class.forName0 will find it at run time.
+            // constant the target is registered as an active use so its
+            // <clinit> runs and it becomes a first-class member of the image,
+            // and the call's result is returned as a TypedValue that carries
+            // the internal name of the looked-up class. That name is what
+            // every subsequent reflective call on the returned Class object
+            // needs in order to resolve its own target class — without it,
+            // a downstream getDeclaredConstructor/getDeclaredMethod handler
+            // falls back to lastLoadedClass, which after the caller has built
+            // a Class[] of parameter types is a parameter class literal, not
+            // the class the caller actually queried.
             //
-            // The three-argument form is what
-            // java.security.Provider$Service.newInstance uses to resolve
-            // a provider implementation whose name is stored in a String
-            // field. Without recognising this form the target class was
-            // invisible to the reachability walk and Class.forName0
-            // failed with a "class not found" against a name that was in
-            // fact present in the bytecode as a string constant.
+            // The concrete failure that motivated returning this value: the
+            // static initializer of sun.nio.ch.Util does
+            //
+            //     Class<?> cl = Class.forName("java.nio.DirectByteBufferR");
+            //     Constructor<?> ctor = cl.getDeclaredConstructor(
+            //         int.class, long.class, FileDescriptor.class,
+            //         Runnable.class, boolean.class, MemorySegment.class);
+            //
+            // and expects to find the class's reflect-only constructor. With
+            // the pre-fix behaviour lastLoadedClass ended up being
+            // java/lang/foreign/MemorySegment (the last parameter literal LDC'd
+            // before INVOKEVIRTUAL), registerAllMethodsByName was called on
+            // that interface, and @refctors_java_nio_DirectByteBufferR was
+            // emitted empty. Class.getDeclaredConstructor then threw
+            // NoSuchMethodException at run time and Util's catch block wrapped
+            // it in an InternalError, aborting SystemModuleFinders$SystemImage.
             // ------------------------------------------------------------------
             if (owner.equals("java/lang/Class") && mName.equals("forName")
                 && (mDesc.equals("(Ljava/lang/String;)Ljava/lang/Class;")
@@ -794,17 +842,21 @@ public class MethodBytecodeVisitor extends ClassVisitor {
                         String className = s.replace('.', '/');
                         addClassWithInit(className);
                         analysis.addInstantiatedClass(className, reachableFromUser);
+                        return TypedValue.fromConstant(
+                            Type.reference("java/lang/Class"), className);
                     }
                 }
-                return;
+                return null;
             }
 
             // ------------------------------------------------------------------
             // ClassLoader.loadClass — both forms.
             //
-            // Same reasoning as Class.forName above. The class-name
-            // argument is parameter slot 0 in both forms. The
-            // two-argument form (String, boolean) is what a subclass's
+            // Same reasoning as Class.forName above: the class-name argument
+            // is parameter slot 0, and the call's result must carry the
+            // internal name of the loaded class so that downstream reflective
+            // calls on the returned Class object can resolve their target.
+            // The two-argument form (String, boolean) is what a subclass's
             // overridden loadClass forwards to when it delegates to
             // super.loadClass(name, resolve).
             // ------------------------------------------------------------------
@@ -817,9 +869,11 @@ public class MethodBytecodeVisitor extends ClassVisitor {
                         String className = s.replace('.', '/');
                         addClassWithInit(className);
                         analysis.addInstantiatedClass(className, reachableFromUser);
+                        return TypedValue.fromConstant(
+                            Type.reference("java/lang/Class"), className);
                     }
                 }
-                return;
+                return null;
             }
 
             // ------------------------------------------------------------------
@@ -873,15 +927,23 @@ public class MethodBytecodeVisitor extends ClassVisitor {
             if (owner.equals("java/lang/Class")
                 && (mName.equals("getMethod") || mName.equals("getDeclaredMethod"))
                 && mDesc.startsWith("(Ljava/lang/String;")) {
-                if (args.isEmpty()) return;
+                if (args.isEmpty()) return null;
 
                 TypedValue nameArg = args.getFirst();
-                if (!nameArg.isConstant() || !(nameArg.getValue() instanceof String methodName)) return;
-                if (methodName.isEmpty()) return;
-                // <clinit> is never requested reflectively; <init> is
-                // requested only through the constructor APIs.
-                if (methodName.equals("<clinit>")) return;
-                if (methodName.equals("<init>")) return;
+                if (!nameArg.isConstant() || !(nameArg.getValue() instanceof String methodName)) return null;
+                switch (methodName) {
+                    case "" -> {
+                        return null;
+                    }
+                    // <clinit> is never requested reflectively; <init> is
+                    // requested only through the constructor APIs.
+                    case "<clinit>" -> {
+                        return null;
+                    }
+                    case "<init>" -> {
+                        return null;
+                    }
+                }
 
                 List<String> paramClassNames = new ArrayList<>();
                 boolean paramsFullyResolved = true;
@@ -918,10 +980,10 @@ public class MethodBytecodeVisitor extends ClassVisitor {
                 if (targetClass == null) {
                     targetClass = lastLoadedClass;
                 }
-                if (targetClass == null) return;
+                if (targetClass == null) return null;
 
                 ClassNode cn = resolver.getClassNode(targetClass);
-                if (cn == null || cn.isExternal()) return;
+                if (cn == null || cn.isExternal()) return null;
 
                 boolean anyRegistered = false;
 
@@ -956,7 +1018,7 @@ public class MethodBytecodeVisitor extends ClassVisitor {
                 if (!anyRegistered) {
                     registerAllMethodsByName(targetClass, cn, methodName);
                 }
-                return;
+                return null;
             }
 
             // ------------------------------------------------------------------
@@ -1018,22 +1080,22 @@ public class MethodBytecodeVisitor extends ClassVisitor {
                 if (targetClass == null) {
                     targetClass = lastLoadedClass;
                 }
-                if (targetClass == null) return;
+                if (targetClass == null) return null;
 
                 // Arrays have no constructors in this model — everything they
                 // inherit is from java/lang/Object and is already covered by the
                 // ordinary Object handling. Skip without loss of correctness.
-                if (targetClass.charAt(0) == '[') return;
+                if (targetClass.charAt(0) == '[') return null;
 
                 ClassNode cn = resolver.getClassNode(targetClass);
                 if (cn == null || cn.isExternal() || resolver.getClassBytes(targetClass) == null) {
                     resolver.forceLoadSystemClass(targetClass);
                     cn = resolver.getClassNode(targetClass);
                 }
-                if (cn == null || cn.isExternal()) return;
+                if (cn == null || cn.isExternal()) return null;
 
                 registerAllMethodsByName(targetClass, cn, "<init>");
-                return;
+                return null;
             }
 
             if (owner.equals("java/lang/Class")
@@ -1061,7 +1123,7 @@ public class MethodBytecodeVisitor extends ClassVisitor {
                         }
                     }
                 }
-                return;
+                return null;
             }
             if (owner.equals("java/lang/reflect/Method") && mName.equals("invoke")
                 && mDesc.equals("(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;")) {
@@ -1071,7 +1133,7 @@ public class MethodBytecodeVisitor extends ClassVisitor {
                         addMethodWithContext(method, true);
                     }
                 }
-                return;
+                return null;
             }
             if (owner.equals("java/lang/reflect/Constructor") && mName.equals("newInstance")
                 && mDesc.equals("([Ljava/lang/Object;)Ljava/lang/Object;")) {
@@ -1082,7 +1144,7 @@ public class MethodBytecodeVisitor extends ClassVisitor {
                         analysis.addInstantiatedClass(cls, reachableFromUser);
                     }
                 }
-                return;
+                return null;
             }
             if (owner.equals("java/lang/Class") && mName.equals("newInstance")
                 && mDesc.equals("()Ljava/lang/Object;")) {
@@ -1106,7 +1168,10 @@ public class MethodBytecodeVisitor extends ClassVisitor {
                         }
                     }
                 }
+                return null;
             }
+
+            return null;
         }
 
         /**
@@ -1175,11 +1240,19 @@ public class MethodBytecodeVisitor extends ClassVisitor {
                 if (args.size() < 2) return;
                 TypedValue nameArg = args.get(1);
                 if (!nameArg.isConstant() || !(nameArg.getValue() instanceof String methodName)) return;
-                if (methodName.isEmpty()) return;
-                // <clinit> is never requested reflectively; <init> is
-                // requested only through findConstructor.
-                if (methodName.equals("<clinit>")) return;
-                if (methodName.equals("<init>")) return;
+                switch (methodName) {
+                    case "" -> {
+                        return;
+                    }
+                    // <clinit> is never requested reflectively; <init> is
+                    // requested only through findConstructor.
+                    case "<clinit>" -> {
+                        return;
+                    }
+                    case "<init>" -> {
+                        return;
+                    }
+                }
 
                 registerAllMethodsByName(targetClass, cn, methodName);
                 return;

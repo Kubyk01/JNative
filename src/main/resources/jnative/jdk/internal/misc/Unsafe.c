@@ -654,47 +654,6 @@ struct ReflectionFieldLayout {
  *  (void*)addr, which is exactly the global's address.
  * ======================================================================== */
 
-/*
- * Build the LLVM global symbol name for a static field, matching
- * LlvmTypeMapper.sanitizeIdentifier byte-for-byte:
- *
- *     "gv_" + sanitize(owner + "." + name)
- *
- * where sanitize replaces every character outside [a-zA-Z0-9_] with a
- * single underscore. '/' and '.' are both outside that set, so
- * "java/util/concurrent/ForkJoinPool.poolIds" becomes
- * "gv_java_util_concurrent_ForkJoinPool_poolIds".
- */
-static int build_static_field_symbol(const char* owner,
-                                     const char* name,
-                                     int32_t name_len,
-                                     char* out, size_t out_size)
-{
-    if (owner == NULL || name == NULL || out_size < 8) return 0;
-
-    size_t pos = 0;
-    out[pos++] = 'g';
-    out[pos++] = 'v';
-    out[pos++] = '_';
-
-    for (const char* p = owner; *p; p++) {
-        if (pos + 2 >= out_size) return 0;
-        unsigned char c = (unsigned char)*p;
-        out[pos++] = (isalnum(c) || c == '_') ? (char)c : '_';
-    }
-    if (pos + 2 >= out_size) return 0;
-    out[pos++] = '_';
-
-    for (int32_t i = 0; i < name_len; i++) {
-        if (pos + 2 >= out_size) return 0;
-        unsigned char c = (unsigned char)name[i];
-        out[pos++] = (isalnum(c) || c == '_') ? (char)c : '_';
-    }
-
-    out[pos] = '\0';
-    return 1;
-}
-
 int64_t __jnative_fn_jdk_internal_misc_Unsafe_objectFieldOffset__Ljava_lang_reflect_Field_J(void* this_unsafe, void* field) {
     (void)this_unsafe;
     if (!field) return 0;
@@ -730,8 +689,8 @@ int64_t __jnative_fn_jdk_internal_misc_Unsafe_staticFieldOffset__Ljava_lang_refl
     while (cur != NULL) {
         const char* cls_name = cur->cname;
         if (cls_name != NULL
-            && build_static_field_symbol(cls_name, name, name_len,
-                                         symbol, sizeof(symbol))) {
+            && jnative_build_static_field_symbol(cls_name, name, name_len,
+                                                 symbol, sizeof(symbol))) {
             void* addr = dlsym(handle, symbol);
             if (addr != NULL) {
                 result = (int64_t)(intptr_t)addr;

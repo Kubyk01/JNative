@@ -7,6 +7,7 @@
 #include <ucontext.h>
 #include <sys/ucontext.h>
 #include <execinfo.h>
+#include <ctype.h>
 
 #include "jnative_runtime.h"
 
@@ -442,6 +443,60 @@ void* __jnative_own_class_vtable(const char* class_name) {
     void** type_info = (void**)dlsym(RTLD_DEFAULT, symbol);
     if (type_info == NULL) return NULL;
     return type_info[0];
+}
+
+/* ============================================================================
+ * Static-field symbol construction
+ * ========================================================================== */
+
+/*
+ * The character-class predicate is spelled out inline rather than calling
+ * isalnum(), because the Java side's rule is exactly
+ *     [a-zA-Z0-9_] -> keep; anything else -> '_'
+ * and the C library's isalnum() is documented to be locale-dependent.
+ * The runtime never calls setlocale(), so the C locale is in effect and
+ * isalnum() would in fact agree, but matching the Java rule explicitly
+ * makes the two implementations provably identical rather than
+ * identical-by-accident-of-environment.
+ */
+static int jnative_is_word_char(unsigned char c) {
+    return (c >= 'a' && c <= 'z')
+        || (c >= 'A' && c <= 'Z')
+        || (c >= '0' && c <= '9')
+        || (c == '_');
+}
+
+int jnative_build_static_field_symbol(const char* owner,
+                                      const char* name,
+                                      int32_t name_len,
+                                      char* out, size_t out_size)
+{
+    if (owner == NULL || name == NULL) return 0;
+    if (name_len < 0) return 0;
+    /* Need room for "gv_" + owner + "_" + name + NUL. */
+    if (out_size < 4) return 0;
+
+    size_t pos = 0;
+    out[pos++] = 'g';
+    out[pos++] = 'v';
+    out[pos++] = '_';
+
+    for (const char* p = owner; *p != '\0'; p++) {
+        if (pos + 2 >= out_size) return 0;
+        unsigned char c = (unsigned char)*p;
+        out[pos++] = jnative_is_word_char(c) ? (char)c : '_';
+    }
+    if (pos + 2 >= out_size) return 0;
+    out[pos++] = '_';
+
+    for (int32_t i = 0; i < name_len; i++) {
+        if (pos + 2 >= out_size) return 0;
+        unsigned char c = (unsigned char)name[i];
+        out[pos++] = jnative_is_word_char(c) ? (char)c : '_';
+    }
+
+    out[pos] = '\0';
+    return 1;
 }
 
 /* ============================================================================

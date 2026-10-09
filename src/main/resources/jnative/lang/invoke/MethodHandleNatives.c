@@ -8,8 +8,16 @@
  * This runtime has no JVM symbol tables and no interpreter: every call
  * site that the LLVM backend emits is resolved at codegen time, so a
  * MemberName never needs a vmtarget to be dispatchable. The
- * vmtarget / vmindex slots can therefore stay NULL / 0 and every call
- * site that goes through a MemberName will find a working body anyway.
+ * vmtarget / vmindex slots can therefore stay NULL / 0 and every
+ * call site that goes through a MemberName will find a working body
+ * anyway. The field-offset accessors (staticFieldBase, staticFieldOffset,
+ * objectFieldOffset) are the one exception: they are read by the JDK's
+ * own ClassSpecializer / BoundMethodHandle bootstrap path, which uses
+ * the returned address to write into a species class's static field
+ * through Unsafe.putReference. Leaving them as stubs made every such
+ * write land at address NULL. They are therefore implemented in full
+ * below, using the same naming convention the emitter applies to every
+ * static field's LLVM global.
  *
  * The flag word of a MemberName, however, is NOT optional. It is not
  * a linkage hint; it is what MethodHandles.Lookup.findXxx reads on the
@@ -860,13 +868,172 @@ void* __jnative_fn_java_lang_invoke_MethodHandleNatives_resolve__Ljava_lang_invo
 
 /*
  * ==========================================================================
+ * MemberName-as-field accessors
+ * ==========================================================================
+ *
+ * The three entry points below are the MemberName-based counterparts of
+ * the java.lang.reflect.Field-based accessors implemented in
+ * jnative/jdk/internal/misc/Unsafe.c. They answer the same three
+ * questions about the same underlying object — an instance field's byte
+ * offset within its receiver, a static field's base, and a static
+ * field's offset — for callers that hold the field reference as a
+ * MemberName rather than as a java.lang.reflect.Field.
+ *
+ * This split exists because the JDK's method-handle and reflection
+ * machinery each prefer a different view of the same field:
+ *
+ *   - java.lang.Class.getDeclaredFields0 (and every caller that builds
+ *     a Field mirror, e.g. Unsafe.objectFieldOffset(Field)) produces
+ *     java.lang.reflect.Field objects, which the Field variants in
+ *     Unsafe.c consume.
+ *
+ *   - MethodHandles.Lookup.resolveOrFail, MemberName.Factory.resolve,
+ *     and every ClassSpecializer / BoundMethodHandle path that has
+ *     already resolved a member through the MethodHandles machinery
+ *     produce MemberName objects, which the natives here consume.
+ *
+ * The concrete failure that motivated implementing these: the static
+ * initializer of java.lang.invoke.BoundMethodHandle runs the
+ * ClassSpecializer.<clinit> chain, which reaches
+ *
+ *     ClassSpecializer$Factory.linkCodeToSpeciesData
+ *         -> IMPL_LOOKUP.resolveOrFail(REF_putStatic, speciesCode,
+ *                                      "BMH_SPECIES", metaType)
+ *             -> MethodHandleNatives.resolve(...)
+ *         -> MethodHandleNatives.staticFieldBase(sdField)
+ *         -> MethodHandleNatives.staticFieldOffset(sdField)
+ *         -> UNSAFE.putReference(base, offset, speciesData)
+ *
+ * With staticFieldBase returning NULL and staticFieldOffset returning 0,
+ * the pair (base, offset) collapsed to (NULL, 0). Unsafe.putReference
+ * computed effective_address(NULL, 0) == (void*)0 and stored the
+ * SpeciesData pointer at address 0, producing a SIGSEGV at (nil) with
+ * RIP inside __jnative_fn_jdk_internal_misc_Unsafe_putReference.
+ *
+ * The fix restores the runtime's static-field convention: base is NULL
+ * and offset is the absolute address of the emitted LLVM global
+ * @gv_<sanitize(owner.name)>, so that
+ * effective_address(NULL, addr) evaluates to (void*)addr — the address
+ * of the global itself.
+ */
+
+/*
+ * --------------------------------------------------------------------------
+ * Extract the (clazz, name) pair that identifies the referenced field.
+ *
+ * The MemberName layout used by this runtime is documented at the top
+ * of this file:
+ *
+ *     +8   clazz   (ReflectionClass*, the declaring class mirror)
+ *     +16  name    (java.lang.String, the field's simple name)
+ *
+ * Both fields are populated by MemberName's own constructor (which
+ * stores the class argument verbatim) and, when the metadata lookup in
+ * resolve() succeeds, clazz is further refined to the class that
+ * actually declares the member. Either way, the walk below starts from
+ * a class that is at or above the declaring class in the hierarchy,
+ * which is exactly what the superclass-chain walk needs.
+ *
+ * Returns 1 on success (both clazz and name are non-null and the name
+ * has a positive length), 0 otherwise. On success, *out_clazz receives
+ * the ReflectionClass* and *out_name receives a pointer to the name
+ * bytes owned by the java.lang.String (valid until the string becomes
+ * unreachable, which for a MemberName-held string is the lifetime of
+ * the MemberName itself).
+ * ------------------------------------------------------------------------ */
+static int membername_extract_field_identity(void* member,
+                                             ReflectionClass** out_clazz,
+                                             const char** out_name,
+                                             int32_t* out_name_len)
+{
+    if (member == NULL) return 0;
+
+    ReflectionClass* clazz =
+        (ReflectionClass*)*(void**)((char*)member + MEMBERNAME_FIELD_CLAZZ);
+    void* name_str =
+        *(void**)((char*)member + MEMBERNAME_FIELD_NAME);
+
+    if (clazz == NULL || name_str == NULL) return 0;
+
+    int32_t name_len = 0;
+    const char* name = __jnative_read_string_bytes(name_str, &name_len);
+    if (name == NULL || name_len <= 0) return 0;
+
+    *out_clazz    = clazz;
+    *out_name     = name;
+    *out_name_len = name_len;
+    return 1;
+}
+
+/*
+ * ==========================================================================
  * objectFieldOffset(MemberName)
  * ==========================================================================
+ *
+ * Returns the byte offset of the referenced instance field within its
+ * receiver's object layout, or 0 when the field cannot be located.
+ *
+ * The lookup mirrors the Field variant in Unsafe.c
+ * (__jnative_fn_jdk_internal_misc_Unsafe_objectFieldOffset__Ljava_lang_reflect_Field_J):
+ * it walks the ReflectionClass.fields array of the declaring class and
+ * each of its ancestors until it finds a ReflectionField whose name
+ * matches the MemberName's name, then returns that entry's offset.
+ *
+ * The offsets in @reffields_<class> come from the same
+ * LlvmGlobalEmitter.getFieldOffset() computation that produced every
+ * direct GET_FIELD / PUT_FIELD in the generated code, so the value
+ * returned here agrees byte-for-byte with the addressing used by the
+ * compiled bytecode and by the C-side Field accessors.
+ *
+ * A return value of 0 is a legitimate offset for the first instance
+ * field of a class whose superclass declares no fields — java.lang.Object
+ * itself has no fields, and the first field of a direct subclass of
+ * Object sits at offset 8 (after the 8-byte vtable pointer), not at 0.
+ * The 0 sentinel therefore unambiguously means "field not found",
+ * which is the same convention the Field variant uses.
  */
 int64_t __jnative_fn_java_lang_invoke_MethodHandleNatives_objectFieldOffset__Ljava_lang_invoke_MemberName__J(
         void* member)
 {
-    (void)member;
+    ReflectionClass* clazz;
+    const char*      name;
+    int32_t          name_len;
+
+    if (!membername_extract_field_identity(member, &clazz, &name, &name_len)) {
+        return 0;
+    }
+
+    /*
+     * Walk the superclass chain. An instance field can be inherited, so
+     * a MemberName whose clazz names a subclass still resolves to the
+     * ReflectionField that was emitted under the field's *declaring*
+     * class. The loop stops at the first class in the chain whose
+     * @reffields_<class> array carries an entry with a matching name.
+     *
+     * The comparison is name-only, matching the Field variant's
+     * behaviour. Two fields with the same name and different descriptors
+     * cannot coexist in one class or in one class-and-its-ancestors,
+     * because a subclass field with the same name shadows the ancestor's
+     * field rather than overloading it — the runtime never has to
+     * disambiguate by descriptor here.
+     */
+    ReflectionClass* cur = clazz;
+    while (cur != NULL) {
+        ReflectionField** fp = cur->fields;
+        while (fp != NULL && *fp != NULL) {
+            ReflectionField* f = *fp;
+            if (f->name != NULL) {
+                const char* fname = (const char*)f->name;
+                size_t flen = strlen(fname);
+                if ((int32_t)flen == name_len
+                    && memcmp(fname, name, (size_t)name_len) == 0) {
+                    return (int64_t)f->offset;
+                }
+            }
+            fp++;
+        }
+        cur = cur->superclass;
+    }
     return 0;
 }
 
@@ -874,6 +1041,25 @@ int64_t __jnative_fn_java_lang_invoke_MethodHandleNatives_objectFieldOffset__Lja
  * ==========================================================================
  * staticFieldBase(MemberName)
  * ==========================================================================
+ *
+ * Returns the base address that, together with the value returned by
+ * staticFieldOffset, addresses the static field's storage.
+ *
+ * The runtime's static-field addressing convention is: base is NULL and
+ * offset is the absolute address of the emitted LLVM global
+ * @gv_<sanitize(owner.name)>. The runtime's effective_address(NULL, addr)
+ * then evaluates to (void*)addr — the global's address itself — which is
+ * exactly what every read or write of the field through
+ * Unsafe.get* / Unsafe.put* expects.
+ *
+ * Returning NULL here is therefore not a "no value" sentinel: it is the
+ * meaningful, contract-mandated answer. The same convention is used by
+ * __jnative_fn_jdk_internal_misc_Unsafe_staticFieldBase__Ljava_lang_reflect_Field_Ljava_lang_Object_
+ * in Unsafe.c, and the rationale is documented next to
+ * jnative_effective_address() in jnative_runtime.h.
+ *
+ * The member argument is unused: the base is a constant of the
+ * convention, not a function of the field.
  */
 void* __jnative_fn_java_lang_invoke_MethodHandleNatives_staticFieldBase__Ljava_lang_invoke_MemberName__Ljava_lang_Object_(
         void* member)
@@ -886,12 +1072,89 @@ void* __jnative_fn_java_lang_invoke_MethodHandleNatives_staticFieldBase__Ljava_l
  * ==========================================================================
  * staticFieldOffset(MemberName)
  * ==========================================================================
+ *
+ * Returns the absolute address of the referenced static field's emitted
+ * LLVM global, or 0 when the field cannot be located.
+ *
+ * The lookup mirrors the Field variant in Unsafe.c
+ * (__jnative_fn_jdk_internal_misc_Unsafe_staticFieldOffset__Ljava_lang_reflect_Field_J):
+ *
+ *   1. Extract the declaring class and field name from the MemberName.
+ *   2. For each class in the superclass chain starting from the
+ *      declaring class, build the symbol
+ *          gv_<sanitize(owner.name)>
+ *      through the shared helper jnative_build_static_field_symbol,
+ *      whose rule is identical to the Java-side emitter's and therefore
+ *      to the name the LLVM global actually carries.
+ *   3. dlsym the symbol in the process image; the first hit is the
+ *      field's address.
+ *
+ * The superclass-chain walk matters because a MemberName constructed
+ * with a subclass as its clazz still names the field that the emitter
+ * registered under the declaring class's name. The walk visits at most
+ * one class per hierarchy level and terminates either on the first hit
+ * or on the NULL superclass of java.lang.Object.
+ *
+ * A return value of 0 means "no such static field in this image", which
+ * is the same sentinel the Field variant uses. A dlsym failure on the
+ * last ancestor is not distinguished from a MemberName that never
+ * carried a usable identity; both leave the caller with an offset of 0,
+ * and the subsequent Unsafe.putReference(NULL, 0, ...) is the caller's
+ * own responsibility to avoid. In practice this path is unreachable in
+ * a well-formed image: any field that appears in a reachable
+ * resolveOrFail call site has an emitter-emitted global under exactly
+ * the symbol this function builds.
+ *
+ * The concrete case this implementation exists for is
+ * BoundMethodHandle$Species_L's BMH_SPECIES, written by
+ * ClassSpecializer$Factory.linkCodeToSpeciesData during the
+ * BoundMethodHandle.<clinit> chain. The emitter emits its storage as
+ * @gv_java_lang_invoke_BoundMethodHandle_Species_L_BMH_SPECIES, and the
+ * symbol construction above produces exactly that name.
  */
 int64_t __jnative_fn_java_lang_invoke_MethodHandleNatives_staticFieldOffset__Ljava_lang_invoke_MemberName__J(
         void* member)
 {
-    (void)member;
-    return 0;
+    ReflectionClass* clazz;
+    const char*      name;
+    int32_t          name_len;
+
+    if (!membername_extract_field_identity(member, &clazz, &name, &name_len)) {
+        return 0;
+    }
+
+    /*
+     * Open the process image once and reuse the handle across every
+     * candidate in the superclass walk. dlopen(NULL, RTLD_LAZY) returns
+     * a handle to the running executable and its already-loaded
+     * dependencies, which is where every @gv_* global emitted by the
+     * LLVM backend lives.
+     */
+    void* handle = dlopen(NULL, RTLD_LAZY);
+    if (handle == NULL) {
+        return 0;
+    }
+
+    ReflectionClass* cur = clazz;
+    int64_t result = 0;
+    char    symbol[1024];
+
+    while (cur != NULL) {
+        const char* cls_name = cur->cname;
+        if (cls_name != NULL
+            && jnative_build_static_field_symbol(cls_name, name, name_len,
+                                                 symbol, sizeof(symbol))) {
+            void* addr = dlsym(handle, symbol);
+            if (addr != NULL) {
+                result = (int64_t)(intptr_t)addr;
+                break;
+            }
+        }
+        cur = cur->superclass;
+    }
+
+    dlclose(handle);
+    return result;
 }
 
 /*

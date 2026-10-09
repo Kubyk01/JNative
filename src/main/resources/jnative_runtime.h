@@ -733,6 +733,41 @@ JNATIVE_NORETURN extern void __jnative_throw_bad_dispatch(void* obj,
  */
 extern void* __jnative_own_class_vtable(const char* class_name);
 
+/**
+ * Builds the LLVM global symbol name of a static field, matching
+ * LlvmTypeMapper.sanitizeIdentifier on the Java side byte-for-byte:
+ *
+ *     "gv_" + sanitize(owner + "." + name)
+ *
+ * where sanitize replaces every character outside [a-zA-Z0-9_] with a
+ * single underscore. Both '/' and '.' are outside that set, so
+ * "java/util/concurrent/ForkJoinPool.poolIds" becomes
+ * "gv_java_util_concurrent_ForkJoinPool_poolIds".
+ *
+ * Returns 1 on success and 0 on failure (a NULL argument, or the output
+ * buffer is too small to hold the built name plus its terminator).
+ *
+ * This function is the single source of truth for the symbol-naming
+ * rule. Both reflective views of a static field — the java.lang.reflect
+ * .Field path implemented in jnative/jdk/internal/misc/Unsafe.c and the
+ * MemberName path implemented in
+ * jnative/lang/invoke/MethodHandleNatives.c — must construct the same
+ * symbol for the same field. If the two views disagreed, the runtime
+ * would silently believe the field lives at two different addresses
+ * depending on which reflective API the caller used, and the resulting
+ * write/read mismatch would only surface as corrupted state far from
+ * the point of the divergence.
+ *
+ * The build the symbol is constructed for is the build of the running
+ * process image; the caller is expected to have already dlopen'ed the
+ * process image (or to use RTLD_DEFAULT) and to dlsym the returned
+ * symbol name itself. The function does not touch the dynamic linker.
+ */
+extern int jnative_build_static_field_symbol(const char* owner,
+                                             const char* name,
+                                             int32_t name_len,
+                                             char* out, size_t out_size);
+
 /* ---- Try/catch setjmp bridge --------------------------------------- */
 
 extern void __jnative_push_catch(void* jmp_buf_ptr, void* type_info);
@@ -854,6 +889,7 @@ extern void __jnative_thread_set_layout(
         int32_t thread_holder_offset,
         int32_t thread_tid_offset,
         int32_t thread_name_offset,
+        int32_t thread_interruptlock_offset,
         int32_t fh_object_size,
         int32_t fh_group_offset,
         int32_t fh_priority_offset,

@@ -331,9 +331,9 @@ public class LlvmGenerator {
         resolver.forceLoadSystemClass("java/lang/ThreadGroup");
 
         ensureExternalFunction("__jnative_thread_set_layout", Type.VOID,
-            Type.INT, Type.INT, Type.INT, Type.INT,   // Thread: size, holder, tid, name
+            Type.INT, Type.INT, Type.INT, Type.INT, Type.INT,  // Thread: size, holder, tid, name, interruptLock
             Type.INT, Type.INT, Type.INT, Type.INT, Type.INT,  // FieldHolder: size, group, priority, daemon, status
-            Type.INT, Type.INT, Type.INT, Type.INT);  // ThreadGroup: size, name, maxPriority, vmAllow
+            Type.INT, Type.INT, Type.INT, Type.INT);           // ThreadGroup: size, name, maxPriority, vmAllow
 
         // Reflection-mirror field-offset handoff.
         //
@@ -519,6 +519,31 @@ public class LlvmGenerator {
         int threadHolder = globalEmitter.getFieldOffset("java/lang/Thread", "holder");
         int threadTid    = globalEmitter.getFieldOffset("java/lang/Thread", "tid");
         int threadName   = globalEmitter.getFieldOffset("java/lang/Thread", "name");
+        /*
+         * interruptLock is the object that Thread.blockedOn() synchronises
+         * on when the current thread enters a blocking I/O operation. The
+         * C-synthesised main thread does not run Thread.<init>, so the
+         * field would be NULL without an explicit write. The first
+         * caller that hits this is
+         *
+         *     BasicImageReader.<init>
+         *         -> FileChannelImpl.readInternal
+         *             -> AbstractInterruptibleChannel.begin
+         *                 -> Thread.blockedOn
+         *                     -> synchronized (me.interruptLock)  // NPE
+         *
+         * and the NPE is immediately masked by an ArrayIndexOutOfBounds
+         * from the enclosing finally block (see jnative/lang/Thread.c for
+         * the full trace). Passing the offset through the layout handoff
+         * keeps the C side and the emitter in lockstep on any JDK whose
+         * field layout differs from the current one; the field has been
+         * present and named "interruptLock" across JDK 17-22, but the safe
+         * lookup below treats a rename or removal as "field absent" and
+         * falls back to -1, which the C side interprets as "skip this
+         * write".
+         */
+        int threadInterruptLock = safeFieldOffset(
+            "java/lang/Thread", "interruptLock", -1);
 
         int fhSize       = globalEmitter.computeObjectSize("java/lang/Thread$FieldHolder");
         int fhGroup      = globalEmitter.getFieldOffset("java/lang/Thread$FieldHolder", "group");
@@ -541,6 +566,7 @@ public class LlvmGenerator {
                 .append("i32 ").append(threadHolder).append(", ")
                 .append("i32 ").append(threadTid).append(", ")
                 .append("i32 ").append(threadName).append(", ")
+                .append("i32 ").append(threadInterruptLock).append(", ")
                 .append("i32 ").append(fhSize).append(", ")
                 .append("i32 ").append(fhGroup).append(", ")
                 .append("i32 ").append(fhPriority).append(", ")

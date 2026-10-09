@@ -33,10 +33,11 @@
  * an object whose layout silently disagrees with the emitted bytecode.
  * ========================================================================== */
 
-static int32_t THREAD_OBJECT_SIZE    = -1;
-static int32_t THREAD_HOLDER_OFFSET  = -1;
-static int32_t THREAD_TID_OFFSET     = -1;
-static int32_t THREAD_NAME_OFFSET    = -1;
+static int32_t THREAD_OBJECT_SIZE         = -1;
+static int32_t THREAD_HOLDER_OFFSET       = -1;
+static int32_t THREAD_TID_OFFSET          = -1;
+static int32_t THREAD_NAME_OFFSET         = -1;
+static int32_t THREAD_INTERRUPTLOCK_OFFSET = -1;
 
 static int32_t FH_OBJECT_SIZE        = -1;
 static int32_t FH_GROUP_OFFSET       = -1;
@@ -72,6 +73,7 @@ void __jnative_thread_set_layout(
     int32_t thread_holder_offset,
     int32_t thread_tid_offset,
     int32_t thread_name_offset,
+    int32_t thread_interruptlock_offset,
     int32_t fh_object_size,
     int32_t fh_group_offset,
     int32_t fh_priority_offset,
@@ -83,19 +85,20 @@ void __jnative_thread_set_layout(
     int32_t tg_vmallow_offset)
 {
     if (THREAD_OBJECT_SIZE > 0) {
-        if (THREAD_OBJECT_SIZE    != thread_object_size
-            || THREAD_HOLDER_OFFSET != thread_holder_offset
-            || THREAD_TID_OFFSET    != thread_tid_offset
-            || THREAD_NAME_OFFSET   != thread_name_offset
-            || FH_OBJECT_SIZE       != fh_object_size
-            || FH_GROUP_OFFSET      != fh_group_offset
-            || FH_PRIORITY_OFFSET   != fh_priority_offset
-            || FH_DAEMON_OFFSET     != fh_daemon_offset
-            || FH_STATUS_OFFSET     != fh_status_offset
-            || TG_OBJECT_SIZE       != tg_object_size
-            || TG_NAME_OFFSET       != tg_name_offset
-            || TG_MAXPRIORITY_OFFSET!= tg_maxpriority_offset
-            || TG_VMALLOW_OFFSET    != tg_vmallow_offset) {
+        if (THREAD_OBJECT_SIZE          != thread_object_size
+            || THREAD_HOLDER_OFFSET     != thread_holder_offset
+            || THREAD_TID_OFFSET        != thread_tid_offset
+            || THREAD_NAME_OFFSET       != thread_name_offset
+            || THREAD_INTERRUPTLOCK_OFFSET != thread_interruptlock_offset
+            || FH_OBJECT_SIZE           != fh_object_size
+            || FH_GROUP_OFFSET          != fh_group_offset
+            || FH_PRIORITY_OFFSET       != fh_priority_offset
+            || FH_DAEMON_OFFSET         != fh_daemon_offset
+            || FH_STATUS_OFFSET         != fh_status_offset
+            || TG_OBJECT_SIZE           != tg_object_size
+            || TG_NAME_OFFSET           != tg_name_offset
+            || TG_MAXPRIORITY_OFFSET    != tg_maxpriority_offset
+            || TG_VMALLOW_OFFSET        != tg_vmallow_offset) {
             fprintf(stderr,
                 "jnative: warning: __jnative_thread_set_layout called twice "
                 "with different values; ignoring the second call\n");
@@ -104,19 +107,20 @@ void __jnative_thread_set_layout(
         return;
     }
 
-    THREAD_OBJECT_SIZE    = thread_object_size;
-    THREAD_HOLDER_OFFSET  = thread_holder_offset;
-    THREAD_TID_OFFSET     = thread_tid_offset;
-    THREAD_NAME_OFFSET    = thread_name_offset;
-    FH_OBJECT_SIZE        = fh_object_size;
-    FH_GROUP_OFFSET       = fh_group_offset;
-    FH_PRIORITY_OFFSET    = fh_priority_offset;
-    FH_DAEMON_OFFSET      = fh_daemon_offset;
-    FH_STATUS_OFFSET      = fh_status_offset;
-    TG_OBJECT_SIZE        = tg_object_size;
-    TG_NAME_OFFSET        = tg_name_offset;
-    TG_MAXPRIORITY_OFFSET = tg_maxpriority_offset;
-    TG_VMALLOW_OFFSET     = tg_vmallow_offset;
+    THREAD_OBJECT_SIZE          = thread_object_size;
+    THREAD_HOLDER_OFFSET        = thread_holder_offset;
+    THREAD_TID_OFFSET           = thread_tid_offset;
+    THREAD_NAME_OFFSET          = thread_name_offset;
+    THREAD_INTERRUPTLOCK_OFFSET = thread_interruptlock_offset;
+    FH_OBJECT_SIZE              = fh_object_size;
+    FH_GROUP_OFFSET             = fh_group_offset;
+    FH_PRIORITY_OFFSET          = fh_priority_offset;
+    FH_DAEMON_OFFSET            = fh_daemon_offset;
+    FH_STATUS_OFFSET            = fh_status_offset;
+    TG_OBJECT_SIZE              = tg_object_size;
+    TG_NAME_OFFSET              = tg_name_offset;
+    TG_MAXPRIORITY_OFFSET       = tg_maxpriority_offset;
+    TG_VMALLOW_OFFSET           = tg_vmallow_offset;
 }
 
 extern const void* vtable_java_lang_Thread[];
@@ -292,6 +296,48 @@ static void* create_main_thread_field_holder(void* group) {
  *   name            -> a real java.lang.String (Thread.getName returns it)
  *   holder          -> FieldHolder whose group is a valid ThreadGroup
  * ------------------------------------------------------------------------- */
+/*
+ * The interruptLock field is a plain java.lang.Object that Thread.<init>
+ * allocates with `new Object()` and that every entry into a blocking I/O
+ * operation reaches through Thread.blockedOn:
+ *
+ *     static void blockedOn(Interruptible b) {
+ *         Thread me = Thread.currentThread();
+ *         synchronized (me.interruptLock) {
+ *             me.nioBlocker = b;
+ *         }
+ *     }
+ *
+ * The synchronised block compiles to __jnative_monitor_enter on the
+ * object reference. If the reference is NULL, the monitor helper throws
+ * NullPointerException with the context string "monitor", which
+ * propagates out of AbstractInterruptibleChannel.blockedOn, through
+ * AbstractInterruptibleChannel.begin, into the try/finally of
+ * FileChannelImpl.readInternal. That finally block unconditionally calls
+ * threads.remove(ti) with ti still at its initialiser value (-1), so the
+ * AIOOBE from the out-of-range index replaces the NPE, and the caller
+ * sees only the secondary failure:
+ *
+ *     java.lang.ArrayIndexOutOfBoundsException: Array index out of bounds
+ *     in sun.nio.ch.NativeThreadSet.remove(IV)
+ *         at jdk.internal.module.SystemModuleFinders$SystemImage.<clinit>
+ *         ...
+ *
+ * The object must therefore be a real java.lang.Object with a valid
+ * vtable, allocated through the same runtime path that any other
+ * C-constructed Java object uses. Object.<init> is a no-op in the JDK,
+ * so calloc-plus-vtable is exactly what the Java constructor would have
+ * produced.
+ *
+ * The allocation is guarded by THREAD_INTERRUPTLOCK_OFFSET >= 0 so that
+ * a JDK release which removes or renames the field (the name has been
+ * stable across JDK 17-22, but a rename is not impossible) does not
+ * produce a write at a nonsensical offset. In that case the field is
+ * left at its calloc'ed zero and the same NPE would reappear — which is
+ * still strictly better than a corrupted write, and the handoff
+ * mechanism makes the discrepancy visible in the build log the moment
+ * the field disappears.
+ */
 static void* create_thread_object(void) {
     if (THREAD_OBJECT_SIZE < 0) return NULL;
 
@@ -317,6 +363,26 @@ static void* create_thread_object(void) {
         void* group  = create_main_thread_group();
         void* holder = create_main_thread_field_holder(group);
         *(void**)((char*)t + THREAD_HOLDER_OFFSET) = holder;
+    }
+
+    if (THREAD_INTERRUPTLOCK_OFFSET >= 0) {
+        /*
+         * jnative_alloc_object() looks the class up in reflect_all_classes,
+         * allocates object_size bytes, and writes the class's vtable into
+         * word 0 — the exact state that `new java.lang.Object()` would have
+         * produced, because java.lang.Object declares no instance fields
+         * and its <init> is empty.
+         *
+         * The reflect registry is guaranteed to contain java/lang/Object:
+         * LlvmGenerator.ensureExternalDeclarations() force-loads it before
+         * any function is emitted, and generateReflectionData() emits a
+         * @refclass_java_lang_Object constant for it unconditionally.
+         */
+        ReflectionClass* obj_cls = jnative_class_by_name("java/lang/Object");
+        void* interrupt_lock = (obj_cls != NULL)
+            ? jnative_alloc_object(obj_cls)
+            : NULL;
+        *(void**)((char*)t + THREAD_INTERRUPTLOCK_OFFSET) = interrupt_lock;
     }
 
     return t;
