@@ -137,6 +137,7 @@ public class Orchestrator implements OrchestratorPort {
         // method listings would be missing them and the vtable slots would
         // hold unresolved thunks.
         forceResourceStreamMethods(analysis);
+        forcePerfMethods(analysis);
 
         // ------------------------------------------------------------------
         // Superclass-<clinit> closure.
@@ -523,6 +524,102 @@ public class Orchestrator implements OrchestratorPort {
                 new MethodReference(owner, "reset", "()V"));
         analysis.addExtraReachableMethod(
                 new MethodReference(owner, "close", "()V"));
+    }
+
+    /**
+     * Forces the {@code java.nio} methods required by the C implementation
+     * of {@code jdk.internal.perf.Perf.create*} into the reachable set.
+     *
+     * <h2>Why this is needed</h2>
+     *
+     * <p>{@code Perf.createLong/createByteArray/createString} are native
+     * methods. Their C implementation (see
+     * {@code jnative/jdk/internal/perf/Perf.c}) returns a real
+     * {@link java.nio.ByteBuffer}, but cannot construct it directly: the
+     * layout of {@code java.nio.Buffer} and {@code java.nio.HeapByteBuffer}
+     * changes between JDK releases, and {@code HeapByteBuffer} itself is
+     * package-private and may have no entry in
+     * {@code reflect_all_classes[]}. The C side therefore calls
+     * {@code java.nio.ByteBuffer.allocate(int)} by mangled name through
+     * {@code dlsym} — the same technique already used in
+     * {@code MethodHandleNatives.c} and {@code FileInputStream.c}.</p>
+     *
+     * <p>For that technique to work, three methods must be <em>translated
+     * into IR and linked into the executable</em>:</p>
+     *
+     * <ol>
+     *   <li><b>{@code java.nio.ByteBuffer.allocate(int)}</b>. The body of
+     *       this method — {@code new HeapByteBuffer(cap, cap)} — does two
+     *       things at once: it emits the symbol
+     *       {@code fn_java_nio_ByteBuffer_allocate__I_Ljava_nio_ByteBuffer_}
+     *       that {@code Perf.c} refers to, and it instantiates
+     *       {@code HeapByteBuffer}, which gives the reachability analysis a
+     *       concrete candidate for the abstract virtual call
+     *       {@code ByteBuffer.asLongBuffer()} from
+     *       {@code PerfCounter.<init>}. Without that second part the vtable
+     *       slot {@code asLongBuffer} would remain unresolved and would fail
+     *       on {@code __jnative_unresolved_slot}.</li>
+     *
+     *   <li><b>{@code java.nio.HeapByteBuffer.putLong(int, long)}</b>.
+     *       Needed so that {@code Perf.createLong} can write a non-zero
+     *       initial counter value. All JDK call-sites pass {@code 0L}, but
+     *       the public contract of {@code jdk.internal.perf.Perf} also
+     *       allows initialisation, and we do not silently substitute for it:
+     *       if the symbol is present, the initial value is written with the
+     *       index-based {@code putLong} (position is not advanced, so the
+     *       subsequent {@code asLongBuffer()} gets a buffer with position
+     *       0).</li>
+     *
+     *   <li><b>{@code java.nio.ByteBuffer.put(byte[])}</b>. Needed for
+     *       {@code Perf.createByteArray(name, variability, units, byte[]
+     *       value, int maxLength)}. The method is concrete (implemented
+     *       directly in {@code ByteBuffer}, not abstract) — its body is
+     *       emitted automatically as soon as it enters the reachable set.
+     *       Inside it delegates to the virtual {@code put(byte[], int, int)},
+     *       whose concrete implementation lives in {@code HeapByteBuffer}
+     *       precisely because {@code allocate} made that class
+     *       instantiable.</li>
+     * </ol>
+     *
+     * <p>All three calls go through
+     * {@link ReachabilityAnalysis#addExtraReachableMethod}, which runs the
+     * worklist to fixed point after each addition and re-resolves the
+     * virtual dispatch sites. The order of the calls does not matter: after
+     * {@code ByteBuffer.allocate} is added, the class {@code HeapByteBuffer}
+     * is loaded and known to the analyser, so the subsequent addition of
+     * {@code HeapByteBuffer.putLong} finds its methods without further
+     * hints.</p>
+     *
+     * <p><b>Root failure this pass closes:</b></p>
+     *
+     * <pre>
+     *   jdk.internal.perf.PerfCounter.&lt;init&gt;:
+     *       ByteBuffer bb = perf.createLong(name, type, U_None, 0L);
+     *       bb.order(ByteOrder.nativeOrder());       // NPE when bb == null
+     *       this.lb = bb.asLongBuffer();             // NPE when bb == null
+     * </pre>
+     *
+     * <p>Previously {@code Perf.create*} in the C runtime returned
+     * {@code NULL}, which produced an NPE on the very first initialization
+     * of {@code PerfCounter$CoreCounters.<clinit>} — and that class is
+     * initialized in the Stage 4 eager loop and is also really used from
+     * {@code ClassLoader.findClass}, {@code ZipFile.open} and
+     * {@code ModuleBootstrap.boot}. Merely excluding it from Stage 4 did
+     * not help: the class was still initialized on the first real access
+     * and failed the same way.</p>
+     */
+    private void forcePerfMethods(ReachabilityAnalysis analysis) {
+        analysis.addExtraReachableMethod(new MethodReference(
+            "java/nio/ByteBuffer", "allocate",
+            "(I)Ljava/nio/ByteBuffer;"));
+
+        analysis.addExtraReachableMethod(new MethodReference(
+            "java/nio/ByteBuffer", "put",
+            "([B)Ljava/nio/ByteBuffer;"));
+
+        analysis.addExtraReachableMethod(new MethodReference(
+            "java/nio/HeapByteBuffer", "putLong",
+            "(IJ)Ljava/nio/ByteBuffer;"));
     }
 
 
