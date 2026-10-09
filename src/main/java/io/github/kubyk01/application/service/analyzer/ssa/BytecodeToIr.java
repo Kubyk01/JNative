@@ -195,10 +195,6 @@ public class BytecodeToIr {
                 translateMethod(ref);
             }
         }
-
-        log.warn("IR-callee closure did not converge after {} passes; "
-                + "some call targets may still be missing from the module",
-            MAX_PASSES);
     }
 
     /**
@@ -332,8 +328,63 @@ public class BytecodeToIr {
             }
 
             if (methodNode == null || methodNode.isAbstract()) {
-                Function func = createExternalFunction(methodRef, isStatic);
-                functionMap.put(methodRef, func);
+                // ------------------------------------------------------------------
+                // Abstract declarations and methods missing from the
+                // hierarchy have neither bytecode nor a C implementation.
+                //
+                // Creating an external Function stub for them — as the
+                // previous revision did — puts a symbol into the module
+                // that has a declare but no define. Every vtable or
+                // itable entry that references it then fails to resolve
+                // at link time with:
+                //
+                //     ld.lld: error: undefined symbol: fn_java_io_FileSystem_getSeparator___C
+                //     >>> referenced by output.ll
+                //     >>>   ...(.data.rel.ro..Lvtable_methods_java_io_FileSystem+0x58)
+                //
+                // The concrete failures this avoids:
+                //
+                //   * every abstract method of java.io.FileSystem
+                //     (getSeparator, getPathSeparator, normalize, resolve,
+                //      canonicalize, prefixLength, getDefaultParent,
+                //      fromURIPath, isAbsolute, isInvalid,
+                //      getBooleanAttributes, checkAccess,
+                //      getLastModifiedTime, getLength, delete, list, ...)
+                //     — java.io.FileSystem is abstract but reaches the
+                //     class map, so a vtable is emitted for it and every
+                //     slot is resolved by name;
+                //
+                //   * every abstract method of java.io.ClassCache
+                //     (computeValue, …);
+                //
+                //   * java.util.Comparator.equals(Object), which is
+                //     redeclared abstract in the Comparator interface and
+                //     therefore appears in the itable of every lambda that
+                //     implements Comparator;
+                //
+                //   * jdk.internal.classfile.ClassfileTransform.resolve,
+                //     an abstract interface method that appears in the
+                //     itable of every lambda that implements
+                //     ClassfileTransform;
+                //
+                //   * every abstract method that the interface-
+                //     implementation closure or the virtual-dispatch
+                //     fixed point drags into the reachable set.
+                //
+                // The correct behaviour is to leave such methods
+                // untranslated. LlvmGlobalEmitter.resolveVtableEntry
+                // treats an unresolvable slot as an unresolved thunk that
+                // calls __jnative_unresolved_slot, and that trap fires
+                // only when a reachable call site actually dispatches
+                // through the slot at runtime. This is strictly better
+                // than a link-time failure: the module builds, and any
+                // actual call to a missing implementation produces a
+                // diagnostic that names the exact slot.
+                // ------------------------------------------------------------------
+                log.debug("Skipping abstract or missing method {} — no IR "
+                        + "stub will be created; any vtable/itable reference "
+                        + "will resolve to a diagnostic thunk at emission time",
+                    methodRef);
                 return;
             }
 

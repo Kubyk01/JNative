@@ -14,7 +14,7 @@ import java.util.regex.Pattern;
 /**
  * Scans C runtime sources for {@code __jnative_override_*} functions and
  * turns each one into a {@link NativeOverride}.
- *
+ * <p>
  * Naming rules (checked in order):
  *
  * <ol>
@@ -91,13 +91,30 @@ public final class NativeOverrideScanner {
                 descriptor = unMangleDescriptor(methodPart.substring(descSep + 2));
             }
 
+            // ----------------------------------------------------------------
+            // <clinit> sentinel.
+            //
+            // The class initializer's Java name is "<clinit>", which contains
+            // angle brackets that are not legal in a C identifier. The
+            // convention adopted here is to spell it in the C symbol as the
+            // bare word "clinit". A C function whose method part is exactly
+            // "clinit" therefore denotes the class initializer, and its
+            // descriptor is fixed at "()V" — the JVM class-file format
+            // requires every class initializer to have exactly that
+            // descriptor, so there is nothing to disambiguate.
+            // ----------------------------------------------------------------
+            if ("clinit".equals(methodName)) {
+                methodName = "<clinit>";
+                descriptor = "()V";
+            }
+
             List<String> cTypes = splitParams(cParams);
-            boolean hasReceiver = cTypes.size() > 1 && !isStaticHint(cTypes);
+            boolean hasReceiver = cTypes.size() > 1;
             Type retType = cReturnType(cReturn);
 
             List<Type> paramTypes = new ArrayList<>();
-            for (int i = 0; i < cTypes.size(); i++) {
-                paramTypes.add(cParamType(cTypes.get(i)));
+            for (String cType : cTypes) {
+                paramTypes.add(cParamType(cType));
             }
 
             out.add(new NativeOverride(className, methodName, descriptor,
@@ -117,7 +134,7 @@ public final class NativeOverrideScanner {
     /**
      * Returns the index within {@code suffix} at which the class name
      * ends, or {@code -1} if no uppercase segment is found.
-     *
+     * <p>
      * Example: {@code "java_security_SecureRandom_getDefaultPRNG"} → 24
      * (the position of the underscore after {@code SecureRandom}).
      */
@@ -139,7 +156,6 @@ public final class NativeOverrideScanner {
      * internal class name from a C resource path.
      */
     private static String classFromCFilePath(String path) {
-        if (!path.startsWith("jnative/")) return path.replace('/', '/');
         String rest = path.substring("jnative/".length());
         if (rest.endsWith(".c")) rest = rest.substring(0, rest.length() - 2);
         if (rest.startsWith("lang/")) return "java/" + rest;
@@ -177,13 +193,6 @@ public final class NativeOverrideScanner {
         }
         out.add(s.substring(start).trim());
         return out;
-    }
-
-    private static boolean isStaticHint(List<String> cTypes) {
-        // A static override has no self/obj receiver; the caller can add
-        // an explicit `_Static_` marker, but by default we treat the
-        // first parameter as a receiver when its C type is a pointer.
-        return false;
     }
 
     private static Type cReturnType(String c) {

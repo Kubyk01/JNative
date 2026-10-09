@@ -357,11 +357,22 @@ public class LlvmGlobalEmitter {
         String owner = className;
         Set<String> seen = new HashSet<>();
         while (owner != null && !owner.isEmpty() && seen.add(owner)) {
+
+            // 1. Explicit override registry (overrideMethod).
             String nativeName = methodOverrides.get(overrideKey(owner, name, descriptor));
             if (nativeName != null) {
                 ownerOut[0] = owner;
                 return nativeName;
             }
+
+            String rawSymbol = "__jnative_override_"
+                + owner.replace('/', '_')
+                + "_" + name;
+            if (module.getFunction(rawSymbol) != null) {
+                ownerOut[0] = owner;
+                return rawSymbol;
+            }
+
             ClassNode cn = resolver.getClassNode(owner);
             if (cn == null) return null;
             owner = cn.getSuperName();
@@ -1021,39 +1032,119 @@ public class LlvmGlobalEmitter {
                 className, name, desc, className);
             return null;
         }
-        if (mn.isAbstract()) {
-            // Abstract slot with no concrete override in the reachable set.
-            // The thunk is intentional: no call site can ever land here
-            // because no concrete receiver of this class can exist.
-            return null;
-        }
 
         String owner = foundOwner[0] != null ? foundOwner[0] : className;
         String baseName = LlvmRuntime.mangleMethod(owner, name, desc);
         String nativeName = "__jnative_" + baseName;
 
-        String funcName;
+        // ------------------------------------------------------------------
+        // Module-first resolution.
+        //
+        // The order of the branches below is deliberate, and it is the fix
+        // for an architectural gap in the previous revision.
+        //
+        // Abstract methods and native overrides interact through two
+        // separate mechanisms:
+        //
+        //   * BytecodeToIr.translate() walks the reachable method set and,
+        //     for every method for which a NativeOverride was discovered,
+        //     calls
+        //         module.registerAlias(mangleMethod(owner, name, desc),
+        //                              overrideFunction)
+        //     The alias is keyed by the bytecode method's own mangled name,
+        //     and it resolves through Module.getFunction() to a Function
+        //     whose name is the C symbol (__jnative_override_...). Such a
+        //     Function has no IR entry block: it is emitted by a linked
+        //     object, not by the LLVM backend.
+        //
+        //   * LlvmGlobalEmitter.resolveVtableEntry() looks up the slot's
+        //     target by mangleMethod(owner, name, desc) and consults the
+        //     module first, then the resolver's hierarchy information.
+        //
+        // For a concrete method the two mechanisms compose without
+        // trouble: the module lookup finds either a real IR body or an
+        // alias, and the resolver is only consulted when neither exists.
+        //
+        // For an *abstract* method the previous revision short-circuited
+        // before the module lookup, on the assumption that no call site
+        // can ever reach an abstract slot. That assumption is false when
+        // the abstract declaration has a native override: the override
+        // supplies a body, the walk registered it in the module, and the
+        // only reason the slot is unresolved is that resolveVtableEntry
+        // never got as far as looking for it. The concrete failure that
+        // motivated the reorder:
+        //
+        //     java.security.cert.X509Certificate declares
+        //         public abstract byte[] getEncoded() throws ...;
+        //     jnative/security/cert/X509Certificate.c provides
+        //         __jnative_override_java_security_cert_X509Certificate_getEncoded
+        //     BytecodeToIr.translate() registers the alias
+        //         fn_java_security_cert_X509Certificate_getEncoded____B
+        //             -> __jnative_override_java_security_cert_X509Certificate_getEncoded
+        //     and resolveVtableEntry then returns null because of the
+        //     abstract check, so the vtable slot is emitted as an
+        //     __jnative_vtable_missing_* thunk. The first caller to
+        //     dispatch through it — sun.security.validator.SimpleValidator.<init>
+        //     reached from javax.crypto.JarVerifier.<clinit> — aborts with
+        //     __jnative_unresolved_slot:
+        //
+        //         class 'java/security/cert/X509Certificate',
+        //         slot 'getEncoded()[B'
+        //
+        // The reorder below makes the module lookup happen first for every
+        // method, abstract included. If the lookup finds a body — either a
+        // real IR function or an alias to a differently-named Function —
+        // the slot is populated with it. Only when the module has nothing
+        // to offer does the resolver's own classification (abstract /
+        // native / missing) determine what to do next.
+        //
+        // The alias check is expressed as `!target.getName().equals(baseName)`:
+        // Module.registerAlias() stores the target under the alias key, so
+        // getFunction(baseName) returns a Function whose own name is the
+        // C symbol rather than baseName. A bare `declare` created by any
+        // other path has the same name as its key and no entry block; that
+        // case must still be treated as unresolved, because nothing
+        // defines the symbol at link time.
+        // ------------------------------------------------------------------
+        String funcName = null;
+
         Function target = module.getFunction(baseName);
         if (target != null) {
-            funcName = target.getName();
-        } else if (module.getFunction(nativeName) != null) {
-            funcName = nativeName;
-        } else if (mn.isNative()) {
-            Type retType = mn.getReturnType();
-            List<Type> paramTypes = mn.getParameterTypes();
-
-            List<Type> allParams = new ArrayList<>();
-            allParams.add(Type.reference(owner));
-            allParams.addAll(paramTypes);
-
-            Function nf = new Function(nativeName, retType);
-            for (int i = 0; i < allParams.size(); i++) {
-                nf.addParameter(new Parameter(allParams.get(i), i));
+            boolean hasBody = target.getEntryBlock() != null;
+            boolean isAlias = !target.getName().equals(baseName);
+            if (hasBody || isAlias) {
+                funcName = target.getName();
             }
-            module.addFunction(nf);
-            funcName = nativeName;
-        } else {
-            return null;
+        }
+
+        if (funcName == null) {
+            Function nativeTarget = module.getFunction(nativeName);
+            if (nativeTarget != null) {
+                funcName = nativeName;
+            } else if (mn.isAbstract()) {
+                // Abstract slot with no override in the module. The thunk
+                // is intentional: no call site can reach a concrete
+                // receiver of this class, and any code path that does
+                // dispatch through this slot will produce a diagnostic
+                // that names the exact class and signature.
+                return null;
+            } else if (mn.isNative()) {
+                Type retType = mn.getReturnType();
+                List<Type> paramTypes = mn.getParameterTypes();
+
+                List<Type> allParams = new ArrayList<>();
+                allParams.add(Type.reference(owner));
+                allParams.addAll(paramTypes);
+
+                Function nf = new Function(nativeName, retType);
+                for (int i = 0; i < allParams.size(); i++) {
+                    nf.addParameter(new Parameter(allParams.get(i), i));
+                }
+                module.addFunction(nf);
+                funcName = nativeName;
+            } else {
+                return null;
+            }
         }
 
         String ret = LlvmTypeMapper.toLlvmType(mn.getReturnType());
@@ -3574,14 +3665,6 @@ public class LlvmGlobalEmitter {
             };
         }
         return null;
-    }
-
-    private String ensureStringConstant(StringBuilder defsBuffer, String s) {
-        if (s == null) return "null";
-        if (emittedStringConstants.add(s)) {
-            defsBuffer.append(LlvmRuntime.typeStringConstant(s));
-        }
-        return LlvmRuntime.typeStringGlobalName(s);
     }
 
     private String ensureStringConstantPtr(StringBuilder defsBuffer, String s) {
