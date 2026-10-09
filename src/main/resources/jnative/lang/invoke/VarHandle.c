@@ -157,6 +157,120 @@ static inline int32_t cax_int(int32_t* slot, int32_t expected, int32_t newValue)
  * ===========================================================================
  */
 
+/*
+ * ===========================================================================
+ *  Byte order
+ * ===========================================================================
+ *
+ * A byte-array-view VarHandle produced by
+ *
+ *     MethodHandles.byteArrayViewVarHandle(int[].class, ByteOrder.BIG_ENDIAN)
+ *
+ * reinterprets a byte[] as a sequence of 16-, 32-, or 64-bit values laid
+ * out in big-endian order. jdk.internal.util.ByteArray — the class that
+ * DataInputStream, DataOutputStream, ObjectInputStream,
+ * ObjectOutputStream and every other java.io stream-protocol reader use —
+ * creates its VarHandles with ByteOrder.BIG_ENDIAN unconditionally,
+ * because the Java data stream format has always been big-endian on the
+ * wire (Java Object Serialization Specification §3.6, and the equivalent
+ * contract that DataInput/DataOutput spell out for every multi-byte
+ * primitive).
+ *
+ * In HotSpot these accessors run through VarHandleByteArrayAsInts /
+ * VarHandleByteArrayAsLongs, whose bodies perform a byte-order correction
+ * before returning:
+ *
+ *     private static int convEndian(boolean big, int n) {
+ *         return big == BE ? n : Integer.reverseBytes(n);
+ *     }
+ *
+ * where BE == (ByteOrder.nativeOrder() == ByteOrder.BIG_ENDIAN). On a
+ * little-endian host a BIG_ENDIAN VarHandle therefore reverses every
+ * 32-bit value that the underlying Unsafe read produced.
+ *
+ * In JNative there is no VarHandleByteArrayAsInts layer to perform that
+ * correction: MethodHandles.byteArrayViewVarHandle(...).get(...) is a
+ * polymorphic call site, and the polymorphic dispatcher resolves it
+ * straight to one of the concrete C functions below. Those functions
+ * must therefore reproduce the JDK-level byte-order correction
+ * themselves. Doing it in Java is not an option — the polymorphic
+ * dispatch replaces the entire Java-level method, so the only code that
+ * runs is what is written here.
+ *
+ * The concrete failure that exposed this:
+ *
+ *     java.util.Currency.<clinit> -> Currency.initStatic() reads
+ *     currency.data through a DataInputStream. Its very first read is
+ *
+ *         if (dis.readInt() != MAGIC_NUMBER) {
+ *             throw new InternalError("Currency data is possibly corrupted");
+ *         }
+ *
+ *     MAGIC_NUMBER is 0x43757244. The first four bytes of the embedded
+ *     resource are 43 75 72 44 — exactly that value in big-endian form.
+ *     But get___BI_I returned 0x44727543 (the same four bytes read as
+ *     little-endian), the comparison failed, and Currency's class
+ *     initializer threw.
+ *
+ * Because ByteArray.getShort/Int/Long/Float/Double read the raw bytes
+ * through these same stubs and pass the result straight to their
+ * callers, the correction must live in the stub. The stubs cannot
+ * change their descriptor — the polymorphic dispatcher selects them by
+ * the Java-level MethodHandle signature, which is fixed — so the byte
+ * order is baked into the C function, exactly as the JDK bakes it into
+ * VarHandleByteArrayAsInts for its own JIT-compiled accessors.
+ *
+ * Scope and known limitation: the correction below assumes the
+ * BIG_ENDIAN semantics that ByteArray uses. Any future caller that
+ * creates a byte-array-view VarHandle with ByteOrder.LITTLE_ENDIAN
+ * would require a distinct C symbol, because the descriptor alone does
+ * not carry the byte order. That is out of scope here — no reachable
+ * path in the JDK creates an LE byte-array-view VarHandle, and the
+ * runtime's contract for these stubs is defined by what ByteArray
+ * actually asks for.
+ *
+ * Implementation: on a big-endian host, a plain memcpy already produces
+ * the big-endian interpretation, so the macros expand to the identity.
+ * On a little-endian host (every platform this runtime targets today:
+ * x86-64 and aarch64), the value read out of memory is byte-reversed
+ * relative to the desired big-endian interpretation, so the macros
+ * expand to __builtin_bswap*. The same macro is used for both read and
+ * write directions and for the expected/new operands of the atomic
+ * primitives, because the byte-swap is an involution: applying it twice
+ * recovers the original value.
+ * ===========================================================================
+ */
+
+#if defined(__BYTE_ORDER__) && defined(__ORDER_BIG_ENDIAN__) \
+    && (__BYTE_ORDER__ == __ORDER_BIG_ENDIAN__)
+#  define JNATIVE_HOST_IS_BIG_ENDIAN 1
+#elif defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__) \
+    && (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
+#  define JNATIVE_HOST_IS_BIG_ENDIAN 0
+#elif defined(__BIG_ENDIAN__) || defined(_BIG_ENDIAN) \
+    || defined(__ARMEB__) || defined(__MIPSEB__) \
+    || defined(__s390x__) || defined(__sparc__) || defined(__powerpc__)
+#  define JNATIVE_HOST_IS_BIG_ENDIAN 1
+#else
+#  define JNATIVE_HOST_IS_BIG_ENDIAN 0
+#endif
+
+#if JNATIVE_HOST_IS_BIG_ENDIAN
+#  define JNATIVE_BE16(v) ((uint16_t)(v))
+#  define JNATIVE_BE32(v) ((uint32_t)(v))
+#  define JNATIVE_BE64(v) ((uint64_t)(v))
+#else
+#  define JNATIVE_BE16(v) ((uint16_t)__builtin_bswap16((uint16_t)(v)))
+#  define JNATIVE_BE32(v) ((uint32_t)__builtin_bswap32((uint32_t)(v)))
+#  define JNATIVE_BE64(v) ((uint64_t)__builtin_bswap64((uint64_t)(v)))
+#endif
+
+/*
+ * ===========================================================================
+ * byte[] @ int  ->  { byte, short, char, int, long, float, double }
+ * ===========================================================================
+ */
+
 int8_t __jnative_fn_java_lang_invoke_VarHandle_get___BI_B(int8_t* arr, int32_t index) {
     barray_check(arr, index, 1);
     return *(int8_t*)(barray_data(arr) + index);
@@ -164,44 +278,50 @@ int8_t __jnative_fn_java_lang_invoke_VarHandle_get___BI_B(int8_t* arr, int32_t i
 
 int16_t __jnative_fn_java_lang_invoke_VarHandle_get___BI_S(int8_t* arr, int32_t index) {
     barray_check(arr, index, 2);
-    int16_t v;
-    memcpy(&v, barray_data(arr) + index, 2);
-    return v;
+    uint16_t raw;
+    memcpy(&raw, barray_data(arr) + index, 2);
+    return (int16_t)JNATIVE_BE16(raw);
 }
 
 uint16_t __jnative_fn_java_lang_invoke_VarHandle_get___BI_C(int8_t* arr, int32_t index) {
     barray_check(arr, index, 2);
-    uint16_t v;
-    memcpy(&v, barray_data(arr) + index, 2);
-    return v;
+    uint16_t raw;
+    memcpy(&raw, barray_data(arr) + index, 2);
+    return JNATIVE_BE16(raw);
 }
 
 int32_t __jnative_fn_java_lang_invoke_VarHandle_get___BI_I(int8_t* arr, int32_t index) {
     barray_check(arr, index, 4);
-    int32_t v;
-    memcpy(&v, barray_data(arr) + index, 4);
-    return v;
+    uint32_t raw;
+    memcpy(&raw, barray_data(arr) + index, 4);
+    return (int32_t)JNATIVE_BE32(raw);
 }
 
 int64_t __jnative_fn_java_lang_invoke_VarHandle_get___BI_J(int8_t* arr, int32_t index) {
     barray_check(arr, index, 8);
-    int64_t v;
-    memcpy(&v, barray_data(arr) + index, 8);
-    return v;
+    uint64_t raw;
+    memcpy(&raw, barray_data(arr) + index, 8);
+    return (int64_t)JNATIVE_BE64(raw);
 }
 
 float __jnative_fn_java_lang_invoke_VarHandle_get___BI_F(int8_t* arr, int32_t index) {
     barray_check(arr, index, 4);
-    float v;
-    memcpy(&v, barray_data(arr) + index, 4);
-    return v;
+    uint32_t raw;
+    memcpy(&raw, barray_data(arr) + index, 4);
+    uint32_t host = JNATIVE_BE32(raw);
+    float f;
+    memcpy(&f, &host, 4);
+    return f;
 }
 
 double __jnative_fn_java_lang_invoke_VarHandle_get___BI_D(int8_t* arr, int32_t index) {
     barray_check(arr, index, 8);
-    double v;
-    memcpy(&v, barray_data(arr) + index, 8);
-    return v;
+    uint64_t raw;
+    memcpy(&raw, barray_data(arr) + index, 8);
+    uint64_t host = JNATIVE_BE64(raw);
+    double d;
+    memcpy(&d, &host, 8);
+    return d;
 }
 
 /*
@@ -217,32 +337,42 @@ void __jnative_fn_java_lang_invoke_VarHandle_set___BIB_V(int8_t* arr, int32_t in
 
 void __jnative_fn_java_lang_invoke_VarHandle_set___BIS_V(int8_t* arr, int32_t index, int16_t v) {
     barray_check(arr, index, 2);
-    memcpy(barray_data(arr) + index, &v, 2);
+    uint16_t be = JNATIVE_BE16((uint16_t)v);
+    memcpy(barray_data(arr) + index, &be, 2);
 }
 
 void __jnative_fn_java_lang_invoke_VarHandle_set___BIC_V(int8_t* arr, int32_t index, uint16_t v) {
     barray_check(arr, index, 2);
-    memcpy(barray_data(arr) + index, &v, 2);
+    uint16_t be = JNATIVE_BE16(v);
+    memcpy(barray_data(arr) + index, &be, 2);
 }
 
 void __jnative_fn_java_lang_invoke_VarHandle_set___BII_V(int8_t* arr, int32_t index, int32_t v) {
     barray_check(arr, index, 4);
-    memcpy(barray_data(arr) + index, &v, 4);
+    uint32_t be = JNATIVE_BE32((uint32_t)v);
+    memcpy(barray_data(arr) + index, &be, 4);
 }
 
 void __jnative_fn_java_lang_invoke_VarHandle_set___BIJ_V(int8_t* arr, int32_t index, int64_t v) {
     barray_check(arr, index, 8);
-    memcpy(barray_data(arr) + index, &v, 8);
+    uint64_t be = JNATIVE_BE64((uint64_t)v);
+    memcpy(barray_data(arr) + index, &be, 8);
 }
 
 void __jnative_fn_java_lang_invoke_VarHandle_set___BIF_V(int8_t* arr, int32_t index, float v) {
     barray_check(arr, index, 4);
-    memcpy(barray_data(arr) + index, &v, 4);
+    uint32_t host;
+    memcpy(&host, &v, 4);
+    uint32_t be = JNATIVE_BE32(host);
+    memcpy(barray_data(arr) + index, &be, 4);
 }
 
 void __jnative_fn_java_lang_invoke_VarHandle_set___BID_V(int8_t* arr, int32_t index, double v) {
     barray_check(arr, index, 8);
-    memcpy(barray_data(arr) + index, &v, 8);
+    uint64_t host;
+    memcpy(&host, &v, 8);
+    uint64_t be = JNATIVE_BE64(host);
+    memcpy(barray_data(arr) + index, &be, 8);
 }
 
 /*
@@ -253,26 +383,28 @@ void __jnative_fn_java_lang_invoke_VarHandle_set___BID_V(int8_t* arr, int32_t in
 
 int32_t __jnative_fn_java_lang_invoke_VarHandle_getVolatile___BI_I(int8_t* arr, int32_t index) {
     barray_check(arr, index, 4);
-    int32_t v;
-    __atomic_load((int32_t*)(barray_data(arr) + index), &v, __ATOMIC_SEQ_CST);
-    return v;
+    uint32_t raw;
+    __atomic_load((uint32_t*)(barray_data(arr) + index), &raw, __ATOMIC_SEQ_CST);
+    return (int32_t)JNATIVE_BE32(raw);
 }
 
 void __jnative_fn_java_lang_invoke_VarHandle_setVolatile___BII_V(int8_t* arr, int32_t index, int32_t v) {
     barray_check(arr, index, 4);
-    __atomic_store((int32_t*)(barray_data(arr) + index), &v, __ATOMIC_SEQ_CST);
+    uint32_t be = JNATIVE_BE32((uint32_t)v);
+    __atomic_store((uint32_t*)(barray_data(arr) + index), &be, __ATOMIC_SEQ_CST);
 }
 
 int64_t __jnative_fn_java_lang_invoke_VarHandle_getVolatile___BI_J(int8_t* arr, int32_t index) {
     barray_check(arr, index, 8);
-    int64_t v;
-    __atomic_load((int64_t*)(barray_data(arr) + index), &v, __ATOMIC_SEQ_CST);
-    return v;
+    uint64_t raw;
+    __atomic_load((uint64_t*)(barray_data(arr) + index), &raw, __ATOMIC_SEQ_CST);
+    return (int64_t)JNATIVE_BE64(raw);
 }
 
 void __jnative_fn_java_lang_invoke_VarHandle_setVolatile___BIJ_V(int8_t* arr, int32_t index, int64_t v) {
     barray_check(arr, index, 8);
-    __atomic_store((int64_t*)(barray_data(arr) + index), &v, __ATOMIC_SEQ_CST);
+    uint64_t be = JNATIVE_BE64((uint64_t)v);
+    __atomic_store((uint64_t*)(barray_data(arr) + index), &be, __ATOMIC_SEQ_CST);
 }
 
 /*
@@ -283,26 +415,28 @@ void __jnative_fn_java_lang_invoke_VarHandle_setVolatile___BIJ_V(int8_t* arr, in
 
 int32_t __jnative_fn_java_lang_invoke_VarHandle_getAcquire___BI_I(int8_t* arr, int32_t index) {
     barray_check(arr, index, 4);
-    int32_t v;
-    __atomic_load((int32_t*)(barray_data(arr) + index), &v, __ATOMIC_ACQUIRE);
-    return v;
+    uint32_t raw;
+    __atomic_load((uint32_t*)(barray_data(arr) + index), &raw, __ATOMIC_ACQUIRE);
+    return (int32_t)JNATIVE_BE32(raw);
 }
 
 void __jnative_fn_java_lang_invoke_VarHandle_setRelease___BII_V(int8_t* arr, int32_t index, int32_t v) {
     barray_check(arr, index, 4);
-    __atomic_store((int32_t*)(barray_data(arr) + index), &v, __ATOMIC_RELEASE);
+    uint32_t be = JNATIVE_BE32((uint32_t)v);
+    __atomic_store((uint32_t*)(barray_data(arr) + index), &be, __ATOMIC_RELEASE);
 }
 
 int64_t __jnative_fn_java_lang_invoke_VarHandle_getAcquire___BI_J(int8_t* arr, int32_t index) {
     barray_check(arr, index, 8);
-    int64_t v;
-    __atomic_load((int64_t*)(barray_data(arr) + index), &v, __ATOMIC_ACQUIRE);
-    return v;
+    uint64_t raw;
+    __atomic_load((uint64_t*)(barray_data(arr) + index), &raw, __ATOMIC_ACQUIRE);
+    return (int64_t)JNATIVE_BE64(raw);
 }
 
 void __jnative_fn_java_lang_invoke_VarHandle_setRelease___BIJ_V(int8_t* arr, int32_t index, int64_t v) {
     barray_check(arr, index, 8);
-    __atomic_store((int64_t*)(barray_data(arr) + index), &v, __ATOMIC_RELEASE);
+    uint64_t be = JNATIVE_BE64((uint64_t)v);
+    __atomic_store((uint64_t*)(barray_data(arr) + index), &be, __ATOMIC_RELEASE);
 }
 
 /*
@@ -313,47 +447,65 @@ void __jnative_fn_java_lang_invoke_VarHandle_setRelease___BIJ_V(int8_t* arr, int
 
 int32_t __jnative_fn_java_lang_invoke_VarHandle_getOpaque___BI_I(int8_t* arr, int32_t index) {
     barray_check(arr, index, 4);
-    int32_t v;
-    __atomic_load((int32_t*)(barray_data(arr) + index), &v, __ATOMIC_RELAXED);
-    return v;
+    uint32_t raw;
+    __atomic_load((uint32_t*)(barray_data(arr) + index), &raw, __ATOMIC_RELAXED);
+    return (int32_t)JNATIVE_BE32(raw);
 }
 
 void __jnative_fn_java_lang_invoke_VarHandle_setOpaque___BII_V(int8_t* arr, int32_t index, int32_t v) {
     barray_check(arr, index, 4);
-    __atomic_store((int32_t*)(barray_data(arr) + index), &v, __ATOMIC_RELAXED);
+    uint32_t be = JNATIVE_BE32((uint32_t)v);
+    __atomic_store((uint32_t*)(barray_data(arr) + index), &be, __ATOMIC_RELAXED);
 }
 
 int64_t __jnative_fn_java_lang_invoke_VarHandle_getOpaque___BI_J(int8_t* arr, int32_t index) {
     barray_check(arr, index, 8);
-    int64_t v;
-    __atomic_load((int64_t*)(barray_data(arr) + index), &v, __ATOMIC_RELAXED);
-    return v;
+    uint64_t raw;
+    __atomic_load((uint64_t*)(barray_data(arr) + index), &raw, __ATOMIC_RELAXED);
+    return (int64_t)JNATIVE_BE64(raw);
 }
 
 void __jnative_fn_java_lang_invoke_VarHandle_setOpaque___BIJ_V(int8_t* arr, int32_t index, int64_t v) {
     barray_check(arr, index, 8);
-    __atomic_store((int64_t*)(barray_data(arr) + index), &v, __ATOMIC_RELAXED);
+    uint64_t be = JNATIVE_BE64((uint64_t)v);
+    __atomic_store((uint64_t*)(barray_data(arr) + index), &be, __ATOMIC_RELAXED);
 }
 
 /*
  * ===========================================================================
  * compareAndSet / weakCompareAndSet on byte[]: int and long
+ *
+ * The expected and new values are passed in host order (they come from a
+ * previous get() result or from a Java-level constant), so both operands
+ * must be converted to their big-endian byte-layout before the atomic
+ * primitive sees them. On success the memory slot ends up holding the
+ * big-endian representation of newValue, which is what a subsequent
+ * get() will read back.
  * ===========================================================================
  */
 
 int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet___BIII_Z(
         int8_t* arr, int32_t index, int32_t expected, int32_t newValue) {
     barray_check(arr, index, 4);
-    return cas_int((int32_t*)(barray_data(arr) + index), expected, newValue);
+    uint32_t* slot = (uint32_t*)(barray_data(arr) + index);
+
+    uint32_t be_expected = JNATIVE_BE32((uint32_t)expected);
+    uint32_t be_new      = JNATIVE_BE32((uint32_t)newValue);
+
+    return __atomic_compare_exchange_n(slot, &be_expected, be_new,
+                                       0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;
 }
 
 int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet___BIJJ_Z(
         int8_t* arr, int32_t index, int64_t expected, int64_t newValue) {
     barray_check(arr, index, 8);
-    int64_t exp = expected;
-    return __atomic_compare_exchange_n((int64_t*)(barray_data(arr) + index),
-                                       &exp, newValue, 0,
-                                       __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;
+    uint64_t* slot = (uint64_t*)(barray_data(arr) + index);
+
+    uint64_t be_expected = JNATIVE_BE64((uint64_t)expected);
+    uint64_t be_new      = JNATIVE_BE64((uint64_t)newValue);
+
+    return __atomic_compare_exchange_n(slot, &be_expected, be_new,
+                                       0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;
 }
 
 int32_t __jnative_fn_java_lang_invoke_VarHandle_weakCompareAndSet___BIII_Z(
@@ -371,61 +523,122 @@ int32_t __jnative_fn_java_lang_invoke_VarHandle_weakCompareAndSet___BIJJ_Z(
 /*
  * ===========================================================================
  * compareAndExchange on byte[]
+ *
+ * The witness value that the atomic primitive leaves in `be_witness` is
+ * either the caller's original expected (on success) or the memory slot's
+ * current contents (on failure). In both cases the value is in the
+ * big-endian byte-layout that the slot uses, so it must be converted
+ * back to host order before being returned to Java.
  * ===========================================================================
  */
 
 int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndExchange___BIII_I(
         int8_t* arr, int32_t index, int32_t expected, int32_t newValue) {
     barray_check(arr, index, 4);
-    return cax_int((int32_t*)(barray_data(arr) + index), expected, newValue);
+    uint32_t* slot = (uint32_t*)(barray_data(arr) + index);
+
+    uint32_t be_witness = JNATIVE_BE32((uint32_t)expected);
+    uint32_t be_new     = JNATIVE_BE32((uint32_t)newValue);
+
+    __atomic_compare_exchange_n(slot, &be_witness, be_new,
+                                0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+
+    return (int32_t)JNATIVE_BE32(be_witness);
 }
 
 int64_t __jnative_fn_java_lang_invoke_VarHandle_compareAndExchange___BIJJ_J(
         int8_t* arr, int32_t index, int64_t expected, int64_t newValue) {
     barray_check(arr, index, 8);
-    int64_t witness = expected;
-    __atomic_compare_exchange_n((int64_t*)(barray_data(arr) + index),
-                                &witness, newValue, 0,
-                                __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
-    return witness;
+    uint64_t* slot = (uint64_t*)(barray_data(arr) + index);
+
+    uint64_t be_witness = JNATIVE_BE64((uint64_t)expected);
+    uint64_t be_new     = JNATIVE_BE64((uint64_t)newValue);
+
+    __atomic_compare_exchange_n(slot, &be_witness, be_new,
+                                0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+
+    return (int64_t)JNATIVE_BE64(be_witness);
 }
 
 /*
  * ===========================================================================
- * getAndSet / getAndAdd on byte[]
+ * getAndSet on byte[]
  * ===========================================================================
  */
 
 int32_t __jnative_fn_java_lang_invoke_VarHandle_getAndSet___BII_I(
         int8_t* arr, int32_t index, int32_t newValue) {
     barray_check(arr, index, 4);
-    int32_t old;
-    __atomic_exchange((int32_t*)(barray_data(arr) + index), &newValue, &old,
-                      __ATOMIC_SEQ_CST);
-    return old;
+    uint32_t* slot = (uint32_t*)(barray_data(arr) + index);
+
+    uint32_t be_new = JNATIVE_BE32((uint32_t)newValue);
+    uint32_t be_old;
+    __atomic_exchange(slot, &be_new, &be_old, __ATOMIC_SEQ_CST);
+    return (int32_t)JNATIVE_BE32(be_old);
 }
 
 int64_t __jnative_fn_java_lang_invoke_VarHandle_getAndSet___BIJ_J(
         int8_t* arr, int32_t index, int64_t newValue) {
     barray_check(arr, index, 8);
-    int64_t old;
-    __atomic_exchange((int64_t*)(barray_data(arr) + index), &newValue, &old,
-                      __ATOMIC_SEQ_CST);
-    return old;
+    uint64_t* slot = (uint64_t*)(barray_data(arr) + index);
+
+    uint64_t be_new = JNATIVE_BE64((uint64_t)newValue);
+    uint64_t be_old;
+    __atomic_exchange(slot, &be_new, &be_old, __ATOMIC_SEQ_CST);
+    return (int64_t)JNATIVE_BE64(be_old);
 }
+
+/*
+ * ===========================================================================
+ * getAndAdd on byte[]
+ *
+ * The addition itself is an arithmetic operation on the Java-level value
+ * (host order), not on the raw bytes. A plain __atomic_fetch_add would
+ * add in host order to a slot that holds big-endian bytes and produce a
+ * value whose bytes are the sum of two differently-scaled operands.
+ * The implementation therefore reads the slot, converts to host order,
+ * adds, converts back, and CAS'es the new bytes in. The loop re-reads on
+ * contention and terminates once the CAS succeeds.
+ * ===========================================================================
+ */
 
 int32_t __jnative_fn_java_lang_invoke_VarHandle_getAndAdd___BII_I(
         int8_t* arr, int32_t index, int32_t delta) {
     barray_check(arr, index, 4);
-    return __atomic_fetch_add((int32_t*)(barray_data(arr) + index), delta,
-                              __ATOMIC_SEQ_CST);
+    uint32_t* slot = (uint32_t*)(barray_data(arr) + index);
+
+    uint32_t be_old = __atomic_load_n(slot, __ATOMIC_SEQ_CST);
+    for (;;) {
+        int32_t old_host = (int32_t)JNATIVE_BE32(be_old);
+        int32_t new_host = (int32_t)((uint32_t)old_host + (uint32_t)delta);
+        uint32_t be_new  = JNATIVE_BE32((uint32_t)new_host);
+
+        if (__atomic_compare_exchange_n(slot, &be_old, be_new, 0,
+                                        __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+            return old_host;
+        }
+        /* On failure __atomic_compare_exchange_n has overwritten
+         * be_old with the current memory contents, still in the
+         * big-endian byte-layout; the next iteration decodes it. */
+    }
 }
 
 int64_t __jnative_fn_java_lang_invoke_VarHandle_getAndAdd___BIJ_J(
         int8_t* arr, int32_t index, int64_t delta) {
     barray_check(arr, index, 8);
-    return __atomic_fetch_add((int64_t*)(barray_data(arr) + index), delta,
-                              __ATOMIC_SEQ_CST);
+    uint64_t* slot = (uint64_t*)(barray_data(arr) + index);
+
+    uint64_t be_old = __atomic_load_n(slot, __ATOMIC_SEQ_CST);
+    for (;;) {
+        int64_t old_host = (int64_t)JNATIVE_BE64(be_old);
+        int64_t new_host = (int64_t)((uint64_t)old_host + (uint64_t)delta);
+        uint64_t be_new  = JNATIVE_BE64((uint64_t)new_host);
+
+        if (__atomic_compare_exchange_n(slot, &be_old, be_new, 0,
+                                        __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+            return old_host;
+        }
+    }
 }
 
 int32_t __jnative_fn_java_lang_invoke_VarHandle_getAndAddInt___BII_I(

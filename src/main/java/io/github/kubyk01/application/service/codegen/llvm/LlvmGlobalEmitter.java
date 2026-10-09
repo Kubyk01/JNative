@@ -2877,10 +2877,112 @@ public class LlvmGlobalEmitter {
             String cleanClassName = LlvmTypeMapper.sanitizeIdentifier(className);
             String classVarName = "@refclass_" + cleanClassName;
 
-            int objectSize = OBJECT_HEADER_SIZE;
-            if (!isPrimitive && classNode != null && !isArrayPseudoClass) {
-                for (FieldNode f : collectInstanceFields(classNode)) {
-                    objectSize += getElementSizeOfType(f.getType());
+            /*
+             * object_size is the single number the C runtime uses for
+             * every allocation of this class: jnative_alloc_object(),
+             * Unsafe.allocateInstance(), and every per-class native
+             * that builds a mirror or a value object from C. It must
+             * match sizeof(%struct.<class>) byte-for-byte, because
+             * generated code writes instance fields at the offsets
+             * returned by getFieldOffset() (which applies the natural
+             * alignment of every field type), and the C side writes the
+             * same fields at the same offsets into the buffer
+             * object_size describes. If object_size is smaller than the
+             * LLVM struct, the last field of any class that has an
+             * alignment gap lies past the end of the allocation and the
+             * C-side value is read out of adjacent heap metadata.
+             *
+             * The previous computation — header plus the unaligned sum
+             * of field sizes — was correct only for classes whose
+             * fields happen to have no internal padding. It was wrong
+             * by 4 bytes for every class that declares an int or float
+             * immediately after a reference or long/double, and that
+             * includes ArrayList, LinkedList, StringBuilder, Hashtable,
+             * IdentityHashMap, Vector, Stack and many more. On a freshly
+             * calloc'ed chunk the four stray bytes happen to be zero
+             * (the allocator returned a virgin arena page) and the bug
+             * is invisible; on a recycled chunk they hold the previous
+             * occupant's prev_size field, the last field reads a stale
+             * non-zero value, and the field's reader takes the wrong
+             * branch.
+             *
+             * The concrete failure this fix closes:
+             *
+             *     java.time.zone.TzdbZoneRulesProvider.load was replaced
+             *     by a C override that installs an empty ArrayList into
+             *     the provider's regionIds field. ZoneRulesProvider's
+             *     registration loop then called provideZoneIds(), which
+             *     is new HashSet<>(regionIds). AbstractCollection.addAll
+             *     iterates that ArrayList; ArrayList.Itr.hasNext reads
+             *     `cursor != size`; size lives at offset 24 of a
+             *     24-byte allocation. The read returned a non-zero byte
+             *     from the adjacent glibc chunk header, hasNext()
+             *     returned true, next() was called, and the very next
+             *     instruction — elementData.length with elementData
+             *     still null — raised
+             *
+             *         NullPointerException: Cannot invoke
+             *             java.util.ArrayList.Itr.next(Ljava/lang/Object;)
+             *             because <array> is null
+             *
+             *     inside the <clinit> of ZoneRulesProvider.
+             *
+             * computeObjectSize(className) is the canonical,
+             * alignment-aware size computation. It is the same function
+             * LlvmGenerator.generateMain() already uses to publish the
+             * Thread, Thread$FieldHolder and ThreadGroup sizes to the C
+             * runtime, so it is the single source of truth for struct
+             * sizes in this codebase. Routing object_size through it
+             * makes the emitted constant agree with the LLVM struct
+             * layout for every class, without duplicating the alignment
+             * rules a second time.
+             *
+             * Primitives and array pseudo-classes do not have an emitted
+             * LLVM struct of their own and are never allocated through
+             * jnative_alloc_object() or Unsafe.allocateInstance();
+             * arrays go through jnative_array_alloc(), which uses
+             * JAVA_ARR_HDR rather than object_size. For those the header
+             * size is the only meaningful value, matching the previous
+             * behaviour.
+             */
+            int objectSize;
+            if (isPrimitive || isArrayPseudoClass || classNode == null) {
+                objectSize = OBJECT_HEADER_SIZE;
+            } else {
+                int computed = computeObjectSize(className);
+                if (computed > 0) {
+                    objectSize = computed;
+                } else {
+                    /*
+                     * computeObjectSize returns -1 only when the class
+                     * is not in the class map, is external, or is an
+                     * interface. The branch above already excludes the
+                     * interface and pseudo-class cases, and the
+                     * earlier loop in this method has already filtered
+                     * out classes that are absent or external, so this
+                     * fallback is unreachable under normal operation.
+                     *
+                     * It exists so that a future change to the filtering
+                     * above cannot silently reintroduce the alignment
+                     * bug by handing a value that computeObjectSize
+                     * refuses to compute to the naive sum instead. The
+                     * fallback performs the same alignment-aware walk
+                     * inline, using the same fieldAlignment / fieldSize
+                     * helpers that computeObjectSize and getFieldOffset
+                     * use internally, so it cannot disagree with either.
+                     */
+                    objectSize = OBJECT_HEADER_SIZE;
+                    for (FieldNode f : collectInstanceFields(classNode)) {
+                        Type ft = f.getType();
+                        int align = fieldAlignment(ft);
+                        int size  = fieldSize(ft);
+                        objectSize = (objectSize + align - 1) & -align;
+                        objectSize += size;
+                    }
+                    objectSize = (objectSize + 7) & ~7;
+                    log.warn("computeObjectSize returned {} for class {}; "
+                        + "falling back to inline alignment-aware size {}",
+                        computed, className, objectSize);
                 }
             }
 

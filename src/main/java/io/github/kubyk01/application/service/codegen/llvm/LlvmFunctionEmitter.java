@@ -26,6 +26,7 @@ import io.github.kubyk01.domain.ir.ThrowTerminator;
 import io.github.kubyk01.domain.ir.TryCatchRange;
 import io.github.kubyk01.domain.ir.Type;
 import io.github.kubyk01.domain.ir.Value;
+import io.github.kubyk01.util.parserC.ParserC;
 import io.github.kubyk01.util.parserC.ParserC.NativeMethodInfo;
 import lombok.RequiredArgsConstructor;
 
@@ -281,10 +282,6 @@ public class LlvmFunctionEmitter {
             BasicBlock block = func.getBlocks().get(i);
             boolean isEntry = (block == currentEntryBlock)
                 || (currentEntryBlock == null && firstBlock);
-            if (isEntry && firstBlock && entryIdx == 0 && i != 0) {
-            }
-            if (isEntry && entryIdx == 0 && i != 0 && currentEntryBlock != null) {
-            }
             if (isEntry && (currentEntryBlock != null)) {
                 entryIdx = i;
             } else if (isEntry && currentEntryBlock == null) {
@@ -700,19 +697,6 @@ public class LlvmFunctionEmitter {
         }
     }
 
-    /**
-     * Emits a null check on {@code obj} with no additional context. The
-     * resulting NullPointerException names only the enclosing method.
-     * Prefer {@link #emitNullCheck(StringBuilder, Value, List, String)}
-     * when the caller knows the Java-level construct it is lowering — a
-     * field name, a method name, {@code "monitor"}, {@code "<array>"} —
-     * because a message that names the dereferenced construct is
-     * dramatically easier to diagnose than one that names only the
-     * enclosing method.
-     */
-    private void emitNullCheck(StringBuilder sb, Value obj, List<TryCatchRange> ranges) {
-        emitNullCheck(sb, obj, ranges, null);
-    }
 
     /**
      * Emits a null check on {@code obj}. When the check fails, the
@@ -757,36 +741,6 @@ public class LlvmFunctionEmitter {
 
         emitNpeThrowHelper(sb, context, ranges);
 
-        sb.append(cont).append(":\n");
-    }
-
-    private void emitBoundsCheck(StringBuilder sb, Value arr, String idxI32, List<TryCatchRange> ranges) {
-        String arrRef = getLlvmValue(sb, arr);
-        // length lives at JAVA_ARR_LENGTH_OFFSET (8) in the array header.
-        String lenPtr = newAux("lenptr");
-        String len = newAux("len");
-        sb.append("  ").append(lenPtr)
-            .append(" = getelementptr inbounds i8, i8* ").append(arrRef)
-            .append(", i64 8\n");
-        String lenPtrI32 = newAux("lenptr_i32");
-        sb.append("  ").append(lenPtrI32).append(" = bitcast i8* ").append(lenPtr)
-            .append(" to i32*\n");
-        sb.append("  ").append(len).append(" = load i32, i32* ")
-            .append(lenPtrI32).append("\n");
-
-        String chk1 = newAux("bnd_chk1");
-        String chk2 = newAux("bnd_chk2");
-        String ok = newAux("bnd_ok");
-        String throwBlk = newLabel("throw_aioobe");
-        String cont = newLabel("bnd_ok");
-        sb.append("  ").append(chk1).append(" = icmp sge i32 ").append(idxI32).append(", 0\n");
-        sb.append("  ").append(chk2).append(" = icmp slt i32 ").append(idxI32).append(", ").append(len).append("\n");
-        sb.append("  ").append(ok).append(" = and i1 ").append(chk1).append(", ").append(chk2).append("\n");
-        sb.append("  br i1 ").append(ok)
-            .append(", label %").append(cont)
-            .append(", label %").append(throwBlk).append("\n");
-        sb.append(throwBlk).append(":\n");
-        emitThrowHelper(sb, "@__jnative_throw_array_index_out_of_bounds", ranges);
         sb.append(cont).append(":\n");
     }
 
@@ -1326,7 +1280,33 @@ public class LlvmFunctionEmitter {
                     NativeMethodInfo best = polymorphicResolver.findBestMatch(owner, methodName, retType, paramTypes);
                     if (best != null) {
                         String expectedDesc = buildDescriptor(retType, paramTypes);
-                        if (expectedDesc.equals(best.getDescriptor())) {
+                        boolean exactMatch      = expectedDesc.equals(best.getDescriptor());
+                        boolean isVoidPtrWrapper = isVoidPtrArgsSignature(best);
+
+                        /*
+                         * The concrete typed call path is taken when either:
+                         *
+                         *   (a) the emitter's descriptor exactly equals the
+                         *       resolver's descriptor (the normal, healthy
+                         *       case after the encoder fix above), or
+                         *
+                         *   (b) the resolver returned a concrete typed
+                         *       native (its parameters do not fit the
+                         *       single-void** wrapper shape). In that case
+                         *       the resolver has already confirmed — by way
+                         *       of the same full descriptor encoding it used
+                         *       to select this candidate — that the target
+                         *       is the correct specialization for this call
+                         *       site. Any residual string difference is
+                         *       cosmetic and must not push the call into the
+                         *       packed-i8** path, which would invoke the
+                         *       concrete C function with the wrong ABI.
+                         *
+                         * The void** path is taken only when the resolver
+                         * actually selected one of the legacy wrapper
+                         * dispatchers.
+                         */
+                        if (exactMatch || !isVoidPtrWrapper) {
                             String funcName = best.getFullFunctionName();
                             Function func = ensurePolymorphicFunctionDeclared(best);
                             final List<Value> argsForCall = argsWithoutReceiver;
@@ -1762,7 +1742,20 @@ public class LlvmFunctionEmitter {
                             owner, methodName, retType, paramTypes);
                         if (best != null) {
                             String expectedDesc = buildDescriptor(retType, paramTypes);
-                            if (expectedDesc.equals(best.getDescriptor())) {
+                            boolean exactMatch       = expectedDesc.equals(best.getDescriptor());
+                            boolean isVoidPtrWrapper = isVoidPtrArgsSignature(best);
+
+                            /*
+                             * Same dispatch rule as the VIRTUAL_CALL /
+                             * INTERFACE_CALL site above: a concrete typed
+                             * native (not a single-void** wrapper) is
+                             * always invoked through the direct typed path,
+                             * even if a residual encoding difference makes
+                             * the string comparison fail. Only genuine
+                             * void** dispatchers go through the packed
+                             * i8** path.
+                             */
+                            if (exactMatch || !isVoidPtrWrapper) {
                                 String funcName = best.getFullFunctionName();
                                 Function func = ensurePolymorphicFunctionDeclared(best);
                                 final List<Value> argsForCall = args;
@@ -1952,7 +1945,15 @@ public class LlvmFunctionEmitter {
                             owner, methodName, retType, paramTypes);
                         if (best != null) {
                             String expectedDesc = buildDescriptor(retType, paramTypes);
-                            if (expectedDesc.equals(best.getDescriptor())) {
+                            boolean exactMatch       = expectedDesc.equals(best.getDescriptor());
+                            boolean isVoidPtrWrapper = isVoidPtrArgsSignature(best);
+
+                            /*
+                             * Same dispatch rule as the VIRTUAL_CALL /
+                             * INTERFACE_CALL and STATIC_CALL / CALL sites.
+                             * See those comments for the full rationale.
+                             */
+                            if (exactMatch || !isVoidPtrWrapper) {
                                 String funcName = best.getFullFunctionName();
                                 Function func = ensurePolymorphicFunctionDeclared(best);
                                 final List<Value> argsForCall = argsWithoutReceiver;
@@ -2640,17 +2641,117 @@ public class LlvmFunctionEmitter {
         return newFunc;
     }
 
+    /**
+     * Builds the JVM method descriptor for a polymorphic call site.
+     *
+     * <p>The resulting string is compared byte-for-byte against
+     * {@link NativeMethodInfo#getDescriptor()} to decide whether the
+     * resolver found a concrete typed native target (direct typed call)
+     * or a generic {@code void**} wrapper (packed {@code i8**} call).
+     * It must therefore be produced by exactly the same encoding rules
+     * that {@link
+     * io.github.kubyk01.application.service.codegen.llvm.nativepolymorphicfunctionresolver.PolymorphicResolver}
+     * uses when it builds its own {@code expectedDescriptor} — in
+     * particular, an array parameter must be encoded as
+     * {@code "[" + elementDescriptor}, not as a bare {@code '['}.</p>
+     *
+     * <p>Historically this method used
+     * {@link #typeToDescriptorChar(Type)} for every parameter and
+     * return type, which returns a single {@code '['} for any array
+     * type. For a call site with parameters {@code (byte[], int)} and
+     * return {@code short} that produced the malformed descriptor
+     * {@code "([I)S"}, while the resolver produced the correct
+     * {@code "([BI)S"}. The two strings never compared equal, the
+     * emitter always took the {@code emitPolymorphicCall} branch, and
+     * the concrete C function
+     * {@code int16_t ..._get___BI_S(int8_t*, int32_t)} was invoked with
+     * the ABI of a {@code void**} dispatcher — one {@code i8**} in
+     * slot 1, garbage in slot 2 — which crashed inside
+     * {@code barray_check} with a bogus
+     * {@code ArrayIndexOutOfBoundsException}.</p>
+     */
     private String buildDescriptor(Type returnType, List<Type> paramTypes) {
         StringBuilder sb = new StringBuilder();
         sb.append('(');
         for (Type pt : paramTypes) {
-            sb.append(typeToDescriptorChar(pt));
+            sb.append(typeToFullDescriptor(pt));
         }
         sb.append(')');
-        sb.append(typeToDescriptorChar(returnType));
+        sb.append(typeToFullDescriptor(returnType));
         return sb.toString();
     }
 
+    /**
+     * Full JVM type descriptor for a single {@link Type}.
+     *
+     * <p>This is the emitter-side counterpart of
+     * {@code PolymorphicResolver.typeToFullDescriptor}. The two must
+     * produce identical strings for the same {@link Type}, otherwise
+     * the exact-match check that distinguishes a concrete typed native
+     * from a {@code void**} wrapper silently misclassifies every call
+     * site whose parameters include an array.</p>
+     *
+     * <p>The encoding rules are:</p>
+     * <ul>
+     *   <li>primitives map to their single-letter code
+     *       ({@code Z B S C I J F D}, plus {@code V} for {@code void});</li>
+     *   <li>an array of {@code T} maps to {@code "[" + fullDescriptor(T)},
+     *       recursing so that {@code int[][]} becomes {@code "[[I"} and
+     *       {@code String[]} becomes {@code "[Ljava/lang/String;"};</li>
+     *   <li>a reference type {@code C} maps to
+     *       {@code "L" + C.getClassName() + ";"};</li>
+     *   <li>the {@code null}, {@code block} and {@code unknown} sentinels
+     *       map to {@code "Ljava/lang/Object;"} — they never appear as a
+     *       declared parameter or return type of a real native, but the
+     *       mapping keeps the encoder total.</li>
+     * </ul>
+     */
+    private String typeToFullDescriptor(Type type) {
+        if (type == null) {
+            return "Ljava/lang/Object;";
+        }
+        if (type.isPrimitive()) {
+            return String.valueOf(typeToDescriptorChar(type));
+        }
+        if (type.isArray()) {
+            Type elem = type.getElementType();
+            if (elem == null) {
+                return "[Ljava/lang/Object;";
+            }
+            return "[" + typeToFullDescriptor(elem);
+        }
+        if (type.isReference()) {
+            String cls = type.getClassName();
+            if (cls == null || cls.isEmpty()) {
+                return "Ljava/lang/Object;";
+            }
+            /*
+             * Defensive: a reference type whose name is itself an array
+             * descriptor. This can arise when a value's declared type was
+             * built from a runtime array descriptor rather than from a
+             * class file. Emitting "L[B;" for it would produce a
+             * descriptor that no JVM — and no native — would ever match.
+             * Returning the descriptor verbatim makes the encoder total
+             * and keeps the exact-match check meaningful for such values.
+             */
+            if (cls.charAt(0) == '[') {
+                return cls;
+            }
+            return "L" + cls + ";";
+        }
+        if (type.isNull()) {
+            return "Ljava/lang/Object;";
+        }
+        return "Ljava/lang/Object;";
+    }
+
+    /**
+     * Single-character descriptor for a primitive type. Kept for the
+     * primitive branch of {@link #typeToFullDescriptor}; arrays and
+     * references must go through the full encoder above, because a
+     * bare {@code '['} is not a valid parameter descriptor and cannot
+     * be used in the exact-match comparison.
+     */
     private char typeToDescriptorChar(Type type) {
         if (type == Type.VOID) return 'V';
         if (type == Type.BOOLEAN) return 'Z';
@@ -2664,6 +2765,27 @@ public class LlvmFunctionEmitter {
         if (type.isReference()) return 'L';
         if (type.isArray()) return '[';
         return 'L';
+    }
+
+    /**
+     * Returns {@code true} when {@code info} describes one of the
+     * legacy {@code void**} polymorphic dispatchers — a native whose
+     * sole parameter is a {@code void*} / {@code void**} pointer and
+     * whose argument list is therefore carried opaquely in a packed
+     * {@code i8**} array rather than in the C ABI's typed registers.
+     *
+     * <p>This is a byte-for-byte copy of
+     * {@code PolymorphicResolver.isVoidPtrArgsSignature}. Keeping a
+     * copy here is deliberate: the emitter must be able to decide
+     * independently of the resolver whether the target it received is
+     * a concrete typed native or a generic wrapper, because the two
+     * cases require different call-emission code.</p>
+     */
+    private boolean isVoidPtrArgsSignature(NativeMethodInfo info) {
+        List<ParserC.CParameter> params = info.getParameters();
+        if (params.size() != 1) return false;
+        String type = params.getFirst().getType().trim();
+        return type.contains("void") && type.contains("*");
     }
 
 
@@ -3011,7 +3133,7 @@ public class LlvmFunctionEmitter {
         if (neverReturnsNormally) {
             sb.append("  unreachable\n");
         } else {
-            sb.append("  call void @__jnative_pop_catch()\n".repeat(k));
+            sb.repeat("  call void @__jnative_pop_catch()\n", k);
             sb.append("  br label %").append(contBlk).append("\n");
         }
 
@@ -3046,7 +3168,7 @@ public class LlvmFunctionEmitter {
                 sb.append("  br label %").append(hitBlk).append("\n");
             }
             sb.append(hitBlk).append(":\n");
-            sb.append("  call void @__jnative_pop_catch()\n".repeat(k - i));
+            sb.repeat("  call void @__jnative_pop_catch()\n", k - i);
             BasicBlock handler = handlerBlockByRange.get(r);
             sb.append("  br label %").append(llvmLabel(handler)).append("\n");
         }
@@ -3387,7 +3509,7 @@ public class LlvmFunctionEmitter {
         if (type == Type.CHAR) {
             int cp;
             if (val instanceof Character ch) {
-                cp = ch.charValue();
+                cp = ch;
             } else if (val instanceof Number n) {
                 cp = n.intValue();
             } else {
@@ -3412,7 +3534,7 @@ public class LlvmFunctionEmitter {
         }
 
         if (type == Type.BOOLEAN) {
-            return ((Boolean) val) ? "true" : "false";
+            return ((Boolean) val).toString();
         }
 
         if (type.isReference() && "java/lang/Class".equals(type.getClassName())) {
@@ -3615,11 +3737,9 @@ public class LlvmFunctionEmitter {
                 sb.append("  ").append(ext).append(" = sext ").append(LlvmTypeMapper.toLlvmType(type))
                     .append(" ").append(valRef).append(" to i64\n");
                 intVal = ext;
-            } else if (type == Type.LONG) {
-                // already i64
-            } else {
-                // fallback
-            }
+            }  // already i64
+            // fallback
+
             String ptrCast = newAux("inttoptr");
             sb.append("  ").append(ptrCast).append(" = inttoptr i64 ").append(intVal).append(" to i8*\n");
             return ptrCast;
