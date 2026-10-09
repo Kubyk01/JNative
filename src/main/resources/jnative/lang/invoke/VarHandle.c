@@ -157,47 +157,47 @@ static inline int32_t cax_int(int32_t* slot, int32_t expected, int32_t newValue)
  * ===========================================================================
  */
 
-int8_t __jnative_fn_java_lang_invoke_VarHandle_get___BI_B(void* arr, int32_t index) {
+int8_t __jnative_fn_java_lang_invoke_VarHandle_get___BI_B(int8_t* arr, int32_t index) {
     barray_check(arr, index, 1);
     return *(int8_t*)(barray_data(arr) + index);
 }
 
-int16_t __jnative_fn_java_lang_invoke_VarHandle_get___BI_S(void* arr, int32_t index) {
+int16_t __jnative_fn_java_lang_invoke_VarHandle_get___BI_S(int8_t* arr, int32_t index) {
     barray_check(arr, index, 2);
     int16_t v;
     memcpy(&v, barray_data(arr) + index, 2);
     return v;
 }
 
-uint16_t __jnative_fn_java_lang_invoke_VarHandle_get___BI_C(void* arr, int32_t index) {
+uint16_t __jnative_fn_java_lang_invoke_VarHandle_get___BI_C(int8_t* arr, int32_t index) {
     barray_check(arr, index, 2);
     uint16_t v;
     memcpy(&v, barray_data(arr) + index, 2);
     return v;
 }
 
-int32_t __jnative_fn_java_lang_invoke_VarHandle_get___BI_I(void* arr, int32_t index) {
+int32_t __jnative_fn_java_lang_invoke_VarHandle_get___BI_I(int8_t* arr, int32_t index) {
     barray_check(arr, index, 4);
     int32_t v;
     memcpy(&v, barray_data(arr) + index, 4);
     return v;
 }
 
-int64_t __jnative_fn_java_lang_invoke_VarHandle_get___BI_J(void* arr, int32_t index) {
+int64_t __jnative_fn_java_lang_invoke_VarHandle_get___BI_J(int8_t* arr, int32_t index) {
     barray_check(arr, index, 8);
     int64_t v;
     memcpy(&v, barray_data(arr) + index, 8);
     return v;
 }
 
-float __jnative_fn_java_lang_invoke_VarHandle_get___BI_F(void* arr, int32_t index) {
+float __jnative_fn_java_lang_invoke_VarHandle_get___BI_F(int8_t* arr, int32_t index) {
     barray_check(arr, index, 4);
     float v;
     memcpy(&v, barray_data(arr) + index, 4);
     return v;
 }
 
-double __jnative_fn_java_lang_invoke_VarHandle_get___BI_D(void* arr, int32_t index) {
+double __jnative_fn_java_lang_invoke_VarHandle_get___BI_D(int8_t* arr, int32_t index) {
     barray_check(arr, index, 8);
     double v;
     memcpy(&v, barray_data(arr) + index, 8);
@@ -210,37 +210,37 @@ double __jnative_fn_java_lang_invoke_VarHandle_get___BI_D(void* arr, int32_t ind
  * ===========================================================================
  */
 
-void __jnative_fn_java_lang_invoke_VarHandle_set___BIB_V(void* arr, int32_t index, int8_t v) {
+void __jnative_fn_java_lang_invoke_VarHandle_set___BIB_V(int8_t* arr, int32_t index, int8_t v) {
     barray_check(arr, index, 1);
     *(int8_t*)(barray_data(arr) + index) = v;
 }
 
-void __jnative_fn_java_lang_invoke_VarHandle_set___BIS_V(void* arr, int32_t index, int16_t v) {
+void __jnative_fn_java_lang_invoke_VarHandle_set___BIS_V(int8_t* arr, int32_t index, int16_t v) {
     barray_check(arr, index, 2);
     memcpy(barray_data(arr) + index, &v, 2);
 }
 
-void __jnative_fn_java_lang_invoke_VarHandle_set___BIC_V(void* arr, int32_t index, uint16_t v) {
+void __jnative_fn_java_lang_invoke_VarHandle_set___BIC_V(int8_t* arr, int32_t index, uint16_t v) {
     barray_check(arr, index, 2);
     memcpy(barray_data(arr) + index, &v, 2);
 }
 
-void __jnative_fn_java_lang_invoke_VarHandle_set___BII_V(void* arr, int32_t index, int32_t v) {
+void __jnative_fn_java_lang_invoke_VarHandle_set___BII_V(int8_t* arr, int32_t index, int32_t v) {
     barray_check(arr, index, 4);
     memcpy(barray_data(arr) + index, &v, 4);
 }
 
-void __jnative_fn_java_lang_invoke_VarHandle_set___BIJ_V(void* arr, int32_t index, int64_t v) {
+void __jnative_fn_java_lang_invoke_VarHandle_set___BIJ_V(int8_t* arr, int32_t index, int64_t v) {
     barray_check(arr, index, 8);
     memcpy(barray_data(arr) + index, &v, 8);
 }
 
-void __jnative_fn_java_lang_invoke_VarHandle_set___BIF_V(void* arr, int32_t index, float v) {
+void __jnative_fn_java_lang_invoke_VarHandle_set___BIF_V(int8_t* arr, int32_t index, float v) {
     barray_check(arr, index, 4);
     memcpy(barray_data(arr) + index, &v, 4);
 }
 
-void __jnative_fn_java_lang_invoke_VarHandle_set___BID_V(void* arr, int32_t index, double v) {
+void __jnative_fn_java_lang_invoke_VarHandle_set___BID_V(int8_t* arr, int32_t index, double v) {
     barray_check(arr, index, 8);
     memcpy(barray_data(arr) + index, &v, 8);
 }
@@ -251,26 +251,26 @@ void __jnative_fn_java_lang_invoke_VarHandle_set___BID_V(void* arr, int32_t inde
  * ===========================================================================
  */
 
-int32_t __jnative_fn_java_lang_invoke_VarHandle_getVolatile___BI_I(void* arr, int32_t index) {
+int32_t __jnative_fn_java_lang_invoke_VarHandle_getVolatile___BI_I(int8_t* arr, int32_t index) {
     barray_check(arr, index, 4);
     int32_t v;
     __atomic_load((int32_t*)(barray_data(arr) + index), &v, __ATOMIC_SEQ_CST);
     return v;
 }
 
-void __jnative_fn_java_lang_invoke_VarHandle_setVolatile___BII_V(void* arr, int32_t index, int32_t v) {
+void __jnative_fn_java_lang_invoke_VarHandle_setVolatile___BII_V(int8_t* arr, int32_t index, int32_t v) {
     barray_check(arr, index, 4);
     __atomic_store((int32_t*)(barray_data(arr) + index), &v, __ATOMIC_SEQ_CST);
 }
 
-int64_t __jnative_fn_java_lang_invoke_VarHandle_getVolatile___BI_J(void* arr, int32_t index) {
+int64_t __jnative_fn_java_lang_invoke_VarHandle_getVolatile___BI_J(int8_t* arr, int32_t index) {
     barray_check(arr, index, 8);
     int64_t v;
     __atomic_load((int64_t*)(barray_data(arr) + index), &v, __ATOMIC_SEQ_CST);
     return v;
 }
 
-void __jnative_fn_java_lang_invoke_VarHandle_setVolatile___BIJ_V(void* arr, int32_t index, int64_t v) {
+void __jnative_fn_java_lang_invoke_VarHandle_setVolatile___BIJ_V(int8_t* arr, int32_t index, int64_t v) {
     barray_check(arr, index, 8);
     __atomic_store((int64_t*)(barray_data(arr) + index), &v, __ATOMIC_SEQ_CST);
 }
@@ -281,26 +281,26 @@ void __jnative_fn_java_lang_invoke_VarHandle_setVolatile___BIJ_V(void* arr, int3
  * ===========================================================================
  */
 
-int32_t __jnative_fn_java_lang_invoke_VarHandle_getAcquire___BI_I(void* arr, int32_t index) {
+int32_t __jnative_fn_java_lang_invoke_VarHandle_getAcquire___BI_I(int8_t* arr, int32_t index) {
     barray_check(arr, index, 4);
     int32_t v;
     __atomic_load((int32_t*)(barray_data(arr) + index), &v, __ATOMIC_ACQUIRE);
     return v;
 }
 
-void __jnative_fn_java_lang_invoke_VarHandle_setRelease___BII_V(void* arr, int32_t index, int32_t v) {
+void __jnative_fn_java_lang_invoke_VarHandle_setRelease___BII_V(int8_t* arr, int32_t index, int32_t v) {
     barray_check(arr, index, 4);
     __atomic_store((int32_t*)(barray_data(arr) + index), &v, __ATOMIC_RELEASE);
 }
 
-int64_t __jnative_fn_java_lang_invoke_VarHandle_getAcquire___BI_J(void* arr, int32_t index) {
+int64_t __jnative_fn_java_lang_invoke_VarHandle_getAcquire___BI_J(int8_t* arr, int32_t index) {
     barray_check(arr, index, 8);
     int64_t v;
     __atomic_load((int64_t*)(barray_data(arr) + index), &v, __ATOMIC_ACQUIRE);
     return v;
 }
 
-void __jnative_fn_java_lang_invoke_VarHandle_setRelease___BIJ_V(void* arr, int32_t index, int64_t v) {
+void __jnative_fn_java_lang_invoke_VarHandle_setRelease___BIJ_V(int8_t* arr, int32_t index, int64_t v) {
     barray_check(arr, index, 8);
     __atomic_store((int64_t*)(barray_data(arr) + index), &v, __ATOMIC_RELEASE);
 }
@@ -311,26 +311,26 @@ void __jnative_fn_java_lang_invoke_VarHandle_setRelease___BIJ_V(void* arr, int32
  * ===========================================================================
  */
 
-int32_t __jnative_fn_java_lang_invoke_VarHandle_getOpaque___BI_I(void* arr, int32_t index) {
+int32_t __jnative_fn_java_lang_invoke_VarHandle_getOpaque___BI_I(int8_t* arr, int32_t index) {
     barray_check(arr, index, 4);
     int32_t v;
     __atomic_load((int32_t*)(barray_data(arr) + index), &v, __ATOMIC_RELAXED);
     return v;
 }
 
-void __jnative_fn_java_lang_invoke_VarHandle_setOpaque___BII_V(void* arr, int32_t index, int32_t v) {
+void __jnative_fn_java_lang_invoke_VarHandle_setOpaque___BII_V(int8_t* arr, int32_t index, int32_t v) {
     barray_check(arr, index, 4);
     __atomic_store((int32_t*)(barray_data(arr) + index), &v, __ATOMIC_RELAXED);
 }
 
-int64_t __jnative_fn_java_lang_invoke_VarHandle_getOpaque___BI_J(void* arr, int32_t index) {
+int64_t __jnative_fn_java_lang_invoke_VarHandle_getOpaque___BI_J(int8_t* arr, int32_t index) {
     barray_check(arr, index, 8);
     int64_t v;
     __atomic_load((int64_t*)(barray_data(arr) + index), &v, __ATOMIC_RELAXED);
     return v;
 }
 
-void __jnative_fn_java_lang_invoke_VarHandle_setOpaque___BIJ_V(void* arr, int32_t index, int64_t v) {
+void __jnative_fn_java_lang_invoke_VarHandle_setOpaque___BIJ_V(int8_t* arr, int32_t index, int64_t v) {
     barray_check(arr, index, 8);
     __atomic_store((int64_t*)(barray_data(arr) + index), &v, __ATOMIC_RELAXED);
 }
@@ -342,13 +342,13 @@ void __jnative_fn_java_lang_invoke_VarHandle_setOpaque___BIJ_V(void* arr, int32_
  */
 
 int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet___BIII_Z(
-        void* arr, int32_t index, int32_t expected, int32_t newValue) {
+        int8_t* arr, int32_t index, int32_t expected, int32_t newValue) {
     barray_check(arr, index, 4);
     return cas_int((int32_t*)(barray_data(arr) + index), expected, newValue);
 }
 
 int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet___BIJJ_Z(
-        void* arr, int32_t index, int64_t expected, int64_t newValue) {
+        int8_t* arr, int32_t index, int64_t expected, int64_t newValue) {
     barray_check(arr, index, 8);
     int64_t exp = expected;
     return __atomic_compare_exchange_n((int64_t*)(barray_data(arr) + index),
@@ -357,13 +357,13 @@ int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet___BIJJ_Z(
 }
 
 int32_t __jnative_fn_java_lang_invoke_VarHandle_weakCompareAndSet___BIII_Z(
-        void* arr, int32_t index, int32_t expected, int32_t newValue) {
+        int8_t* arr, int32_t index, int32_t expected, int32_t newValue) {
     return __jnative_fn_java_lang_invoke_VarHandle_compareAndSet___BIII_Z(
         arr, index, expected, newValue);
 }
 
 int32_t __jnative_fn_java_lang_invoke_VarHandle_weakCompareAndSet___BIJJ_Z(
-        void* arr, int32_t index, int64_t expected, int64_t newValue) {
+        int8_t* arr, int32_t index, int64_t expected, int64_t newValue) {
     return __jnative_fn_java_lang_invoke_VarHandle_compareAndSet___BIJJ_Z(
         arr, index, expected, newValue);
 }
@@ -375,13 +375,13 @@ int32_t __jnative_fn_java_lang_invoke_VarHandle_weakCompareAndSet___BIJJ_Z(
  */
 
 int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndExchange___BIII_I(
-        void* arr, int32_t index, int32_t expected, int32_t newValue) {
+        int8_t* arr, int32_t index, int32_t expected, int32_t newValue) {
     barray_check(arr, index, 4);
     return cax_int((int32_t*)(barray_data(arr) + index), expected, newValue);
 }
 
 int64_t __jnative_fn_java_lang_invoke_VarHandle_compareAndExchange___BIJJ_J(
-        void* arr, int32_t index, int64_t expected, int64_t newValue) {
+        int8_t* arr, int32_t index, int64_t expected, int64_t newValue) {
     barray_check(arr, index, 8);
     int64_t witness = expected;
     __atomic_compare_exchange_n((int64_t*)(barray_data(arr) + index),
@@ -397,7 +397,7 @@ int64_t __jnative_fn_java_lang_invoke_VarHandle_compareAndExchange___BIJJ_J(
  */
 
 int32_t __jnative_fn_java_lang_invoke_VarHandle_getAndSet___BII_I(
-        void* arr, int32_t index, int32_t newValue) {
+        int8_t* arr, int32_t index, int32_t newValue) {
     barray_check(arr, index, 4);
     int32_t old;
     __atomic_exchange((int32_t*)(barray_data(arr) + index), &newValue, &old,
@@ -406,7 +406,7 @@ int32_t __jnative_fn_java_lang_invoke_VarHandle_getAndSet___BII_I(
 }
 
 int64_t __jnative_fn_java_lang_invoke_VarHandle_getAndSet___BIJ_J(
-        void* arr, int32_t index, int64_t newValue) {
+        int8_t* arr, int32_t index, int64_t newValue) {
     barray_check(arr, index, 8);
     int64_t old;
     __atomic_exchange((int64_t*)(barray_data(arr) + index), &newValue, &old,
@@ -415,26 +415,26 @@ int64_t __jnative_fn_java_lang_invoke_VarHandle_getAndSet___BIJ_J(
 }
 
 int32_t __jnative_fn_java_lang_invoke_VarHandle_getAndAdd___BII_I(
-        void* arr, int32_t index, int32_t delta) {
+        int8_t* arr, int32_t index, int32_t delta) {
     barray_check(arr, index, 4);
     return __atomic_fetch_add((int32_t*)(barray_data(arr) + index), delta,
                               __ATOMIC_SEQ_CST);
 }
 
 int64_t __jnative_fn_java_lang_invoke_VarHandle_getAndAdd___BIJ_J(
-        void* arr, int32_t index, int64_t delta) {
+        int8_t* arr, int32_t index, int64_t delta) {
     barray_check(arr, index, 8);
     return __atomic_fetch_add((int64_t*)(barray_data(arr) + index), delta,
                               __ATOMIC_SEQ_CST);
 }
 
 int32_t __jnative_fn_java_lang_invoke_VarHandle_getAndAddInt___BII_I(
-        void* arr, int32_t index, int32_t delta) {
+        int8_t* arr, int32_t index, int32_t delta) {
     return __jnative_fn_java_lang_invoke_VarHandle_getAndAdd___BII_I(arr, index, delta);
 }
 
 int64_t __jnative_fn_java_lang_invoke_VarHandle_getAndAddLong___BIJ_J(
-        void* arr, int32_t index, int64_t delta) {
+        int8_t* arr, int32_t index, int64_t delta) {
     return __jnative_fn_java_lang_invoke_VarHandle_getAndAdd___BIJ_J(arr, index, delta);
 }
 
@@ -454,7 +454,7 @@ void __jnative_fn_java_lang_invoke_VarHandle_get___V_V(void **args) {
 
 int __jnative_fn_java_lang_invoke_VarHandle_get___V_I(void **args) {
     if (args == NULL || args[1] == NULL || args[2] == NULL) return 0;
-    void*  array = *(void**)args[1];
+    void*  array = args[1];
     int32_t index = *(int32_t*)args[2];
     return __jnative_fn_java_lang_invoke_VarHandle_get___BI_I(array, index);
 }
