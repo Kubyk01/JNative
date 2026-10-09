@@ -685,6 +685,32 @@ public class LlvmGenerator {
         String setJlaName       = "fn_java_lang_System_setJavaLangAccess___V";
         String characterDataLatin1ClinitName = "fn_java_lang_CharacterDataLatin1__clinit____V";
         String accessibleObjectClinitName = "fn_java_lang_reflect_AccessibleObject__clinit____V";
+        /*
+         * <clinit> function of java.lang.StackTraceElement$HashedModules.
+         *
+         * Its static initializer unconditionally calls
+         *
+         *     ModuleLayer.boot().configuration().findModule("java.base")
+         *
+         * and ModuleLayer.boot() reads System.bootLayer. The System.bootLayer
+         * field is assigned EXCLUSIVELY inside System.initPhase2()
+         * (through ModuleBootstrap.boot()) — see System.java:2217-2242.
+         *
+         * Therefore any invocation of this <clinit> BEFORE Stage 5 runs
+         * initPhase2 is guaranteed to NPE. That is exactly what happened:
+         * Stage 4 (the eager-<clinit> schedule) invoked it through the
+         * lazy-wrapper (fn___lazy_clinit_run_java_lang_StackTraceElement_HashedModules),
+         * bypassing the isHashedInJavaBase / VM.isModuleSystemInited()
+         * guard inside StackTraceElement, and crashed on the first
+         * .configuration() call.
+         *
+         * Fix: the class is excluded from Stage 4 and initialised
+         * explicitly in the new Stage 5b — right after initPhase2, once
+         * bootLayer has been assigned, but before the user entry point
+         * gains control.
+         */
+        String hashedModulesClinitName =
+            "fn_java_lang_StackTraceElement_HashedModules__clinit____V";
 
         Function systemClinit = module.getFunction(systemClinitName);
         if (systemClinit != null && systemClinit.getEntryBlock() != null) {
@@ -873,6 +899,7 @@ public class LlvmGenerator {
             if (name.equals(arraysClinitName))  continue;
             if (name.equals(characterDataLatin1ClinitName)) continue;
             if (name.equals(accessibleObjectClinitName))    continue;
+            if (name.equals(hashedModulesClinitName))       continue;
 
             emitDebugClinitCall(sb, name);
             sb.append("  call void @").append(eagerTarget(name)).append("()\n");
@@ -905,6 +932,60 @@ public class LlvmGenerator {
         Function initPhase3 = module.getFunction("fn_java_lang_System_initPhase3___V");
         if (initPhase3 != null && initPhase3.getEntryBlock() != null) {
             sb.append("  call void @fn_java_lang_System_initPhase3___V()\n");
+        }
+
+        // ------------------------------------------------------------------
+        // Stage 5b: post-bootstrap <clinit> schedule.
+        //
+        // Classes whose static initializer depends on state that only
+        // exists once the module system is fully up. The only member at
+        // present is java.lang.StackTraceElement$HashedModules:
+        //
+        //     static Set<String> HASHED_MODULES = hashedModules();
+        //     static Set<String> hashedModules() {
+        //         Optional<ResolvedModule> rm =
+        //             ModuleLayer.boot()            // <-- System.bootLayer
+        //                 .configuration()
+        //                 .findModule("java.base");
+        //         ...
+        //     }
+        //
+        // System.bootLayer is assigned EXCLUSIVELY inside initPhase2()
+        // (through ModuleBootstrap.boot()), so this <clinit> must run
+        // after Stage 5. It used to fall into the Stage 4 eager loop and
+        // crashed with NPE on ModuleLayer.boot() == null — see the
+        // detailed comment on hashedModulesClinitName above.
+        //
+        // The position within Stage 5b is deliberately AFTER initPhase3:
+        // initPhase3 (SystemImpl.initPhase3) installs the final hooks and
+        // activates the security managers; by the time it returns, the
+        // module layer is guaranteed to be fully functional, and any
+        // future class with the same dependency can be added to this same
+        // list without risking a race with the bootstrap phases.
+        //
+        // The call goes through eagerTarget(), not the raw name: the
+        // class is marked lazy (it has the wrapper
+        // fn___lazy_clinit_run_java_lang_StackTraceElement_HashedModules),
+        // and the wrapper owns the __jnative_clinit_enter /
+        // __jnative_clinit_exit state machine. Calling the body directly
+        // would bypass the state machine and leave the clinit_table in
+        // the "not started" state, which would cause a re-initialisation
+        // on a later lazy access from Java code.
+        // ------------------------------------------------------------------
+        {
+            Function hashedModulesClinit = module.getFunction(hashedModulesClinitName);
+            if (hashedModulesClinit != null && hashedModulesClinit.getEntryBlock() != null) {
+                emitDebugClinitCall(sb, hashedModulesClinitName);
+                sb.append("  call void @")
+                  .append(eagerTarget(hashedModulesClinitName))
+                  .append("()\n");
+            } else {
+                log.warn("java.lang.StackTraceElement$HashedModules.<clinit> "
+                    + "is missing from the module; the class will be initialised "
+                    + "lazily on the first real access through StackTraceElement. "
+                    + "If that access happens before System.initPhase2 has run, "
+                    + "the runtime will still NPE on ModuleLayer.boot().");
+            }
         }
 
         // ------------------------------------------------------------------

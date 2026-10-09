@@ -2980,9 +2980,6 @@ public class LlvmGlobalEmitter {
                         objectSize += size;
                     }
                     objectSize = (objectSize + 7) & ~7;
-                    log.warn("computeObjectSize returned {} for class {}; "
-                        + "falling back to inline alignment-aware size {}",
-                        computed, className, objectSize);
                 }
             }
 
