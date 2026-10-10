@@ -6,6 +6,7 @@ import io.github.kubyk01.domain.inspector.InspectionResult;
 import io.github.kubyk01.domain.inspector.MethodInfo;
 import io.github.kubyk01.port.primary.InspectorPort;
 import io.github.kubyk01.port.primary.OrchestratorPort;
+import io.github.kubyk01.util.LlvmUtil;
 import lombok.AllArgsConstructor;
 import picocli.CommandLine;
 import picocli.CommandLine.Command;
@@ -49,7 +50,7 @@ public class CLI implements Runnable {
             return;
         }
 
-        InspectionResult result = resultMono.block();
+        InspectionResult result = LlvmUtil.awaitMono(resultMono);
         if (result == null) {
             System.err.println("No result received.");
             return;

@@ -926,6 +926,11 @@ public class LlvmGenerator {
             if (bootstrapPrereqNames.contains(name)) continue;
             if (name.equals(hashedModulesClinitName)) continue;
 
+            // Deferred clinits are NOT in clinitSchedule: Analyzer.sortInitializers
+            // removes them before emitting the schedule so that Stage 4 cannot
+            // call them eagerly. They run on demand through their lazy wrapper
+            // at the first active-use site. See Analyzer.computeDeferredClinits
+            // for the full rationale.
             emitDebugClinitCall(sb, name);
 
             if (entry.bootstrapPhase()) {

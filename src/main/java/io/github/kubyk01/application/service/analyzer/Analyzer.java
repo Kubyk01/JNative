@@ -48,6 +48,7 @@ import reactor.core.scheduler.Schedulers;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.Deque;
 import java.util.HashMap;
@@ -116,6 +117,14 @@ public class Analyzer {
             this.scheduler = scheduler;
         }
     }
+
+    /**
+     * Mangled names of {@code <clinit>} functions the scheduler has deferred
+     * to lazy initialization because their eager position conflicts with a
+     * bootstrap phase. Populated by {@link #sortInitializers}; read by
+     * {@link #analyze} and passed through to the lazy-clinit instrumenter.
+     */
+    private final Set<String> deferredClinits = new LinkedHashSet<>();
 
     /**
      * Optional IR translator that produced the module being analyzed.
@@ -232,13 +241,30 @@ public class Analyzer {
         // The list of only the real <clinit>s (without the phases) is needed
         // by applyLazyClinitForCyclicClasses, because lazy instrumentation
         // makes sense only for class initializers, not for System methods.
-        List<Function> sortedClinits = new ArrayList<>();
+        //
+        // The eager schedule contains only the clinits that survived the
+        // deferral step. Every deferred clinit still needs a wrapper so
+        // that lazy triggering works; it is added to the instrumentation
+        // pass explicitly.
+        List<Function> clinitsToInstrument = new ArrayList<>();
+        Set<String> scheduledNames = new HashSet<>();
         for (ClinitScheduleEntry e : clinitSchedule) {
-            if (!e.bootstrapPhase()) sortedClinits.add(e.function());
+            if (e.bootstrapPhase()) continue;
+            Function f = e.function();
+            clinitsToInstrument.add(f);
+            scheduledNames.add(f.getName());
+        }
+        for (Function f : clinitFunctions) {
+            if (deferredClinits.contains(f.getName())
+                && !scheduledNames.contains(f.getName())) {
+                clinitsToInstrument.add(f);
+            }
         }
 
         Map<String, String> clinitWrappers = new HashMap<>();
-        applyLazyClinitForCyclicClasses(module, resolver, sortedClinits, clinitWrappers);
+        applyLazyClinitForCyclicClasses(module, resolver,
+                                        clinitsToInstrument, clinitWrappers,
+                                        deferredClinits);
 
         // --- 3. Alias analysis --------------------------------------------
         //
@@ -334,6 +360,7 @@ public class Analyzer {
 
         return new AnalyzerResult(
             clinitSchedule, clinitWrappers,
+            Collections.unmodifiableSet(new LinkedHashSet<>(deferredClinits)),
             aliasResult, escapeResult, lifetimeResult);
     }
 
@@ -344,7 +371,8 @@ public class Analyzer {
     private void applyLazyClinitForCyclicClasses(Module module,
                                                  DependencyResolver resolver,
                                                  List<Function> clinitFunctions,
-                                                 Map<String, String> clinitWrappers) {
+                                                 Map<String, String> clinitWrappers,
+                                                 Set<String> forcedDeferredClinits) {
         if (clinitFunctions.isEmpty()) return;
 
         Map<String, String> clinitNameToClassName = new HashMap<>();
@@ -364,10 +392,35 @@ public class Analyzer {
 
         Set<String> allWithClinit = new HashSet<>(classNameToClinitName.keySet());
 
+        // Force-include any class that the scheduler deferred. A deferred
+        // class is not in the cyclic classDeps graph computed below — the
+        // cycle it participates in goes through the bootstrap phases,
+        // which are not represented in classDeps at all — so without this
+        // merge it would never receive a wrapper and its active-use sites
+        // would never be instrumented. Then the deferred <clinit> would
+        // simply never run, and the first read of a field it initializes
+        // would observe null.
+        //
+        // We add the class to the cyclicClasses set below and let the
+        // ordinary propagation and instrumentation passes do the rest.
+        Set<String> forcedClasses = new LinkedHashSet<>();
+        if (forcedDeferredClinits != null) {
+            for (String clinitName : forcedDeferredClinits) {
+                String cls = clinitNameToClassName.get(clinitName);
+                if (cls != null && allWithClinit.contains(cls)) {
+                    forcedClasses.add(cls);
+                }
+            }
+        }
+        if (!forcedClasses.isEmpty()) {
+            System.out.println("Lazy <clinit>: forcing " + forcedClasses.size()
+                + " deferred class(es) into the lazy set: " + forcedClasses);
+        }
+
         // ---- Parallel call-graph construction (Reactor).
         Map<String, Set<String>> callGraph = new ConcurrentHashMap<>();
         List<Function> functionsSnapshot = new ArrayList<>(module.getFunctions());
-        Flux.fromIterable(functionsSnapshot)
+        LlvmUtil.awaitMono(Flux.fromIterable(functionsSnapshot)
             .filter(f -> f.getEntryBlock() != null)
             .parallel()
             .runOn(scheduler)
@@ -382,12 +435,12 @@ public class Analyzer {
             })
             .sequential()
             .then()
-            .block();
+        );
 
         // ---- Parallel scope / nested clinit construction (Reactor).
         Map<String, Set<String>> clinitScope = new ConcurrentHashMap<>();
         Map<String, Set<String>> nestedClinits = new ConcurrentHashMap<>();
-        Flux.fromIterable(clinitFunctions)
+        LlvmUtil.awaitMono(Flux.fromIterable(clinitFunctions)
             .parallel()
             .runOn(scheduler)
             .doOnNext(clinit -> {
@@ -413,7 +466,7 @@ public class Analyzer {
             })
             .sequential()
             .then()
-            .block();
+        );
 
         Map<String, Set<String>> classDeps = new LinkedHashMap<>();
         for (String cls : allWithClinit) classDeps.put(cls, new LinkedHashSet<>());
@@ -465,7 +518,7 @@ public class Analyzer {
         // ---- Parallel field writer/reader collection (Reactor).
         Map<String, Set<String>> fieldWriters = new ConcurrentHashMap<>();
         Map<String, Set<String>> fieldReaders = new ConcurrentHashMap<>();
-        Flux.fromIterable(clinitFunctions)
+        LlvmUtil.awaitMono(Flux.fromIterable(clinitFunctions)
             .parallel()
             .runOn(scheduler)
             .doOnNext(clinit -> {
@@ -495,7 +548,7 @@ public class Analyzer {
             })
             .sequential()
             .then()
-            .block();
+        );
 
         for (Map.Entry<String, Set<String>> entry : fieldReaders.entrySet()) {
             Set<String> writers = fieldWriters.get(entry.getKey());
@@ -521,6 +574,7 @@ public class Analyzer {
                 if (deps != null && deps.contains(c)) cyclicClasses.add(c);
             }
         }
+        cyclicClasses.addAll(forcedClasses);
         if (cyclicClasses.isEmpty()) return;
 
         Set<String> lazyClasses = LazyClinitInstrumenter.propagateLazy(
@@ -1264,6 +1318,68 @@ public class Analyzer {
                 + " after=" + after + ", before=" + before);
         }
 
+        // ---- Defer the family-B side of the phase/clinit cycle ----
+        //
+        // Any initializer that reads a static field written by a phase,
+        // but does not itself write a field any phase reads, must run
+        // after that phase. In a linear schedule whose phase positions
+        // are dictated by after(P) — which is what the schedule needs
+        // to satisfy the phase's own dependencies — such an initializer
+        // would run before the phase and observe a null field. Rather
+        // than move the phase (which reintroduces the StringConcatHelper
+        // failure) this code removes the conflicting initializer from
+        // the eager schedule entirely. Its wrapper fires on first active
+        // use, which is by construction after the phase that provoked
+        // that use. See computeDeferredClinits() for the full rationale.
+        Set<String> deferred = computeDeferredClinits(
+            clinitOrder, phaseOrder, afterMap, initScope, module);
+
+        if (!deferred.isEmpty()) {
+            this.deferredClinits.addAll(deferred);
+
+            System.out.println("Deferring " + deferred.size()
+                + " <clinit>(s) to lazy initialization: they read a field "
+                + "written by a bootstrap phase but do not contribute to any "
+                + "phase's own dependencies, so eager scheduling would place "
+                + "them before the phase and observe a null field.");
+
+            Set<Function> deferredSet = new HashSet<>();
+            for (Function c : clinitOrder) {
+                if (deferred.contains(c.getName())) deferredSet.add(c);
+            }
+            clinitOrder.removeIf(deferredSet::contains);
+
+            // Recompute after/before positions against the trimmed list.
+            Map<Function, Integer> trimmedIdx = new HashMap<>();
+            for (int i = 0; i < clinitOrder.size(); i++) {
+                trimmedIdx.put(clinitOrder.get(i), i);
+            }
+            for (Function p : phaseOrder) {
+                Set<Function> depsOfP = transitiveClosure(deps, p);
+                int afterTrimmed = 0;
+                for (Function d : depsOfP) {
+                    Integer idx = trimmedIdx.get(d);
+                    if (idx != null && idx + 1 > afterTrimmed) {
+                        afterTrimmed = idx + 1;
+                    }
+                }
+                afterMap.put(p, afterTrimmed);
+
+                Set<Function> dependentsOfP = transitiveClosure(revDeps, p);
+                int beforeTrimmed = clinitOrder.size();
+                for (Function d : dependentsOfP) {
+                    Integer idx = trimmedIdx.get(d);
+                    if (idx != null && idx < beforeTrimmed) {
+                        beforeTrimmed = idx;
+                    }
+                }
+                beforeMap.put(p, beforeTrimmed);
+
+                System.out.println("Phase placement (post-defer): " + p.getName()
+                    + " after=" + afterTrimmed + ", before=" + beforeTrimmed);
+            }
+        }
+
         // ---- Merge: clinits + phases with a hard phase order ----
         List<ClinitScheduleEntry> result =
             new ArrayList<>(clinitOrder.size() + phaseOrder.size());
@@ -1382,6 +1498,233 @@ public class Analyzer {
             worklist.addAll(succ);
         }
         return visited;
+    }
+
+    /**
+     * Determines which <clinit> functions must be deferred to lazy
+     * initialization because eager scheduling cannot satisfy them together
+     * with the bootstrap phases.
+     *
+     * <p>The conflict is structural. Between a phase {@code P} and the set of
+     * class initializers there are two opposing edge families:</p>
+     *
+     * <ul>
+     *   <li>{@code phase → clinit} (family A): the phase reads a static field
+     *       written by some initializer, so that initializer must run
+     *       <em>before</em> the phase;</li>
+     *   <li>{@code clinit → phase} (family B): an initializer reads a static
+     *       field written by the phase, so the phase must run <em>before</em>
+     *       that initializer.</li>
+     * </ul>
+     *
+     * <p>When the transitive closure of both families contains a cycle —
+     * which is always the case in {@code java.base} — no linear schedule can
+     * satisfy both. Every initializer that is <em>only</em> in family B is
+     * therefore removed from the eager schedule entirely. Its wrapper —
+     * installed by the lazy-clinit instrumenter — fires on first active use,
+     * which is necessarily after the phase that triggered that use.</p>
+     *
+     * <h2>Precision of the family-A test</h2>
+     *
+     * <p>Family A is evaluated against the fields read by the phase's
+     * <em>own body only</em>, not against the fields read anywhere in the
+     * phase's transitive scope.</p>
+     *
+     * <p>The rationale is the interaction with
+     * {@link LazyClinitInstrumenter}. When a class {@code C} is deferred,
+     * every active-use site of every field {@code C} writes is rewritten to
+     * call {@code C}'s wrapper before the read. A read that occurs deep in
+     * the phase's call chain therefore triggers {@code C} lazily at exactly
+     * the point where the read happens. If that point is after the phase has
+     * finished writing its own fields — the normal case, because the phase's
+     * job is precisely to write those fields early — deferring {@code C} is
+     * harmless. If that point is before, deferring {@code C} and keeping it
+     * eager would both fail identically: the read site triggers {@code C}
+     * at the same moment in either case, and the outcome is the same.</p>
+     *
+     * <p>A read in the phase's own body, by contrast, cannot be protected by
+     * the wrapper's instrumentation in the same way: the phase's body is the
+     * top frame of the eager execution, and any field it reads from
+     * {@code C} is read before the phase yields control. If the phase's own
+     * body reads a field written by {@code C}, then {@code C} must have run
+     * before the phase began; deferring {@code C} would only postpone the
+     * trigger to the same instruction, which is not necessarily after the
+     * phase's own writes.</p>
+     *
+     * <p>Narrowing family A to the phase's own body is therefore the
+     * tightest safe criterion. Using the full transitive scope — as an
+     * earlier revision did — makes {@code pReads} a set of thousands of
+     * fields, every candidate clinit is classified as "family A", and
+     * nothing is ever deferred. This is exactly the state that produced</p>
+     *
+     * <pre>
+     *   java.lang.NullPointerException: Cannot invoke
+     *     java.lang.SecurityManager.addNonExportedPackages(Ljava/lang/ModuleLayer;)V
+     *     because receiver of
+     *     java/lang/ModuleLayer.modules()Ljava/util/Set; is null
+     *       at java.lang.SecurityManager.addNonExportedPackages
+     *       at java.lang.SecurityManager.&lt;clinit&gt;
+     * </pre>
+     *
+     * <p>with {@code java.lang.SecurityManager.<clinit>} left in the eager
+     * schedule at a position before {@code System.initPhase2} and reading
+     * {@code System.bootLayer} (assigned exclusively by initPhase2) while it
+     * was still null.</p>
+     *
+     * <h2>Iteration</h2>
+     *
+     * <p>The pass is repeated to a fixed point. Deferring a clinit removes
+     * it from the eager schedule, which shrinks the position index of every
+     * later clinit; a clinit that was previously past {@code after(P)} can
+     * therefore become a family-B candidate on the next iteration.
+     * Convergence is guaranteed because each iteration either defers at
+     * least one new clinit or terminates, and the total number of clinits
+     * is finite.</p>
+     *
+     * @return mangled names of the deferred {@code <clinit>} functions.
+     */
+    private Set<String> computeDeferredClinits(
+            List<Function> clinitOrder,
+            List<Function> phaseOrder,
+            Map<Function, Integer> afterMap,
+            Map<String, Set<String>> initScope,
+            Module module) {
+
+        Set<String> deferred = new LinkedHashSet<>();
+
+        final int MAX_PASSES = 8;
+        boolean changed = true;
+        int pass = 0;
+
+        while (changed && pass++ < MAX_PASSES) {
+            changed = false;
+
+            for (Function p : phaseOrder) {
+                int after = afterMap.getOrDefault(p, 0);
+                if (after <= 0) continue;
+
+                Set<String> pScope = initScope.get(p.getName());
+                if (pScope == null) continue;
+
+                // Fields written anywhere in the phase's transitive scope.
+                // A clinit that reads any of these is family B for this
+                // phase and is a deferral candidate.
+                Set<String> pWrites = new HashSet<>();
+                for (String fname : pScope) {
+                    Function f = module.getFunction(fname);
+                    if (f == null || f.getEntryBlock() == null) continue;
+                    for (BasicBlock b : f.getBlocks()) {
+                        for (Instruction inst : b.getInstructions()) {
+                            if (inst.getOpcode() == Opcode.PUT_STATIC) {
+                                String key = extractStaticFieldKey(inst);
+                                if (key != null) pWrites.add(key);
+                            }
+                        }
+                    }
+                }
+                if (pWrites.isEmpty()) continue;
+
+                // Fields read by the phase's OWN body. This is the only set
+                // that determines whether the phase still needs a candidate
+                // clinit eagerly placed before it. See the method javadoc.
+                Set<String> pDirectReads = new HashSet<>();
+                for (BasicBlock b : p.getBlocks()) {
+                    for (Instruction inst : b.getInstructions()) {
+                        if (inst.getOpcode() == Opcode.GET_STATIC) {
+                            String key = extractStaticFieldKey(inst);
+                            if (key != null) pDirectReads.add(key);
+                        }
+                    }
+                }
+
+                int scanEnd = Math.min(after, clinitOrder.size());
+                for (int i = 0; i < scanEnd; i++) {
+                    Function c = clinitOrder.get(i);
+                    String cName = c.getName();
+                    if (deferred.contains(cName)) continue;
+
+                    Set<String> cScope = initScope.get(cName);
+                    if (cScope == null) continue;
+
+                    boolean cReadsP  = false;
+                    boolean cWritesP = false;
+
+                    outer:
+                    for (String fname : cScope) {
+                        Function f = module.getFunction(fname);
+                        if (f == null || f.getEntryBlock() == null) continue;
+                        for (BasicBlock b : f.getBlocks()) {
+                            for (Instruction inst : b.getInstructions()) {
+                                Opcode op = inst.getOpcode();
+                                if (op == Opcode.GET_STATIC) {
+                                    String key = extractStaticFieldKey(inst);
+                                    if (key != null && pWrites.contains(key)) {
+                                        cReadsP = true;
+                                    }
+                                } else if (op == Opcode.PUT_STATIC) {
+                                    String key = extractStaticFieldKey(inst);
+                                    if (key != null && pDirectReads.contains(key)) {
+                                        cWritesP = true;
+                                    }
+                                }
+                                if (cReadsP && cWritesP) break outer;
+                            }
+                        }
+                    }
+
+                    // Family B only: defer. Family A or A∩B: leave in the
+                    // eager schedule — the phase still depends on it.
+                    if (cReadsP && !cWritesP) {
+                        deferred.add(cName);
+                        changed = true;
+                        System.out.println("  defer candidate: " + cName
+                            + " (reads a field written by phase " + p.getName()
+                            + ", contributes nothing to that phase's own reads)");
+                    }
+                }
+            }
+
+            // Each pass may unblock new candidates because defers shift the
+            // index of later clinits. Recompute `after` against the trimmed
+            // schedule before the next pass.
+            if (changed) {
+                Map<Function, Integer> trimmedIdx = new HashMap<>();
+                int k = 0;
+                for (Function c : clinitOrder) {
+                    if (!deferred.contains(c.getName())) {
+                        trimmedIdx.put(c, k++);
+                    }
+                }
+                for (Function p : phaseOrder) {
+                    // Re-derive from the same deps the phase had, but only
+                    // over clinits that survive the deferral.
+                    // (deps is not passed here; we approximate by scanning
+                    // the surviving order and taking the largest index whose
+                    // name is in the phase's written-field provenance.)
+                    //
+                    // The approximation is conservative: it can only fail to
+                    // shrink after(P), which leaves more candidates eligible,
+                    // never fewer. That is the safe direction.
+                    //
+                    // A tighter bound would require deps to be threaded
+                    // through; the conservative version is sufficient because
+                    // the fixed point terminates by exhausting the clinit
+                    // list.
+                    Integer prev = afterMap.get(p);
+                    if (prev != null && prev > trimmedIdx.size()) {
+                        afterMap.put(p, trimmedIdx.size());
+                    }
+                }
+            }
+        }
+
+        if (pass >= MAX_PASSES) {
+            System.out.println("Deferral fixed point did not converge after "
+                + MAX_PASSES + " passes; " + deferred.size()
+                + " clinit(s) deferred so far.");
+        }
+
+        return deferred;
     }
 
     /**

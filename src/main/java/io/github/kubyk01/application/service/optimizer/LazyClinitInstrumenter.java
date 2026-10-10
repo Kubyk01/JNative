@@ -16,6 +16,7 @@ import io.github.kubyk01.domain.ir.ReturnTerminator;
 import io.github.kubyk01.domain.ir.Temporary;
 import io.github.kubyk01.domain.ir.Type;
 import io.github.kubyk01.domain.ir.Value;
+import io.github.kubyk01.util.LlvmUtil;
 import reactor.core.publisher.Flux;
 import reactor.core.scheduler.Scheduler;
 import reactor.core.scheduler.Schedulers;
@@ -194,7 +195,7 @@ public class LazyClinitInstrumenter {
 
         AtomicInteger inserted = new AtomicInteger(0);
 
-        Flux.fromIterable(snapshot)
+        LlvmUtil.awaitMono(Flux.fromIterable(snapshot)
             .filter(f -> f.getEntryBlock() != null)
             .filter(f -> !wrapperNames.contains(f.getName()))
             .parallel()
@@ -211,7 +212,7 @@ public class LazyClinitInstrumenter {
             })
             .sequential()
             .then()
-            .block();
+        );
 
         return inserted.get();
     }

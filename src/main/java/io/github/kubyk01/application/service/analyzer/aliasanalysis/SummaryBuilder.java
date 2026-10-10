@@ -28,6 +28,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
+import static io.github.kubyk01.util.LlvmUtil.awaitFlux;
 import static io.github.kubyk01.util.LlvmUtil.extractCalleeName;
 import static io.github.kubyk01.util.LlvmUtil.extractFieldName;
 import static io.github.kubyk01.util.LlvmUtil.getCallArguments;
@@ -176,13 +177,13 @@ public class SummaryBuilder {
             // Parallel analysis of the batch against the current snapshot
             // of callee summaries. The .block() barrier guarantees that no
             // worker observes a partially committed state.
-            List<FunctionSummary> fresh = Flux.fromIterable(batch)
-                .parallel()
-                .runOn(scheduler)
-                .map(this::analyzeFunction)
-                .sequential()
-                .collectList()
-                .block();
+            List<FunctionSummary> fresh = awaitFlux(
+                Flux.fromIterable(batch)
+                    .parallel()
+                    .runOn(scheduler)
+                    .map(this::analyzeFunction)
+                    .sequential()
+            );
 
             if (fresh == null || fresh.size() != batch.size()) {
                 throw new IllegalStateException(

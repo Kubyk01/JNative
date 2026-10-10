@@ -8,11 +8,54 @@ import io.github.kubyk01.domain.ir.Opcode;
 import io.github.kubyk01.domain.ir.Parameter;
 import io.github.kubyk01.domain.ir.Type;
 import io.github.kubyk01.domain.ir.Value;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicReference;
 
 public class LlvmUtil {
+
+    public static <T> T awaitMono(Mono<T> mono) {
+        CountDownLatch latch = new CountDownLatch(1);
+        AtomicReference<T> value = new AtomicReference<>();
+        AtomicReference<Throwable> error = new AtomicReference<>();
+
+        mono.subscribe(value::set, error::set, latch::countDown);
+
+        try {
+            latch.await();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException("interrupted while awaiting Mono", e);
+        }
+        if (error.get() != null) {
+            throw new RuntimeException("reactive pipeline failed", error.get());
+        }
+        return value.get();
+    }
+
+    public static <T> List<T> awaitFlux(Flux<T> flux) {
+        CountDownLatch latch = new CountDownLatch(1);
+        List<T> collected = Collections.synchronizedList(new ArrayList<>());
+        AtomicReference<Throwable> error = new AtomicReference<>();
+
+        flux.subscribe(collected::add, error::set, latch::countDown);
+
+        try {
+            latch.await();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException("interrupted while awaiting Flux", e);
+        }
+        if (error.get() != null) {
+            throw new RuntimeException("reactive pipeline failed", error.get());
+        }
+        return collected;
+    }
 
     public static Type inferLocalType(Function func, int idx) {
         for (Parameter p : func.getParameters()) {
