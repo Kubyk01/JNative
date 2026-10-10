@@ -3,6 +3,7 @@ package io.github.kubyk01.application.service.codegen.llvm;
 import io.github.kubyk01.application.service.analyzer.dependencyresolver.DependencyResolver;
 import io.github.kubyk01.application.service.analyzer.ssa.TypeResolver;
 import io.github.kubyk01.application.service.codegen.llvm.nativepolymorphicfunctionresolver.PolymorphicResolver;
+import io.github.kubyk01.domain.analyzer.ClinitScheduleEntry;
 import io.github.kubyk01.domain.analyzer.aliasanalysis.AliasAnalysisResult;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.ClassNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.FieldNode;
@@ -33,6 +34,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -64,9 +66,8 @@ public class LlvmGenerator {
      */
     private final PolymorphicResolver polymorphicResolverRef;
 
-    private List<Function> clinitFunctions = new ArrayList<>();
+    private List<ClinitScheduleEntry> clinitSchedule = new ArrayList<>();
     private Map<String, String> clinitWrappers = new HashMap<>();
-    private List<String> bootstrapPhaseFunctions = new ArrayList<>();
 
     /**
      * Maximum number of CPU cores the generator may use for the parallel
@@ -93,8 +94,8 @@ public class LlvmGenerator {
      */
     private List<Map.Entry<String, byte[]>> embeddedResources = new ArrayList<>();
 
-    public void setClinitFunctions(List<Function> functions) {
-        this.clinitFunctions = functions != null ? functions : new ArrayList<>();
+    public void setClinitSchedule(List<ClinitScheduleEntry> schedule) {
+        this.clinitSchedule = (schedule != null) ? schedule : new ArrayList<>();
     }
 
     public void setEmbeddedResources(List<Map.Entry<String, byte[]>> resources) {
@@ -103,10 +104,6 @@ public class LlvmGenerator {
 
     public void setClinitWrappers(Map<String, String> wrappers) {
         this.clinitWrappers = wrappers != null ? wrappers : new HashMap<>();
-    }
-
-    public void setBootstrapPhaseFunctions(List<String> funcs) {
-        this.bootstrapPhaseFunctions = (funcs != null) ? funcs : new ArrayList<>();
     }
 
     /**
@@ -884,86 +881,83 @@ public class LlvmGenerator {
         }
 
         // ------------------------------------------------------------------
-        // Stage 4: eager <clinit> schedule.
+        // Stage 4: unified initialization schedule.
         //
-        // Every reachable class initializer that was not part of the
-        // bootstrap prerequisites above. By the time this loop runs,
-        // VM.savedProps is populated and System.props holds the bootstrap
-        // property table, so any <clinit> that consults either of them
-        // observes a well-defined value.
+        // clinitSchedule is the result of Analyzer.sortInitializers(), in
+        // which the <clinit> functions and the bootstrap phases
+        // System.initPhase1/2/3 are interleaved by a topological sort over
+        // the dependency graph. Every phase stands exactly where its
+        // dependencies require it: initPhase2, for example, stands before
+        // SecurityManager.<clinit>, ModuleLayer.<clinit> and any other
+        // <clinit> that (transitively) reads System.bootLayer, because the
+        // field-provenance analysis built the corresponding edge.
+        //
+        // Bootstrap prerequisites (String.<clinit>, System.<clinit>,
+        // UnsafeConstants.<clinit>, Unsafe.<clinit>, Properties.<clinit>,
+        // ConcurrentHashMap.<clinit>, ArraysSupport.<clinit>,
+        // CharacterDataLatin1.<clinit>, AccessibleObject.<clinit>) have
+        // already run above and must be skipped.
+        //
+        // HashedModules.<clinit> (StackTraceElement$HashedModules) is
+        // skipped here and executed as a separate Stage 5b: its <clinit>
+        // reads System.bootLayer and must run after initPhase3, not right
+        // after initPhase2. Field provenance yields only the nearest
+        // dependency; the explicit exclusion preserves the "phases fully
+        // done" semantics.
         // ------------------------------------------------------------------
-        for (Function clinit : clinitFunctions) {
-            if (clinit.getEntryBlock() == null) continue;
-            String name = clinit.getName();
-            if (name.equals(stringClinitName))  continue;
-            if (name.equals(systemClinitName))  continue;
-            if (name.equals(unsafeClinitName))  continue;
-            if (name.equals(unsafeConstantsClinitName)) continue;
-            if (name.equals(chmClinitName))     continue;
-            if (name.equals(propsClinitName))   continue;
-            if (name.equals(arraysClinitName))  continue;
-            if (name.equals(characterDataLatin1ClinitName)) continue;
-            if (name.equals(accessibleObjectClinitName))    continue;
-            if (name.equals(hashedModulesClinitName))       continue;
+
+        Set<String> bootstrapPrereqNames = Set.of(
+            stringClinitName,
+            systemClinitName,
+            unsafeClinitName,
+            unsafeConstantsClinitName,
+            chmClinitName,
+            propsClinitName,
+            arraysClinitName,
+            characterDataLatin1ClinitName,
+            accessibleObjectClinitName
+        );
+
+        int bootstrapPhaseIdx = 0;
+        for (ClinitScheduleEntry entry : clinitSchedule) {
+            Function f = entry.function();
+            String name = f.getName();
+
+            if (bootstrapPrereqNames.contains(name)) continue;
+            if (name.equals(hashedModulesClinitName)) continue;
 
             emitDebugClinitCall(sb, name);
-            sb.append("  call void @").append(eagerTarget(name)).append("()\n");
-        }
 
-        // ------------------------------------------------------------------
-        // Stage 5: JVM bootstrap phases (dynamic).
-        //
-        // The phase list is assembled by
-        // Analyzer.collectBootstrapPhaseFunctions(), which scans the static
-        // methods of java.lang.System by the "initPhase" prefix. No method
-        // name is hard-coded here.
-        //
-        // Why this position:
-        //
-        //   * by the time any phase starts, the whole eager <clinit>
-        //     schedule has already run, so SystemProps.cmdProperties() and
-        //     Raw.platformProperties() return fully constructed objects,
-        //   * the IR-callee closure (see BytecodeToIr.closeOverIrCallees)
-        //     guarantees that the bodies of HashMap.putVal / newNode /
-        //     HashMap$Node.<init> are present in the module, otherwise
-        //     copying cmdProps into the new HashMap inside initProperties
-        //     silently loses the "java.home" entry,
-        //   * initPhase1 installs System.out / System.err / System.in, and
-        //     any <clinit> that could have printed diagnostics earlier has
-        //     already completed.
-        //
-        // Arguments are zero; the return value (i32 for initPhase2) is
-        // discarded.
-        // ------------------------------------------------------------------
-        int bootstrapPhaseIdx = 0;
-        for (String phaseName : bootstrapPhaseFunctions) {
-            Function phase = module.getFunction(phaseName);
-            if (phase == null || phase.getEntryBlock() == null) {
-                log.warn("bootstrap phase {} not present in the module; skipping",
-                    phaseName);
-                continue;
-            }
-            String target = eagerTarget(phaseName);
-            Type retType = phase.getReturnType();
-            String retLlvm = LlvmTypeMapper.toLlvmType(retType);
+            if (entry.bootstrapPhase()) {
+                // Bootstrap phase: call it with zero arguments and discard
+                // the result. The arguments are taken from the phase's real
+                // signature, so initPhase2(ZZ)I and initPhase1()V are
+                // handled correctly and without hard-coding.
+                Type retType = f.getReturnType();
+                String retLlvm = LlvmTypeMapper.toLlvmType(retType);
 
-            StringBuilder args = new StringBuilder();
-            List<Parameter> params = phase.getParameters();
-            for (int i = 0; i < params.size(); i++) {
-                if (i > 0) args.append(", ");
-                Type pt = params.get(i).getType();
-                args.append(LlvmTypeMapper.toLlvmType(pt))
-                    .append(" ").append(zeroLiteralForType(pt));
-            }
+                StringBuilder args = new StringBuilder();
+                List<Parameter> params = f.getParameters();
+                for (int i = 0; i < params.size(); i++) {
+                    if (i > 0) args.append(", ");
+                    Type pt = params.get(i).getType();
+                    args.append(LlvmTypeMapper.toLlvmType(pt))
+                        .append(" ").append(zeroLiteralForType(pt));
+                }
 
-            if (retType.isVoid()) {
-                sb.append("  call void @").append(target)
-                  .append("(").append(args).append(")\n");
+                if (retType.isVoid()) {
+                    sb.append("  call void @").append(name)
+                      .append("(").append(args).append(")\n");
+                } else {
+                    sb.append("  %bootstrap_phase_result_").append(bootstrapPhaseIdx++)
+                      .append(" = call ").append(retLlvm)
+                      .append(" @").append(name)
+                      .append("(").append(args).append(")\n");
+                }
             } else {
-                sb.append("  %bootstrap_phase_result_").append(bootstrapPhaseIdx++)
-                  .append(" = call ").append(retLlvm)
-                  .append(" @").append(target)
-                  .append("(").append(args).append(")\n");
+                // Ordinary <clinit>; eagerTarget substitutes the lazy wrapper
+                // when the class was marked cyclic.
+                sb.append("  call void @").append(eagerTarget(name)).append("()\n");
             }
         }
 

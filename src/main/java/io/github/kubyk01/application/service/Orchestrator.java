@@ -380,9 +380,8 @@ public class Orchestrator implements OrchestratorPort {
         LlvmGenerator llvmGen = new LlvmGenerator(module, resolver, aliasResult,
                 entryClass, entryMethod, entryDescriptor, analysis.getReflectInfo(),
                 polymorphicResolver);
-        llvmGen.setClinitFunctions(analysisResult.clinitFunctions());
+        llvmGen.setClinitSchedule(analysisResult.clinitSchedule());
         llvmGen.setClinitWrappers(analysisResult.clinitWrappers());
-        llvmGen.setBootstrapPhaseFunctions(analysisResult.bootstrapPhaseFunctions());
         llvmGen.setEmbeddedResources(embedded);
         llvmGen.setCores(effectiveCores);
 

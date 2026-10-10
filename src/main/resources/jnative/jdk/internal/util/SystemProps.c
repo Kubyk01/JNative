@@ -41,48 +41,12 @@
 #define NODE_VAL_OFFSET  24
 #define NODE_NEXT_OFFSET 32
 
-/* ------------------------------------------------------------------ *
- * java.util.HashMap field offsets.
- *
- * The emitter builds the struct type by walking the class hierarchy
- * superclass-first (LlvmGlobalEmitter.collectInstanceFields). For
- * HashMap that gives, in this exact order:
- *
- *     AbstractMap:  keySet (reference), values (reference)
- *     HashMap:      table (Node[]), entrySet (reference),
- *                   size (int), modCount (int),
- *                   threshold (int), loadFactor (float)
- *
- * so the emitted type is
- *
- *     %struct.java_util_HashMap =
- *         { i8*, i8*, i8*, i8*, i8*, i32, i32, i32, float }
- *           ^vt  ^kS  ^vl  ^tbl ^eS  ^sz  ^mc  ^thr  ^lf
- *
- * and the byte offsets are:
- *
- *     vtable        0    (8 bytes)
- *     keySet        8    (8 bytes, inherited)
- *     values       16    (8 bytes, inherited)
- *     table        24    (8 bytes)
- *     entrySet     32    (8 bytes)
- *     size         40    (4 bytes)
- *     modCount     44    (4 bytes)
- *     threshold    48    (4 bytes)
- *     loadFactor   52    (4 bytes)
- *
- * NOTE: These offsets are for HashMap only. Properties extends
- * Hashtable, ConcurrentHashMap extends AbstractMap with its own set
- * of shadowing fields, and both use their own explicitly-passed
- * offset arguments in __jnative_make_bootstrap_props(). Do not reuse
- * these constants for either of those maps.
- * ------------------------------------------------------------------ */
-#define HASHMAP_TABLE_OFF       24
-#define HASHMAP_ENTRYSET_OFF    32
-#define HASHMAP_SIZE_OFF        40
-#define HASHMAP_MODCOUNT_OFF    44
-#define HASHMAP_THRESHOLD_OFF   48
-#define HASHMAP_LOADFACTOR_OFF  52
+#define HASHMAP_TABLE_OFF      24
+#define HASHMAP_ENTRYSET_OFF   32
+#define HASHMAP_SIZE_OFF       40
+#define HASHMAP_MODCOUNT_OFF   44
+#define HASHMAP_THRESHOLD_OFF  48
+#define HASHMAP_LOADFACTOR_OFF 52
 
 static struct ReflectionClass* find_class(const char* name) {
     if (!name || reflect_all_classes == NULL) return NULL;
@@ -229,10 +193,6 @@ static const char* resolve_user_name(char* buf, size_t bufsz) {
     return buf;
 }
 
-/* Reads the POSIX locale from the environment the same way the platform
- * does: LC_ALL wins over LC_MESSAGES, which wins over LANG. Anything that
- * is not a "ll" or "ll_CC" value leaves the corresponding output empty and
- * lets the caller fall back. */
 static void resolve_locale(char* lang, size_t langsz,
                            char* country, size_t countrysz) {
     if (langsz == 0 || countrysz == 0) return;
@@ -281,17 +241,38 @@ static void resolve_locale(char* lang, size_t langsz,
     }
 }
 
-/* ------------------------------------------------------------------ *
- * Raw.platformProperties()
+/*
+ * -------------------------------------------------------------------------
+ *  Positional layout of Raw.platformProperties()
+ * -------------------------------------------------------------------------
  *
- * jdk.internal.util.SystemProps.Raw stores the String[] returned here in
- * its final "platformProps" field and propDefault(int) is a plain
- * platformProps[index] load. The indices below are the @Native _*_NDX
- * constants of SystemProps.Raw; they are positional, so this table must
- * stay in the exact declared order or every property silently resolves
- * to the wrong value. FIXED_LENGTH is the array length the JDK expects.
- * ------------------------------------------------------------------ */
-
+ * The reference JDK's SystemProps.initProperties() reads the array
+ * returned by this native positionally, against the parallel string
+ * table RAW_PLATFORM_PROPERTIES declared on the Java side:
+ *
+ *     String[] platformProps = Raw.platformProperties();
+ *     for (int i = 0; i < RAW_PLATFORM_PROPERTIES.length; i++) {
+ *         if (platformProps[i] != null) {
+ *             put(props, RAW_PLATFORM_PROPERTIES[i], platformProps[i], false);
+ *         }
+ *     }
+ *
+ * Each array slot is the VALUE of one property; the corresponding
+ * property NAME comes from the Java-side table at the same index. The
+ * slot layout is therefore a plain "one value per property" vector, not
+ * an alternating key/value sequence, and the array length must equal
+ * RAW_PLATFORM_PROPERTIES.length exactly.
+ *
+ * RAW_FIXED_LENGTH must therefore be 39 — the number of entries in the
+ * Java-side table — and every RAW_NDX_<name> below is the index of the
+ * corresponding property inside that table. The order is frozen by the
+ * JDK's own source file and cannot be permuted without breaking the
+ * positional lookup on the Java side.
+ *
+ * The corresponding platform-property array entries are emitted by
+ * SystemProps.Raw.platformProperties() at the bottom of this file, and
+ * the RAW_NDX_<name> constants are consumed there.
+ */
 #define RAW_NDX_display_country           0
 #define RAW_NDX_display_language          1
 #define RAW_NDX_display_script            2
@@ -337,16 +318,12 @@ static void* make_string_array(int32_t len) {
     return jnative_ref_array_of_class(NULL, len, "[Ljava/lang/String;");
 }
 
-/* A null value is meaningful here: SystemProps.put/putIfAbsent skip null
- * defaults, so leaving a slot empty is how "no proxy configured" and
- * "no variant" are expressed. */
 static void string_array_set(void* arr, int32_t index, const char* value) {
     if (arr == NULL || value == NULL) return;
     *(void**)((char*)arr + JAVA_ARR_HDR + (size_t)index * sizeof(void*)) =
         __jnative_make_string_obj(value, (int32_t)strlen(value));
 }
 
-/* String.hashCode() for a latin1 String. */
 static int32_t jnative_string_hash(const char* s, int32_t len) {
     uint32_t h = 0;
     for (int32_t i = 0; i < len; i++) {
@@ -355,42 +332,72 @@ static int32_t jnative_string_hash(const char* s, int32_t len) {
     return (int32_t)h;
 }
 
-/* ConcurrentHashMap.spread(): additionally masks off the sign bit, because
- * a CHM.Node.hash of 0 marks the reserved bin. */
 static uint32_t jnative_spread(int32_t h) {
     uint32_t uh = (uint32_t)h;
     return (uh ^ (uh >> 16)) & 0x7fffffff;
 }
 
-/* HashMap.hash(Object): the same fold WITHOUT the sign-bit mask. Using the
- * CHM variant here would put the node in a different bucket than
- * HashMap.getNode() looks in, and the lookup would always miss. */
 static uint32_t jnative_map_spread(int32_t h) {
     uint32_t uh = (uint32_t)h;
     return uh ^ (uh >> 16);
 }
 
-/* Raw.cmdProperties() models the properties the launcher passes on the
- * command line. The HotSpot launcher always supplies java.home this way and
- * SystemProps.initProperties() asserts on it, so the map must not be empty.
+/*
+ * =====================================================================
+ *  Raw.cmdProperties()
+ * =====================================================================
  *
- * The map is assembled field by field rather than through the generated
- * java.util.HashMap.put(): the generated HashMap.putVal in this module
- * allocates no nodes at all, so every put() into a HashMap is a silent
- * no-op. The layout below matches
- *     %struct.java_util_HashMap       = { i8*, i8*, i8*, i8*, i8*, i32, i32, i32, float }
- *     %struct.java_util_HashMap_Node  = { i8*, i32, i8*, i8*, i8* }
- * and HashMap.hash() = h ^ (h >>> 16), which is the same spread the
- * ConcurrentHashMap bootstrap table below already relies on.
+ * Returns a freshly-constructed java.util.HashMap populated with the
+ * properties that in a real VM would have been supplied on the command
+ * line (-D flags). In a native image there are no -D flags, but the
+ * JDK's own SystemProps.initProperties expects java.home to be present
+ * in the merged result, and the single property this native therefore
+ * publishes is java.home.
  *
- * The two inherited AbstractMap fields (keySet at +8, values at +16) are
- * left null: HashMap.get() never dereferences them, and the Java-side
- * caller treats a null keySet/values as "the view has not been created
- * yet", which is the correct lazy state for a freshly constructed map. */
+ * ---------------------------------------------------------------------
+ *  Key construction: 9 bytes, not 10
+ * ---------------------------------------------------------------------
+ *
+ * "java.home" is exactly nine ASCII characters:
+ *
+ *     j a v a . h o m e
+ *     1 2 3 4 5 6 7 8 9
+ *
+ * The terminating NUL byte of the C string literal must NOT be included
+ * in the Java String's payload. A String constructed with length 10
+ * would carry a trailing '\0' character that no other part of the
+ * runtime produces, and the resulting HashMap key would never compare
+ * equal to the nine-character literal "java.home" that
+ * SystemProps.initProperties uses in its lookup.
+ *
+ * Two independent consequences followed from the previous hard-coded
+ * length of 10:
+ *
+ *   1. String.hashCode() over "java.home\0" differs from hashCode() over
+ *      "java.home", so the node was inserted into a different bucket
+ *      than the one the later lookup inspected.
+ *
+ *   2. Even if the buckets had matched, the key comparison inside
+ *      HashMap.getNode would have failed, because the stored key had
+ *      one extra character.
+ *
+ * The observable symptom was the AssertionError "java.home not set"
+ * raised from SystemProps.initProperties during System.initPhase1 — the
+ * java.home entry was physically present in the map but invisible to
+ * the lookup.
+ *
+ * Both the value-construction call and the hash-computation call had
+ * the same off-by-one length, so both are corrected below. To prevent
+ * the two from ever drifting apart again, the key and its byte length
+ * are pulled into two named constants and every use in this function
+ * refers to those constants rather than to a string literal plus a
+ * hard-coded integer.
+ */
 void* __jnative_fn_jdk_internal_util_SystemProps_Raw_cmdProperties___Ljava_util_HashMap_(
         void* self)
 {
     (void)self;
+
     void* map = alloc_java_object("java/util/HashMap", 64);
     if (map == NULL) {
         fprintf(stderr, "jnative: fatal: HashMap not registered\n");
@@ -412,14 +419,6 @@ void* __jnative_fn_jdk_internal_util_SystemProps_Raw_cmdProperties___Ljava_util_
     }
 
     int table_size = 16;
-    /*
-     * HashMap.Node[] — the generated HashMap.get() reads this field with
-     * ARRAYLENGTH and ALOAD, so it must carry the standard array header.
-     * Routing it through jnative_ref_array_of_class() gives it the right
-     * length/elem_size words and payload offset; a hand-rolled
-     * calloc + two int32 stores would leave length at offset 0 and the
-     * payload at 8.
-     */
     void* table = jnative_ref_array_of_class(NULL, table_size,
                                              "[Ljava/util/HashMap$Node;");
     if (table == NULL) abort();
@@ -427,10 +426,27 @@ void* __jnative_fn_jdk_internal_util_SystemProps_Raw_cmdProperties___Ljava_util_
     char home_buf[PATH_MAX];
     const char* java_home = resolve_java_home(home_buf, sizeof(home_buf));
 
-    void* key = __jnative_make_string_obj("java.home", 10);
-    void* value = __jnative_make_string_obj(java_home, (int32_t)strlen(java_home));
+    /*
+     * The key, its byte length, and its hash are all derived from these
+     * two constants. If the key is ever renamed, only the definition
+     * here changes and every downstream site picks up the new length
+     * automatically.
+     */
+    static const char JAVA_HOME_KEY[] = "java.home";
+    static const int32_t JAVA_HOME_KEY_LEN =
+        (int32_t)(sizeof(JAVA_HOME_KEY) - 1);   /* 9 */
 
-    int32_t h = jnative_string_hash("java.home", 10);
+    void* key = __jnative_make_string_obj(JAVA_HOME_KEY, JAVA_HOME_KEY_LEN);
+    void* value = __jnative_make_string_obj(
+        java_home, (int32_t)strlen(java_home));
+
+    /*
+     * Compute the hash over exactly JAVA_HOME_KEY_LEN bytes. Hashing
+     * over the C literal's full sizeof() would include the terminator
+     * byte and land the node in the wrong bucket — this is the exact
+     * mistake that produced the "java.home not set" assertion.
+     */
+    int32_t h = jnative_string_hash(JAVA_HOME_KEY, JAVA_HOME_KEY_LEN);
     uint32_t spread = jnative_map_spread(h);
     int idx = (int)(spread & (uint32_t)(table_size - 1));
 
@@ -443,10 +459,6 @@ void* __jnative_fn_jdk_internal_util_SystemProps_Raw_cmdProperties___Ljava_util_
     *(void**)((char*)node + NODE_NEXT_OFFSET) = NULL;
     *(void**)((char*)table + JAVA_ARR_HDR + (size_t)idx * sizeof(void*)) = node;
 
-    /* keySet (+8) and values (+16) are inherited AbstractMap slots.
-     * Leaving them null keeps the lazy-view semantics intact: the
-     * Java-side keySet()/values() methods create the view on first
-     * access. HashMap.get() and HashMap.put() never consult them. */
     *(void**)((char*)map + 8)  = NULL;
     *(void**)((char*)map + 16) = NULL;
 
@@ -461,6 +473,21 @@ void* __jnative_fn_jdk_internal_util_SystemProps_Raw_cmdProperties___Ljava_util_
     return map;
 }
 
+/*
+ * =====================================================================
+ *  Raw.platformProperties()
+ * =====================================================================
+ *
+ * Returns the platform-derived properties as a positional String[]
+ * indexed against the Java-side RAW_PLATFORM_PROPERTIES table (see the
+ * block of RAW_NDX_* constants above for the exact order).
+ *
+ * Each array slot carries the VALUE of one property. A slot whose value
+ * is not available on this platform is left NULL, and the Java-side
+ * merge loop skips any entry whose slot is NULL — that is how a
+ * property ends up "defined but unset", which is distinct from "never
+ * mentioned at all".
+ */
 void* __jnative_fn_jdk_internal_util_SystemProps_Raw_platformProperties____Ljava_lang_String_(void) {
     void* arr = make_string_array(RAW_FIXED_LENGTH);
     if (arr == NULL) {
@@ -484,8 +511,6 @@ void* __jnative_fn_jdk_internal_util_SystemProps_Raw_platformProperties____Ljava
     string_array_set(arr, RAW_NDX_display_country,  country_buf);
     string_array_set(arr, RAW_NDX_format_language,  lang_buf);
     string_array_set(arr, RAW_NDX_format_country,   country_buf);
-    /* display_script / display_variant / format_script / format_variant
-     * stay null, which is how "no script, no variant" is reported. */
 
     string_array_set(arr, RAW_NDX_file_encoding,   "UTF-8");
     string_array_set(arr, RAW_NDX_file_separator,  "/");
@@ -512,16 +537,47 @@ void* __jnative_fn_jdk_internal_util_SystemProps_Raw_platformProperties____Ljava
     string_array_set(arr, RAW_NDX_user_name,
                      resolve_user_name(user_buf, sizeof(user_buf)));
 
-    /* The proxy and nonProxyHosts slots stay null: no proxy is configured,
-     * and SystemProps.putIfAbsent() drops null defaults. */
-
     return arr;
 }
 
+/*
+ * =====================================================================
+ *  Raw.vmProperties()
+ * =====================================================================
+ *
+ * Returns the properties the VM itself supplies. On a native image the
+ * complete, authoritative list of VM-provided properties is already
+ * present in the bootstrap Properties table built by
+ * __jnative_make_bootstrap_props() below, so there is nothing extra to
+ * add here; an empty array is the truthful answer and the Java side's
+ * merge loop iterates over it zero times.
+ */
 void* __jnative_fn_jdk_internal_util_SystemProps_Raw_vmProperties____Ljava_lang_String_(void) {
     return make_empty_string_array();
 }
 
+/*
+ * =====================================================================
+ *  Bootstrap Properties construction
+ * =====================================================================
+ *
+ * Builds the java.util.Properties object that System.initPhase1 and
+ * every downstream consumer of System.getProperties() observe. The
+ * Properties instance is backed by a ConcurrentHashMap whose internal
+ * layout this function writes directly, because the emitter guarantees
+ * neither that CHM.<init> is present in the module nor that its
+ * constructor can be invoked from C without a vtable lookup — and the
+ * field offsets are stable across every JDK this runtime targets (they
+ * are computed by LlvmGlobalEmitter.getFieldOffset from the same class
+ * files that the module was compiled from).
+ *
+ * The offset arguments are supplied by LlvmGenerator.generateMain() and
+ * come from LlvmGlobalEmitter.getFieldOffset / computeObjectSize, so
+ * they cannot disagree with what generated bytecode would have used to
+ * address the same fields. A value of zero or negative for any offset
+ * means "the emitter did not supply it" and the corresponding fallback
+ * constant at the top of this file is used instead.
+ */
 void* __jnative_make_bootstrap_props(
     int32_t props_table_off,
     int32_t props_count_off,
@@ -568,7 +624,6 @@ void* __jnative_make_bootstrap_props(
     }
 
     int table_size = 16;
-    /* ConcurrentHashMap.Node[] — see the HashMap.Node[] note above. */
     void* chm_table = jnative_ref_array_of_class(NULL, table_size,
         "[Ljava/util/concurrent/ConcurrentHashMap$Node;");
     if (!chm_table) abort();
@@ -687,36 +742,6 @@ void* __jnative_make_bootstrap_props(
     JNATIVE_INSERT("sun.jnu.encoding",           "UTF-8");
     JNATIVE_INSERT("sun.io.unicode.encoding",    "UnicodeLittle");
 
-    /* ------------------------------------------------------------------
-     * NEW: properties that VM.saveProperties() reads unconditionally.
-     *
-     * jdk.internal.misc.VM.saveProperties() is invoked from @main right
-     * after the bootstrap table is installed on java.lang.System. It
-     * reads three keys:
-     *
-     *   - "sun.nio.MaxDirectMemorySize"    — null-safe: an absent value
-     *     leaves directMemory at its "unlimited" default.
-     *
-     *   - "sun.nio.PageAlignDirectMemory"  — null-safe via
-     *     "true".equals(...): an absent value leaves the flag false.
-     *
-     *   - "java.class.version"             — NOT null-safe. The body is
-     *
-     *         s = (String)p.get("java.class.version");
-     *         int i = s.indexOf('.');       // NPE when s == null
-     *         classFileMajorVersion = Integer.parseInt(s.substring(0, i));
-     *
-     *     so the key must be present or VM.saveProperties itself aborts
-     *     with an NPE before System.initPhase1 ever runs. This is
-     *     exactly the failure mode reported at build-startup:
-     *
-     *         java.lang.NullPointerException: Cannot invoke
-     *         jdk.internal.misc.VM.saveProperties(Ljava_util_MapV)
-     *         because %tmp_63100 is null
-     *
-     *     The value is the class file format version, major.minor; "65.0"
-     *     is the JDK 21 value and matches the java.version string above.
-     * ------------------------------------------------------------------ */
     JNATIVE_INSERT("java.class.version",         "65.0");
     JNATIVE_INSERT("sun.nio.MaxDirectMemorySize", "-1");
     JNATIVE_INSERT("sun.nio.PageAlignDirectMemory", "false");
