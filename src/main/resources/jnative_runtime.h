@@ -135,7 +135,19 @@
  * descriptor), which is the state Module.isNamed() tests and the state
  * that steers Class.getResourceAsStream into its "unnamed module"
  * branch. LlvmGlobalEmitter.generateUnnamedModule() emits that object
- * as a constant; every @refclass_* mirror points at it.
+ * as a writable global; every @refclass_* mirror points at it.
+ *
+ * That object is emitted as a writable `global`, not as a `constant`.
+ * The JDK's own module bootstrap (`System.initPhase2` ->
+ * `ModuleBootstrap.boot` -> `ModuleLayer.defineModules`) takes it back
+ * out of Object.class.getModule() as the `java.base` module and writes
+ * its `reads` / `exports` / `opens` fields, and later its
+ * `name` / `loader` / `descriptor` fields. Emitting it as a `constant`
+ * places the object in `.data.rel.ro`, which RELRO maps read-only, and
+ * the first store then takes a SIGSEGV (SEGV_ACCERR at offset 0x30)
+ * inside `java.lang.Module.defineModules`. The writable emission is
+ * what keeps the JDK's module bootstrap working on every JDK release
+ * this runtime targets.
  *
  * The eight reserved slots are a stable landing pad for any
  * java.lang.Class field the emitter has not enumerated yet. An

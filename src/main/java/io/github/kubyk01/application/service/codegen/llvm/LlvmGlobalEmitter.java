@@ -93,6 +93,21 @@ import static io.github.kubyk01.util.LlvmUtil.getElementSizeOfType;
  * as {@code constant} was the root cause of a SIGSEGV inside
  * {@code Class.getPackageName()} while the VarHandle bootstrap was
  * resolving {@code ConcurrentSkipListMap.<clinit>}.</p>
+ *
+ * <p>The bootstrap-loader module singleton
+ * {@code @jnative_unnamed_module} is the second exception. Its initial
+ * field values describe the unnamed module (all reference slots null,
+ * {@code isNamed == false}), but the JDK's own module bootstrap — which
+ * runs from {@code System.initPhase2()} through
+ * {@code ModuleLayer.defineModules()} — takes that same object back out
+ * of the class mirror registry as the {@code java.base} module and
+ * writes its {@code reads} / {@code exports} / {@code opens} fields, and
+ * later its {@code name} / {@code loader} / {@code descriptor} fields.
+ * The object is therefore emitted as a writable {@code global} rather
+ * than as a {@code constant}. See
+ * {@link #generateUnnamedModule()} for the full rationale and for the
+ * SIGSEGV ({@code SEGV_ACCERR} at offset {@code 0x30}) that the previous
+ * {@code constant} emission produced.</p>
  */
 @Slf4j
 @RequiredArgsConstructor
@@ -772,34 +787,86 @@ public class LlvmGlobalEmitter {
 
     /**
      * Emits the one shared {@code java.lang.Module} object that stands for the
-     * unnamed module of the bootstrap loader.
+     * bootstrap loader's module.
      *
      * <p>Every {@code @refclass_*} mirror has a {@code module} slot at offset
      * 80, and the bytecode of {@code Class.getModule()} is a plain read of
-     * that slot. Emitting null there means every {@code Class.getResourceAsStream}
-     * dereferences a null {@code Module} and dies with an NPE on the
-     * {@code thisModule.isNamed()} call that follows.
+     * that slot. Emitting {@code null} there makes every
+     * {@code Class.getResourceAsStream} dereference a null {@code Module} and
+     * die with an NPE on the {@code thisModule.isNamed()} call that follows.</p>
      *
-     * <p>So every mirror points at this object instead. It is a {@code Module}
-     * with all fields zeroed, which is exactly the JDK's unnamed module:
-     * {@code name == null}, {@code loader == null}, no descriptor. That is the
-     * state {@code Module.isNamed()} tests ({@code return name != null}), and
-     * it steers {@code Class.getResourceAsStream} down its "unnamed module"
-     * branch rather than the named-module branch.
+     * <p>So every mirror points at this object instead. Initially it describes
+     * the unnamed module of the bootstrap loader: {@code isNamed == false},
+     * {@code name == null}, {@code loader == null}, no descriptor — which is
+     * the state {@code Module.isNamed()} tests ({@code name != null}) and the
+     * state that steers {@code Class.getResourceAsStream} down its "unnamed
+     * module" branch.</p>
      *
-     * <p>The field list and their order come from {@link #collectInstanceFields},
-     * the same source {@link #generateStructs()} uses, so this literal has
-     * exactly the shape of the emitted {@code %struct.java_lang_Module} and LLVM
-     * lays it out with the same natural alignment. It is a {@code constant}, so
-     * it needs no run-time initialisation.
+     * <h2>Why this global must be writable</h2>
      *
-     * <p>Zero values are produced by {@link #zeroLiteralFor(Type)}, which is
-     * the single point where the Java-side {@link Type} and the LLVM
-     * spelling of "the zero of that type" are kept in correspondence. An
-     * integral literal {@code 0} is not valid where a pointer is expected —
-     * the LLVM parser rejects it with "integer constant must have integer
-     * type" — so the correspondence must be exact and must be maintained in
-     * one place.
+     * <p>The object is emitted as a plain, writable {@code global} — not as a
+     * {@code constant} — and that distinction is load-bearing. The JDK's own
+     * module bootstrap, running from {@code System.initPhase2()} through
+     * {@code ModuleBootstrap.boot()} into
+     * {@code ModuleLayer.defineModules()}, takes this same object back out of
+     * the class mirror registry as the {@code java.base} module and writes
+     * into its fields:</p>
+     *
+     * <pre>
+     *   Module.defineModules(Configuration, Function&lt;ClassLoader, List&lt;Module&gt;&gt;, ModuleLayer):
+     *       ...
+     *       Module module = Object.class.getModule();   // this global
+     *       modules[i] = module;
+     *       ...
+     *       module.reads = new HashSet&lt;&gt;();           // store into field 6 (offset 0x30)
+     *       ...
+     * </pre>
+     *
+     * <p>When this object is emitted as a {@code constant}, LLVM places it in
+     * {@code .data.rel.ro}, the linker applies RELRO, and the runtime maps the
+     * page {@code r--p}. The store at {@code module.reads} then takes a
+     * hardware write barrier and the process dies with {@code SIGSEGV} and
+     * {@code si_code == 2} ({@code SEGV_ACCERR}) inside
+     * {@code java.lang.Module.defineModules}, before any user code has
+     * produced output:</p>
+     *
+     * <pre>
+     *   RIP: fn_java_lang_Module_defineModules_..._+0xddb
+     *        mov %rax, 0x30(%r14)      ; r14 = &amp;jnative_unnamed_module
+     *   si_code = 2  (SEGV_ACCERR — write to a read-only page)
+     * </pre>
+     *
+     * <p>Emitting it as a writable {@code global} lets those stores succeed.
+     * Every field the JDK's module system writes to — {@code reads},
+     * {@code exports}, {@code opens}, and the identity fields {@code name} /
+     * {@code loader} / {@code descriptor} — is a slot inside this struct. The
+     * struct layout comes from {@link #collectInstanceFields(ClassNode)} and
+     * therefore covers every instance field that {@code java.lang.Module}
+     * declares on the JDK the image is built against, including any that a
+     * future JDK release adds.</p>
+     *
+     * <h2>Shared identity with the JDK's {@code java.base} module</h2>
+     *
+     * <p>All classes in the image initially share this object, because every
+     * {@code @refclass_*} mirror points its {@code module} slot at it. After
+     * the JDK's module bootstrap has run, that same object has become the
+     * {@code java.base} module, and every class that has not been assigned a
+     * module of its own still reports it as its module. That sharing is a
+     * deliberate simplification of this runtime's module model: the image has
+     * no user-defined module layer, no module path, and no resolver that could
+     * partition its classes into distinct named modules. The object must be
+     * writable precisely because the JDK's own bootstrap performs those writes
+     * unconditionally on every JDK release this runtime targets, and those
+     * writes are the difference between a well-formed {@code java.base} module
+     * and an NPE on {@code Module.isNamed()} three frames later.</p>
+     *
+     * <p>A future revision that wants fully separate unnamed / {@code java.base}
+     * module identities would have to emit a per-class module pointer rather
+     * than a single shared one, and teach {@code Object.class.getModule()} to
+     * return the {@code java.base} module while every other class returns the
+     * unnamed one. The current single-object model is the smallest change that
+     * keeps the JDK's own bootstrap working without giving up the rest of the
+     * runtime's module-free design.</p>
      */
     private String generateUnnamedModule() {
         ClassNode moduleNode = resolver.getClassNode("java/lang/Module");
@@ -826,8 +893,15 @@ public class LlvmGlobalEmitter {
                 .append(" ").append(zeroLiteralFor(ft));
         }
 
-        return "\n; ----- Unnamed module singleton -----\n"
-            + "@jnative_unnamed_module = constant " + structName
+        // NOTE: `global`, not `constant`. The JDK's own module bootstrap writes
+        // into this object's fields (`reads`, `exports`, `opens`, and later
+        // `name`/`loader`/`descriptor`); emitting it as `constant` places it in
+        // `.data.rel.ro`, which RELRO maps read-only, and the first such store
+        // takes a SIGSEGV (SEGV_ACCERR) inside
+        // java.lang.Module.defineModules. See the method javadoc for the full
+        // chain of evidence.
+        return "\n; ----- Unnamed module singleton (mutable) -----\n"
+            + "@jnative_unnamed_module = global " + structName
             + " { " + init + " }, align 8\n\n";
     }
 

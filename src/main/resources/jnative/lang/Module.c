@@ -155,3 +155,112 @@ void __jnative_fn_java_lang_Module_addExportsToAllUnnamed0__Ljava_lang_Module_Lj
     (void)from;
     (void)pn;
 }
+
+/* =====================================================================
+ *  Module.defineModules — native override.
+ * =====================================================================
+ *
+ *  Module.defineModules(Configuration, Function<String,ClassLoader>,
+ *                       ModuleLayer) is the single point at which the
+ *  JDK's module bootstrap constructs its run-time module graph. It:
+ *
+ *    1. iterates cf.modules() and creates a Module object for every
+ *       ResolvedModule in the configuration,
+ *
+ *    2. substitutes the shared bootstrap-module singleton
+ *       (@jnative_unnamed_module) for java.base, obtained through
+ *       Object.class.getModule(),
+ *
+ *    3. wires up the reads / exports / opens edges by calling
+ *       Module.initExports / initOpens / implAddReads,
+ *
+ *    4. returns the Map<String, Module> that ModuleLayer stores as its
+ *       nameToModule field.
+ *
+ *  Every subsequent consumer of that map — ModuleLayer.getServicesCatalog
+ *  iterating nameToModule.values() to call ServicesCatalog.register(m),
+ *  ModuleLayer.findModule / findLoader, Module.getPackages — reads the
+ *  modules that defineModules produced. Every one of those consumers, in
+ *  turn, reads the module's `descriptor` field. The shared singleton has
+ *  descriptor == null (this runtime never parses module-info.class and
+ *  therefore has no ModuleDescriptor to install there), so the first such
+ *  reader raises NullPointerException. The first reader turned out to be
+ *  Module.initExports; the next would have been
+ *  jdk.internal.module.ServicesCatalog.register; the one after that would
+ *  have been Module.getPackages. Patching them one by one is a losing
+ *  proposition: the JDK adds new descriptor readers with every release,
+ *  and any method that inspects a module in the boot path is a candidate.
+ *
+ *  The structural fix is to remove the graph construction at its source.
+ *  This runtime has no module graph: every class belongs to the one shared
+ *  singleton, no class's getModule() returns anything else, and nothing in
+ *  the compiled image ever dispatches on module identity. The truthful
+ *  answer for defineModules in that runtime is an empty map, and every
+ *  consumer of the map has a well-defined behaviour on an empty map:
+ *
+ *    - ModuleLayer.getServicesCatalog() iterates zero modules and calls
+ *      ServicesCatalog.register zero times — no descriptor is read.
+ *
+ *    - ModuleLayer.findModule(name) returns Optional.empty() for every
+ *      name; in this runtime no reachable code path ever asks for a
+ *      module by name.
+ *
+ *    - ModuleLayer.findLoader(name) is only reached when a caller asks
+ *      for a module's class loader by name, which nothing in the boot
+ *      path or in the reachable closure does.
+ *
+ *    - ModuleLayer.modules() returns Set.of() — an empty, immutable set.
+ *
+ *  Returning an empty HashMap is therefore the only well-defined answer
+ *  for a runtime without a module graph, and it is what this override
+ *  does.
+ *
+ *  The HashMap is allocated through jnative_alloc_object() rather than
+ *  through a call to HashMap.<init>(): the no-argument HashMap state —
+ *  table == null, size == 0 — is a valid empty map for every operation
+ *  the JDK performs on the returned value. size() reads the int at
+ *  offset +16 (zero), isEmpty() reads the same field, values() creates
+ *  a Values view whose iteration terminates immediately because table
+ *  is null, entrySet() and keySet() behave the same way. No constructor
+ *  call is needed and none is attempted: the emitter does not guarantee
+ *  that HashMap.<init>()V is in the module for every JDK build, and a
+ *  zeroed HashMap is byte-for-byte what the JDK's own no-argument
+ *  constructor produces on an empty map.
+ *
+ *  The override is reached exactly once: Module.defineModules is called
+ *  from ModuleLayer.<init>(Configuration, List, Function), and in this
+ *  runtime no second layer is ever created. The fresh-map-per-call
+ *  policy is therefore irrelevant in practice.
+ *
+ *  HashMap itself is guaranteed to be in the compiled image: it is
+ *  used by the JDK's own Module.defineModules (the method this
+ *  overrides), by System.initPhase1, and by every collection class the
+ *  bootstrap path touches. jnative_class_by_name("java/util/HashMap")
+ *  therefore always returns a non-null ReflectionClass, and
+ *  jnative_alloc_object() always produces a valid HashMap object with
+ *  the correct vtable and object_size. Both failure branches below are
+ *  defensive: they can only fire if the class was somehow dropped from
+ *  the image, which would itself be a build defect worth reporting
+ *  through the runtime's generic OOM helper rather than silently
+ *  returning a wrong-typed object.
+ */
+
+void* __jnative_override_java_lang_Module_defineModules(
+        void* cf, void* clf, void* layer)
+{
+    (void)cf;
+    (void)clf;
+    (void)layer;
+
+    ReflectionClass* hm_cls = jnative_class_by_name("java/util/HashMap");
+    if (hm_cls == NULL) {
+        __jnative_throw_out_of_memory_error_ctx(
+            "Module.defineModules: java.util.HashMap not in image");
+    }
+
+    void* map = jnative_alloc_object(hm_cls);
+    if (map == NULL) {
+        __jnative_throw_out_of_memory_error_ctx("Module.defineModules");
+    }
+    return map;
+}
