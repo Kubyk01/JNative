@@ -312,6 +312,7 @@ public class BytecodeToIr {
             if (methodNode != null && methodNode.isNative()) {
                 String nativeName = "__jnative_" + LlvmRuntime.mangleMethod(owner, name, desc);
                 Function func = new Function(nativeName, methodNode.getReturnType());
+                func.setOwnerClass(owner);
 
                 List<Type> allParams = new ArrayList<>();
                 if (!methodNode.isStatic()) {
@@ -462,6 +463,7 @@ public class BytecodeToIr {
         allParams.addAll(paramTypes);
         String mangledName = LlvmRuntime.mangleMethod(ref.getOwner(), ref.getName(), ref.getDescriptor());
         Function func = new Function(mangledName, retType);
+        func.setOwnerClass(ref.getOwner());
         for (int i = 0; i < allParams.size(); i++) {
             func.addParameter(new Parameter(allParams.get(i), i));
         }

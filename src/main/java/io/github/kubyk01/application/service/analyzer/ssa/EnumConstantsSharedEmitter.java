@@ -98,6 +98,7 @@ public final class EnumConstantsSharedEmitter {
 
         Function func = builder.createFunctionWithSlots(
             mangledName, returnType, List.of(thisParam));
+        func.setOwnerClass(OWNER);
 
         BasicBlock entry = builder.createBlock(mangledName + "_entry");
 

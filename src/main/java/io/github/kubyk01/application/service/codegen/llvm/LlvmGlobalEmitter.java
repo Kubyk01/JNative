@@ -292,6 +292,12 @@ public class LlvmGlobalEmitter {
 
     private final Map<String, String> typeInfoNames = new ConcurrentHashMap<>();
 
+    /** Cached output of {@link #generateStructs()} (struct type definitions only). */
+    private String cachedStructDefinitions;
+
+    /** Cached output of {@link #generateTypeDefinitions()}. */
+    private String cachedTypeDefinitions;
+
     private final Map<String, String> extraStructs = new ConcurrentHashMap<>();
     private final Map<String, String> extraVtables = new ConcurrentHashMap<>();
 
@@ -763,22 +769,103 @@ public class LlvmGlobalEmitter {
         return "@refclass_" + LlvmTypeMapper.sanitizeIdentifier(className);
     }
 
+    /**
+     * Emits the type definitions only ({@code %struct.X = type {...}} and the
+     * reflection/resource ABI types), without any global variable
+     * definitions. Safe to duplicate across modules: LLVM unifies types by
+     * name, so identical definitions in every .ll file merge into one.
+     *
+     * <p>The result is cached: the types are a pure function of the loaded
+     * class map and the reachable instruction set, and every per-class file
+     * (plus the module file) is built from the same prelude.</p>
+     */
+    public String generateTypeDefinitions() {
+        if (cachedTypeDefinitions != null) {
+            return cachedTypeDefinitions;
+        }
+        StringBuilder sb = new StringBuilder();
+        sb.append("%JNativeResourceEntry = type { i8*, i8*, i32 }\n");
+        sb.append("%ReflectionMethod = type { i8*, i8*, i8*, i32 }\n");
+        sb.append("%ReflectionField = type { i8*, i8*, i32, i32 }\n");
+        sb.append("%ReflectionConstructor = type { i8*, i8*, i32 }\n");
+        // Must stay in lockstep with `struct ReflectionClass` in
+        // jnative_runtime.h and with the @refclass_* constant emission below.
+        //
+        // Layout:
+        //   [0]  %JNativeVTable*      vtable
+        //   [1]  i8*                  name (Java String cache, kept null)
+        //   [2]  %ReflectionClass*    superclass
+        //   [3]  %ReflectionClass**   interfaces
+        //   [4]  %ReflectionMethod**  methods
+        //   [5]  %ReflectionField**   fields
+        //   [6]  %ReflectionConstructor** constructors
+        //   [7]  i32                  modifiers
+        //   [8]  i32                  objectSize
+        //   [9]  i8*                  cname (const char*, internal name)
+        //   [10] i8*                  classLoader           (always null)
+        //   [11] i8*                  module                (always null)
+        //   [12] i8*                  componentType         (always null)
+        //   [13] i8*                  packageName           (always null)
+        //   [14] i8*                  enumConstants         (always null)
+        //   [15] i8*                  annotationData        (always null)
+        //   [16] i8*                  genericInfo           (always null)
+        //   [17] i8*                  reflectionData        (always null)
+        //   [18] i8*                  classValueMap         (always null)
+        //   [19] i8*                  enumConstantDirectory (always null)
+        //   [20..27] i8*              reserved[8]           (always null)
+        sb.append("%ReflectionClass = type { %JNativeVTable*, i8*, %ReflectionClass*, %ReflectionClass**, "
+            + "%ReflectionMethod**, %ReflectionField**, %ReflectionConstructor**, i32, i32, i8*, "
+            + "i8*, i8*, i8*, i8*, i8*, i8*, i8*, i8*, i8*, i8*, "
+            + "i8*, i8*, i8*, i8*, i8*, i8*, i8*, i8* }\n");
+        sb.append("%JNativeSymbolClassEntry = type { i8*, %ReflectionClass* }\n");
+        cachedTypeDefinitions = sb.toString();
+        return cachedTypeDefinitions;
+    }
+
+    /**
+     * Returns ONLY the struct type definitions ({@code %struct.X = type
+     * {...}}), without any global variable definitions. Safe to duplicate
+     * across modules; LLVM unifies types by name.
+     */
+    public String generateStructDefinitions() {
+        if (cachedStructDefinitions == null) {
+            cachedStructDefinitions = generateStructs();
+        }
+        return cachedStructDefinitions;
+    }
+
+    /**
+     * Returns ONLY the global variable definitions (static fields, vtables,
+     * string literals, reflection data, etc.), without struct type
+     * definitions. Every global is emitted with linkonce_odr linkage so
+     * identical definitions in different modules are deduplicated by the
+     * linker.
+     */
+    public String generateGlobalDefinitions() {
+        prepareLayouts();
+        StringBuilder sb = new StringBuilder();
+        sb.append(generateStaticFields());
+        // generateStringLiterals() depends on vtableNames, which only exists
+        // after generateVtables(); the reflection data depends on the string
+        // literal pool; the unnamed module and the embedded-resource table
+        // depend on the vtables. The ordering below is load-bearing and
+        // mirrors the original generateGlobals() chain.
+        sb.append(generateVtables());
+        sb.append(generateTypeStringConstants());
+        sb.append(generateStringLiterals());
+        sb.append(generateTypeInfo());
+        sb.append(generateUnnamedModule());
+        sb.append(generateEmbeddedResources());
+        sb.append(generateReflectionData());
+        return sb.toString();
+    }
+
+    /** Existing entry point, preserved for backwards compatibility. */
     public String generateGlobals() {
         prepareLayouts();
-        return generateStructs()
-            + generateStaticFields()
-            + generateVtables()
-            + generateTypeStringConstants()
-            + generateStringLiterals()
-            + generateTypeInfo()
-            // Both of these must run after generateVtables(): the unnamed
-            // module points at @vtable_java_lang_Module, which only exists once
-            // vtableNames is populated. Both must run after generateStructs():
-            // the module object is a %struct.java_lang_Module literal, and the
-            // resource table is a %JNativeResourceEntry literal.
-            + generateUnnamedModule()
-            + generateEmbeddedResources()
-            + generateReflectionData();
+        return generateTypeDefinitions()
+            + generateStructDefinitions()
+            + generateGlobalDefinitions();
     }
 
     // =========================================================================
@@ -901,7 +988,7 @@ public class LlvmGlobalEmitter {
         // java.lang.Module.defineModules. See the method javadoc for the full
         // chain of evidence.
         return "\n; ----- Unnamed module singleton (mutable) -----\n"
-            + "@jnative_unnamed_module = global " + structName
+            + "@jnative_unnamed_module = linkonce_odr global " + structName
             + " { " + init + " }, align 8\n\n";
     }
 
@@ -962,13 +1049,12 @@ public class LlvmGlobalEmitter {
     private String generateEmbeddedResources() {
         StringBuilder sb = new StringBuilder();
         sb.append("\n; ----- Embedded resources -----\n");
-        sb.append("%JNativeResourceEntry = type { i8*, i8*, i32 }\n");
 
         if (embeddedResources.isEmpty()) {
-            sb.append("@jnative_builtin_resources = constant "
+            sb.append("@jnative_builtin_resources = linkonce_odr constant "
                 + "[1 x %JNativeResourceEntry] "
                 + "[%JNativeResourceEntry { i8* null, i8* null, i32 0 }]\n");
-            sb.append("@jnative_builtin_resources_count = constant i32 0\n\n");
+            sb.append("@jnative_builtin_resources_count = linkonce_odr constant i32 0\n\n");
             return sb.toString();
         }
 
@@ -989,7 +1075,7 @@ public class LlvmGlobalEmitter {
                 + ", i8* " + dataRef + ", i32 " + data.length + " }");
         }
 
-        sb.append("@jnative_builtin_resources = constant [")
+        sb.append("@jnative_builtin_resources = linkonce_odr constant [")
             .append(entryRefs.size())
             .append(" x %JNativeResourceEntry] [\n");
         for (int i = 0; i < entryRefs.size(); i++) {
@@ -997,7 +1083,7 @@ public class LlvmGlobalEmitter {
             sb.append("  ").append(entryRefs.get(i));
         }
         sb.append("\n]\n");
-        sb.append("@jnative_builtin_resources_count = constant i32 ")
+        sb.append("@jnative_builtin_resources_count = linkonce_odr constant i32 ")
             .append(entryRefs.size()).append("\n\n");
         return sb.toString();
     }
@@ -1030,7 +1116,7 @@ public class LlvmGlobalEmitter {
         if (nulTerminate != 0) esc.append("\\00");
 
         sb.append("@").append(baseName)
-            .append(" = private unnamed_addr constant [")
+            .append(" = linkonce_odr unnamed_addr constant [")
             .append(total).append(" x i8] c\"")
             .append(esc).append("\", align 1\n");
         return "getelementptr inbounds ([" + total + " x i8], [" + total
@@ -1285,7 +1371,7 @@ public class LlvmGlobalEmitter {
             vtableNames.put(iface, vtableName);
             String ifaceNameRef = ensureStringConstantPtr(sb, iface);
             sb.append(vtableName)
-                .append(" = constant %JNativeVTable { i8** null, %JNativeIfaceMap* null, i8* ")
+                .append(" = linkonce_odr constant %JNativeVTable { i8** null, %JNativeIfaceMap* null, i8* ")
                 .append(ifaceNameRef).append(" }\n");
         }
 
@@ -1307,7 +1393,7 @@ public class LlvmGlobalEmitter {
             }
 
             String methodsName = "@vtable_methods_" + LlvmTypeMapper.sanitizeIdentifier(className);
-            sb.append(methodsName).append(" = private constant [")
+            sb.append(methodsName).append(" = linkonce_odr constant [")
                 .append(length).append(" x i8*] [");
             for (int i = 0; i < length; i++) {
                 if (i > 0) sb.append(", ");
@@ -1346,7 +1432,7 @@ public class LlvmGlobalEmitter {
                 String itableName = "@itable_"
                     + LlvmTypeMapper.sanitizeIdentifier(className) + "_"
                     + LlvmTypeMapper.sanitizeIdentifier(iface);
-                sb.append(itableName).append(" = private constant [")
+                sb.append(itableName).append(" = linkonce_odr constant [")
                     .append(len).append(" x i8*] [");
                 for (int i = 0; i < len; i++) {
                     if (i > 0) sb.append(", ");
@@ -1367,7 +1453,7 @@ public class LlvmGlobalEmitter {
             if (!sortedIfaces.isEmpty()) {
                 String entriesArrayName = "@ifacemap_entries_"
                     + LlvmTypeMapper.sanitizeIdentifier(className);
-                sb.append(entriesArrayName).append(" = private constant [")
+                sb.append(entriesArrayName).append(" = linkonce_odr constant [")
                     .append(sortedIfaces.size()).append(" x %JNativeIfaceMapEntry] [");
                 for (int i = 0; i < sortedIfaces.size(); i++) {
                     if (i > 0) sb.append(", ");
@@ -1379,12 +1465,12 @@ public class LlvmGlobalEmitter {
                 }
                 sb.append("]\n");
 
-                sb.append(ifacemapName).append(" = constant %JNativeIfaceMap { i32 ")
+                sb.append(ifacemapName).append(" = linkonce_odr constant %JNativeIfaceMap { i32 ")
                     .append(sortedIfaces.size()).append(", %JNativeIfaceMapEntry* ")
                     .append(entriesArrayName).append(" }\n");
             } else {
                 sb.append(ifacemapName)
-                    .append(" = constant %JNativeIfaceMap { i32 0, %JNativeIfaceMapEntry* null }\n");
+                    .append(" = linkonce_odr constant %JNativeIfaceMap { i32 0, %JNativeIfaceMapEntry* null }\n");
             }
 
             int methodLen = vtableLengths.getOrDefault(className, 1);
@@ -1392,7 +1478,7 @@ public class LlvmGlobalEmitter {
 
             String vtableName = "@vtable_" + LlvmTypeMapper.sanitizeIdentifier(className);
             String classNameRef = ensureStringConstantPtr(sb, className);
-            sb.append(vtableName).append(" = constant %JNativeVTable {\n")
+            sb.append(vtableName).append(" = linkonce_odr constant %JNativeVTable {\n")
                 .append("  i8** bitcast ([").append(methodLen).append(" x i8*]* ")
                 .append(methodsName).append(" to i8**),\n")
                 .append("  %JNativeIfaceMap* ").append(ifacemapName).append(",\n")
@@ -1611,7 +1697,7 @@ public class LlvmGlobalEmitter {
 
             String methodsName = "@vtable_methods_"
                     + LlvmTypeMapper.sanitizeIdentifier(lambdaClassName);
-            sb.append(methodsName).append(" = private constant [")
+            sb.append(methodsName).append(" = linkonce_odr constant [")
                     .append(methodLen).append(" x i8*] [");
             for (int i = 0; i < methodLen; i++) {
                 if (i > 0) sb.append(", ");
@@ -1748,7 +1834,7 @@ public class LlvmGlobalEmitter {
                 String itableName = "@itable_"
                         + LlvmTypeMapper.sanitizeIdentifier(lambdaClassName) + "_"
                         + LlvmTypeMapper.sanitizeIdentifier(iface);
-                sb.append(itableName).append(" = private constant [")
+                sb.append(itableName).append(" = linkonce_odr constant [")
                         .append(len).append(" x i8*] [");
                 for (int i = 0; i < len; i++) {
                     if (i > 0) sb.append(", ");
@@ -1767,7 +1853,7 @@ public class LlvmGlobalEmitter {
                     + LlvmTypeMapper.sanitizeIdentifier(lambdaClassName);
 
             sb.append(ifacemapEntriesName)
-                    .append(" = private constant [")
+                    .append(" = linkonce_odr constant [")
                     .append(ifaceNames.size())
                     .append(" x %JNativeIfaceMapEntry] [");
             for (int i = 0; i < ifaceNames.size(); i++) {
@@ -1780,14 +1866,14 @@ public class LlvmGlobalEmitter {
             sb.append("]\n");
 
             sb.append(ifacemapName)
-                    .append(" = constant %JNativeIfaceMap { i32 ")
+                    .append(" = linkonce_odr constant %JNativeIfaceMap { i32 ")
                     .append(ifaceNames.size())
                     .append(", %JNativeIfaceMapEntry* ")
                     .append(ifacemapEntriesName).append(" }\n");
 
             String vtableName = vtableNames.get(lambdaClassName);
             String lambdaNameRef = ensureStringConstantPtr(sb, lambdaClassName);
-            sb.append(vtableName).append(" = constant %JNativeVTable {\n")
+            sb.append(vtableName).append(" = linkonce_odr constant %JNativeVTable {\n")
                     .append("  i8** bitcast ([").append(methodLen).append(" x i8*]* ")
                     .append(methodsName).append(" to i8**),\n")
                     .append("  %JNativeIfaceMap* ").append(ifacemapName).append(",\n")
@@ -1900,7 +1986,7 @@ public class LlvmGlobalEmitter {
             }
 
             String globalName = "gv_" + LlvmTypeMapper.sanitizeIdentifier(fullName);
-            sb.append("@").append(globalName).append(" = global ").append(llvmType)
+            sb.append("@").append(globalName).append(" = linkonce_odr global ").append(llvmType)
                 .append(" ").append(init).append(", align 8\n");
         }
         sb.append("\n");
@@ -1951,6 +2037,30 @@ public class LlvmGlobalEmitter {
         if (s != null && !s.isEmpty()) {
             deferredStrings.add(s);
         }
+    }
+
+    /**
+     * Resolves the LLVM type of a deferred string constant by its global
+     * name (e.g. {@code .str.abcdef}), or {@code null} when the string was
+     * never registered.
+     *
+     * <p>Used by {@link LlvmGenerator} when a per-class body references a
+     * deferred {@code .str.<hex>} constant: the definition lives in
+     * {@code _module.ll}, so the class file needs an {@code external}
+     * declaration for it. The name alone does not carry the byte length, so
+     * the type has to be recovered from the registered string itself.</p>
+     */
+    public String deferredStringGlobalType(String globalName) {
+        synchronized (deferredStrings) {
+            String withAt = "@" + globalName;
+            for (String s : deferredStrings) {
+                if (LlvmRuntime.typeStringGlobalName(s).equals(withAt)) {
+                    int len = LlvmRuntime.typeStringArrayLength(s);
+                    return "[" + len + " x i8]";
+                }
+            }
+        }
+        return null;
     }
 
     public String generateDeferredStringConstants() {
@@ -2392,7 +2502,7 @@ public class LlvmGlobalEmitter {
             int payloadLen = len + 1;   // NUL terminator is part of the array
 
             sb.append("@").append(bytesGlobal)
-                    .append(" = private unnamed_addr constant { i8*, i32, i32, [")
+                    .append(" = linkonce_odr unnamed_addr constant { i8*, i32, i32, [")
                     .append(payloadLen).append(" x i8] } {\n")
                     .append("  i8* bitcast (%ReflectionClass* ").append(byteArrayKlassRef)
                     .append(" to i8*),\n")
@@ -2425,7 +2535,7 @@ public class LlvmGlobalEmitter {
              * i1 is left false for the same reason.
              */
             sb.append("@").append(objGlobal)
-                    .append(" = global %struct.java_lang_String {\n")
+                    .append(" = linkonce_odr global %struct.java_lang_String {\n")
                     .append("  i8* bitcast (%JNativeVTable* ").append(vtableName).append(" to i8*),\n")
                     .append("  i8* bitcast ({ i8*, i32, i32, [").append(payloadLen)
                     .append(" x i8] }* @").append(bytesGlobal).append(" to i8*),\n")
@@ -2438,13 +2548,13 @@ public class LlvmGlobalEmitter {
         }
 
         int n = stringLiteralPool.size();
-        sb.append("@__jnative_literal_pool = constant [").append(n).append(" x i8*] [");
+        sb.append("@__jnative_literal_pool = linkonce_odr constant [").append(n).append(" x i8*] [");
         for (int i = 0; i < n; i++) {
             if (i > 0) sb.append(", ");
             sb.append("i8* bitcast (%struct.java_lang_String* @").append(stringLiteralPool.get(i)).append(" to i8*)");
         }
         sb.append("], align 8\n");
-        sb.append("@__jnative_literal_pool_size = constant i32 ").append(n).append("\n");
+        sb.append("@__jnative_literal_pool_size = linkonce_odr constant i32 ").append(n).append("\n");
         return sb.toString();
     }
 
@@ -2543,7 +2653,7 @@ public class LlvmGlobalEmitter {
                 sorted.addFirst(ownVtable);
             }
 
-            sb.append(typeInfoName).append(" = constant [")
+            sb.append(typeInfoName).append(" = linkonce_odr constant [")
                 .append(sorted.size() + 1).append(" x i8*] [");
             for (int i = 0; i < sorted.size(); i++) {
                 if (i > 0) sb.append(", ");
@@ -2783,53 +2893,6 @@ public class LlvmGlobalEmitter {
         StringBuilder sb = new StringBuilder();
         StringBuilder strConsts = new StringBuilder();
         sb.append("\n; ----- Reflection data -----\n");
-
-        sb.append("%ReflectionMethod = type { i8*, i8*, i8*, i32 }\n");
-        sb.append("%ReflectionField = type { i8*, i8*, i32, i32 }\n");
-        sb.append("%ReflectionConstructor = type { i8*, i8*, i32 }\n");
-        // Must stay in lockstep with `struct ReflectionClass` in
-        // jnative_runtime.h and with the @refclass_* constant emission below.
-        //
-        // Layout:
-        //   [0]  %JNativeVTable*      vtable
-        //   [1]  i8*                  name (Java String cache, kept null)
-        //   [2]  %ReflectionClass*    superclass
-        //   [3]  %ReflectionClass**   interfaces
-        //   [4]  %ReflectionMethod**  methods
-        //   [5]  %ReflectionField**   fields
-        //   [6]  %ReflectionConstructor** constructors
-        //   [7]  i32                  modifiers
-        //   [8]  i32                  objectSize
-        //   [9]  i8*                  cname (const char*, internal name)
-        //   [10] i8*                  classLoader           (always null)
-        //   [11] i8*                  module                (always null)
-        //   [12] i8*                  componentType         (always null)
-        //   [13] i8*                  packageName           (always null)
-        //   [14] i8*                  enumConstants         (always null)
-        //   [15] i8*                  annotationData        (always null)
-        //   [16] i8*                  genericInfo           (always null)
-        //   [17] i8*                  reflectionData        (always null)
-        //   [18] i8*                  classValueMap         (always null)
-        //   [19] i8*                  enumConstantDirectory (always null)
-        //   [20..27] i8*              reserved[8]           (always null)
-        //
-        // The nine named tail slots, enumConstantDirectory, and the eight
-        // reserved slots exist because generated bytecode under
-        // java.lang.Class reads them. checkPackageAccessForPermitted
-        // Subclasses reads classLoader, getEnumConstantsShared reads
-        // enumConstants, enumConstantDirectory reads/writes
-        // enumConstantDirectory, getAnnotation / getDeclaredAnnotations
-        // read annotationData, and the ReflectionData machinery reads
-        // reflectionData. The reserved tail is the fallback landing pad
-        // for any further Class field the emitter has not enumerated yet
-        // — see getFieldOffset() for the routing and the class-level
-        // javadoc on ReflectionClass in jnative_runtime.h for the
-        // rationale.
-        sb.append("%ReflectionClass = type { %JNativeVTable*, i8*, %ReflectionClass*, %ReflectionClass**, "
-            + "%ReflectionMethod**, %ReflectionField**, %ReflectionConstructor**, i32, i32, i8*, "
-            + "i8*, i8*, i8*, i8*, i8*, i8*, i8*, i8*, i8*, i8*, "
-            + "i8*, i8*, i8*, i8*, i8*, i8*, i8*, i8* }\n");
-        sb.append("%JNativeSymbolClassEntry = type { i8*, %ReflectionClass* }\n");
 
         String classVtableRef = vtableNames.get("java/lang/Class");
         if (classVtableRef == null) {
@@ -3240,7 +3303,7 @@ public class LlvmGlobalEmitter {
                 if (mn != null) modifiers = mn.getAccess();
 
                 String methodVar = "@refmethod_" + cleanClassName + "_" + mangledSuffix;
-                sb.append(methodVar).append(" = constant %ReflectionMethod { i8* ")
+                sb.append(methodVar).append(" = linkonce_odr constant %ReflectionMethod { i8* ")
                     .append(ensureStringConstantPtr(strConsts, methodName))
                     .append(", i8* ").append(ensureStringConstantPtr(strConsts, desc))
                     .append(", ").append(adaptorPtr)
@@ -3311,7 +3374,7 @@ public class LlvmGlobalEmitter {
                 }
 
                 String fieldVar = "@reffield_" + cleanClassName + "_" + fieldName;
-                sb.append(fieldVar).append(" = constant %ReflectionField { i8* ")
+                sb.append(fieldVar).append(" = linkonce_odr constant %ReflectionField { i8* ")
                     .append(ensureStringConstantPtr(strConsts, fieldName))
                     .append(", i8* ")
                     .append(desc != null ? ensureStringConstantPtr(strConsts, desc) : "null")
@@ -3359,7 +3422,7 @@ public class LlvmGlobalEmitter {
                 if (mn != null) modifiers = mn.getAccess();
 
                 String ctorVar = "@refctor_" + cleanClassName + "_" + mangledDesc;
-                sb.append(ctorVar).append(" = constant %ReflectionConstructor { i8* ")
+                sb.append(ctorVar).append(" = linkonce_odr constant %ReflectionConstructor { i8* ")
                     .append(ensureStringConstantPtr(strConsts, desc))
                     .append(", ").append(adaptorPtr)
                     .append(", i32 ").append(modifiers).append(" }\n");
@@ -3391,7 +3454,7 @@ public class LlvmGlobalEmitter {
                 if (ifaceVar != null) ifacePtrs.add(ifaceVar);
             }
             String ifacesArray = "@refifaces_" + cleanClassName;
-            sb.append(ifacesArray).append(" = constant [")
+            sb.append(ifacesArray).append(" = linkonce_odr constant [")
                 .append(ifacePtrs.size() + 1).append(" x %ReflectionClass*] [");
             for (String p : ifacePtrs) sb.append("%ReflectionClass* ").append(p).append(", ");
             sb.append("%ReflectionClass* null]\n");
@@ -3487,7 +3550,7 @@ public class LlvmGlobalEmitter {
             // construction (a String's contents never change after
             // construction), so they too remain `constant`.
             // =================================================================
-            sb.append(classVarName).append(" = global %ReflectionClass { %JNativeVTable* ")
+            sb.append(classVarName).append(" = linkonce_odr global %ReflectionClass { %JNativeVTable* ")
                 .append(classVtableRef)
                 // name — always null. The bytecode of Class.getName() reads
                 // this field, tests it for null and falls back to the native
@@ -3557,7 +3620,7 @@ public class LlvmGlobalEmitter {
             classPtrs.add("%ReflectionClass* " + classVarName);
         }
 
-        sb.append("@reflect_all_classes = constant [")
+        sb.append("@reflect_all_classes = linkonce_odr constant [")
             .append(classPtrs.size() + 1).append(" x %ReflectionClass*] [");
         for (String p : classPtrs) sb.append(p).append(", ");
         sb.append("%ReflectionClass* null]\n");
@@ -3601,13 +3664,13 @@ public class LlvmGlobalEmitter {
         sb.append("\n; ----- Symbol-to-class map (for Reflection.getCallerClass) -----\n");
 
         if (map.isEmpty()) {
-            sb.append("@jnative_symbol_class_map = constant [1 x %JNativeSymbolClassEntry] ["
+            sb.append("@jnative_symbol_class_map = linkonce_odr constant [1 x %JNativeSymbolClassEntry] ["
                 + "%JNativeSymbolClassEntry { i8* null, %ReflectionClass* null }]\n");
-            sb.append("@jnative_symbol_class_map_size = constant i64 0\n");
+            sb.append("@jnative_symbol_class_map_size = linkonce_odr constant i64 0\n");
             return sb.toString();
         }
 
-        sb.append("@jnative_symbol_class_map = constant [")
+        sb.append("@jnative_symbol_class_map = linkonce_odr constant [")
             .append(map.size() + 1)
             .append(" x %JNativeSymbolClassEntry] [\n");
         for (Map.Entry<String, String> e : map.entrySet()) {
@@ -3621,7 +3684,7 @@ public class LlvmGlobalEmitter {
         }
         sb.append("  %JNativeSymbolClassEntry { i8* null, %ReflectionClass* null }\n");
         sb.append("]\n");
-        sb.append("@jnative_symbol_class_map_size = constant i64 ")
+        sb.append("@jnative_symbol_class_map_size = linkonce_odr constant i64 ")
             .append(map.size()).append("\n");
         return sb.toString();
     }
@@ -3658,24 +3721,24 @@ public class LlvmGlobalEmitter {
         sb.append("\n; ----- Caller-sensitive symbols (for Reflection.getCallerClass) -----\n");
 
         if (symbols.isEmpty()) {
-            sb.append("@jnative_caller_sensitive_symbols = constant [1 x i8*] [i8* null]\n");
-            sb.append("@jnative_caller_sensitive_symbols_size = constant i64 0\n");
+            sb.append("@jnative_caller_sensitive_symbols = linkonce_odr constant [1 x i8*] [i8* null]\n");
+            sb.append("@jnative_caller_sensitive_symbols_size = linkonce_odr constant i64 0\n");
             return sb.toString();
         }
 
-        sb.append("@jnative_caller_sensitive_symbols = constant [")
+        sb.append("@jnative_caller_sensitive_symbols = linkonce_odr constant [")
             .append(symbols.size() + 1).append(" x i8*] [\n");
         for (String sym : symbols) {
             sb.append("  i8* ").append(ensureStringConstantPtr(strConsts, sym)).append(",\n");
         }
         sb.append("  i8* null\n]\n");
-        sb.append("@jnative_caller_sensitive_symbols_size = constant i64 ")
+        sb.append("@jnative_caller_sensitive_symbols_size = linkonce_odr constant i64 ")
             .append(symbols.size()).append("\n");
         return sb.toString();
     }
 
     private void appendNullTerminatedPtrArray(StringBuilder sb, String arrayName, List<String> ptrs) {
-        sb.append(arrayName).append(" = constant [")
+        sb.append(arrayName).append(" = linkonce_odr constant [")
             .append(ptrs.size() + 1).append(" x i8*] [");
         for (String ptr : ptrs) sb.append(ptr).append(", ");
         sb.append("i8* null]\n");

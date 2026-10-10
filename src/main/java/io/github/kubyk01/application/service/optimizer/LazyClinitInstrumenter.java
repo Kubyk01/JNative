@@ -247,6 +247,7 @@ public class LazyClinitInstrumenter {
             }
 
             Function wrapper = new Function(wrapperName, Type.VOID);
+            wrapper.setOwnerClass(className);
             module.addFunction(wrapper);
             classToWrapper.put(className, wrapperName);
             wrapperNames.add(wrapperName);

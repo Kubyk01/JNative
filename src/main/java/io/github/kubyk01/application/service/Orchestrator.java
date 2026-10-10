@@ -385,20 +385,30 @@ public class Orchestrator implements OrchestratorPort {
         llvmGen.setEmbeddedResources(embedded);
         llvmGen.setCores(effectiveCores);
 
-        String llvmIR = llvmGen.generate();
-        Path llPath = Paths.get("output.ll");
+        Path genDir = Paths.get("target", "generated-jnative");
         try {
-            Files.write(llPath, llvmIR.getBytes());
-            System.out.println("LLVM IR written to output.ll");
+            llvmGen.generate(genDir);
         } catch (IOException e) {
-            log.error("Failed to write LLVM IR", e);
+            log.error("Failed to write generated IR", e);
+            return;
         }
+
+        List<Path> llPaths = new ArrayList<>();
+        try (var stream = Files.walk(genDir)) {
+            stream.filter(p -> p.toString().endsWith(".ll"))
+                  .sorted()
+                  .forEach(llPaths::add);
+        } catch (IOException e) {
+            log.error("Failed to enumerate generated IR files under {}", genDir, e);
+            return;
+        }
+        System.out.println("Generated " + llPaths.size() + " LLVM IR file(s) in " + genDir);
 
         // --- 11. Native compilation ---------------------------------------
         if (!noCompile) {
             Path exePath = outputFile != null ? Paths.get(outputFile) : Paths.get("a.out");
             try {
-                compiler.compileAndLink(llPath, exePath, usedSystemClasses, module,
+                compiler.compileAndLink(llPaths, exePath, usedSystemClasses, module,
                         resolver, effectiveCores, optimizationLevel);
                 System.out.println("Native executable built successfully: "
                         + exePath.toAbsolutePath());

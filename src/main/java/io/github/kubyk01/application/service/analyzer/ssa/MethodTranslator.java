@@ -105,6 +105,7 @@ public class MethodTranslator extends MethodVisitor {
         }
 
         currentFunction = builder.createFunctionWithSlots(mangledName, returnType, params);
+        currentFunction.setOwnerClass(methodRef.getOwner());
 
         for (Parameter p : params) {
             frame.setLocal(p.getIndex(), p);

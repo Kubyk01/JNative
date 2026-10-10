@@ -11,7 +11,7 @@ public class Test {
             var x = new Test2(i);
         }
 
-        throw new IllegalArgumentException("test");
+        System.out.println("done" + Thread.currentThread() + "x");
     }
 }
 

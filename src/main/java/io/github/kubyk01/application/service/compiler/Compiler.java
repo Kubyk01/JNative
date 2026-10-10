@@ -17,9 +17,7 @@ import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashSet;
-import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -60,25 +58,25 @@ import java.util.concurrent.atomic.AtomicInteger;
  * <p>Two parallel phases are involved:</p>
  *
  * <ol>
- *   <li>Every C source in the build — {@code jnative_runtime.c} and each
- *       per-class native file — is compiled into an LLVM bitcode object
- *       in parallel by an independent compiler process. The number of
- *       concurrent compiler processes is bounded by the caller-supplied
- *       {@code cores} value.</li>
+ *   <li>Every translation unit in the build — {@code jnative_runtime.c},
+ *       each per-class native file, and each per-class LLVM IR module
+ *       produced by {@code LlvmGenerator} — is compiled into an LLVM
+ *       bitcode object in parallel by an independent compiler process.
+ *       The number of concurrent compiler processes is bounded by the
+ *       caller-supplied {@code cores} value.</li>
  *
- *   <li>The heavy link-time optimization runs via ThinLTO. Because the
- *       whole module is a single LLVM translation unit,
- *       {@code clang -O<n> file.ll} cannot parallelize on its own;
- *       {@code -flto=thin -Wl,--thinlto-jobs=N} hands the optimization
- *       to the ThinLTO backend, which splits the module into partitions
- *       and optimizes them across {@code N} worker threads.</li>
+ *   <li>The heavy link-time optimization runs via ThinLTO. Because every
+ *       object is ThinLTO bitcode over the same merged IR,
+ *       {@code clang -flto=thin -Wl,--thinlto-jobs=N} hands the
+ *       optimization to the ThinLTO backend, which splits the module into
+ *       partitions and optimizes them across {@code N} worker threads.</li>
  * </ol>
  *
- * <p>The generated {@code .ll} is emitted to bitcode with the
+ * <p>The generated {@code .ll} modules are emitted to bitcode with the
  * user-supplied {@code -O<level>}; the expensive passes run only during
- * the link step, where they are parallelized. This two-stage
- * arrangement is what turns a single-threaded {@code clang} invocation
- * into a fully parallel build.</p>
+ * the link step, where they are parallelized. This arrangement is what
+ * turns a single-threaded {@code clang} invocation into a fully parallel
+ * build.</p>
  */
 @Slf4j
 public class Compiler implements CompilerPort {
@@ -110,7 +108,7 @@ public class Compiler implements CompilerPort {
     private static final int MAX_OPT_LEVEL = 3;
 
     @Override
-    public void compileAndLink(Path llPath,
+    public void compileAndLink(List<Path> llPaths,
                                Path exePath,
                                Set<String> usedClasses,
                                Module module,
@@ -158,55 +156,61 @@ public class Compiler implements CompilerPort {
             List<Path> extraSources = extractSystemNativeSources(classesToCompile, tempDir);
 
             // ------------------------------------------------------------------
-            // 3. Build the (source → object) work list. Every object is
-            //    bitcode, ready for the ThinLTO link step.
+            // 3. Build the (source → object) work list. Every compiled unit —
+            //    the runtime C file, each per-class native C file, and each
+            //    generated .ll module — becomes an LLVM bitcode object that
+            //    participates in the same single ThinLTO link step.
             // ------------------------------------------------------------------
-            Map<Path, Path> srcToObj = new LinkedHashMap<>();
-            srcToObj.put(runtimeSource, tempDir.resolve("jnative_runtime.o"));
+            List<CompileTask> tasks = new ArrayList<>();
+
+            // ------------------------------------------------------------------
+            // 3a. C sources — runtime + per-class natives. They live under
+            //     c/ so the object naming is predictable and never collides
+            //     with the IR objects under ir/.
+            // ------------------------------------------------------------------
+            Path cDir = tempDir.resolve("c");
+            Files.createDirectories(cDir);
+
+            Path runtimeObj = cDir.resolve("jnative_runtime.o");
+            tasks.add(new CompileTask(runtimeSource, runtimeObj, false));
+
             for (Path src : extraSources) {
-                Path obj = src.getParent().resolve(
-                    src.getFileName().toString().replaceAll("\\.c$", ".o"));
-                srcToObj.put(src, obj);
+                // Duplicate basenames (different packages, same class name)
+                // must not overwrite each other — mirror the source's path
+                // under c/.
+                Path rel = tempDir.relativize(src);
+                Path objWithPath = cDir.resolve(
+                    rel.toString().replaceAll("\\.c$", ".o"));
+                Files.createDirectories(objWithPath.getParent());
+                tasks.add(new CompileTask(src, objWithPath, false));
             }
 
-            int toCompile = srcToObj.size();
+            // ------------------------------------------------------------------
+            // 3b. LLVM IR files (one per class + _module.ll). Object names are
+            //     sanitized ($, ':', whitespace) and made unique with an index.
+            // ------------------------------------------------------------------
+            List<Path> llObjPaths = new ArrayList<>(llPaths.size());
+            int irIndex = 0;
+            for (Path ll : llPaths) {
+                String base = sanitizeForObjName(ll.getFileName().toString());
+                // The index guarantees uniqueness even if two classes collide
+                // after sanitizing (e.g. Foo$Bar and Foo_Bar).
+                Path obj = tempDir.resolve("ir")
+                    .resolve(String.format("%05d_%s.o", irIndex++, base));
+                tasks.add(new CompileTask(ll, obj, true));
+                llObjPaths.add(obj);
+            }
+
+            int toCompile = tasks.size();
             int threadCount = Math.min(effectiveCores, toCompile);
-            System.out.println("Compiling " + toCompile + " C source(s) using "
+            System.out.println("Compiling " + toCompile + " translation unit(s) using "
                 + threadCount + " thread(s) (ThinLTO bitcode, -O"
                 + effectiveOptLevel + ")...");
 
-            compileAllSources(compiler, srcToObj, tempDir, threadCount, effectiveOptLevel);
+            compileAll(compiler, tasks, tempDir, threadCount, effectiveOptLevel);
 
             // ------------------------------------------------------------------
-            // 4. Compile the generated LLVM IR to bitcode. The
-            //    optimization level is user-controlled; the default of 2
-            //    is a cheap pass that mostly normalizes the IR so the
-            //    expensive work can be scheduled at link time under
-            //    ThinLTO.
-            // ------------------------------------------------------------------
-            Path objPath = tempDir.resolve(exePath.getFileName().toString() + ".o");
-            List<String> irCommand = new ArrayList<>();
-            irCommand.add(compiler);
-            irCommand.add("-c");
-            irCommand.add("-O" + effectiveOptLevel);
-            irCommand.add("-flto=thin");
-            irCommand.add("-g");
-            irCommand.add("-fno-omit-frame-pointer");
-            irCommand.add("-I" + tempDir);
-            irCommand.add(llPath.toString());
-            irCommand.add("-o");
-            irCommand.add(objPath.toString());
-
-            ProcessBuilder irBuilder = new ProcessBuilder(irCommand);
-            irBuilder.inheritIO();
-            int exit = irBuilder.start().waitFor();
-            if (exit != 0) {
-                throw new RuntimeException(
-                    "Compilation of generated LLVM IR to bitcode failed with exit code " + exit);
-            }
-
-            // ------------------------------------------------------------------
-            // 5. Link with ThinLTO. The link driver reads every bitcode
+            // 4. Link with ThinLTO. The link driver reads every bitcode
             //    object, hands the merged module to the ThinLTO backend,
             //    and the backend splits it into partitions and runs the
             //    requested optimization level over them across
@@ -218,9 +222,8 @@ public class Compiler implements CompilerPort {
             linkCmd.add("-fuse-ld=lld");
             linkCmd.add("-O" + effectiveOptLevel);
             linkCmd.add("-Wl,--thinlto-jobs=" + effectiveCores);
-            linkCmd.add(objPath.toString());
-            for (Path obj : srcToObj.values()) {
-                linkCmd.add(obj.toString());
+            for (CompileTask task : tasks) {
+                linkCmd.add(task.obj.toString());
             }
             linkCmd.add("-o");
             linkCmd.add(exePath.toString());
@@ -247,7 +250,7 @@ public class Compiler implements CompilerPort {
 
             ProcessBuilder linkBuilder = new ProcessBuilder(linkCmd);
             linkBuilder.inheritIO();
-            exit = linkBuilder.start().waitFor();
+            int exit = linkBuilder.start().waitFor();
             if (exit != 0) {
                 throw new RuntimeException("Linking failed with exit code " + exit);
             }
@@ -286,7 +289,48 @@ public class Compiler implements CompilerPort {
     // =========================================================================
 
     /**
-     * Compiles every (source → object) pair using a fixed-size thread pool.
+     * One compilation unit in the build: either a C source of the runtime /
+     * per-class native files, or a generated LLVM IR module.
+     */
+    private static final class CompileTask {
+
+        private final Path src;
+        private final Path obj;
+        private final boolean isIr;
+
+        CompileTask(Path src, Path obj, boolean isIr) {
+            this.src = src;
+            this.obj = obj;
+            this.isIr = isIr;
+        }
+    }
+
+    /**
+     * Returns a filesystem-safe form of a Java class-file basename for use
+     * as the base of an object-file name.
+     *
+     * <p>Replaces every character outside {@code [A-Za-z0-9._-]} with
+     * {@code '_'}. This is enough to cover {@code $} in nested-class names,
+     * the {@code :} that appears in some Windows-style internal names, and
+     * any stray whitespace that the class-file format technically
+     * permits.</p>
+     */
+    private static String sanitizeForObjName(String name) {
+        StringBuilder sb = new StringBuilder(name.length());
+        for (int i = 0; i < name.length(); i++) {
+            char c = name.charAt(i);
+            if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+                || (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-') {
+                sb.append(c);
+            } else {
+                sb.append('_');
+            }
+        }
+        return sb.toString();
+    }
+
+    /**
+     * Compiles every task using a fixed-size thread pool.
      *
      * <p>Work is distributed through a shared atomic counter rather than a
      * pre-partitioned queue: a slow translation unit (say, a per-class
@@ -300,19 +344,16 @@ public class Compiler implements CompilerPort {
      * left running after the method returns, and the original exception
      * is rethrown wrapped in a {@link RuntimeException}.</p>
      */
-    private void compileAllSources(String compiler,
-                                   Map<Path, Path> srcToObj,
-                                   Path includeDir,
-                                   int threadCount,
-                                   int optimizationLevel)
+    private void compileAll(String compiler,
+                            List<CompileTask> tasks,
+                            Path includeDir,
+                            int threadCount,
+                            int optimizationLevel)
         throws IOException, InterruptedException {
 
-        List<Map.Entry<Path, Path>> tasks = new ArrayList<>(srcToObj.entrySet());
-
         if (threadCount <= 1 || tasks.size() <= 1) {
-            for (Map.Entry<Path, Path> e : tasks) {
-                compileCSource(compiler, e.getKey(), e.getValue(), includeDir,
-                    optimizationLevel);
+            for (CompileTask task : tasks) {
+                compileOne(compiler, task, includeDir, optimizationLevel);
             }
             return;
         }
@@ -332,10 +373,9 @@ public class Compiler implements CompilerPort {
             futures.add(pool.submit(() -> {
                 int idx;
                 while ((idx = nextTask.getAndIncrement()) < tasks.size()) {
-                    Map.Entry<Path, Path> e = tasks.get(idx);
+                    CompileTask task = tasks.get(idx);
                     try {
-                        compileCSource(compiler, e.getKey(), e.getValue(),
-                            includeDir, optimizationLevel);
+                        compileOne(compiler, task, includeDir, optimizationLevel);
                     } catch (Throwable t) {
                         failures.add(t);
                     }
@@ -365,7 +405,7 @@ public class Compiler implements CompilerPort {
         if (!failures.isEmpty()) {
             Throwable first = failures.getFirst();
             throw new RuntimeException(
-                "C compilation failed for " + failures.size()
+                "Compilation failed for " + failures.size()
                     + " translation unit(s); first failure: " + first.getMessage(),
                 first);
         }
@@ -402,16 +442,32 @@ public class Compiler implements CompilerPort {
     }
 
     // =========================================================================
-    //  Compilation of a single C source
+    //  Compilation of a single unit
     // =========================================================================
 
-    private void compileCSource(String compiler, Path src, Path obj, Path includeDir,
-                                int optimizationLevel)
+    /**
+     * Compiles one task into an LLVM bitcode object. C sources are passed
+     * with {@code -x c}; generated LLVM IR modules with {@code -x ir}.
+     * Every object participates in the same ThinLTO link step.
+     */
+    private void compileOne(String compiler, CompileTask task, Path includeDir,
+                            int optimizationLevel)
         throws IOException, InterruptedException {
+
+        // clang does not create intermediate directories for -o. The object
+        // path of a per-class IR file mirrors the class's package path, so
+        // the directory must be created explicitly — otherwise the build
+        // fails with "No such file or directory".
+        Path parent = task.obj.getParent();
+        if (parent != null) {
+            Files.createDirectories(parent);
+        }
 
         List<String> command = new ArrayList<>();
         command.add(compiler);
         command.add("-c");
+        command.add("-x");
+        command.add(task.isIr ? "ir" : "c");
         command.add("-O" + optimizationLevel);
         // Emit LLVM bitcode for ThinLTO. Every translation unit (including
         // the runtime itself) participates in the same link-time
@@ -419,17 +475,24 @@ public class Compiler implements CompilerPort {
         command.add("-flto=thin");
         command.add("-g");
         command.add("-fno-omit-frame-pointer");
-        command.add("-I" + includeDir.toString());
-        command.add(src.toString());
+
+        // -I only makes sense for C sources. For the IR frontend clang
+        // prints "argument unused during compilation" for every file, which
+        // turns the log of 3000+ files into noise.
+        if (!task.isIr) {
+            command.add("-I" + includeDir.toString());
+        }
+
+        command.add(task.src.toString());
         command.add("-o");
-        command.add(obj.toString());
+        command.add(task.obj.toString());
 
         ProcessBuilder pb = new ProcessBuilder(command);
         pb.inheritIO();
         int exit = pb.start().waitFor();
         if (exit != 0) {
             throw new RuntimeException(
-                "Compilation of " + src + " failed with exit code " + exit);
+                "Compilation of " + task.src + " failed with exit code " + exit);
         }
     }
 

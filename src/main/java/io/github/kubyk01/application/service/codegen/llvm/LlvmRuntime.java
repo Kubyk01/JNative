@@ -227,7 +227,7 @@ public class LlvmRuntime {
      *
      * <p>The emitted constant has the shape:</p>
      * <pre>
-     *   @.str.&lt;hex&gt; = private unnamed_addr constant [N x i8] c"&lt;escaped&gt;\00"
+     *   @.str.&lt;hex&gt; = linkonce_odr unnamed_addr constant [N x i8] c"&lt;escaped&gt;\00"
      * </pre>
      * <p>with every byte that LLVM's string-literal syntax cannot represent
      * directly escaped in {@code \XX} form. Printable ASCII passes through
@@ -255,7 +255,7 @@ public class LlvmRuntime {
                 }
             }
         }
-        return typeStringGlobalName(s) + " = private unnamed_addr constant ["
+        return typeStringGlobalName(s) + " = linkonce_odr unnamed_addr constant ["
             + (bytes.length + 1) + " x i8] c\"" + escaped + "\\00\"\n";
     }
 

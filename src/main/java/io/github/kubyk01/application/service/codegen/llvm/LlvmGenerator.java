@@ -30,16 +30,19 @@ import lombok.extern.slf4j.Slf4j;
 import org.objectweb.asm.Handle;
 import org.objectweb.asm.Opcodes;
 
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
-import java.util.concurrent.TimeUnit;
 
 import static io.github.kubyk01.util.LlvmUtil.getElementSizeOfType;
 
@@ -54,15 +57,14 @@ public class LlvmGenerator {
     private final String entryDescriptor;
 
     private final LlvmGlobalEmitter globalEmitter;
-    private final LlvmFunctionEmitter functionEmitter;
 
     /**
      * The polymorphic-resolver instance handed to the constructor.
      *
      * <p>It is stored as a {@code final} field so that the
-     * {@link ThreadLocal} factory inside {@link #emitFunctions(List)}
-     * can capture it. Keeping it {@code final} makes the compiler
-     * reject any future revision that forgets to initialise it.</p>
+     * {@link ThreadLocal} factory inside {@link #generate()} can capture
+     * it. Keeping it {@code final} makes the compiler reject any future
+     * revision that forgets to initialise it.</p>
      */
     private final PolymorphicResolver polymorphicResolverRef;
 
@@ -75,9 +77,11 @@ public class LlvmGenerator {
      *
      * <p>The value is set by {@link
      * io.github.kubyk01.application.service.Orchestrator} through
-     * {@link #setCores(int)}; it is never derived here. The default of 1
-     * keeps the class usable in tests and in any code path that emits a
-     * trivial module without an explicit core budget.</p>
+     * {@link #setCores(int)}; it is never derived here. This revision
+     * emits function bodies sequentially (parallelism kicked to the clang
+     * stage), but the setter and its default of 1 are kept for API
+     * compatibility — the field is documented as a hint rather than a
+     * hard budget.</p>
      */
     private int cores = 1;
 
@@ -132,8 +136,6 @@ public class LlvmGenerator {
         this.entryDescriptor = entryDescriptor;
         this.reflectInfo = reflectInfo;
         this.globalEmitter = new LlvmGlobalEmitter(module, resolver, aliasResult, reflectInfo);
-        this.functionEmitter = new LlvmFunctionEmitter(
-            module, globalEmitter, polymorphicResolver, resolver);
         this.polymorphicResolverRef = polymorphicResolver;
     }
 
@@ -147,142 +149,356 @@ public class LlvmGenerator {
         return wrapper != null ? wrapper : realClinitName;
     }
 
-    public String generate() {
+    public void generate(Path outputDir) throws IOException {
+        Files.createDirectories(outputDir);
         ensureExternalDeclarations();
-
-        StringBuilder sb = new StringBuilder();
-
-        sb.append("target datalayout = \"e-m:e-p270:32:32-p271:64:64-i64:64-f80:128-n8:16:32:64-S128\"\n");
-        sb.append("target triple = \"x86_64-pc-linux-gnu\"\n\n");
-
-        sb.append(LlvmRuntime.getVtableTypeDefinition());
-        sb.append("\n");
-
-        sb.append(LlvmRuntime.getDeclarations());
-
         generateLambdaAdaptors();
-
-        globalEmitter.emitExtraStructs(sb);
-
-        sb.append(globalEmitter.emitLambdaVtables());
-        sb.append("\n");
-
-        sb.append(globalEmitter.generateGlobals());
-
-        // Freeze every lazily-built cache in LlvmGlobalEmitter before the
-        // parallel phase. After this call, classLayouts / interfaceLayouts /
-        // interfaceIds are complete and no longer written to.
         globalEmitter.prepareLayouts();
 
-        List<Function> functionsCopy = new ArrayList<>(module.getFunctions());
-        List<Function> toEmit = new ArrayList<>(functionsCopy.size());
-        for (Function func : functionsCopy) {
-            if (func.getEntryBlock() != null) {
-                toEmit.add(func);
+        String structDefs = globalEmitter.generateStructDefinitions();
+        String globalDefs = globalEmitter.generateGlobalDefinitions();
+        String lambdaVts  = globalEmitter.emitLambdaVtables();
+        String staticPrelude = buildStaticPrelude(structDefs);
+
+        // ---- 1. Emit EVERY function body, grouped by owner class. The
+        //         bodies are accumulated in memory rather than streamed,
+        //         because the deferred strings they register are only known
+        //         once emission is finished. (Typically tens-to-hundreds of
+        //         MB, which fits the heap.) ----
+        List<Function> toEmit = new ArrayList<>();
+        for (Function f : module.getFunctions()) {
+            if (f.getEntryBlock() != null) toEmit.add(f);
+        }
+        toEmit.sort(Comparator.comparing(f ->
+            f.getOwnerClass() == null ? "" : f.getOwnerClass()));
+
+        LlvmFunctionEmitter emitter = new LlvmFunctionEmitter(
+            module, globalEmitter, polymorphicResolverRef, resolver);
+
+        Map<String, StringBuilder> classBodies = new LinkedHashMap<>();
+        StringBuilder moduleBodies = new StringBuilder();
+
+        for (Function func : toEmit) {
+            String body = emitter.emitFunction(func);
+            String owner = func.getOwnerClass();
+            if (owner != null && !owner.isEmpty()) {
+                classBodies.computeIfAbsent(owner, k -> new StringBuilder()).append(body);
+            } else {
+                moduleBodies.append(body);
             }
         }
 
-        for (String body : emitFunctions(toEmit)) {
-            sb.append(body);
-        }
+        // ---- 2. Deferred strings are now fully known. Collect them. ----
+        String deferred = globalEmitter.generateDeferredStringConstants();
 
+        // ---- 3. knownGlobals = every definition that lives in _module.ll,
+        //         deferred strings included. ----
+        Map<String, GlobalDecl> knownGlobals =
+            parseGlobalDecls(globalDefs + "\n" + lambdaVts + "\n" + deferred);
+
+        // ---- 4. Functions without bodies: declarations for _module.ll. ----
+        //         moduleAvailable = everything already defined OR declared in
+        //         _module.ll; the module extern pass must skip these, because
+        //         LLVM rejects both a redeclaration and a declaration of a
+        //         locally-defined symbol ("invalid redefinition of function"). ----
+        StringBuilder moduleDecls = new StringBuilder();
+        Set<String> moduleAvailable = new HashSet<>();
+        for (Function f : toEmit) {
+            if (f.getOwnerClass() == null || f.getOwnerClass().isEmpty()) {
+                moduleAvailable.add(f.getName());
+            }
+        }
         for (Function func : new ArrayList<>(module.getFunctions())) {
-            if (func.getEntryBlock() == null) {
-                sb.append(emitDeclaration(func));
+            if (func.getEntryBlock() == null
+                && moduleAvailable.add(func.getName())) {
+                moduleDecls.append(emitDeclaration(func));
             }
         }
 
-        sb.append(globalEmitter.generateDeferredStringConstants());
+        // ---- 5. Write _module.ll. Every global lives in this file, so its
+        //         extern block must NOT re-declare globals (LLVM rejects a
+        //         declaration followed by a definition of the same symbol);
+        //         it only declares referenced functions defined elsewhere. ----
+        String main = generateMain();
+        String moduleExterns = buildExterns(
+            moduleBodies.toString() + main,
+            moduleAvailable,
+            Collections.emptyMap(),
+            module);
 
-        sb.append(generateMain());
+        StringBuilder moduleSb = new StringBuilder(
+            staticPrelude.length() + globalDefs.length() + lambdaVts.length()
+            + deferred.length() + moduleBodies.length() + moduleDecls.length()
+            + moduleExterns.length() + main.length() + 65536);
+        moduleSb.append(staticPrelude);
+        moduleSb.append(moduleExterns);       // <-- externs for functions
+        moduleSb.append(globalDefs);
+        moduleSb.append(lambdaVts);
+        moduleSb.append(deferred);            // <-- deferred strings in _module.ll
+        moduleSb.append(moduleBodies);
+        moduleSb.append(moduleDecls);
+        moduleSb.append(main);
 
+        Path modulePath = outputDir.resolve("_module.ll");
+        Files.writeString(modulePath, moduleSb.toString(), StandardCharsets.UTF_8);
+        System.out.println("Wrote " + modulePath + " (" + moduleSb.length() + " chars)");
+
+        // ---- 6. Write per-class files. ----
+        for (Map.Entry<String, StringBuilder> e : classBodies.entrySet()) {
+            String className = e.getKey();
+            String body = e.getValue().toString();
+
+            Set<String> definedHere = new HashSet<>();
+            for (Function f : toEmit) {
+                if (className.equals(f.getOwnerClass())) {
+                    definedHere.add(f.getName());
+                }
+            }
+
+            String externs = buildExterns(body, definedHere, knownGlobals, module);
+
+            StringBuilder sb = new StringBuilder(
+                staticPrelude.length() + externs.length() + body.length() + 256);
+            sb.append(staticPrelude);
+            sb.append(externs);
+            sb.append(body);
+
+            Path out = outputDir.resolve(className + ".ll");
+            if (out.getParent() != null) Files.createDirectories(out.getParent());
+            Files.writeString(out, sb.toString(), StandardCharsets.UTF_8);
+            System.out.println("Wrote " + className + ".ll (" + sb.length() + " chars)");
+        }
+    }
+
+    /**
+     * Static prelude shared by {@code _module.ll} and every per-class file:
+     * datalayout/triple, the vtable ABI types, the runtime function
+     * declarations, the extra (lambda) structs, and the struct type
+     * definitions. Built exactly once.
+     */
+    private String buildStaticPrelude(String structDefs) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("target datalayout = \"e-m:e-p270:32:32-p271:64:64-i64:64-f80:128-n8:16:32:64-S128\"\n");
+        sb.append("target triple = \"x86_64-pc-linux-gnu\"\n\n");
+        sb.append(LlvmRuntime.getVtableTypeDefinition()).append("\n");
+        sb.append(LlvmRuntime.getDeclarations()).append("\n");
+
+        // Extra structs (lambda structs etc., registered by createLambdaAdaptor).
+        StringBuilder extra = new StringBuilder();
+        globalEmitter.emitExtraStructs(extra);
+        sb.append(extra);
+
+        // Struct type definitions, the reflection / resource ABI types, and
+        // the layout constants. They are duplicated into every file; LLVM
+        // unifies types by name. The ABI types (%ReflectionClass and friends)
+        // are referenced by the global definitions in _module.ll, so they
+        // must be present there, and per-class files carry them so body
+        // references resolve regardless of which file they land in.
+        sb.append(structDefs);
+        sb.append(globalEmitter.generateTypeDefinitions());
+        sb.append("\n");
         return sb.toString();
     }
 
     /**
-     * Emits the LLVM IR body of every function in {@code functions}.
-     *
-     * <p>When {@link #cores} is 1 (or there is only one function to emit)
-     * the loop runs on the calling thread and reuses the single
-     * {@link LlvmFunctionEmitter} instance created in the constructor.
-     * Otherwise a fixed-size thread pool is used, with one emitter per
-     * worker thread cached in a {@link ThreadLocal}.</p>
-     *
-     * <p>The returned list preserves the input order — the emitted bodies
-     * are collected via {@link Future#get()} in submission order — so the
-     * output is byte-for-byte identical to the sequential version.</p>
+     * Type of one top-level global as emitted in the textual IR: its LLVM
+     * type string and whether it was declared {@code constant}.
      */
-    private List<String> emitFunctions(List<Function> functions) {
-        int n = functions.size();
-        List<String> results = new ArrayList<>(n);
-        if (n == 0) {
-            return results;
+    private static final class GlobalDecl {
+        final String type;
+        final boolean constant;
+        GlobalDecl(String type, boolean constant) {
+            this.type = type;
+            this.constant = constant;
+        }
+    }
+
+    /**
+     * Parses the textual form our own global emitter produces, mapping each
+     * top-level symbol to its LLVM type and whether it is a {@code constant}.
+     * Only the type string and the const flag are retained; the initializer
+     * is discarded, because the initializer is only ever needed in
+     * {@code _module.ll} which contains the full definitions.
+     *
+     * <p>A single {@code src} string carrying all sources (global defs,
+     * lambda vtables, deferred strings) is parsed in one pass. The parser is
+     * robust to multi-line initializers: after the type token the remainder
+     * of the definition — a brace/bracket-balanced initializer possibly
+     * spanning several lines — is skipped as a unit.</p>
+     *
+     * <p>Every global our emitter produces is now emitted with
+     * {@code linkonce_odr}; the LTO linker therefore unifies definitions
+     * across modules, and per-class files only need a bare {@code external}
+     * declaration for the symbols they touch.</p>
+     */
+    private static Map<String, GlobalDecl> parseGlobalDecls(String src) {
+        Map<String, GlobalDecl> out = new HashMap<>();
+        int i = 0, n = src.length();
+        while (i < n) {
+            // Find the start of a definition line: '@' at column 0.
+            if (src.charAt(i) != '@') {
+                int lineEnd = src.indexOf('\n', i);
+                if (lineEnd < 0) break;
+                i = lineEnd + 1;
+                continue;
+            }
+            int eq = src.indexOf('=', i);
+            int lineEnd = src.indexOf('\n', i);
+            if (eq < 0) break;
+            if (lineEnd >= 0 && lineEnd < eq) {   // '@' not followed by '='
+                i = lineEnd + 1;
+                continue;
+            }
+
+            String name = src.substring(i, eq).trim();
+            int j = eq + 1;
+            int limit = lineEnd >= 0 ? lineEnd : n;
+            while (j < limit && Character.isWhitespace(src.charAt(j))) j++;
+
+            boolean isConst = false;
+            while (j < limit) {
+                int k = matchLinkageKeyword(src, j, limit);
+                if (k < 0) break;
+                String kw = src.substring(j, k);
+                if (kw.equals("constant")) isConst = true;
+                j = k;
+                while (j < limit && Character.isWhitespace(src.charAt(j))) j++;
+            }
+            int typeEnd = scanTypeToken(src, j, limit);
+            if (typeEnd > j && !name.isEmpty()) {
+                out.put(name.substring(1),                       // strip '@'
+                    new GlobalDecl(src.substring(j, typeEnd), isConst));
+            }
+            i = skipInitializer(src, typeEnd > j ? typeEnd : j, n);
+        }
+        return out;
+    }
+
+    /**
+     * Matches one LLVM linkage/precedence keyword at offset {@code i} and
+     * returns the index just past it, or -1 when the next token is not a
+     * keyword. Never scans past {@code limit}.
+     */
+    private static int matchLinkageKeyword(String s, int i, int limit) {
+        String[] kws = {"private","internal","linkonce_odr","weak_odr",
+                        "linkonce","weak","external","common","appending",
+                        "extern_weak","dllimport","dllexport","thread_local",
+                        "unnamed_addr","local_unnamed_addr","constant","global"};
+        for (String kw : kws) {
+            int after = i + kw.length();
+            if (after > limit || after > s.length()) continue;
+            if (!s.regionMatches(i, kw, 0, kw.length())) continue;
+            if (after < s.length() && after != limit
+                && !Character.isWhitespace(s.charAt(after))) continue;
+            return after;
+        }
+        return -1;
+    }
+
+    /**
+     * Scans one LLVM type token starting at offset {@code i}; returns the
+     * index just past the token, or -1 when the position does not hold the
+     * start of a type. Bracketed array/struct types are consumed as a single
+     * balanced unit.
+     */
+    private static int scanTypeToken(String s, int i, int limit) {
+        if (i >= limit) return -1;
+        char c = s.charAt(i);
+        if (c == '[' || c == '{') {
+            char close = (c == '[') ? ']' : '}';
+            int depth = 0;
+            while (i < s.length()) {
+                char ch = s.charAt(i);
+                if (ch == c) depth++;
+                else if (ch == close) { depth--; if (depth == 0) return i + 1; }
+                i++;
+            }
+            return -1;
+        }
+        int start = i;
+        while (i < s.length()) {
+            char ch = s.charAt(i);
+            if (Character.isWhitespace(ch) || ch == ',' || ch == '}' || ch == ']') break;
+            i++;
+        }
+        return i > start ? i : -1;
+    }
+
+    /**
+     * Skips the remainder of a global definition — its initializer, which may
+     * span several lines and contain brace/bracket-balanced literals — so the
+     * next line begins at {@code i}.
+     */
+    private static int skipInitializer(String s, int start, int n) {
+        int depth = 0, i = start;
+        while (i < n) {
+            char c = s.charAt(i);
+            if (c == '{' || c == '[') depth++;
+            else if (c == '}' || c == ']') depth--;
+            else if (c == '\n' && depth == 0) return i + 1;
+            i++;
+        }
+        return i;
+    }
+
+    /**
+     * Scans the emitted body for {@code @symbol} references and emits:
+     *
+     * <ul>
+     *   <li>an {@code external} global/constant declaration for each name
+     *       that maps to a known global defined in {@code _module.ll},</li>
+     *   <li>a {@code declare} line for each referenced function the current
+     *       file does not define ({@code module.getFunction(name)}).</li>
+     * </ul>
+     *
+     * Local SSA names ({@code %...}) and LLVM intrinsics
+     * ({@code @llvm.*}) are ignored.
+     *
+     * <p>The body of a typical class references a few dozen globals, so the
+     * resulting extern block is a few KB rather than the tens of MB that the
+     * whole-module extern list would be.</p>
+     */
+    private String buildExterns(String bodyContent,
+                                Set<String> definedHere,
+                                Map<String, GlobalDecl> knownGlobals,
+                                Module module) {
+        Set<String> used = new HashSet<>();
+        int i = 0, n = bodyContent.length();
+        while ((i = bodyContent.indexOf("@", i)) >= 0) {
+            int j = i + 1;
+            while (j < n) {
+                char c = bodyContent.charAt(j);
+                if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+                    || (c >= '0' && c <= '9') || c == '_' || c == '.') j++;
+                else break;
+            }
+            if (j > i + 1) used.add(bodyContent.substring(i + 1, j));
+            i = j;
         }
 
-        int threadCount = Math.max(1, Math.min(cores, n));
-
-        if (threadCount == 1) {
-            for (Function func : functions) {
-                results.add(functionEmitter.emitFunction(func));
-            }
-            return results;
-        }
-
-        System.out.println("Emitting " + n + " function(s) using "
-            + threadCount + " thread(s)...");
-
-        final PolymorphicResolver polyResolver = this.polymorphicResolverRef;
-        final Module moduleRef = this.module;
-        final LlvmGlobalEmitter globalEmitterRef = this.globalEmitter;
-        final DependencyResolver resolverRef = this.resolver;
-
-        ThreadLocal<LlvmFunctionEmitter> emitterTl = ThreadLocal.withInitial(
-            () -> new LlvmFunctionEmitter(
-                moduleRef, globalEmitterRef, polyResolver, resolverRef));
-
-        // todo remake this to reactor
-        ExecutorService pool = Executors.newFixedThreadPool(threadCount, r -> {
-            Thread t = new Thread(r, "jnative-llvm-emit");
-            t.setDaemon(true);
-            return t;
-        });
-
-        try {
-            List<Future<String>> futures = new ArrayList<>(n);
-            for (Function func : functions) {
-                futures.add(pool.submit(() -> emitterTl.get().emitFunction(func)));
-            }
-
-            for (int i = 0; i < n; i++) {
-                try {
-                    results.add(futures.get(i).get());
-                } catch (InterruptedException ie) {
-                    Thread.currentThread().interrupt();
-                    throw new RuntimeException(
-                        "Interrupted while emitting LLVM IR for function "
-                            + functions.get(i).getName(), ie);
-                } catch (ExecutionException ee) {
-                    Throwable cause = ee.getCause();
-                    throw new RuntimeException(
-                        "Failed to emit LLVM IR for function "
-                            + functions.get(i).getName(),
-                        cause != null ? cause : ee);
+        StringBuilder sb = new StringBuilder();
+        List<String> sorted = new ArrayList<>(used);
+        Collections.sort(sorted);
+        for (String name : sorted) {
+            if (name.startsWith("llvm.")) continue;
+            if (definedHere.contains(name)) continue;
+            GlobalDecl d = knownGlobals.get(name);
+            if (d != null) {
+                if (d.constant) {
+                    sb.append("@").append(name).append(" = external constant ")
+                      .append(d.type).append("\n");
+                } else {
+                    sb.append("@").append(name).append(" = external global ")
+                      .append(d.type).append("\n");
                 }
+                continue;
             }
-        } finally {
-            pool.shutdown();
-            try {
-                if (!pool.awaitTermination(60, TimeUnit.SECONDS)) {
-                    pool.shutdownNow();
-                }
-            } catch (InterruptedException ie) {
-                Thread.currentThread().interrupt();
-                pool.shutdownNow();
+            Function func = module.getFunction(name);
+            if (func != null) {
+                sb.append(emitDeclaration(func));
             }
-            emitterTl.remove();
         }
-
-        return results;
+        return sb.toString();
     }
 
     private void ensureExternalDeclarations() {

@@ -946,6 +946,7 @@ public class Analyzer {
                 Type retType = TypeResolver.descToReturnType(descriptor);
                 List<Type> paramTypes = TypeResolver.descToParamTypes(descriptor);
                 Function func = new Function(nativeName, retType);
+                func.setOwnerClass(actualOwner);
                 for (int i = 0; i < paramTypes.size(); i++) {
                     func.addParameter(new Parameter(paramTypes.get(i), i));
                 }
