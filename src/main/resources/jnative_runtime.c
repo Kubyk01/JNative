@@ -268,8 +268,8 @@ void __jnative_monitor_exit(void* obj) {
  *     class whose <clinit> participates in a cyclic initialization
  *     group. That is tens of thousands of call sites on a large image.
  *
- *   - Their bodies contain a pthread_mutex_lock and a linear strcmp walk
- *     over clinit_table. Inlining them into every call site duplicates
+ *   - Their bodies contain a pthread_mutex_lock and a hashed strcmp probe
+ *     over the clinit bucket table. Inlining them into every call site duplicates
  *     the lock and the strcmp chain tens of thousands of times, bloating
  *     the binary and (more importantly) obscuring the CFG of the
  *     surrounding function under a heavyweight instruction sequence —
@@ -327,8 +327,25 @@ typedef struct ClinitEntry {
     struct ClinitEntry* next;
 } ClinitEntry;
 
-static ClinitEntry*    clinit_table = NULL;
+#define CLINIT_HASH_BUCKETS 1024
+
+static ClinitEntry*    clinit_buckets[CLINIT_HASH_BUCKETS] = {0};
 static pthread_mutex_t clinit_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/*
+ * FNV-1a over the class name bytes. All accesses to the table happen under
+ * clinit_lock, so the table needs no atomicity of its own; the hash only
+ * shortens the probe chain to O(1) for the typical number of classes with an
+ * instrumented <clinit> (tens to hundreds).
+ */
+static uint32_t clinit_hash(const char* name) {
+    uint32_t h = 2166136261u;
+    for (const char* p = name; *p; p++) {
+        h ^= (uint8_t)*p;
+        h *= 16777619u;
+    }
+    return h;
+}
 
 typedef struct ClinitFrame {
     char*               name;
@@ -363,25 +380,28 @@ const char* __jnative_current_clinit_class(void) {
 }
 
 static ClinitEntry* clinit_lookup(const char* name) {
-    for (ClinitEntry* e = clinit_table; e; e = e->next) {
+    uint32_t bucket = clinit_hash(name) & (CLINIT_HASH_BUCKETS - 1);
+    for (ClinitEntry* e = clinit_buckets[bucket]; e; e = e->next) {
         if (strcmp(e->name, name) == 0) return e;
     }
     return NULL;
 }
 
 static ClinitEntry* clinit_lookup_or_create(const char* name) {
-    ClinitEntry* e = clinit_lookup(name);
-    if (e != NULL) return e;
-    e = (ClinitEntry*)malloc(sizeof(ClinitEntry));
+    uint32_t bucket = clinit_hash(name) & (CLINIT_HASH_BUCKETS - 1);
+    for (ClinitEntry* e = clinit_buckets[bucket]; e; e = e->next) {
+        if (strcmp(e->name, name) == 0) return e;
+    }
+    ClinitEntry* e = (ClinitEntry*)malloc(sizeof(ClinitEntry));
     if (e == NULL) return NULL;
-    e->name  = strdup(name);
+    e->name = strdup(name);
     if (e->name == NULL) {
         free(e);
         return NULL;
     }
     e->state = CLINIT_STATE_NOT_STARTED;
-    e->next  = clinit_table;
-    clinit_table = e;
+    e->next = clinit_buckets[bucket];
+    clinit_buckets[bucket] = e;
     return e;
 }
 
@@ -1314,6 +1334,20 @@ int __jnative_is_class_mirror(const void* ptr) {
     return 0;
 }
 
+/*
+ * Cached vtable of java/lang/Object, used when dispatching on an array.
+ * Arrays inherit all their methods from Object, so their effective vtable is
+ * Object's vtable. This path used to call dlsym on every invocation; it runs
+ * on every VIRTUAL_CALL with an array receiver, so cache it via pthread_once.
+ */
+static JNativeVTable* jnative_cached_object_vtable = NULL;
+static pthread_once_t jnative_object_vtable_once  = PTHREAD_ONCE_INIT;
+
+static void jnative_init_object_vtable(void) {
+    jnative_cached_object_vtable =
+        (JNativeVTable*)__jnative_own_class_vtable("java/lang/Object");
+}
+
 JNativeVTable* __jnative_resolve_dispatch_vtable(void* obj) {
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
@@ -1323,13 +1357,13 @@ JNativeVTable* __jnative_resolve_dispatch_vtable(void* obj) {
         __jnative_throw_bad_vtable("virtual dispatch", obj);
     }
     if (__jnative_is_class_mirror(first)) {
-        void* obj_vtable = __jnative_own_class_vtable("java/lang/Object");
-        if (obj_vtable == NULL) {
+        pthread_once(&jnative_object_vtable_once, jnative_init_object_vtable);
+        if (jnative_cached_object_vtable == NULL) {
             __jnative_throw_bad_vtable(
                 "virtual dispatch on array receiver "
                 "(java/lang/Object has no registered vtable)", obj);
         }
-        return (JNativeVTable*)obj_vtable;
+        return jnative_cached_object_vtable;
     }
     return (JNativeVTable*)first;
 }

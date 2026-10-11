@@ -6,12 +6,15 @@ public class Test {
     public static void main(String[] args) throws IOException {
         final int b = Example.lol();
         Thread.currentThread();
+        long num = 0;
+        var x = "";
+        for (long i = 0; i < 100_000; i++) {
+            x = new Test2((int) num).toString();
+            num++;
 
-        for (int i = 0; i < 100; i++) {
-            var x = new Test2(i);
         }
-
-        System.out.println("done" + Thread.currentThread() + "x");
+        System.out.println(x);
+        System.out.println(num);
     }
 }
 
