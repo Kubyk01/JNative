@@ -383,7 +383,6 @@ public class Orchestrator implements OrchestratorPort {
         llvmGen.setClinitSchedule(analysisResult.clinitSchedule());
         llvmGen.setClinitWrappers(analysisResult.clinitWrappers());
         llvmGen.setEmbeddedResources(embedded);
-        llvmGen.setCores(effectiveCores);
 
         Path genDir = Paths.get("target", "generated-jnative");
         try {
@@ -631,69 +630,6 @@ public class Orchestrator implements OrchestratorPort {
         analysis.addExtraReachableMethod(new MethodReference(
             "java/nio/HeapByteBuffer", "putLong",
             "(IJ)Ljava/nio/ByteBuffer;"));
-    }
-
-
-    /**
-     * Makes every declared {@code <init>} of {@code className} reachable
-     * and registers it in the reflection table.
-     *
-     * <p>The instantiation of secure-random providers happens
-     * reflectively — see {@code java.security.Provider$Service
-     * .newInstanceUtil} and {@code Class.getConstructor(Class[])}.
-     * Fix #1 in {@code MethodBytecodeVisitor} makes that lookup visible
-     * to the reachability walk, so under normal circumstances these
-     * constructors would already be registered by the time this method
-     * runs. The two operations below are a deliberate belt-and-braces:
-     * they cover the corner case where the reflective call site is not
-     * reached (for example because a JDK optimisation short-circuits a
-     * path this build's reachability walk did not anticipate), and they
-     * cost nothing when Fix #1 has already done the work — both stores
-     * below use set semantics, so re-registering an already-present
-     * constructor is a no-op.</p>
-     *
-     * <p>These two operations are independent and both required:</p>
-     *
-     * <ul>
-     *   <li>{@link ReachabilityAnalysis#getReflectInfo()}
-     *       {@code .addConstructor(...)} is what makes the constructor
-     *       appear in {@code @refctors_<class>}. The C side's
-     *       {@code Class.getDeclaredConstructors0} walks that array to
-     *       build a {@code Constructor[]} for the Java layer.</li>
-     *
-     *   <li>{@link ReachabilityAnalysis#addExtraReachableMethod} is what
-     *       pulls the constructor's bytecode into the module as an IR
-     *       {@code Function}. Without it, {@code @refctors_<class>} would
-     *       contain entries but their adaptor slot would be
-     *       {@code i8* null} — see {@code generateReflectionData} — and
-     *       {@code Constructor.newInstance()} would dereference a null
-     *       target at run time.</li>
-     * </ul>
-     */
-    private void registerConstructorForReflection(ReachabilityAnalysis analysis,
-                                                  DependencyResolver resolver,
-                                                  String className) {
-        ClassNode cn = resolver.getClassNode(className);
-        if (cn == null || cn.isExternal() || resolver.getClassBytes(className) == null) {
-            resolver.forceLoadSystemClass(className);
-            cn = resolver.getClassNode(className);
-        }
-        if (cn == null || cn.isExternal()) {
-            log.debug("registerConstructorForReflection: {} is not available "
-                    + "in the class map after a forced load; skipping", className);
-            return;
-        }
-
-        for (MethodNode mn : cn.getMethods()) {
-            if (!"<init>".equals(mn.getName())) continue;
-            if (mn.getDescriptor() == null || mn.getDescriptor().isEmpty()) continue;
-
-            MethodReference ref = new MethodReference(
-                    className, mn.getName(), mn.getDescriptor());
-
-            analysis.getReflectInfo().addConstructor(className, ref);
-            analysis.addExtraReachableMethod(ref);
-        }
     }
 
     // =====================================================================

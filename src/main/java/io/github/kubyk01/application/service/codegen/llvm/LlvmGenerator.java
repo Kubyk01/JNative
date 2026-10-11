@@ -96,16 +96,6 @@ public class LlvmGenerator {
         this.clinitWrappers = wrappers != null ? wrappers : new HashMap<>();
     }
 
-    /**
-     * Sets the maximum number of CPU cores the generator may use.
-     *
-     * <p>A value {@code <= 0} collapses to {@code 1}: the caller is
-     * expected to have resolved the effective core count before invoking
-     * this method, and the absence of a positive value means "run
-     * sequentially". The class deliberately does not call
-     * {@link Runtime#availableProcessors()} here — that decision belongs
-     * to {@link io.github.kubyk01.application.service.Orchestrator}.</p>
-     */
     public LlvmGenerator(Module module, DependencyResolver resolver,
                          AliasAnalysisResult aliasResult,
                          String entryClass, String entryMethod, String entryDescriptor,

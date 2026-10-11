@@ -839,9 +839,13 @@ public class LlvmGlobalEmitter {
     /**
      * Returns ONLY the global variable definitions (static fields, vtables,
      * string literals, reflection data, etc.), without struct type
-     * definitions. Every global is emitted with linkonce_odr linkage so
-     * identical definitions in different modules are deduplicated by the
-     * linker.
+     * definitions. Every global is emitted with the default (external)
+     * linkage. It is defined exactly once, in _module.ll; the per-class files
+     * reference it through a bare external declaration. linkonce_odr is
+     * deliberately NOT used: the per-class .ll files are compiled as separate
+     * ThinLTO translation units with -O3, and LLVM drops every linkonce_odr
+     * global that has no reference inside its own module, which would leave
+     * the external references unresolved at link time.
      */
     public String generateGlobalDefinitions() {
         prepareLayouts();
@@ -988,7 +992,7 @@ public class LlvmGlobalEmitter {
         // java.lang.Module.defineModules. See the method javadoc for the full
         // chain of evidence.
         return "\n; ----- Unnamed module singleton (mutable) -----\n"
-            + "@jnative_unnamed_module = linkonce_odr global " + structName
+            + "@jnative_unnamed_module = global " + structName
             + " { " + init + " }, align 8\n\n";
     }
 
@@ -1051,10 +1055,10 @@ public class LlvmGlobalEmitter {
         sb.append("\n; ----- Embedded resources -----\n");
 
         if (embeddedResources.isEmpty()) {
-            sb.append("@jnative_builtin_resources = linkonce_odr constant "
+            sb.append("@jnative_builtin_resources = constant "
                 + "[1 x %JNativeResourceEntry] "
                 + "[%JNativeResourceEntry { i8* null, i8* null, i32 0 }]\n");
-            sb.append("@jnative_builtin_resources_count = linkonce_odr constant i32 0\n\n");
+            sb.append("@jnative_builtin_resources_count = constant i32 0\n\n");
             return sb.toString();
         }
 
@@ -1075,7 +1079,7 @@ public class LlvmGlobalEmitter {
                 + ", i8* " + dataRef + ", i32 " + data.length + " }");
         }
 
-        sb.append("@jnative_builtin_resources = linkonce_odr constant [")
+        sb.append("@jnative_builtin_resources = constant [")
             .append(entryRefs.size())
             .append(" x %JNativeResourceEntry] [\n");
         for (int i = 0; i < entryRefs.size(); i++) {
@@ -1083,7 +1087,7 @@ public class LlvmGlobalEmitter {
             sb.append("  ").append(entryRefs.get(i));
         }
         sb.append("\n]\n");
-        sb.append("@jnative_builtin_resources_count = linkonce_odr constant i32 ")
+        sb.append("@jnative_builtin_resources_count = constant i32 ")
             .append(entryRefs.size()).append("\n\n");
         return sb.toString();
     }
@@ -1116,7 +1120,7 @@ public class LlvmGlobalEmitter {
         if (nulTerminate != 0) esc.append("\\00");
 
         sb.append("@").append(baseName)
-            .append(" = linkonce_odr unnamed_addr constant [")
+            .append(" = unnamed_addr constant [")
             .append(total).append(" x i8] c\"")
             .append(esc).append("\", align 1\n");
         return "getelementptr inbounds ([" + total + " x i8], [" + total
@@ -1364,7 +1368,7 @@ public class LlvmGlobalEmitter {
             vtableNames.put(iface, vtableName);
             String ifaceNameRef = ensureStringConstantPtr(sb, iface);
             sb.append(vtableName)
-                .append(" = linkonce_odr constant %JNativeVTable { i8** null, %JNativeIfaceMap* null, i8* ")
+                .append(" = constant %JNativeVTable { i8** null, %JNativeIfaceMap* null, i8* ")
                 .append(ifaceNameRef).append(" }\n");
         }
 
@@ -1386,7 +1390,7 @@ public class LlvmGlobalEmitter {
             }
 
             String methodsName = "@vtable_methods_" + LlvmTypeMapper.sanitizeIdentifier(className);
-            sb.append(methodsName).append(" = linkonce_odr constant [")
+            sb.append(methodsName).append(" = constant [")
                 .append(length).append(" x i8*] [");
             for (int i = 0; i < length; i++) {
                 if (i > 0) sb.append(", ");
@@ -1425,7 +1429,7 @@ public class LlvmGlobalEmitter {
                 String itableName = "@itable_"
                     + LlvmTypeMapper.sanitizeIdentifier(className) + "_"
                     + LlvmTypeMapper.sanitizeIdentifier(iface);
-                sb.append(itableName).append(" = linkonce_odr constant [")
+                sb.append(itableName).append(" = constant [")
                     .append(len).append(" x i8*] [");
                 for (int i = 0; i < len; i++) {
                     if (i > 0) sb.append(", ");
@@ -1446,7 +1450,7 @@ public class LlvmGlobalEmitter {
             if (!sortedIfaces.isEmpty()) {
                 String entriesArrayName = "@ifacemap_entries_"
                     + LlvmTypeMapper.sanitizeIdentifier(className);
-                sb.append(entriesArrayName).append(" = linkonce_odr constant [")
+                sb.append(entriesArrayName).append(" = constant [")
                     .append(sortedIfaces.size()).append(" x %JNativeIfaceMapEntry] [");
                 for (int i = 0; i < sortedIfaces.size(); i++) {
                     if (i > 0) sb.append(", ");
@@ -1458,12 +1462,12 @@ public class LlvmGlobalEmitter {
                 }
                 sb.append("]\n");
 
-                sb.append(ifacemapName).append(" = linkonce_odr constant %JNativeIfaceMap { i32 ")
+                sb.append(ifacemapName).append(" = constant %JNativeIfaceMap { i32 ")
                     .append(sortedIfaces.size()).append(", %JNativeIfaceMapEntry* ")
                     .append(entriesArrayName).append(" }\n");
             } else {
                 sb.append(ifacemapName)
-                    .append(" = linkonce_odr constant %JNativeIfaceMap { i32 0, %JNativeIfaceMapEntry* null }\n");
+                    .append(" = constant %JNativeIfaceMap { i32 0, %JNativeIfaceMapEntry* null }\n");
             }
 
             int methodLen = vtableLengths.getOrDefault(className, 1);
@@ -1471,7 +1475,7 @@ public class LlvmGlobalEmitter {
 
             String vtableName = "@vtable_" + LlvmTypeMapper.sanitizeIdentifier(className);
             String classNameRef = ensureStringConstantPtr(sb, className);
-            sb.append(vtableName).append(" = linkonce_odr constant %JNativeVTable {\n")
+            sb.append(vtableName).append(" = constant %JNativeVTable {\n")
                 .append("  i8** bitcast ([").append(methodLen).append(" x i8*]* ")
                 .append(methodsName).append(" to i8**),\n")
                 .append("  %JNativeIfaceMap* ").append(ifacemapName).append(",\n")
@@ -1690,7 +1694,7 @@ public class LlvmGlobalEmitter {
 
             String methodsName = "@vtable_methods_"
                     + LlvmTypeMapper.sanitizeIdentifier(lambdaClassName);
-            sb.append(methodsName).append(" = linkonce_odr constant [")
+            sb.append(methodsName).append(" = constant [")
                     .append(methodLen).append(" x i8*] [");
             for (int i = 0; i < methodLen; i++) {
                 if (i > 0) sb.append(", ");
@@ -1827,7 +1831,7 @@ public class LlvmGlobalEmitter {
                 String itableName = "@itable_"
                         + LlvmTypeMapper.sanitizeIdentifier(lambdaClassName) + "_"
                         + LlvmTypeMapper.sanitizeIdentifier(iface);
-                sb.append(itableName).append(" = linkonce_odr constant [")
+                sb.append(itableName).append(" = constant [")
                         .append(len).append(" x i8*] [");
                 for (int i = 0; i < len; i++) {
                     if (i > 0) sb.append(", ");
@@ -1846,7 +1850,7 @@ public class LlvmGlobalEmitter {
                     + LlvmTypeMapper.sanitizeIdentifier(lambdaClassName);
 
             sb.append(ifacemapEntriesName)
-                    .append(" = linkonce_odr constant [")
+                    .append(" = constant [")
                     .append(ifaceNames.size())
                     .append(" x %JNativeIfaceMapEntry] [");
             for (int i = 0; i < ifaceNames.size(); i++) {
@@ -1859,14 +1863,14 @@ public class LlvmGlobalEmitter {
             sb.append("]\n");
 
             sb.append(ifacemapName)
-                    .append(" = linkonce_odr constant %JNativeIfaceMap { i32 ")
+                    .append(" = constant %JNativeIfaceMap { i32 ")
                     .append(ifaceNames.size())
                     .append(", %JNativeIfaceMapEntry* ")
                     .append(ifacemapEntriesName).append(" }\n");
 
             String vtableName = vtableNames.get(lambdaClassName);
             String lambdaNameRef = ensureStringConstantPtr(sb, lambdaClassName);
-            sb.append(vtableName).append(" = linkonce_odr constant %JNativeVTable {\n")
+            sb.append(vtableName).append(" = constant %JNativeVTable {\n")
                     .append("  i8** bitcast ([").append(methodLen).append(" x i8*]* ")
                     .append(methodsName).append(" to i8**),\n")
                     .append("  %JNativeIfaceMap* ").append(ifacemapName).append(",\n")
@@ -1979,7 +1983,7 @@ public class LlvmGlobalEmitter {
             }
 
             String globalName = "gv_" + LlvmTypeMapper.sanitizeIdentifier(fullName);
-            sb.append("@").append(globalName).append(" = linkonce_odr global ").append(llvmType)
+            sb.append("@").append(globalName).append(" = global ").append(llvmType)
                 .append(" ").append(init).append(", align 8\n");
         }
         sb.append("\n");
@@ -2456,7 +2460,7 @@ public class LlvmGlobalEmitter {
             int payloadLen = len + 1;   // NUL terminator is part of the array
 
             sb.append("@").append(bytesGlobal)
-                    .append(" = linkonce_odr unnamed_addr constant { i8*, i32, i32, [")
+                    .append(" = unnamed_addr constant { i8*, i32, i32, [")
                     .append(payloadLen).append(" x i8] } {\n")
                     .append("  i8* bitcast (%ReflectionClass* ").append(byteArrayKlassRef)
                     .append(" to i8*),\n")
@@ -2489,7 +2493,7 @@ public class LlvmGlobalEmitter {
              * i1 is left false for the same reason.
              */
             sb.append("@").append(objGlobal)
-                    .append(" = linkonce_odr global %struct.java_lang_String {\n")
+                    .append(" = global %struct.java_lang_String {\n")
                     .append("  i8* bitcast (%JNativeVTable* ").append(vtableName).append(" to i8*),\n")
                     .append("  i8* bitcast ({ i8*, i32, i32, [").append(payloadLen)
                     .append(" x i8] }* @").append(bytesGlobal).append(" to i8*),\n")
@@ -2502,13 +2506,13 @@ public class LlvmGlobalEmitter {
         }
 
         int n = stringLiteralPool.size();
-        sb.append("@__jnative_literal_pool = linkonce_odr constant [").append(n).append(" x i8*] [");
+        sb.append("@__jnative_literal_pool = constant [").append(n).append(" x i8*] [");
         for (int i = 0; i < n; i++) {
             if (i > 0) sb.append(", ");
             sb.append("i8* bitcast (%struct.java_lang_String* @").append(stringLiteralPool.get(i)).append(" to i8*)");
         }
         sb.append("], align 8\n");
-        sb.append("@__jnative_literal_pool_size = linkonce_odr constant i32 ").append(n).append("\n");
+        sb.append("@__jnative_literal_pool_size = constant i32 ").append(n).append("\n");
         return sb.toString();
     }
 
@@ -2627,7 +2631,7 @@ public class LlvmGlobalEmitter {
                 sorted.addFirst(ownVtable);
             }
 
-            sb.append(typeInfoName).append(" = linkonce_odr constant [")
+            sb.append(typeInfoName).append(" = constant [")
                 .append(sorted.size() + 1).append(" x i8*] [");
             for (int i = 0; i < sorted.size(); i++) {
                 if (i > 0) sb.append(", ");
@@ -3271,7 +3275,7 @@ public class LlvmGlobalEmitter {
                 if (mn != null) modifiers = mn.getAccess();
 
                 String methodVar = "@refmethod_" + cleanClassName + "_" + mangledSuffix;
-                sb.append(methodVar).append(" = linkonce_odr constant %ReflectionMethod { i8* ")
+                sb.append(methodVar).append(" = constant %ReflectionMethod { i8* ")
                     .append(ensureStringConstantPtr(strConsts, methodName))
                     .append(", i8* ").append(ensureStringConstantPtr(strConsts, desc))
                     .append(", ").append(adaptorPtr)
@@ -3342,7 +3346,7 @@ public class LlvmGlobalEmitter {
                 }
 
                 String fieldVar = "@reffield_" + cleanClassName + "_" + fieldName;
-                sb.append(fieldVar).append(" = linkonce_odr constant %ReflectionField { i8* ")
+                sb.append(fieldVar).append(" = constant %ReflectionField { i8* ")
                     .append(ensureStringConstantPtr(strConsts, fieldName))
                     .append(", i8* ")
                     .append(desc != null ? ensureStringConstantPtr(strConsts, desc) : "null")
@@ -3390,7 +3394,7 @@ public class LlvmGlobalEmitter {
                 if (mn != null) modifiers = mn.getAccess();
 
                 String ctorVar = "@refctor_" + cleanClassName + "_" + mangledDesc;
-                sb.append(ctorVar).append(" = linkonce_odr constant %ReflectionConstructor { i8* ")
+                sb.append(ctorVar).append(" = constant %ReflectionConstructor { i8* ")
                     .append(ensureStringConstantPtr(strConsts, desc))
                     .append(", ").append(adaptorPtr)
                     .append(", i32 ").append(modifiers).append(" }\n");
@@ -3422,7 +3426,7 @@ public class LlvmGlobalEmitter {
                 if (ifaceVar != null) ifacePtrs.add(ifaceVar);
             }
             String ifacesArray = "@refifaces_" + cleanClassName;
-            sb.append(ifacesArray).append(" = linkonce_odr constant [")
+            sb.append(ifacesArray).append(" = constant [")
                 .append(ifacePtrs.size() + 1).append(" x %ReflectionClass*] [");
             for (String p : ifacePtrs) sb.append("%ReflectionClass* ").append(p).append(", ");
             sb.append("%ReflectionClass* null]\n");
@@ -3518,7 +3522,7 @@ public class LlvmGlobalEmitter {
             // construction (a String's contents never change after
             // construction), so they too remain `constant`.
             // =================================================================
-            sb.append(classVarName).append(" = linkonce_odr global %ReflectionClass { %JNativeVTable* ")
+            sb.append(classVarName).append(" = global %ReflectionClass { %JNativeVTable* ")
                 .append(classVtableRef)
                 // name — always null. The bytecode of Class.getName() reads
                 // this field, tests it for null and falls back to the native
@@ -3588,7 +3592,7 @@ public class LlvmGlobalEmitter {
             classPtrs.add("%ReflectionClass* " + classVarName);
         }
 
-        sb.append("@reflect_all_classes = linkonce_odr constant [")
+        sb.append("@reflect_all_classes = constant [")
             .append(classPtrs.size() + 1).append(" x %ReflectionClass*] [");
         for (String p : classPtrs) sb.append(p).append(", ");
         sb.append("%ReflectionClass* null]\n");
@@ -3632,13 +3636,13 @@ public class LlvmGlobalEmitter {
         sb.append("\n; ----- Symbol-to-class map (for Reflection.getCallerClass) -----\n");
 
         if (map.isEmpty()) {
-            sb.append("@jnative_symbol_class_map = linkonce_odr constant [1 x %JNativeSymbolClassEntry] ["
+            sb.append("@jnative_symbol_class_map = constant [1 x %JNativeSymbolClassEntry] ["
                 + "%JNativeSymbolClassEntry { i8* null, %ReflectionClass* null }]\n");
-            sb.append("@jnative_symbol_class_map_size = linkonce_odr constant i64 0\n");
+            sb.append("@jnative_symbol_class_map_size = constant i64 0\n");
             return sb.toString();
         }
 
-        sb.append("@jnative_symbol_class_map = linkonce_odr constant [")
+        sb.append("@jnative_symbol_class_map = constant [")
             .append(map.size() + 1)
             .append(" x %JNativeSymbolClassEntry] [\n");
         for (Map.Entry<String, String> e : map.entrySet()) {
@@ -3652,7 +3656,7 @@ public class LlvmGlobalEmitter {
         }
         sb.append("  %JNativeSymbolClassEntry { i8* null, %ReflectionClass* null }\n");
         sb.append("]\n");
-        sb.append("@jnative_symbol_class_map_size = linkonce_odr constant i64 ")
+        sb.append("@jnative_symbol_class_map_size = constant i64 ")
             .append(map.size()).append("\n");
         return sb.toString();
     }
@@ -3689,24 +3693,24 @@ public class LlvmGlobalEmitter {
         sb.append("\n; ----- Caller-sensitive symbols (for Reflection.getCallerClass) -----\n");
 
         if (symbols.isEmpty()) {
-            sb.append("@jnative_caller_sensitive_symbols = linkonce_odr constant [1 x i8*] [i8* null]\n");
-            sb.append("@jnative_caller_sensitive_symbols_size = linkonce_odr constant i64 0\n");
+            sb.append("@jnative_caller_sensitive_symbols = constant [1 x i8*] [i8* null]\n");
+            sb.append("@jnative_caller_sensitive_symbols_size = constant i64 0\n");
             return sb.toString();
         }
 
-        sb.append("@jnative_caller_sensitive_symbols = linkonce_odr constant [")
+        sb.append("@jnative_caller_sensitive_symbols = constant [")
             .append(symbols.size() + 1).append(" x i8*] [\n");
         for (String sym : symbols) {
             sb.append("  i8* ").append(ensureStringConstantPtr(strConsts, sym)).append(",\n");
         }
         sb.append("  i8* null\n]\n");
-        sb.append("@jnative_caller_sensitive_symbols_size = linkonce_odr constant i64 ")
+        sb.append("@jnative_caller_sensitive_symbols_size = constant i64 ")
             .append(symbols.size()).append("\n");
         return sb.toString();
     }
 
     private void appendNullTerminatedPtrArray(StringBuilder sb, String arrayName, List<String> ptrs) {
-        sb.append(arrayName).append(" = linkonce_odr constant [")
+        sb.append(arrayName).append(" = constant [")
             .append(ptrs.size() + 1).append(" x i8*] [");
         for (String ptr : ptrs) sb.append(ptr).append(", ");
         sb.append("i8* null]\n");
