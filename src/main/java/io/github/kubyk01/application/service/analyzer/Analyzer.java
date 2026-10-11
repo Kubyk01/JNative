@@ -301,7 +301,8 @@ public class Analyzer {
         }
 
         // --- 4. Escape analysis -------------------------------------------
-        EscapeAnalyzer escapeAnalyzer = new EscapeAnalyzer(module, aliasResult, resolver);
+        EscapeAnalyzer escapeAnalyzer =
+            new EscapeAnalyzer(module, aliasResult, resolver, scheduler);
         EscapeAnalysisResult escapeResult = escapeAnalyzer.analyze();
         if (showEscape) {
             System.out.println("\n--- Escape Analysis ---");
@@ -329,6 +330,7 @@ public class Analyzer {
         Map<String, FunctionSummary> summaries = aliasResult.getFunctionSummaries();
         LifetimeAnalyzer lifetimeAnalyzer =
             new LifetimeAnalyzer(module, aliasResult, escapeResult, summaries);
+        lifetimeAnalyzer.setScheduler(scheduler);
         LifetimeAnalysisResult lifetimeResult =
             lifetimeAnalyzer.analyze(aliasResult.getAllocationSiteToValue());
 

@@ -4,22 +4,17 @@ import io.github.kubyk01.application.service.analyzer.dependencyresolver.Depende
 import io.github.kubyk01.domain.analyzer.aliasanalysis.AliasAnalysisResult;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.FieldNode;
 import io.github.kubyk01.domain.analyzer.escapeanalysis.EscapeSummary;
-import io.github.kubyk01.domain.ir.BasicBlock;
-import io.github.kubyk01.domain.ir.Constant;
-import io.github.kubyk01.domain.ir.Function;
-import io.github.kubyk01.domain.ir.Instruction;
+import io.github.kubyk01.domain.ir.*;
 import io.github.kubyk01.domain.ir.Module;
-import io.github.kubyk01.domain.ir.Opcode;
-import io.github.kubyk01.domain.ir.Parameter;
-import io.github.kubyk01.domain.ir.ReturnTerminator;
-import io.github.kubyk01.domain.ir.Terminator;
-import io.github.kubyk01.domain.ir.ThrowTerminator;
-import io.github.kubyk01.domain.ir.Type;
-import io.github.kubyk01.domain.ir.Value;
+import io.github.kubyk01.util.LlvmUtil;
 import lombok.extern.slf4j.Slf4j;
 import org.objectweb.asm.Opcodes;
+import reactor.core.publisher.Flux;
+import reactor.core.scheduler.Scheduler;
+import reactor.core.scheduler.Schedulers;
 
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 
 import static io.github.kubyk01.util.LlvmUtil.extractCalleeName;
 import static io.github.kubyk01.util.LlvmUtil.extractFieldOwnerAndName;
@@ -31,50 +26,141 @@ public class EscapeSummaryBuilder {
     private final Module module;
     private final AliasAnalysisResult aliasResult;
     private final DependencyResolver resolver;
-    private final Map<String, EscapeSummary> summaries = new HashMap<>();
-    private final Map<Value, Value> valueOrigin = new HashMap<>();
+    private final Scheduler scheduler;
+    private final Map<String, EscapeSummary> summaries = new ConcurrentHashMap<>();
 
-    public EscapeSummaryBuilder(Module module, AliasAnalysisResult aliasResult, DependencyResolver resolver) {
+    public EscapeSummaryBuilder(Module module,
+                                AliasAnalysisResult aliasResult,
+                                DependencyResolver resolver) {
+        this(module, aliasResult, resolver, Schedulers.single());
+    }
+
+    public EscapeSummaryBuilder(Module module,
+                                AliasAnalysisResult aliasResult,
+                                DependencyResolver resolver,
+                                Scheduler scheduler) {
         this.module = module;
         this.aliasResult = aliasResult;
         this.resolver = resolver;
+        this.scheduler = (scheduler != null) ? scheduler : Schedulers.single();
     }
 
     public Map<String, EscapeSummary> build() {
-        boolean changed = true;
-        while (changed) {
-            changed = false;
-            for (Function func : module.getFunctions()) {
-                if (func.getEntryBlock() == null) continue;
-                EscapeSummary newSum = analyzeFunction(func);
-                EscapeSummary oldSum = summaries.get(func.getName());
-                if (oldSum == null || !oldSum.equals(newSum)) {
-                    summaries.put(func.getName(), newSum);
-                    changed = true;
+        List<Function> live = new ArrayList<>();
+        for (Function f : module.getFunctions()) {
+            if (f.getEntryBlock() != null) live.add(f);
+        }
+        if (live.isEmpty()) return summaries;
+
+        // ---- Build the reverse call graph ONCE --------------------------
+        //
+        // callersOf: callee mangled name -> set of caller Functions.
+        // Building this once is what turns the fixed point from
+        // "N full passes over the module" into "only re-analyze the
+        // callers whose callee actually changed".
+        Map<String, Set<Function>> callersOf = new HashMap<>();
+        for (Function f : live) {
+            for (BasicBlock b : f.getBlocks()) {
+                for (Instruction inst : b.getInstructions()) {
+                    String callee = extractCalleeName(inst);
+                    if (callee != null) {
+                        callersOf.computeIfAbsent(callee, k -> new HashSet<>()).add(f);
+                    }
                 }
             }
         }
+
+        // ---- Worklist initialised with every function -------------------
+        Deque<Function> worklist = new ArrayDeque<>(live);
+        Set<Function> inWorklist = new HashSet<>(live);
+
+        long processed = 0;
+        long lastLog = 0;
+
+        // Snapshot for the parallel batch: since analyzeFunction reads the
+        // callee summaries, we must ensure a stable view. We commit the
+        // batch results only after it returns.
+        while (!worklist.isEmpty()) {
+            // Drain the current wavefront as one parallel batch.
+            List<Function> batch = new ArrayList<>();
+            Set<Function> nextWaveSet = new HashSet<>();
+            while (!worklist.isEmpty()) {
+                Function f = worklist.poll();
+                inWorklist.remove(f);
+                batch.add(f);
+            }
+
+            Map<String, EscapeSummary> snapshot = new HashMap<>(summaries);
+
+            List<EscapeSummary> fresh = LlvmUtil.awaitFlux(
+                Flux.fromIterable(batch)
+                    .parallel()
+                    .runOn(scheduler)
+                    .map(func -> analyzeFunction(func, snapshot))
+                    .sequential()
+            );
+            if (fresh == null || fresh.size() != batch.size()) {
+                throw new IllegalStateException(
+                    "EscapeSummaryBuilder: reactor pipeline returned " +
+                        (fresh == null ? "null"
+                                       : fresh.size() + " summaries for "
+                                         + batch.size() + " functions"));
+            }
+
+            for (int i = 0; i < batch.size(); i++) {
+                Function f = batch.get(i);
+                EscapeSummary newSum = fresh.get(i);
+                EscapeSummary oldSum = summaries.get(f.getName());
+                processed++;
+
+                if (oldSum == null || !oldSum.equals(newSum)) {
+                    summaries.put(f.getName(), newSum);
+
+                    // Re-enqueue the callers of this function.
+                    Set<Function> callers = callersOf.get(f.getName());
+                    if (callers != null) {
+                        for (Function caller : callers) {
+                            if (inWorklist.add(caller)) {
+                                worklist.add(caller);
+                                nextWaveSet.add(caller);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (processed - lastLog >= 5_000) {
+                lastLog = processed;
+                System.out.println("EscapeSummaryBuilder: " + processed
+                    + " evaluations, " + worklist.size() + " queued");
+            }
+        }
+
+        System.out.println("EscapeSummaryBuilder: converged after "
+            + processed + " function evaluations, "
+            + summaries.size() + " summaries");
         return summaries;
     }
 
-    private EscapeSummary analyzeFunction(Function func) {
+    private EscapeSummary analyzeFunction(Function func,
+                                          Map<String, EscapeSummary> snapshot) {
         Set<Integer> paramsEscaped = new HashSet<>();
         Set<Integer> paramsReturned = new HashSet<>();
         Set<String> fieldsEscaped = new HashSet<>();
-        boolean[] flags = new boolean[3]; // returnsObject, escapesGlobally, createsThread
+        boolean[] flags = new boolean[3];
 
         Map<Integer, Set<Integer>> paramAliases = computeParamAliases(func);
-
-        // Clear origin map for this function
-        valueOrigin.clear();
+        Map<Value, Value> valueOrigin = new HashMap<>();
 
         for (BasicBlock block : func.getBlocks()) {
             for (Instruction inst : block.getInstructions()) {
-                processInstruction(inst, paramAliases, paramsEscaped, paramsReturned, fieldsEscaped, flags);
+                processInstruction(inst, paramAliases, paramsEscaped,
+                    paramsReturned, fieldsEscaped, flags, snapshot, valueOrigin);
             }
             Terminator term = block.getTerminator();
             if (term != null) {
-                processTerminator(term, paramAliases, paramsEscaped, paramsReturned, flags);
+                processTerminator(term, paramAliases, paramsEscaped,
+                    paramsReturned, flags, valueOrigin);
             }
         }
 
@@ -105,21 +191,20 @@ public class EscapeSummaryBuilder {
 
     private void processInstruction(Instruction inst,
                                     Map<Integer, Set<Integer>> paramAliases,
-                                    Set<Integer> paramsEscaped, Set<Integer> paramsReturned,
-                                    Set<String> fieldsEscaped, boolean[] flags) {
+                                    Set<Integer> paramsEscaped,
+                                    Set<Integer> paramsReturned,
+                                    Set<String> fieldsEscaped,
+                                    boolean[] flags,
+                                    Map<String, EscapeSummary> snapshot,
+                                    Map<Value, Value> valueOrigin) {
         Opcode op = inst.getOpcode();
         switch (op) {
-            case PUT_FIELD: {
+            case PUT_FIELD -> {
                 if (inst.getOperands().size() >= 3) {
                     Value base = inst.getOperands().get(0);
                     Value rhs = inst.getOperands().get(2);
-                    String[] ownerAndField = extractFieldOwnerAndName(inst);
-                    String owner = ownerAndField[0];
-                    String fieldName = ownerAndField[1];
-
-                    // Check if field is volatile
-                    if (isVolatileField(owner, fieldName)) {
-                        // volatile field makes base and rhs globally visible
+                    String[] of = extractFieldOwnerAndName(inst);
+                    if (isVolatileField(of[0], of[1])) {
                         if (base instanceof Parameter p) {
                             paramsEscaped.add(p.getIndex());
                             addAliases(p.getIndex(), paramAliases, paramsEscaped);
@@ -128,9 +213,8 @@ public class EscapeSummaryBuilder {
                             paramsEscaped.add(p.getIndex());
                             addAliases(p.getIndex(), paramAliases, paramsEscaped);
                         }
-                        flags[1] = true; // escapesGlobally
+                        flags[1] = true;
                     } else {
-                        // Normal field handling (existing logic)
                         if (base instanceof Parameter p) {
                             paramsEscaped.add(p.getIndex());
                             addAliases(p.getIndex(), paramAliases, paramsEscaped);
@@ -139,73 +223,52 @@ public class EscapeSummaryBuilder {
                             paramsEscaped.add(p.getIndex());
                             addAliases(p.getIndex(), paramAliases, paramsEscaped);
                         }
-                        Object fieldNameObj = inst.getOperands().get(1);
-                        if (fieldNameObj instanceof Constant c) {
-                            fieldsEscaped.add(c.getValue().toString());
-                        }
+                        Object fn = inst.getOperands().get(1);
+                        if (fn instanceof Constant c) fieldsEscaped.add(c.getValue().toString());
                     }
                 }
-                break;
             }
-            case GET_FIELD: {
+            case GET_FIELD -> {
                 if (inst.getOperands().size() >= 2) {
                     Value base = inst.getOperands().getFirst();
-                    String[] ownerAndField = extractFieldOwnerAndName(inst);
-                    String owner = ownerAndField[0];
-                    String fieldName = ownerAndField[1];
-
-                    // Check if field is volatile
-                    if (isVolatileField(owner, fieldName)) {
-                        // Accessing volatile field makes base globally visible
+                    String[] of = extractFieldOwnerAndName(inst);
+                    if (isVolatileField(of[0], of[1])) {
                         if (base instanceof Parameter p) {
                             paramsEscaped.add(p.getIndex());
                             addAliases(p.getIndex(), paramAliases, paramsEscaped);
                         }
-                        flags[1] = true; // escapesGlobally
+                        flags[1] = true;
                     }
                 }
-                break;
             }
-            case MONITOR_ENTER:
-            case MONITOR_EXIT: {
+            case MONITOR_ENTER, MONITOR_EXIT -> {
                 if (!inst.getOperands().isEmpty()) {
                     Value obj = inst.getOperands().getFirst();
                     if (obj instanceof Parameter p) {
                         paramsEscaped.add(p.getIndex());
                         addAliases(p.getIndex(), paramAliases, paramsEscaped);
-                        flags[1] = true; // synchronizing on object makes it globally visible
+                        flags[1] = true;
                     }
                 }
-                break;
             }
-            case PUT_STATIC: {
-                // Layout PUT_STATIC: [fieldConst, val]
+            case PUT_STATIC -> {
                 if (inst.getOperands().size() >= 2) {
                     Value rhs = inst.getOperands().get(1);
                     if (rhs instanceof Parameter p) {
                         paramsEscaped.add(p.getIndex());
                         addAliases(p.getIndex(), paramAliases, paramsEscaped);
                     }
-                    flags[1] = true; // escapesGlobally
+                    flags[1] = true;
                 }
-                break;
             }
-            case ALOAD: {
-                // array load: result = array[index]
+            case ALOAD -> {
                 if (inst.getOperands().size() >= 2) {
                     Value array = inst.getOperands().getFirst();
                     Value result = inst.getResult();
-                    if (result != null) {
-                        // Remember that 'result' originates from 'array'
-                        valueOrigin.put(result, array);
-                    }
-                    // Reading from array does not cause escape by itself.
-                    // If the result is returned, it will be handled in processTerminator.
+                    if (result != null) valueOrigin.put(result, array);
                 }
-                break;
             }
-            case ASTORE: {
-                // array store: array[index] = value
+            case ASTORE -> {
                 if (inst.getOperands().size() >= 3) {
                     Value array = inst.getOperands().get(0);
                     Value value = inst.getOperands().get(2);
@@ -217,38 +280,30 @@ public class EscapeSummaryBuilder {
                         paramsEscaped.add(p.getIndex());
                         addAliases(p.getIndex(), paramAliases, paramsEscaped);
                     }
-                    // The array element field escapes
                     fieldsEscaped.add("[]");
                 }
-                break;
             }
-            case CALL:
-            case VIRTUAL_CALL:
-            case INTERFACE_CALL:
-            case STATIC_CALL:
-            case SPECIAL_CALL: {
-                processCall(inst, paramAliases, paramsEscaped, paramsReturned, flags);
-                break;
-            }
-            default:
-                // other instructions do not affect the summary (except return, which is handled in the terminator)
+            case CALL, VIRTUAL_CALL, INTERFACE_CALL, STATIC_CALL, SPECIAL_CALL ->
+                processCall(inst, paramAliases, paramsEscaped, paramsReturned, flags, snapshot);
+            default -> { }
         }
     }
 
     private void processCall(Instruction callInst,
                              Map<Integer, Set<Integer>> paramAliases,
-                             Set<Integer> paramsEscaped, Set<Integer> paramsReturned,
-                             boolean[] flags) {
+                             Set<Integer> paramsEscaped,
+                             Set<Integer> paramsReturned,
+                             boolean[] flags,
+                             Map<String, EscapeSummary> snapshot) {
         String calleeName = extractCalleeName(callInst);
         if (calleeName == null) return;
 
-        if (calleeName.startsWith("java/util/concurrent/ExecutorService.submit") ||
-            calleeName.startsWith("java/util/concurrent/ForkJoinPool.submit") ||
-            calleeName.startsWith("java/util/concurrent/CompletableFuture.supplyAsync") ||
-            calleeName.startsWith("java/lang/Thread.start()V")) {
+        if (calleeName.startsWith("java/util/concurrent/ExecutorService.submit")
+            || calleeName.startsWith("java/util/concurrent/ForkJoinPool.submit")
+            || calleeName.startsWith("java/util/concurrent/CompletableFuture.supplyAsync")
+            || calleeName.startsWith("java/lang/Thread.start()V")) {
             flags[2] = true;
-            List<Value> args = getCallArguments(callInst);
-            for (Value arg : args) {
+            for (Value arg : getCallArguments(callInst)) {
                 if (arg instanceof Parameter p) {
                     paramsEscaped.add(p.getIndex());
                     addAliases(p.getIndex(), paramAliases, paramsEscaped);
@@ -257,36 +312,29 @@ public class EscapeSummaryBuilder {
             return;
         }
 
-        EscapeSummary calleeSum = summaries.get(calleeName);
+        EscapeSummary calleeSum = snapshot.get(calleeName);
         if (calleeSum == null) {
-            List<Value> args = getCallArguments(callInst);
-            for (Value arg : args) {
+            for (Value arg : getCallArguments(callInst)) {
                 if (arg instanceof Parameter p) {
                     paramsEscaped.add(p.getIndex());
                     addAliases(p.getIndex(), paramAliases, paramsEscaped);
                 }
             }
             Value ret = callInst.getResult();
-            if (ret != null && ret.getType() != Type.VOID) {
-                flags[0] = true;
-            }
+            if (ret != null && ret.getType() != Type.VOID) flags[0] = true;
             return;
         }
 
         List<Value> args = getCallArguments(callInst);
         for (int i = 0; i < args.size(); i++) {
             Value arg = args.get(i);
-            if (calleeSum.getParamsEscaped().contains(i)) {
-                if (arg instanceof Parameter p) {
-                    paramsEscaped.add(p.getIndex());
-                    addAliases(p.getIndex(), paramAliases, paramsEscaped);
-                }
+            if (calleeSum.getParamsEscaped().contains(i) && arg instanceof Parameter p) {
+                paramsEscaped.add(p.getIndex());
+                addAliases(p.getIndex(), paramAliases, paramsEscaped);
             }
-            if (calleeSum.getParamsReturned().contains(i)) {
-                if (arg instanceof Parameter p) {
-                    paramsReturned.add(p.getIndex());
-                    addAliases(p.getIndex(), paramAliases, paramsReturned);
-                }
+            if (calleeSum.getParamsReturned().contains(i) && arg instanceof Parameter p) {
+                paramsReturned.add(p.getIndex());
+                addAliases(p.getIndex(), paramAliases, paramsReturned);
             }
         }
         if (calleeSum.isEscapesGlobally()) flags[1] = true;
@@ -298,7 +346,8 @@ public class EscapeSummaryBuilder {
                                    Map<Integer, Set<Integer>> paramAliases,
                                    Set<Integer> paramsEscaped,
                                    Set<Integer> paramsReturned,
-                                   boolean[] flags) {
+                                   boolean[] flags,
+                                   Map<Value, Value> valueOrigin) {
         if (term instanceof ReturnTerminator rt) {
             Value retVal = rt.getValue();
             if (retVal != null && retVal.getType() != Type.VOID) {
@@ -309,31 +358,14 @@ public class EscapeSummaryBuilder {
                     addAliases(p.getIndex(), paramAliases, paramsEscaped);
                     addAliases(p.getIndex(), paramAliases, paramsReturned);
                 } else {
-                    // Check if retVal originates from an array load
                     Value origin = valueOrigin.get(retVal);
                     if (origin instanceof Parameter p) {
-                        // Returning an element of a parameter array means the parameter's contents may be returned.
-                        // Conservatively mark the parameter as returned.
                         paramsReturned.add(p.getIndex());
                         addAliases(p.getIndex(), paramAliases, paramsReturned);
                     }
                 }
             }
         } else if (term instanceof ThrowTerminator tt) {
-            // A thrown exception leaves the current method exactly like a
-            // returned value does: it is observed by the caller (either by
-            // an enclosing try/catch or by the runtime's unhandled-exception
-            // reporter). It must therefore not be treated as method-local,
-            // or the escape analysis would report its AllocationSite as
-            // STACK and ScalarReplacer / DestructorInserter would delete or
-            // destroy it while it is still referenced.
-            //
-            // The same reasoning applies to any parameter that appears in
-            // the thrown expression (typically the exception object itself,
-            // but also any parameter referenced while building the message
-            // or cause chain): throwing it hands it to the caller, so the
-            // parameter escapes and may be returned in the sense used by
-            // the EscapeSummary contract.
             Value exc = tt.getException();
             if (exc != null) {
                 if (exc instanceof Parameter p) {
@@ -342,12 +374,6 @@ public class EscapeSummaryBuilder {
                     addAliases(p.getIndex(), paramAliases, paramsEscaped);
                     addAliases(p.getIndex(), paramAliases, paramsReturned);
                 } else {
-                    // The exception value may be derived from a parameter —
-                    // for instance it may be an element loaded out of a
-                    // parameter array, or a value stashed away by an earlier
-                    // ALOAD. Reuse the same origin tracking that the RETURN
-                    // branch uses so the parameter that really escaped is
-                    // the one recorded.
                     Value origin = valueOrigin.get(exc);
                     if (origin instanceof Parameter p) {
                         paramsEscaped.add(p.getIndex());
@@ -368,9 +394,6 @@ public class EscapeSummaryBuilder {
 
     private void addAliases(int paramIndex, Map<Integer, Set<Integer>> aliases, Set<Integer> set) {
         Set<Integer> aliasSet = aliases.get(paramIndex);
-        if (aliasSet != null) {
-            set.addAll(aliasSet);
-        }
+        if (aliasSet != null) set.addAll(aliasSet);
     }
-
 }

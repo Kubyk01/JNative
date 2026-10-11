@@ -102,6 +102,12 @@ public class DestructorInserter {
             Function dtor = findDestructor(type);
             if (dtor == null) continue;
             for (DestructionPoint dp : entry.getValue()) {
+                if (!isLiveReference(dp.getObjectRef())) {
+                    // Destruction point without a live reference: skip it
+                    // entirely so the inserted counter is not inflated and no
+                    // fictitious insertion is logged.
+                    continue;
+                }
                 insertDestructorCall(dp, dtor);
                 inserted++;
             }
@@ -568,10 +574,40 @@ public class DestructorInserter {
         return refFields;
     }
 
+    /**
+     * Inserts a destructor call at the given destruction point.
+     *
+     * <p>The call is not inserted when {@code objectRef} is not a real
+     * reference to an allocated object:</p>
+     *
+     * <ul>
+     *   <li>Java {@code null} — the destruction point was created without an
+     *       object reference (for example, for an alias of a variable that
+     *       already owns the storage);</li>
+     *   <li>a {@code Constant} whose value is {@code null} — the same thing,
+     *       but represented as a null constant;</li>
+     *   <li>a value with type {@code NULL} or {@code UNKNOWN} — the type shows
+     *       it cannot be the result of {@code NEW}.</li>
+     * </ul>
+     *
+     * <p>In all of these cases the destructor call would degenerate into
+     * {@code free(i8* null)} at the LLVM level — a meaningless no-op that
+     * pollutes the output. There is nothing to free, so the call is simply not
+     * created.</p>
+     */
     private void insertDestructorCall(DestructionPoint dp, Function dtor) {
         BasicBlock block = dp.getBlock();
         Instruction before = dp.getBeforeInstruction();
         Value objRef = dp.getObjectRef();
+
+        if (!isLiveReference(objRef)) {
+            // A destruction point without a live reference has nothing to
+            // free. Such points arise for aliases (`var c = a`) and for values
+            // whose type was not resolved during lifetime analysis. Skip them
+            // silently: the only alternative would be to emit `free(i8* null)`,
+            // which does nothing.
+            return;
+        }
 
         Instruction call = new Instruction(Opcode.STATIC_CALL);
         call.addOperand(new Constant(Type.reference(dtor.getName()), dtor.getName()));
@@ -586,5 +622,28 @@ public class DestructorInserter {
             }
         }
         block.addInstruction(call);
+    }
+
+    /**
+     * Returns {@code true} iff {@code v} can denote a live Java object for
+     * which generating a {@code free()} makes sense.
+     *
+     * <p>It filters out exactly the cases that used to produce
+     * {@code free(i8* null)} in the generated IR:</p>
+     *
+     * <ul>
+     *   <li>{@code v == null} — the operand is absent;</li>
+     *   <li>{@code v instanceof Constant} with {@code getValue() == null} —
+     *       a null constant;</li>
+     *   <li>type {@code NULL} or {@code UNKNOWN} — the type shows the value is
+     *       not a reference to an allocated object.</li>
+     * </ul>
+     */
+    private static boolean isLiveReference(Value v) {
+        if (v == null) return false;
+        if (v instanceof Constant c && c.getValue() == null) return false;
+        Type t = v.getType();
+        if (t == null) return false;
+        return !t.isNull() && !t.isUnknown();
     }
 }

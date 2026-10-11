@@ -174,9 +174,6 @@ public class SummaryBuilder {
             pending.clear();
             totalProcessed += batch.size();
 
-            // Parallel analysis of the batch against the current snapshot
-            // of callee summaries. The .block() barrier guarantees that no
-            // worker observes a partially committed state.
             List<FunctionSummary> fresh = awaitFlux(
                 Flux.fromIterable(batch)
                     .parallel()

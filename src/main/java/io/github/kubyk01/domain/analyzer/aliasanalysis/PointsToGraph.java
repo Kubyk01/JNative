@@ -5,13 +5,22 @@ import lombok.Getter;
 
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 public class PointsToGraph {
-    private final Map<Value, PointsToSet> nodeToPointsTo = new HashMap<>();
+    // was: new HashMap<>()
+    //
+    // Escape analysis reads this map from many threads concurrently.
+    // computeIfAbsent() on a plain HashMap corrupts the table under
+    // concurrent insertion (rehash races), which manifests either as
+    // an infinite loop inside HashMap.resize() or as silently dropped
+    // entries. ConcurrentHashMap makes per-key computeIfAbsent atomic,
+    // so parallel readers see a consistent map without external locking.
+    private final Map<Value, PointsToSet> nodeToPointsTo = new ConcurrentHashMap<>();
     // Field points-to: for each allocation site and field name
-    private final Map<AllocationSite, Map<String, PointsToSet>> fieldPointsTo = new HashMap<>();
+    private final Map<AllocationSite, Map<String, PointsToSet>> fieldPointsTo = new ConcurrentHashMap<>();
     // Static fields
-    private final Map<String, PointsToSet> staticFieldPointsTo = new HashMap<>();
+    private final Map<String, PointsToSet> staticFieldPointsTo = new ConcurrentHashMap<>();
     // Mapping allocation site -> IR value (NEW result)
     @Getter
     private final Map<AllocationSite, Value> allocationSiteToValue = new HashMap<>();
@@ -51,7 +60,7 @@ public class PointsToGraph {
     // ---- field points-to (instance fields) ----
     public PointsToSet getFieldPointsTo(AllocationSite site, String field) {
         return fieldPointsTo
-                .computeIfAbsent(site, k -> new HashMap<>())
+                .computeIfAbsent(site, k -> new ConcurrentHashMap<>())
                 .computeIfAbsent(field, k -> new PointsToSet());
     }
 

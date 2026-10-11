@@ -34,12 +34,15 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -127,10 +130,16 @@ public class LlvmGenerator {
         generateLambdaAdaptors();
         globalEmitter.prepareLayouts();
 
-        String structDefs = globalEmitter.generateStructDefinitions();
-        String globalDefs = globalEmitter.generateGlobalDefinitions();
-        String lambdaVts  = globalEmitter.emitLambdaVtables();
-        String staticPrelude = buildStaticPrelude(structDefs);
+        String structDefs   = globalEmitter.generateStructDefinitions();
+        String globalDefs   = globalEmitter.generateGlobalDefinitions();
+        String lambdaVts    = globalEmitter.emitLambdaVtables();
+
+        // The lambda struct text and the reflection ABI types take part in the
+        // per-file prelude filtering, so they are materialised once here.
+        StringBuilder extraBuf = new StringBuilder();
+        globalEmitter.emitExtraStructs(extraBuf);
+        String extraStructsText = extraBuf.toString();
+        String reflectionTypesText = globalEmitter.generateTypeDefinitions();
 
         // ---- 1. Emit EVERY function body, grouped by owner class. The
         //         bodies are accumulated in memory rather than streamed,
@@ -187,59 +196,44 @@ public class LlvmGenerator {
             }
         }
 
-        // ---- 5. Write _module.ll. Every global lives in this file, so its
-        //         extern block must NOT re-declare globals (LLVM rejects a
-        //         declaration followed by a definition of the same symbol);
-        //         it only declares referenced functions defined elsewhere.
+        // ---- 5. Write _module.ll. ----
         //
-        //         The extern pass must scan BOTH the function bodies AND the
-        //         global-definition text. The vtables / vtable_methods /
-        //         itables / reflection tables that live in `globalDefs` (and
-        //         the lambda vtables that live in `lambdaVts`) carry function
-        //         pointers to per-class methods (`@fn_*`), and those methods
-        //         are defined in the per-class `.ll` files, not here.
-        //         Scanning only `moduleBodies + main` (as an earlier revision
-        //         did) left every such pointer unsatisfied, and clang rejected
-        //         the module with "use of undefined value '@fn_...'".
+        // Order: the filtered prelude, then the externs, then the tail
+        // (globalDefs + lambdaVts + deferred + owner-less bodies +
+        // moduleDecls + main).
         //
-        //         Global *data* symbols (`@gv_*`, `@.str.*`, `@vtable_*`,
-        //         `@ifacemap_*`, `@itable_*`, `@refclass_*`, `@jstr_*`,
-        //         `@strbytes_*`, `@refmethod_*`, `@jtable_*`, `@typeinfo_*`,
-        //         ...) fall through the same pass as non-function names: they
-        //         are not resolvable via `module.getFunction`, so no
-        //         `declare` is emitted for them, and no redefinition of a
-        //         locally-defined global can occur.
-        //
-        //         The textual thunks emitted by `vtableSlotEntry`
-        //         (`@__jnative_vtable_missing_*`) are likewise absent from
-        //         `module.getFunctions()` — they are synthesised as raw text
-        //         inside `globalDefs`, not as IR `Function`s — so their
-        //         `define` in `globalDefs` is left untouched and no
-        //         conflicting `declare` is produced.
-        //         ----
+        // The tail is assembled into a single string first, so the prelude
+        // filter and the extern pass both see exactly the same content and do
+        // not double-count it.
         String main = generateMain();
+
+        String moduleTail = globalDefs
+            + "\n" + lambdaVts
+            + "\n" + deferred
+            + "\n" + moduleBodies
+            + moduleDecls
+            + main;
+
         String moduleExterns = buildExterns(
-            globalDefs + "\n"
-                + lambdaVts + "\n"
-                + deferred + "\n"
-                + moduleBodies + moduleDecls + main,
+            moduleTail,
             moduleAvailable,
             Collections.emptyMap(),
             module);
 
-        String moduleSb = staticPrelude +
-            moduleExterns +       // <-- externs for functions
-            globalDefs +
-            lambdaVts +
-            deferred +            // <-- deferred strings in _module.ll
-            moduleBodies +
-            moduleDecls +
-            main;
+        String modulePrelude = buildFilteredPrelude(
+            moduleTail + "\n" + moduleExterns,
+            structDefs,
+            extraStructsText,
+            reflectionTypesText);
+
+        String moduleSb = modulePrelude
+            + moduleExterns
+            + moduleTail;
 
         Path modulePath = outputDir.resolve("_module.ll");
         Files.writeString(modulePath, moduleSb, StandardCharsets.UTF_8);
 
-        // ---- 6. Write per-class files. ----
+        // ---- 6. Write one .ll file per class. ----
         for (Map.Entry<String, StringBuilder> e : classBodies.entrySet()) {
             String className = e.getKey();
             String body = e.getValue().toString();
@@ -253,13 +247,185 @@ public class LlvmGenerator {
 
             String externs = buildExterns(body, definedHere, knownGlobals, module);
 
-            String sb = staticPrelude +
-                externs +
-                body;
+            String prelude = buildFilteredPrelude(
+                body + "\n" + externs,
+                structDefs,
+                extraStructsText,
+                reflectionTypesText);
+
+            String sb = prelude + externs + body;
 
             Path out = outputDir.resolve(className + ".ll");
             if (out.getParent() != null) Files.createDirectories(out.getParent());
             Files.writeString(out, sb, StandardCharsets.UTF_8);
+        }
+    }
+
+    /**
+     * Builds the prelude for a single .ll file, including only the type
+     * definitions and function declarations that are actually needed by
+     * {@code bodyContent}.
+     *
+     * <p>Algorithm:</p>
+     * <ol>
+     *   <li>Every possible candidate (vtable types, reflection ABI types,
+     *       lambda structs, class structs, runtime declares) is parsed into
+     *       one ordered map {@code name -> definition-line}.</li>
+     *   <li>All {@code %Type} and {@code @func} names occurring in
+     *       {@code bodyContent} are collected (string literals are
+     *       skipped).</li>
+     *   <li>From those names the ones present in the map are selected, and
+     *       their dependencies are added recursively: if a type definition
+     *       references other types, those are pulled in as well.</li>
+     *   <li>All definitions that made it into the set are emitted in their
+     *       original order. That order guarantees dependent types are declared
+     *       after their dependencies (the emitter already follows it).</li>
+     * </ol>
+     */
+    private String buildFilteredPrelude(String bodyContent,
+                                        String structDefsText,
+                                        String extraStructsText,
+                                        String reflectionTypesText) {
+
+        // Single ordered map of every potential definition. The insertion
+        // order matches the current (working) output order:
+        //   1) vtable types
+        //   2) reflection ABI types
+        //   3) lambda structs
+        //   4) class structs
+        //   5) runtime declares
+        Map<String, String> allDefs = new LinkedHashMap<>();
+        allDefs.putAll(parseSingleLineDefinitions(LlvmRuntime.getVtableTypeDefinition()));
+        allDefs.putAll(parseSingleLineDefinitions(reflectionTypesText));
+        allDefs.putAll(parseSingleLineDefinitions(extraStructsText));
+        allDefs.putAll(parseSingleLineDefinitions(structDefsText));
+        allDefs.putAll(parseSingleLineDefinitions(LlvmRuntime.getDeclarations()));
+
+        // Transitive closure of the set of used names.
+        Set<String> needed = new LinkedHashSet<>();
+        Deque<String> worklist = new ArrayDeque<>();
+
+        seedFilter(needed, worklist, allDefs, bodyContent);
+
+        while (!worklist.isEmpty()) {
+            String name = worklist.poll();
+            String def = allDefs.get(name);
+            if (def == null) continue;
+            seedFilter(needed, worklist, allDefs, def);
+        }
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("target datalayout = \"e-m:e-p270:32:32-p271:64:64-i64:64-f80:128-n8:16:32:64-S128\"\n");
+        sb.append("target triple = \"x86_64-pc-linux-gnu\"\n\n");
+
+        for (Map.Entry<String, String> e : allDefs.entrySet()) {
+            if (needed.contains(e.getKey())) {
+                sb.append(e.getValue()).append('\n');
+            }
+        }
+        sb.append('\n');
+        return sb.toString();
+    }
+
+    /**
+     * Parses a block of textual LLVM definitions into a {@code symbol -> line}
+     * map.
+     *
+     * <p>Only single-line definitions are recognised:</p>
+     * <ul>
+     *   <li>{@code %Name = type { ... }} — key {@code "%Name"};</li>
+     *   <li>{@code declare ... @name(...) ...} — key {@code "@name"}.</li>
+     * </ul>
+     *
+     * <p>Every block produced by the runtime
+     * ({@code getVtableTypeDefinition}, {@code generateTypeDefinitions},
+     * {@code generateStructDefinitions}, {@code emitExtraStructs},
+     * {@code getDeclarations}) consists solely of single-line definitions, so
+     * a more elaborate parser is unnecessary.</p>
+     */
+    private static Map<String, String> parseSingleLineDefinitions(String text) {
+        Map<String, String> out = new LinkedHashMap<>();
+        if (text == null) return out;
+
+        for (String rawLine : text.split("\n")) {
+            String line = rawLine.trim();
+            if (line.isEmpty() || line.startsWith(";")) continue;
+
+            if (line.startsWith("%")) {
+                int eq = line.indexOf(" = type ");
+                if (eq > 0) {
+                    String name = line.substring(0, eq).trim();
+                    out.put(name, line);
+                }
+            } else if (line.startsWith("declare ")) {
+                int at = line.indexOf('@');
+                if (at > 0) {
+                    int paren = line.indexOf('(', at);
+                    int nameEnd = (paren > 0) ? paren : line.length();
+                    out.put(line.substring(at, nameEnd), line);
+                }
+            }
+        }
+        return out;
+    }
+
+    /**
+     * Adds every name from {@code text} that exists in {@code allDefs} to
+     * {@code needed}/{@code worklist}.
+     *
+     * <p>The content of string literals {@code "..."} is ignored: LLVM escapes
+     * {@code \\XX} are not expanded, but an escaped quote or backslash is
+     * skipped correctly. This guards against false positives on strings that
+     * contain {@code %} or {@code @}.</p>
+     */
+    private static void seedFilter(Set<String> needed,
+                                   Deque<String> worklist,
+                                   Map<String, String> allDefs,
+                                   String text) {
+        if (text == null || text.isEmpty()) return;
+
+        int n = text.length();
+        int i = 0;
+        while (i < n) {
+            char c = text.charAt(i);
+
+            // Skip a whole string literal.
+            if (c == '"') {
+                i++;
+                while (i < n) {
+                    char d = text.charAt(i);
+                    if (d == '\\' && i + 1 < n) { i += 2; continue; }
+                    if (d == '"') { i++; break; }
+                    i++;
+                }
+                continue;
+            }
+
+            // Reference to a type (%Type) or a symbol (@func).
+            if (c == '%' || c == '@') {
+                int start = i;
+                int j = i + 1;
+                while (j < n) {
+                    char d = text.charAt(j);
+                    boolean ident =
+                           (d >= 'a' && d <= 'z')
+                        || (d >= 'A' && d <= 'Z')
+                        || (d >= '0' && d <= '9')
+                        || d == '_' || d == '.' || d == '$' || d == '-';
+                    if (!ident) break;
+                    j++;
+                }
+                if (j > start + 1) {
+                    String key = text.substring(start, j);
+                    if (allDefs.containsKey(key) && needed.add(key)) {
+                        worklist.add(key);
+                    }
+                }
+                i = j;
+                continue;
+            }
+
+            i++;
         }
     }
 

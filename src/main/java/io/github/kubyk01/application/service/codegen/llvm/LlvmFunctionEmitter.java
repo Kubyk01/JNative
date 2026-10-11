@@ -566,7 +566,7 @@ public class LlvmFunctionEmitter {
      */
     private String emitUnsafeConstantsClinit() {
 
-        String sb = "define void @fn_jdk_internal_misc_UnsafeConstants__clinit____V() {\n" +
+        return "define void @fn_jdk_internal_misc_UnsafeConstants__clinit____V() {\n" +
                 "entry:\n" +
 
                 /* ADDRESS_SIZE0 : int */
@@ -597,7 +597,6 @@ public class LlvmFunctionEmitter {
                 "@gv_jdk_internal_misc_UnsafeConstants_DATA_CACHE_LINE_FLUSH_SIZE, align 4\n" +
                 "  ret void\n" +
                 "}\n\n";
-        return sb;
     }
 
     private String llvmLabel(BasicBlock block) {
@@ -2268,8 +2267,31 @@ public class LlvmFunctionEmitter {
             }
 
             case FREE: {
+                if (inst.getOperands().isEmpty()) {
+                    // Instruction without an operand: nothing to free. This is
+                    // a defensive case; valid IR never contains it.
+                    break;
+                }
                 Value obj = inst.getOperands().getFirst();
+                if (obj == null) {
+                    break;
+                }
+                if (obj instanceof Constant c && c.getValue() == null) {
+                    // free(NULL) in LLVM IR is not a no-op: it is a real
+                    // function call with a null pointer. It does nothing
+                    // semantically but pollutes the IR and masks lifetime bugs.
+                    // Skip the emission entirely.
+                    break;
+                }
                 String objRef = getLlvmValue(sb, obj);
+                if ("null".equals(objRef)) {
+                    // getLlvmValue() returned "null" — either because the value
+                    // did not map (valueMapper.getValue() == null) or because
+                    // the value type is a reference and the value itself is
+                    // absent. In both cases there is no register, and
+                    // free(null) is meaningless.
+                    break;
+                }
                 sb.append("  call void @free(i8* ").append(objRef).append(")\n");
                 break;
             }
