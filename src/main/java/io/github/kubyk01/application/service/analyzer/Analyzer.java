@@ -1754,32 +1754,27 @@ public class Analyzer {
                                      java.util.function.Consumer<T> action) {
         if (items.isEmpty()) return;
 
-        Scheduler.Worker worker = scheduler.createWorker();
         CountDownLatch latch = new CountDownLatch(items.size());
         AtomicReference<Throwable> failure = new AtomicReference<>();
 
-        try {
-            for (T item : items) {
-                worker.schedule(() -> {
-                    try {
-                        action.accept(item);
-                    } catch (Throwable t) {
-                        failure.compareAndSet(null, t);
-                    } finally {
-                        latch.countDown();
-                    }
-                });
-            }
+        for (T item : items) {
+            scheduler.schedule(() -> {
+                try {
+                    action.accept(item);
+                } catch (Throwable t) {
+                    failure.compareAndSet(null, t);
+                } finally {
+                    latch.countDown();
+                }
+            });
+        }
 
-            try {
-                latch.await();
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                throw new RuntimeException(
-                    "parallel initialization phase interrupted", e);
-            }
-        } finally {
-            worker.dispose();
+        try {
+            latch.await();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException(
+                "parallel initialization phase interrupted", e);
         }
 
         Throwable first = failure.get();

@@ -551,6 +551,34 @@ extern const int64_t    jnative_symbol_class_map_size     JNATIVE_WEAK;
 extern const char* jnative_caller_sensitive_symbols[]     JNATIVE_WEAK;
 extern const int64_t jnative_caller_sensitive_symbols_size JNATIVE_WEAK;
 
+/* ---- Function index for stack walking ------------------------------ */
+
+/**
+ * One entry of @jnative_function_index. Layout is frozen by the emitted
+ * LLVM type; see LlvmGlobalEmitter.generateFunctionIndex().
+ */
+typedef struct {
+    void*            address;  /* function pointer, relocated by the loader */
+    const char*      symbol;   /* mangled symbol name */
+    ReflectionClass* cls;      /* owning class mirror, or NULL */
+} JNativeFunctionEntry;
+
+extern JNativeFunctionEntry jnative_function_index[]     JNATIVE_WEAK;
+extern const int64_t        jnative_function_index_size  JNATIVE_WEAK;
+
+/**
+ * Resolves `pc` to the symbol and owning class of the function that
+ * contains it. Returns 1 when the address is covered by the emitted
+ * function index, 0 otherwise (the caller is expected to fall back to
+ * dladdr, which it will rarely need to do).
+ *
+ * The implementation builds a sorted-by-address copy of the emitted
+ * table on first use, then answers queries with a binary search.
+ */
+extern int __jnative_function_at_address(uintptr_t pc,
+                                         const char** out_symbol,
+                                         ReflectionClass** out_cls);
+
 /* ---- Embedded resources -------------------------------------------- */
 
 /**

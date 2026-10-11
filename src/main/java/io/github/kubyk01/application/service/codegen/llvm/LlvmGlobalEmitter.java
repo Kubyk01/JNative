@@ -266,6 +266,15 @@ public class LlvmGlobalEmitter {
 
     private final Set<String> emittedVtableThunks = ConcurrentHashMap.newKeySet();
 
+    /**
+     * Internal class names for which {@link #generateReflectionData()} has
+     * emitted a {@code @refclass_*} mirror. Populated at the end of that
+     * method, so {@link #generateFunctionIndex()} (which runs after it in
+     * {@link #generateGlobalDefinitions()}) can decide whether a function's
+     * owning class has a mirror to point at.
+     */
+    private final Set<String> emittedRefClassNames = ConcurrentHashMap.newKeySet();
+
     public int getLiteralPoolSize() {
         return stringLiteralPool.size();
     }
@@ -820,7 +829,13 @@ public class LlvmGlobalEmitter {
             + "%ReflectionMethod**, %ReflectionField**, %ReflectionConstructor**, i32, i32, i8*, "
             + "i8*, i8*, i8*, i8*, i8*, i8*, i8*, i8*, i8*, i8*, "
             + "i8*, i8*, i8*, i8*, i8*, i8*, i8*, i8* }\n" +
-            "%JNativeSymbolClassEntry = type { i8*, %ReflectionClass* }\n";
+            "%JNativeSymbolClassEntry = type { i8*, %ReflectionClass* }\n" +
+            // One entry of @jnative_function_index; see
+            // generateFunctionIndex() and JNativeFunctionEntry in
+            // jnative_runtime.h. The three fields are the function pointer,
+            // its mangled symbol name, and the owning class mirror (NULL
+            // when the owning class has no emitted mirror).
+            "%JNativeFunctionEntry = type { i8*, i8*, %ReflectionClass* }\n";
         return cachedTypeDefinitions;
     }
 
@@ -861,7 +876,8 @@ public class LlvmGlobalEmitter {
             generateTypeInfo() +
             generateUnnamedModule() +
             generateEmbeddedResources() +
-            generateReflectionData();
+            generateReflectionData() +
+            generateFunctionIndex();
     }
 
     /** Existing entry point, preserved for backwards compatibility. */
@@ -3592,6 +3608,11 @@ public class LlvmGlobalEmitter {
             classPtrs.add("%ReflectionClass* " + classVarName);
         }
 
+        // Publish the set of classes that actually got a mirror, so that
+        // generateFunctionIndex() (called after this method) can attach the
+        // right @refclass_* pointer to every function whose owner is here.
+        emittedRefClassNames.addAll(classNames);
+
         sb.append("@reflect_all_classes = constant [")
             .append(classPtrs.size() + 1).append(" x %ReflectionClass*] [");
         for (String p : classPtrs) sb.append(p).append(", ");
@@ -3601,6 +3622,118 @@ public class LlvmGlobalEmitter {
         sb.append(generateCallerSensitiveSymbols(strConsts));
 
         sb.append(strConsts);
+        return sb.toString();
+    }
+
+    /**
+     * Emits {@code @jnative_function_index} — a flat table of every function
+     * with a body in the module, together with its mangled symbol name and
+     * (when the function belongs to a Java class) the {@code @refclass_*}
+     * mirror of that class.
+     *
+     * <p>The table is emitted as {@code global}, not {@code constant},
+     * because the runtime sorts it in place by address on first use.
+     *
+     * <p>The dynamic linker resolves every function pointer in the
+     * initializer at load time, so a query at run time maps an instruction
+     * pointer to a (symbol, class) pair with a single binary search — no
+     * {@code dladdr}, no per-symbol {@code dlsym}, no linear scan of
+     * {@code .dynsym}.
+     *
+     * <p>Functions whose owning class is not in the emitted mirror set get a
+     * NULL class pointer; the runtime then falls back to prefix-based
+     * classification, exactly as it does today.
+     */
+    private String generateFunctionIndex() {
+        StringBuilder sb = new StringBuilder();
+        sb.append("\n; ----- Function index for stack walking -----\n");
+
+        List<Function> allFuncs = new ArrayList<>();
+        for (Function f : module.getFunctions()) {
+            if (f.getEntryBlock() != null && hasFunctionIndexSignature(f)) {
+                allFuncs.add(f);
+            }
+        }
+        allFuncs.sort(Comparator.comparing(Function::getName));
+
+        if (allFuncs.isEmpty()) {
+            sb.append("@jnative_function_index = global [1 x %JNativeFunctionEntry] [")
+              .append("%JNativeFunctionEntry { i8* null, i8* null, %ReflectionClass* null }]\n");
+            sb.append("@jnative_function_index_size = constant i64 0\n");
+            return sb.toString();
+        }
+
+        StringBuilder strConsts = new StringBuilder();
+        List<String> lines = new ArrayList<>(allFuncs.size());
+        for (Function f : allFuncs) {
+            String name = f.getName();
+            String fnPtrTy = llvmFunctionPointerType(f);
+            String namePtr = ensureStringConstantPtr(strConsts, name);
+            String clsPtr = "null";
+            String owner = f.getOwnerClass();
+            if (owner != null && !owner.isEmpty() && hasRefClassMirror(owner)) {
+                clsPtr = getRefClassGlobalName(owner);
+            }
+            lines.add("  %JNativeFunctionEntry { i8* bitcast (" + fnPtrTy
+                      + " @" + name + " to i8*), i8* " + namePtr
+                      + ", %ReflectionClass* " + clsPtr + " }");
+        }
+
+        sb.append("@jnative_function_index = global [")
+          .append(allFuncs.size())
+          .append(" x %JNativeFunctionEntry] [\n");
+        for (int i = 0; i < lines.size(); i++) {
+            if (i > 0) sb.append(",\n");
+            sb.append(lines.get(i));
+        }
+        sb.append("\n]\n");
+        sb.append("@jnative_function_index_size = constant i64 ")
+          .append(allFuncs.size()).append("\n\n");
+
+        sb.append(strConsts);
+        return sb.toString();
+    }
+
+    /**
+     * True when the function's emitted definition has the same LLVM type as
+     * its IR signature, so that the {@code bitcast (... to i8*)} in the
+     * function index is well-typed.
+     *
+     * <p>{@link LlvmFunctionEmitter#emitFunction} replaces the body of a
+     * couple of functions with hand-written text. One of those replacement
+     * bodies — {@code fn_java_security_Provider_checkInitialized___V} —
+     * declares an extra {@code i8*} parameter that the IR signature does
+     * not have. A function-pointer bitcast cannot be validated for such a
+     * symbol, so it is left out of the index; the runtime then falls back
+     * to the symbol-class map for it, as it did before the index existed.
+     */
+    private static boolean hasFunctionIndexSignature(Function f) {
+        return !"fn_java_security_Provider_checkInitialized___V"
+            .equals(f.getName());
+    }
+
+    /**
+     * True when {@link #generateReflectionData()} emitted a
+     * {@code @refclass_*} mirror for this internal class name.
+     */
+    private boolean hasRefClassMirror(String className) {
+        return emittedRefClassNames.contains(className);
+    }
+
+    /**
+     * The LLVM spelling of the function-pointer type of {@code f}, e.g.
+     * {@code "void (i8*, i32)*"} or {@code "i8* ()*"}, used as the source
+     * type of the {@code bitcast (... to i8*)} in the function index.
+     */
+    private static String llvmFunctionPointerType(Function f) {
+        StringBuilder sb = new StringBuilder();
+        sb.append(LlvmTypeMapper.toLlvmType(f.getReturnType())).append(" (");
+        List<Parameter> params = f.getParameters();
+        for (int i = 0; i < params.size(); i++) {
+            if (i > 0) sb.append(", ");
+            sb.append(LlvmTypeMapper.toLlvmType(params.get(i).getType()));
+        }
+        sb.append(")*");
         return sb.toString();
     }
 

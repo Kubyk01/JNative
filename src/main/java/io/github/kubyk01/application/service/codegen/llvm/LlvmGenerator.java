@@ -796,7 +796,8 @@ public class LlvmGenerator {
         ensureExternalFunction("__jnative_reflect_set_layout", Type.VOID,
             Type.INT, Type.INT, Type.INT, Type.INT, Type.INT,   // Field: clazz, slot, name, type, modifiers
             Type.INT, Type.INT, Type.INT, Type.INT, Type.INT, Type.INT, Type.INT,   // Method: clazz, slot, name, returnType, params, exc, modifiers
-            Type.INT, Type.INT, Type.INT, Type.INT, Type.INT);  // Constructor: clazz, slot, params, exc, modifiers
+            Type.INT, Type.INT, Type.INT, Type.INT, Type.INT,   // Constructor: clazz, slot, params, exc, modifiers
+            Type.INT, Type.INT);                                // Constructor root, Method root
 
         ensureExternalFunction(
             "__jnative_fn_jdk_internal_util_SystemProps_Raw_cmdProperties___Ljava_util_HashMap_",
@@ -1054,6 +1055,8 @@ public class LlvmGenerator {
         int ctorParams      = safeFieldOffset("java/lang/reflect/Constructor", "parameterTypes", 56);
         int ctorExc         = safeFieldOffset("java/lang/reflect/Constructor", "exceptionTypes", 64);
         int ctorMods        = safeFieldOffset("java/lang/reflect/Constructor", "modifiers",      72);
+        int ctorRoot        = safeFieldOffset("java/lang/reflect/Constructor", "root",           -1);
+        int methodRoot      = safeFieldOffset("java/lang/reflect/Method", "root",                -1);
 
         sb.append("  call void @__jnative_reflect_set_layout(")
             .append("i32 ").append(fieldClazz).append(", ")
@@ -1072,7 +1075,9 @@ public class LlvmGenerator {
             .append("i32 ").append(ctorSlot).append(", ")
             .append("i32 ").append(ctorParams).append(", ")
             .append("i32 ").append(ctorExc).append(", ")
-            .append("i32 ").append(ctorMods).append(")\n");
+            .append("i32 ").append(ctorMods).append(", ")
+            .append("i32 ").append(ctorRoot).append(", ")
+            .append("i32 ").append(methodRoot).append(")\n");
 
         int poolSize = globalEmitter.getLiteralPoolSize();
         sb.append("  call void @__jnative_init_string_pool(i8** getelementptr inbounds ([")

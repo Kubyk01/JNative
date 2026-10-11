@@ -283,12 +283,21 @@ static struct ReflectionClass* find_first_java_caller(void) {
      * frames are present, only on which frames are service frames.
      */
     for (int i = 0; i < n; i++) {
-        Dl_info info;
-        memset(&info, 0, sizeof(info));
-        if (dladdr(frames[i], &info) == 0) continue;
-        if (info.dli_sname == NULL) continue;
+        const char* sym = NULL;
+        struct ReflectionClass* entry_cls = NULL;
 
-        const char* sym = info.dli_sname;
+        if (!__jnative_function_at_address((uintptr_t)frames[i],
+                                           &sym, &entry_cls)) {
+            /* Address outside the emitted module — a function from a
+             * shared library, or the runtime itself. Fall back to the
+             * slow path; these frames are not Java frames and are
+             * skipped anyway. */
+            Dl_info info;
+            memset(&info, 0, sizeof(info));
+            if (dladdr(frames[i], &info) == 0) continue;
+            if (info.dli_sname == NULL) continue;
+            sym = info.dli_sname;
+        }
 
         if (!is_java_frame_symbol(sym)) continue;
 
@@ -315,6 +324,11 @@ static struct ReflectionClass* find_first_java_caller(void) {
         }
 
         if (is_service_frame_symbol(sym)) continue;
+
+        /* Fast path: the emitter recorded the owning class directly in
+         * the function index, so no second lookup by symbol name is
+         * required for the common case of a Java method frame. */
+        if (entry_cls != NULL) return entry_cls;
 
         struct ReflectionClass* cls = class_for_symbol(sym);
         if (cls != NULL) return cls;

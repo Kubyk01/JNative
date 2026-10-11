@@ -1552,38 +1552,50 @@ public class LlvmFunctionEmitter {
                     "receiver of " + owner + "." + methodName + methodDesc);
                 String receiverRef = getLlvmValue(sb, receiver);
 
-                // Resolve the vtable through the runtime helper instead of
-                // reading obj[0] inline.
+                // Whether the runtime type of `receiver` can be an array.
+                // Arrays are the only objects whose first word is a class
+                // mirror rather than a vtable, and only three static types
+                // admit them: Object, Cloneable, Serializable. For every
+                // other static reference type the runtime value is
+                // guaranteed to be an ordinary object, so obj[0] can be read
+                // directly as a %JNativeVTable* and the whole hash-set probe
+                // inside __jnative_resolve_dispatch_vtable is skipped.
                 //
-                // For an ordinary object obj[0] is a %JNativeVTable*, but for
-                // an array it is a %ReflectionClass* (JAVA_ARR_KLASS_OFFSET == 0,
-                // see jnative_runtime.h). An array only reaches this point when
-                // its STATIC type is Object or an interface: in that case
-                // receiverIsArray is false (see how receiverIsArray is derived
-                // from receiver.getType().isArray()) and the direct-dispatch
-                // branch does not fire. Reading obj[0] as a vtable made the
-                // emitter treat the class mirror as a %JNativeVTable, the
-                // mirror's 'methods' field as methods of class
-                // java.lang.Class, and the call went out through a foreign slot
-                // with a garbage receiver. Observable symptom:
-                // fn_java_lang_Class_3_run calls itself through jmp *0x58(%rax).
-                //
-                // __jnative_resolve_dispatch_vtable does exactly what the
-                // emitter should have done:
-                //
-                //   * ordinary object -> returns obj[0] unchanged;
-                //   * array           -> returns @vtable_java_lang_Object
-                //     (arrays inherit all of their methods from Object);
-                //   * obj[0] == NULL or unregistered -> throws a diagnostic
-                //     exception instead of calling into garbage.
-                //
-                // The distinction is made with a precomputed hash set of the
-                // reflect_all_classes[] pointers; the cost is O(1) per call.
+                // The emitter derives this from the receiver's declared IR
+                // type, which is exactly the static type the bytecode
+                // verifier computed. An UNKNOWN, NULL or BLOCK type keeps the
+                // resolve path because there is no static guarantee.
+                boolean maybeArray = true;
+                Type recvTy = receiver.getType();
+                if (recvTy.isReference()) {
+                    String rcn = recvTy.getClassName();
+                    maybeArray = (rcn == null)
+                        || "java/lang/Object".equals(rcn)
+                        || "java/lang/Cloneable".equals(rcn)
+                        || "java/io/Serializable".equals(rcn);
+                }
+
                 String vtableStruct = newAux("vtable_struct");
-                sb.append("  ").append(vtableStruct)
-                    .append(" = call %JNativeVTable* "
-                        + "@__jnative_resolve_dispatch_vtable(i8* ")
-                    .append(receiverRef).append(")\n");
+                if (maybeArray) {
+                    // __jnative_resolve_dispatch_vtable distinguishes an
+                    // ordinary object (obj[0] is a vtable) from an array
+                    // (obj[0] is a %ReflectionClass*), and throws a
+                    // diagnostic when obj[0] is NULL or unregistered.
+                    sb.append("  ").append(vtableStruct)
+                        .append(" = call %JNativeVTable* "
+                            + "@__jnative_resolve_dispatch_vtable(i8* ")
+                        .append(receiverRef).append(")\n");
+                } else {
+                    // The static type guarantees an ordinary object, so the
+                    // first word is the vtable itself.
+                    String vtableSlot = newAux("vtable_slot");
+                    sb.append("  ").append(vtableSlot)
+                        .append(" = bitcast i8* ").append(receiverRef)
+                        .append(" to %JNativeVTable**\n");
+                    sb.append("  ").append(vtableStruct)
+                        .append(" = load %JNativeVTable*, %JNativeVTable** ")
+                        .append(vtableSlot).append("\n");
+                }
 
                 String funcPtr;
                 if (isInterfaceCall) {

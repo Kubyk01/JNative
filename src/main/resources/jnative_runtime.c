@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include <pthread.h>
+#include <link.h>
 #include <setjmp.h>
 #include <stdarg.h>
 #include <signal.h>
@@ -448,6 +449,272 @@ void __jnative_clinit_exit(void* name_str) {
     ClinitEntry* e = clinit_lookup(name);
     if (e != NULL) e->state = CLINIT_STATE_DONE;
     pthread_mutex_unlock(&clinit_lock);
+}
+
+/* ============================================================================
+ * Function index for stack walking
+ * ============================================================================
+ *
+ * dladdr has no reverse index into the dynamic symbol table and therefore
+ * performs a linear scan of every exported symbol on every call. On an
+ * image that exports every reachable Java method (~271k dynamic symbols on
+ * the build that motivated this code) a single dladdr call costs ~9M
+ * instructions, and a stack walk of ten frames costs ~90M.
+ *
+ * This section builds a sorted-by-address copy of @jnative_function_index
+ * on first use. The copy is kept for the lifetime of the process; queries
+ * are answered with a binary search over the pointer values, which is
+ * O(log N) pointer comparisons and therefore independent of the size of
+ * the exported symbol table.
+ * ========================================================================== */
+
+typedef struct {
+    uintptr_t        address;
+    const char*      symbol;
+    ReflectionClass* cls;
+} FunctionIndexSortedEntry;
+
+static FunctionIndexSortedEntry* function_index_sorted = NULL;
+static int64_t                   function_index_count  = 0;
+static pthread_once_t            function_index_once   = PTHREAD_ONCE_INIT;
+
+/*
+ * Address range of the main executable's executable text. Queries outside
+ * this range belong to another image (the dynamic loader, libc, the stack,
+ * a JNI library) and must not be attributed to the nearest preceding
+ * generated function, which would otherwise turn a foreign frame into a
+ * bogus Java frame. Both bounds are 0 until build_function_index has run;
+ * a 0 upper bound means "unknown" and disables the range check.
+ */
+static uintptr_t function_index_text_low  = 0;
+static uintptr_t function_index_text_high = 0;
+
+#if defined(__linux__)
+static int jnative_find_main_text_end(struct dl_phdr_info* info,
+                                      size_t size, void* data) {
+    (void)size;
+    /* The main executable is the object whose name is the empty string;
+     * every shared library has a non-empty path in dlpi_name. */
+    if (info->dlpi_name == NULL || info->dlpi_name[0] == '\0') {
+        uintptr_t end = 0;
+        for (int i = 0; i < info->dlpi_phnum; i++) {
+            const ElfW(Phdr)* ph = &info->dlpi_phdr[i];
+            if (ph->p_type == PT_LOAD && (ph->p_flags & PF_X)) {
+                uintptr_t seg_end = (uintptr_t)info->dlpi_addr
+                                  + (uintptr_t)ph->p_vaddr
+                                  + (uintptr_t)ph->p_memsz;
+                if (seg_end > end) end = seg_end;
+            }
+        }
+        *(uintptr_t*)data = end;
+        return 1;
+    }
+    return 0;
+}
+#endif
+
+/* ----------------------------------------------------------------------------
+ * Sparse page index over the sorted function array
+ * ----------------------------------------------------------------------------
+ *
+ * The query is interval-based ("which function contains pc?"), so a hash on
+ * pc itself is wrong: it would miss every address inside a function except
+ * its first byte. The structure below hashes only the page number and then
+ * does a bounded forward scan in the sorted array — at most a few entries
+ * per page for any realistic code layout.
+ *
+ * Memory cost: 8 bytes per page that contains at least one function start.
+ * On a 111 MB image with ~271k functions this is on the order of a few
+ * thousand pages, i.e. tens of KiB — comfortably resident in L2.
+ * -------------------------------------------------------------------------- */
+
+#define PAGE_SHIFT          12
+#define PAGE_SIZE_BYTES     (1u << PAGE_SHIFT)
+#define PAGE_MASK           (PAGE_SIZE_BYTES - 1u)
+
+typedef struct {
+    uintptr_t page_number;   /* page >> PAGE_SHIFT                   */
+    int64_t   sorted_index;  /* index + 1 into function_index_sorted */
+} PageIndexEntry;
+
+static PageIndexEntry* page_index      = NULL;
+static size_t          page_index_size = 0;   /* power of two, 0 = none */
+
+static uintptr_t hash_page_number(uintptr_t p) {
+    /* Multiplicative hash; page numbers are dense and small, but the
+     * multiply spreads them across the table after the shift. */
+    return (p * 0x9E3779B97F4A7C15ULL);
+}
+
+static int compare_function_entries(const void* a, const void* b) {
+    uintptr_t aa = ((const FunctionIndexSortedEntry*)a)->address;
+    uintptr_t bb = ((const FunctionIndexSortedEntry*)b)->address;
+    if (aa < bb) return -1;
+    if (aa > bb) return  1;
+    return 0;
+}
+
+/*
+ * Rebuilds the page index from function_index_sorted. Called once after
+ * build_function_index. Walks the sorted array front-to-back and emits one
+ * entry per page that contains at least one function start.
+ *
+ * An open-addressed table with linear probing is used: it is never resized,
+ * never deleted from, and the load factor is kept below 0.5 by sizing to
+ * 2 * (number of distinct start pages).
+ */
+static void build_page_index(void) {
+    if (function_index_sorted == NULL || function_index_count == 0) return;
+
+    /* Count distinct pages that contain a function start. */
+    size_t distinct = 1;
+    uintptr_t last_page = function_index_sorted[0].address >> PAGE_SHIFT;
+    for (int64_t i = 1; i < function_index_count; i++) {
+        uintptr_t p = function_index_sorted[i].address >> PAGE_SHIFT;
+        if (p != last_page) {
+            distinct++;
+            last_page = p;
+        }
+    }
+
+    size_t cap = 16;
+    while (cap < distinct * 2) cap <<= 1;
+
+    PageIndexEntry* table = calloc(cap, sizeof(*table));
+    if (table == NULL) return;
+
+    int64_t first_in_page = 0;
+    uintptr_t current_page =
+        function_index_sorted[0].address >> PAGE_SHIFT;
+
+    for (int64_t i = 1; i <= function_index_count; i++) {
+        uintptr_t p = (i < function_index_count)
+            ? (function_index_sorted[i].address >> PAGE_SHIFT)
+            : (uintptr_t)-1;
+        if (p == current_page) continue;
+
+        /* Insert (current_page -> first_in_page) with linear probing. */
+        size_t slot = (size_t)(hash_page_number(current_page) & (cap - 1));
+        while (table[slot].sorted_index != 0) {
+            slot = (slot + 1) & (cap - 1);
+        }
+        table[slot].page_number  = current_page;
+        /* Encode index + 1 so that 0 means "empty slot". */
+        table[slot].sorted_index = first_in_page + 1;
+
+        if (i < function_index_count) {
+            current_page  = p;
+            first_in_page = i;
+        }
+    }
+
+    page_index      = table;
+    page_index_size = cap;
+}
+
+static void build_function_index(void) {
+    if ((uintptr_t)&jnative_function_index_size == 0) return;
+    if ((uintptr_t)&jnative_function_index      == 0) return;
+    int64_t n = jnative_function_index_size;
+    if (n <= 0) return;
+
+    FunctionIndexSortedEntry* arr = malloc((size_t)n * sizeof(*arr));
+    if (arr == NULL) return;
+
+    for (int64_t i = 0; i < n; i++) {
+        arr[i].address = (uintptr_t)jnative_function_index[i].address;
+        arr[i].symbol  = jnative_function_index[i].symbol;
+        arr[i].cls     = jnative_function_index[i].cls;
+    }
+    qsort(arr, (size_t)n, sizeof(*arr), compare_function_entries);
+
+    function_index_sorted = arr;
+    function_index_count  = n;
+    function_index_text_low = arr[0].address;
+#if defined(__linux__)
+    {
+        uintptr_t end = 0;
+        dl_iterate_phdr(jnative_find_main_text_end, &end);
+        function_index_text_high = end;
+    }
+#endif
+    build_page_index();
+}
+
+/*
+ * Returns the last entry whose start address does not exceed `pc`, or NULL
+ * if `pc` precedes every entry. With -flto and cross-function inlining, a pc
+ * may lie inside an inlined body whose start is not separately recorded; the
+ * query then resolves to the outermost function that contains the inlined
+ * body, which is the correct frame identity for a stack walk.
+ */
+static const FunctionIndexSortedEntry* function_index_lookup(uintptr_t pc) {
+    if (function_index_sorted == NULL || function_index_count == 0) {
+        return NULL;
+    }
+
+    /* Reject addresses outside the main executable's text before the
+     * nearest-preceding search can attach them to a generated function. */
+    if (function_index_text_high != 0
+        && (pc < function_index_text_low || pc >= function_index_text_high)) {
+        return NULL;
+    }
+
+    /* Fast path: the page index gives the first function whose start is on
+     * the page containing pc, plus a short scan for the function that
+     * actually contains pc. */
+    if (page_index != NULL && page_index_size > 0) {
+        uintptr_t page = pc >> PAGE_SHIFT;
+        size_t slot = (size_t)(hash_page_number(page) & (page_index_size - 1));
+        while (page_index[slot].sorted_index != 0) {
+            if (page_index[slot].page_number == page) {
+                int64_t idx = page_index[slot].sorted_index - 1;
+                /* The first start on pc's page may lie after pc when pc is
+                 * inside a function that began on an earlier page. Step
+                 * back to the last start not past pc. */
+                while (idx > 0
+                       && function_index_sorted[idx].address > pc) {
+                    idx--;
+                }
+                if (function_index_sorted[idx].address > pc) {
+                    /* pc precedes every recorded start; use the search. */
+                    break;
+                }
+                while (idx + 1 < function_index_count
+                       && function_index_sorted[idx + 1].address <= pc) {
+                    idx++;
+                }
+                return &function_index_sorted[idx];
+            }
+            slot = (slot + 1) & (page_index_size - 1);
+        }
+        /* pc lies on a page that has no function start of its own. The
+         * nearest preceding start lives on an earlier page, so fall
+         * through to the binary search — this is rare and only occurs for
+         * the tail of a function whose start is on a previous page, which
+         * the binary search handles directly. */
+    }
+
+    /* Fallback: binary search over the sorted array. */
+    int64_t lo = 0, hi = function_index_count;
+    while (lo < hi) {
+        int64_t mid = lo + (hi - lo) / 2;
+        if (function_index_sorted[mid].address <= pc) lo = mid + 1;
+        else                                          hi = mid;
+    }
+    if (lo == 0) return NULL;
+    return &function_index_sorted[lo - 1];
+}
+
+int __jnative_function_at_address(uintptr_t pc,
+                                  const char** out_symbol,
+                                  ReflectionClass** out_cls) {
+    pthread_once(&function_index_once, build_function_index);
+    const FunctionIndexSortedEntry* e = function_index_lookup(pc);
+    if (e == NULL || e->symbol == NULL) return 0;
+    if (out_symbol != NULL) *out_symbol = e->symbol;
+    if (out_cls    != NULL) *out_cls    = e->cls;
+    return 1;
 }
 
 /* ============================================================================
