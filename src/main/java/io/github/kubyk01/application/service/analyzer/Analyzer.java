@@ -412,10 +412,6 @@ public class Analyzer {
                 }
             }
         }
-        if (!forcedClasses.isEmpty()) {
-            System.out.println("Lazy <clinit>: forcing " + forcedClasses.size()
-                + " deferred class(es) into the lazy set: " + forcedClasses);
-        }
 
         // ---- Parallel call-graph construction (Reactor).
         Map<String, Set<String>> callGraph = new ConcurrentHashMap<>();
@@ -1675,12 +1671,19 @@ public class Analyzer {
 
                     // Family B only: defer. Family A or A∩B: leave in the
                     // eager schedule — the phase still depends on it.
+                    //
+                    // The verbose per-candidate trace ("defer candidate:
+                    // <clinit> (reads a field written by phase <p>, ...)")
+                    // was useful while the deferral rule was being debugged
+                    // against a full JDK closure, where it printed hundreds
+                    // of lines per pass and dominated the analysis log. The
+                    // aggregate is still reported once per run by the
+                    // "Deferring N <clinit>(s) ..." summary below, which is
+                    // the only line a caller needs; the per-candidate
+                    // detail is omitted.
                     if (cReadsP && !cWritesP) {
                         deferred.add(cName);
                         changed = true;
-                        System.out.println("  defer candidate: " + cName
-                            + " (reads a field written by phase " + p.getName()
-                            + ", contributes nothing to that phase's own reads)");
                     }
                 }
             }

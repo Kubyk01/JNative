@@ -1792,7 +1792,31 @@ void __jnative_invoke_runnable(void* runnable) {
  * <clinit> trace hook
  * ========================================================================== */
 
+/*
+ * <clinit> trace hook.
+ *
+ * Emitted into @main by earlier revisions of LlvmGenerator as a
+ * "call void @__jnative_debug_clinit(...)" before each eager <clinit>
+ * invocation and before each bootstrap phase. The current revision no
+ * longer emits those calls, but the symbol is kept declared so that:
+ *
+ *   - a previously-generated _module.ll that still contains the calls
+ *     links and runs without flooding stderr;
+ *
+ *   - the hook can be turned back on without rebuilding the JVM side,
+ *     by setting JNATIVE_TRACE_CLINIT=1 in the environment.
+ *
+ * The env-var gate is checked on every call. It is a single getenv()
+ * per <clinit>, of which there are at most a few thousand per process,
+ * so the cost is not measurable and the diagnostic remains one line
+ * away.
+ */
 void __jnative_debug_clinit(const char* name) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        enabled = (getenv("JNATIVE_TRACE_CLINIT") != NULL) ? 1 : 0;
+    }
+    if (!enabled) return;
     fprintf(stderr, "[clinit] %s\n", name);
     fflush(stderr);
 }

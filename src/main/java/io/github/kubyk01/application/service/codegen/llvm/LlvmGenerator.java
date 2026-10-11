@@ -72,20 +72,6 @@ public class LlvmGenerator {
     private Map<String, String> clinitWrappers = new HashMap<>();
 
     /**
-     * Maximum number of CPU cores the generator may use for the parallel
-     * function-emission phase.
-     *
-     * <p>The value is set by {@link
-     * io.github.kubyk01.application.service.Orchestrator} through
-     * {@link #setCores(int)}; it is never derived here. This revision
-     * emits function bodies sequentially (parallelism kicked to the clang
-     * stage), but the setter and its default of 1 are kept for API
-     * compatibility — the field is documented as a hint rather than a
-     * hard budget.</p>
-     */
-    private int cores = 1;
-
-    /**
      * Resources to bake into the image, in the order the caller collected
      * them. Each entry is a path and its bytes; the path is the internal
      * form {@code Class.getResourceAsStream} resolves to (leading {@code '/'}
@@ -120,10 +106,6 @@ public class LlvmGenerator {
      * {@link Runtime#availableProcessors()} here — that decision belongs
      * to {@link io.github.kubyk01.application.service.Orchestrator}.</p>
      */
-    public void setCores(int cores) {
-        this.cores = (cores <= 0) ? 1 : cores;
-    }
-
     public LlvmGenerator(Module module, DependencyResolver resolver,
                          AliasAnalysisResult aliasResult,
                          String entryClass, String entryMethod, String entryDescriptor,
@@ -218,30 +200,54 @@ public class LlvmGenerator {
         // ---- 5. Write _module.ll. Every global lives in this file, so its
         //         extern block must NOT re-declare globals (LLVM rejects a
         //         declaration followed by a definition of the same symbol);
-        //         it only declares referenced functions defined elsewhere. ----
+        //         it only declares referenced functions defined elsewhere.
+        //
+        //         The extern pass must scan BOTH the function bodies AND the
+        //         global-definition text. The vtables / vtable_methods /
+        //         itables / reflection tables that live in `globalDefs` (and
+        //         the lambda vtables that live in `lambdaVts`) carry function
+        //         pointers to per-class methods (`@fn_*`), and those methods
+        //         are defined in the per-class `.ll` files, not here.
+        //         Scanning only `moduleBodies + main` (as an earlier revision
+        //         did) left every such pointer unsatisfied, and clang rejected
+        //         the module with "use of undefined value '@fn_...'".
+        //
+        //         Global *data* symbols (`@gv_*`, `@.str.*`, `@vtable_*`,
+        //         `@ifacemap_*`, `@itable_*`, `@refclass_*`, `@jstr_*`,
+        //         `@strbytes_*`, `@refmethod_*`, `@jtable_*`, `@typeinfo_*`,
+        //         ...) fall through the same pass as non-function names: they
+        //         are not resolvable via `module.getFunction`, so no
+        //         `declare` is emitted for them, and no redefinition of a
+        //         locally-defined global can occur.
+        //
+        //         The textual thunks emitted by `vtableSlotEntry`
+        //         (`@__jnative_vtable_missing_*`) are likewise absent from
+        //         `module.getFunctions()` — they are synthesised as raw text
+        //         inside `globalDefs`, not as IR `Function`s — so their
+        //         `define` in `globalDefs` is left untouched and no
+        //         conflicting `declare` is produced.
+        //         ----
         String main = generateMain();
         String moduleExterns = buildExterns(
-            moduleBodies.toString() + main,
+            globalDefs + "\n"
+                + lambdaVts + "\n"
+                + deferred + "\n"
+                + moduleBodies + moduleDecls + main,
             moduleAvailable,
             Collections.emptyMap(),
             module);
 
-        StringBuilder moduleSb = new StringBuilder(
-            staticPrelude.length() + globalDefs.length() + lambdaVts.length()
-            + deferred.length() + moduleBodies.length() + moduleDecls.length()
-            + moduleExterns.length() + main.length() + 65536);
-        moduleSb.append(staticPrelude);
-        moduleSb.append(moduleExterns);       // <-- externs for functions
-        moduleSb.append(globalDefs);
-        moduleSb.append(lambdaVts);
-        moduleSb.append(deferred);            // <-- deferred strings in _module.ll
-        moduleSb.append(moduleBodies);
-        moduleSb.append(moduleDecls);
-        moduleSb.append(main);
+        String moduleSb = staticPrelude +
+            moduleExterns +       // <-- externs for functions
+            globalDefs +
+            lambdaVts +
+            deferred +            // <-- deferred strings in _module.ll
+            moduleBodies +
+            moduleDecls +
+            main;
 
         Path modulePath = outputDir.resolve("_module.ll");
-        Files.writeString(modulePath, moduleSb.toString(), StandardCharsets.UTF_8);
-        System.out.println("Wrote " + modulePath + " (" + moduleSb.length() + " chars)");
+        Files.writeString(modulePath, moduleSb, StandardCharsets.UTF_8);
 
         // ---- 6. Write per-class files. ----
         for (Map.Entry<String, StringBuilder> e : classBodies.entrySet()) {
@@ -257,16 +263,13 @@ public class LlvmGenerator {
 
             String externs = buildExterns(body, definedHere, knownGlobals, module);
 
-            StringBuilder sb = new StringBuilder(
-                staticPrelude.length() + externs.length() + body.length() + 256);
-            sb.append(staticPrelude);
-            sb.append(externs);
-            sb.append(body);
+            String sb = staticPrelude +
+                externs +
+                body;
 
             Path out = outputDir.resolve(className + ".ll");
             if (out.getParent() != null) Files.createDirectories(out.getParent());
-            Files.writeString(out, sb.toString(), StandardCharsets.UTF_8);
-            System.out.println("Wrote " + className + ".ll (" + sb.length() + " chars)");
+            Files.writeString(out, sb, StandardCharsets.UTF_8);
         }
     }
 
@@ -326,10 +329,13 @@ public class LlvmGenerator {
      * of the definition — a brace/bracket-balanced initializer possibly
      * spanning several lines — is skipped as a unit.</p>
      *
-     * <p>Every global our emitter produces is now emitted with
-     * {@code linkonce_odr}; the LTO linker therefore unifies definitions
-     * across modules, and per-class files only need a bare {@code external}
-     * declaration for the symbols they touch.</p>
+     * <p>Symbols emitted with {@code private}/{@code internal} linkage are
+     * skipped: they are file-local to {@code _module.ll} and must not be
+     * referenced from per-class files. Everything else is retained —
+     * {@code @.str.*} constants carry the default (external) linkage and the
+     * remaining globals are {@code linkonce_odr}, so both are visible across
+     * modules; per-class files reach them through a bare {@code external}
+     * declaration.</p>
      */
     private static Map<String, GlobalDecl> parseGlobalDecls(String src) {
         Map<String, GlobalDecl> out = new HashMap<>();
@@ -356,20 +362,22 @@ public class LlvmGenerator {
             while (j < limit && Character.isWhitespace(src.charAt(j))) j++;
 
             boolean isConst = false;
+            boolean isPrivate = false;
             while (j < limit) {
                 int k = matchLinkageKeyword(src, j, limit);
                 if (k < 0) break;
                 String kw = src.substring(j, k);
+                if (kw.equals("private") || kw.equals("internal")) isPrivate = true;
                 if (kw.equals("constant")) isConst = true;
                 j = k;
                 while (j < limit && Character.isWhitespace(src.charAt(j))) j++;
             }
             int typeEnd = scanTypeToken(src, j, limit);
-            if (typeEnd > j && !name.isEmpty()) {
+            if (typeEnd > j && !isPrivate && !name.isEmpty()) {
                 out.put(name.substring(1),                       // strip '@'
                     new GlobalDecl(src.substring(j, typeEnd), isConst));
             }
-            i = skipInitializer(src, typeEnd > j ? typeEnd : j, n);
+            i = skipInitializer(src, Math.max(typeEnd, j), n);
         }
         return out;
     }
@@ -428,14 +436,58 @@ public class LlvmGenerator {
      * Skips the remainder of a global definition — its initializer, which may
      * span several lines and contain brace/bracket-balanced literals — so the
      * next line begins at {@code i}.
+     *
+     * <p>The skip is string-literal aware. LLVM string literals (both
+     * {@code "..."} and {@code c"..."}) can legally contain raw {@code '['},
+     * {@code ']'}, {@code '{'} and {@code '}'} bytes, and the emitted
+     * {@code @.str.*} constants do exactly that: any Java string containing a
+     * bracket or a brace — for example the vtable slot string
+     * {@code class '[B', slot 'wait(JI)V'} — is emitted with the byte verbatim
+     * inside {@code c"..."}. Treating those bytes as structural nesting
+     * desynchronizes {@code depth}, the initializer skip never terminates at
+     * its own newline, and every subsequent global definition is swallowed by
+     * a single call. The result is that {@code knownGlobals} is truncated,
+     * {@code buildExterns} emits no {@code external constant} line for the
+     * dropped {@code @.str.*} symbols, and clang rejects every per-class
+     * module with "use of undefined value '@.str....'".</p>
+     *
+     * <p>While the scanner is inside a string, {@code depth} is left
+     * unchanged. A backslash consumes the following character so that an
+     * escaped quote ({@code \22}, which is how {@code typeStringConstant}
+     * renders {@code "}) or an escaped bracket ({@code \5B}) does not
+     * terminate the string early or perturb the counter.</p>
      */
     private static int skipInitializer(String s, int start, int n) {
         int depth = 0, i = start;
+        boolean inString = false;
         while (i < n) {
             char c = s.charAt(i);
-            if (c == '{' || c == '[') depth++;
-            else if (c == '}' || c == ']') depth--;
-            else if (c == '\n' && depth == 0) return i + 1;
+            if (inString) {
+                if (c == '\\') {
+                    // Consume the backslash and the character it escapes.
+                    // LLVM escapes are either \" or \\ or a two-digit hex
+                    // escape \XX; in every form the byte immediately after
+                    // the backslash must not be interpreted as a quote or
+                    // as a bracket.
+                    i += 2;
+                    continue;
+                }
+                if (c == '"') {
+                    inString = false;
+                }
+                // Inside a string literal, '[', ']', '{', '}' are data,
+                // not structural nesting: `depth` must not change.
+            } else {
+                if (c == '"') {
+                    inString = true;
+                } else if (c == '{' || c == '[') {
+                    depth++;
+                } else if (c == '}' || c == ']') {
+                    depth--;
+                } else if (c == '\n' && depth == 0) {
+                    return i + 1;
+                }
+            }
             i++;
         }
         return i;
@@ -883,7 +935,6 @@ public class LlvmGenerator {
         String stringClinitName = "fn_java_lang_String__clinit____V";
         Function stringClinit = module.getFunction(stringClinitName);
         if (stringClinit != null && stringClinit.getEntryBlock() != null) {
-            emitDebugClinitCall(sb, stringClinitName);
             sb.append("  call void @").append(eagerTarget(stringClinitName)).append("()\n");
         } else {
             log.warn("java.lang.String.<clinit> is missing from the module; "
@@ -932,7 +983,6 @@ public class LlvmGenerator {
 
         Function systemClinit = module.getFunction(systemClinitName);
         if (systemClinit != null && systemClinit.getEntryBlock() != null) {
-            emitDebugClinitCall(sb, systemClinitName);
             sb.append("  call void @").append(eagerTarget(systemClinitName)).append("()\n");
         }
 
@@ -1011,7 +1061,6 @@ public class LlvmGenerator {
         for (String prereq : bootstrapPrereqClinits) {
             Function f = module.getFunction(prereq);
             if (f == null || f.getEntryBlock() == null) continue;
-            emitDebugClinitCall(sb, prereq);
             sb.append("  call void @").append(eagerTarget(prereq)).append("()\n");
         }
 
@@ -1147,7 +1196,6 @@ public class LlvmGenerator {
             // call them eagerly. They run on demand through their lazy wrapper
             // at the first active-use site. See Analyzer.computeDeferredClinits
             // for the full rationale.
-            emitDebugClinitCall(sb, name);
 
             if (entry.bootstrapPhase()) {
                 // Bootstrap phase: call it with zero arguments and discard
@@ -1223,7 +1271,6 @@ public class LlvmGenerator {
         {
             Function hashedModulesClinit = module.getFunction(hashedModulesClinitName);
             if (hashedModulesClinit != null && hashedModulesClinit.getEntryBlock() != null) {
-                emitDebugClinitCall(sb, hashedModulesClinitName);
                 sb.append("  call void @")
                   .append(eagerTarget(hashedModulesClinitName))
                   .append("()\n");
@@ -1287,14 +1334,6 @@ public class LlvmGenerator {
             .append(privExcActionRunSlot).append("\n\n");
 
         return sb.toString();
-    }
-
-    private void emitDebugClinitCall(StringBuilder sb, String clinitName) {
-        int len = LlvmRuntime.typeStringArrayLength(clinitName);
-        String g = LlvmRuntime.typeStringGlobalName(clinitName);
-        sb.append("  call void @__jnative_debug_clinit(i8* getelementptr inbounds ([")
-            .append(len).append(" x i8], [").append(len)
-            .append(" x i8]* ").append(g).append(", i32 0, i32 0))\n");
     }
 
     /**

@@ -162,11 +162,7 @@ public class CLI implements Runnable {
             return;
         }
 
-        boolean anyFlag = showClasses || showAlias || showEscape || showLifetime
-            || showDestructor || showClassesGraph || showAll;
-        if (!anyFlag) {
-            showClasses = showAlias = showEscape = showLifetime = showDestructor = true;
-        } else if (showAll) {
+        if (showAll) {
             showClasses = showAlias = showEscape = showLifetime = showDestructor = true;
         }
 

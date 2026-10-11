@@ -160,37 +160,36 @@ public class LlvmGlobalEmitter {
     private static final Map<String, Integer> JAVA_LANG_CLASS_FIELD_OFFSETS;
 
     static {
-        Map<String, Integer> m = new HashMap<>();
         // Field order and types are fixed by struct ReflectionClass
         // (jnative_runtime.h) and by the @refclass_* constant emission in
         // generateReflectionData() below. Change one, change all three.
-        m.put("name",                     8);   // Java String | null
-        m.put("superclass",              16);   // %ReflectionClass*
-        m.put("interfaces",              24);   // %ReflectionClass**
-        m.put("methods",                 32);   // C-only, Java code never reads it
-        m.put("fields",                  40);   // C-only
-        m.put("constructors",            48);   // C-only
-        m.put("modifiers",               56);   // i32
-        m.put("objectSize",              60);   // i32
-        m.put("cname",                   64);   // const char*
-        // Named tail slots. All are emitted as `i8* null` in every
-        // @refclass_* constant except `module`, which points at the shared
-        // unnamed-module singleton. See the class-level javadoc on
-        // ReflectionClass in jnative_runtime.h for the full rationale.
-        m.put("classLoader",             72);   // java/lang/ClassLoader | null
-        m.put("module",                  80);   // java/lang/Module      | @jnative_unnamed_module
-        m.put("componentType",           88);   // java/lang/Class       | null
-        m.put("packageName",             96);   // java/lang/String      | null
-        m.put("enumConstants",          104);   // Object[]              | null
-        m.put("annotationData",         112);   // Map                   | null
-        m.put("genericInfo",            120);   // Object                | null
-        m.put("reflectionData",         128);   // SoftReference         | null
-        m.put("classValueMap",          136);   // ClassValue            | null
-        m.put("enumConstantDirectory",  144);   // Map                   | null
         // +152..+216 is the reserved tail (CLASS_RESERVED_SLOT_COUNT slots,
         // each 8 bytes). An unknown java.lang.Class field falls back to
         // CLASS_RESERVED_OFFSET_START; see getFieldOffset().
-        JAVA_LANG_CLASS_FIELD_OFFSETS = Collections.unmodifiableMap(m);
+        // Map                   | null
+        JAVA_LANG_CLASS_FIELD_OFFSETS = Map.ofEntries(Map.entry("name", 8),   // Java String | null
+            Map.entry("superclass", 16),   // %ReflectionClass*
+            Map.entry("interfaces", 24),   // %ReflectionClass**
+            Map.entry("methods", 32),   // C-only, Java code never reads it
+            Map.entry("fields", 40),   // C-only
+            Map.entry("constructors", 48),   // C-only
+            Map.entry("modifiers", 56),   // i32
+            Map.entry("objectSize", 60),   // i32
+            Map.entry("cname", 64),   // const char*
+            // Named tail slots. All are emitted as `i8* null` in every
+            // @refclass_* constant except `module`, which points at the shared
+            // unnamed-module singleton. See the class-level javadoc on
+            // ReflectionClass in jnative_runtime.h for the full rationale.
+            Map.entry("classLoader", 72),   // java/lang/ClassLoader | null
+            Map.entry("module", 80),   // java/lang/Module      | @jnative_unnamed_module
+            Map.entry("componentType", 88),   // java/lang/Class       | null
+            Map.entry("packageName", 96),   // java/lang/String      | null
+            Map.entry("enumConstants", 104),   // Object[]              | null
+            Map.entry("annotationData", 112),   // Map                   | null
+            Map.entry("genericInfo", 120),   // Object                | null
+            Map.entry("reflectionData", 128),   // SoftReference         | null
+            Map.entry("classValueMap", 136),   // ClassValue            | null
+            Map.entry("enumConstantDirectory", 144));
     }
 
     /**
@@ -618,15 +617,7 @@ public class LlvmGlobalEmitter {
                 for (MethodNode mn : cn.getMethods()) {
                     if (!isVtableVirtual(mn)) continue;
 
-                    int access = mn.getAccess();
-                    if ((access & Opcodes.ACC_STATIC) != 0) {
-                        throw new IllegalStateException(
-                            "Static method '" + cn.getName() + "." + mn.getName()
-                                + mn.getDescriptor() + "' was offered to the vtable "
-                                + "layout builder for class '" + className + "'. "
-                                + "isVtableVirtual() should have rejected it; the "
-                                + "resolver's access flags are inconsistent.");
-                    }
+                    int access = getAccess(className, mn, cn);
                     if ((access & Opcodes.ACC_PRIVATE) != 0) {
                         throw new IllegalStateException(
                             "Private method '" + cn.getName() + "." + mn.getName()
@@ -646,6 +637,19 @@ public class LlvmGlobalEmitter {
             classLayoutInProgress.remove(className);
             return layout;
         }
+    }
+
+    private static int getAccess(String className, MethodNode mn, ClassNode cn) {
+        int access = mn.getAccess();
+        if ((access & Opcodes.ACC_STATIC) != 0) {
+            throw new IllegalStateException(
+                "Static method '" + cn.getName() + "." + mn.getName()
+                    + mn.getDescriptor() + "' was offered to the vtable "
+                    + "layout builder for class '" + className + "'. "
+                    + "isVtableVirtual() should have rejected it; the "
+                    + "resolver's access flags are inconsistent.");
+        }
+        return access;
     }
 
     private VtableLayout getOrBuildInterfaceLayout(String ifaceName) {
@@ -783,42 +787,40 @@ public class LlvmGlobalEmitter {
         if (cachedTypeDefinitions != null) {
             return cachedTypeDefinitions;
         }
-        StringBuilder sb = new StringBuilder();
-        sb.append("%JNativeResourceEntry = type { i8*, i8*, i32 }\n");
-        sb.append("%ReflectionMethod = type { i8*, i8*, i8*, i32 }\n");
-        sb.append("%ReflectionField = type { i8*, i8*, i32, i32 }\n");
-        sb.append("%ReflectionConstructor = type { i8*, i8*, i32 }\n");
-        // Must stay in lockstep with `struct ReflectionClass` in
-        // jnative_runtime.h and with the @refclass_* constant emission below.
-        //
-        // Layout:
-        //   [0]  %JNativeVTable*      vtable
-        //   [1]  i8*                  name (Java String cache, kept null)
-        //   [2]  %ReflectionClass*    superclass
-        //   [3]  %ReflectionClass**   interfaces
-        //   [4]  %ReflectionMethod**  methods
-        //   [5]  %ReflectionField**   fields
-        //   [6]  %ReflectionConstructor** constructors
-        //   [7]  i32                  modifiers
-        //   [8]  i32                  objectSize
-        //   [9]  i8*                  cname (const char*, internal name)
-        //   [10] i8*                  classLoader           (always null)
-        //   [11] i8*                  module                (always null)
-        //   [12] i8*                  componentType         (always null)
-        //   [13] i8*                  packageName           (always null)
-        //   [14] i8*                  enumConstants         (always null)
-        //   [15] i8*                  annotationData        (always null)
-        //   [16] i8*                  genericInfo           (always null)
-        //   [17] i8*                  reflectionData        (always null)
-        //   [18] i8*                  classValueMap         (always null)
-        //   [19] i8*                  enumConstantDirectory (always null)
-        //   [20..27] i8*              reserved[8]           (always null)
-        sb.append("%ReflectionClass = type { %JNativeVTable*, i8*, %ReflectionClass*, %ReflectionClass**, "
+        cachedTypeDefinitions = "%JNativeResourceEntry = type { i8*, i8*, i32 }\n" +
+            "%ReflectionMethod = type { i8*, i8*, i8*, i32 }\n" +
+            "%ReflectionField = type { i8*, i8*, i32, i32 }\n" +
+            "%ReflectionConstructor = type { i8*, i8*, i32 }\n" +
+            // Must stay in lockstep with `struct ReflectionClass` in
+            // jnative_runtime.h and with the @refclass_* constant emission below.
+            //
+            // Layout:
+            //   [0]  %JNativeVTable*      vtable
+            //   [1]  i8*                  name (Java String cache, kept null)
+            //   [2]  %ReflectionClass*    superclass
+            //   [3]  %ReflectionClass**   interfaces
+            //   [4]  %ReflectionMethod**  methods
+            //   [5]  %ReflectionField**   fields
+            //   [6]  %ReflectionConstructor** constructors
+            //   [7]  i32                  modifiers
+            //   [8]  i32                  objectSize
+            //   [9]  i8*                  cname (const char*, internal name)
+            //   [10] i8*                  classLoader           (always null)
+            //   [11] i8*                  module                (always null)
+            //   [12] i8*                  componentType         (always null)
+            //   [13] i8*                  packageName           (always null)
+            //   [14] i8*                  enumConstants         (always null)
+            //   [15] i8*                  annotationData        (always null)
+            //   [16] i8*                  genericInfo           (always null)
+            //   [17] i8*                  reflectionData        (always null)
+            //   [18] i8*                  classValueMap         (always null)
+            //   [19] i8*                  enumConstantDirectory (always null)
+            //   [20..27] i8*              reserved[8]           (always null)
+            "%ReflectionClass = type { %JNativeVTable*, i8*, %ReflectionClass*, %ReflectionClass**, "
             + "%ReflectionMethod**, %ReflectionField**, %ReflectionConstructor**, i32, i32, i8*, "
             + "i8*, i8*, i8*, i8*, i8*, i8*, i8*, i8*, i8*, i8*, "
-            + "i8*, i8*, i8*, i8*, i8*, i8*, i8*, i8* }\n");
-        sb.append("%JNativeSymbolClassEntry = type { i8*, %ReflectionClass* }\n");
-        cachedTypeDefinitions = sb.toString();
+            + "i8*, i8*, i8*, i8*, i8*, i8*, i8*, i8* }\n" +
+            "%JNativeSymbolClassEntry = type { i8*, %ReflectionClass* }\n";
         return cachedTypeDefinitions;
     }
 
@@ -843,21 +845,19 @@ public class LlvmGlobalEmitter {
      */
     public String generateGlobalDefinitions() {
         prepareLayouts();
-        StringBuilder sb = new StringBuilder();
-        sb.append(generateStaticFields());
-        // generateStringLiterals() depends on vtableNames, which only exists
-        // after generateVtables(); the reflection data depends on the string
-        // literal pool; the unnamed module and the embedded-resource table
-        // depend on the vtables. The ordering below is load-bearing and
-        // mirrors the original generateGlobals() chain.
-        sb.append(generateVtables());
-        sb.append(generateTypeStringConstants());
-        sb.append(generateStringLiterals());
-        sb.append(generateTypeInfo());
-        sb.append(generateUnnamedModule());
-        sb.append(generateEmbeddedResources());
-        sb.append(generateReflectionData());
-        return sb.toString();
+        return generateStaticFields() +
+            // generateStringLiterals() depends on vtableNames, which only exists
+            // after generateVtables(); the reflection data depends on the string
+            // literal pool; the unnamed module and the embedded-resource table
+            // depend on the vtables. The ordering below is load-bearing and
+            // mirrors the original generateGlobals() chain.
+            generateVtables() +
+            generateTypeStringConstants() +
+            generateStringLiterals() +
+            generateTypeInfo() +
+            generateUnnamedModule() +
+            generateEmbeddedResources() +
+            generateReflectionData();
     }
 
     /** Existing entry point, preserved for backwards compatibility. */
@@ -1127,14 +1127,7 @@ public class LlvmGlobalEmitter {
     //  Internal value-type for vtable slot resolution
     // =========================================================================
 
-    private static final class ResolvedFn {
-        final String name;
-        final String type;
-
-        ResolvedFn(String name, String type) {
-            this.name = name;
-            this.type = type;
-        }
+    private record ResolvedFn(String name, String type) {
     }
 
     private ResolvedFn resolveVtableEntry(String className, String sig) {
@@ -2039,30 +2032,6 @@ public class LlvmGlobalEmitter {
         }
     }
 
-    /**
-     * Resolves the LLVM type of a deferred string constant by its global
-     * name (e.g. {@code .str.abcdef}), or {@code null} when the string was
-     * never registered.
-     *
-     * <p>Used by {@link LlvmGenerator} when a per-class body references a
-     * deferred {@code .str.<hex>} constant: the definition lives in
-     * {@code _module.ll}, so the class file needs an {@code external}
-     * declaration for it. The name alone does not carry the byte length, so
-     * the type has to be recovered from the registered string itself.</p>
-     */
-    public String deferredStringGlobalType(String globalName) {
-        synchronized (deferredStrings) {
-            String withAt = "@" + globalName;
-            for (String s : deferredStrings) {
-                if (LlvmRuntime.typeStringGlobalName(s).equals(withAt)) {
-                    int len = LlvmRuntime.typeStringArrayLength(s);
-                    return "[" + len + " x i8]";
-                }
-            }
-        }
-        return null;
-    }
-
     public String generateDeferredStringConstants() {
         // Snapshot the synchronized set under its own monitor, then work
         // on the copy. This is the read side of the write performed by
@@ -2456,22 +2425,7 @@ public class LlvmGlobalEmitter {
              * never observed by String.length(), String.charAt() or any
              * other method of String.
              */
-            StringBuilder escaped = new StringBuilder();
-            for (byte b : bytes) {
-                int v = b & 0xFF;
-                switch (v) {
-                    case '\\' -> escaped.append("\\5C");
-                    case '"' -> escaped.append("\\22");
-                    case '\n' -> escaped.append("\\0A");
-                    case '\r' -> escaped.append("\\0D");
-                    case '\t' -> escaped.append("\\09");
-                    default -> {
-                        if (v < 0x20 || v > 0x7E) escaped.append(String.format("\\%02X", v));
-                        else escaped.append((char) v);
-                    }
-                }
-            }
-            escaped.append("\\00");
+            StringBuilder escaped = getStringBuilder(bytes);
 
             String safe = LlvmRuntime.stringIdSuffix(s);
             String bytesGlobal = "strbytes_" + safe;
@@ -2556,6 +2510,26 @@ public class LlvmGlobalEmitter {
         sb.append("], align 8\n");
         sb.append("@__jnative_literal_pool_size = linkonce_odr constant i32 ").append(n).append("\n");
         return sb.toString();
+    }
+
+    private static StringBuilder getStringBuilder(byte[] bytes) {
+        StringBuilder escaped = new StringBuilder();
+        for (byte b : bytes) {
+            int v = b & 0xFF;
+            switch (v) {
+                case '\\' -> escaped.append("\\5C");
+                case '"' -> escaped.append("\\22");
+                case '\n' -> escaped.append("\\0A");
+                case '\r' -> escaped.append("\\0D");
+                case '\t' -> escaped.append("\\09");
+                default -> {
+                    if (v < 0x20 || v > 0x7E) escaped.append(String.format("\\%02X", v));
+                    else escaped.append((char) v);
+                }
+            }
+        }
+        escaped.append("\\00");
+        return escaped;
     }
 
     // =========================================================================
@@ -2833,18 +2807,12 @@ public class LlvmGlobalEmitter {
         // Object, so this never produces a type error at emission time.
         if ("java/lang/Class".equals(className)) {
             return switch (fieldName) {
-                case "name" -> Type.reference("java/lang/String");
-                case "superclass" -> Type.reference("java/lang/Class");
+                case "name", "packageName" -> Type.reference("java/lang/String");
+                case "superclass", "componentType" -> Type.reference("java/lang/Class");
                 case "classLoader" -> Type.reference("java/lang/ClassLoader");
                 case "module" -> Type.reference("java/lang/Module");
-                case "componentType" -> Type.reference("java/lang/Class");
-                case "packageName" -> Type.reference("java/lang/String");
-                case "enumConstants" -> Type.reference("java/lang/Object");
-                case "annotationData" -> Type.reference("java/util/Map");
-                case "genericInfo" -> Type.reference("java/lang/Object");
-                case "reflectionData" -> Type.reference("java/lang/Object");
+                case "annotationData", "enumConstantDirectory" -> Type.reference("java/util/Map");
                 case "classValueMap" -> Type.reference("java/lang/ClassValue");
-                case "enumConstantDirectory" -> Type.reference("java/util/Map");
                 default -> Type.reference("java/lang/Object");
             };
         }

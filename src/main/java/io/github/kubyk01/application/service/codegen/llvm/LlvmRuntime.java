@@ -227,8 +227,14 @@ public class LlvmRuntime {
      *
      * <p>The emitted constant has the shape:</p>
      * <pre>
-     *   @.str.&lt;hex&gt; = linkonce_odr unnamed_addr constant [N x i8] c"&lt;escaped&gt;\00"
+     *   @.str.&lt;hex&gt; = unnamed_addr constant [N x i8] c"&lt;escaped&gt;\00"
      * </pre>
+     * <p>No linkage keyword is emitted, so the symbol gets LLVM's default
+     * ({@code external}) linkage and stays visible from the other {@code .ll}
+     * modules: per-class files reference it through a plain
+     * {@code external constant [N x i8]} declaration. {@code linkonce_odr} is
+     * deliberately not used — each unique string is defined exactly once in
+     * {@code _module.ll}, so there is nothing to deduplicate.</p>
      * <p>with every byte that LLVM's string-literal syntax cannot represent
      * directly escaped in {@code \XX} form. Printable ASCII passes through
      * unchanged; backslash, double quote, and the common whitespace escapes
@@ -255,7 +261,7 @@ public class LlvmRuntime {
                 }
             }
         }
-        return typeStringGlobalName(s) + " = linkonce_odr unnamed_addr constant ["
+        return typeStringGlobalName(s) + " = unnamed_addr constant ["
             + (bytes.length + 1) + " x i8] c\"" + escaped + "\\00\"\n";
     }
 
