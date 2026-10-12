@@ -45,9 +45,9 @@ public class LifetimeAnalyzer {
     public LifetimeAnalysisResult analyze(Map<AllocationSite, Value> siteToValue) {
         LifetimeAnalysisResult result = new LifetimeAnalysisResult();
 
-        // -------- 1. Collect sites (already parallel-friendly; keep as-is) -----
+        // -------- 1. Collect sites (parallel over functions) -----
         AllocationSiteCollector collector =
-            new AllocationSiteCollector(module, aliasResult);
+            new AllocationSiteCollector(module, aliasResult, scheduler);
         List<AllocationSite> allSites = collector.collect();
 
         // -------- 2. Cyclic reference detection --------
@@ -115,10 +115,12 @@ public class LifetimeAnalyzer {
             for (SiteResult sr : siteResults) {
                 if (sr.unresolved()) {
                     result.getUnresolved().add(sr.site());
-                } else if (sr.point() != null) {
-                    result.getDestructionPoints()
-                          .computeIfAbsent(sr.site(), k -> new HashSet<>())
-                          .add(sr.point());
+                } else {
+                    for (DestructionPoint point : sr.points()) {
+                        result.getDestructionPoints()
+                              .computeIfAbsent(sr.site(), k -> new HashSet<>())
+                              .add(point);
+                    }
                 }
             }
         }
@@ -135,42 +137,62 @@ public class LifetimeAnalyzer {
         if (status == EscapeStatus.GLOBAL
             || status == EscapeStatus.THREAD
             || status == EscapeStatus.RETURN) {
-            return new SiteResult(site, null, false);
+            return new SiteResult(site, List.of(), false);
         }
 
         Function func = module.getFunction(site.getMethodName());
         if (func == null || func.getEntryBlock() == null) {
-            return new SiteResult(site, null, false);
+            return new SiteResult(site, List.of(), false);
         }
 
-        DominatorTree domTree = domTrees.get(func);
-        if (domTree == null) return new SiteResult(site, null, false);
+        DominatorTree dom = domTrees.get(func);
+        if (dom == null) return new SiteResult(site, List.of(), false);
 
         Map<BasicBlock, Set<BasicBlock>> loops = loopHeaders.get(func);
 
-        Set<BasicBlock> deathBlocks = new HashSet<>();
-        for (BasicBlock block : func.getBlocks()) {
+        Value allocVal = siteToValue.get(site);
+        if (allocVal == null) return new SiteResult(site, List.of(), false);
+
+        // Any value that may point to the site is a legal "root" for the
+        // destructor call; pick the last syntactic use of each.
+        Set<Value> roots = collectAliases(site, func, allocVal);
+
+        Map<Value, List<LivenessAnalyzer.ValueLastUse>> valueLastUses =
+            livenessAnalyzer.computeValueLastUses(func);
+
+        List<DestructionPoint> points = new ArrayList<>();
+        for (Value root : roots) {
+            List<LivenessAnalyzer.ValueLastUse> uses = valueLastUses.get(root);
+            if (uses == null || uses.isEmpty()) continue;
+
+            // The list is built in block/instruction order, so the final
+            // entry is the root's last syntactic use.
+            LivenessAnalyzer.ValueLastUse last = uses.getLast();
+            BasicBlock block = last.block();
+
+            // A real death requires the site to be live on entry to the
+            // block but not live on exit. If it is still live on exit the
+            // value flows onward and this use is not a death site.
             Set<AllocationSite> liveIn = livenessAnalyzer.getLiveIn(block);
             Set<AllocationSite> liveOut = livenessAnalyzer.getLiveOut(block);
+            if (!liveIn.contains(site) || liveOut.contains(site)) continue;
 
-            if (liveIn.contains(site) && !liveOut.contains(site)) {
-                Terminator term = block.getTerminator();
-                boolean isReturned = false;
-                if (term instanceof ReturnTerminator) {
-                    Value retVal = ((ReturnTerminator) term).getValue();
-                    if (retVal != null
-                        && aliasResult.getPointsTo(retVal).getSites().contains(site)) {
-                        isReturned = true;
-                    }
-                }
-                if (!isReturned) deathBlocks.add(block);
+            Instruction before = null;
+            List<Instruction> insts = block.getInstructions();
+            int idx = last.instructionIndex();
+            if (idx >= 0 && idx < insts.size()) {
+                before = insts.get(idx);
             }
+            points.add(new DestructionPoint(block, before, root));
         }
 
-        Set<BasicBlock> filteredDeathBlocks = filterDeathBlocksInLoops(
-            deathBlocks, site, loops, livenessAnalyzer);
+        List<DestructionPoint> filtered =
+            filterPointsInLoops(points, site, loops, livenessAnalyzer);
 
-        if (filteredDeathBlocks.isEmpty()) {
+        if (filtered.isEmpty()) {
+            // No provably-dead last use. Fall back to the common
+            // post-return point so the object is still released on normal
+            // exit; this mirrors the pre-existing conservative behaviour.
             List<BasicBlock> returnBlocks = new ArrayList<>();
             for (BasicBlock block : func.getBlocks()) {
                 if (block.getTerminator() instanceof ReturnTerminator) {
@@ -178,31 +200,138 @@ public class LifetimeAnalyzer {
                 }
             }
             if (returnBlocks.isEmpty()) {
-                return new SiteResult(site, null, false);
+                return new SiteResult(site, List.of(), true);
             }
-            BasicBlock lca = domTree.getLCA(returnBlocks);
+            BasicBlock lca = dom.getLCA(returnBlocks);
             if (lca == null) {
-                return new SiteResult(site, null, true);
+                return new SiteResult(site, List.of(), true);
             }
-            Value objRef = siteToValue.get(site);
-            if (objRef == null) return new SiteResult(site, null, false);
             return new SiteResult(site,
-                new DestructionPoint(lca, null, objRef), false);
+                List.of(new DestructionPoint(lca, null, allocVal)), false);
         }
 
-        BasicBlock lca = domTree.getLCA(new ArrayList<>(filteredDeathBlocks));
-        if (lca == null) {
-            return new SiteResult(site, null, true);
-        }
-        Value objRef = siteToValue.get(site);
-        if (objRef == null) return new SiteResult(site, null, false);
-        return new SiteResult(site,
-            new DestructionPoint(lca, null, objRef), false);
+        return new SiteResult(site, dedupPoints(filtered, dom), false);
     }
 
     private record SiteResult(AllocationSite site,
-                              DestructionPoint point,
+                              List<DestructionPoint> points,
                               boolean unresolved) {}
+
+    /**
+     * All IR values in {@code func} whose points-to set contains
+     * {@code site}: the allocation itself, any aliasing temporary, and any
+     * parameter or field read that may refer to it.
+     */
+    private Set<Value> collectAliases(AllocationSite site,
+                                      Function func,
+                                      Value allocVal) {
+        Set<Value> aliases = new LinkedHashSet<>();
+        aliases.add(allocVal);
+        for (BasicBlock block : func.getBlocks()) {
+            for (Instruction inst : block.getInstructions()) {
+                Value result = inst.getResult();
+                if (result != null && pointsToSite(result, site)) {
+                    aliases.add(result);
+                }
+                for (Value op : inst.getOperands()) {
+                    if (op != null && pointsToSite(op, site)) {
+                        aliases.add(op);
+                    }
+                }
+            }
+            Terminator term = block.getTerminator();
+            if (term != null) {
+                for (Value op : terminatorOperands(term)) {
+                    if (op != null && pointsToSite(op, site)) {
+                        aliases.add(op);
+                    }
+                }
+            }
+        }
+        for (Parameter p : func.getParameters()) {
+            if (pointsToSite(p, site)) aliases.add(p);
+        }
+        return aliases;
+    }
+
+    private boolean pointsToSite(Value v, AllocationSite site) {
+        return aliasResult.getPointsTo(v).getSites().contains(site);
+    }
+
+    private List<Value> terminatorOperands(Terminator term) {
+        List<Value> out = new ArrayList<>();
+        if (term instanceof ReturnTerminator) {
+            Value v = ((ReturnTerminator) term).getValue();
+            if (v != null) out.add(v);
+        } else if (term instanceof ThrowTerminator) {
+            Value v = ((ThrowTerminator) term).getException();
+            if (v != null) out.add(v);
+        } else if (term instanceof CondBranchTerminator) {
+            Value v = ((CondBranchTerminator) term).getCondition();
+            if (v != null) out.add(v);
+        } else if (term instanceof LookupSwitchTerminator) {
+            Value v = ((LookupSwitchTerminator) term).getKey();
+            if (v != null) out.add(v);
+        } else if (term instanceof TableSwitchTerminator) {
+            Value v = ((TableSwitchTerminator) term).getKey();
+            if (v != null) out.add(v);
+        } else if (term instanceof IndirectBranchTerminator) {
+            Value v = ((IndirectBranchTerminator) term).getTargetBlock();
+            if (v != null) out.add(v);
+        }
+        return out;
+    }
+
+    /**
+     * Removes points that fall inside a natural loop whose header still has
+     * the site live-in. Freeing there would run the destructor on an object
+     * that is used again on the next iteration.
+     */
+    private List<DestructionPoint> filterPointsInLoops(
+            List<DestructionPoint> points,
+            AllocationSite site,
+            Map<BasicBlock, Set<BasicBlock>> loops,
+            LivenessAnalyzer livenessAnalyzer) {
+        if (points.isEmpty() || loops == null || loops.isEmpty()) return points;
+
+        List<DestructionPoint> filtered = new ArrayList<>();
+        for (DestructionPoint p : points) {
+            boolean inLiveLoop = false;
+            for (Map.Entry<BasicBlock, Set<BasicBlock>> e : loops.entrySet()) {
+                if (e.getValue().contains(p.getBlock())
+                    && livenessAnalyzer.getLiveIn(e.getKey()).contains(site)) {
+                    inLiveLoop = true;
+                    break;
+                }
+            }
+            if (!inLiveLoop) filtered.add(p);
+        }
+        return filtered;
+    }
+
+    /**
+     * Collapses candidate points: at most one per block, and no point whose
+     * block is dominated by another candidate's block (the dominating block
+     * is the earlier death site, so the dominated one is unreachable).
+     */
+    private List<DestructionPoint> dedupPoints(List<DestructionPoint> points,
+                                               DominatorTree dom) {
+        List<DestructionPoint> kept = new ArrayList<>();
+        Set<BasicBlock> seen = new HashSet<>();
+        for (DestructionPoint p : points) {
+            if (!seen.add(p.getBlock())) continue;
+            boolean dominated = false;
+            for (DestructionPoint q : points) {
+                if (q.getBlock() != p.getBlock()
+                    && dom.dominates(q.getBlock(), p.getBlock())) {
+                    dominated = true;
+                    break;
+                }
+            }
+            if (!dominated) kept.add(p);
+        }
+        return kept;
+    }
 
     private Map<BasicBlock, Set<BasicBlock>> detectNaturalLoops(Function func,
                                                                DominatorTree domTree) {
@@ -231,24 +360,5 @@ public class LifetimeAnalyzer {
                 if (!body.contains(pred)) stack.push(pred);
             }
         }
-    }
-
-    private Set<BasicBlock> filterDeathBlocksInLoops(
-            Set<BasicBlock> deathBlocks,
-            AllocationSite site,
-            Map<BasicBlock, Set<BasicBlock>> loops,
-            LivenessAnalyzer livenessAnalyzer) {
-        Set<BasicBlock> result = new HashSet<>(deathBlocks);
-        if (loops == null) return result;
-        for (Map.Entry<BasicBlock, Set<BasicBlock>> entry : loops.entrySet()) {
-            BasicBlock header = entry.getKey();
-            Set<BasicBlock> body = entry.getValue();
-            boolean liveOnEntry =
-                livenessAnalyzer.getLiveIn(header).contains(site);
-            if (liveOnEntry) {
-                for (BasicBlock block : body) result.remove(block);
-            }
-        }
-        return result;
     }
 }

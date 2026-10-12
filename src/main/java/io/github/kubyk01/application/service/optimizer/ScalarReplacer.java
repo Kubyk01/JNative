@@ -28,6 +28,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
+import static io.github.kubyk01.util.LlvmUtil.extractCalleeName;
 import static io.github.kubyk01.util.LlvmUtil.extractFieldName;
 
 /**
@@ -51,17 +52,61 @@ public class ScalarReplacer {
     public void replace() {
         for (Function func : module.getFunctions()) {
             if (func.getEntryBlock() == null) continue;
-            // Collect all allocation sites eligible for replacement (STACK and not used as a whole object)
+
+            // ------------------------------------------------------------------
+            // First pass: every NEW whose result is a STACK-status object
+            // but which is used as a real object — i.e. as a receiver of a
+            // call — cannot be scalar-replaced (there is no way to give the
+            // callee a real object pointer without an allocation). Mark
+            // such a NEW as stack-allocated. The codegen will emit an
+            // alloca in the function's entry block instead of a calloc,
+            // and no destructor will be inserted, because the alloca's
+            // memory is released automatically when the function returns.
+            //
+            // The condition `isUsedAsObject(inst)` is deliberate and is the
+            // same predicate that gates scalar replacement below. An object
+            // that passes this check has at least one call use that is not
+            // a destructor call, so scalar replacement is not applicable.
+            // ------------------------------------------------------------------
+            for (BasicBlock block : func.getBlocks()) {
+                for (Instruction inst : block.getInstructions()) {
+                    if (inst.getOpcode() != Opcode.NEW) continue;
+                    Value result = inst.getResult();
+                    if (result == null) continue;
+
+                    PointsToSet pts = aliasResult.getPointsTo(result);
+                    if (pts.getSites().isEmpty()) continue;
+
+                    boolean allStack = true;
+                    for (AllocationSite site : pts.getSites()) {
+                        if (escapeResult.getSiteStatus(site) != EscapeStatus.STACK) {
+                            allStack = false;
+                            break;
+                        }
+                    }
+                    if (!allStack) continue;
+
+                    if (isUsedAsObject(inst)) {
+                        inst.setStackAllocated(true);
+                    }
+                }
+            }
+
+            // ------------------------------------------------------------------
+            // Second pass: scalar replacement for STACK objects that are
+            // never used as opaque references. These are the objects whose
+            // entire observable state is their fields, so the object can be
+            // removed and the fields turned into individual SSA values.
+            // ------------------------------------------------------------------
             Set<AllocationSite> candidates = collectCandidates(func);
             if (candidates.isEmpty()) continue;
 
-            // Iterate over blocks and instructions, performing replacement
             for (BasicBlock block : func.getBlocks()) {
                 List<Instruction> instructions = block.getInstructions();
                 List<Instruction> newInstructions = new ArrayList<>();
                 for (Instruction inst : instructions) {
                     if (processInstruction(inst, candidates)) {
-                        // Instruction processed (replaced or removed)
+                        // Instruction was replaced or removed.
                     } else {
                         newInstructions.add(inst);
                     }
@@ -70,9 +115,60 @@ public class ScalarReplacer {
                 block.getInstructions().addAll(newInstructions);
             }
 
-            // Remove all NOP instructions and dead temporaries
             cleanup(func);
         }
+    }
+
+    private boolean isUsedAsObject(Instruction newInst) {
+        Value result = newInst.getResult();
+        if (result == null) return false;
+        BasicBlock parent = newInst.getParent();
+        if (parent == null) return false;
+        Function func = parent.getFunction();
+        if (func == null) return false;
+
+        for (BasicBlock block : func.getBlocks()) {
+            for (Instruction inst : block.getInstructions()) {
+                if (inst == newInst) continue;
+                Opcode op = inst.getOpcode();
+
+                boolean isCall = switch (op) {
+                    case CALL, VIRTUAL_CALL, INTERFACE_CALL, STATIC_CALL, SPECIAL_CALL -> true;
+                    default -> false;
+                };
+                if (!isCall) continue;
+
+                // ------------------------------------------------------------------
+                // Destructor calls are clean-up, not genuine object uses.
+                //
+                // The DestructorInserter runs before this pass and, for every
+                // object it decides to free, emits a
+                //     call void @__destruct_<Type>(obj)
+                // at the object's death point. That call holds the object as
+                // its argument and would otherwise make `isUsedAsObject`
+                // return true, which in turn would prevent scalar
+                // replacement of any object that the rest of the pipeline
+                // had already classified as STACK. The destructor call is
+                // removed by DestructorSimplifier when the object no longer
+                // has a NEW, so it is safe to ignore here.
+                // ------------------------------------------------------------------
+                if (op == Opcode.STATIC_CALL) {
+                    String callee = extractCalleeName(inst);
+                    if (callee != null
+                        && (callee.startsWith("__destruct_")
+                            || callee.startsWith("__destruct_array_"))) {
+                        continue;
+                    }
+                }
+
+                // Every operand, including the receiver slot at index 0 for
+                // VIRTUAL_CALL / INTERFACE_CALL / SPECIAL_CALL.
+                for (Value operand : inst.getOperands()) {
+                    if (operand == result) return true;
+                }
+            }
+        }
+        return false;
     }
 
     private Set<AllocationSite> collectCandidates(Function func) {
@@ -101,41 +197,6 @@ public class ScalarReplacer {
             }
         }
         return candidates;
-    }
-
-    private boolean isUsedAsObject(Instruction newInst) {
-        Value result = newInst.getResult();
-        if (result == null) return false;
-        BasicBlock parent = newInst.getParent();
-        if (parent == null) return false;
-        Function func = parent.getFunction();
-        if (func == null) return false;
-
-        for (BasicBlock block : func.getBlocks()) {
-            for (Instruction inst : block.getInstructions()) {
-                if (inst == newInst) continue;
-                Opcode op = inst.getOpcode();
-
-                boolean isCall = switch (op) {
-                    case CALL, VIRTUAL_CALL, INTERFACE_CALL, STATIC_CALL, SPECIAL_CALL -> true;
-                    default -> false;
-                };
-                if (!isCall) continue;
-
-                // Every operand, including the receiver slot at index 0 for
-                // VIRTUAL_CALL / INTERFACE_CALL / SPECIAL_CALL. The old code
-                // started at index 1 for those opcodes, which hid exactly the
-                // `throw new X(...)` and `new X(); super(...)` cases and led
-                // ScalarReplacer to delete the NEW while its Temporary was
-                // still live as a call receiver / throw operand.
-                for (int i = 0; i < inst.getOperands().size(); i++) {
-                    if (inst.getOperands().get(i) == result) {
-                        return true;
-                    }
-                }
-            }
-        }
-        return false;
     }
 
     private boolean processInstruction(Instruction inst,

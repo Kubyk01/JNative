@@ -6,6 +6,7 @@ import io.github.kubyk01.domain.ir.Type;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.regex.Pattern;
 
 public class LlvmRuntime {
 
@@ -19,6 +20,51 @@ public class LlvmRuntime {
      */
     private static final ConcurrentHashMap<String, String> STRING_ID_CACHE =
         new ConcurrentHashMap<>();
+
+    /**
+     * Replaces every character outside {@code [a-zA-Z0-9_]} with {@code '_'}.
+     *
+     * <p>Behaviourally identical to {@code s.replaceAll("[^a-zA-Z0-9_]", "_")},
+     * but without compiling a {@link Pattern} on every call. The previous
+     * implementation invoked {@code replaceAll} three times per
+     * {@code mangleMethod}, and {@code mangleMethod} on every CALL instruction
+     * of every function evaluation in {@code InterproceduralPointsTo} and
+     * {@code EscapeSummaryBuilder}. On a large JDK closure that is millions of
+     * {@code Pattern.compile} calls per phase, a noticeable share of the
+     * worker threads' hot stack.</p>
+     *
+     * <p>{@code '/'} is handled by the same rule as any other non-alphanumeric
+     * character, so the leading {@code .replace('/', '_')} of the old
+     * {@code mangleMethod} is unnecessary and has been removed: it was a pure
+     * no-op relative to the final result.</p>
+     */
+    private static String sanitizeToAsciiIdentifier(String s) {
+        if (s == null) return "_";
+        int n = s.length();
+        StringBuilder sb = new StringBuilder(n);
+        for (int i = 0; i < n; i++) {
+            char c = s.charAt(i);
+            if ((c >= 'a' && c <= 'z')
+                || (c >= 'A' && c <= 'Z')
+                || (c >= '0' && c <= '9')
+                || c == '_') {
+                sb.append(c);
+            } else {
+                sb.append('_');
+            }
+        }
+        return sb.toString();
+    }
+
+    /**
+     * The {@code "owner.name(desc)"} shape with the character set permitted in
+     * generated names. Precompiled because {@code String.matches(String)}
+     * compiles a fresh {@link Pattern} on every call — and
+     * {@link #mangleCallable} is invoked from {@code canonicalCalleeKey} on
+     * every CALL site.
+     */
+    private static final Pattern MANGLED_CALLABLE_PATTERN = Pattern.compile(
+        "^[a-zA-Z0-9_/$]+\\.[a-zA-Z0-9_<>$]+\\([^)]*\\)[^)]*$");
 
     /**
      * Returns the block of {@code declare} lines that every generated module
@@ -57,6 +103,7 @@ public class LlvmRuntime {
             declare void @abort() noreturn
             declare i32 @atexit(void ()*)
             declare i64 @llvm.objectsize.i64.p0i8(i8*, i1)
+            declare void @llvm.memset.p0i8.i64(i8* nocapture writeonly, i8, i64, i1 immarg)
 
             declare i32 @pthread_mutex_lock(i8*)
             declare i32 @pthread_mutex_unlock(i8*)
@@ -288,7 +335,7 @@ public class LlvmRuntime {
                 return mangleMethod(className, methodName, descriptor);
             }
         }
-        return "fn_" + name.replaceAll("[^a-zA-Z0-9_]", "_");
+        return "fn_" + sanitizeToAsciiIdentifier(name);
     }
 
     /**
@@ -302,12 +349,15 @@ public class LlvmRuntime {
      * character outside the set {@code [a-zA-Z0-9_]} is replaced with a
      * single underscore. The result is stable and unambiguous for every
      * legal Java method reference.</p>
+     * <p>Callers that invoke this on the same (class, name, desc) triple
+     * thousands of times per analysis run should go through {@link
+     * io.github.kubyk01.util.LlvmUtil#canonicalCalleeKey(String)}, which
+     * memoises the result.</p>
      */
     public static String mangleMethod(String className, String methodName, String descriptor) {
-        String safeClass = className.replace('/', '_').replaceAll("[^a-zA-Z0-9_]", "_");
-        String safeMethod = methodName.replaceAll("[^a-zA-Z0-9_]", "_");
-        String safeDesc = descriptor.replaceAll("[^a-zA-Z0-9_]", "_");
-        return "fn_" + safeClass + "_" + safeMethod + "_" + safeDesc;
+        return "fn_" + sanitizeToAsciiIdentifier(className)
+            + "_" + sanitizeToAsciiIdentifier(methodName)
+            + "_" + sanitizeToAsciiIdentifier(descriptor);
     }
 
     /**
@@ -323,9 +373,8 @@ public class LlvmRuntime {
      * reference.</p>
      */
     public static String mangleCallable(String callableName) {
-        if (!callableName.matches("^[a-zA-Z0-9_/$]+\\.[a-zA-Z0-9_<>$]+\\([^)]*\\)[^)]*$")) {
-            String mangled = callableName.replaceAll("[^a-zA-Z0-9_]", "_");
-            return "fn_" + mangled;
+        if (!MANGLED_CALLABLE_PATTERN.matcher(callableName).matches()) {
+            return "fn_" + sanitizeToAsciiIdentifier(callableName);
         }
         int dotIdx = callableName.lastIndexOf('.');
         if (dotIdx < 0) return mangleFunction(callableName);
@@ -376,8 +425,7 @@ public class LlvmRuntime {
      * instead.</p>
      */
     public static String mangleBase(String className, String methodName) {
-        String safeClass = className.replace('/', '_').replaceAll("[^a-zA-Z0-9_]", "_");
-        String safeMethod = methodName.replaceAll("[^a-zA-Z0-9_]", "_");
-        return "fn_" + safeClass + "_" + safeMethod;
+        return "fn_" + sanitizeToAsciiIdentifier(className)
+            + "_" + sanitizeToAsciiIdentifier(methodName);
     }
 }

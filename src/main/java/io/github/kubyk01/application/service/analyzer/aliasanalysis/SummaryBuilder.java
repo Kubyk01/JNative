@@ -29,15 +29,24 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 import static io.github.kubyk01.util.LlvmUtil.awaitFlux;
+import static io.github.kubyk01.util.LlvmUtil.canonicalCalleeKey;
 import static io.github.kubyk01.util.LlvmUtil.extractCalleeName;
 import static io.github.kubyk01.util.LlvmUtil.extractFieldName;
 import static io.github.kubyk01.util.LlvmUtil.getCallArguments;
 import static io.github.kubyk01.util.LlvmUtil.isAllocation;
+import static io.github.kubyk01.util.LlvmUtil.isLazyClinitWrapper;
 
 @Slf4j
 public class SummaryBuilder {
 
     private static final int MAX_SCC_ITERATIONS = 2000;
+
+    /**
+     * Progress-log threshold for {@link #processSCC}. A large SCC can run for
+     * minutes with no other output; above this size one line per iteration is
+     * emitted so that a long fixed point is not mistaken for a lock. Small
+     * SCCs stay silent because they converge in a single pass.
+     */
 
     private final Module module;
     private final Map<String, FunctionSummary> summaries = new ConcurrentHashMap<>();
@@ -70,6 +79,11 @@ public class SummaryBuilder {
         //
         // The callee lists are pre-deduplicated so that a function with a
         // hundred calls to the same target does not inflate the SCC walk.
+        //
+        // Lazy-<clinit> wrappers are excluded from this graph entirely: their
+        // caller edges are skipped so that a wrapper's summary change does
+        // not cascade into its tens of thousands of trigger sites. See
+        // LlvmUtil.isLazyClinitWrapper.
         Map<String, Function> byName = new HashMap<>(allLive.size() * 2);
         for (Function f : allLive) {
             byName.put(f.getName(), f);
@@ -84,14 +98,30 @@ public class SummaryBuilder {
             for (BasicBlock block : f.getBlocks()) {
                 for (Instruction inst : block.getInstructions()) {
                     String calleeName = extractCalleeName(inst);
-                    if (calleeName == null || !seen.add(calleeName)) {
+                    if (calleeName == null) {
                         continue;
                     }
-                    Function callee = byName.get(calleeName);
+                    String calleeKey = canonicalCalleeKey(calleeName);
+
+                    // Lazy <clinit> wrapper: skip the caller edge so that a
+                    // wrapper's summary change does not cascade into its
+                    // tens of thousands of trigger sites, and so the wrapper
+                    // does not merge the wrapped <clinit> and every trigger
+                    // site into one enormous SCC. The wrapper's own summary
+                    // is still computed when the wrapper itself is processed
+                    // as a module function. See LlvmUtil.isLazyClinitWrapper.
+                    if (isLazyClinitWrapper(calleeKey)) {
+                        continue;
+                    }
+
+                    if (!seen.add(calleeKey)) {
+                        continue;
+                    }
+                    Function callee = byName.get(calleeKey);
                     if (callee != null) {
                         out.add(callee);
                     }
-                    callers.computeIfAbsent(calleeName, k -> new HashSet<>(4)).add(f);
+                    callers.computeIfAbsent(calleeKey, k -> new HashSet<>(4)).add(f);
                 }
             }
             callees.put(f, out);
@@ -138,32 +168,58 @@ public class SummaryBuilder {
             return 0;
         }
 
-        // Fast path: a singleton with no self-edge (no self-recursion) can
-        // be committed on the first pass. Every one of the 24000+ functions
-        // in a typical module falls into this case, so making it explicit
-        // keeps the per-function overhead at one HashSet alloc and one
-        // analyzeFunction call.
+        // Fast path: singleton. There are no intra-SCC calls inside such an
+        // SCC that could fall into the "missing callee" branch, so a single
+        // pass is sufficient. The merge below makes the write monotone in
+        // case this function is processed again.
         if (scc.size() == 1) {
             Function f = scc.getFirst();
             FunctionSummary newSum = analyzeFunction(f);
             FunctionSummary oldSum = summaries.get(f.getName());
+            if (oldSum != null) newSum.merge(oldSum);
             if (oldSum == null || !oldSum.equals(newSum)) {
                 summaries.put(f.getName(), newSum);
             }
             return 1;
         }
 
-        Set<Function> sccSet = new HashSet<>(scc);
+        Set<Function> sccSet  = new HashSet<>(scc);
         Set<Function> pending = new HashSet<>(scc);
         int totalProcessed = 0;
         int iteration = 0;
 
+        // ---- Pre-fill ------------------------------------------------------
+        //
+        // Every SCC member receives an empty FunctionSummary (the bottom of
+        // the lattice) in summaries before the fixed point starts.
+        //
+        // Without this, the first iteration sees
+        // `summaries.get(calleeName) == null` for every intra-SCC call, and
+        // processCall takes the conservative branch (escapes every
+        // parameter). On the second iteration the callee already has a
+        // concrete — and strictly smaller — summary, the caller shrinks,
+        // its callers are pushed back into pending, and the SCC oscillates
+        // forever between the large (conservative) and the small (concrete)
+        // value. That oscillation is exactly what produced the 2000-iteration
+        // warning.
+        //
+        // With the pre-fill a callee's summary only ever grows across
+        // iterations, the transfer function is monotone in the snapshot, and
+        // the fixed point is reached in O(lattice height) iterations. The
+        // per-function height is a small constant, so the total is well
+        // below the limit.
+        for (Function f : scc) {
+            summaries.putIfAbsent(f.getName(), FunctionSummary.builder().build());
+        }
+
+        final int maxIterations = Math.max(MAX_SCC_ITERATIONS, 4 * scc.size());
+
         while (!pending.isEmpty()) {
             iteration++;
-            if (iteration > MAX_SCC_ITERATIONS) {
+            if (iteration > maxIterations) {
                 System.err.println("SummaryBuilder: WARNING: SCC of size "
                     + scc.size() + " did not converge after "
-                    + MAX_SCC_ITERATIONS + " iterations; "
+                    + maxIterations + " iterations; "
                     + pending.size() + " functions still changing. "
                     + "Continuing with the current summaries "
                     + "(some field-write information may be missing).");
@@ -191,17 +247,32 @@ public class SummaryBuilder {
                         + batch.size() + " functions"));
             }
 
-            // Sequential commit: the only place summaries are written.
-            // Re-enqueue only callers that belong to this SCC; callers in
-            // other SCCs will observe the final summary when their own SCC
-            // is processed later, so re-enqueuing them here would be wasted
-            // work and could not terminate until every SCC had been visited.
+            // ---- Sequential commit with monotone merge --------------------
+            //
+            // The only place summaries are written. Old and new are merged
+            // rather than replaced, so the stored value never decreases
+            // across iterations even when the freshly computed value is
+            // strictly smaller than the previous one. Together with the
+            // pre-fill above this is what guarantees SCC convergence.
+            //
+            // Only callers that belong to this same SCC are pushed back into
+            // pending. Callers in other SCCs will observe the final summary
+            // when their own SCC is processed later — Tarjan emits SCCs in
+            // reverse topological order, so callees are always fully
+            // resolved before their callers, and re-enqueueing them here
+            // would be wasted work.
             int committed = 0;
             for (int i = 0; i < batch.size(); i++) {
                 Function f = batch.get(i);
                 FunctionSummary newSum = fresh.get(i);
                 FunctionSummary oldSum = summaries.get(f.getName());
-                if (oldSum == null || !oldSum.equals(newSum)) {
+
+                // newSum is a fresh object built by analyzeFunction
+                // specifically for this commit. It is not shared between
+                // threads and is safe to mutate in place.
+                newSum.merge(oldSum);
+
+                if (!oldSum.equals(newSum)) {
                     summaries.put(f.getName(), newSum);
                     committed++;
 
@@ -216,7 +287,16 @@ public class SummaryBuilder {
                 }
             }
 
-            // No summary changed in this pass: the SCC is at its fixed point.
+
+            System.out.println("SummaryBuilder: SCC(size=" + scc.size()
+                    + ") iteration " + iteration + " done: committed "
+                    + committed + " changed summar"
+                    + (committed == 1 ? "y" : "ies")
+                    + (committed == 0
+                        ? " — fixed point reached"
+                        : ", " + pending.size() + " queued for next iteration"));
+
+
             if (committed == 0) {
                 break;
             }
@@ -587,7 +667,31 @@ public class SummaryBuilder {
             return;
         }
 
-        FunctionSummary calleeSum = summaries.get(calleeName);
+        String calleeKey = canonicalCalleeKey(calleeName);
+
+        // Lazy <clinit> wrapper: do not propagate the callee's summary into
+        // the caller.
+        //
+        // A wrapper's summary inherits the wrapped <clinit>'s entire
+        // static-field-write set, its writesStaticFields and escapesGlobally
+        // flags, and (transitively) the static writes of every class in the
+        // wrapper's superclass chain. Propagating that into a trigger site is
+        // wrong and expensive:
+        //
+        //   * Semantically, a trigger site does not itself write the trigger
+        //     class's static fields — the wrapped <clinit> does, and the real
+        //     <clinit> is analysed on its own elsewhere. Carrying the
+        //     wrapper's static writes into the caller only adds spurious
+        //     static/escape flags (the РАУНД 13 HEAP over-approximation).
+        //
+        // The wrapper's own summary is still needed when the wrapper itself
+        // is analysed; only its callers skip it. See
+        // LlvmUtil.isLazyClinitWrapper.
+        if (isLazyClinitWrapper(calleeKey)) {
+            return;
+        }
+
+        FunctionSummary calleeSum = summaries.get(calleeKey);
         if (calleeSum == null) {
             // External or not-yet-analyzed callee: conservatively assume
             // every argument escapes and the return value is an object.

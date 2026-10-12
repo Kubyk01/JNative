@@ -2122,6 +2122,75 @@ public class LlvmFunctionEmitter {
                 String className = extractTypeName(inst);
                 String structType = globalEmitter.getStructName(className);
 
+                if (inst.isStackAllocated()) {
+                    // ------------------------------------------------------------------
+                    // Stack-allocated object.
+                    //
+                    // The alloca is queued into pendingSlotDeclarations rather than
+                    // emitted in the current block, so that it lands in the
+                    // function's entry block. Its address therefore dominates every
+                    // use, including uses that follow a try-guard region, and LLVM
+                    // never has to reason about whether an alloca inside a loop
+                    // can be hoisted.
+                    //
+                    // alloca does not zero the memory it reserves, and the struct's
+                    // primitive fields have Java default values (0, false, null),
+                    // so the slot is zeroed before the vtable is written. The
+                    // memset is emitted in the current block (not the entry block)
+                    // because it is a runtime operation on the slot's contents, not
+                    // a declaration of the slot itself.
+                    //
+                    // The vtable is written into the slot's first word before the
+                    // constructor runs. This mirrors exactly what the calloc-based
+                    // heap path does and is required by every virtual call that
+                    // takes the object as a receiver.
+                    // ------------------------------------------------------------------
+                    String allocName = newAux("stack_alloc");
+                    pendingSlotDeclarations.add(
+                        "  " + allocName + " = alloca " + structType + ", align 8\n");
+
+                    String gepReg = newAux("alloc_gep");
+                    sb.append("  ").append(gepReg)
+                        .append(" = getelementptr ").append(structType)
+                        .append(", ").append(structType).append("* null, i32 1\n");
+
+                    String sizeReg = newAux("alloc_size");
+                    sb.append("  ").append(sizeReg)
+                        .append(" = ptrtoint ").append(structType)
+                        .append("* ").append(gepReg).append(" to i64\n");
+
+                    String i8Ptr = newAux("stack_i8");
+                    sb.append("  ").append(i8Ptr)
+                        .append(" = bitcast ").append(structType)
+                        .append("* ").append(allocName).append(" to i8*\n");
+                    sb.append("  call void @llvm.memset.p0i8.i64(i8* ")
+                        .append(i8Ptr).append(", i8 0, i64 ").append(sizeReg)
+                        .append(", i1 false)\n");
+
+                    String vtableName = globalEmitter.getVtableName(className);
+                    if (vtableName != null) {
+                        String vtablePtr = newAux("vtableptr");
+                        sb.append("  ").append(vtablePtr)
+                            .append(" = bitcast %JNativeVTable* ").append(vtableName)
+                            .append(" to i8*\n");
+
+                        String objPtrCast = newAux("objptrcast");
+                        sb.append("  ").append(objPtrCast).append(" = bitcast ").append(structType)
+                            .append("* ").append(allocName).append(" to i8**\n");
+
+                        sb.append("  store i8* ").append(vtablePtr).append(", i8** ")
+                            .append(objPtrCast).append("\n");
+                    }
+
+                    sb.append("  ").append(resultName).append(" = bitcast ").append(structType)
+                        .append("* ").append(allocName)
+                        .append(" to ")
+                        .append(LlvmTypeMapper.toLlvmType(inst.getResult().getType()))
+                        .append("\n");
+                    break;
+                }
+
+                // ---- Heap allocation (existing code path, unchanged) ----
                 String gepReg = newAux("alloc_gep");
                 sb.append("  ").append(gepReg)
                     .append(" = getelementptr ").append(structType)

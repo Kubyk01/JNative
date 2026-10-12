@@ -17,7 +17,6 @@ import io.github.kubyk01.application.service.optimizer.Optimizer;
 import io.github.kubyk01.domain.analyzer.AnalyzerResult;
 import io.github.kubyk01.domain.analyzer.aliasanalysis.AliasAnalysisResult;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.ClassNode;
-import io.github.kubyk01.domain.analyzer.dependencyresolver.MethodNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.MethodReference;
 import io.github.kubyk01.domain.analyzer.escapeanalysis.EscapeAnalysisResult;
 import io.github.kubyk01.domain.analyzer.lifetime.LifetimeAnalysisResult;
@@ -324,7 +323,7 @@ public class Orchestrator implements OrchestratorPort {
 
         // --- 8. Destructor insertion + optimization -----------------------
         DestructorInserter inserter = new DestructorInserter(module, resolver, lifetimeResult,
-                aliasResult.getAllocationSiteToValue(), aliasResult);
+                aliasResult.getAllocationSiteToValue(), aliasResult, escapeResult);
         inserter.insert();
 
         System.out.println("\n--- Running Optimizations ---");

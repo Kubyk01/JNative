@@ -22,7 +22,8 @@ public class AliasAnalyzer {
         SummaryBuilder summaryBuilder = new SummaryBuilder(module, scheduler);
         Map<String, FunctionSummary> summaries = summaryBuilder.build();
 
-        InterproceduralPointsTo interproc = new InterproceduralPointsTo(module, summaries);
+        InterproceduralPointsTo interproc =
+                new InterproceduralPointsTo(module, summaries, scheduler);
         PointsToGraph graph = interproc.analyze();
 
         return new AliasAnalysisResult(graph, summaries);

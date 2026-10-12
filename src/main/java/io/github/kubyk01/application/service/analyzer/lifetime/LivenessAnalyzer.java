@@ -14,6 +14,7 @@ import reactor.core.scheduler.Schedulers;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
+import static io.github.kubyk01.util.LlvmUtil.canonicalCalleeKey;
 import static io.github.kubyk01.util.LlvmUtil.extractCalleeName;
 import static io.github.kubyk01.util.LlvmUtil.getCallArguments;
 
@@ -150,6 +151,73 @@ public class LivenessAnalyzer {
             : Collections.emptySet();
     }
 
+    /**
+     * A single syntactic occurrence of a value as an operand: the block it
+     * appears in, the index of the instruction that consumes it (equal to
+     * {@code block.getInstructions().size()} when the consumer is the
+     * terminator), and the value itself.
+     */
+    public record ValueLastUse(BasicBlock block, int instructionIndex, Value value) {}
+
+    /**
+     * Value-level liveness support: for every value that appears as an
+     * operand anywhere in {@code func}, the list of its occurrences. The
+     * last element of each list is the value's last syntactic use. This is
+     * a purely syntactic index; it makes no attempt to be a true liveness
+     * analysis, which is deliberate — the lifetime pass only needs the
+     * candidate death sites and filters them by the block-level live sets.
+     */
+    public Map<Value, List<ValueLastUse>> computeValueLastUses(Function func) {
+        Map<Value, List<ValueLastUse>> lastUses = new HashMap<>();
+        for (BasicBlock block : func.getBlocks()) {
+            List<Instruction> insts = block.getInstructions();
+            for (int i = 0; i < insts.size(); i++) {
+                for (Value operand : insts.get(i).getOperands()) {
+                    if (operand == null) continue;
+                    lastUses.computeIfAbsent(operand, k -> new ArrayList<>())
+                            .add(new ValueLastUse(block, i, operand));
+                }
+            }
+            Terminator term = block.getTerminator();
+            if (term != null) {
+                for (Value operand : terminatorOperands(term)) {
+                    if (operand == null) continue;
+                    lastUses.computeIfAbsent(operand, k -> new ArrayList<>())
+                            .add(new ValueLastUse(block, insts.size(), operand));
+                }
+            }
+        }
+        return lastUses;
+    }
+
+    /**
+     * The operands a terminator consumes, in the same spirit as
+     * {@link Instruction#getOperands()}.
+     */
+    public List<Value> terminatorOperands(Terminator term) {
+        List<Value> result = new ArrayList<>();
+        if (term instanceof ReturnTerminator) {
+            Value v = ((ReturnTerminator) term).getValue();
+            if (v != null) result.add(v);
+        } else if (term instanceof ThrowTerminator) {
+            Value v = ((ThrowTerminator) term).getException();
+            if (v != null) result.add(v);
+        } else if (term instanceof CondBranchTerminator) {
+            Value v = ((CondBranchTerminator) term).getCondition();
+            if (v != null) result.add(v);
+        } else if (term instanceof LookupSwitchTerminator) {
+            Value v = ((LookupSwitchTerminator) term).getKey();
+            if (v != null) result.add(v);
+        } else if (term instanceof TableSwitchTerminator) {
+            Value v = ((TableSwitchTerminator) term).getKey();
+            if (v != null) result.add(v);
+        } else if (term instanceof IndirectBranchTerminator) {
+            Value v = ((IndirectBranchTerminator) term).getTargetBlock();
+            if (v != null) result.add(v);
+        }
+        return result;
+    }
+
     private Set<AllocationSite> getAllocationSitesDef(Instruction inst,
                                                       Set<AllocationSite> allowed) {
         Set<AllocationSite> result = new HashSet<>();
@@ -166,7 +234,8 @@ public class LivenessAnalyzer {
                 || op == Opcode.SPECIAL_CALL) {
             String calleeName = extractCalleeName(inst);
             if (calleeName == null) return result;
-            FunctionSummary summary = summaries.get(calleeName);
+            String calleeKey = canonicalCalleeKey(calleeName);
+            FunctionSummary summary = summaries.get(calleeKey);
             if (summary == null) return result;
             List<Value> args = getCallArguments(inst);
             for (int i = 0; i < args.size(); i++) {

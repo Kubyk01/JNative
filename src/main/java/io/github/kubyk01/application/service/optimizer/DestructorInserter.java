@@ -8,6 +8,8 @@ import io.github.kubyk01.domain.analyzer.aliasanalysis.PointsToGraph;
 import io.github.kubyk01.domain.analyzer.aliasanalysis.PointsToSet;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.ClassNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.FieldNode;
+import io.github.kubyk01.domain.analyzer.escapeanalysis.EscapeAnalysisResult;
+import io.github.kubyk01.domain.analyzer.escapeanalysis.EscapeStatus;
 import io.github.kubyk01.domain.analyzer.lifetime.DestructionPoint;
 import io.github.kubyk01.domain.analyzer.lifetime.LifetimeAnalysisResult;
 import io.github.kubyk01.domain.ir.BasicBlock;
@@ -48,6 +50,7 @@ public class DestructorInserter {
     @Getter
     private final Map<AllocationSite, Value> siteToValue;
     private final AliasAnalysisResult aliasResult;
+    private final EscapeAnalysisResult escapeResult;
 
     public void insert() {
         // 1. Collect classes and array types encountered at destruction points
@@ -96,6 +99,21 @@ public class DestructorInserter {
         for (Map.Entry<AllocationSite, Set<DestructionPoint>> entry
             : lifetimeResult.getDestructionPoints().entrySet()) {
             AllocationSite site = entry.getKey();
+
+            // ------------------------------------------------------------------
+            // Stack-allocated object.
+            //
+            // The object's storage lives in its function's stack frame and is
+            // released automatically when the function returns. Emitting a
+            // destructor call — which ends in `free(obj)` — would call free()
+            // on a stack address and corrupt the heap. The same applies to a
+            // scalar-replaced object: the destructor argument would be a
+            // dangling reference. One check handles both cases.
+            // ------------------------------------------------------------------
+            if (escapeResult.getSiteStatus(site) == EscapeStatus.STACK) {
+                continue;
+            }
+
             Type type = site.getType();
             if (type.isUnknown() || type.isNull()) continue;
             if (!isManagedType(type)) continue;
@@ -265,6 +283,7 @@ public class DestructorInserter {
         if (existing != null) return existing;
 
         Function func = new Function(funcName, Type.VOID);
+        func.setOwnerClass(className);
         module.addFunction(func);
         Parameter thisParam = new Parameter(Type.reference(className), 0);
         func.addParameter(thisParam);

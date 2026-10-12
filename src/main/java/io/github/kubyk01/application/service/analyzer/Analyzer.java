@@ -469,48 +469,74 @@ public class Analyzer {
         Map<String, Set<String>> classDeps = new LinkedHashMap<>();
         for (String cls : allWithClinit) classDeps.put(cls, new LinkedHashSet<>());
 
-        for (Function clinit : clinitFunctions) {
-            String className = clinitNameToClassName.get(clinit.getName());
-            if (className == null) continue;
-            Set<String> deps = classDeps.get(className);
+        Map<String, Set<String>> classDepDeltas = new ConcurrentHashMap<>();
+        LlvmUtil.awaitMono(Flux.fromIterable(clinitFunctions)
+            .parallel()
+            .runOn(scheduler)
+            .doOnNext(clinit -> {
+                String className = clinitNameToClassName.get(clinit.getName());
+                if (className == null) return;
 
-            ClassNode cn = resolver.getClassNode(className);
-            Set<String> visited = new HashSet<>();
-            while (cn != null && cn.getSuperName() != null
-                && !cn.getSuperName().equals(cn.getName())
-                && visited.add(cn.getSuperName())) {
-                String sup = cn.getSuperName();
-                if ("java/lang/Object".equals(sup)) break;
-                deps.add(sup);
-                cn = resolver.getClassNode(sup);
-            }
+                Set<String> delta = new HashSet<>();
 
-            Set<String> nested = nestedClinits.get(clinit.getName());
-            if (nested != null) {
-                for (String nestedClinit : nested) {
-                    String nestedClass = clinitNameToClassName.get(nestedClinit);
-                    if (nestedClass != null && !nestedClass.equals(className)) {
-                        deps.add(nestedClass);
+                ClassNode cn = resolver.getClassNode(className);
+                Set<String> visited = new HashSet<>();
+                while (cn != null && cn.getSuperName() != null
+                    && !cn.getSuperName().equals(cn.getName())
+                    && visited.add(cn.getSuperName())) {
+                    String sup = cn.getSuperName();
+                    if ("java/lang/Object".equals(sup)) break;
+                    delta.add(sup);
+                    cn = resolver.getClassNode(sup);
+                }
+
+                Set<String> nested = nestedClinits.get(clinit.getName());
+                if (nested != null) {
+                    for (String nestedClinit : nested) {
+                        String nestedClass = clinitNameToClassName.get(nestedClinit);
+                        if (nestedClass != null && !nestedClass.equals(className)) {
+                            delta.add(nestedClass);
+                        }
                     }
                 }
-            }
 
-            Set<String> scope = clinitScope.get(clinit.getName());
-            if (scope != null) {
-                for (String funcName : scope) {
-                    Function func = module.getFunction(funcName);
-                    if (func == null || func.getEntryBlock() == null) continue;
-                    for (BasicBlock block : func.getBlocks()) {
-                        for (Instruction inst : block.getInstructions()) {
-                            String owner = extractTriggerOwner(inst);
-                            if (owner != null && !owner.isEmpty()
-                                && !owner.equals(className)) {
-                                deps.add(owner);
+                Set<String> scope = clinitScope.get(clinit.getName());
+                if (scope != null) {
+                    for (String funcName : scope) {
+                        Function func = module.getFunction(funcName);
+                        if (func == null || func.getEntryBlock() == null) continue;
+                        for (BasicBlock block : func.getBlocks()) {
+                            for (Instruction inst : block.getInstructions()) {
+                                String owner = extractTriggerOwner(inst);
+                                if (owner != null && !owner.isEmpty()
+                                    && !owner.equals(className)) {
+                                    delta.add(owner);
+                                }
                             }
                         }
                     }
                 }
-            }
+
+                if (!delta.isEmpty()) {
+                    classDepDeltas.compute(className, (k, existing) -> {
+                        if (existing == null) return delta;
+                        existing.addAll(delta);
+                        return existing;
+                    });
+                }
+            })
+            .sequential()
+            .then()
+        );
+
+        // Merge deltas into classDeps on the caller thread, preserving
+        // deterministic per-set iteration order by sorting each delta.
+        for (Map.Entry<String, Set<String>> entry : classDepDeltas.entrySet()) {
+            Set<String> deps = classDeps.get(entry.getKey());
+            if (deps == null) continue;
+            List<String> sorted = new ArrayList<>(entry.getValue());
+            Collections.sort(sorted);
+            deps.addAll(sorted);
         }
 
         // ---- Parallel field writer/reader collection (Reactor).

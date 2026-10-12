@@ -16,8 +16,10 @@ import reactor.core.scheduler.Schedulers;
 
 import java.util.*;
 
+import static io.github.kubyk01.util.LlvmUtil.canonicalCalleeKey;
 import static io.github.kubyk01.util.LlvmUtil.extractCalleeName;
 import static io.github.kubyk01.util.LlvmUtil.isAllocation;
+import static io.github.kubyk01.util.LlvmUtil.isLazyClinitWrapper;
 
 @Slf4j
 public class InterproceduralEscape {
@@ -78,9 +80,13 @@ public class InterproceduralEscape {
             for (BasicBlock b : f.getBlocks()) {
                 for (Instruction inst : b.getInstructions()) {
                     String callee = extractCalleeName(inst);
-                    if (callee != null) {
-                        callersOf.computeIfAbsent(callee, k -> new HashSet<>()).add(f);
-                    }
+                    if (callee == null) continue;
+                    String calleeKey = canonicalCalleeKey(callee);
+
+                    // See the comment on LlvmUtil.isLazyClinitWrapper.
+                    if (isLazyClinitWrapper(calleeKey)) continue;
+
+                    callersOf.computeIfAbsent(calleeKey, k -> new HashSet<>()).add(f);
                 }
             }
         }
