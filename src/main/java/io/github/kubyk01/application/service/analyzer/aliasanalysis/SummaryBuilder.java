@@ -287,16 +287,6 @@ public class SummaryBuilder {
                 }
             }
 
-
-            System.out.println("SummaryBuilder: SCC(size=" + scc.size()
-                    + ") iteration " + iteration + " done: committed "
-                    + committed + " changed summar"
-                    + (committed == 1 ? "y" : "ies")
-                    + (committed == 0
-                        ? " — fixed point reached"
-                        : ", " + pending.size() + " queued for next iteration"));
-
-
             if (committed == 0) {
                 break;
             }

@@ -36,15 +36,6 @@ public class EscapeSummaryBuilder {
      */
     private static final int MAX_SCC_ITERATIONS = 2000;
 
-    /**
-     * Progress-log threshold for {@link #processSCC}. A large SCC can
-     * run for minutes with no other output; above this size one line
-     * per iteration is emitted so that a long fixed point is not
-     * mistaken for a lock. Small SCCs stay silent because they
-     * converge in a single pass.
-     */
-    private static final int SCC_PROGRESS_LOG_THRESHOLD = 100;
-
     private final Module module;
     private final AliasAnalysisResult aliasResult;
     private final DependencyResolver resolver;
@@ -252,10 +243,6 @@ public class EscapeSummaryBuilder {
         int totalProcessed = 0;
         int iteration = 0;
 
-        // Progress log: a large SCC can run for minutes with no other
-        // output, which makes a long fixed point look like a lock. Small
-        // SCCs stay silent because they converge in a single pass.
-        final boolean logProgress = scc.size() > SCC_PROGRESS_LOG_THRESHOLD;
 
         // ---- Pre-fill every SCC member with ⊥ (the empty summary). ----
         //
@@ -285,18 +272,6 @@ public class EscapeSummaryBuilder {
             List<Function> batch = new ArrayList<>(pending);
             pending.clear();
             totalProcessed += batch.size();
-
-            if (logProgress) {
-                // The queued count is intentionally NOT printed here: at
-                // this point pending was just cleared and has not yet been
-                // refilled by the commit loop below, so any value printed
-                // would be zero. The "queued for next iteration" figure is
-                // reported at the end of the iteration instead.
-                System.out.println("EscapeSummaryBuilder: SCC(size=" + scc.size()
-                        + ") iteration " + iteration + ": analysing "
-                        + batch.size() + " function(s), "
-                        + totalProcessed + " total evaluations so far");
-            }
 
             // The `summaries` map is a ConcurrentHashMap, and it is only
             // written on the main thread after this parallel phase
@@ -354,16 +329,6 @@ public class EscapeSummaryBuilder {
                         }
                     }
                 }
-            }
-
-            if (logProgress) {
-                System.out.println("EscapeSummaryBuilder: SCC(size=" + scc.size()
-                        + ") iteration " + iteration + " done: committed "
-                        + committed + " changed summar"
-                        + (committed == 1 ? "y" : "ies")
-                        + (committed == 0
-                            ? " — fixed point reached"
-                            : ", " + pending.size() + " queued for next iteration"));
             }
 
             // No summary changed in this pass: the SCC is at its fixed
@@ -565,7 +530,6 @@ public class EscapeSummaryBuilder {
                                  boolean[]    flags) {
         if (inst.getOperands().size() < 3) return;
 
-        Value base = inst.getOperands().get(0);
         Value rhs  = inst.getOperands().get(2);
         String[] of = extractFieldOwnerAndName(inst);
         String owner = of[0];
@@ -590,6 +554,17 @@ public class EscapeSummaryBuilder {
             fieldsEscaped.add(c.getValue().toString());
         }
 
+        // --- FIX: type-dependent check ---
+        // A primitive value stored into a field stays a primitive and
+        // cannot make any allocation site reachable from another object
+        // or another thread.
+        Type rhsType = (rhs != null) ? rhs.getType() : null;
+        boolean rhsIsReference = (rhsType == null)
+                || rhsType.isReference()
+                || rhsType.isArray()
+                || rhsType.isNull()
+                || rhsType.isUnknown();
+
         // The stored value becomes reachable from the base object. Since
         // the summary is by construction an over-approximation of what
         // this function may do to its parameters, and since the summary
@@ -598,12 +573,12 @@ public class EscapeSummaryBuilder {
         // escaping. (The IntraproceduralEscape pass handles the more
         // precise case where the base is a local whose escape status is
         // known within the function.)
-        if (rhs instanceof Parameter pr) {
+        if (rhsIsReference && rhs instanceof Parameter pr) {
             paramsEscaped.add(pr.getIndex());
             addAliases(pr.getIndex(), paramAliases, paramsEscaped);
         }
 
-        if (isVolatile) {
+        if (isVolatile && rhsIsReference) {
             flags[1] = true;
             if (rhs instanceof Parameter pr) {
                 paramsEscaped.add(pr.getIndex());
@@ -644,11 +619,33 @@ public class EscapeSummaryBuilder {
                                   boolean[]    flags) {
         if (inst.getOperands().size() < 2) return;
         Value rhs = inst.getOperands().get(1);
+
+        // --- FIX: type-dependent check ---
+        // Only storing a reference value into a static field can make an
+        // object globally reachable. A primitive store (including the
+        // synthetic `static final boolean $assertionsDisabled` that javac
+        // generates for assert) makes no object globally reachable and
+        // must not taint the caller's summary with escapesGlobally.
+        //
+        // Before this fix, one boolean store anywhere in the transitive
+        // closure of Object.toString() flipped the whole chain to
+        // escapesGlobally: IntegerCache.<clinit> -> Integer.valueOf ->
+        // ... -> Object.toString. IntraproceduralEscape then promoted the
+        // receiver `new Test2(...)` to GLOBAL.
+        Type rhsType = (rhs != null) ? rhs.getType() : null;
+        boolean rhsIsReference = (rhsType == null)
+                || rhsType.isReference()
+                || rhsType.isArray()
+                || rhsType.isNull()
+                || rhsType.isUnknown();
+
         if (rhs instanceof Parameter p) {
             paramsEscaped.add(p.getIndex());
             addAliases(p.getIndex(), paramAliases, paramsEscaped);
         }
-        flags[1] = true;
+        if (rhsIsReference) {
+            flags[1] = true;
+        }
     }
 
     private void processALoad(Instruction inst, Map<Value, Value> valueOrigin) {
@@ -663,11 +660,18 @@ public class EscapeSummaryBuilder {
                                Set<Integer> paramsEscaped,
                                Set<String>  fieldsEscaped) {
         if (inst.getOperands().size() < 3) return;
-        Value array = inst.getOperands().get(0);
         Value value = inst.getOperands().get(2);
+
+        Type vt = (value != null) ? value.getType() : null;
+        boolean valueIsReference = (vt == null)
+                || vt.isReference()
+                || vt.isArray()
+                || vt.isNull()
+                || vt.isUnknown();
+
         // Writing into an array mutates it in place; the array reference
         // itself does not escape. Only the stored value does.
-        if (value instanceof Parameter p) {
+        if (valueIsReference && value instanceof Parameter p) {
             paramsEscaped.add(p.getIndex());
             addAliases(p.getIndex(), paramAliases, paramsEscaped);
         }
