@@ -134,9 +134,77 @@ public class LifetimeAnalyzer {
                                    LivenessAnalyzer livenessAnalyzer,
                                    Map<AllocationSite, Value> siteToValue) {
         EscapeStatus status = escapeResult.getSiteStatus(site);
+
+        // ------------------------------------------------------------------
+        // Ownership rule for HEAP sites.
+        //
+        // A HEAP allocation is one whose only remaining reference is inside
+        // a field of another object. That owner is the sole entity entitled
+        // to release the storage: DestructorInserter.createClassDestructor
+        // already emits a destructor that walks every reference-typed field
+        // of the owner and calls the field's destructor recursively, and
+        // the single-free rule (delegatedToSuper) guarantees that the
+        // object is freed exactly once along that chain.
+        //
+        // Emitting a per-use destruction point for a HEAP site would create
+        // a second, competing owner of the same allocation -- the store
+        // site. Its destructor runs while the real owner still holds a
+        // reference to the object, and the results are exactly the two
+        // failures observed in the previous two runs:
+        //
+        //   1. Use-after-free: the owner's field points at freed memory,
+        //      and the first read through the field observes whatever the
+        //      allocator wrote into the recycled chunk. On the run that
+        //      produced this report the recycled chunk happened to contain
+        //      the string "/usr/lib", which was then interpreted as a vtable
+        //      by AccessController.executePrivileged.
+        //
+        //   2. Double free: the owner's destructor walks the field and
+        //      frees the same storage again, which glibc's tcache detects
+        //      and turns into a "free(): double free detected in tcache 2"
+        //      abort.
+        //
+        // The reproduced crash was the deep form of the same defect:
+        //
+        //     ReferenceQueue.<init>:
+        //         new ReentrantLock()               -> stored into this.lock
+        //             ReentrantLock.<init>:
+        //                 new NonfairSync()         -> stored into this.sync
+        //                 per-use destructor for the Sync       (wrong)
+        //         per-use destructor for the Lock           (wrong)
+        //     ... later, an owner's destructor walks the field ...
+        //     __destruct_ReentrantLock -> __destruct_Sync -> __destruct_AQS
+        //         -> __destruct_AOS loads the (already freed) field
+        //         -> loads a garbage exclusiveOwnerThread
+        //         -> calls __destruct_java_lang_Thread(garbage)
+        //         -> SIGSEGV
+        //
+        // The correct treatment of a HEAP site is therefore the same as for
+        // GLOBAL / THREAD / RETURN: its lifetime is bounded by an entity
+        // outside the destruction-point machinery, and no per-use destructor
+        // is emitted for it. Storage is reclaimed through the owner's
+        // destructor chain, which is the only correct owner of a HEAP
+        // object.
+        //
+        // STACK is intentionally not listed here. A STACK object that is
+        // used as an object is materialised via alloca (see
+        // LlvmFunctionEmitter's NEW case and ScalarReplacer's first pass),
+        // and its storage is released by the frame teardown. The
+        // DestructorInserter.insert() method filters STACK sites with the
+        // same reasoning, one layer later.
+        //
+        // UNKNOWN is likewise not listed. It is the default status returned
+        // by EscapeAnalysisResult.getSiteStatus for a site that the
+        // analysis did not classify at all; treating such a site as
+        // potentially free-able at its last use preserves the previous
+        // conservative behaviour and cannot introduce the HEAP double-free,
+        // because an UNKNOWN site was never observed being stored into
+        // another object's field.
+        // ------------------------------------------------------------------
         if (status == EscapeStatus.GLOBAL
             || status == EscapeStatus.THREAD
-            || status == EscapeStatus.RETURN) {
+            || status == EscapeStatus.RETURN
+            || status == EscapeStatus.HEAP) {
             return new SiteResult(site, List.of(), false);
         }
 
@@ -170,6 +238,21 @@ public class LifetimeAnalyzer {
             LivenessAnalyzer.ValueLastUse last = uses.getLast();
             BasicBlock block = last.block();
 
+            // ------------------------------------------------------------------
+            // The destructor call is inserted at the last-use site and takes
+            // the root value as its argument. For the call to be well-formed
+            // IR, the root's definition must dominate that block. When it does
+            // not — a case reachable through an over-approximated CFG edge or
+            // through a value that only survives on some paths — the call
+            // cannot be emitted here. Skipping the destruction point leaves
+            // the object unfreed until process exit (or, when the object is
+            // reachable from a static field, until @__jnative_shutdown), which
+            // is strictly better than producing IR the LLVM verifier rejects.
+            // ------------------------------------------------------------------
+            if (!valueAvailableAt(root, block, dom)) {
+                continue;
+            }
+
             // A real death requires the site to be live on entry to the
             // block but not live on exit. If it is still live on exit the
             // value flows onward and this use is not a death site.
@@ -180,9 +263,52 @@ public class LifetimeAnalyzer {
             Instruction before = null;
             List<Instruction> insts = block.getInstructions();
             int idx = last.instructionIndex();
-            if (idx >= 0 && idx < insts.size()) {
-                before = insts.get(idx);
+
+            // ------------------------------------------------------------------
+            // The destructor must run AFTER the value's last use, not before it.
+            //
+            // DestructionPoint.beforeInstruction has the semantics "insert the
+            // destructor call immediately before this instruction"; a null
+            // value means "at the end of the block, before the terminator".
+            // The value at `idx` is the last instruction that consumes the
+            // root, so the destructor must be placed at `idx + 1` -- i.e.
+            // before whatever instruction sits at `idx + 1`, or at the end of
+            // the block when `idx` is the final instruction.
+            //
+            // Placing the destructor at `idx` (the previous behaviour) puts
+            // it *before* the last use. Since a destructor for a class with
+            // no reference-typed fields is emitted as `free(obj)`, and
+            // DestructorSimplifier.inlineDestructors() collapses trivial
+            // destructor calls into an in-place FREE instruction, the
+            // emitted IR contains
+            //
+            //     free(obj);   // destructor, placed at index idx
+            //     use(obj);    // last use, shifted to index idx + 1
+            //
+            // and the object is released the moment before its final
+            // consumption. The LLVM verifier accepts this IR -- the
+            // definition of obj does dominate the call site -- so the bug
+            // is silent until the freed memory is re-used by another
+            // allocation and the consumer dereferences the object's
+            // overwritten vtable word. The observed crash was
+            //
+            //     SIGSEGV at java.security.AccessController.executePrivileged
+            //     vtable word of the receiver contained the string
+            //     "/usr/lib" written by an unrelated allocation that had
+            //     reused the freed chunk.
+            //
+            // The check below is stated in terms of `idx + 1 < insts.size()`
+            // rather than the equivalent `idx + 1 <= insts.size() - 1` so
+            // that the compiler emits a single comparison against the size
+            // of the instruction list. Both forms are equivalent, and both
+            // leave `before == null` when the last use is the final
+            // instruction of the block, or when it is the terminator (whose
+            // index is insts.size()).
+            // ------------------------------------------------------------------
+            if (idx >= 0 && idx + 1 < insts.size()) {
+                before = insts.get(idx + 1);
             }
+
             points.add(new DestructionPoint(block, before, root));
         }
 
@@ -206,6 +332,42 @@ public class LifetimeAnalyzer {
             if (lca == null) {
                 return new SiteResult(site, List.of(), true);
             }
+
+            // ------------------------------------------------------------------
+            // Dominance check for the fallback path.
+            //
+            // The main path above already filters out candidates whose root
+            // value is not available at the insertion block (see
+            // valueAvailableAt). The fallback path bypasses that filter and
+            // uses the raw allocation value directly, so it must re-apply the
+            // same check here. Without it, an allocation performed in a
+            // block that does not dominate the LCA of the return blocks —
+            // for example, an allocation inside a branch or inside a
+            // try-guarded body whose merge point lies above the returns —
+            // produces a DestructionPoint whose objectRef cannot legally be
+            // named at the insertion site. The LLVM backend then rejects the
+            // module with:
+            //
+            //   Instruction does not dominate all uses!
+            //     %tmp = bitcast ptr %alloc to ptr
+            //     call void @__destruct_X(ptr %tmp)
+            //
+            // Observed on ObjectInputStream$SerialCallbackContext inside
+            // ObjectInputStream.readOrdinaryObject and on the two HashSets
+            // inside ObjectInputStream$BlockDataInputStream, all three of
+            // which are created inside a try-guard body and whose only
+            // legal insertion point would be inside that guarded body, not
+            // at the LCA of the returns.
+            //
+            // Treating such an allocation as unresolved is the correct
+            // conservative answer: the analysis has no safe point at which
+            // it can release the object, so the object is left to the
+            // runtime's own shutdown path, exactly as a cyclic object is.
+            // ------------------------------------------------------------------
+            if (!valueAvailableAt(allocVal, lca, dom)) {
+                return new SiteResult(site, List.of(), true);
+            }
+
             return new SiteResult(site,
                 List.of(new DestructionPoint(lca, null, allocVal)), false);
         }
@@ -216,6 +378,61 @@ public class LifetimeAnalyzer {
     private record SiteResult(AllocationSite site,
                               List<DestructionPoint> points,
                               boolean unresolved) {}
+
+    /**
+     * Returns true when {@code v} can be legally named as an operand of an
+     * instruction placed anywhere in {@code block}.
+     *
+     * <p>For the IR produced by
+     * {@link io.github.kubyk01.application.service.analyzer.ssa.SSATransformer},
+     * this is exactly the LLVM dominance rule: the defining instruction of
+     * a value must dominate every instruction that uses it. A value defined
+     * in a block that does not dominate {@code block} cannot be used there,
+     * and any attempt to emit such a use produces IR that clang rejects
+     * with</p>
+     *
+     * <pre>
+     *   Instruction does not dominate all uses!
+     * </pre>
+     *
+     * <p>Constants and parameters are always considered available: a
+     * constant is an immediate operand, and every parameter is written
+     * into its slot in the entry block, which dominates every block of
+     * the function. For a {@link io.github.kubyk01.domain.ir.Temporary}
+     * the defining instruction's parent block is compared against
+     * {@code block} through the dominator tree. A temporary with no
+     * defining instruction — an artifact of an earlier pass that has not
+     * (yet) resolved it — is treated as unavailable, which is the
+     * conservative choice.</p>
+     */
+    private boolean valueAvailableAt(Value v, BasicBlock block, DominatorTree dom) {
+        switch (v) {
+            case null -> {
+                return false;
+            }
+            case Constant ignored2 -> {
+                return true;
+            }
+            case Parameter ignored1 -> {
+                return true;
+            }
+            case UndefinedValue ignored -> {
+                return true;
+            }
+            case Temporary t -> {
+                Instruction def = t.getDefiningInstruction();
+                if (def == null) return false;
+                BasicBlock defBlock = def.getParent();
+                if (defBlock == null) return false;
+                if (defBlock == block) return true;
+                return dom.dominates(defBlock, block);
+            }
+            default -> {
+            }
+        }
+
+        return false;
+    }
 
     /**
      * All IR values in {@code func} whose points-to set contains

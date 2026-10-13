@@ -111,6 +111,61 @@ public class LlvmFunctionEmitter {
     private final Map<Value, String> valueSlots = new HashMap<>();
 
     /**
+     * Stack-allocated objects whose alloca lives in the function's entry
+     * block.
+     *
+     * <p>Maps the SSA value produced by a {@code NEW} instruction that has
+     * been marked stack-allocated (see {@code ScalarReplacer}'s first pass)
+     * to the name of its {@code alloca} in the entry block, together with
+     * the LLVM spelling of the allocated struct type. Every use of such a
+     * value re-emits a fresh {@code bitcast} from the alloca at the use
+     * site, so the pointer value is always available in the block that
+     * uses it, no matter where that block is relative to the block that
+     * contains the {@code NEW}.</p>
+     *
+     * <h2>Why this is necessary</h2>
+     *
+     * <p>The alloca itself is emitted into the entry block (through the
+     * {@code pendingSlotDeclarations} mechanism, see the comment inside
+     * the {@code NEW} case), so the alloca address dominates every block
+     * of the function. But a {@code bitcast} of that address into the
+     * object's reference type, emitted once at the {@code NEW} site, is an
+     * SSA value defined in the {@code NEW}'s block. A use of that value in
+     * a different block — most importantly, a destructor call inserted by
+     * {@code DestructorInserter} at the object's last syntactic use, which
+     * routinely lives in a successor block of the one containing the
+     * {@code NEW} — is then rejected by the LLVM verifier with</p>
+     *
+     * <pre>
+     *   Instruction does not dominate all uses!
+     *     %tmp = bitcast ptr %aux_alloc to ptr
+     *     call void @__destruct_X(ptr %tmp)
+     * </pre>
+     *
+     * <p>Re-emitting the bitcast at each use site removes the problem
+     * without changing the meaning of the value: with opaque pointer
+     * syntax (LLVM 15+) the bitcast is essentially an identity, and with
+     * typed pointers it produces the same pointer from the same alloca.
+     * The alloca is guaranteed to be live at the use site because it is
+     * in the entry block.</p>
+     *
+     * <p>This mirrors the {@link #valueSlots} mechanism exactly, with one
+     * difference: a value in {@code valueSlots} is a pointer to a stack
+     * cell that must be {@code load}-ed, whereas a value in
+     * {@code valuePointers} is the stack cell itself and must be
+     * {@code bitcast}-ed.</p>
+     */
+    private final Map<Value, StackAlloc> valuePointers = new HashMap<>();
+
+    /**
+     * One entry of {@link #valuePointers}: the name of the entry-block
+     * alloca that backs a stack-allocated object, together with the LLVM
+     * spelling of the allocated struct type (used as the source type of
+     * the re-emitted bitcast at each use site).
+     */
+    private record StackAlloc(String allocaName, String structType) {}
+
+    /**
      * Per-phi cache of preloaded slot-based operands. Keyed by the phi
      * {@link Instruction}, then by the incoming-edge index. Materialised in
      * the predecessor block, right before its terminator, so that the loaded
@@ -201,6 +256,7 @@ public class LlvmFunctionEmitter {
 
         valueMapper.clear();
         valueSlots.clear();
+        valuePointers.clear();
         phiPreloads.clear();
         pendingSlotDeclarations.clear();
 
@@ -486,18 +542,47 @@ public class LlvmFunctionEmitter {
                     if (predIdx >= succInst.getOperands().size()) continue;
                     Value phiOp = succInst.getOperands().get(predIdx);
                     if (phiOp == null) continue;
+
+                    // Slot-based preload (existing behaviour).
                     String slot = valueSlots.get(phiOp);
-                    if (slot == null) continue;
+                    if (slot != null) {
+                        String ty = LlvmTypeMapper.toLlvmType(phiOp.getType());
+                        String tmp = newAux("phi_preload");
+                        sb.append("  ").append(tmp).append(" = load ")
+                            .append(ty).append(", ").append(ty)
+                            .append("* ").append(slot).append("\n");
+                        phiPreloads
+                            .computeIfAbsent(succInst, k -> new HashMap<>())
+                            .put(predIdx, tmp);
+                        continue;
+                    }
 
-                    String ty = LlvmTypeMapper.toLlvmType(phiOp.getType());
-                    String tmp = newAux("phi_preload");
-                    sb.append("  ").append(tmp).append(" = load ")
-                        .append(ty).append(", ").append(ty)
-                        .append("* ").append(slot).append("\n");
-
-                    phiPreloads
-                        .computeIfAbsent(succInst, k -> new HashMap<>())
-                        .put(predIdx, tmp);
+                    // ------------------------------------------------------------------
+                    // Stack-allocated object preload.
+                    //
+                    // A PHI operand is conceptually evaluated on the incoming edge,
+                    // so its SSA value must dominate the predecessor's terminator,
+                    // not the PHI's own block. The alloca in the entry block
+                    // dominates the predecessor terminator unconditionally, so
+                    // emitting a fresh bitcast here (right before the terminator,
+                    // in the predecessor block) is always well-formed.
+                    //
+                    // Doing this via the phiPreloads map keeps the same structure
+                    // as the valueSlots case above, so the PHI emission itself
+                    // needs no special-casing beyond checking phiPreloads first.
+                    // ------------------------------------------------------------------
+                    StackAlloc ptrSlot = valuePointers.get(phiOp);
+                    if (ptrSlot != null) {
+                        String destTy = LlvmTypeMapper.toLlvmType(phiOp.getType());
+                        String tmp = newAux("phi_preload");
+                        sb.append("  ").append(tmp).append(" = bitcast ")
+                            .append(ptrSlot.structType()).append("* ")
+                            .append(ptrSlot.allocaName())
+                            .append(" to ").append(destTy).append("\n");
+                        phiPreloads
+                            .computeIfAbsent(succInst, k -> new HashMap<>())
+                            .put(predIdx, tmp);
+                    }
                 }
             }
             sb.append(emitTerminator(term, ranges));
@@ -2129,21 +2214,20 @@ public class LlvmFunctionEmitter {
                     // The alloca is queued into pendingSlotDeclarations rather than
                     // emitted in the current block, so that it lands in the
                     // function's entry block. Its address therefore dominates every
-                    // use, including uses that follow a try-guard region, and LLVM
-                    // never has to reason about whether an alloca inside a loop
-                    // can be hoisted.
+                    // use, including uses that follow a try-guard region.
                     //
-                    // alloca does not zero the memory it reserves, and the struct's
-                    // primitive fields have Java default values (0, false, null),
-                    // so the slot is zeroed before the vtable is written. The
-                    // memset is emitted in the current block (not the entry block)
-                    // because it is a runtime operation on the slot's contents, not
-                    // a declaration of the slot itself.
+                    // The bitcast into the object's reference type is NOT emitted here.
+                    // Doing so would define an SSA value in this block, and a use of
+                    // that value in a different block — most importantly, the
+                    // destructor call that DestructorInserter routinely places in a
+                    // successor block — would then violate LLVM's dominance rule and
+                    // the module would be rejected with
                     //
-                    // The vtable is written into the slot's first word before the
-                    // constructor runs. This mirrors exactly what the calloc-based
-                    // heap path does and is required by every virtual call that
-                    // takes the object as a receiver.
+                    //     Instruction does not dominate all uses!
+                    //
+                    // Instead, the alloca name is registered in valuePointers and
+                    // getLlvmValue re-emits the bitcast at each use site, in the block
+                    // that actually performs the use.
                     // ------------------------------------------------------------------
                     String allocName = newAux("stack_alloc");
                     pendingSlotDeclarations.add(
@@ -2182,11 +2266,20 @@ public class LlvmFunctionEmitter {
                             .append(objPtrCast).append("\n");
                     }
 
-                    sb.append("  ").append(resultName).append(" = bitcast ").append(structType)
-                        .append("* ").append(allocName)
-                        .append(" to ")
-                        .append(LlvmTypeMapper.toLlvmType(inst.getResult().getType()))
-                        .append("\n");
+                    // Register the entry-block alloca as this value's pointer source.
+                    // Every read of inst.getResult() through getLlvmValue will emit a
+                    // fresh bitcast from this alloca at the read site.
+                    valuePointers.put(inst.getResult(),
+                        new StackAlloc(allocName, structType));
+
+                    // Remove the stale valueMapper entry created at the top of
+                    // emitInstruction, so that a caller bypassing getLlvmValue cannot
+                    // observe an SSA name that was never defined.
+                    valueMapper.setValue(inst.getResult(), null);
+
+                    // resultName was reserved at the top of emitInstruction but is
+                    // deliberately not assigned here: the value is materialised lazily
+                    // by getLlvmValue at every use.
                     break;
                 }
 
@@ -2373,7 +2466,44 @@ public class LlvmFunctionEmitter {
                     // free(null) is meaningless.
                     break;
                 }
-                sb.append("  call void @free(i8* ").append(objRef).append(")\n");
+                // ------------------------------------------------------------------
+                // Route the deallocation through __jnative_free rather than
+                // through libc free().
+                //
+                // A reference-typed value that reaches this point is not
+                // necessarily heap-allocated. It can be a Java String literal
+                // emitted by LlvmGlobalEmitter.generateStringLiterals as a
+                // static @jstr_<hex> global in the executable's .data
+                // segment, or any other static constant that a class chose to
+                // store into a field. Calling free() on such a pointer is
+                // undefined behaviour: glibc detects it and aborts with
+                // "free(): invalid pointer".
+                //
+                // The concrete failure the indirection closes:
+                //
+                //   __jnative_shutdown
+                //       -> __destruct_java_lang_invoke_VarHandle$AccessMode
+                //           -> frees the `methodName` field
+                //
+                // VarHandle$AccessMode.GET_AND_ADD_RELEASE is a genuine heap
+                // enum constant, but its `methodName` field points at
+                // @jstr_676574416e6441646452656c65617365 ("getAndAddRelease"),
+                // a static String. free() on that pointer aborted the process
+                // during exit, after main() had already printed its result.
+                //
+                // __jnative_free checks whether the pointer lies inside the
+                // main executable's writable data segments and skips the free
+                // for anything static; heap pointers pass through unchanged.
+                // See the implementation in jnative_runtime.c for the full
+                // reasoning.
+                //
+                // Every emitter of Opcode.FREE -- DestructorInserter's class
+                // and array destructors, DestructorSimplifier's inlined
+                // FREE, DestructorSimplifier's simplified trivial destructor
+                // body -- reaches libc through this single site, so the
+                // guard covers all of them at once.
+                // ------------------------------------------------------------------
+                sb.append("  call void @__jnative_free(i8* ").append(objRef).append(")\n");
                 break;
             }
 
@@ -2622,6 +2752,14 @@ public class LlvmFunctionEmitter {
                     Map<Integer, String> preloads = phiPreloads.get(inst);
                     if (preloads != null && preloads.containsKey(i)) {
                         valRef = preloads.get(i);
+                    } else if (valuePointers.containsKey(phiOp)) {
+                        // Fallback for a PHI in a block whose predecessor did not run the
+                        // phiPreloads pass (the entry block, in practice). getLlvmValue
+                        // re-emits the bitcast from the entry-block alloca here, in the
+                        // PHI's own block. That is weaker than a proper edge preload but
+                        // is still well-formed: the alloca dominates this block, and the
+                        // bitcast is only ever used within the PHI's block.
+                        valRef = getLlvmValue(sb, phiOp);
                     } else if (valueSlots.containsKey(phiOp)) {
                         String mapped = valueMapper.getValue(phiOp);
                         valRef = mapped != null ? mapped : getDefaultValue(phiOp.getType());
@@ -3524,6 +3662,32 @@ public class LlvmFunctionEmitter {
         if (v == null) return "null";
         if (v instanceof Constant c) {
             return constantToLlvmLiteral(c);
+        }
+
+        // ------------------------------------------------------------------
+        // Stack-allocated object: re-emit a bitcast from the entry-block
+        // alloca at the use site.
+        //
+        // This branch must be checked before valueSlots and valueMapper:
+        // the NEW site never materialises an SSA value for a stack-allocated
+        // object (see the case in emitInstruction), so a fall-through to
+        // either of the two other sources would return an undefined name
+        // or a stale SSA register whose defining block does not dominate
+        // the current one.
+        //
+        // The alloca lives in the entry block and therefore dominates the
+        // current position unconditionally. See the valuePointers javadoc
+        // for the full reasoning.
+        // ------------------------------------------------------------------
+        StackAlloc ptrSlot = valuePointers.get(v);
+        if (ptrSlot != null) {
+            String destTy = LlvmTypeMapper.toLlvmType(v.getType());
+            String tmp = newAux("ptr_cast");
+            sb.append("  ").append(tmp).append(" = bitcast ")
+                .append(ptrSlot.structType()).append("* ")
+                .append(ptrSlot.allocaName())
+                .append(" to ").append(destTy).append("\n");
+            return tmp;
         }
 
         // Values produced by a call inside a try-guard are not defined as plain

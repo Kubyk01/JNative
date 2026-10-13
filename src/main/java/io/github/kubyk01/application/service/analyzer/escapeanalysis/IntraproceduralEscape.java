@@ -41,6 +41,26 @@ public class IntraproceduralEscape {
 
     private final NativeBodyEscapeAnalyzer nativeAnalyzer;
 
+    /**
+     * Local parameter-to-parameter escape edges, populated from callee
+     * summaries during {@link #processCall}. Each entry `from -> {to}`
+     * means "the object referenced by `from` is reachable from the object
+     * referenced by `to`". The fixed-point loop in {@link #analyze}
+     * propagates `to`'s escape status to `from`, so that when `to`
+     * becomes {@code RETURN} the `from` site is promoted to {@code RETURN}
+     * as well.
+     *
+     * <p>The concrete case this closes is {@code ConcurrentHashMap} created
+     * in {@code newKeySet()} and stored into a {@code KeySetView} that is
+     * returned: the map is reachable from the returned view, so its escape
+     * status must be at least {@code RETURN}, and no per-use destructor
+     * may be inserted for it. Without this mechanism the map is classified
+     * as {@code HEAP}, a destruction point is created for it, and the
+     * destructor frees the map before the caller can use the returned
+     * view.</p>
+     */
+    private final Map<Value, Set<Value>> localEscapeEdges = new HashMap<>();
+
     /** Reset at the start of every fixed-point iteration. */
     private boolean changed;
 
@@ -77,6 +97,26 @@ public class IntraproceduralEscape {
                 Terminator term = block.getTerminator();
                 if (term != null) processTerminator(term);
             }
+
+            // Propagate local escape edges. If `from` escapes into `to`
+            // (i.e. `from` is reachable from `to`), then `from`'s status is
+            // at least `to`'s -- an object reachable from a returned value
+            // is itself returned, an object reachable from a global is
+            // itself global, and so on. Running this after the instruction
+            // walk means the status of `to` reflects every update that
+            // occurred in this iteration.
+            for (Map.Entry<Value, Set<Value>> e : localEscapeEdges.entrySet()) {
+                Value from = e.getKey();
+                EscapeStatus fromEsc = getMaxStatus(from);
+                for (Value to : e.getValue()) {
+                    EscapeStatus toEsc = valueEscapeStatus(to);
+                    if (toEsc.ordinal() > fromEsc.ordinal()) {
+                        markEscaped(from, toEsc);
+                        fromEsc = toEsc;
+                    }
+                }
+            }
+
             if (!changed) break;
         }
 
@@ -342,6 +382,27 @@ public class IntraproceduralEscape {
 
         if (summary.isReturnsObject() && returnValue != null) {
             markEscaped(returnValue, EscapeStatus.RETURN);
+        }
+
+        // Map the callee's parameter-to-parameter edges to the caller's
+        // argument values. The escape propagation step inside analyze()
+        // turns these into monotone status updates across iterations of
+        // the fixed point.
+        for (Map.Entry<Integer, Set<Integer>> e
+                : summary.getParamEscapeEdges().entrySet()) {
+            int fromIdx = e.getKey();
+            if (fromIdx >= args.size()) continue;
+            Value fromArg = args.get(fromIdx);
+            if (fromArg == null) continue;
+
+            for (int toIdx : e.getValue()) {
+                if (toIdx >= args.size()) continue;
+                Value toArg = args.get(toIdx);
+                if (toArg == null || toArg == fromArg) continue;
+                localEscapeEdges
+                    .computeIfAbsent(fromArg, k -> new HashSet<>())
+                    .add(toArg);
+            }
         }
     }
 

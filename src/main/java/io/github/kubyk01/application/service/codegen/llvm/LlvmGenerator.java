@@ -662,6 +662,30 @@ public class LlvmGenerator {
      * Local SSA names ({@code %...}) and LLVM intrinsics
      * ({@code @llvm.*}) are ignored.
      *
+     * <p><b>Identifier character set.</b> LLVM permits {@code $} inside
+     * unquoted identifiers — every symbol that involves an inner or
+     * anonymous Java class carries at least one, because the JVM uses
+     * {@code $} as the separator between an outer class and its nested
+     * class, and {@code LlvmRuntime.mangleMethod} intentionally preserves
+     * it (it only replaces characters outside {@code [a-zA-Z0-9_]}) —
+     * and the mangled names produced for destructors use the raw internal
+     * class name with {@code '/'} and {@code '.'} folded to {@code '_'}
+     * but <em>not</em> {@code '$'}. A previous revision scanned only
+     * {@code [a-zA-Z0-9_.]} and therefore truncated
+     * {@code @__destruct_com_sun_crypto_provider_SunJCE$1} to
+     * {@code @__destruct_com_sun_crypto_provider_SunJCE}, looked up the
+     * wrong name in the module, found nothing, and emitted no
+     * {@code declare}. clang then rejected every per-class .ll file that
+     * contained a call to such a destructor with
+     *
+     * <pre>
+     * error: use of undefined value '@__destruct_...$1'
+     * </pre>
+     *
+     * <p>The character set below matches the one used by
+     * {@link #seedFilter(Set, Deque, Map, String)} and by every symbol
+     * that {@code LlvmRuntime.mangleMethod} actually produces.</p>
+     *
      * <p>The body of a typical class references a few dozen globals, so the
      * resulting extern block is a few KB rather than the tens of MB that the
      * whole-module extern list would be.</p>
@@ -676,9 +700,16 @@ public class LlvmGenerator {
             int j = i + 1;
             while (j < n) {
                 char c = bodyContent.charAt(j);
+                // a-zA-Z0-9_ . $ - — the exact set LLVM accepts in
+                // unquoted identifiers and the exact set the mangler
+                // produces.
                 if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
-                    || (c >= '0' && c <= '9') || c == '_' || c == '.') j++;
-                else break;
+                    || (c >= '0' && c <= '9') || c == '_' || c == '.'
+                    || c == '$' || c == '-') {
+                    j++;
+                } else {
+                    break;
+                }
             }
             if (j > i + 1) used.add(bodyContent.substring(i + 1, j));
             i = j;

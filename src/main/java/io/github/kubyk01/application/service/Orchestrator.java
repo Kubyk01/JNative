@@ -385,6 +385,17 @@ public class Orchestrator implements OrchestratorPort {
 
         Path genDir = Paths.get("target", "generated-jnative");
         try {
+            if (Files.exists(genDir)) {
+                try (var stream = Files.walk(genDir)) {
+                    stream.sorted(Comparator.reverseOrder()).forEach(p -> {
+                        try {
+                            Files.deleteIfExists(p);
+                        } catch (IOException ex) {
+                            log.warn("Could not delete stale generated file {}", p, ex);
+                        }
+                    });
+                }
+            }
             llvmGen.generate(genDir);
         } catch (IOException e) {
             log.error("Failed to write generated IR", e);

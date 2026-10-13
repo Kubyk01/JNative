@@ -40,6 +40,194 @@ static const char* __jnative_vtable_class_name(void* vtable) {
 }
 
 /* ============================================================================
+ * Safe deallocation of Java reference fields.
+ *
+ * Every reference-typed field of a Java object is a pointer, but not every
+ * such pointer addresses heap memory. The runtime emits three distinct
+ * kinds of reference values, and only one of them is malloc-owned:
+ *
+ *   1. Objects allocated at run time by the emitter (Opcode.NEW,
+ *      NEW_ARRAY, MULTI_NEW_ARRAY) or by the runtime's own
+ *      jnative_alloc_object / jnative_array_alloc helpers. These are
+ *      backed by calloc and are safe to free.
+ *
+ *   2. Java String literals, emitted by LlvmGlobalEmitter as static
+ *      `global %struct.java_lang_String` constants with the mangled
+ *      name @jstr_<hex>. A class that stores such a literal into one of
+ *      its fields -- every enum constant, every class that caches a
+ *      literal name, every method handle that remembers its method
+ *      name -- ends up with a field whose value points into the
+ *      executable's .data segment. free() of such a pointer is
+ *      undefined behaviour; glibc reports it as "free(): invalid
+ *      pointer".
+ *
+ *   3. The backing byte[] of a String literal, emitted alongside the
+ *      String as @strbytes_<hex>. Same reasoning as (2): it is static
+ *      storage, and no destructor may free it.
+ *
+ * The concrete failure that motivated this helper:
+ *
+ *     fn___jnative_shutdown walks every static field and calls the
+ *     field's destructor. One such field is the enum constant
+ *     VarHandle.AccessMode.GET_AND_ADD_RELEASE, a genuine heap object
+ *     whose destructor calls __destruct_java_lang_Enum and then frees
+ *     its own String-typed fields. Those fields hold @jstr_* constants,
+ *     which are not heap allocations. The first free() on such a value
+ *     aborted the process during exit, after main() had already
+ *     produced its output:
+ *
+ *         Test2@fa8c8d50
+ *         100000
+ *         free(): invalid pointer
+ *
+ *     The same shape is present throughout the module: java.lang.Enum's
+ *     own destructor frees the `name` field, every enum constant has
+ *     both `name` and any string-typed auxiliary field, and any class
+ *     with a String-typed field that receives a literal at construction
+ *     time is on the same path.
+ *
+ * __jnative_free is the single entry point that DestructorInserter and
+ * DestructorSimplifier route every Opcode.FREE through. It answers the
+ * one question that matters -- "was this pointer handed out by the
+ * allocator?" -- by checking whether the address falls inside the main
+ * executable's writable data segments. Everything outside that range
+ * (the heap, the stack, other mappings) is passed to free() unchanged;
+ * everything inside is left alone.
+ *
+ * Rationale for the range, rather than a per-allocation registry:
+ *
+ *   - The registry approach (record every calloc, look up every free)
+ *     would add a hash-table insert to every object construction and a
+ *     lookup to every destruction. On a JDK-sized image that is millions
+ *     of operations per second of execution; the range check is two
+ *     integer comparisons.
+ *
+ *   - The range approach is exact for the failure mode that actually
+ *     occurs: static constants live inside the executable's writable
+ *     segments and nowhere else. A heap pointer can never coincide with
+ *     that range; the allocator's arena is a separate mmap'd region.
+ *
+ *   - The range is computed once, lazily, through pthread_once, and is
+ *     then a pair of read-only values. No lock is taken on the hot
+ *     path.
+ *
+ * The writable-segment filter is deliberate. A String literal's String
+ * header has mutable fields (the cached hashCode), so LLVM emits it as
+ * a mutable `global`, which lands in .data. The byte[] payload is
+ * emitted as `unnamed_addr constant`, which lands in .rodata and is
+ * never stored into a Java-visible field as a reference -- no destructor
+ * ever holds one of those pointers. Restricting the range to writable
+ * segments keeps it tight and avoids having to consult the read-only
+ * segment layout at all.
+ *
+ * On platforms without PT_LOAD introspection the fallback symbols
+ * __data_start and _end bracket the same region and are always provided
+ * by the system linker. Both sources are merged: whichever produces the
+ * wider range wins, which is the safe direction -- a pointer on the
+ * boundary is treated as static, never as heap.
+ * ========================================================================== */
+
+static uintptr_t     jnative_static_low  = 0;
+static uintptr_t     jnative_static_high = 0;
+static pthread_once_t jnative_static_once = PTHREAD_ONCE_INIT;
+
+#if defined(__linux__)
+/**
+ * dl_iterate_phdr callback: accumulate the address range of every
+ * writable PT_LOAD segment of the main executable.
+ *
+ * Only the main executable is inspected. Every @jstr_* constant and
+ * every @strbytes_* payload is emitted into the executable image itself
+ * by the LLVM backend; no shared object produced by this runtime
+ * contains any. Walking every loaded object would unnecessarily widen
+ * the range -- the region between two different objects' data segments
+ * is mapped by other libraries or is unmapped entirely, and a pointer
+ * into that region would be misclassified as static. Restricting the
+ * walk to the main executable keeps the range exact.
+ */
+static int jnative_collect_main_writable_segments(struct dl_phdr_info* info,
+                                                  size_t size, void* data) {
+    (void)size;
+    (void)data;
+
+    /* The main executable is the object whose name is the empty string;
+     * every shared library has a non-empty path in dlpi_name. This is
+     * the same discriminator the function-index builder uses for the
+     * main text segment. */
+    if (info->dlpi_name != NULL && info->dlpi_name[0] != '\0') {
+        return 0;
+    }
+
+    for (int i = 0; i < info->dlpi_phnum; i++) {
+        const ElfW(Phdr)* ph = &info->dlpi_phdr[i];
+        if (ph->p_type != PT_LOAD) continue;
+        if (!(ph->p_flags & PF_W)) continue;
+
+        uintptr_t lo = (uintptr_t)info->dlpi_addr + (uintptr_t)ph->p_vaddr;
+        uintptr_t hi = lo + (uintptr_t)ph->p_memsz;
+
+        if (jnative_static_low  == 0 || lo < jnative_static_low)  jnative_static_low  = lo;
+        if (jnative_static_high == 0 || hi > jnative_static_high) jnative_static_high = hi;
+    }
+    return 0;
+}
+#endif
+
+static void jnative_build_static_range(void) {
+#if defined(__linux__)
+    dl_iterate_phdr(jnative_collect_main_writable_segments, NULL);
+#endif
+
+    /* Fallback and complement: the ELF linker always defines
+     * __data_start and _end in the main executable, and they bracket
+     * the entire writable data + bss region. Merging them into the
+     * range guarantees the guard is at least as strong as the segment
+     * walk, and covers any platform where the walk produced nothing
+     * usable. Weak references let the program link even on a target
+     * whose linker script does not provide either symbol. */
+#if defined(__linux__) || defined(__ELF__)
+    {
+        extern char __data_start[] __attribute__((weak));
+        extern char _end[]        __attribute__((weak));
+
+        if (__data_start != NULL && _end != NULL) {
+            uintptr_t lo = (uintptr_t)__data_start;
+            uintptr_t hi = (uintptr_t)_end;
+            if (lo != 0 && hi > lo) {
+                if (jnative_static_low  == 0 || lo < jnative_static_low)  jnative_static_low  = lo;
+                if (jnative_static_high == 0 || hi > jnative_static_high) jnative_static_high = hi;
+            }
+        }
+    }
+#endif
+}
+
+__attribute__((noinline))
+void __jnative_free(void* p) {
+    if (p == NULL) {
+        return;
+    }
+
+    pthread_once(&jnative_static_once, jnative_build_static_range);
+
+    uintptr_t addr = (uintptr_t)p;
+    if (jnative_static_low != 0
+        && jnative_static_high != 0
+        && addr >= jnative_static_low
+        && addr <  jnative_static_high) {
+        /* The pointer addresses a static object baked into the module
+         * image. It is not allocator-owned, and free() of it is
+         * undefined behaviour that glibc catches as "free(): invalid
+         * pointer". Static objects live for the entire process lifetime
+         * and are reclaimed by the OS at exit; the runtime deliberately
+         * leaves them alone. */
+        return;
+    }
+
+    free(p);
+}
+
+/* ============================================================================
  * Reflect-mirror field offsets
  *
  * These globals are declared extern in jnative_runtime.h and referenced by

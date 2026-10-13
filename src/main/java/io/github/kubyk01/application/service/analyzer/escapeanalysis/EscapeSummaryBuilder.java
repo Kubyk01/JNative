@@ -451,11 +451,13 @@ public class EscapeSummaryBuilder {
 
         Map<Integer, Set<Integer>> paramAliases = computeParamAliases(func);
         Map<Value, Value> valueOrigin = new HashMap<>();
+        Map<Integer, Set<Integer>> paramEscapeEdges = new HashMap<>();
 
         for (BasicBlock block : func.getBlocks()) {
             for (Instruction inst : block.getInstructions()) {
                 processInstruction(inst, paramAliases, paramsEscaped,
-                        paramsReturned, fieldsEscaped, flags, snapshot, valueOrigin);
+                        paramsReturned, fieldsEscaped, flags, snapshot, valueOrigin,
+                        paramEscapeEdges);
             }
             Terminator term = block.getTerminator();
             if (term != null) {
@@ -471,6 +473,7 @@ public class EscapeSummaryBuilder {
                 .returnsObject(flags[0])
                 .escapesGlobally(flags[1])
                 .createsThread(flags[2])
+                .paramEscapeEdges(paramEscapeEdges)
                 .build();
 
         validateSummaryIndices(func, result);
@@ -526,10 +529,12 @@ public class EscapeSummaryBuilder {
                                     Set<String>  fieldsEscaped,
                                     boolean[]    flags,
                                     Map<String, EscapeSummary> snapshot,
-                                    Map<Value, Value> valueOrigin) {
+                                    Map<Value, Value> valueOrigin,
+                                    Map<Integer, Set<Integer>> paramEscapeEdges) {
         Opcode op = inst.getOpcode();
         switch (op) {
-            case PUT_FIELD -> processPutField(inst, paramAliases, paramsEscaped, fieldsEscaped, flags);
+            case PUT_FIELD -> processPutField(inst, paramAliases, paramsEscaped, fieldsEscaped, flags,
+                    paramEscapeEdges);
             case GET_FIELD -> processGetField(inst, flags);
             case MONITOR_ENTER, MONITOR_EXIT -> processMonitor(inst, paramAliases, paramsEscaped, flags);
             case PUT_STATIC -> processPutStatic(inst, paramAliases, paramsEscaped, flags);
@@ -537,7 +542,7 @@ public class EscapeSummaryBuilder {
             case ASTORE -> processAStore(inst, paramAliases, paramsEscaped, fieldsEscaped);
             case CALL, VIRTUAL_CALL, INTERFACE_CALL, STATIC_CALL, SPECIAL_CALL ->
                     processCall(inst, paramAliases, paramsEscaped, paramsReturned,
-                            flags, snapshot);
+                            flags, snapshot, paramEscapeEdges);
             default -> { }
         }
     }
@@ -546,7 +551,8 @@ public class EscapeSummaryBuilder {
                                  Map<Integer, Set<Integer>> paramAliases,
                                  Set<Integer> paramsEscaped,
                                  Set<String>  fieldsEscaped,
-                                 boolean[]    flags) {
+                                 boolean[]    flags,
+                                 Map<Integer, Set<Integer>> paramEscapeEdges) {
         if (inst.getOperands().size() < 3) return;
 
         Value rhs  = inst.getOperands().get(2);
@@ -595,6 +601,17 @@ public class EscapeSummaryBuilder {
         if (rhsIsReference && rhs instanceof Parameter pr) {
             paramsEscaped.add(pr.getOrdinal());
             addAliases(pr.getOrdinal(), paramAliases, paramsEscaped);
+
+            // Record the param-to-param edge when the base of the
+            // write is itself a parameter. This is the only way the
+            // caller can learn that the stored value's escape status
+            // is at least as high as the base's. See the javadoc on
+            // EscapeSummary.paramEscapeEdges for the full rationale.
+            if (inst.getOperands().getFirst() instanceof Parameter bp) {
+                paramEscapeEdges
+                    .computeIfAbsent(pr.getOrdinal(), k -> new HashSet<>())
+                    .add(bp.getOrdinal());
+            }
         }
 
         if (isVolatile && rhsIsReference) {
@@ -702,7 +719,8 @@ public class EscapeSummaryBuilder {
                              Set<Integer> paramsEscaped,
                              Set<Integer> paramsReturned,
                              boolean[]    flags,
-                             Map<String, EscapeSummary> snapshot) {
+                             Map<String, EscapeSummary> snapshot,
+                             Map<Integer, Set<Integer>> paramEscapeEdges) {
         String calleeName = extractCalleeName(inst);
         if (calleeName == null) return;
 
@@ -761,6 +779,37 @@ public class EscapeSummaryBuilder {
         if (calleeSum.isEscapesGlobally()) flags[1] = true;
         if (calleeSum.isCreatesThread())   flags[2] = true;
         if (calleeSum.isReturnsObject())   flags[0] = true;
+
+        // Propagate parameter-to-parameter escape edges from the callee.
+        //
+        // For each callee edge `i -> j`, the callee's parameter i escapes
+        // into the callee's parameter j. At the call site that means the
+        // caller's arg[i] escapes into the caller's arg[j]. When both
+        // args are parameters of the current function, record the same
+        // edge on the current summary. When only arg[i] is a parameter
+        // (arg[j] is a local/temporary), the edge cannot be expressed in
+        // the summary; fall back to marking arg[i] as escaped to heap,
+        // which is the conservative answer.
+        for (Map.Entry<Integer, Set<Integer>> e
+                : calleeSum.getParamEscapeEdges().entrySet()) {
+            int fromIdx = e.getKey();
+            if (fromIdx >= args.size()) continue;
+            Value fromArg = args.get(fromIdx);
+            if (!(fromArg instanceof Parameter fromParam)) continue;
+
+            for (int toIdx : e.getValue()) {
+                if (toIdx >= args.size()) continue;
+                Value toArg = args.get(toIdx);
+                if (toArg instanceof Parameter toParam) {
+                    paramEscapeEdges
+                        .computeIfAbsent(fromParam.getOrdinal(),
+                                         k -> new HashSet<>())
+                        .add(toParam.getOrdinal());
+                } else {
+                    paramsEscaped.add(fromParam.getOrdinal());
+                }
+            }
+        }
     }
 
     private void processTerminator(Terminator term,

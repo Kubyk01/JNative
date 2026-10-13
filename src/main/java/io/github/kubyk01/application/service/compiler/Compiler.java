@@ -6,7 +6,6 @@ import io.github.kubyk01.domain.analyzer.dependencyresolver.ClassNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.MethodNode;
 import io.github.kubyk01.domain.ir.Module;
 import io.github.kubyk01.port.secondary.CompilerPort;
-import io.github.kubyk01.util.LlvmUtil;
 import lombok.extern.slf4j.Slf4j;
 
 import java.io.IOException;
@@ -574,9 +573,6 @@ public class Compiler implements CompilerPort {
         Set<String> result = new HashSet<>();
 
         for (String cls : new ArrayList<>(resolver.getClassMap().keySet())) {
-            if (!LlvmUtil.isSystemClassName(cls)) {
-                continue;
-            }
             if (!hasNativeSupport(cls)) {
                 continue;
             }

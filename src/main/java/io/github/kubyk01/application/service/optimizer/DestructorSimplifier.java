@@ -104,6 +104,44 @@ public class DestructorSimplifier {
         // resurrect it into the IR while its body was no longer emitted.
         Set<Function> dead = new HashSet<>(destructors);
         dead.removeAll(called);
+
+        // ------------------------------------------------------------------
+        // Second-chance sanity check.
+        //
+        // collectCalls() is expected to find every STATIC_CALL whose callee
+        // is a __destruct_ / __destruct_array_ symbol present in the module.
+        // The check below is a safety net for the case where the scan missed
+        // one — for example because a symbol was added to the module after
+        // this pass's first snapshot — and prevents the LLVM backend from
+        // emitting a call to a symbol that the same pass is about to remove.
+        // Without it, clang rejects the emitted IR with
+        //
+        //     error: use of undefined value '@__destruct_...'
+        //
+        // and the whole build stops. Removing the call here is strictly
+        // better: the destructor had no live reference anyway, so the call
+        // was dead code.
+        // ------------------------------------------------------------------
+        if (!dead.isEmpty()) {
+            Set<String> deadNames = new HashSet<>();
+            for (Function f : dead) deadNames.add(f.getName());
+
+            for (Function func : module.getFunctions()) {
+                if (dead.contains(func)) continue;
+                if (func.getEntryBlock() == null) continue;
+                for (BasicBlock block : func.getBlocks()) {
+                    block.getInstructions().removeIf(inst -> {
+                        if (inst.getOpcode() != Opcode.STATIC_CALL) return false;
+                        if (inst.getOperands().isEmpty()) return false;
+                        Value callee = inst.getOperands().getFirst();
+                        if (!(callee instanceof Constant c)) return false;
+                        Object v = c.getValue();
+                        return v instanceof String s && deadNames.contains(s);
+                    });
+                }
+            }
+        }
+
         for (Function func : dead) {
             log.debug("Removing dead destructor: {}", func.getName());
             module.removeFunction(func);

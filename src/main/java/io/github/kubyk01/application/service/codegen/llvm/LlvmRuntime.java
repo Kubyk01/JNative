@@ -99,6 +99,7 @@ public class LlvmRuntime {
             declare i8* @malloc(i64)
             declare i8* @calloc(i64, i64)
             declare void @free(i8*)
+            declare void @__jnative_free(i8*)
             declare i32 @printf(i8*, ...)
             declare void @abort() noreturn
             declare i32 @atexit(void ()*)
