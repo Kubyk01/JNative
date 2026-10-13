@@ -95,13 +95,16 @@ public class MethodTranslator extends MethodVisitor {
 
         List<Parameter> params = new ArrayList<>();
         int slot = 0;
+        int ordinal = 0;
         if (!isStatic) {
-            params.add(new Parameter(Type.reference(methodRef.getOwner()), slot));
+            params.add(new Parameter(Type.reference(methodRef.getOwner()), slot, ordinal));
             slot++;
+            ordinal++;
         }
         for (Type pt : paramTypes) {
-            params.add(new Parameter(pt, slot));
+            params.add(new Parameter(pt, slot, ordinal));
             slot += (pt == Type.LONG || pt == Type.DOUBLE) ? 2 : 1;
+            ordinal++;
         }
 
         currentFunction = builder.createFunctionWithSlots(mangledName, returnType, params);

@@ -53,19 +53,6 @@ import java.util.regex.Pattern;
  * blow up on an input whose shape happens to be pathological for a
  * regex engine.</p>
  *
- * <p>This matters in practice. The previous revision used the pattern
- *
- * <pre>
- *   ([\w\s\*]+?)\s+(\w+)\s*\(([^)]*)\)\s*\{
- * </pre>
- *
- * whose lazy `[\w\s*]+?` overlaps with the following `\s+` and
- * therefore causes exponential backtracking on a C file of any
- * realistic size. The regex engine recurses on the Java stack for
- * every split it tries; on a 200 KB file the parser overflowed the
- * stack inside {@code Pattern$BmpCharPropertyGreedy.match} before it
- * ever produced a result.</p>
- *
  * <h2>Recursion and cycles</h2>
  *
  * <p>Calls to helper functions defined in the same C translation unit
@@ -75,16 +62,6 @@ import java.util.regex.Pattern;
  * "everything escapes" summary. Helper summaries are cached, so each
  * (owner, helper) pair is analyzed at most once across the whole run,
  * no matter how many different callers reference it.</p>
- *
- * <h2>Unknown callees</h2>
- *
- * <p>Any call whose target cannot be resolved — a function defined in
- * another translation unit, a macro, a function pointer invoked
- * indirectly — causes every pointer-typed argument that appears in the
- * call expression to be marked as escaping. This is the same
- * conservative fallback used before this analyzer existed; it just
- * happens far less often now, because the libc functions that used to
- * trigger it are recognized by {@link #LIBRARY_NON_RETAINING}.</p>
  *
  * <h2>Thread-safety</h2>
  *
@@ -311,25 +288,6 @@ public final class NativeBodyEscapeAnalyzer {
     //  Linear scanner — no backtracking regex is applied to the source
     // ==================================================================
 
-    /**
-     * Parses every top-level function definition in {@code text} and
-     * returns a map from function name to its parsed representation.
-     *
-     * <p>The scanner walks the source once. It skips line comments,
-     * block comments, string literals and character literals so that
-     * their contents cannot upset the brace counting. At brace depth 0
-     * it recognizes a function definition by the shape</p>
-     *
-     * <pre>
-     *     &lt;return type&gt; &lt;name&gt; ( &lt;params&gt; ) { &lt;body&gt; }
-     * </pre>
-     *
-     * <p>and skips the whole body in one step. At any other brace
-     * depth it advances one character at a time.</p>
-     *
-     * <p>Cost is linear in the size of {@code text}. There is no
-     * pattern matcher, no lazy quantifier, no backtracking.</p>
-     */
     private static Map<String, CFunction> parseAllFunctions(String text) {
         Map<String, CFunction> result = new HashMap<>();
         int n = text.length();
@@ -339,7 +297,6 @@ public final class NativeBodyEscapeAnalyzer {
         while (i < n) {
             char c = text.charAt(i);
 
-            // --- Comments and literals: skip in one step. ---
             if (c == '/' && i + 1 < n && text.charAt(i + 1) == '/') {
                 i = skipLineComment(text, i + 2, n);
                 continue;
@@ -357,7 +314,6 @@ public final class NativeBodyEscapeAnalyzer {
                 continue;
             }
 
-            // --- Brace tracking. ---
             if (c == '{') {
                 braceDepth++;
                 i++;
@@ -369,14 +325,11 @@ public final class NativeBodyEscapeAnalyzer {
                 continue;
             }
 
-            // --- Inside any braces: skip. ---
             if (braceDepth != 0) {
                 i++;
                 continue;
             }
 
-            // --- At depth 0: only identifier-start positions can begin
-            //     a function definition. ---
             if (!isIdentifierStart(c)) {
                 i++;
                 continue;
@@ -389,47 +342,33 @@ public final class NativeBodyEscapeAnalyzer {
             }
             String name = text.substring(nameStart, nameEnd);
 
-            // Skip whitespace after the name.
             int j = nameEnd;
             while (j < n && Character.isWhitespace(text.charAt(j))) j++;
 
-            // Must be followed by '('.
             if (j >= n || text.charAt(j) != '(') {
                 i = nameEnd;
                 continue;
             }
 
-            // Find the matching ')'.
             int parenEnd = matchClose(text, j, '(', ')');
             if (parenEnd < 0) {
                 i = nameEnd;
                 continue;
             }
 
-            // Skip whitespace after ')'.
             int k = parenEnd + 1;
             while (k < n && Character.isWhitespace(text.charAt(k))) k++;
 
-            // Must be followed by '{'.
             if (k >= n || text.charAt(k) != '{') {
-                // A prototype, a call expression, a function-pointer
-                // declaration, or a macro invocation at top level.
-                // Move past the closing paren and keep scanning.
                 i = parenEnd + 1;
                 continue;
             }
 
-            // Find the matching '}'.
             int braceEnd = matchClose(text, k, '{', '}');
             if (braceEnd < 0) {
-                // Unbalanced; nothing useful is left in the file.
                 break;
             }
 
-            // Determine the return type by looking back from the
-            // identifier. Skip trailing whitespace, then consume
-            // identifier chars, '*' and whitespace until we hit a
-            // character that cannot appear in a type.
             int typeEnd = nameStart;
             while (typeEnd > 0 && Character.isWhitespace(text.charAt(typeEnd - 1))) {
                 typeEnd--;
@@ -452,7 +391,6 @@ public final class NativeBodyEscapeAnalyzer {
             cf.body = text.substring(k + 1, braceEnd);
             result.putIfAbsent(name, cf);
 
-            // Resume after the body.
             i = braceEnd + 1;
         }
 
@@ -474,16 +412,6 @@ public final class NativeBodyEscapeAnalyzer {
         }
     }
 
-    // ------------------------------------------------------------------
-    //  Low-level scanning primitives
-    // ------------------------------------------------------------------
-
-    /**
-     * Returns the index of the closing bracket matching the opening
-     * bracket at {@code openPos}, or -1 if none is found. Comments and
-     * string/char literals are skipped so their contents cannot affect
-     * the depth count.
-     */
     private static int matchClose(String text, int openPos,
                                   char open, char close) {
         int depth = 0;
@@ -524,7 +452,7 @@ public final class NativeBodyEscapeAnalyzer {
     }
 
     private static int skipBlockComment(String text, int i, int n) {
-        i += 2; // past "/*"
+        i += 2;
         while (i + 1 < n) {
             if (text.charAt(i) == '*' && text.charAt(i + 1) == '/') {
                 return i + 2;
@@ -535,7 +463,7 @@ public final class NativeBodyEscapeAnalyzer {
     }
 
     private static int skipStringLiteral(String text, int i, int n) {
-        i++; // past opening '"'
+        i++;
         while (i < n) {
             char c = text.charAt(i);
             if (c == '\\' && i + 1 < n) { i += 2; continue; }
@@ -546,7 +474,7 @@ public final class NativeBodyEscapeAnalyzer {
     }
 
     private static int skipCharLiteral(String text, int i, int n) {
-        i++; // past opening '\''
+        i++;
         while (i < n) {
             char c = text.charAt(i);
             if (c == '\\' && i + 1 < n) { i += 2; continue; }
@@ -575,57 +503,13 @@ public final class NativeBodyEscapeAnalyzer {
             Pattern.compile("([^;=()\\s][^;=()]*?)\\s*=\\s*([^;]+?);",
                     Pattern.DOTALL);
 
-    /**
-     * Matches a C function call of the form {@code name(args)}.
-     *
-     * <p>The negative lookahead excludes the C keyword constructs that
-     * also have the shape {@code word(...)} but are not function calls:
-     * {@code if}, {@code while}, {@code for}, {@code switch},
-     * {@code return}, {@code sizeof}, {@code do}, {@code case},
-     * {@code default}, {@code _Static_assert}, {@code _Generic},
-     * {@code typeof}, {@code asm}, {@code alignof},
-     * {@code _Alignof} and {@code __attribute__}. Without the lookahead
-     * every {@code if (param)} clause in a native body was mistaken for
-     * a call to a function named {@code if}, {@code resolveHelperSummary}
-     * returned {@code null} for it, and the fallback marked every
-     * parameter appearing in the condition as escaped.</p>
-     *
-     * <p>Concretely, {@code jnative/lang/Object.c}'s
-     * {@code __jnative_fn_java_lang_Object_getClass___Ljava_lang_Class_}
-     * begins with {@code if (!obj) { __jnative_throw_null_pointer_exception(); return NULL; }}.
-     * The old pattern matched {@code if (!obj)} as a call whose argument
-     * contained the identifier {@code obj}, marked the receiver as
-     * escaped, and every downstream escape summary then classified the
-     * receiver of {@code Object.getClass()} — and, through it, of
-     * {@code Object.toString()} and {@code Object.hashCode()} — as
-     * escaping to HEAP, which turned every freshly-allocated
-     * {@code Test2} object in the reachable set into a heap allocation.</p>
-     *
-     * <p>The rest of the pattern is the original call matcher. The
-     * bounded {@code [^()]*(?:\([^()]*\)[^()]*)*} handles a single level
-     * of nested parentheses; deeper nesting falls back to the caller's
-     * own conservative path. The matcher is applied only to individual
-     * call expressions on already-isolated {@code return}/{@code if}
-     * statements, never to a whole translation unit, so neither the
-     * nested-paren alternation nor the lazy quantifiers can cause the
-     * exponential backtracking that an unbounded match would produce.</p>
-     */
     private static final Pattern CALL_EXPR =
             Pattern.compile(
-                "\\b(?!if\\b|while\\b|for\\b|switch\\b|return\\b"
-              + "|sizeof\\b|else\\b|do\\b|case\\b|default\\b"
-              + "|_Static_assert\\b|_Generic\\b|typeof\\b|asm\\b"
-              + "|alignof\\b|_Alignof\\b|__attribute__\\b)"
-              + "(\\w+)\\s*\\(([^()]*(?:\\([^()]*\\)[^()]*)*)\\)");
-
-    /**
-     * Note: the three patterns above are used only on individual
-     * statements and call expressions, never on a whole file. Even so,
-     * their bounds are small (a single statement, a single call), so
-     * neither the lazy quantifiers in {@link #ASSIGN_STMT} nor the
-     * nested-paren alternation in {@link #CALL_EXPR} can cause the kind
-     * of backtracking that a whole-file scan would.
-     */
+                    "\\b(?!if\\b|while\\b|for\\b|switch\\b|return\\b"
+                            + "|sizeof\\b|else\\b|do\\b|case\\b|default\\b"
+                            + "|_Static_assert\\b|_Generic\\b|typeof\\b|asm\\b"
+                            + "|alignof\\b|_Alignof\\b|__attribute__\\b)"
+                            + "(\\w+)\\s*\\(([^()]*(?:\\([^()]*\\)[^()]*)*)\\)");
 
     private void analyzeBody(CFunction function,
                              Map<String, CFunction> functions,
@@ -634,15 +518,54 @@ public final class NativeBodyEscapeAnalyzer {
                              Set<Integer> returned,
                              GlobalFlag globalFlag) {
 
-        // Rule 1 — `return <expr>;` makes every parameter that appears
-        // in <expr> both returned and escaped.
-        Matcher returns = RETURN_STMT.matcher(function.body);
-        while (returns.find()) {
-            String expr = returns.group(1);
-            for (Map.Entry<String, Integer> p : function.paramIndex.entrySet()) {
-                if (containsIdentifier(expr, p.getKey())) {
-                    returned.add(p.getValue());
-                    escaped.add(p.getValue());
+        // ------------------------------------------------------------------
+        // Rule 1 — `return <expr>;` makes every parameter that appears in
+        // <expr> both returned and escaped — BUT ONLY WHEN THE FUNCTION
+        // ACTUALLY RETURNS A POINTER.
+        //
+        // A C function whose declared return type carries no '*' cannot
+        // hand the caller back a reference to any of its arguments. The
+        // caller receives a scalar (int / long / float / double / char /
+        // bool), which is a value, not a reference to a live object. From
+        // the Java memory model's point of view, nothing reachable from
+        // the parameter has escaped into the caller's frame.
+        //
+        // The concrete failure this guard closes:
+        //
+        //     int __jnative_fn_java_lang_Object_hashCode___I(void* obj) {
+        //         if (!obj) return 0;
+        //         return (int)((uintptr_t)obj);
+        //     }
+        //
+        // The return expression mentions `obj`, so the previous,
+        // unconditional rule marked `obj` as both escaped AND returned.
+        // That propagated up through every caller of hashCode — in
+        // particular through the receiver of Object.toString, whose
+        // bytecode calls this.hashCode() — and promoted every freshly
+        // allocated receiver of toString, including
+        //     new Test2(i).toString()
+        // in the reported benchmark, to EscapeStatus.GLOBAL. The object
+        // was stack-allocatable in principle, but the analysis refused to
+        // see it because hashCode appeared to leak its receiver.
+        //
+        // The condition is intentionally on `function.returnsPointer`,
+        // not on "the expression is cast to a pointer": a function that
+        // returns `void*` and whose body is
+        //     return (void*)(uintptr_t)obj;
+        // DOES leak obj (the caller gets a dereferenceable pointer), and
+        // IS correctly caught by the check below. A function that returns
+        // a plain scalar cannot leak anything, no matter what the return
+        // expression contains.
+        // ------------------------------------------------------------------
+        if (function.returnsPointer) {
+            Matcher returns = RETURN_STMT.matcher(function.body);
+            while (returns.find()) {
+                String expr = returns.group(1);
+                for (Map.Entry<String, Integer> p : function.paramIndex.entrySet()) {
+                    if (containsIdentifier(expr, p.getKey())) {
+                        returned.add(p.getValue());
+                        escaped.add(p.getValue());
+                    }
                 }
             }
         }
@@ -685,8 +608,6 @@ public final class NativeBodyEscapeAnalyzer {
                     resolveHelperSummary(functions, owner, callee);
 
             if (calleeSummary == null) {
-                // Unresolvable callee: every parameter appearing in any
-                // argument is conservatively treated as escaping.
                 for (String arg : args) {
                     for (Map.Entry<String, Integer> p
                             : function.paramIndex.entrySet()) {
@@ -721,30 +642,6 @@ public final class NativeBodyEscapeAnalyzer {
     //  Helper resolution — cycle-safe and cached
     // ==================================================================
 
-    /**
-     * Analyzes a helper function defined in the same C translation unit
-     * as its caller. Returns {@code null} if the helper is not present
-     * in that unit; the caller then treats the call conservatively.
-     *
-     * <p>Three safety properties make this method safe to call from the
-     * parallel Reactor pipeline:</p>
-     *
-     * <ol>
-     *   <li><b>Cycle detection.</b> Before analyzing a helper, its
-     *       identity ({@code owner#name}) is pushed onto the per-thread
-     *       stack. A second encounter of the same identity on the same
-     *       thread returns the conservative "everything escapes"
-     *       summary and does not recurse further.</li>
-     *   <li><b>Caching.</b> The result is stored in
-     *       {@link #helperCache}, keyed by {@code owner#name}. A helper
-     *       called by a hundred different top-level functions is
-     *       analyzed exactly once.</li>
-     *   <li><b>Depth limit.</b> The per-thread stack depth is bounded by
-     *       {@link #MAX_HELPER_DEPTH}. Beyond it, the conservative
-     *       summary is returned. In practice this limit is never
-     *       reached: the JNative C files have shallow helper graphs.</li>
-     * </ol>
-     */
     private EscapeSummary resolveHelperSummary(Map<String, CFunction> functions,
                                                String owner,
                                                String helperName) {
@@ -760,12 +657,9 @@ public final class NativeBodyEscapeAnalyzer {
         String cycleKey = "helper:" + key;
 
         if (inProgress.contains(cycleKey)) {
-            // Recursion cycle. Break it with the conservative summary.
             return allEscape();
         }
         if (inProgress.size() >= MAX_HELPER_DEPTH) {
-            // Defensive: a very deep helper chain. Give up rather than
-            // overflow the Java stack.
             return allEscape();
         }
 
@@ -794,50 +688,26 @@ public final class NativeBodyEscapeAnalyzer {
     //  Library non-retaining set
     // ==================================================================
 
-    /**
-     * The set of standard C/POSIX library functions whose contract
-     * explicitly forbids them from retaining pointers passed to them.
-     * Every entry is documented to copy, read, or release the memory it
-     * is given, never to store the pointer anywhere that outlives the
-     * call.
-     *
-     * <p>This is a property of the standard library, not a
-     * JNative-specific whitelist: no matter which runtime links against
-     * libc, these names have the same meaning.</p>
-     */
     private static final Set<String> LIBRARY_NON_RETAINING = Set.of(
-            // Memory copy / initialize
             "memcpy", "memmove", "memset", "memcmp",
-            // String operations
             "strlen", "strcmp", "strncmp", "strchr", "strrchr", "strstr",
             "strcpy", "strncpy", "strdup",
-            // stdio
             "printf", "fprintf", "snprintf", "fputs", "fwrite",
             "puts", "putchar", "fopen", "fclose", "fscanf", "fgets",
-            // Allocators
             "malloc", "calloc", "realloc", "free",
-            // Process control
             "abort", "exit", "_exit",
-            // Clocks
             "clock_gettime", "gettimeofday", "time", "localtime_r", "gmtime_r",
-            // File I/O
             "open", "openat", "close", "read", "write", "lseek",
             "pread", "pwrite", "fstat", "stat", "lstat", "access", "ftruncate",
-            // Dynamic loading
             "dlopen", "dlsym", "dlclose", "dlerror",
-            // Threads and mutexes
             "pthread_mutex_lock", "pthread_mutex_unlock", "pthread_mutex_init",
             "pthread_cond_wait", "pthread_cond_signal", "pthread_cond_broadcast",
             "pthread_self", "pthread_create",
-            // Environment and platform
             "sysconf", "getenv", "getcwd", "gethostname",
             "htonl", "htons", "ntohl", "ntohs",
             "isatty", "ioctl",
-            // Primitive parsing
             "sscanf", "atoi", "atol", "strtol", "strtoul",
-            // Non-local jumps
             "setjmp", "_setjmp", "longjmp",
-            // Networking
             "getaddrinfo", "freeaddrinfo", "getnameinfo", "if_nametoindex"
     );
 
@@ -845,11 +715,6 @@ public final class NativeBodyEscapeAnalyzer {
     //  Low-level helpers
     // ==================================================================
 
-    /**
-     * Splits a comma-separated argument list, respecting nested
-     * parentheses and brackets. Handles {@code foo(bar(a, b), c)}
-     * correctly, unlike a naive split on ','.
-     */
     private static List<String> splitArguments(String s) {
         List<String> out = new ArrayList<>();
         if (s == null || s.isBlank()) return out;
@@ -889,11 +754,6 @@ public final class NativeBodyEscapeAnalyzer {
         return Character.isLetterOrDigit(c) || c == '_';
     }
 
-    /**
-     * Returns {@code true} when {@code lhs} is a dereference — that is,
-     * a write that can move the right-hand side into memory reachable
-     * from somewhere other than the current stack frame.
-     */
     private static boolean isDereferencedLhs(String lhs) {
         String t = lhs.trim();
         if (t.isEmpty()) return false;

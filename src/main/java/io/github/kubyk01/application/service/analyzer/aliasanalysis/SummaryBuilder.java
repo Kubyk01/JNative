@@ -12,8 +12,8 @@ import io.github.kubyk01.domain.ir.ReturnTerminator;
 import io.github.kubyk01.domain.ir.Terminator;
 import io.github.kubyk01.domain.ir.Type;
 import io.github.kubyk01.domain.ir.Value;
+import io.github.kubyk01.util.LlvmUtil;
 import lombok.extern.slf4j.Slf4j;
-import reactor.core.publisher.Flux;
 import reactor.core.scheduler.Scheduler;
 
 import java.util.ArrayDeque;
@@ -28,7 +28,6 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
-import static io.github.kubyk01.util.LlvmUtil.awaitFlux;
 import static io.github.kubyk01.util.LlvmUtil.canonicalCalleeKey;
 import static io.github.kubyk01.util.LlvmUtil.extractCalleeName;
 import static io.github.kubyk01.util.LlvmUtil.extractFieldName;
@@ -230,22 +229,9 @@ public class SummaryBuilder {
             pending.clear();
             totalProcessed += batch.size();
 
-            List<FunctionSummary> fresh = awaitFlux(
-                Flux.fromIterable(batch)
-                    .parallel()
-                    .runOn(scheduler)
-                    .map(this::analyzeFunction)
-                    .sequential()
-            );
-
-            if (fresh == null || fresh.size() != batch.size()) {
-                throw new IllegalStateException(
-                    "SummaryBuilder: reactor pipeline returned "
-                        + (fresh == null
-                        ? "null"
-                        : fresh.size() + " summaries for "
-                        + batch.size() + " functions"));
-            }
+            List<FunctionSummary> fresh = LlvmUtil.parallelMapOrdered(
+                batch, scheduler, this::analyzeFunction);
+            // parallelMapOrdered already validates the result size.
 
             // ---- Sequential commit with monotone merge --------------------
             //
@@ -431,8 +417,13 @@ public class SummaryBuilder {
     private FunctionSummary analyzeFunction(Function func) {
         Map<Value, Set<AllocationSite>> localPointsTo = new HashMap<>();
         Map<Integer, Set<AllocationSite>> paramPointsTo = new HashMap<>();
+        Map<Integer, Integer> slotToOrdinal = new HashMap<>();
         for (Parameter p : func.getParameters()) {
+            // paramPointsTo keyed by SLOT — this is what LOAD/STORE use.
             paramPointsTo.put(p.getIndex(), new HashSet<>());
+            // slotToOrdinal — this is what "does this LOAD read a parameter?"
+            // needs.
+            slotToOrdinal.put(p.getIndex(), p.getOrdinal());
         }
 
         // Phase 1: seed allocation sites.
@@ -469,6 +460,7 @@ public class SummaryBuilder {
         for (BasicBlock block : func.getBlocks()) {
             for (Instruction inst : block.getInstructions()) {
                 processInstruction(inst, func, localPointsTo, paramPointsTo,
+                    slotToOrdinal,
                     paramsRead, paramsWritten, paramsEscaped, paramsReturned,
                     fieldsRead, fieldsWritten, flags,
                     paramsFieldWrites, staticFieldWrites,
@@ -481,7 +473,7 @@ public class SummaryBuilder {
             }
         }
 
-        return FunctionSummary.builder()
+        FunctionSummary result = FunctionSummary.builder()
             .paramsRead(paramsRead)
             .paramsWritten(paramsWritten)
             .paramsEscaped(paramsEscaped)
@@ -497,11 +489,43 @@ public class SummaryBuilder {
             .paramsFieldWrites(paramsFieldWrites)
             .staticFieldWrites(staticFieldWrites)
             .build();
+
+        validateSummaryIndices(func, result);
+        return result;
+    }
+
+    private static void validateSummaryIndices(Function func, FunctionSummary s) {
+        int n = func.getParameters().size();
+        checkIndices(func, "paramsRead",      s.getParamsRead(),      n);
+        checkIndices(func, "paramsWritten",   s.getParamsWritten(),   n);
+        checkIndices(func, "paramsEscaped",   s.getParamsEscaped(),   n);
+        checkIndices(func, "paramsReturned",  s.getParamsReturned(),  n);
+        checkIndices(func, "paramsDestroyed", s.getParamsDestroyed(), n);
+        for (int idx : s.getParamsFieldWrites().keySet()) {
+            if (idx < 0 || idx >= n) {
+                throw new IllegalStateException(
+                    "FunctionSummary for " + func.getName()
+                        + " has paramsFieldWrites key " + idx
+                        + " outside [0, " + n + ")");
+            }
+        }
+    }
+
+    private static void checkIndices(Function func, String name,
+                                     Set<Integer> indices, int paramCount) {
+        for (int idx : indices) {
+            if (idx < 0 || idx >= paramCount) {
+                throw new IllegalStateException(
+                    "FunctionSummary for " + func.getName() + " has " + name
+                        + " index " + idx + " outside [0, " + paramCount + ")");
+            }
+        }
     }
 
     private void processInstruction(Instruction inst, Function func,
                                     Map<Value, Set<AllocationSite>> localPointsTo,
                                     Map<Integer, Set<AllocationSite>> paramPointsTo,
+                                    Map<Integer, Integer> slotToOrdinal,
                                     Set<Integer> paramsRead, Set<Integer> paramsWritten,
                                     Set<Integer> paramsEscaped, Set<Integer> paramsReturned,
                                     Set<String> fieldsRead, Set<String> fieldsWritten,
@@ -513,12 +537,15 @@ public class SummaryBuilder {
         switch (op) {
             case LOAD: {
                 int idx = inst.getLocalIndex();
-                if (idx >= 0 && idx < func.getParameters().size()) {
-                    paramsRead.add(idx);
-                    Set<AllocationSite> pts =
-                        paramPointsTo.getOrDefault(idx, new HashSet<>());
-                    if (inst.getResult() != null) {
-                        localPointsTo.put(inst.getResult(), new HashSet<>(pts));
+                if (idx >= 0) {
+                    Integer ordinal = slotToOrdinal.get(idx);
+                    if (ordinal != null) {
+                        paramsRead.add(ordinal);
+                        Set<AllocationSite> pts =
+                            paramPointsTo.getOrDefault(idx, new HashSet<>());
+                        if (inst.getResult() != null) {
+                            localPointsTo.put(inst.getResult(), new HashSet<>(pts));
+                        }
                     }
                 }
                 break;
@@ -529,8 +556,9 @@ public class SummaryBuilder {
                     int idx = inst.getLocalIndex();
                     Set<AllocationSite> pts =
                         localPointsTo.getOrDefault(stored, new HashSet<>());
-                    if (idx >= 0 && idx < func.getParameters().size()) {
-                        paramsWritten.add(idx);
+                    Integer ordinal = (idx >= 0) ? slotToOrdinal.get(idx) : null;
+                    if (ordinal != null) {
+                        paramsWritten.add(ordinal);
                         paramPointsTo.put(idx, new HashSet<>(pts));
                     } else {
                         if (inst.getResult() != null) {
@@ -560,7 +588,7 @@ public class SummaryBuilder {
                     // points-to to UNKNOWN when it sees a write reported
                     // through this summary.
                     if (base instanceof Parameter p) {
-                        int pidx = p.getIndex();
+                        int pidx = p.getOrdinal();
                         paramsWritten.add(pidx);
                         paramsEscaped.add(pidx);
                         paramsFieldWrites
@@ -568,7 +596,7 @@ public class SummaryBuilder {
                             .add(field);
                     }
                     if (rhs instanceof Parameter p) {
-                        paramsEscaped.add(p.getIndex());
+                        paramsEscaped.add(p.getOrdinal());
                     }
                 }
                 break;
@@ -584,7 +612,7 @@ public class SummaryBuilder {
                         fieldsRead.add("[]");
                     }
                     if (array instanceof Parameter p) {
-                        paramsRead.add(p.getIndex());
+                        paramsRead.add(p.getOrdinal());
                     }
                 }
                 break;
@@ -594,7 +622,7 @@ public class SummaryBuilder {
                     Value array = inst.getOperands().get(0);
                     Value value = inst.getOperands().get(2);
                     if (array instanceof Parameter p) {
-                        int pidx = p.getIndex();
+                        int pidx = p.getOrdinal();
                         paramsWritten.add(pidx);
                         paramsEscaped.add(pidx);
                         paramsFieldWrites
@@ -602,7 +630,7 @@ public class SummaryBuilder {
                             .add("[]");
                     }
                     if (value instanceof Parameter p) {
-                        paramsEscaped.add(p.getIndex());
+                        paramsEscaped.add(p.getOrdinal());
                     }
                     fieldsWritten.add("[]");
                 }
@@ -651,7 +679,7 @@ public class SummaryBuilder {
             if (!args.isEmpty()) {
                 Value arg = args.getFirst();
                 if (arg instanceof Parameter p) {
-                    paramsDestroyed.add(p.getIndex());
+                    paramsDestroyed.add(p.getOrdinal());
                 }
             }
             return;
@@ -688,7 +716,7 @@ public class SummaryBuilder {
             List<Value> args = getCallArguments(callInst);
             for (Value arg : args) {
                 if (arg instanceof Parameter p) {
-                    paramsEscaped.add(p.getIndex());
+                    paramsEscaped.add(p.getOrdinal());
                 }
             }
             if (callInst.getResult() != null) {
@@ -701,19 +729,19 @@ public class SummaryBuilder {
         for (int i = 0; i < args.size(); i++) {
             Value arg = args.get(i);
             if (calleeSum.getParamsRead().contains(i)) {
-                if (arg instanceof Parameter p) paramsRead.add(p.getIndex());
+                if (arg instanceof Parameter p) paramsRead.add(p.getOrdinal());
             }
             if (calleeSum.getParamsWritten().contains(i)) {
-                if (arg instanceof Parameter p) paramsWritten.add(p.getIndex());
+                if (arg instanceof Parameter p) paramsWritten.add(p.getOrdinal());
             }
             if (calleeSum.getParamsEscaped().contains(i)) {
-                if (arg instanceof Parameter p) paramsEscaped.add(p.getIndex());
+                if (arg instanceof Parameter p) paramsEscaped.add(p.getOrdinal());
             }
             if (calleeSum.getParamsReturned().contains(i)) {
-                if (arg instanceof Parameter p) paramsReturned.add(p.getIndex());
+                if (arg instanceof Parameter p) paramsReturned.add(p.getOrdinal());
             }
             if (calleeSum.getParamsDestroyed().contains(i)) {
-                if (arg instanceof Parameter p) paramsDestroyed.add(p.getIndex());
+                if (arg instanceof Parameter p) paramsDestroyed.add(p.getOrdinal());
             }
         }
 
@@ -726,7 +754,7 @@ public class SummaryBuilder {
             if (paramIndex >= args.size()) continue;
             Value arg = args.get(paramIndex);
             if (arg instanceof Parameter p) {
-                int localIdx = p.getIndex();
+                int localIdx = p.getOrdinal();
                 Set<String> destSet = paramsFieldWrites
                     .computeIfAbsent(localIdx, k -> new HashSet<>());
                 destSet.addAll(entry.getValue());
@@ -776,8 +804,8 @@ public class SummaryBuilder {
                     localPointsTo.getOrDefault(retVal, new HashSet<>());
                 returnedAllocations.addAll(pts);
                 if (retVal instanceof Parameter p) {
-                    paramsEscaped.add(p.getIndex());
-                    paramsReturned.add(p.getIndex());
+                    paramsEscaped.add(p.getOrdinal());
+                    paramsReturned.add(p.getOrdinal());
                 }
             }
         }

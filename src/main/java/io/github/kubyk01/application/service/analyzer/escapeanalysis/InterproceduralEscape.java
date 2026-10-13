@@ -10,7 +10,6 @@ import io.github.kubyk01.domain.ir.*;
 import io.github.kubyk01.domain.ir.Module;
 import io.github.kubyk01.util.LlvmUtil;
 import lombok.extern.slf4j.Slf4j;
-import reactor.core.publisher.Flux;
 import reactor.core.scheduler.Scheduler;
 import reactor.core.scheduler.Schedulers;
 
@@ -105,21 +104,12 @@ public class InterproceduralEscape {
                 batch.add(f);
             }
 
-            List<Map<AllocationSite, EscapeStatus>> results = LlvmUtil.awaitFlux(
-                Flux.fromIterable(batch)
-                    .parallel()
-                    .runOn(scheduler)
-                    .map(func -> new IntraproceduralEscape(
-                            func, aliasResult, summaries, resolver).analyze())
-                    .sequential()
-            );
-            if (results == null || results.size() != batch.size()) {
-                throw new IllegalStateException(
-                    "InterproceduralEscape: reactor pipeline returned " +
-                        (results == null ? "null"
-                                         : results.size() + " results for "
-                                           + batch.size() + " functions"));
-            }
+            List<Map<AllocationSite, EscapeStatus>> results =
+                LlvmUtil.parallelMapOrdered(
+                    batch, scheduler,
+                    func -> new IntraproceduralEscape(
+                            func, aliasResult, summaries, resolver).analyze());
+            // parallelMapOrdered already validates the result size.
 
             for (int i = 0; i < batch.size(); i++) {
                 Function func = batch.get(i);

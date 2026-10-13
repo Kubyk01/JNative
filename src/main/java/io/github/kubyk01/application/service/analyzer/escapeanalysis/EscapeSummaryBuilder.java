@@ -9,7 +9,6 @@ import io.github.kubyk01.domain.ir.Module;
 import io.github.kubyk01.util.LlvmUtil;
 import lombok.extern.slf4j.Slf4j;
 import org.objectweb.asm.Opcodes;
-import reactor.core.publisher.Flux;
 import reactor.core.scheduler.Scheduler;
 import reactor.core.scheduler.Schedulers;
 
@@ -280,20 +279,10 @@ public class EscapeSummaryBuilder {
             // per-batch copy — gives exactly the same consistency
             // (every worker of one batch sees the same snapshot) with no
             // O(|summaries|) copy per batch.
-            List<EscapeSummary> fresh = LlvmUtil.awaitFlux(
-                    Flux.fromIterable(batch)
-                            .parallel()
-                            .runOn(scheduler)
-                            .map(func -> analyzeFunction(func, summaries))
-                            .sequential()
-            );
-            if (fresh == null || fresh.size() != batch.size()) {
-                throw new IllegalStateException(
-                        "EscapeSummaryBuilder: reactor pipeline returned "
-                                + (fresh == null ? "null"
-                                : fresh.size() + " summaries for "
-                                + batch.size() + " functions"));
-            }
+            List<EscapeSummary> fresh = LlvmUtil.parallelMapOrdered(
+                    batch, scheduler,
+                    func -> analyzeFunction(func, summaries));
+            // parallelMapOrdered already validates the result size.
 
             // Sequential commit: the only place summaries are written.
             // Old and new summaries are merged rather than replaced, so the
@@ -475,7 +464,7 @@ public class EscapeSummaryBuilder {
             }
         }
 
-        return EscapeSummary.builder()
+        EscapeSummary result = EscapeSummary.builder()
                 .paramsEscaped(paramsEscaped)
                 .paramsReturned(paramsReturned)
                 .fieldsEscaped(fieldsEscaped)
@@ -483,17 +472,47 @@ public class EscapeSummaryBuilder {
                 .escapesGlobally(flags[1])
                 .createsThread(flags[2])
                 .build();
+
+        validateSummaryIndices(func, result);
+        return result;
+    }
+
+    /**
+     * Catches any error where a summary refers to a parameter index outside
+     * the declared parameter list. This is exactly the error that occurs when
+     * slot and ordinal are confused: a function with one parameter
+     * (Object.toString) cannot legally have paramsEscaped = {1,2,3}, but a
+     * slot-based summary produced by another function can.
+     */
+    private static void validateSummaryIndices(Function func, EscapeSummary s) {
+        int n = func.getParameters().size();
+        checkIndices(func, "paramsEscaped",  s.getParamsEscaped(),  n);
+        checkIndices(func, "paramsReturned", s.getParamsReturned(), n);
+    }
+
+    private static void checkIndices(Function func, String name,
+                                     Set<Integer> indices, int paramCount) {
+        for (int idx : indices) {
+            if (idx < 0 || idx >= paramCount) {
+                throw new IllegalStateException(
+                    "EscapeSummary for " + func.getName() + " has " + name
+                        + " index " + idx + " outside [0, " + paramCount + ")");
+            }
+        }
     }
 
     private Map<Integer, Set<Integer>> computeParamAliases(Function func) {
         Map<Integer, Set<Integer>> aliases = new HashMap<>();
-        for (int i = 0; i < func.getParameters().size(); i++) {
-            for (int j = i + 1; j < func.getParameters().size(); j++) {
-                Parameter p1 = func.getParameters().get(i);
-                Parameter p2 = func.getParameters().get(j);
+        List<Parameter> ps = func.getParameters();
+        for (int i = 0; i < ps.size(); i++) {
+            for (int j = i + 1; j < ps.size(); j++) {
+                Parameter p1 = ps.get(i);
+                Parameter p2 = ps.get(j);
                 if (aliasResult.mayAlias(p1, p2)) {
-                    aliases.computeIfAbsent(i, k -> new HashSet<>()).add(j);
-                    aliases.computeIfAbsent(j, k -> new HashSet<>()).add(i);
+                    int o1 = p1.getOrdinal();
+                    int o2 = p2.getOrdinal();
+                    aliases.computeIfAbsent(o1, k -> new HashSet<>()).add(o2);
+                    aliases.computeIfAbsent(o2, k -> new HashSet<>()).add(o1);
                 }
             }
         }
@@ -574,15 +593,15 @@ public class EscapeSummaryBuilder {
         // precise case where the base is a local whose escape status is
         // known within the function.)
         if (rhsIsReference && rhs instanceof Parameter pr) {
-            paramsEscaped.add(pr.getIndex());
-            addAliases(pr.getIndex(), paramAliases, paramsEscaped);
+            paramsEscaped.add(pr.getOrdinal());
+            addAliases(pr.getOrdinal(), paramAliases, paramsEscaped);
         }
 
         if (isVolatile && rhsIsReference) {
             flags[1] = true;
             if (rhs instanceof Parameter pr) {
-                paramsEscaped.add(pr.getIndex());
-                addAliases(pr.getIndex(), paramAliases, paramsEscaped);
+                paramsEscaped.add(pr.getOrdinal());
+                addAliases(pr.getOrdinal(), paramAliases, paramsEscaped);
             }
         }
     }
@@ -607,8 +626,8 @@ public class EscapeSummaryBuilder {
         // Synchronising on an object exposes it to any other thread that
         // synchronises on the same object.
         if (obj instanceof Parameter p) {
-            paramsEscaped.add(p.getIndex());
-            addAliases(p.getIndex(), paramAliases, paramsEscaped);
+            paramsEscaped.add(p.getOrdinal());
+            addAliases(p.getOrdinal(), paramAliases, paramsEscaped);
             flags[1] = true;
         }
     }
@@ -640,8 +659,8 @@ public class EscapeSummaryBuilder {
                 || rhsType.isUnknown();
 
         if (rhs instanceof Parameter p) {
-            paramsEscaped.add(p.getIndex());
-            addAliases(p.getIndex(), paramAliases, paramsEscaped);
+            paramsEscaped.add(p.getOrdinal());
+            addAliases(p.getOrdinal(), paramAliases, paramsEscaped);
         }
         if (rhsIsReference) {
             flags[1] = true;
@@ -672,8 +691,8 @@ public class EscapeSummaryBuilder {
         // Writing into an array mutates it in place; the array reference
         // itself does not escape. Only the stored value does.
         if (valueIsReference && value instanceof Parameter p) {
-            paramsEscaped.add(p.getIndex());
-            addAliases(p.getIndex(), paramAliases, paramsEscaped);
+            paramsEscaped.add(p.getOrdinal());
+            addAliases(p.getOrdinal(), paramAliases, paramsEscaped);
         }
         fieldsEscaped.add("[]");
     }
@@ -694,8 +713,8 @@ public class EscapeSummaryBuilder {
             flags[2] = true;
             for (Value arg : getCallArguments(inst)) {
                 if (arg instanceof Parameter p) {
-                    paramsEscaped.add(p.getIndex());
-                    addAliases(p.getIndex(), paramAliases, paramsEscaped);
+                    paramsEscaped.add(p.getOrdinal());
+                    addAliases(p.getOrdinal(), paramAliases, paramsEscaped);
                 }
             }
             return;
@@ -717,8 +736,8 @@ public class EscapeSummaryBuilder {
                 // argument may be stored anywhere the callee has access to.
                 for (Value arg : getCallArguments(inst)) {
                     if (arg instanceof Parameter p) {
-                        paramsEscaped.add(p.getIndex());
-                        addAliases(p.getIndex(), paramAliases, paramsEscaped);
+                        paramsEscaped.add(p.getOrdinal());
+                        addAliases(p.getOrdinal(), paramAliases, paramsEscaped);
                     }
                 }
                 Value ret = inst.getResult();
@@ -731,12 +750,12 @@ public class EscapeSummaryBuilder {
         for (int i = 0; i < args.size(); i++) {
             Value arg = args.get(i);
             if (calleeSum.getParamsEscaped().contains(i) && arg instanceof Parameter p) {
-                paramsEscaped.add(p.getIndex());
-                addAliases(p.getIndex(), paramAliases, paramsEscaped);
+                paramsEscaped.add(p.getOrdinal());
+                addAliases(p.getOrdinal(), paramAliases, paramsEscaped);
             }
             if (calleeSum.getParamsReturned().contains(i) && arg instanceof Parameter p) {
-                paramsReturned.add(p.getIndex());
-                addAliases(p.getIndex(), paramAliases, paramsReturned);
+                paramsReturned.add(p.getOrdinal());
+                addAliases(p.getOrdinal(), paramAliases, paramsReturned);
             }
         }
         if (calleeSum.isEscapesGlobally()) flags[1] = true;
@@ -755,15 +774,15 @@ public class EscapeSummaryBuilder {
             if (retVal != null && retVal.getType() != Type.VOID) {
                 flags[0] = true;
                 if (retVal instanceof Parameter p) {
-                    paramsEscaped.add(p.getIndex());
-                    paramsReturned.add(p.getIndex());
-                    addAliases(p.getIndex(), paramAliases, paramsEscaped);
-                    addAliases(p.getIndex(), paramAliases, paramsReturned);
+                    paramsEscaped.add(p.getOrdinal());
+                    paramsReturned.add(p.getOrdinal());
+                    addAliases(p.getOrdinal(), paramAliases, paramsEscaped);
+                    addAliases(p.getOrdinal(), paramAliases, paramsReturned);
                 } else {
                     Value origin = valueOrigin.get(retVal);
                     if (origin instanceof Parameter p) {
-                        paramsReturned.add(p.getIndex());
-                        addAliases(p.getIndex(), paramAliases, paramsReturned);
+                        paramsReturned.add(p.getOrdinal());
+                        addAliases(p.getOrdinal(), paramAliases, paramsReturned);
                     }
                 }
             }
@@ -771,17 +790,17 @@ public class EscapeSummaryBuilder {
             Value exc = tt.getException();
             if (exc != null) {
                 if (exc instanceof Parameter p) {
-                    paramsEscaped.add(p.getIndex());
-                    paramsReturned.add(p.getIndex());
-                    addAliases(p.getIndex(), paramAliases, paramsEscaped);
-                    addAliases(p.getIndex(), paramAliases, paramsReturned);
+                    paramsEscaped.add(p.getOrdinal());
+                    paramsReturned.add(p.getOrdinal());
+                    addAliases(p.getOrdinal(), paramAliases, paramsEscaped);
+                    addAliases(p.getOrdinal(), paramAliases, paramsReturned);
                 } else {
                     Value origin = valueOrigin.get(exc);
                     if (origin instanceof Parameter p) {
-                        paramsEscaped.add(p.getIndex());
-                        paramsReturned.add(p.getIndex());
-                        addAliases(p.getIndex(), paramAliases, paramsEscaped);
-                        addAliases(p.getIndex(), paramAliases, paramsReturned);
+                        paramsEscaped.add(p.getOrdinal());
+                        paramsReturned.add(p.getOrdinal());
+                        addAliases(p.getOrdinal(), paramAliases, paramsEscaped);
+                        addAliases(p.getOrdinal(), paramAliases, paramsReturned);
                     }
                 }
             }

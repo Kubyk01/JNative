@@ -14,7 +14,6 @@ import io.github.kubyk01.domain.ir.Terminator;
 import io.github.kubyk01.domain.ir.Value;
 import io.github.kubyk01.util.LlvmUtil;
 import lombok.extern.slf4j.Slf4j;
-import reactor.core.publisher.Flux;
 import reactor.core.scheduler.Scheduler;
 import reactor.core.scheduler.Schedulers;
 
@@ -265,22 +264,9 @@ public class InterproceduralPointsTo {
             // worker of the scheduler for the whole batch, and processes
             // items with zero per-item allocation. On the same input it
             // saturates all available cores.
-            List<EvaluationResult> results = LlvmUtil.awaitFlux(
-                    Flux.fromIterable(batch)
-                            .parallel()
-                            .runOn(scheduler)
-                            .map(this::evaluateFunction)
-                            .sequential()
-            );
-
-            if (results == null || results.size() != batch.size()) {
-                throw new IllegalStateException(
-                        "InterproceduralPointsTo: reactor pipeline returned "
-                                + (results == null
-                                ? "null"
-                                : results.size() + " results for "
-                                + batch.size() + " functions"));
-            }
+            List<EvaluationResult> results = LlvmUtil.parallelMapOrdered(
+                    batch, scheduler, this::evaluateFunction);
+            // parallelMapOrdered already validates the result size.
 
             // ---- Sequential commit of change flags ----------------
             //

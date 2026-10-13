@@ -320,8 +320,11 @@ public class BytecodeToIr {
                 }
                 allParams.addAll(methodNode.getParameterTypes());
 
+                int slot = 0;
                 for (int i = 0; i < allParams.size(); i++) {
-                    func.addParameter(new Parameter(allParams.get(i), i));
+                    Type t = allParams.get(i);
+                    func.addParameter(new Parameter(t, slot, i));
+                    slot += (t == Type.LONG || t == Type.DOUBLE) ? 2 : 1;
                 }
                 builder.getModule().addFunction(func);
                 functionMap.put(methodRef, func);
@@ -464,8 +467,11 @@ public class BytecodeToIr {
         String mangledName = LlvmRuntime.mangleMethod(ref.getOwner(), ref.getName(), ref.getDescriptor());
         Function func = new Function(mangledName, retType);
         func.setOwnerClass(ref.getOwner());
+        int slot = 0;
         for (int i = 0; i < allParams.size(); i++) {
-            func.addParameter(new Parameter(allParams.get(i), i));
+            Type t = allParams.get(i);
+            func.addParameter(new Parameter(t, slot, i));
+            slot += (t == Type.LONG || t == Type.DOUBLE) ? 2 : 1;
         }
         builder.getModule().addFunction(func);
         return func;

@@ -37,7 +37,7 @@ public class IntraproceduralEscape {
      * the read result.
      */
     private final Map<AllocationSite, Map<String, EscapeStatus>> fieldStatus =
-        new HashMap<>();
+            new HashMap<>();
 
     private final NativeBodyEscapeAnalyzer nativeAnalyzer;
 
@@ -56,7 +56,6 @@ public class IntraproceduralEscape {
     }
 
     public Map<AllocationSite, EscapeStatus> analyze() {
-        // Initialise every allocation site to STACK.
         for (BasicBlock block : function.getBlocks()) {
             for (Instruction inst : block.getInstructions()) {
                 if (isAllocation(inst.getOpcode()) && inst.getResult() != null) {
@@ -68,19 +67,6 @@ public class IntraproceduralEscape {
             }
         }
 
-        // Fixed point over the function's CFG.
-        //
-        // The previous revision performed a single pass in block order,
-        // which is insufficient: escape status propagates transitively
-        // through field writes and reads (PUT_FIELD followed by a later
-        // GET_FIELD that feeds a return, for example), and a single
-        // traversal of the block list can miss the second-order
-        // propagation. The loop below iterates until the status map
-        // stops changing.
-        //
-        // The bound is generous: the lattice has only six levels, so
-        // each site can be promoted at most five times, and each pass
-        // performs one promotion per instruction at most.
         final int MAX_ITERATIONS = 64;
         for (int i = 0; i < MAX_ITERATIONS; i++) {
             changed = false;
@@ -108,7 +94,7 @@ public class IntraproceduralEscape {
             case PUT_STATIC   -> processPutStatic(inst);
             case GET_STATIC   -> processGetStatic(inst);
             case CALL, VIRTUAL_CALL, INTERFACE_CALL, STATIC_CALL, SPECIAL_CALL ->
-                processCall(inst);
+                    processCall(inst);
             default -> { }
         }
     }
@@ -136,7 +122,7 @@ public class IntraproceduralEscape {
         PointsToSet basePts = aliasResult.getPointsTo(base);
         if (basePts.isEmpty() && base instanceof Parameter) {
             updateFieldStatus(AllocationSite.UNKNOWN, field,
-                              maxEscape(fieldEsc, EscapeStatus.HEAP));
+                    maxEscape(fieldEsc, EscapeStatus.HEAP));
         } else {
             for (AllocationSite site : basePts.getSites()) {
                 updateFieldStatus(site, field, fieldEsc);
@@ -158,11 +144,6 @@ public class IntraproceduralEscape {
         String field = extractFieldName(inst);
         String[] ownerAndField = extractFieldOwnerAndName(inst);
 
-        // A read does not make the base escape. The result's escape
-        // level is the max of:
-        //   - the base's own escape level (if the base is externally
-        //     observable, so is anything read out of it), and
-        //   - the field's stored level.
         EscapeStatus baseEsc = valueEscapeStatus(base);
         PointsToSet   basePts = aliasResult.getPointsTo(base);
 
@@ -171,29 +152,23 @@ public class IntraproceduralEscape {
             Map<String, EscapeStatus> map = fieldStatus.get(site);
             if (map != null) {
                 resultEsc = maxEscape(resultEsc,
-                    map.getOrDefault(field, EscapeStatus.STACK));
+                        map.getOrDefault(field, EscapeStatus.STACK));
             }
         }
         if (basePts.isEmpty() && base instanceof Parameter) {
             Map<String, EscapeStatus> map = fieldStatus.get(AllocationSite.UNKNOWN);
             if (map != null) {
                 resultEsc = maxEscape(resultEsc,
-                    map.getOrDefault(field, EscapeStatus.STACK));
+                        map.getOrDefault(field, EscapeStatus.STACK));
             }
-            // A parameter is externally observable, so anything read out
-            // of its field is observable at HEAP level.
             resultEsc = maxEscape(resultEsc, EscapeStatus.HEAP);
         }
 
-        // Promote the escape level of every site reachable through the
-        // field to at least resultEsc.
         PointsToSet fieldPts = aliasResult.getFieldPointsToForSites(basePts, field);
         for (AllocationSite site : fieldPts.getSites()) {
             markEscaped(site, resultEsc);
         }
 
-        // The result itself is a fresh value; its escape level for the
-        // purposes of downstream propagation is resultEsc.
         markEscaped(result, resultEsc);
 
         if (isVolatileField(ownerAndField[0], ownerAndField[1])) {
@@ -235,7 +210,7 @@ public class IntraproceduralEscape {
         PointsToSet arrayPts = aliasResult.getPointsTo(array);
         if (arrayPts.isEmpty() && array instanceof Parameter) {
             updateFieldStatus(AllocationSite.UNKNOWN, "[]",
-                              maxEscape(fieldEsc, EscapeStatus.HEAP));
+                    maxEscape(fieldEsc, EscapeStatus.HEAP));
         } else {
             for (AllocationSite site : arrayPts.getSites()) {
                 updateFieldStatus(site, "[]", fieldEsc);
@@ -269,9 +244,9 @@ public class IntraproceduralEscape {
         if (calleeName == null) return;
 
         if (calleeName.startsWith("java/util/concurrent/ExecutorService.submit")
-            || calleeName.startsWith("java/util/concurrent/ForkJoinPool.submit")
-            || calleeName.startsWith("java/util/concurrent/CompletableFuture.supplyAsync")
-            || calleeName.startsWith("java/lang/Thread.start()V")) {
+                || calleeName.startsWith("java/util/concurrent/ForkJoinPool.submit")
+                || calleeName.startsWith("java/util/concurrent/CompletableFuture.supplyAsync")
+                || calleeName.startsWith("java/lang/Thread.start()V")) {
             for (Value arg : getCallArguments(callInst)) {
                 markEscaped(arg, EscapeStatus.THREAD);
             }
@@ -304,18 +279,65 @@ public class IntraproceduralEscape {
         List<Value> args = getCallArguments(callInst);
         Value returnValue = callInst.getResult();
 
+        // ------------------------------------------------------------------
+        // Argument escape propagation.
+        //
+        // The callee's summary tells us WHICH of its parameters escape
+        // (indices in getParamsEscaped) and WHICH are returned (indices
+        // in getParamsReturned). It does NOT record, for a parameter
+        // that escapes, whether the escape was to a heap object or to a
+        // static field. The escapesGlobally flag says "somewhere in this
+        // callee's transitive body, a value was stored into global
+        // state", but it does not say WHICH value.
+        //
+        // Because of that, the caller's policy is:
+        //
+        //   * An argument the callee does NOT escape (its index is not
+        //     in paramsEscaped and not in paramsReturned) is left alone,
+        //     regardless of escapesGlobally. The callee's global escapes
+        //     must have come from values it created itself — fresh
+        //     allocations, values read from static state, values read
+        //     out of objects reachable from static state. Nothing the
+        //     caller passed in is at risk through this particular call.
+        //
+        //   * An argument the callee DOES escape is promoted to GLOBAL
+        //     if the callee escapes globally, and to HEAP otherwise:
+        //     the summary cannot distinguish the two cases, so the
+        //     coarser (higher) status wins.
+        //
+        // The previous revision promoted EVERY argument of a globally
+        // escaping callee to GLOBAL, without consulting paramsEscaped.
+        // On a callee such as Object.toString — whose body creates
+        // fresh intermediate objects (StringBuilder, String) that
+        // themselves reach state that makes escapesGlobally true, but
+        // which never store the receiver into any global location —
+        // that unconditional promotion raised the receiver of
+        //     new Test2(i).toString()
+        // in the reported benchmark to EscapeStatus.GLOBAL and made
+        // stack allocation of Test2 impossible.
+        //
+        // The return-value branch below keeps its previous shape: a
+        // globally escaping callee might return the globally escaped
+        // value, and the returned reference outlives the call in any
+        // case, so the return value is promoted to GLOBAL when the
+        // callee escapes globally, and to RETURN when it merely
+        // returns an object.
+        // ------------------------------------------------------------------
+        EscapeStatus escapedArgStatus = summary.isEscapesGlobally()
+                ? EscapeStatus.GLOBAL
+                : EscapeStatus.HEAP;
+
         for (int i = 0; i < args.size(); i++) {
             if (summary.getParamsEscaped().contains(i)) {
-                markEscaped(args.get(i), EscapeStatus.HEAP);
+                markEscaped(args.get(i), escapedArgStatus);
             }
             if (summary.getParamsReturned().contains(i)) {
                 markEscaped(args.get(i), EscapeStatus.RETURN);
             }
         }
 
-        if (summary.isEscapesGlobally()) {
-            for (Value arg : args) markEscaped(arg, EscapeStatus.GLOBAL);
-            if (returnValue != null) markEscaped(returnValue, EscapeStatus.GLOBAL);
+        if (summary.isEscapesGlobally() && returnValue != null) {
+            markEscaped(returnValue, EscapeStatus.GLOBAL);
         }
 
         if (summary.isReturnsObject() && returnValue != null) {
@@ -341,13 +363,6 @@ public class IntraproceduralEscape {
     //  Helpers
     // -----------------------------------------------------------------
 
-    /**
-     * Returns the effective escape status of a value.
-     *
-     * A {@link Parameter} is a reference the caller owns; it is
-     * externally observable regardless of what this function does with
-     * it, so it is conservatively reported as at least HEAP.
-     */
     private EscapeStatus valueEscapeStatus(Value v) {
         if (v == null) return EscapeStatus.STACK;
         EscapeStatus status = getMaxStatus(v);
@@ -385,7 +400,7 @@ public class IntraproceduralEscape {
     private void updateFieldStatus(AllocationSite site, String field,
                                    EscapeStatus status) {
         Map<String, EscapeStatus> map =
-            fieldStatus.computeIfAbsent(site, k -> new HashMap<>());
+                fieldStatus.computeIfAbsent(site, k -> new HashMap<>());
         EscapeStatus existing = map.getOrDefault(field, EscapeStatus.STACK);
         if (status.ordinal() > existing.ordinal()) {
             map.put(field, status);

@@ -11,6 +11,8 @@ import io.github.kubyk01.domain.ir.Type;
 import io.github.kubyk01.domain.ir.Value;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Scheduler;
+import reactor.core.scheduler.Schedulers;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -98,6 +100,48 @@ public class LlvmUtil {
             throw new RuntimeException("reactive pipeline failed", error.get());
         }
         return collected.get();
+    }
+
+    private record Indexed<T>(int index, T value) {}
+
+    public static <T, R> List<R> parallelMapOrdered(
+            List<T> items,
+            Scheduler scheduler,
+            java.util.function.Function<T, R> mapper) {
+        if (items == null || items.isEmpty()) {
+            return new ArrayList<>();
+        }
+        Scheduler sched = (scheduler != null) ? scheduler : Schedulers.single();
+
+        List<Indexed<T>> tagged = new ArrayList<>(items.size());
+        for (int i = 0; i < items.size(); i++) {
+            tagged.add(new Indexed<>(i, items.get(i)));
+        }
+
+        List<Indexed<R>> raw = awaitFlux(
+            Flux.fromIterable(tagged)
+                .parallel()
+                .runOn(sched)
+                .map(p -> new Indexed<>(p.index(), mapper.apply(p.value())))
+                .sequential()
+        );
+
+        if (raw == null || raw.size() != items.size()) {
+            throw new IllegalStateException(
+                "parallelMapOrdered: reactor pipeline returned "
+                    + (raw == null
+                        ? "null"
+                        : raw.size() + " results for " + items.size() + " items"));
+        }
+
+        List<R> ordered = new ArrayList<>(items.size());
+        for (int i = 0; i < items.size(); i++) {
+            ordered.add(null);
+        }
+        for (Indexed<R> entry : raw) {
+            ordered.set(entry.index(), entry.value());
+        }
+        return ordered;
     }
 
     public static Type inferLocalType(Function func, int idx) {

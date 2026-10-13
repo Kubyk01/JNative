@@ -971,8 +971,11 @@ public class Analyzer {
                 List<Type> paramTypes = TypeResolver.descToParamTypes(descriptor);
                 Function func = new Function(nativeName, retType);
                 func.setOwnerClass(actualOwner);
+                int slot = 0;
                 for (int i = 0; i < paramTypes.size(); i++) {
-                    func.addParameter(new Parameter(paramTypes.get(i), i));
+                    Type t = paramTypes.get(i);
+                    func.addParameter(new Parameter(t, slot, i));
+                    slot += (t == Type.LONG || t == Type.DOUBLE) ? 2 : 1;
                 }
                 module.addFunction(func);
                 added++;
