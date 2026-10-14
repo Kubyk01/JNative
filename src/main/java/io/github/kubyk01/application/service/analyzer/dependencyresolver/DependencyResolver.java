@@ -122,6 +122,53 @@ public class DependencyResolver {
     private FileSystem jrtFileSystem;
 
     /**
+     * Absolute path of the top-level input archive, if {@link #scan(Path)}
+     * was given a Spring Boot fat jar. Used by {@link #loadFromNestedJarIndex}
+     * to reopen the outer archive and stream out the requested .class entry.
+     *
+     * Null when the input is a plain jar, a directory, or a single .class
+     * file; in those cases there are no nested jars to index.
+     */
+    private volatile Path inputArchive;
+
+    /**
+     * Lazy index of every .class entry that lives inside a nested jar of a
+     * Spring Boot fat jar.
+     *
+     * <p>Key   : internal class name ("com/example/Foo").
+     * <p>Value : the location of the entry inside the outer archive.</p>
+     *
+     * <p>The index is populated by {@link #indexNestedJar} during
+     * {@link #scan(Path)} — entry names are read from the nested jar's
+     * central directory, no bytecode is parsed. Individual class bytes are
+     * read on demand the first time {@link #loadSystemClass(String)} is
+     * asked for the class and the class is not already in
+     * {@link #classMap}.</p>
+     *
+     * <p>Entries are consumed (removed) on first successful lookup: once a
+     * class has been loaded into {@link #classMap} the index entry has no
+     * further use. A failed lookup also removes the entry, because the
+     * subsequent fallback chain will register the class either as loaded
+     * or as missing and a second attempt would only repeat the same I/O.</p>
+     */
+    private final Map<String, NestedClassRef> nestedClassIndex =
+            new ConcurrentHashMap<>();
+
+    /**
+     * Location of one .class entry inside a nested jar of the input archive.
+     *
+     * <p>{@code outerJar} is the top-level archive passed to
+     * {@link #scan(Path)}; {@code nestedJarEntryName} is the entry of the
+     * outer archive that holds the nested jar (e.g.
+     * {@code "BOOT-INF/lib/netty-common-4.1.100.Final.jar"}); and
+     * {@code classEntryName} is the entry inside that nested jar
+     * (e.g. {@code "io/netty/util/internal/logging/Log4JLogger.class"}).</p>
+     */
+    private record NestedClassRef(Path outerJar,
+                                  String nestedJarEntryName,
+                                  String classEntryName) {}
+
+    /**
      * True iff {@code name} denotes a Java array type, in any of the two
      * forms the resolver observes.
      *
@@ -256,7 +303,18 @@ public class DependencyResolver {
             return;
         }
 
-        byte[] bytes = null;
+        byte[] bytes = loadFromNestedJarIndex(internalName);
+
+        if (bytes != null) {
+            try {
+                parseClassBytes(internalName, bytes);
+                loadedClasses.add(internalName);
+                return;
+            } catch (IOException e) {
+                log.warn("Failed to parse class {} from nested jar: {}",
+                        internalName, e.getMessage());
+            }
+        }
 
         try (InputStream is = ClassLoader.getSystemResourceAsStream(internalName + ".class")) {
             if (is != null) {
@@ -264,7 +322,8 @@ public class DependencyResolver {
                 log.debug("Loaded system class {} via ClassLoader", internalName);
             }
         } catch (IOException e) {
-            log.debug("Failed to load system class {} via ClassLoader: {}", internalName, e.getMessage());
+            log.debug("Failed to load system class {} via ClassLoader: {}",
+                    internalName, e.getMessage());
         }
 
         if (bytes == null) {
@@ -277,7 +336,8 @@ public class DependencyResolver {
                 loadedClasses.add(internalName);
                 return;
             } catch (IOException e) {
-                log.warn("Failed to parse system class {}: {}", internalName, e.getMessage());
+                log.warn("Failed to parse system class {}: {}",
+                        internalName, e.getMessage());
             }
         }
 
@@ -495,41 +555,49 @@ public class DependencyResolver {
     }
 
     public void scan(Path path) throws IOException {
+        this.inputArchive = path;
+
         if (Files.isDirectory(path)) {
             Files.walk(path)
                     .filter(p -> p.toString().endsWith(".class"))
                     .forEach(this::parseClassFile);
             Files.walk(path)
-                    .filter(p -> p.toString().endsWith(".json") && p.toString().contains(NATIVE_IMAGE_METADATA_PREFIX))
+                    .filter(p -> p.toString().endsWith(".json")
+                            && p.toString().contains(NATIVE_IMAGE_METADATA_PREFIX))
                     .forEach(this::parseMetadataFile);
         } else if (path.toString().endsWith(".jar")) {
             try (JarFile jar = new JarFile(path.toFile())) {
                 Enumeration<JarEntry> entries = jar.entries();
                 while (entries.hasMoreElements()) {
                     JarEntry entry = entries.nextElement();
-                    if (entry.getName().endsWith(".class")) {
+                    String name = entry.getName();
+
+                    // Spring Boot "fat"/executable jars keep every dependency
+                    // as a nested jar under BOOT-INF/lib/. Those jars are
+                    // INDEXED, not parsed: the individual .class entries are
+                    // pulled on demand by loadFromNestedJarIndex(). Parsing
+                    // every entry of every nested jar up front defeats the
+                    // purpose of the analysis (the reachability walk would
+                    // scan the whole transitive closure of every library on
+                    // the classpath, most of which the user's code never
+                    // touches), and it is what produced the flood of
+                    // "System class ... not found" warnings from optional
+                    // dependencies that the fat jar does not and cannot
+                    // contain.
+                    if (name.endsWith(".jar")) {
+                        indexNestedJar(jar, entry);
+                        continue;
+                    }
+
+                    if (name.endsWith(".class")) {
                         try (InputStream is = jar.getInputStream(entry)) {
                             parseClassStream(is);
                         }
                     }
-                    if (entry.getName().startsWith(NATIVE_IMAGE_METADATA_PREFIX) && entry.getName().endsWith(".json")) {
+                    if (name.startsWith(NATIVE_IMAGE_METADATA_PREFIX)
+                            && name.endsWith(".json")) {
                         try (InputStream is = jar.getInputStream(entry)) {
-                            parseMetadataStream(is, entry.getName());
-                        }
-                    }
-                    // Spring Boot "fat"/executable jars keep every
-                    // dependency as a nested jar under BOOT-INF/lib/ (and
-                    // the application's own classes under BOOT-INF/classes/,
-                    // which are already handled above because their entry
-                    // names still end in ".class"). Without this branch the
-                    // outer enumeration only ever sees the handful of
-                    // spring-boot-loader classes and the application's own
-                    // classes; every Spring/Reactor/R2DBC/Liquibase class
-                    // is invisible, so the resolver falls back to
-                    // reflection stubs and logs "System class ... not found".
-                    if (entry.getName().endsWith(".jar")) {
-                        try (InputStream is = jar.getInputStream(entry)) {
-                            parseNestedJarStream(is, entry.getName());
+                            parseMetadataStream(is, name);
                         }
                     }
                 }
@@ -572,35 +640,105 @@ public class DependencyResolver {
     }
 
     /**
-     * Parses the classes and reachability metadata out of a jar nested
-     * inside the input archive (the Spring Boot {@code BOOT-INF/lib/*.jar}
-     * layout). The nested jar is streamed through a {@link ZipInputStream}
-     * so it never has to be materialised on disk; each {@code .class}
-     * entry is handed to {@link #parseClassStream(InputStream)}, which
-     * consumes exactly one entry because {@code readAllBytes()} stops at
-     * the entry boundary.
+     * Walks the entry list of one nested jar (a {@code .jar} entry of the
+     * outer Spring Boot fat jar) and records the location of every
+     * {@code .class} entry in {@link #nestedClassIndex}.
+     *
+     * <p>No bytecode is read: the scan consumes only the central directory
+     * of the nested jar, which costs O(number of entries) time and zero
+     * heap beyond the index entry names. This is what makes it cheap to
+     * index every nested jar of the input up front while still deferring
+     * the actual class parsing until a class is required.</p>
+     *
+     * <p>Native-image reachability metadata inside a nested jar is parsed
+     * eagerly: it is small, it is consumed in a single fixed-up pass by
+     * {@code ReachabilityAnalysis.applyMetadata}, and there is nothing to
+     * gain by deferring it.</p>
+     *
+     * <p>Duplicate class names across nested jars are resolved first-wins,
+     * matching the order the outer archive's entry enumerator produces.
+     * That is the same resolution order a class loader would observe when
+     * walking the equivalent flat classpath.</p>
      */
-    private void parseNestedJarStream(InputStream is, String nestedName) {
-        try (ZipInputStream zis = new ZipInputStream(is)) {
+    private void indexNestedJar(JarFile outerJar, JarEntry nestedEntry)
+            throws IOException {
+        String nestedName = nestedEntry.getName();
+        try (InputStream is = outerJar.getInputStream(nestedEntry);
+             ZipInputStream zis = new ZipInputStream(is)) {
+
             ZipEntry entry;
             while ((entry = zis.getNextEntry()) != null) {
                 String entryName = entry.getName();
+
                 if (entryName.endsWith(".class")) {
-                    try {
-                        parseClassStream(zis);
-                    } catch (IOException e) {
-                        log.warn("Failed to parse class {} from nested jar {}: {}",
-                                entryName, nestedName, e.getMessage());
-                    }
+                    String internalName =
+                            entryName.substring(0, entryName.length() - 6);
+                    nestedClassIndex.putIfAbsent(
+                            internalName,
+                            new NestedClassRef(inputArchive, nestedName, entryName));
                 } else if (entryName.startsWith(NATIVE_IMAGE_METADATA_PREFIX)
                         && entryName.endsWith(".json")) {
                     parseMetadataStream(zis, nestedName + "!/" + entryName);
                 }
+
                 zis.closeEntry();
             }
         } catch (IOException e) {
-            log.warn("Failed to parse nested jar {}: {}", nestedName, e.getMessage());
+            log.warn("Failed to index nested jar {}: {}", nestedName, e.getMessage());
         }
+    }
+
+    /**
+     * Attempts to read a single class's bytes out of a nested jar of the
+     * input archive, using {@link #nestedClassIndex} to locate the entry.
+     *
+     * <p>On a hit, the index entry is removed: the caller
+     * ({@link #loadSystemClass(String)}) is about to place the resulting
+     * {@code ClassNode} into {@link #classMap}, and the index entry has no
+     * further purpose. On a miss the entry is likewise removed — the
+     * subsequent fallback chain will register the class as missing and a
+     * repeated attempt would only re-open the outer archive to fail the
+     * same way.</p>
+     *
+     * <p>The outer archive is reopened on every lookup rather than being
+     * held open for the lifetime of the analysis. A Spring Boot fat jar's
+     * central directory is small (a few dozen nested jar entries plus a
+     * handful of top-level classes), so the reopen cost is one {@code open(2)}
+     * plus one central-directory read. In exchange, the resolver does not
+     * hold an OS file descriptor open for the whole analysis, which matters
+     * when the input lives on a network filesystem or is replaced between
+     * runs.</p>
+     */
+    private byte[] loadFromNestedJarIndex(String internalName) {
+        NestedClassRef ref = nestedClassIndex.remove(internalName);
+        if (ref == null) {
+            return null;
+        }
+
+        try (JarFile outer = new JarFile(ref.outerJar().toFile())) {
+            JarEntry nestedEntry = outer.getJarEntry(ref.nestedJarEntryName());
+            if (nestedEntry == null) {
+                log.warn("Nested jar {} is not present in {}",
+                        ref.nestedJarEntryName(), ref.outerJar());
+                return null;
+            }
+
+            try (InputStream is = outer.getInputStream(nestedEntry);
+                 ZipInputStream zis = new ZipInputStream(is)) {
+                ZipEntry entry;
+                while ((entry = zis.getNextEntry()) != null) {
+                    if (entry.getName().equals(ref.classEntryName())) {
+                        return zis.readAllBytes();
+                    }
+                    zis.closeEntry();
+                }
+            }
+        } catch (IOException e) {
+            log.warn("Failed to read {} from {}!/{}: {}",
+                    ref.classEntryName(), ref.outerJar(),
+                    ref.nestedJarEntryName(), e.getMessage());
+        }
+        return null;
     }
 
     private void parseClassFile(Path classFile) {
