@@ -2,11 +2,8 @@ package io.github.kubyk01.application.service.optimizer;
 
 import io.github.kubyk01.application.service.analyzer.dependencyresolver.DependencyResolver;
 import io.github.kubyk01.application.service.analyzer.ssa.DominatorTree;
-import io.github.kubyk01.application.service.codegen.llvm.LlvmRuntime;
 import io.github.kubyk01.domain.analyzer.aliasanalysis.AliasAnalysisResult;
 import io.github.kubyk01.domain.analyzer.aliasanalysis.AllocationSite;
-import io.github.kubyk01.domain.analyzer.aliasanalysis.PointsToGraph;
-import io.github.kubyk01.domain.analyzer.aliasanalysis.PointsToSet;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.ClassNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.FieldNode;
 import io.github.kubyk01.domain.analyzer.escapeanalysis.EscapeAnalysisResult;
@@ -40,7 +37,6 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Queue;
@@ -57,7 +53,6 @@ public class DestructorInserter {
     private final Map<AllocationSite, Value> siteToValue;
     private final AliasAnalysisResult aliasResult;
     private final EscapeAnalysisResult escapeResult;
-    private record StaticFieldDestructor(Function dtor, AllocationSite dedupSite) {}
 
     private final Map<Function, DominatorTree> domTrees = new HashMap<>();
 
@@ -166,112 +161,6 @@ public class DestructorInserter {
         log.info("Destructor insertion: {} destructors generated, {} calls inserted",
             destructorMap.size(), inserted);
 
-        createShutdownFunction();
-    }
-
-    private void createShutdownFunction() {
-        String funcName = LlvmRuntime.mangleFunction("__jnative_shutdown");
-        Function existing = module.getFunction(funcName);
-        if (existing != null) return;
-
-        Function func = new Function(funcName, Type.VOID);
-        module.addFunction(func);
-        BasicBlock entry = new BasicBlock(funcName + "_entry");
-        func.addBlock(entry);
-        func.setEntryBlock(entry);
-
-        BasicBlock current = entry;
-        PointsToGraph graph = aliasResult.getGraph();
-        Map<String, PointsToSet> staticFields = graph.getStaticFieldPointsToMap();
-
-        // ------------------------------------------------------------------
-        // Shutdown destroys each static field exactly once, with a destructor
-        // chosen for the object the field actually holds.
-        //
-        // The previous revision iterated every AllocationSite of every
-        // static field's points-to set and emitted one destructor call per
-        // site, applying the site's class destructor to the field's value.
-        // That was wrong in two independent ways:
-        //
-        //   * The points-to set of a static field is transitive: it
-        //     contains both the allocation the field directly holds and
-        //     every allocation reachable through the object's fields.
-        //     For Duration.DurationUnits.UNITS = List.of(SECONDS, NANOS)
-        //     the set is {List12, ChronoUnit_SECONDS, ChronoUnit_NANOS},
-        //     and the loop emitted a ChronoUnit destructor call on a
-        //     List12 object. The destructor read `name` at offset 24 of a
-        //     List12 -- which is the small integer 0x31 stored there by
-        //     ImmutableCollections$List12.e0 -- and passed it to free(),
-        //     aborting with "free(): invalid pointer".
-        //
-        //   * Iterating the set also called the container destructor and
-        //     the two element destructors on the same object, producing a
-        //     double-destruction of the container and, when the pointers
-        //     happened to line up, a double free.
-        //
-        // The correct answer for a static field is one destructor chosen
-        // for the concrete type the field actually holds. The container's
-        // destructor already recurses into its own reference fields, so
-        // destroying only the outermost object is sufficient to release
-        // the entire reachable subgraph -- provided the destructor
-        // matches the object's real class.
-        //
-        // resolveStaticFieldDestructor() answers exactly that question,
-        // and processedSites ensures that two static fields pointing at
-        // the same object do not produce two destructor calls.
-        // ------------------------------------------------------------------
-        Set<AllocationSite> processedSites = new HashSet<>();
-        int uniqueBlockIndex = 0;
-
-        for (Map.Entry<String, PointsToSet> entryStatic : staticFields.entrySet()) {
-            String fieldName = entryStatic.getKey();
-            PointsToSet pts = entryStatic.getValue();
-
-            StaticFieldDestructor sfd = resolveStaticFieldDestructor(fieldName, pts);
-            if (sfd == null) continue;
-
-            if (!processedSites.add(sfd.dedupSite())) continue;
-
-            Instruction getStatic = new Instruction(Opcode.GET_STATIC);
-            getStatic.addOperand(new Constant(Type.reference(fieldName), fieldName));
-            Temporary staticVal = new Temporary(Type.reference("java/lang/Object"));
-            getStatic.setResult(staticVal);
-            staticVal.setDefiningInstruction(getStatic);
-            current.addInstruction(getStatic);
-
-            Constant nullConst = new Constant(Type.NULL, null);
-            Instruction isNull = new Instruction(Opcode.EQ);
-            isNull.addOperand(staticVal);
-            isNull.addOperand(nullConst);
-            Temporary isNullTmp = new Temporary(Type.BOOLEAN);
-            isNull.setResult(isNullTmp);
-            isNullTmp.setDefiningInstruction(isNull);
-            current.addInstruction(isNull);
-
-            int blockTag = uniqueBlockIndex++;
-            BasicBlock skipBlock = new BasicBlock(funcName + "_skip_" + blockTag);
-            BasicBlock callBlock = new BasicBlock(funcName + "_call_" + blockTag);
-            func.addBlock(skipBlock);
-            func.addBlock(callBlock);
-
-            CondBranchTerminator cond =
-                new CondBranchTerminator(isNullTmp, skipBlock, callBlock);
-            current.setTerminator(cond);
-            current.addSuccessor(skipBlock);
-            current.addSuccessor(callBlock);
-
-            Instruction callDtor = new Instruction(Opcode.STATIC_CALL);
-            callDtor.addOperand(new Constant(
-                Type.reference(sfd.dtor().getName()), sfd.dtor().getName()));
-            callDtor.addOperand(staticVal);
-            callBlock.addInstruction(callDtor);
-            callBlock.setTerminator(new BranchTerminator(skipBlock));
-            callBlock.addSuccessor(skipBlock);
-
-            current = skipBlock;
-        }
-
-        current.setTerminator(new ReturnTerminator(null));
     }
 
     /**
@@ -334,6 +223,83 @@ public class DestructorInserter {
         return null;
     }
 
+    /**
+     * Emits the entry guard for a generated destructor.
+     *
+     * <p>Calls {@code __jnative_dtor_enter(this)} and returns a boolean that
+     * is true exactly when the destructor must skip its body and return
+     * immediately. {@code __jnative_dtor_enter} rejects:
+     *
+     * <ul>
+     *   <li>a null receiver;</li>
+     *   <li>an object that has already been freed earlier in the same
+     *       shutdown pass (the DAG case — a shared singleton reachable from
+     *       two static fields or from two field paths);</li>
+     *   <li>an object that is currently on the destruction call chain (the
+     *       cycle case — e.g. {@code UCharacterProperty.intProp} pointing at
+     *       an {@code IntProperty} whose {@code this$0} points back).</li>
+     * </ul>
+     *
+     * <p>The guard is what breaks infinite mutual recursion between two
+     * destructors on a cyclic graph. It is installed at the entry of every
+     * generated destructor, so an object can never be entered twice on the
+     * same destruction chain, whether the re-entry comes from a diamond or
+     * from a cycle.</p>
+     *
+     * <p>Outside the shutdown phase {@code __jnative_dtor_enter} returns 1
+     * immediately, so this guard costs a single predictable branch in the
+     * normal-execution destruction path.</p>
+     */
+    private Temporary emitDestructionGuard(BasicBlock entry, Parameter thisParam) {
+        Instruction enterCall = new Instruction(Opcode.STATIC_CALL);
+        enterCall.addOperand(new Constant(
+            Type.reference("__jnative_dtor_enter"),
+            "__jnative_dtor_enter"));
+        enterCall.addOperand(thisParam);
+        Temporary enterResult = new Temporary(Type.INT);
+        enterCall.setResult(enterResult);
+        enterResult.setDefiningInstruction(enterCall);
+        entry.addInstruction(enterCall);
+
+        // Skip the destructor body when the entry check rejected us
+        // (__jnative_dtor_enter returned 0).
+        Instruction skip = new Instruction(Opcode.EQ);
+        skip.addOperand(enterResult);
+        skip.addOperand(new Constant(Type.INT, 0));
+        Temporary skipResult = new Temporary(Type.BOOLEAN);
+        skip.setResult(skipResult);
+        skipResult.setDefiningInstruction(skip);
+        entry.addInstruction(skip);
+
+        return skipResult;
+    }
+
+    /**
+     * Emits a call to {@code __jnative_dtor_unclaim(thisParam)} into
+     * {@code block}.
+     *
+     * <p>Removes {@code thisParam} from the thread-local claim stack that
+     * {@link #emitDestructionGuard} populated on entry, so that a
+     * superclass destructor (which receives the same receiver during the
+     * delegation chain) can claim it in turn. Without this release the
+     * delegation chain would stop at the first level, since the superclass
+     * destructor would see the receiver already claimed and return without
+     * touching its own fields.</p>
+     *
+     * <p>Called immediately before the destructor delegates to its
+     * superclass destructor and before it frees the object. Outside the
+     * shutdown phase the call is a no-op.</p>
+     */
+    private void emitUnclaim(BasicBlock block, Parameter thisParam) {
+        Instruction unclaim = new Instruction(Opcode.STATIC_CALL);
+        unclaim.addOperand(new Constant(
+            Type.reference("__jnative_dtor_unclaim"),
+            "__jnative_dtor_unclaim"));
+        unclaim.addOperand(thisParam);
+        unclaim.setParent(block);
+        block.addInstruction(unclaim);
+    }
+
     private Function createClassDestructor(String className) {
         ClassNode classNode = resolver.getClassNode(className);
         if (classNode.isExternal()) {
@@ -356,13 +322,6 @@ public class DestructorInserter {
         func.setEntryBlock(entry);
 
         Constant nullConst = new Constant(Type.NULL, null);
-        Instruction cmp = new Instruction(Opcode.EQ);
-        cmp.addOperand(thisParam);
-        cmp.addOperand(nullConst);
-        Temporary cmpResult = new Temporary(Type.BOOLEAN);
-        cmp.setResult(cmpResult);
-        cmpResult.setDefiningInstruction(cmp);
-        entry.addInstruction(cmp);
 
         BasicBlock returnBlock = new BasicBlock(funcName + "_return");
         func.addBlock(returnBlock);
@@ -371,7 +330,8 @@ public class DestructorInserter {
         BasicBlock bodyBlock = new BasicBlock(funcName + "_body");
         func.addBlock(bodyBlock);
 
-        entry.setTerminator(new CondBranchTerminator(cmpResult, returnBlock, bodyBlock));
+        Temporary skipResult = emitDestructionGuard(entry, thisParam);
+        entry.setTerminator(new CondBranchTerminator(skipResult, returnBlock, bodyBlock));
         entry.addSuccessor(returnBlock);
         entry.addSuccessor(bodyBlock);
 
@@ -447,6 +407,13 @@ public class DestructorInserter {
         // ConcurrentHashMap inside NativeLibraries.<clinit> -- aborted the
         // process before user code could run.
         // ------------------------------------------------------------------
+        // Release the claim before delegating to the superclass destructor or
+        // freeing the object. The superclass destructor receives the same
+        // receiver (thisParam) and must be able to claim it in turn; without
+        // this release the whole delegation chain would stop at the first
+        // level, and the fields declared by every ancestor would leak.
+        emitUnclaim(current, thisParam);
+
         boolean delegatedToSuper = false;
         String superName = classNode.getSuperName();
         if (superName != null && !superName.equals("java/lang/Object")) {
@@ -529,6 +496,8 @@ public class DestructorInserter {
         func.addBlock(entry);
         func.setEntryBlock(entry);
 
+        Constant nullConst = new Constant(Type.NULL, null);
+
         BasicBlock returnBlock = new BasicBlock(funcName + "_return");
         func.addBlock(returnBlock);
         returnBlock.setTerminator(new ReturnTerminator(null));
@@ -536,16 +505,8 @@ public class DestructorInserter {
         BasicBlock bodyBlock = new BasicBlock(funcName + "_body");
         func.addBlock(bodyBlock);
 
-        Constant nullConst = new Constant(Type.NULL, null);
-        Instruction cmpNull = new Instruction(Opcode.EQ);
-        cmpNull.addOperand(arrParam);
-        cmpNull.addOperand(nullConst);
-        Temporary cmpNullResult = new Temporary(Type.BOOLEAN);
-        cmpNull.setResult(cmpNullResult);
-        cmpNullResult.setDefiningInstruction(cmpNull);
-        entry.addInstruction(cmpNull);
-
-        entry.setTerminator(new CondBranchTerminator(cmpNullResult, returnBlock, bodyBlock));
+        Temporary skipResult = emitDestructionGuard(entry, arrParam);
+        entry.setTerminator(new CondBranchTerminator(skipResult, returnBlock, bodyBlock));
         entry.addSuccessor(returnBlock);
         entry.addSuccessor(bodyBlock);
 
@@ -699,13 +660,6 @@ public class DestructorInserter {
         func.setEntryBlock(entry);
 
         Constant nullConst = new Constant(Type.NULL, null);
-        Instruction cmpNull = new Instruction(Opcode.EQ);
-        cmpNull.addOperand(arrParam);
-        cmpNull.addOperand(nullConst);
-        Temporary cmpNullResult = new Temporary(Type.BOOLEAN);
-        cmpNull.setResult(cmpNullResult);
-        cmpNullResult.setDefiningInstruction(cmpNull);
-        entry.addInstruction(cmpNull);
 
         BasicBlock returnBlock = new BasicBlock(funcName + "_return");
         func.addBlock(returnBlock);
@@ -718,173 +672,12 @@ public class DestructorInserter {
         bodyBlock.addInstruction(freeInst);
         bodyBlock.setTerminator(new ReturnTerminator(null));
 
-        entry.setTerminator(new CondBranchTerminator(cmpNullResult, returnBlock, bodyBlock));
+        Temporary skipResult = emitDestructionGuard(entry, arrParam);
+        entry.setTerminator(new CondBranchTerminator(skipResult, returnBlock, bodyBlock));
         entry.addSuccessor(returnBlock);
         entry.addSuccessor(bodyBlock);
 
         return func;
-    }
-
-    /**
-     * Resolves the destructor that shutdown must call on the value of a
-     * static field.
-     *
-     * <p>The field is identified by its fully-qualified name
-     * ({@code "java/time/Duration$DurationUnits.UNITS"}). The field's
-     * declared type is looked up through the resolver; when it is
-     * available, it constrains the candidates to subtypes of that type,
-     * which is exactly the set of concrete classes the field can legally
-     * hold at run time.</p>
-     *
-     * <p>Among the field's points-to sites, those whose type is
-     * {@linkplain #isManagedType managed} and assignable to the declared
-     * type are grouped by concrete type name. If exactly one concrete
-     * type survives, its destructor is used. If the declared type itself
-     * appears among the sites, that exact match wins over any subtype --
-     * a field declared as {@code List12} that also recorded a subtype of
-     * {@code List12} in its points-to set is still a {@code List12} and
-     * its {@code List12} destructor is the correct one to call.</p>
-     *
-     * <p>When two or more distinct concrete types are possible and none
-     * of them matches the declared type exactly, the runtime value's
-     * class cannot be determined at compile time. Destroying it with an
-     * arbitrary candidate's destructor would read fields at the wrong
-     * offsets and, in the general case, free unrelated memory. The
-     * function returns {@code null} in that case, and the caller skips
-     * the field: the object leaks at process exit, which is strictly
-     * safer than corrupting memory.</p>
-     *
-     * <p>The returned {@code dedupSite} is one of the surviving sites and
-     * identifies the object the destructor was chosen for. Because a
-     * given object has exactly one allocation site, two static fields
-     * pointing at the same object produce the same {@code dedupSite} and
-     * the second one is skipped by the caller's {@code processedSites}
-     * set.</p>
-     */
-    private StaticFieldDestructor resolveStaticFieldDestructor(
-            String fieldName, PointsToSet pts) {
-        int dot = fieldName.lastIndexOf('.');
-        if (dot <= 0) return null;
-        String owner = fieldName.substring(0, dot);
-        String name  = fieldName.substring(dot + 1);
-
-        FieldNode fld = resolver.getField(owner, name);
-        Type declaredType = (fld != null) ? fld.getType() : null;
-
-        // Filtering by the declared type is only meaningful when the
-        // resolver actually produced a reference type for the field. A
-        // missing FieldNode, an unresolved declared type, or a primitive
-        // declared type all collapse to "no filter".
-        boolean filterByDeclared = false;
-        if (declaredType != null && declaredType.isReference()) {
-            String dcls = declaredType.getClassName();
-            ClassNode dnode = (dcls != null) ? resolver.getClassNode(dcls) : null;
-            // Even a purely external declared type can be used as the
-            // upper bound of the subtype test -- the class hierarchy of
-            // the point-to sites' own classes is what walkHierarchy
-            // traverses, not the declared type's hierarchy.
-            filterByDeclared = (dcls != null) && (dnode != null);
-        }
-
-        Map<String, AllocationSite> candidatesByType = new LinkedHashMap<>();
-        for (AllocationSite site : pts.getSites()) {
-            if (site == AllocationSite.UNKNOWN) continue;
-            Type t = site.getType();
-            if (t == null || t.isUnknown() || t.isNull()) continue;
-            if (!isManagedType(t)) continue;
-            if (filterByDeclared && !isAssignableTo(t, declaredType)) continue;
-            candidatesByType.putIfAbsent(typeKeyOf(t), site);
-        }
-
-        if (candidatesByType.isEmpty()) return null;
-
-        AllocationSite chosen;
-        if (filterByDeclared) {
-            AllocationSite exact = candidatesByType.get(typeKeyOf(declaredType));
-            if (exact != null) {
-                chosen = exact;
-            } else if (candidatesByType.size() == 1) {
-                chosen = candidatesByType.values().iterator().next();
-            } else {
-                return null;
-            }
-        } else {
-            if (candidatesByType.size() == 1) {
-                chosen = candidatesByType.values().iterator().next();
-            } else {
-                return null;
-            }
-        }
-
-        Function dtor = findDestructor(chosen.getType());
-        if (dtor == null) return null;
-        return new StaticFieldDestructor(dtor, chosen);
-    }
-
-    /**
-     * Stable key identifying the concrete type of an allocation site.
-     * Arrays use their descriptor form ("[Ljava/lang/String;"); reference
-     * types use their internal name ("java/util/ImmutableCollections$List12").
-     */
-    private static String typeKeyOf(Type t) {
-        if (t == null) return "<null>";
-        if (t.isArray()) return t.toString();
-        if (t.isReference()) {
-            String n = t.getClassName();
-            return (n != null) ? n : "<unknown-ref>";
-        }
-        return t.toString();
-    }
-
-    /**
-     * True iff {@code sub} is a subtype of {@code sup} in the resolver's
-     * class hierarchy.
-     *
-     * <p>Arrays are subtypes of {@code java/lang/Object},
-     * {@code java/lang/Cloneable} and {@code java/io/Serializable}, and
-     * of nothing else. Reference types are walked up their superclass
-     * chain and across every declared interface. Cycles cannot occur
-     * (the JVM forbids them), but the visited set is kept as a belt-and-
-     * braces guard against a malformed class map.</p>
-     */
-    private boolean isAssignableTo(Type sub, Type sup) {
-        if (sub == null || sup == null) return false;
-        if (!sup.isReference()) return false;
-
-        if (sub.isArray()) {
-            String sn = sup.getClassName();
-            return "java/lang/Object".equals(sn)
-                || "java/lang/Cloneable".equals(sn)
-                || "java/io/Serializable".equals(sn);
-        }
-        if (!sub.isReference()) return false;
-
-        String subName = sub.getClassName();
-        String supName = sup.getClassName();
-        if (subName == null || supName == null) return false;
-
-        return walkHierarchy(subName, supName, new HashSet<>());
-    }
-
-    private boolean walkHierarchy(String current, String target, Set<String> visited) {
-        if (current == null || !visited.add(current)) return false;
-        if (current.equals(target)) return true;
-
-        ClassNode cn = resolver.getClassNode(current);
-        if (cn == null) return false;
-
-        String sup = cn.getSuperName();
-        if (sup != null && !sup.equals(current)
-            && walkHierarchy(sup, target, visited)) {
-            return true;
-        }
-        for (String iface : cn.getInterfaces()) {
-            if (iface != null && !iface.equals(current)
-                && walkHierarchy(iface, target, visited)) {
-                return true;
-            }
-        }
-        return false;
     }
 
     private Function findDestructor(Type type) {

@@ -40,92 +40,11 @@ static const char* __jnative_vtable_class_name(void* vtable) {
 }
 
 /* ============================================================================
- * Safe deallocation of Java reference fields.
- *
- * Every reference-typed field of a Java object is a pointer, but not every
- * such pointer addresses heap memory. The runtime emits three distinct
- * kinds of reference values, and only one of them is malloc-owned:
- *
- *   1. Objects allocated at run time by the emitter (Opcode.NEW,
- *      NEW_ARRAY, MULTI_NEW_ARRAY) or by the runtime's own
- *      jnative_alloc_object / jnative_array_alloc helpers. These are
- *      backed by calloc and are safe to free.
- *
- *   2. Java String literals, emitted by LlvmGlobalEmitter as static
- *      `global %struct.java_lang_String` constants with the mangled
- *      name @jstr_<hex>. A class that stores such a literal into one of
- *      its fields -- every enum constant, every class that caches a
- *      literal name, every method handle that remembers its method
- *      name -- ends up with a field whose value points into the
- *      executable's .data segment. free() of such a pointer is
- *      undefined behaviour; glibc reports it as "free(): invalid
- *      pointer".
- *
- *   3. The backing byte[] of a String literal, emitted alongside the
- *      String as @strbytes_<hex>. Same reasoning as (2): it is static
- *      storage, and no destructor may free it.
- *
- * The concrete failure that motivated this helper:
- *
- *     fn___jnative_shutdown walks every static field and calls the
- *     field's destructor. One such field is the enum constant
- *     VarHandle.AccessMode.GET_AND_ADD_RELEASE, a genuine heap object
- *     whose destructor calls __destruct_java_lang_Enum and then frees
- *     its own String-typed fields. Those fields hold @jstr_* constants,
- *     which are not heap allocations. The first free() on such a value
- *     aborted the process during exit, after main() had already
- *     produced its output:
- *
- *         Test2@fa8c8d50
- *         100000
- *         free(): invalid pointer
- *
- *     The same shape is present throughout the module: java.lang.Enum's
- *     own destructor frees the `name` field, every enum constant has
- *     both `name` and any string-typed auxiliary field, and any class
- *     with a String-typed field that receives a literal at construction
- *     time is on the same path.
- *
- * __jnative_free is the single entry point that DestructorInserter and
- * DestructorSimplifier route every Opcode.FREE through. It answers the
- * one question that matters -- "was this pointer handed out by the
- * allocator?" -- by checking whether the address falls inside the main
- * executable's writable data segments. Everything outside that range
- * (the heap, the stack, other mappings) is passed to free() unchanged;
- * everything inside is left alone.
- *
- * Rationale for the range, rather than a per-allocation registry:
- *
- *   - The registry approach (record every calloc, look up every free)
- *     would add a hash-table insert to every object construction and a
- *     lookup to every destruction. On a JDK-sized image that is millions
- *     of operations per second of execution; the range check is two
- *     integer comparisons.
- *
- *   - The range approach is exact for the failure mode that actually
- *     occurs: static constants live inside the executable's writable
- *     segments and nowhere else. A heap pointer can never coincide with
- *     that range; the allocator's arena is a separate mmap'd region.
- *
- *   - The range is computed once, lazily, through pthread_once, and is
- *     then a pair of read-only values. No lock is taken on the hot
- *     path.
- *
- * The writable-segment filter is deliberate. A String literal's String
- * header has mutable fields (the cached hashCode), so LLVM emits it as
- * a mutable `global`, which lands in .data. The byte[] payload is
- * emitted as `unnamed_addr constant`, which lands in .rodata and is
- * never stored into a Java-visible field as a reference -- no destructor
- * ever holds one of those pointers. Restricting the range to writable
- * segments keeps it tight and avoids having to consult the read-only
- * segment layout at all.
- *
- * On platforms without PT_LOAD introspection the fallback symbols
- * __data_start and _end bracket the same region and are always provided
- * by the system linker. Both sources are merged: whichever produces the
- * wider range wins, which is the safe direction -- a pointer on the
- * boundary is treated as static, never as heap.
+ * Safe deallocation and cycle-safe destruction.
+ * See the matching comment block in jnative_runtime.h.
  * ========================================================================== */
+
+/* --- Static data-segment range (unchanged) ------------------------------ */
 
 static uintptr_t     jnative_static_low  = 0;
 static uintptr_t     jnative_static_high = 0;
@@ -202,11 +121,194 @@ static void jnative_build_static_range(void) {
 #endif
 }
 
+/* --- Shutdown flag ------------------------------------------------------ */
+
+static volatile int jnative_in_shutdown = 0;
+
+void __jnative_begin_shutdown(void) {
+    jnative_in_shutdown = 1;
+}
+
+/* --- Freed-address set (permanent for the process lifetime) ------------- */
+
+typedef struct {
+    uintptr_t* slots;
+    size_t     capacity;
+    size_t     size;
+} JNativeFreedSet;
+
+#define JNATIVE_FREED_INITIAL_CAPACITY ((size_t)1 << 12)
+
+static JNativeFreedSet jnative_freed_set  = { NULL, 0, 0 };
+static pthread_mutex_t jnative_freed_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static inline uintptr_t jnative_mix(uintptr_t p) {
+    p ^= p >> 33;
+    p *= 0xff51afd7ed558ccdULL;
+    p ^= p >> 33;
+    p *= 0xc4ceb9fe1a85ec53ULL;
+    p ^= p >> 33;
+    return p;
+}
+
+static int jnative_freed_grow_locked(void) {
+    size_t new_cap = (jnative_freed_set.capacity == 0)
+        ? JNATIVE_FREED_INITIAL_CAPACITY
+        : jnative_freed_set.capacity * 2;
+
+    uintptr_t* new_slots = (uintptr_t*)calloc(new_cap, sizeof(uintptr_t));
+    if (new_slots == NULL) return 0;
+
+    if (jnative_freed_set.slots != NULL) {
+        for (size_t i = 0; i < jnative_freed_set.capacity; i++) {
+            uintptr_t v = jnative_freed_set.slots[i];
+            if (v == 0) continue;
+            size_t j = (size_t)(jnative_mix(v) & (new_cap - 1));
+            while (new_slots[j] != 0) j = (j + 1) & (new_cap - 1);
+            new_slots[j] = v;
+        }
+        free(jnative_freed_set.slots);
+    }
+    jnative_freed_set.slots    = new_slots;
+    jnative_freed_set.capacity = new_cap;
+    return 1;
+}
+
+/* Inserts `p`; returns 1 on a fresh insert, 0 on duplicate or on
+ * allocator failure. A 0 from an allocator failure would be wrong to
+ * treat as "already freed", so in that case we return 1 (proceed to
+ * free) — the alternative is a leak, which is the lesser evil under
+ * memory exhaustion. */
+static int jnative_freed_insert(uintptr_t p) {
+    if (p == 0) return 0;
+
+    pthread_mutex_lock(&jnative_freed_lock);
+
+    if (jnative_freed_set.capacity == 0) {
+        if (!jnative_freed_grow_locked()) {
+            pthread_mutex_unlock(&jnative_freed_lock);
+            return 1;
+        }
+    }
+    if (jnative_freed_set.size * 2 >= jnative_freed_set.capacity) {
+        (void)jnative_freed_grow_locked();
+    }
+
+    size_t idx = (size_t)(jnative_mix(p) &
+                          (jnative_freed_set.capacity - 1));
+    while (jnative_freed_set.slots[idx] != 0) {
+        if (jnative_freed_set.slots[idx] == p) {
+            pthread_mutex_unlock(&jnative_freed_lock);
+            return 0;
+        }
+        idx = (idx + 1) & (jnative_freed_set.capacity - 1);
+    }
+    jnative_freed_set.slots[idx] = p;
+    jnative_freed_set.size++;
+    pthread_mutex_unlock(&jnative_freed_lock);
+    return 1;
+}
+
+static int jnative_freed_contains(uintptr_t p) {
+    if (p == 0) return 0;
+
+    pthread_mutex_lock(&jnative_freed_lock);
+    if (jnative_freed_set.capacity == 0) {
+        pthread_mutex_unlock(&jnative_freed_lock);
+        return 0;
+    }
+    size_t idx = (size_t)(jnative_mix(p) &
+                          (jnative_freed_set.capacity - 1));
+    while (jnative_freed_set.slots[idx] != 0) {
+        if (jnative_freed_set.slots[idx] == p) {
+            pthread_mutex_unlock(&jnative_freed_lock);
+            return 1;
+        }
+        idx = (idx + 1) & (jnative_freed_set.capacity - 1);
+    }
+    pthread_mutex_unlock(&jnative_freed_lock);
+    return 0;
+}
+
+/* --- Thread-local claim stack ------------------------------------------- */
+
+typedef struct {
+    uintptr_t* slots;
+    size_t     depth;
+    size_t     capacity;
+} JNativeClaimStack;
+
+static _Thread_local JNativeClaimStack jnative_claim_stack = { NULL, 0, 0 };
+
+static int jnative_claim_push(uintptr_t p) {
+    if (jnative_claim_stack.depth == jnative_claim_stack.capacity) {
+        size_t new_cap = (jnative_claim_stack.capacity == 0)
+            ? 64
+            : jnative_claim_stack.capacity * 2;
+        uintptr_t* grown = (uintptr_t*)realloc(
+            jnative_claim_stack.slots, new_cap * sizeof(uintptr_t));
+        if (grown == NULL) return 0;
+        jnative_claim_stack.slots    = grown;
+        jnative_claim_stack.capacity = new_cap;
+    }
+    jnative_claim_stack.slots[jnative_claim_stack.depth++] = p;
+    return 1;
+}
+
+static int jnative_claim_contains(uintptr_t p) {
+    for (size_t i = 0; i < jnative_claim_stack.depth; i++) {
+        if (jnative_claim_stack.slots[i] == p) return 1;
+    }
+    return 0;
+}
+
+static void jnative_claim_remove(uintptr_t p) {
+    for (size_t i = jnative_claim_stack.depth; i > 0; i--) {
+        if (jnative_claim_stack.slots[i - 1] == p) {
+            /* Swap with the last entry. The stack has no LIFO discipline
+             * worth preserving: each entry is independent and membership
+             * is what matters. */
+            jnative_claim_stack.slots[i - 1] =
+                jnative_claim_stack.slots[jnative_claim_stack.depth - 1];
+            jnative_claim_stack.depth--;
+            return;
+        }
+    }
+}
+
+/* --- Public destructor entry / unclaim ---------------------------------- */
+
+int __jnative_dtor_enter(void* this_obj) {
+    if (this_obj == NULL) return 0;
+    if (!jnative_in_shutdown) return 1;
+
+    uintptr_t p = (uintptr_t)this_obj;
+
+    if (jnative_freed_contains(p))     return 0;
+    if (jnative_claim_contains(p))     return 0;
+
+    if (!jnative_claim_push(p)) {
+        /* Allocation failed while growing the claim stack. Proceeding
+         * without a claim risks an unbounded cycle; refusing to proceed
+         * leaves the object un-freed. The safer direction is to
+         * proceed: a bounded double destruction is caught by the
+         * __jnative_free idempotence, while an unbounded cycle is not. */
+        return 1;
+    }
+    return 1;
+}
+
+void __jnative_dtor_unclaim(void* this_obj) {
+    if (this_obj == NULL) return;
+    if (!jnative_in_shutdown) return;
+    jnative_claim_remove((uintptr_t)this_obj);
+}
+
+/* --- Public deallocation entry point ------------------------------------ */
+
 __attribute__((noinline))
 void __jnative_free(void* p) {
-    if (p == NULL) {
-        return;
-    }
+    if (p == NULL) return;
 
     pthread_once(&jnative_static_once, jnative_build_static_range);
 
@@ -215,13 +317,15 @@ void __jnative_free(void* p) {
         && jnative_static_high != 0
         && addr >= jnative_static_low
         && addr <  jnative_static_high) {
-        /* The pointer addresses a static object baked into the module
-         * image. It is not allocator-owned, and free() of it is
-         * undefined behaviour that glibc catches as "free(): invalid
-         * pointer". Static objects live for the entire process lifetime
-         * and are reclaimed by the OS at exit; the runtime deliberately
-         * leaves them alone. */
+        /* Static object baked into the module image — not allocator-owned. */
         return;
+    }
+
+    if (jnative_in_shutdown) {
+        if (!jnative_freed_insert(addr)) {
+            /* Already freed earlier in this shutdown pass. */
+            return;
+        }
     }
 
     free(p);

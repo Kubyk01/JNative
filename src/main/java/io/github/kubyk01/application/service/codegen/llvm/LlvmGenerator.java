@@ -941,9 +941,34 @@ public class LlvmGenerator {
     private String generateMain() {
         StringBuilder sb = new StringBuilder();
         sb.append("define i32 @main(i32 %argc, i8** %argv) {\n");
-        sb.append("  call i32 @atexit(void ()* @")
-            .append(LlvmRuntime.mangleFunction("__jnative_shutdown"))
-            .append(")\n");
+
+        // Shutdown-based destruction is deliberately NOT installed.
+        //
+        // Earlier revisions registered fn___jnative_shutdown with atexit()
+        // and had it walk every static field, calling each field's
+        // destructor. That design is unsafe against two structural
+        // properties of a real Java object graph:
+        //
+        //   1. DAG sharing — the same singleton reachable from two static
+        //      fields, or from a static field and from another object's
+        //      field, is destroyed twice by a flat per-field schedule.
+        //
+        //   2. Cycles — a pair of objects pointing at each other, such as
+        //      UCharacterProperty.intProp <-> IntProperty.this$0, makes
+        //      the recursive destructors enter each other forever and
+        //      exhausts the native stack.
+        //
+        // A correct fix would have to compute the full reachability
+        // closure of every static field, topologically order it, and
+        // destroy each object exactly once at its depth. That machinery
+        // is out of proportion to the benefit: the process is about to
+        // exit anyway, and the operating system reclaims every byte of
+        // the image's memory regardless of what the C side does here.
+        //
+        // Per-use destruction at ordinary destruction points is
+        // unaffected. DestructorInserter still generates destructors and
+        // still inserts calls at the DestructionPoints that
+        // LifetimeAnalyzer found. Only the shutdown aggregation is gone.
 
         // ------------------------------------------------------------------
         // Stage 0: layout handoffs.

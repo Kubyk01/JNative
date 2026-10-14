@@ -703,6 +703,68 @@ extern void __jnative_monitor_exit(void* obj);
  */
 extern void __jnative_free(void* p);
 
+/* ============================================================================
+ *  Cycle-safe destruction during shutdown.
+ * ============================================================================
+ *
+ * Java object graphs are DAGs with cycles. A shared singleton such as
+ * java.lang.module.Configuration.EMPTY_CONFIGURATION is reachable both as
+ * a static field of its own class and as a field of another static
+ * field's object; and pairs such as
+ *
+ *     UCharacterProperty.intProp      --->  UCharacterProperty$IntProperty
+ *     UCharacterProperty$IntProperty.this$0  --->  UCharacterProperty
+ *
+ * form genuine cycles. A naive recursive destructor would then
+ *   - on a DAG:    free a shared object twice (glibc "double free in tcache 2");
+ *   - on a cycle:  recurse forever between the two objects, exhausting the
+ *                  native stack and taking SIGSEGV on the guard page.
+ *
+ * The runtime exposes three entry points that together make the shutdown
+ * pass safe against both shapes.
+ *
+ *   __jnative_begin_shutdown()
+ *       Activates the machinery for the remainder of the process. Called
+ *       once, from the very beginning of fn___jnative_shutdown, before the
+ *       first destructor runs. Before it is called the two guards below
+ *       are no-ops; ordinary-execution destructor calls pay nothing.
+ *
+ *   __jnative_dtor_enter(this) -> int
+ *       Called at the entry of every generated destructor. Returns 1 if
+ *       the destructor may proceed, 0 if it must return immediately.
+ *       Returns 0 when
+ *         - `this` is NULL, or
+ *         - `this` has already been freed earlier in this shutdown pass
+ *           (freed set membership), or
+ *         - `this` is currently on the destruction call chain (claim stack
+ *           membership, i.e. a cycle or a re-entrant path).
+ *       Otherwise it adds `this` to the thread-local claim stack and
+ *       returns 1.
+ *
+ *   __jnative_dtor_unclaim(this)
+ *       Called immediately before the destructor delegates to its
+ *       superclass destructor or frees the object. It removes `this` from
+ *       the claim stack so that the superclass destructor (which receives
+ *       the same receiver) can claim it in turn. Without this call the
+ *       delegation chain would stop at the first level.
+ *
+ * Every free() in a destructor path is routed through __jnative_free,
+ * which adds the address to the freed set so any later arrival on the
+ * same address in the same shutdown pass is rejected by
+ * __jnative_dtor_enter.
+ *
+ * Threading model: the shutdown pass is single-threaded by construction
+ * (atexit runs on the main thread), so the claim stack is thread-local
+ * and both operations are lock-free. The freed set is process-wide and
+ * protected by a mutex, because it must remain valid if any thread ever
+ * invokes a destructor during shutdown (defensive, not needed today).
+ * ========================================================================== */
+
+extern void __jnative_begin_shutdown(void);
+extern int  __jnative_dtor_enter(void* this_obj);
+extern void __jnative_dtor_unclaim(void* this_obj);
+extern void __jnative_free(void* p);
+
 /* ---- Exception construction and throwers --------------------------- */
 
 /**

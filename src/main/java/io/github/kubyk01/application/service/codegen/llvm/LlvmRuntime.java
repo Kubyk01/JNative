@@ -100,6 +100,11 @@ public class LlvmRuntime {
             declare i8* @calloc(i64, i64)
             declare void @free(i8*)
             declare void @__jnative_free(i8*)
+
+            declare void @__jnative_begin_shutdown()
+            declare i32  @__jnative_dtor_enter(i8*)
+            declare void @__jnative_dtor_unclaim(i8*)
+
             declare i32 @printf(i8*, ...)
             declare void @abort() noreturn
             declare i32 @atexit(void ()*)
