@@ -17,6 +17,7 @@ import org.objectweb.asm.FieldVisitor;
 import org.objectweb.asm.MethodVisitor;
 import org.objectweb.asm.Opcodes;
 
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.lang.reflect.Field;
@@ -29,6 +30,8 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
 import java.util.stream.Collectors;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipInputStream;
 
 /**
  * Resolves class metadata from the input (a JAR, a directory of .class
@@ -118,7 +121,126 @@ public class DependencyResolver {
 
     private FileSystem jrtFileSystem;
 
+    /**
+     * True iff {@code name} denotes a Java array type, in any of the two
+     * forms the resolver observes.
+     *
+     * <p>Two distinct subsystems build class-name strings for the
+     * resolver, and each uses its own notation:</p>
+     *
+     * <ul>
+     *   <li>JVM descriptors — {@code "[Lorg/springframework/expression/spel/SpelCompilerMode;"}
+     *       — produced by {@link io.github.kubyk01.domain.ir.Type#toString()}
+     *       for {@code Type.ArrayType} instances and by every code path
+     *       that stringifies a resolved {@code Type}. The leading
+     *       {@code '['} carries the dimensionality; reference components
+     *       are wrapped in {@code L...;} and primitive components use
+     *       their standard single-letter codes.</li>
+     *
+     *   <li>Java-style array names — {@code "bce/com/salonshub/view/SalonView[]"}
+     *       — produced by {@code java.lang.Class.getName()} on an array
+     *       class, and by any code that calls {@code getTypeName()}
+     *       without the descriptor conversion step. The trailing
+     *       {@code "[]"} pair carries the dimensionality; the base name
+     *       uses the same {@code '/'} separator the resolver sees for
+     *       ordinary classes.</li>
+     * </ul>
+     *
+     * <p>Both forms reach the resolver through the same entry points —
+     * {@link #getClassNode(String)}, {@link #loadSystemClass(String)},
+     * {@link #forceLoadSystemClass(String)}, {@link #reloadSystemClass(String)}
+     * — because the callers that produce them do not distinguish "a class"
+     * from "a type whose name happens to be resolvable". Neither form
+     * names a class with bytecode: array classes are synthesised by the
+     * JVM at run time and have no {@code .class} file to load.</p>
+     *
+     * <p>The concrete symptom that motivated this check: a Spring Boot
+     * fat-jar run produced 587 distinct warnings of the form</p>
+     *
+     * <pre>
+     *   Class not found in input:
+     *       [Lorg/springframework/expression/spel/SpelCompilerMode;
+     *       – treated as external
+     * </pre>
+     *
+     * <p>that buried the two genuine missing-class warnings — the
+     * compile-only optional dependencies that really are absent from the
+     * input — in a stream of false positives.</p>
+     */
+    private static boolean isArrayTypeName(String name) {
+        if (name == null || name.isEmpty()) return false;
+        if (name.charAt(0) == '[') return true;
+        int n = name.length();
+        return n >= 2 && name.charAt(n - 1) == ']' && name.charAt(n - 2) == '[';
+    }
+
+    /**
+     * Builds the synthetic {@link ClassNode} that represents an array
+     * type. The node is cached in {@link #classMap} under the array name
+     * by every caller of this method, so the same array mentioned from N
+     * call sites produces exactly one node.
+     *
+     * <p>The node is deliberately minimal, but each of its three
+     * populated fields carries a specific, load-bearing meaning:</p>
+     *
+     * <ul>
+     *   <li>{@code getName()} returns the array name exactly as the caller
+     *       supplied it. A caller that asks for
+     *       {@code "[Lorg/foo/Bar;"} and later reads the node's name back
+     *       must observe the same string; anything else would make the
+     *       caller's own cache keys and reachability bookkeeping diverge
+     *       from the resolver's.</li>
+     *
+     *   <li>{@code getSuperName()} returns {@code java/lang/Object}. JLS
+     *       §10.8 fixes this for every array type, including arrays whose
+     *       component is a primitive. Consumers that walk the superclass
+     *       chain — {@link #findMethodInHierarchy} among them — therefore
+     *       resolve array method calls through {@code java/lang/Object},
+     *       which is exactly where the JVM resolves them: the only
+     *       methods an array has are the ones it inherits from
+     *       {@code Object}.</li>
+     *
+     *   <li>{@code isExternal()} is {@code true}. Arrays have no bytecode,
+     *       no {@code <clinit>}, no vtable of their own and no fields;
+     *       every downstream pass that consumes a {@code ClassNode} checks
+     *       this flag first and skips the node accordingly. Marking the
+     *       node external keeps every one of those passes from attempting
+     *       work that has no meaning for an array.</li>
+     * </ul>
+     *
+     * <p>The node has no methods, no fields, no interfaces and no
+     * constructors. That is not an under-approximation: an array class
+     * genuinely declares nothing of its own, and the reflection machinery
+     * that consumes {@code ClassNode} never reaches an array class through
+     * the paths that would need those lists populated.</p>
+     */
+    private static ClassNode createArrayClassNode(String arrayName) {
+        return ClassNode.builder()
+                .name(arrayName)
+                .superName("java/lang/Object")
+                .isExternal(true)
+                .build();
+    }
+
     public synchronized void loadSystemClass(String internalName) {
+        // Array types have no class file: they are synthesised by the JVM
+        // at run time and cannot be loaded through any of the paths below.
+        // Short-circuit with a synthetic ClassNode before the missing-class
+        // cache and the ClassLoader / JRT / reflection probes so that
+        //   (a) no spurious "not found" warning is logged — the caller
+        //       that produced the array name did not ask for a class that
+        //       failed to load, it asked for a type that never had a
+        //       class file to begin with; and
+        //   (b) the result is deterministic and independent of what the
+        //       build host's classpath happens to contain.
+        // See isArrayTypeName / createArrayClassNode for the full
+        // rationale and the shape of the synthetic node.
+        if (isArrayTypeName(internalName)) {
+            classMap.computeIfAbsent(internalName,
+                    DependencyResolver::createArrayClassNode);
+            return;
+        }
+
         if (classMap.containsKey(internalName)) {
             return;
         }
@@ -325,6 +447,18 @@ public class DependencyResolver {
     }
 
     public synchronized void forceLoadSystemClass(String internalName) {
+        // Array types have no load path and no cached bytecode to
+        // refresh: the synthetic node installed by loadSystemClass() is
+        // the final answer, and no amount of forcing will change it.
+        // Short-circuit so a forced reload of an array name does not
+        // remove the cached node only to have it reinstalled with an
+        // identical shape a moment later.
+        if (isArrayTypeName(internalName)) {
+            classMap.computeIfAbsent(internalName,
+                    DependencyResolver::createArrayClassNode);
+            return;
+        }
+
         ClassNode existing = classMap.get(internalName);
         if (existing != null) {
             boolean noBytes = classBytes.get(internalName) == null;
@@ -343,6 +477,16 @@ public class DependencyResolver {
      * preferring the JRT image or ClassLoader over reflection.
      */
     public synchronized void reloadSystemClass(String internalName) {
+        // Array types have no class file to reload and no cached bytes to
+        // discard; the synthetic ClassNode installed by loadSystemClass()
+        // is the only representation that can exist for an array name.
+        // See isArrayTypeName / createArrayClassNode.
+        if (isArrayTypeName(internalName)) {
+            classMap.computeIfAbsent(internalName,
+                    DependencyResolver::createArrayClassNode);
+            return;
+        }
+
         classMap.remove(internalName);
         classBytes.remove(internalName);
         missingClasses.remove(internalName);
@@ -373,6 +517,21 @@ public class DependencyResolver {
                             parseMetadataStream(is, entry.getName());
                         }
                     }
+                    // Spring Boot "fat"/executable jars keep every
+                    // dependency as a nested jar under BOOT-INF/lib/ (and
+                    // the application's own classes under BOOT-INF/classes/,
+                    // which are already handled above because their entry
+                    // names still end in ".class"). Without this branch the
+                    // outer enumeration only ever sees the handful of
+                    // spring-boot-loader classes and the application's own
+                    // classes; every Spring/Reactor/R2DBC/Liquibase class
+                    // is invisible, so the resolver falls back to
+                    // reflection stubs and logs "System class ... not found".
+                    if (entry.getName().endsWith(".jar")) {
+                        try (InputStream is = jar.getInputStream(entry)) {
+                            parseNestedJarStream(is, entry.getName());
+                        }
+                    }
                 }
             }
         } else if (path.toString().endsWith(".class")) {
@@ -394,10 +553,53 @@ public class DependencyResolver {
 
     private void parseMetadataStream(InputStream is, String fileName) {
         try {
-            ReachabilityMetadata part = ReachabilityMetadataParser.parse(is, fileName);
+            // Jackson's ObjectMapper closes the stream it is given
+            // (AUTO_CLOSE_SOURCE). When this method is called with the
+            // shared ZipInputStream that walks a nested jar, that close
+            // tears the whole archive down and every subsequent
+            // getNextEntry()/read() throws "Stream closed", silently
+            // dropping every remaining class in that jar. Buffering the
+            // small JSON entry first hands Jackson a stream it may close
+            // harmlessly. readAllBytes() on the ZipInputStream consumes
+            // exactly the current entry, leaving the archive walk intact.
+            byte[] bytes = is.readAllBytes();
+            ReachabilityMetadata part = ReachabilityMetadataParser.parse(
+                    new ByteArrayInputStream(bytes), fileName);
             metadata.merge(part);
         } catch (Exception e) {
             log.warn("Failed to parse metadata stream: {}", fileName, e);
+        }
+    }
+
+    /**
+     * Parses the classes and reachability metadata out of a jar nested
+     * inside the input archive (the Spring Boot {@code BOOT-INF/lib/*.jar}
+     * layout). The nested jar is streamed through a {@link ZipInputStream}
+     * so it never has to be materialised on disk; each {@code .class}
+     * entry is handed to {@link #parseClassStream(InputStream)}, which
+     * consumes exactly one entry because {@code readAllBytes()} stops at
+     * the entry boundary.
+     */
+    private void parseNestedJarStream(InputStream is, String nestedName) {
+        try (ZipInputStream zis = new ZipInputStream(is)) {
+            ZipEntry entry;
+            while ((entry = zis.getNextEntry()) != null) {
+                String entryName = entry.getName();
+                if (entryName.endsWith(".class")) {
+                    try {
+                        parseClassStream(zis);
+                    } catch (IOException e) {
+                        log.warn("Failed to parse class {} from nested jar {}: {}",
+                                entryName, nestedName, e.getMessage());
+                    }
+                } else if (entryName.startsWith(NATIVE_IMAGE_METADATA_PREFIX)
+                        && entryName.endsWith(".json")) {
+                    parseMetadataStream(zis, nestedName + "!/" + entryName);
+                }
+                zis.closeEntry();
+            }
+        } catch (IOException e) {
+            log.warn("Failed to parse nested jar {}: {}", nestedName, e.getMessage());
         }
     }
 
@@ -527,6 +729,18 @@ public class DependencyResolver {
 
     private void buildSubclassIndex() {
         for (ClassNode cn : classMap.values()) {
+            // Array stubs are synthetic: the JVM's array classes are
+            // subtypes of Object per JLS §10.8, but they are not classes
+            // with bytecode, they are never the target of a virtual or
+            // interface dispatch through the subclass index, and the
+            // resolver caches one synthetic node per array-type name it
+            // observes. Registering those nodes under java/lang/Object
+            // would make every subclass-of-Object query return an
+            // unbounded list of array types that have no relevant
+            // structure, and would grow the subclass index by one entry
+            // per distinct array type mentioned anywhere in the image.
+            if (isArrayTypeName(cn.getName())) continue;
+
             if (cn.getSuperName() != null) {
                 subclasses
                         .computeIfAbsent(cn.getSuperName(),
@@ -543,6 +757,16 @@ public class DependencyResolver {
     }
 
     public ClassNode getClassNode(String internalName) {
+        // Array types have no class file: return a synthetic ClassNode
+        // rather than probing every load path and logging a false-positive
+        // "not found" warning. See isArrayTypeName /
+        // createArrayClassNode for the shape of the node and why each
+        // field has the value it has.
+        if (isArrayTypeName(internalName)) {
+            return classMap.computeIfAbsent(internalName,
+                    DependencyResolver::createArrayClassNode);
+        }
+
         ClassNode node = classMap.get(internalName);
         if (node != null) return node;
 
@@ -656,17 +880,22 @@ public class DependencyResolver {
         classMap.put(name, classNode);
         classBytes.put(name, bytes);
 
-        if (classNode.getSuperName() != null) {
+        // The name that reaches this point always comes from a real
+        // ClassReader.visit callback, so it is never an array descriptor;
+        // the guard is defensive and mirrors the one in buildSubclassIndex.
+        if (!isArrayTypeName(name) && classNode.getSuperName() != null) {
             subclasses
                     .computeIfAbsent(classNode.getSuperName(),
                             k -> ConcurrentHashMap.newKeySet())
                     .add(name);
         }
-        for (String iface : classNode.getInterfaces()) {
-            subclasses
-                    .computeIfAbsent(iface,
-                            k -> ConcurrentHashMap.newKeySet())
-                    .add(name);
+        if (!isArrayTypeName(name)) {
+            for (String iface : classNode.getInterfaces()) {
+                subclasses
+                        .computeIfAbsent(iface,
+                                k -> ConcurrentHashMap.newKeySet())
+                        .add(name);
+            }
         }
     }
 

@@ -44,6 +44,23 @@ public class ReachabilityMetadata {
         private boolean allPublicMethods;
         private boolean allPublicFields;
         private boolean allPublicConstructors;
+
+        /**
+         * The value of the {@code condition.typeReachable} expression from
+         * the source {@code reflect-config.json}, or {@code null} when the
+         * entry has no condition.
+         *
+         * <p>Semantics (as in GraalVM native-image): the entry is applied
+         * only if the named trigger type is reachable in the image. When
+         * {@code null} or empty the entry is unconditional and always
+         * applied.</p>
+         *
+         * <p>The name form is a binary name with dots
+         * ({@code java.lang.String}), not an internal name with slashes.
+         * Conversion to internal form is performed in
+         * {@link io.github.kubyk01.application.service.analyzer.reachabilityanalysis.ReachabilityAnalysis#isTriggerReachable(String)}.</p>
+         */
+        private String typeReachable;
     }
 
     @Data

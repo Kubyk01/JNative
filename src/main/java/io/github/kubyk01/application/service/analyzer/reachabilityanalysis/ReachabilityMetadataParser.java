@@ -104,8 +104,10 @@ public class ReachabilityMetadataParser {
                 || node.has("queryAllDeclaredMethods") || node.has("queryAllPublicMethods");
     }
 
-    private static void parseReflectClass(JsonNode node, List<ReachabilityMetadata.ReflectClass> out) {
+    private static void parseReflectClass(JsonNode node,
+                                          List<ReachabilityMetadata.ReflectClass> out) {
         if (!node.has("name")) return;
+
         Set<String> methods = new HashSet<>();
         Set<String> fields = new HashSet<>();
         Set<String> constructors = new HashSet<>();
@@ -144,7 +146,44 @@ public class ReachabilityMetadataParser {
             .allPublicMethods(flag(node, "allPublicMethods"))
             .allPublicFields(flag(node, "allPublicFields"))
             .allPublicConstructors(flag(node, "allPublicConstructors"))
+            .typeReachable(parseTypeReachableCondition(node))
             .build());
+    }
+
+    /**
+     * Extracts {@code condition.typeReachable} from a reflect-config.json
+     * node.
+     *
+     * <p>The native-image metadata schema allows any reflect entry to carry
+     * an optional condition:</p>
+     *
+     * <pre>
+     *   { "name": "…",
+     *     "condition": { "typeReachable": "…" },
+     *     "methods": [...] }
+     * </pre>
+     *
+     * <p>The condition field is not part of the entry as such — it only
+     * controls whether the entry is applied. The value is returned in
+     * binary form (with dots). An empty string and a missing condition are
+     * both normalised to {@code null} so that callers treat the two cases
+     * identically.</p>
+     *
+     * <p>If {@code condition} is present but is not an object, or does not
+     * contain {@code typeReachable} (or contains {@code null}), the
+     * condition is considered absent. This is robust to future schema
+     * extensions: unknown kinds of conditions do not cause the entry to be
+     * dropped, but are treated as "no condition".</p>
+     */
+    private static String parseTypeReachableCondition(JsonNode node) {
+        if (!node.has("condition")) return null;
+        JsonNode condition = node.get("condition");
+        if (condition == null || !condition.isObject()) return null;
+        if (!condition.has("typeReachable")) return null;
+        JsonNode trigger = condition.get("typeReachable");
+        if (trigger == null || trigger.isNull()) return null;
+        String value = trigger.asText("");
+        return value.isEmpty() ? null : value;
     }
 
     private static void appendParams(StringBuilder sig, JsonNode member) {
