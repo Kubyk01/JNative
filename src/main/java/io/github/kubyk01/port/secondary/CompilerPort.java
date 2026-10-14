@@ -5,16 +5,18 @@ import io.github.kubyk01.domain.ir.Module;
 
 import java.io.IOException;
 import java.nio.file.Path;
+import java.util.List;
 import java.util.Set;
 
 public interface CompilerPort {
 
-    void compileAndLink(Path llPath,
+    void compileAndLink(List<Path> llPaths,
                         Path exePath,
                         Set<String> usedSystemClasses,
                         Module module,
                         DependencyResolver resolver,
-                        int cores)
+                        int cores,
+                        int optimizationLevel)
         throws IOException, InterruptedException;
 
     boolean hasNativeSupport(String className);

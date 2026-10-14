@@ -25,10 +25,56 @@ import java.lang.reflect.Modifier;
 import java.net.URI;
 import java.nio.file.*;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
 import java.util.stream.Collectors;
 
+/**
+ * Resolves class metadata from the input (a JAR, a directory of .class
+ * files, or a single .class file) and from the JDK's own modular runtime
+ * image when the input references a system class.
+ *
+ * <h2>Thread-safety model</h2>
+ *
+ * <p>This class is used concurrently. The reachability walk, the clinit
+ * sort, and the code-generation phase all call back into it — often in
+ * parallel on the Reactor scheduler that {@link
+ * io.github.kubyk01.application.service.Orchestrator} owns — in order to
+ * resolve a method in a hierarchy, look up a field's owner, or force a
+ * class to load. Every cache in this class is therefore a concurrent
+ * container:</p>
+ *
+ * <ul>
+ *   <li>{@link #classMap} and {@link #classBytes} are
+ *       {@link ConcurrentHashMap}s. The map is lazily expanded from
+ *       inside the parallel phases: {@link #getClassNode} and
+ *       {@link #findMethodInHierarchy} force a class to load on cache
+ *       miss, and that load writes into the same maps that other workers
+ *       are reading.</li>
+ *
+ *   <li>{@link #subclasses} maps a supertype to the set of its direct
+ *       subtypes. Both the outer map and every value set are concurrent:
+ *       the outer map because new supertypes are observed while the
+ *       subclass index is being queried, and the value sets because
+ *       {@link #getSubclasses} iterates them while a concurrent class
+ *       load may add to the same set. The earlier revision used a plain
+ *       {@code HashMap<String, HashSet<String>>} and produced a
+ *       {@link ConcurrentModificationException} inside
+ *       {@code collectSubclasses} the first time a class was forced to
+ *       load while another worker walked the subclass closure of a
+ *       different class.</li>
+ *
+ *   <li>{@link #missingClasses} and {@link #loadedClasses} are concurrent
+ *       key sets. They are written on the same lazy-load path as the two
+ *       maps above and read by the same callers.</li>
+ * </ul>
+ *
+ * <p>The JRT filesystem handle is guarded by the two {@code load*}
+ * methods being {@code synchronized}; the handle itself is only assigned
+ * on the first call to {@link #getJrtFileSystem()}, and every subsequent
+ * caller simply reads the already-assigned field.</p>
+ */
 @Slf4j
 @RequiredArgsConstructor
 public class DependencyResolver {
@@ -36,11 +82,37 @@ public class DependencyResolver {
     private static final String NATIVE_IMAGE_METADATA_PREFIX = "META-INF/native-image/";
 
     @Getter
-    private final Map<String, ClassNode> classMap = new HashMap<>();
-    private final Map<String, byte[]> classBytes = new HashMap<>();
-    private final Map<String, Set<String>> subclasses = new HashMap<>();
-    private final Set<String> missingClasses = new HashSet<>();
-    private final Set<String> loadedClasses = new HashSet<>();
+    private final Map<String, ClassNode> classMap = new ConcurrentHashMap<>();
+
+    /**
+     * Raw {@code .class} bytes for every class that has been parsed from
+     * a real class file (as opposed to a reflection-only stub).
+     *
+     * <p>Concurrent because it is written on the same lazy-load path as
+     * {@link #classMap} and read concurrently by the IR translator and
+     * the reachability walk.</p>
+     */
+    private final Map<String, byte[]> classBytes = new ConcurrentHashMap<>();
+
+    /**
+     * Direct-subtype index: supertype internal name → set of direct
+     * subtypes.
+     *
+     * <p>The value sets are {@link ConcurrentHashMap#newKeySet()} rather
+     * than plain {@link HashSet}s because {@link #getSubclasses} iterates
+     * them while a concurrent class load can add to the same set.
+     * Iteration over a concurrent key set is weakly consistent: it never
+     * throws, and a subclass added while a particular traversal is in
+     * flight is simply observed by the next traversal. That is precisely
+     * the semantics the callers need — a subtype that becomes known
+     * after a subclass-closure query has started cannot have been
+     * relevant to that query's answer.</p>
+     */
+    private final Map<String, Set<String>> subclasses = new ConcurrentHashMap<>();
+
+    private final Set<String> missingClasses = ConcurrentHashMap.newKeySet();
+    private final Set<String> loadedClasses  = ConcurrentHashMap.newKeySet();
+
     @Getter
     private final ReachabilityMetadata metadata = ReachabilityMetadata.builder().build();
 
@@ -53,11 +125,11 @@ public class DependencyResolver {
         if (missingClasses.contains(internalName)) {
             if (!classMap.containsKey(internalName)) {
                 ClassNode stub = ClassNode.builder()
-                    .name(internalName)
-                    .superName("java/lang/Object")
-                    .isExternal(true)
-                    .build();
-                classMap.put(internalName, stub);
+                        .name(internalName)
+                        .superName("java/lang/Object")
+                        .isExternal(true)
+                        .build();
+                classMap.putIfAbsent(internalName, stub);
             }
             return;
         }
@@ -97,23 +169,23 @@ public class DependencyResolver {
 
             ClassNode.ClassNodeBuilder builder = ClassNode.builder();
             builder.name(internalName)
-                .superName(clazz.getSuperclass() != null ? clazz.getSuperclass().getName().replace('.', '/') : "java/lang/Object")
-                .interfaces(Arrays.stream(clazz.getInterfaces())
-                    .map(c -> c.getName().replace('.', '/'))
-                    .collect(Collectors.toList()))
-                .access(clazz.getModifiers())
-                .isInterface(clazz.isInterface())
-                .isExternal(false);
+                    .superName(clazz.getSuperclass() != null ? clazz.getSuperclass().getName().replace('.', '/') : "java/lang/Object")
+                    .interfaces(Arrays.stream(clazz.getInterfaces())
+                            .map(c -> c.getName().replace('.', '/'))
+                            .collect(Collectors.toList()))
+                    .access(clazz.getModifiers())
+                    .isInterface(clazz.isInterface())
+                    .isExternal(false);
 
             for (Field field : clazz.getDeclaredFields()) {
                 String desc = org.objectweb.asm.Type.getDescriptor(field.getType());
                 builder.field(FieldNode.builder()
-                    .name(field.getName())
-                    .descriptor(desc)
-                    .type(Type.fromDescriptor(desc))
-                    .access(field.getModifiers())
-                    .owner(internalName)                 // <-- FIX: declaring class
-                    .build());
+                        .name(field.getName())
+                        .descriptor(desc)
+                        .type(Type.fromDescriptor(desc))
+                        .access(field.getModifiers())
+                        .owner(internalName)                 // <-- FIX: declaring class
+                        .build());
             }
 
             for (Method method : clazz.getDeclaredMethods()) {
@@ -122,8 +194,8 @@ public class DependencyResolver {
                 String returnDesc = retAsmType.getDescriptor();
                 org.objectweb.asm.Type[] paramAsmTypes = org.objectweb.asm.Type.getArgumentTypes(method);
                 List<Type> paramIrTypes = Arrays.stream(paramAsmTypes)
-                    .map(t -> Type.fromDescriptor(t.getDescriptor()))
-                    .collect(Collectors.toList());
+                        .map(t -> Type.fromDescriptor(t.getDescriptor()))
+                        .collect(Collectors.toList());
 
                 boolean isPoly = false;
                 boolean isCS = false;
@@ -132,23 +204,23 @@ public class DependencyResolver {
                     if (an.equals("java.lang.invoke.MethodHandle$PolymorphicSignature")) {
                         isPoly = true;
                     } else if (an.equals("jdk.internal.reflect.CallerSensitive")
-                        || an.equals("sun.reflect.CallerSensitive")) {
+                            || an.equals("sun.reflect.CallerSensitive")) {
                         isCS = true;
                     }
                 }
 
                 MethodNode mn = MethodNode.builder()
-                    .name(method.getName())
-                    .descriptor(desc)
-                    .returnType(Type.fromDescriptor(returnDesc))
-                    .parameterTypes(paramIrTypes)
-                    .access(method.getModifiers())
-                    .isAbstract(Modifier.isAbstract(method.getModifiers()))
-                    .isNative(Modifier.isNative(method.getModifiers()))
-                    .isStatic(Modifier.isStatic(method.getModifiers()))
-                    .isPolymorphicSignature(isPoly)
-                    .callerSensitive(isCS)
-                    .build();
+                        .name(method.getName())
+                        .descriptor(desc)
+                        .returnType(Type.fromDescriptor(returnDesc))
+                        .parameterTypes(paramIrTypes)
+                        .access(method.getModifiers())
+                        .isAbstract(Modifier.isAbstract(method.getModifiers()))
+                        .isNative(Modifier.isNative(method.getModifiers()))
+                        .isStatic(Modifier.isStatic(method.getModifiers()))
+                        .isPolymorphicSignature(isPoly)
+                        .callerSensitive(isCS)
+                        .build();
                 builder.method(mn);
 
                 if (isPoly) {
@@ -160,20 +232,20 @@ public class DependencyResolver {
                 String desc = org.objectweb.asm.Type.getConstructorDescriptor(ctor);
                 org.objectweb.asm.Type[] paramAsmTypes = org.objectweb.asm.Type.getArgumentTypes(desc);
                 List<Type> paramIrTypes = Arrays.stream(paramAsmTypes)
-                    .map(t -> Type.fromDescriptor(t.getDescriptor()))
-                    .collect(Collectors.toList());
+                        .map(t -> Type.fromDescriptor(t.getDescriptor()))
+                        .collect(Collectors.toList());
 
                 builder.method(MethodNode.builder()
-                    .name("<init>")
-                    .descriptor(desc)
-                    .returnType(Type.VOID)
-                    .parameterTypes(paramIrTypes)
-                    .access(ctor.getModifiers())
-                    .isAbstract(false)
-                    .isNative(false)
-                    .isStatic(false)
-                    .isPolymorphicSignature(false)
-                    .build());
+                        .name("<init>")
+                        .descriptor(desc)
+                        .returnType(Type.VOID)
+                        .parameterTypes(paramIrTypes)
+                        .access(ctor.getModifiers())
+                        .isAbstract(false)
+                        .isNative(false)
+                        .isStatic(false)
+                        .isPolymorphicSignature(false)
+                        .build());
             }
 
             ClassNode node = builder.build();
@@ -184,21 +256,21 @@ public class DependencyResolver {
         } catch (ClassNotFoundException e) {
             missingClasses.add(internalName);
             ClassNode stub = ClassNode.builder()
-                .name(internalName)
-                .superName("java/lang/Object")
-                .isExternal(true)
-                .build();
-            classMap.put(internalName, stub);
+                    .name(internalName)
+                    .superName("java/lang/Object")
+                    .isExternal(true)
+                    .build();
+            classMap.putIfAbsent(internalName, stub);
             log.warn("System class {} not found even via reflection, stub created", internalName);
         } catch (Exception e) {
             log.warn("Failed to load class {} via reflection: {}", internalName, e.getMessage());
             missingClasses.add(internalName);
             ClassNode stub = ClassNode.builder()
-                .name(internalName)
-                .superName("java/lang/Object")
-                .isExternal(true)
-                .build();
-            classMap.put(internalName, stub);
+                    .name(internalName)
+                    .superName("java/lang/Object")
+                    .isExternal(true)
+                    .build();
+            classMap.putIfAbsent(internalName, stub);
         }
     }
 
@@ -222,17 +294,17 @@ public class DependencyResolver {
                 // built by fs.getPath("modules", ...) silently returns
                 // false. The absolute form is the only one that works.
                 Path classPath = fs.getPath(
-                    "/modules/" + moduleName + "/" + internalName + ".class");
+                        "/modules/" + moduleName + "/" + internalName + ".class");
                 if (Files.exists(classPath)) {
                     byte[] bytes = Files.readAllBytes(classPath);
                     log.debug("Loaded system class {} from jrt:/{}/{}",
-                        internalName, moduleName, internalName + ".class");
+                            internalName, moduleName, internalName + ".class");
                     return bytes;
                 }
             }
         } catch (Exception e) {
             log.debug("Failed to load system class {} via jrt:/: {}",
-                internalName, e.getMessage());
+                    internalName, e.getMessage());
         }
         return null;
     }
@@ -281,11 +353,11 @@ public class DependencyResolver {
     public void scan(Path path) throws IOException {
         if (Files.isDirectory(path)) {
             Files.walk(path)
-                .filter(p -> p.toString().endsWith(".class"))
-                .forEach(this::parseClassFile);
+                    .filter(p -> p.toString().endsWith(".class"))
+                    .forEach(this::parseClassFile);
             Files.walk(path)
-                .filter(p -> p.toString().endsWith(".json") && p.toString().contains(NATIVE_IMAGE_METADATA_PREFIX))
-                .forEach(this::parseMetadataFile);
+                    .filter(p -> p.toString().endsWith(".json") && p.toString().contains(NATIVE_IMAGE_METADATA_PREFIX))
+                    .forEach(this::parseMetadataFile);
         } else if (path.toString().endsWith(".jar")) {
             try (JarFile jar = new JarFile(path.toFile())) {
                 Enumeration<JarEntry> entries = jar.entries();
@@ -355,23 +427,23 @@ public class DependencyResolver {
                                       String superName, String[] interfaces) {
                         currentClassName[0] = name;
                         builder.name(name)
-                            .superName(superName)
-                            .interfaces(interfaces != null ? Arrays.asList(interfaces) : Collections.emptyList())
-                            .access(access)
-                            .isInterface((access & Opcodes.ACC_INTERFACE) != 0)
-                            .isExternal(false);
+                                .superName(superName)
+                                .interfaces(interfaces != null ? Arrays.asList(interfaces) : Collections.emptyList())
+                                .access(access)
+                                .isInterface((access & Opcodes.ACC_INTERFACE) != 0)
+                                .isExternal(false);
                     }
 
                     @Override
                     public FieldVisitor visitField(int access, String name, String descriptor,
                                                    String signature, Object value) {
                         fields.add(FieldNode.builder()
-                            .name(name)
-                            .descriptor(descriptor)
-                            .type(Type.fromDescriptor(descriptor))
-                            .access(access)
-                            .owner(currentClassName[0])          // <-- FIX
-                            .build());
+                                .name(name)
+                                .descriptor(descriptor)
+                                .type(Type.fromDescriptor(descriptor))
+                                .access(access)
+                                .owner(currentClassName[0])          // <-- FIX
+                                .build());
                         return null;
                     }
 
@@ -379,20 +451,20 @@ public class DependencyResolver {
                     public MethodVisitor visitMethod(int access, String name, String descriptor,
                                                      String signature, String[] exceptions) {
                         MethodNode.MethodNodeBuilder mb = MethodNode.builder()
-                            .name(name)
-                            .descriptor(descriptor)
-                            .returnType(TypeResolver.descToReturnType(descriptor))
-                            .parameterTypes(TypeResolver.descToParamTypes(descriptor))
-                            .access(access)
-                            .isAbstract((access & Opcodes.ACC_ABSTRACT) != 0)
-                            .isNative((access & Opcodes.ACC_NATIVE) != 0)
-                            .isStatic((access & Opcodes.ACC_STATIC) != 0);
+                                .name(name)
+                                .descriptor(descriptor)
+                                .returnType(TypeResolver.descToReturnType(descriptor))
+                                .parameterTypes(TypeResolver.descToParamTypes(descriptor))
+                                .access(access)
+                                .isAbstract((access & Opcodes.ACC_ABSTRACT) != 0)
+                                .isNative((access & Opcodes.ACC_NATIVE) != 0)
+                                .isStatic((access & Opcodes.ACC_STATIC) != 0);
 
                         return new MethodVisitor(Opcodes.ASM9) {
                             @Override
                             public AnnotationVisitor visitAnnotation(String desc, boolean visible) {
                                 if ("Ljdk/internal/reflect/CallerSensitive;".equals(desc)
-                                    || "Lsun/reflect/CallerSensitive;".equals(desc)) {
+                                        || "Lsun/reflect/CallerSensitive;".equals(desc)) {
                                     mb.callerSensitive(true);
                                 }
                                 if ("Ljava/lang/invoke/MethodHandle$PolymorphicSignature;".equals(desc)) {
@@ -417,10 +489,10 @@ public class DependencyResolver {
             }
 
             ClassNode classNode = builder
-                .fields(fields)
-                .methods(methods)
-                .polymorphicMethodNames(polymorphicMethodNames)
-                .build();
+                    .fields(fields)
+                    .methods(methods)
+                    .polymorphicMethodNames(polymorphicMethodNames)
+                    .build();
 
             String name = currentClassName[0];
             if (name == null) {
@@ -429,6 +501,23 @@ public class DependencyResolver {
             }
             classMap.put(name, classNode);
             classBytes.put(name, bytes);
+
+            // Update the subtype index for this class. The value sets are
+            // concurrent key sets (see the field declaration), so a
+            // concurrent subclass-closure traversal in another thread
+            // observes a consistent, non-throwing iteration.
+            if (classNode.getSuperName() != null) {
+                subclasses
+                        .computeIfAbsent(classNode.getSuperName(),
+                                k -> ConcurrentHashMap.newKeySet())
+                        .add(name);
+            }
+            for (String iface : classNode.getInterfaces()) {
+                subclasses
+                        .computeIfAbsent(iface,
+                                k -> ConcurrentHashMap.newKeySet())
+                        .add(name);
+            }
         } catch (Exception e) {
             System.err.println("ERROR in parseClassStream: " + e.getMessage());
             e.printStackTrace();
@@ -439,10 +528,16 @@ public class DependencyResolver {
     private void buildSubclassIndex() {
         for (ClassNode cn : classMap.values()) {
             if (cn.getSuperName() != null) {
-                subclasses.computeIfAbsent(cn.getSuperName(), k -> new HashSet<>()).add(cn.getName());
+                subclasses
+                        .computeIfAbsent(cn.getSuperName(),
+                                k -> ConcurrentHashMap.newKeySet())
+                        .add(cn.getName());
             }
             for (String iface : cn.getInterfaces()) {
-                subclasses.computeIfAbsent(iface, k -> new HashSet<>()).add(cn.getName());
+                subclasses
+                        .computeIfAbsent(iface,
+                                k -> ConcurrentHashMap.newKeySet())
+                        .add(cn.getName());
             }
         }
     }
@@ -455,17 +550,22 @@ public class DependencyResolver {
         node = classMap.get(internalName);
         if (node != null) return node;
 
-        if (!missingClasses.contains(internalName)) {
-            missingClasses.add(internalName);
+        // The class was not resolvable through any of the load paths. If
+        // no other thread has already installed a stub under this name,
+        // install one now; using computeIfAbsent makes the "log once,
+        // put once" pattern race-free even though the outer
+        // loadSystemClass call already took the monitor for the load
+        // itself.
+        if (missingClasses.add(internalName)) {
             log.warn("Class not found in input: {} – treated as external", internalName);
         }
         ClassNode stub = ClassNode.builder()
-            .name(internalName)
-            .superName("java/lang/Object")
-            .isExternal(true)
-            .build();
-        classMap.put(internalName, stub);
-        return stub;
+                .name(internalName)
+                .superName("java/lang/Object")
+                .isExternal(true)
+                .build();
+        ClassNode previous = classMap.putIfAbsent(internalName, stub);
+        return previous != null ? previous : stub;
     }
 
     private void parseClassBytes(String internalName, byte[] bytes) throws IOException {
@@ -483,23 +583,23 @@ public class DependencyResolver {
                                   String superName, String[] interfaces) {
                     currentClassName[0] = name;
                     builder.name(name)
-                        .superName(superName)
-                        .interfaces(interfaces != null ? Arrays.asList(interfaces) : Collections.emptyList())
-                        .access(access)
-                        .isInterface((access & Opcodes.ACC_INTERFACE) != 0)
-                        .isExternal(false);
+                            .superName(superName)
+                            .interfaces(interfaces != null ? Arrays.asList(interfaces) : Collections.emptyList())
+                            .access(access)
+                            .isInterface((access & Opcodes.ACC_INTERFACE) != 0)
+                            .isExternal(false);
                 }
 
                 @Override
                 public FieldVisitor visitField(int access, String name, String descriptor,
                                                String signature, Object value) {
                     fields.add(FieldNode.builder()
-                        .name(name)
-                        .descriptor(descriptor)
-                        .type(Type.fromDescriptor(descriptor))
-                        .access(access)
-                        .owner(currentClassName[0])              // <-- FIX
-                        .build());
+                            .name(name)
+                            .descriptor(descriptor)
+                            .type(Type.fromDescriptor(descriptor))
+                            .access(access)
+                            .owner(currentClassName[0])              // <-- FIX
+                            .build());
                     return null;
                 }
 
@@ -507,20 +607,20 @@ public class DependencyResolver {
                 public MethodVisitor visitMethod(int access, String name, String descriptor,
                                                  String signature, String[] exceptions) {
                     MethodNode.MethodNodeBuilder mb = MethodNode.builder()
-                        .name(name)
-                        .descriptor(descriptor)
-                        .returnType(TypeResolver.descToReturnType(descriptor))
-                        .parameterTypes(TypeResolver.descToParamTypes(descriptor))
-                        .access(access)
-                        .isAbstract((access & Opcodes.ACC_ABSTRACT) != 0)
-                        .isNative((access & Opcodes.ACC_NATIVE) != 0)
-                        .isStatic((access & Opcodes.ACC_STATIC) != 0);
+                            .name(name)
+                            .descriptor(descriptor)
+                            .returnType(TypeResolver.descToReturnType(descriptor))
+                            .parameterTypes(TypeResolver.descToParamTypes(descriptor))
+                            .access(access)
+                            .isAbstract((access & Opcodes.ACC_ABSTRACT) != 0)
+                            .isNative((access & Opcodes.ACC_NATIVE) != 0)
+                            .isStatic((access & Opcodes.ACC_STATIC) != 0);
 
                     return new MethodVisitor(Opcodes.ASM9) {
                         @Override
                         public AnnotationVisitor visitAnnotation(String desc, boolean visible) {
                             if ("Ljdk/internal/reflect/CallerSensitive;".equals(desc)
-                                || "Lsun/reflect/CallerSensitive;".equals(desc)) {
+                                    || "Lsun/reflect/CallerSensitive;".equals(desc)) {
                                 mb.callerSensitive(true);
                             }
                             if ("Ljava/lang/invoke/MethodHandle$PolymorphicSignature;".equals(desc)) {
@@ -543,10 +643,10 @@ public class DependencyResolver {
         }
 
         ClassNode classNode = builder
-            .fields(fields)
-            .methods(methods)
-            .polymorphicMethodNames(polymorphicMethodNames)
-            .build();
+                .fields(fields)
+                .methods(methods)
+                .polymorphicMethodNames(polymorphicMethodNames)
+                .build();
 
         String name = currentClassName[0];
         if (name == null) {
@@ -557,10 +657,16 @@ public class DependencyResolver {
         classBytes.put(name, bytes);
 
         if (classNode.getSuperName() != null) {
-            subclasses.computeIfAbsent(classNode.getSuperName(), k -> new HashSet<>()).add(name);
+            subclasses
+                    .computeIfAbsent(classNode.getSuperName(),
+                            k -> ConcurrentHashMap.newKeySet())
+                    .add(name);
         }
         for (String iface : classNode.getInterfaces()) {
-            subclasses.computeIfAbsent(iface, k -> new HashSet<>()).add(name);
+            subclasses
+                    .computeIfAbsent(iface,
+                            k -> ConcurrentHashMap.newKeySet())
+                    .add(name);
         }
     }
 
@@ -656,6 +762,9 @@ public class DependencyResolver {
     }
 
     private void collectSubclasses(String className, Set<String> accumulator) {
+        // The value set may be concurrently modified by another thread
+        // that is lazily loading a class; ConcurrentHashMap.newKeySet()
+        // makes this iteration weakly consistent and never throwing.
         Set<String> direct = subclasses.getOrDefault(className, Collections.emptySet());
         for (String child : direct) {
             if (accumulator.add(child)) {

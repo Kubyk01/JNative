@@ -1,93 +1,141 @@
-#include <stdint.h>
-#include <string.h>
-#include <stdlib.h>
-#include <stdatomic.h>
-
-#include "jnative_runtime.h"
-
 /*
  * java.lang.invoke.VarHandle — the native entry points behind every
  * VarHandle access mode.
  *
- * The file is organised in sections:
+ * ============================================================================
+ * ABI: parameter layout
+ * ============================================================================
  *
- *   1. Byte-array access modes: byte[] @ int for every primitive
- *      payload type, with the full set of access-mode qualifiers
- *      (plain / volatile / acquire / release / opaque), plus
- *      compareAndSet, weakCompareAndSet, compareAndExchange, getAndSet
- *      and getAndAdd.
+ * VarHandle access modes are polymorphic-signature methods. Their
+ * native implementations are reached through one of two emitter
+ * paths, and both pass exactly the Java-level arguments — the
+ * VarHandle receiver itself is never part of the C signature.
  *
- *   2. Legacy void** entry points kept for compatibility with older
- *      call sites that pack their arguments into a void* array.
+ * The polymorphic path in LlvmFunctionEmitter builds the argument
+ * list as:
  *
- *   3. Generic single-Object entry points for the plain VarHandle
- *      call shapes that reach this runtime without a statically
- *      resolvable field descriptor.
+ *     List<Value> allArgs = new ArrayList<>();
+ *     allArgs.add(receiver);                        // the VarHandle
+ *     for (int i = 2; i < operands.size(); i++) {
+ *         allArgs.add(operands.get(i));             // the java args
+ *     }
+ *     List<Value> argsWithoutReceiver = allArgs.subList(1, allArgs.size());
  *
- *   4. Concrete (class, descriptor) specialisations for the specific
- *      VarHandle call sites that Striped64, AtomicReference,
- *      AtomicMarkableReference, FutureTask, ConcurrentSkipListMap,
- *      LinkedTransferQueue, ForEachOps.ForEachOrderedTask,
- *      SharedThreadContainer, Thread and jdk.internal.event.EventHelper
- *      emit. Each of these has a hard-coded field offset that matches
- *      the LLVM backend's own layout computation for the target class.
+ * and every concrete call below uses argsWithoutReceiver, so the
+ * VarHandle is dropped before the call is emitted.
  *
- * The layout constants used by the concrete specialisations are frozen
- * by the LLVM emitter's field-offset rules: vtable at offset 0, then
- * instance fields at increasing byte offsets with the natural alignment
- * of each field's type, no padding beyond alignment. Any change to that
- * layout must be reflected both here and in LlvmGlobalEmitter.
+ * Each C function's parameter list therefore matches its mangled
+ * descriptor one-for-one, with no leading receiver. A function whose
+ * mangled name ends in, for example,
  *
- * ---------------------------------------------------------------------------
- * LinkedTransferQueue / DualNode (JDK 21+)
- * ---------------------------------------------------------------------------
+ *     __Ljava_util_concurrent_atomic_AtomicReference_
+ *     Ljava_lang_Object_Ljava_lang_Object__Z
  *
- * The JDK 21 rewrite of LinkedTransferQueue replaces the classic
- * Node-based queue with a Doubly-Linked list of DualNode objects. The
- * class hierarchy and the resulting layout computed by
- * LlvmGlobalEmitter.getFieldOffset are:
+ * takes exactly three arguments — the AtomicReference, the old
+ * value, and the new value — and returns an int32. It does NOT take a
+ * leading VarHandle pointer. The previous revision of this file gave
+ * every class-based accessor a leading `void* this_handle`, which
+ * shifted every argument by one slot at the call site and produced
+ * the linker diagnostic the current revision removes.
  *
- *   LinkedTransferQueue.Node (abstract? plain class):
- *       offset  8 : boolean isData        (1 byte, padded to 8)
- *       offset 16 : Object  item          (volatile)
- *       offset 24 : Node    next          (volatile)
- *       offset 32 : Thread  waiter        (volatile)
+ * ============================================================================
+ * Byte-order handling for byte[] view accessors
+ * ============================================================================
  *
- *   LinkedTransferQueue.DualNode extends Node:
- *       offset  8 : boolean isData
- *       offset 16 : Object  item
- *       offset 24 : Node    next
- *       offset 32 : Thread  waiter
- *       offset 40 : DualNode prev         (volatile, added by the subclass)
+ * A byte-array-view VarHandle produced by
  *
- *   LinkedTransferQueue itself:
- *       offset  8 : DualNode head         (volatile)
- *       offset 16 : DualNode tail         (volatile)
- *       offset 24 : int      sweepNow     (counter; see sweepNow() in Java)
+ *     MethodHandles.byteArrayViewVarHandle(int[].class, ByteOrder.BIG_ENDIAN)
  *
- * The three offsets at 8/16/24 of DualNode mirror the three at the same
- * offsets of LinkedTransferQueue.DualNode inherited from Node, because
- * the LLVM emitter lays out superclass fields first. The extra `prev`
- * field lives at offset 40, since it is the first field the subclass
- * declares after the superclass's fields.
+ * reinterprets a byte[] as a sequence of 16-, 32- or 64-bit values
+ * laid out in big-endian order. jdk.internal.util.ByteArray — the
+ * class that DataInputStream, DataOutputStream, ObjectInputStream,
+ * ObjectOutputStream and every other java.io stream-protocol reader
+ * use — creates its VarHandles with ByteOrder.BIG_ENDIAN
+ * unconditionally, because the Java data stream format is defined to
+ * be big-endian on the wire (Java Object Serialization Specification
+ * §3.6).
  *
- * Every entry point below is a thin wrapper over the runtime's
- * atomic primitives (`cas_ref`, `cas_int`, `__atomic_store_n`), which
- * is what the reference HotSpot implementation does as well.
+ * In HotSpot the byte-order conversion lives in
+ * VarHandleByteArrayAsInts.convEndian and its Longs counterpart; in
+ * this runtime there is no such Java-level wrapper between the
+ * polymorphic dispatch and the C function, so the conversion must
+ * happen in C. The macros below perform it at every load, store and
+ * compare-and-exchange on the byte-array accessors:
+ *
+ *   - on a big-endian host, a plain memcpy already produces the
+ *     big-endian interpretation, so the macros expand to the identity;
+ *
+ *   - on a little-endian host (every platform this runtime targets
+ *     today: x86_64 and aarch64), the value read out of memory is
+ *     byte-reversed relative to the desired interpretation, so the
+ *     macros expand to __builtin_bswap16 / 32 / 64.
+ *
+ * The same macro is used for both read and write directions and for
+ * the expected / new operands of the atomic primitives, because the
+ * byte-swap is an involution: applying it twice recovers the original
+ * value.
+ *
+ * The concrete failure the big-endian handling was written for:
+ *
+ *     java.util.Currency.<clinit> reads its embedded currency.data
+ *     resource through a DataInputStream. The first read is
+ *
+ *         if (dis.readInt() != MAGIC_NUMBER) throw new InternalError(...);
+ *
+ *     MAGIC_NUMBER is 0x43757244. On a little-endian host without the
+ *     conversion, get___BI_I returned 0x44727543, the comparison
+ *     failed, and Currency's class initializer threw.
+ *
+ * ============================================================================
+ * Field offsets used by the class-based accessors
+ * ============================================================================
+ *
+ * The class-based accessors below use fixed byte offsets into the
+ * target objects. Each offset matches the layout computed by
+ * LlvmGlobalEmitter.getFieldOffset for the target class: an 8-byte
+ * object header, then each instance field placed at its natural
+ * alignment with no additional padding. The comments on the affected
+ * functions name the field and its declaring class.
  */
 
-#define VAR_HANDLE_FIRST_FIELD_OFFSET 8
+#define _GNU_SOURCE
+#include <stdint.h>
+#include <string.h>
+#include <stdatomic.h>
 
-/*
- * ===========================================================================
- * Byte-array header accessors
- *
- * Every Java array begins with a 16-byte header: a ReflectionClass* class
- * mirror, an int32 length, an int32 element size, then the payload. The
- * helpers below read the length, compute the payload pointer, and validate
- * an index/element-size pair before any access.
- * ===========================================================================
- */
+#include "jnative_runtime.h"
+
+/* ===========================================================================
+ *  Byte-order macros
+ * =========================================================================== */
+
+#if defined(__BYTE_ORDER__) && defined(__ORDER_BIG_ENDIAN__) \
+    && (__BYTE_ORDER__ == __ORDER_BIG_ENDIAN__)
+#  define JNATIVE_HOST_IS_BIG_ENDIAN 1
+#elif defined(__BYTE_ORDER__) && defined(__ORDER_LITTLE_ENDIAN__) \
+    && (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
+#  define JNATIVE_HOST_IS_BIG_ENDIAN 0
+#elif defined(__BIG_ENDIAN__) || defined(_BIG_ENDIAN) \
+    || defined(__ARMEB__) || defined(__MIPSEB__) \
+    || defined(__s390x__) || defined(__sparc__) || defined(__powerpc__)
+#  define JNATIVE_HOST_IS_BIG_ENDIAN 1
+#else
+#  define JNATIVE_HOST_IS_BIG_ENDIAN 0
+#endif
+
+#if JNATIVE_HOST_IS_BIG_ENDIAN
+#  define JNATIVE_BE16(v) ((uint16_t)(v))
+#  define JNATIVE_BE32(v) ((uint32_t)(v))
+#  define JNATIVE_BE64(v) ((uint64_t)(v))
+#else
+#  define JNATIVE_BE16(v) ((uint16_t)__builtin_bswap16((uint16_t)(v)))
+#  define JNATIVE_BE32(v) ((uint32_t)__builtin_bswap32((uint32_t)(v)))
+#  define JNATIVE_BE64(v) ((uint64_t)__builtin_bswap64((uint64_t)(v)))
+#endif
+
+/* ===========================================================================
+ *  Array and CAS helpers
+ * =========================================================================== */
 
 static inline uint8_t* barray_data(void* arr) {
     return (uint8_t*)jnative_array_data(arr);
@@ -106,12 +154,6 @@ static inline void barray_check(void* arr, int32_t index, int32_t elem_size) {
         __jnative_throw_array_index_out_of_bounds();
     }
 }
-
-/*
- * ===========================================================================
- * Generic CAS helpers for reference / int / boolean fields
- * ===========================================================================
- */
 
 static inline int32_t cas_ref(void** slot, void* expected, void* newValue) {
     void* exp = expected;
@@ -132,10 +174,6 @@ static inline int32_t cas_bool(uint8_t* slot, int32_t expected, int32_t newValue
                                        __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;
 }
 
-/*
- * compareAndExchangeReference-style helper: returns the witness value.
- * Used by the compareAndExchange overloads for reference-typed fields.
- */
 static inline void* cax_ref(void** slot, void* expected, void* newValue) {
     void* witness = expected;
     __atomic_compare_exchange_n(slot, &witness, newValue, 0,
@@ -150,302 +188,310 @@ static inline int32_t cax_int(int32_t* slot, int32_t expected, int32_t newValue)
     return witness;
 }
 
-/*
- * ===========================================================================
- * byte[] @ int  ->  { byte, short, char, int, long, float, double }
- * ===========================================================================
- */
+/* ===========================================================================
+ *  byte[] @ int  ->  { byte, short, char, int, long, float, double }
+ *
+ *  These accessors take exactly two arguments: the byte[] and the
+ *  index. The VarHandle that names the access mode (view type plus
+ *  byte order) is not part of the C signature — see the ABI comment
+ *  at the top of the file.
+ * =========================================================================== */
 
-int8_t __jnative_fn_java_lang_invoke_VarHandle_get___BI_B(void* arr, int32_t index) {
+int8_t __jnative_fn_java_lang_invoke_VarHandle_get___BI_B(int8_t* arr, int32_t index) {
     barray_check(arr, index, 1);
     return *(int8_t*)(barray_data(arr) + index);
 }
 
-int16_t __jnative_fn_java_lang_invoke_VarHandle_get___BI_S(void* arr, int32_t index) {
+int16_t __jnative_fn_java_lang_invoke_VarHandle_get___BI_S(int8_t* arr, int32_t index) {
     barray_check(arr, index, 2);
-    int16_t v;
-    memcpy(&v, barray_data(arr) + index, 2);
-    return v;
+    uint16_t raw;
+    memcpy(&raw, barray_data(arr) + index, 2);
+    return (int16_t)JNATIVE_BE16(raw);
 }
 
-uint16_t __jnative_fn_java_lang_invoke_VarHandle_get___BI_C(void* arr, int32_t index) {
+uint16_t __jnative_fn_java_lang_invoke_VarHandle_get___BI_C(int8_t* arr, int32_t index) {
     barray_check(arr, index, 2);
-    uint16_t v;
-    memcpy(&v, barray_data(arr) + index, 2);
-    return v;
+    uint16_t raw;
+    memcpy(&raw, barray_data(arr) + index, 2);
+    return JNATIVE_BE16(raw);
 }
 
-int32_t __jnative_fn_java_lang_invoke_VarHandle_get___BI_I(void* arr, int32_t index) {
+int32_t __jnative_fn_java_lang_invoke_VarHandle_get___BI_I(int8_t* arr, int32_t index) {
     barray_check(arr, index, 4);
-    int32_t v;
-    memcpy(&v, barray_data(arr) + index, 4);
-    return v;
+    uint32_t raw;
+    memcpy(&raw, barray_data(arr) + index, 4);
+    return (int32_t)JNATIVE_BE32(raw);
 }
 
-int64_t __jnative_fn_java_lang_invoke_VarHandle_get___BI_J(void* arr, int32_t index) {
+int64_t __jnative_fn_java_lang_invoke_VarHandle_get___BI_J(int8_t* arr, int32_t index) {
     barray_check(arr, index, 8);
-    int64_t v;
-    memcpy(&v, barray_data(arr) + index, 8);
-    return v;
+    uint64_t raw;
+    memcpy(&raw, barray_data(arr) + index, 8);
+    return (int64_t)JNATIVE_BE64(raw);
 }
 
-float __jnative_fn_java_lang_invoke_VarHandle_get___BI_F(void* arr, int32_t index) {
+float __jnative_fn_java_lang_invoke_VarHandle_get___BI_F(int8_t* arr, int32_t index) {
     barray_check(arr, index, 4);
-    float v;
-    memcpy(&v, barray_data(arr) + index, 4);
-    return v;
+    uint32_t raw;
+    memcpy(&raw, barray_data(arr) + index, 4);
+    uint32_t host = JNATIVE_BE32(raw);
+    float f;
+    memcpy(&f, &host, 4);
+    return f;
 }
 
-double __jnative_fn_java_lang_invoke_VarHandle_get___BI_D(void* arr, int32_t index) {
+double __jnative_fn_java_lang_invoke_VarHandle_get___BI_D(int8_t* arr, int32_t index) {
     barray_check(arr, index, 8);
-    double v;
-    memcpy(&v, barray_data(arr) + index, 8);
-    return v;
+    uint64_t raw;
+    memcpy(&raw, barray_data(arr) + index, 8);
+    uint64_t host = JNATIVE_BE64(raw);
+    double d;
+    memcpy(&d, &host, 8);
+    return d;
 }
 
-/*
- * ===========================================================================
- * set: byte[] @ int <- value
- * ===========================================================================
- */
-
-void __jnative_fn_java_lang_invoke_VarHandle_set___BIB_V(void* arr, int32_t index, int8_t v) {
+void __jnative_fn_java_lang_invoke_VarHandle_set___BIB_V(int8_t* arr, int32_t index, int8_t v) {
     barray_check(arr, index, 1);
     *(int8_t*)(barray_data(arr) + index) = v;
 }
 
-void __jnative_fn_java_lang_invoke_VarHandle_set___BIS_V(void* arr, int32_t index, int16_t v) {
+void __jnative_fn_java_lang_invoke_VarHandle_set___BIS_V(int8_t* arr, int32_t index, int16_t v) {
     barray_check(arr, index, 2);
-    memcpy(barray_data(arr) + index, &v, 2);
+    uint16_t be = JNATIVE_BE16((uint16_t)v);
+    memcpy(barray_data(arr) + index, &be, 2);
 }
 
-void __jnative_fn_java_lang_invoke_VarHandle_set___BIC_V(void* arr, int32_t index, uint16_t v) {
+void __jnative_fn_java_lang_invoke_VarHandle_set___BIC_V(int8_t* arr, int32_t index, uint16_t v) {
     barray_check(arr, index, 2);
-    memcpy(barray_data(arr) + index, &v, 2);
+    uint16_t be = JNATIVE_BE16(v);
+    memcpy(barray_data(arr) + index, &be, 2);
 }
 
-void __jnative_fn_java_lang_invoke_VarHandle_set___BII_V(void* arr, int32_t index, int32_t v) {
+void __jnative_fn_java_lang_invoke_VarHandle_set___BII_V(int8_t* arr, int32_t index, int32_t v) {
     barray_check(arr, index, 4);
-    memcpy(barray_data(arr) + index, &v, 4);
+    uint32_t be = JNATIVE_BE32((uint32_t)v);
+    memcpy(barray_data(arr) + index, &be, 4);
 }
 
-void __jnative_fn_java_lang_invoke_VarHandle_set___BIJ_V(void* arr, int32_t index, int64_t v) {
+void __jnative_fn_java_lang_invoke_VarHandle_set___BIJ_V(int8_t* arr, int32_t index, int64_t v) {
     barray_check(arr, index, 8);
-    memcpy(barray_data(arr) + index, &v, 8);
+    uint64_t be = JNATIVE_BE64((uint64_t)v);
+    memcpy(barray_data(arr) + index, &be, 8);
 }
 
-void __jnative_fn_java_lang_invoke_VarHandle_set___BIF_V(void* arr, int32_t index, float v) {
+void __jnative_fn_java_lang_invoke_VarHandle_set___BIF_V(int8_t* arr, int32_t index, float v) {
     barray_check(arr, index, 4);
-    memcpy(barray_data(arr) + index, &v, 4);
+    uint32_t host;
+    memcpy(&host, &v, 4);
+    uint32_t be = JNATIVE_BE32(host);
+    memcpy(barray_data(arr) + index, &be, 4);
 }
 
-void __jnative_fn_java_lang_invoke_VarHandle_set___BID_V(void* arr, int32_t index, double v) {
+void __jnative_fn_java_lang_invoke_VarHandle_set___BID_V(int8_t* arr, int32_t index, double v) {
     barray_check(arr, index, 8);
-    memcpy(barray_data(arr) + index, &v, 8);
+    uint64_t host;
+    memcpy(&host, &v, 8);
+    uint64_t be = JNATIVE_BE64(host);
+    memcpy(barray_data(arr) + index, &be, 8);
 }
 
-/*
- * ===========================================================================
- * Volatile access modes on byte[]
- * ===========================================================================
- */
-
-int32_t __jnative_fn_java_lang_invoke_VarHandle_getVolatile___BI_I(void* arr, int32_t index) {
+int32_t __jnative_fn_java_lang_invoke_VarHandle_getVolatile___BI_I(int8_t* arr, int32_t index) {
     barray_check(arr, index, 4);
-    int32_t v;
-    __atomic_load((int32_t*)(barray_data(arr) + index), &v, __ATOMIC_SEQ_CST);
-    return v;
+    uint32_t raw;
+    __atomic_load((uint32_t*)(barray_data(arr) + index), &raw, __ATOMIC_SEQ_CST);
+    return (int32_t)JNATIVE_BE32(raw);
 }
 
-void __jnative_fn_java_lang_invoke_VarHandle_setVolatile___BII_V(void* arr, int32_t index, int32_t v) {
+void __jnative_fn_java_lang_invoke_VarHandle_setVolatile___BII_V(int8_t* arr, int32_t index, int32_t v) {
     barray_check(arr, index, 4);
-    __atomic_store((int32_t*)(barray_data(arr) + index), &v, __ATOMIC_SEQ_CST);
+    uint32_t be = JNATIVE_BE32((uint32_t)v);
+    __atomic_store((uint32_t*)(barray_data(arr) + index), &be, __ATOMIC_SEQ_CST);
 }
 
-int64_t __jnative_fn_java_lang_invoke_VarHandle_getVolatile___BI_J(void* arr, int32_t index) {
+int64_t __jnative_fn_java_lang_invoke_VarHandle_getVolatile___BI_J(int8_t* arr, int32_t index) {
     barray_check(arr, index, 8);
-    int64_t v;
-    __atomic_load((int64_t*)(barray_data(arr) + index), &v, __ATOMIC_SEQ_CST);
-    return v;
+    uint64_t raw;
+    __atomic_load((uint64_t*)(barray_data(arr) + index), &raw, __ATOMIC_SEQ_CST);
+    return (int64_t)JNATIVE_BE64(raw);
 }
 
-void __jnative_fn_java_lang_invoke_VarHandle_setVolatile___BIJ_V(void* arr, int32_t index, int64_t v) {
+void __jnative_fn_java_lang_invoke_VarHandle_setVolatile___BIJ_V(int8_t* arr, int32_t index, int64_t v) {
     barray_check(arr, index, 8);
-    __atomic_store((int64_t*)(barray_data(arr) + index), &v, __ATOMIC_SEQ_CST);
+    uint64_t be = JNATIVE_BE64((uint64_t)v);
+    __atomic_store((uint64_t*)(barray_data(arr) + index), &be, __ATOMIC_SEQ_CST);
 }
 
-/*
- * ===========================================================================
- * Acquire / Release access modes on byte[]
- * ===========================================================================
- */
-
-int32_t __jnative_fn_java_lang_invoke_VarHandle_getAcquire___BI_I(void* arr, int32_t index) {
+int32_t __jnative_fn_java_lang_invoke_VarHandle_getAcquire___BI_I(int8_t* arr, int32_t index) {
     barray_check(arr, index, 4);
-    int32_t v;
-    __atomic_load((int32_t*)(barray_data(arr) + index), &v, __ATOMIC_ACQUIRE);
-    return v;
+    uint32_t raw;
+    __atomic_load((uint32_t*)(barray_data(arr) + index), &raw, __ATOMIC_ACQUIRE);
+    return (int32_t)JNATIVE_BE32(raw);
 }
 
-void __jnative_fn_java_lang_invoke_VarHandle_setRelease___BII_V(void* arr, int32_t index, int32_t v) {
+void __jnative_fn_java_lang_invoke_VarHandle_setRelease___BII_V(int8_t* arr, int32_t index, int32_t v) {
     barray_check(arr, index, 4);
-    __atomic_store((int32_t*)(barray_data(arr) + index), &v, __ATOMIC_RELEASE);
+    uint32_t be = JNATIVE_BE32((uint32_t)v);
+    __atomic_store((uint32_t*)(barray_data(arr) + index), &be, __ATOMIC_RELEASE);
 }
 
-int64_t __jnative_fn_java_lang_invoke_VarHandle_getAcquire___BI_J(void* arr, int32_t index) {
+int64_t __jnative_fn_java_lang_invoke_VarHandle_getAcquire___BI_J(int8_t* arr, int32_t index) {
     barray_check(arr, index, 8);
-    int64_t v;
-    __atomic_load((int64_t*)(barray_data(arr) + index), &v, __ATOMIC_ACQUIRE);
-    return v;
+    uint64_t raw;
+    __atomic_load((uint64_t*)(barray_data(arr) + index), &raw, __ATOMIC_ACQUIRE);
+    return (int64_t)JNATIVE_BE64(raw);
 }
 
-void __jnative_fn_java_lang_invoke_VarHandle_setRelease___BIJ_V(void* arr, int32_t index, int64_t v) {
+void __jnative_fn_java_lang_invoke_VarHandle_setRelease___BIJ_V(int8_t* arr, int32_t index, int64_t v) {
     barray_check(arr, index, 8);
-    __atomic_store((int64_t*)(barray_data(arr) + index), &v, __ATOMIC_RELEASE);
+    uint64_t be = JNATIVE_BE64((uint64_t)v);
+    __atomic_store((uint64_t*)(barray_data(arr) + index), &be, __ATOMIC_RELEASE);
 }
 
-/*
- * ===========================================================================
- * Opaque access modes on byte[]
- * ===========================================================================
- */
-
-int32_t __jnative_fn_java_lang_invoke_VarHandle_getOpaque___BI_I(void* arr, int32_t index) {
+int32_t __jnative_fn_java_lang_invoke_VarHandle_getOpaque___BI_I(int8_t* arr, int32_t index) {
     barray_check(arr, index, 4);
-    int32_t v;
-    __atomic_load((int32_t*)(barray_data(arr) + index), &v, __ATOMIC_RELAXED);
-    return v;
+    uint32_t raw;
+    __atomic_load((uint32_t*)(barray_data(arr) + index), &raw, __ATOMIC_RELAXED);
+    return (int32_t)JNATIVE_BE32(raw);
 }
 
-void __jnative_fn_java_lang_invoke_VarHandle_setOpaque___BII_V(void* arr, int32_t index, int32_t v) {
+void __jnative_fn_java_lang_invoke_VarHandle_setOpaque___BII_V(int8_t* arr, int32_t index, int32_t v) {
     barray_check(arr, index, 4);
-    __atomic_store((int32_t*)(barray_data(arr) + index), &v, __ATOMIC_RELAXED);
+    uint32_t be = JNATIVE_BE32((uint32_t)v);
+    __atomic_store((uint32_t*)(barray_data(arr) + index), &be, __ATOMIC_RELAXED);
 }
 
-int64_t __jnative_fn_java_lang_invoke_VarHandle_getOpaque___BI_J(void* arr, int32_t index) {
+int64_t __jnative_fn_java_lang_invoke_VarHandle_getOpaque___BI_J(int8_t* arr, int32_t index) {
     barray_check(arr, index, 8);
-    int64_t v;
-    __atomic_load((int64_t*)(barray_data(arr) + index), &v, __ATOMIC_RELAXED);
-    return v;
+    uint64_t raw;
+    __atomic_load((uint64_t*)(barray_data(arr) + index), &raw, __ATOMIC_RELAXED);
+    return (int64_t)JNATIVE_BE64(raw);
 }
 
-void __jnative_fn_java_lang_invoke_VarHandle_setOpaque___BIJ_V(void* arr, int32_t index, int64_t v) {
+void __jnative_fn_java_lang_invoke_VarHandle_setOpaque___BIJ_V(int8_t* arr, int32_t index, int64_t v) {
     barray_check(arr, index, 8);
-    __atomic_store((int64_t*)(barray_data(arr) + index), &v, __ATOMIC_RELAXED);
+    uint64_t be = JNATIVE_BE64((uint64_t)v);
+    __atomic_store((uint64_t*)(barray_data(arr) + index), &be, __ATOMIC_RELAXED);
 }
-
-/*
- * ===========================================================================
- * compareAndSet / weakCompareAndSet on byte[]: int and long
- * ===========================================================================
- */
 
 int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet___BIII_Z(
-        void* arr, int32_t index, int32_t expected, int32_t newValue) {
+        int8_t* arr, int32_t index, int32_t expected, int32_t newValue) {
     barray_check(arr, index, 4);
-    return cas_int((int32_t*)(barray_data(arr) + index), expected, newValue);
+    uint32_t* slot = (uint32_t*)(barray_data(arr) + index);
+    uint32_t be_expected = JNATIVE_BE32((uint32_t)expected);
+    uint32_t be_new      = JNATIVE_BE32((uint32_t)newValue);
+    return __atomic_compare_exchange_n(slot, &be_expected, be_new,
+                                       0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;
 }
 
 int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet___BIJJ_Z(
-        void* arr, int32_t index, int64_t expected, int64_t newValue) {
+        int8_t* arr, int32_t index, int64_t expected, int64_t newValue) {
     barray_check(arr, index, 8);
-    int64_t exp = expected;
-    return __atomic_compare_exchange_n((int64_t*)(barray_data(arr) + index),
-                                       &exp, newValue, 0,
-                                       __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;
+    uint64_t* slot = (uint64_t*)(barray_data(arr) + index);
+    uint64_t be_expected = JNATIVE_BE64((uint64_t)expected);
+    uint64_t be_new      = JNATIVE_BE64((uint64_t)newValue);
+    return __atomic_compare_exchange_n(slot, &be_expected, be_new,
+                                       0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;
 }
 
 int32_t __jnative_fn_java_lang_invoke_VarHandle_weakCompareAndSet___BIII_Z(
-        void* arr, int32_t index, int32_t expected, int32_t newValue) {
+        int8_t* arr, int32_t index, int32_t expected, int32_t newValue) {
     return __jnative_fn_java_lang_invoke_VarHandle_compareAndSet___BIII_Z(
         arr, index, expected, newValue);
 }
 
 int32_t __jnative_fn_java_lang_invoke_VarHandle_weakCompareAndSet___BIJJ_Z(
-        void* arr, int32_t index, int64_t expected, int64_t newValue) {
+        int8_t* arr, int32_t index, int64_t expected, int64_t newValue) {
     return __jnative_fn_java_lang_invoke_VarHandle_compareAndSet___BIJJ_Z(
         arr, index, expected, newValue);
 }
 
-/*
- * ===========================================================================
- * compareAndExchange on byte[]
- * ===========================================================================
- */
-
 int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndExchange___BIII_I(
-        void* arr, int32_t index, int32_t expected, int32_t newValue) {
+        int8_t* arr, int32_t index, int32_t expected, int32_t newValue) {
     barray_check(arr, index, 4);
-    return cax_int((int32_t*)(barray_data(arr) + index), expected, newValue);
+    uint32_t* slot = (uint32_t*)(barray_data(arr) + index);
+    uint32_t be_witness = JNATIVE_BE32((uint32_t)expected);
+    uint32_t be_new     = JNATIVE_BE32((uint32_t)newValue);
+    __atomic_compare_exchange_n(slot, &be_witness, be_new,
+                                0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    return (int32_t)JNATIVE_BE32(be_witness);
 }
 
 int64_t __jnative_fn_java_lang_invoke_VarHandle_compareAndExchange___BIJJ_J(
-        void* arr, int32_t index, int64_t expected, int64_t newValue) {
+        int8_t* arr, int32_t index, int64_t expected, int64_t newValue) {
     barray_check(arr, index, 8);
-    int64_t witness = expected;
-    __atomic_compare_exchange_n((int64_t*)(barray_data(arr) + index),
-                                &witness, newValue, 0,
-                                __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
-    return witness;
+    uint64_t* slot = (uint64_t*)(barray_data(arr) + index);
+    uint64_t be_witness = JNATIVE_BE64((uint64_t)expected);
+    uint64_t be_new     = JNATIVE_BE64((uint64_t)newValue);
+    __atomic_compare_exchange_n(slot, &be_witness, be_new,
+                                0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    return (int64_t)JNATIVE_BE64(be_witness);
 }
 
-/*
- * ===========================================================================
- * getAndSet / getAndAdd on byte[]
- * ===========================================================================
- */
-
 int32_t __jnative_fn_java_lang_invoke_VarHandle_getAndSet___BII_I(
-        void* arr, int32_t index, int32_t newValue) {
+        int8_t* arr, int32_t index, int32_t newValue) {
     barray_check(arr, index, 4);
-    int32_t old;
-    __atomic_exchange((int32_t*)(barray_data(arr) + index), &newValue, &old,
-                      __ATOMIC_SEQ_CST);
-    return old;
+    uint32_t* slot = (uint32_t*)(barray_data(arr) + index);
+    uint32_t be_new = JNATIVE_BE32((uint32_t)newValue);
+    uint32_t be_old;
+    __atomic_exchange(slot, &be_new, &be_old, __ATOMIC_SEQ_CST);
+    return (int32_t)JNATIVE_BE32(be_old);
 }
 
 int64_t __jnative_fn_java_lang_invoke_VarHandle_getAndSet___BIJ_J(
-        void* arr, int32_t index, int64_t newValue) {
+        int8_t* arr, int32_t index, int64_t newValue) {
     barray_check(arr, index, 8);
-    int64_t old;
-    __atomic_exchange((int64_t*)(barray_data(arr) + index), &newValue, &old,
-                      __ATOMIC_SEQ_CST);
-    return old;
+    uint64_t* slot = (uint64_t*)(barray_data(arr) + index);
+    uint64_t be_new = JNATIVE_BE64((uint64_t)newValue);
+    uint64_t be_old;
+    __atomic_exchange(slot, &be_new, &be_old, __ATOMIC_SEQ_CST);
+    return (int64_t)JNATIVE_BE64(be_old);
 }
 
 int32_t __jnative_fn_java_lang_invoke_VarHandle_getAndAdd___BII_I(
-        void* arr, int32_t index, int32_t delta) {
+        int8_t* arr, int32_t index, int32_t delta) {
     barray_check(arr, index, 4);
-    return __atomic_fetch_add((int32_t*)(barray_data(arr) + index), delta,
-                              __ATOMIC_SEQ_CST);
+    uint32_t* slot = (uint32_t*)(barray_data(arr) + index);
+    uint32_t be_old = __atomic_load_n(slot, __ATOMIC_SEQ_CST);
+    for (;;) {
+        int32_t old_host = (int32_t)JNATIVE_BE32(be_old);
+        int32_t new_host = (int32_t)((uint32_t)old_host + (uint32_t)delta);
+        uint32_t be_new  = JNATIVE_BE32((uint32_t)new_host);
+        if (__atomic_compare_exchange_n(slot, &be_old, be_new, 0,
+                                        __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+            return old_host;
+        }
+    }
 }
 
 int64_t __jnative_fn_java_lang_invoke_VarHandle_getAndAdd___BIJ_J(
-        void* arr, int32_t index, int64_t delta) {
+        int8_t* arr, int32_t index, int64_t delta) {
     barray_check(arr, index, 8);
-    return __atomic_fetch_add((int64_t*)(barray_data(arr) + index), delta,
-                              __ATOMIC_SEQ_CST);
+    uint64_t* slot = (uint64_t*)(barray_data(arr) + index);
+    uint64_t be_old = __atomic_load_n(slot, __ATOMIC_SEQ_CST);
+    for (;;) {
+        int64_t old_host = (int64_t)JNATIVE_BE64(be_old);
+        int64_t new_host = (int64_t)((uint64_t)old_host + (uint64_t)delta);
+        uint64_t be_new  = JNATIVE_BE64((uint64_t)new_host);
+        if (__atomic_compare_exchange_n(slot, &be_old, be_new, 0,
+                                        __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+            return old_host;
+        }
+    }
 }
 
 int32_t __jnative_fn_java_lang_invoke_VarHandle_getAndAddInt___BII_I(
-        void* arr, int32_t index, int32_t delta) {
+        int8_t* arr, int32_t index, int32_t delta) {
     return __jnative_fn_java_lang_invoke_VarHandle_getAndAdd___BII_I(arr, index, delta);
 }
 
 int64_t __jnative_fn_java_lang_invoke_VarHandle_getAndAddLong___BIJ_J(
-        void* arr, int32_t index, int64_t delta) {
+        int8_t* arr, int32_t index, int64_t delta) {
     return __jnative_fn_java_lang_invoke_VarHandle_getAndAdd___BIJ_J(arr, index, delta);
 }
 
-/*
- * ===========================================================================
- * Legacy void** entry points
- *
- * These carry the VarHandle as args[0], the receiver as args[1], and
- * the primitive index as args[2]. They are kept for compatibility with
- * class files emitted by older builds of this runtime.
- * ===========================================================================
- */
+/* ===========================================================================
+ *  Legacy void** entry points (kept for older call shapes)
+ * =========================================================================== */
 
 void __jnative_fn_java_lang_invoke_VarHandle_get___V_V(void **args) {
     (void)args;
@@ -453,53 +499,46 @@ void __jnative_fn_java_lang_invoke_VarHandle_get___V_V(void **args) {
 
 int __jnative_fn_java_lang_invoke_VarHandle_get___V_I(void **args) {
     if (args == NULL || args[1] == NULL || args[2] == NULL) return 0;
-    void*  array = *(void**)args[1];
+    void*  array = args[1];
     int32_t index = *(int32_t*)args[2];
     return __jnative_fn_java_lang_invoke_VarHandle_get___BI_I(array, index);
 }
 
-/*
- * ===========================================================================
- * Generic single-Object entry points
+/* ===========================================================================
+ *  Generic single-Object accessors.
  *
- * Reached when the VarHandle call shape could not be statically
- * resolved to a concrete field descriptor. The helpers below treat
- * the single reference argument as a pointer to the first instance
- * field (offset 8), which matches the layout of the AtomicX classes,
- * java.lang.Thread.threadLocalRandomProbe's container, and other
- * simple single-field containers this runtime encounters.
- * ===========================================================================
- */
+ *  Read or write the first instance field (offset 8) of the receiver.
+ *  Used for AtomicXxx and other single-field containers whose
+ *  VarHandle call site could not be resolved to a concrete field
+ *  descriptor. The first argument is the target object, not the
+ *  VarHandle.
+ * =========================================================================== */
 
 typedef void* VarHandlePolyArg;
-typedef int32_t jboolean;
 
 static inline void* var_handle_read_field(void* target) {
     if (target == NULL) return NULL;
-    return *(void**)((char*)target + VAR_HANDLE_FIRST_FIELD_OFFSET);
+    return *(void**)((char*)target + 8);
 }
 
 static inline void* var_handle_read_field_acquire(void* target) {
     if (target == NULL) return NULL;
     void* v;
-    __atomic_load((void**)((char*)target + VAR_HANDLE_FIRST_FIELD_OFFSET),
-                  &v, __ATOMIC_ACQUIRE);
+    __atomic_load((void**)((char*)target + 8), &v, __ATOMIC_ACQUIRE);
     return v;
 }
 
 static inline void* var_handle_read_field_volatile(void* target) {
     if (target == NULL) return NULL;
     void* v;
-    __atomic_load((void**)((char*)target + VAR_HANDLE_FIRST_FIELD_OFFSET),
-                  &v, __ATOMIC_SEQ_CST);
+    __atomic_load((void**)((char*)target + 8), &v, __ATOMIC_SEQ_CST);
     return v;
 }
 
 static inline void* var_handle_read_field_opaque(void* target) {
     if (target == NULL) return NULL;
     void* v;
-    __atomic_load((void**)((char*)target + VAR_HANDLE_FIRST_FIELD_OFFSET),
-                  &v, __ATOMIC_RELAXED);
+    __atomic_load((void**)((char*)target + 8), &v, __ATOMIC_RELAXED);
     return v;
 }
 
@@ -523,199 +562,134 @@ void* __jnative_fn_java_lang_invoke_VarHandle_getVolatile___Ljava_lang_Object__L
     return var_handle_read_field_volatile((void*)target);
 }
 
-void __jnative_fn_java_lang_invoke_VarHandle_set___Ljava_lang_Object__V(
-        VarHandlePolyArg arg) {
+void __jnative_fn_java_lang_invoke_VarHandle_set___Ljava_lang_Object__V(VarHandlePolyArg arg) {
+    (void)arg;
+}
+void __jnative_fn_java_lang_invoke_VarHandle_setRelease___Ljava_lang_Object__V(VarHandlePolyArg arg) {
+    (void)arg;
+}
+void __jnative_fn_java_lang_invoke_VarHandle_setOpaque___Ljava_lang_Object__V(VarHandlePolyArg arg) {
+    (void)arg;
+}
+void __jnative_fn_java_lang_invoke_VarHandle_setVolatile___Ljava_lang_Object__V(VarHandlePolyArg arg) {
     (void)arg;
 }
 
-void __jnative_fn_java_lang_invoke_VarHandle_setRelease___Ljava_lang_Object__V(
-        VarHandlePolyArg arg) {
+int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet___Ljava_lang_Object__Z(VarHandlePolyArg arg) {
     (void)arg;
+    return 0;
 }
-
-void __jnative_fn_java_lang_invoke_VarHandle_setOpaque___Ljava_lang_Object__V(
-        VarHandlePolyArg arg) {
+int32_t __jnative_fn_java_lang_invoke_VarHandle_weakCompareAndSet___Ljava_lang_Object__Z(VarHandlePolyArg arg) {
     (void)arg;
+    return 0;
 }
-
-void __jnative_fn_java_lang_invoke_VarHandle_setVolatile___Ljava_lang_Object__V(
-        VarHandlePolyArg arg) {
+int32_t __jnative_fn_java_lang_invoke_VarHandle_weakCompareAndSetAcquire___Ljava_lang_Object__Z(VarHandlePolyArg arg) {
     (void)arg;
+    return 0;
 }
-
-jboolean __jnative_fn_java_lang_invoke_VarHandle_compareAndSet___Ljava_lang_Object__Z(
-        VarHandlePolyArg arg) {
+int32_t __jnative_fn_java_lang_invoke_VarHandle_weakCompareAndSetPlain___Ljava_lang_Object__Z(VarHandlePolyArg arg) {
+    (void)arg;
+    return 0;
+}
+int32_t __jnative_fn_java_lang_invoke_VarHandle_weakCompareAndSetRelease___Ljava_lang_Object__Z(VarHandlePolyArg arg) {
     (void)arg;
     return 0;
 }
 
-jboolean __jnative_fn_java_lang_invoke_VarHandle_weakCompareAndSet___Ljava_lang_Object__Z(
-        VarHandlePolyArg arg) {
-    (void)arg;
-    return 0;
-}
-
-jboolean __jnative_fn_java_lang_invoke_VarHandle_weakCompareAndSetAcquire___Ljava_lang_Object__Z(
-        VarHandlePolyArg arg) {
-    (void)arg;
-    return 0;
-}
-
-jboolean __jnative_fn_java_lang_invoke_VarHandle_weakCompareAndSetPlain___Ljava_lang_Object__Z(
-        VarHandlePolyArg arg) {
-    (void)arg;
-    return 0;
-}
-
-jboolean __jnative_fn_java_lang_invoke_VarHandle_weakCompareAndSetRelease___Ljava_lang_Object__Z(
-        VarHandlePolyArg arg) {
-    (void)arg;
-    return 0;
-}
-
-void* __jnative_fn_java_lang_invoke_VarHandle_compareAndExchange___Ljava_lang_Object__Ljava_lang_Object_(
-        VarHandlePolyArg target) {
+void* __jnative_fn_java_lang_invoke_VarHandle_compareAndExchange___Ljava_lang_Object__Ljava_lang_Object_(VarHandlePolyArg target) {
     return var_handle_read_field_volatile((void*)target);
 }
-
-void* __jnative_fn_java_lang_invoke_VarHandle_compareAndExchangeAcquire___Ljava_lang_Object__Ljava_lang_Object_(
-        VarHandlePolyArg target) {
+void* __jnative_fn_java_lang_invoke_VarHandle_compareAndExchangeAcquire___Ljava_lang_Object__Ljava_lang_Object_(VarHandlePolyArg target) {
     return var_handle_read_field_acquire((void*)target);
 }
-
-void* __jnative_fn_java_lang_invoke_VarHandle_compareAndExchangeRelease___Ljava_lang_Object__Ljava_lang_Object_(
-        VarHandlePolyArg target) {
+void* __jnative_fn_java_lang_invoke_VarHandle_compareAndExchangeRelease___Ljava_lang_Object__Ljava_lang_Object_(VarHandlePolyArg target) {
+    return var_handle_read_field((void*)target);
+}
+void* __jnative_fn_java_lang_invoke_VarHandle_getAndAdd___Ljava_lang_Object__Ljava_lang_Object_(VarHandlePolyArg target) {
+    return var_handle_read_field_volatile((void*)target);
+}
+void* __jnative_fn_java_lang_invoke_VarHandle_getAndAddAcquire___Ljava_lang_Object__Ljava_lang_Object_(VarHandlePolyArg target) {
+    return var_handle_read_field_acquire((void*)target);
+}
+void* __jnative_fn_java_lang_invoke_VarHandle_getAndAddRelease___Ljava_lang_Object__Ljava_lang_Object_(VarHandlePolyArg target) {
+    return var_handle_read_field((void*)target);
+}
+void* __jnative_fn_java_lang_invoke_VarHandle_getAndSet___Ljava_lang_Object__Ljava_lang_Object_(VarHandlePolyArg target) {
+    return var_handle_read_field_volatile((void*)target);
+}
+void* __jnative_fn_java_lang_invoke_VarHandle_getAndSetAcquire___Ljava_lang_Object__Ljava_lang_Object_(VarHandlePolyArg target) {
+    return var_handle_read_field_acquire((void*)target);
+}
+void* __jnative_fn_java_lang_invoke_VarHandle_getAndSetRelease___Ljava_lang_Object__Ljava_lang_Object_(VarHandlePolyArg target) {
+    return var_handle_read_field((void*)target);
+}
+void* __jnative_fn_java_lang_invoke_VarHandle_getAndBitwiseAnd___Ljava_lang_Object__Ljava_lang_Object_(VarHandlePolyArg target) {
+    return var_handle_read_field_volatile((void*)target);
+}
+void* __jnative_fn_java_lang_invoke_VarHandle_getAndBitwiseAndAcquire___Ljava_lang_Object__Ljava_lang_Object_(VarHandlePolyArg target) {
+    return var_handle_read_field_acquire((void*)target);
+}
+void* __jnative_fn_java_lang_invoke_VarHandle_getAndBitwiseAndRelease___Ljava_lang_Object__Ljava_lang_Object_(VarHandlePolyArg target) {
+    return var_handle_read_field((void*)target);
+}
+void* __jnative_fn_java_lang_invoke_VarHandle_getAndBitwiseOr___Ljava_lang_Object__Ljava_lang_Object_(VarHandlePolyArg target) {
+    return var_handle_read_field_volatile((void*)target);
+}
+void* __jnative_fn_java_lang_invoke_VarHandle_getAndBitwiseOrAcquire___Ljava_lang_Object__Ljava_lang_Object_(VarHandlePolyArg target) {
+    return var_handle_read_field_acquire((void*)target);
+}
+void* __jnative_fn_java_lang_invoke_VarHandle_getAndBitwiseOrRelease___Ljava_lang_Object__Ljava_lang_Object_(VarHandlePolyArg target) {
+    return var_handle_read_field((void*)target);
+}
+void* __jnative_fn_java_lang_invoke_VarHandle_getAndBitwiseXor___Ljava_lang_Object__Ljava_lang_Object_(VarHandlePolyArg target) {
+    return var_handle_read_field_volatile((void*)target);
+}
+void* __jnative_fn_java_lang_invoke_VarHandle_getAndBitwiseXorAcquire___Ljava_lang_Object__Ljava_lang_Object_(VarHandlePolyArg target) {
+    return var_handle_read_field_acquire((void*)target);
+}
+void* __jnative_fn_java_lang_invoke_VarHandle_getAndBitwiseXorRelease___Ljava_lang_Object__Ljava_lang_Object_(VarHandlePolyArg target) {
     return var_handle_read_field((void*)target);
 }
 
-void* __jnative_fn_java_lang_invoke_VarHandle_getAndAdd___Ljava_lang_Object__Ljava_lang_Object_(
-        VarHandlePolyArg target) {
-    return var_handle_read_field_volatile((void*)target);
-}
-
-void* __jnative_fn_java_lang_invoke_VarHandle_getAndAddAcquire___Ljava_lang_Object__Ljava_lang_Object_(
-        VarHandlePolyArg target) {
-    return var_handle_read_field_acquire((void*)target);
-}
-
-void* __jnative_fn_java_lang_invoke_VarHandle_getAndAddRelease___Ljava_lang_Object__Ljava_lang_Object_(
-        VarHandlePolyArg target) {
-    return var_handle_read_field((void*)target);
-}
-
-void* __jnative_fn_java_lang_invoke_VarHandle_getAndSet___Ljava_lang_Object__Ljava_lang_Object_(
-        VarHandlePolyArg target) {
-    return var_handle_read_field_volatile((void*)target);
-}
-
-void* __jnative_fn_java_lang_invoke_VarHandle_getAndSetAcquire___Ljava_lang_Object__Ljava_lang_Object_(
-        VarHandlePolyArg target) {
-    return var_handle_read_field_acquire((void*)target);
-}
-
-void* __jnative_fn_java_lang_invoke_VarHandle_getAndSetRelease___Ljava_lang_Object__Ljava_lang_Object_(
-        VarHandlePolyArg target) {
-    return var_handle_read_field((void*)target);
-}
-
-void* __jnative_fn_java_lang_invoke_VarHandle_getAndBitwiseAnd___Ljava_lang_Object__Ljava_lang_Object_(
-        VarHandlePolyArg target) {
-    return var_handle_read_field_volatile((void*)target);
-}
-
-void* __jnative_fn_java_lang_invoke_VarHandle_getAndBitwiseAndAcquire___Ljava_lang_Object__Ljava_lang_Object_(
-        VarHandlePolyArg target) {
-    return var_handle_read_field_acquire((void*)target);
-}
-
-void* __jnative_fn_java_lang_invoke_VarHandle_getAndBitwiseAndRelease___Ljava_lang_Object__Ljava_lang_Object_(
-        VarHandlePolyArg target) {
-    return var_handle_read_field((void*)target);
-}
-
-void* __jnative_fn_java_lang_invoke_VarHandle_getAndBitwiseOr___Ljava_lang_Object__Ljava_lang_Object_(
-        VarHandlePolyArg target) {
-    return var_handle_read_field_volatile((void*)target);
-}
-
-void* __jnative_fn_java_lang_invoke_VarHandle_getAndBitwiseOrAcquire___Ljava_lang_Object__Ljava_lang_Object_(
-        VarHandlePolyArg target) {
-    return var_handle_read_field_acquire((void*)target);
-}
-
-void* __jnative_fn_java_lang_invoke_VarHandle_getAndBitwiseOrRelease___Ljava_lang_Object__Ljava_lang_Object_(
-        VarHandlePolyArg target) {
-    return var_handle_read_field((void*)target);
-}
-
-void* __jnative_fn_java_lang_invoke_VarHandle_getAndBitwiseXor___Ljava_lang_Object__Ljava_lang_Object_(
-        VarHandlePolyArg target) {
-    return var_handle_read_field_volatile((void*)target);
-}
-
-void* __jnative_fn_java_lang_invoke_VarHandle_getAndBitwiseXorAcquire___Ljava_lang_Object__Ljava_lang_Object_(
-        VarHandlePolyArg target) {
-    return var_handle_read_field_acquire((void*)target);
-}
-
-void* __jnative_fn_java_lang_invoke_VarHandle_getAndBitwiseXorRelease___Ljava_lang_Object__Ljava_lang_Object_(
-        VarHandlePolyArg target) {
-    return var_handle_read_field((void*)target);
-}
-
-/*
- * ===========================================================================
- * Concrete (class, descriptor) specialisations used by Striped64,
- * atomic reference types, FutureTask, ConcurrentSkipListMap,
- * LinkedTransferQueue, ForEachOps.ForEachOrderedTask,
- * SharedThreadContainer and jdk.internal.event.EventHelper.
+/* ===========================================================================
+ *  AtomicReference
  *
- * Object layout in this runtime:
- *     [ i8* vtable ][ first field ][ second field ] ...
- * ===========================================================================
- */
+ *  Object layout (LlvmGlobalEmitter.getFieldOffset):
+ *      +0  vtable
+ *      +8  Object value
+ * =========================================================================== */
 
-/*
- * ---- AtomicReference ----
- *
- * value (Object, offset 8): Object / Object
- */
 int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concurrent_atomic_AtomicReference_Ljava_lang_Object_Ljava_lang_Object__Z(
-        void* this_handle, void* obj, void* expected, void* newValue)
-{
-    (void)this_handle;
+        void* obj, void* expected, void* newValue) {
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
     return cas_ref((void**)((char*)obj + 8), expected, newValue);
 }
 
-/*
- * ---- Thread.threadLocalRandomProbe ----
+/* ===========================================================================
+ *  java.lang.Thread.threadLocalRandomProbe
  *
- * threadLocalRandomProbe (int, offset 36). The offset is the one the
- * LLVM emitter computes from the JDK's Thread field declaration order.
- */
+ *  +36  int threadLocalRandomProbe
+ * =========================================================================== */
+
 void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_lang_Thread_I_V(
-        void* this_handle, void* thread, int32_t value)
-{
-    (void)this_handle;
+        void* thread, int32_t value) {
     if (thread == NULL) {
         __jnative_throw_null_pointer_exception();
     }
     *(int32_t*)((char*)thread + 36) = value;
 }
 
-/*
- * ---- Striped64 ----
+/* ===========================================================================
+ *  Striped64 and Striped64.Cell
  *
- * Striped64.base (long, offset 8) and Striped64.cellsBusy (int, offset 16).
- * Striped64.Cell.value (long, offset 8).
- */
+ *      Striped64   +8 long base, +16 int cellsBusy
+ *      Cell        +8 long value
+ * =========================================================================== */
+
 int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concurrent_atomic_Striped64_II_Z(
-        void* this_handle, void* obj, int32_t expected, int32_t newValue)
-{
-    (void)this_handle;
+        void* obj, int32_t expected, int32_t newValue) {
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
@@ -723,9 +697,7 @@ int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concur
 }
 
 int32_t __jnative_fn_java_lang_invoke_VarHandle_weakCompareAndSetRelease__Ljava_util_concurrent_atomic_Striped64_JJ_Z(
-        void* this_handle, void* obj, int64_t expected, int64_t newValue)
-{
-    (void)this_handle;
+        void* obj, int64_t expected, int64_t newValue) {
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
@@ -735,9 +707,7 @@ int32_t __jnative_fn_java_lang_invoke_VarHandle_weakCompareAndSetRelease__Ljava_
 }
 
 int32_t __jnative_fn_java_lang_invoke_VarHandle_weakCompareAndSetRelease__Ljava_util_concurrent_atomic_Striped64_Cell_JJ_Z(
-        void* this_handle, void* obj, int64_t expected, int64_t newValue)
-{
-    (void)this_handle;
+        void* obj, int64_t expected, int64_t newValue) {
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
@@ -746,33 +716,59 @@ int32_t __jnative_fn_java_lang_invoke_VarHandle_weakCompareAndSetRelease__Ljava_
                                        0, __ATOMIC_RELEASE, __ATOMIC_RELAXED) ? 1 : 0;
 }
 
-/*
- * ---- AtomicMarkableReference.Pair ----
+/* ===========================================================================
+ *  AtomicMarkableReference.Pair
  *
- * reference (Object, offset 8): Pair / Pair
- */
+ *      +8  Object reference
+ * =========================================================================== */
+
 int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concurrent_atomic_AtomicMarkableReference_Ljava_util_concurrent_atomic_AtomicMarkableReference_Pair_Ljava_util_concurrent_atomic_AtomicMarkableReference_Pair__Z(
-        void* this_handle, void* obj, void* expected, void* newValue)
-{
-    (void)this_handle;
+        void* obj, void* expected, void* newValue) {
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
     return cas_ref((void**)((char*)obj + 8), expected, newValue);
 }
 
-/*
- * ---- FutureTask ----
+/* ===========================================================================
+ *  FutureTask and FutureTask.WaitNode
  *
- * state (int, offset 8)
- * runner (Thread, offset 24)
- * waiters (WaitNode, offset 32)
- */
+ *  Layout (LlvmGlobalEmitter.getFieldOffset for java/util/concurrent/FutureTask):
+ *
+ *      +0   vtable
+ *      +8   int      state
+ *      +16  Callable callable
+ *      +24  Object   outcome
+ *      +32  Thread   runner       <-- RUNNER VarHandle
+ *      +40  WaitNode waiters      <-- WAITERS VarHandle
+ *
+ *  Layout for FutureTask$WaitNode:
+ *
+ *      +0   vtable
+ *      +8   Thread   thread
+ *      +16  WaitNode next
+ *
+ *  Three distinct access-mode signatures reach this file, one per
+ *  call site the reachable closure contains:
+ *
+ *    run, runAndReset       — RUNNER.compareAndSet(this, null, Thread.currentThread())
+ *                             args (Void, Thread),   field runner  (+32)
+ *
+ *    awaitDone              — WAITERS.weakCompareAndSet(this, q.next = waiters, q)
+ *                             args (WaitNode, WaitNode), field waiters (+40)
+ *
+ *    removeWaiter           — WAITERS.compareAndSet(this, q, s)
+ *                             args (WaitNode, WaitNode), field waiters (+40)
+ *
+ *    finishCompletion       — WAITERS.weakCompareAndSet(this, q, null)
+ *                             args (WaitNode, Void),  field waiters (+40)
+ *
+ *  All four symbols must be present; the JDK emits each one from a
+ *  different method and none of them can be supplied by another.
+ * =========================================================================== */
 
 int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concurrent_FutureTask_II_Z(
-        void* this_handle, void* obj, int32_t expected, int32_t newValue)
-{
-    (void)this_handle;
+        void* obj, int32_t expected, int32_t newValue) {
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
@@ -780,47 +776,63 @@ int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concur
 }
 
 void __jnative_fn_java_lang_invoke_VarHandle_setRelease__Ljava_util_concurrent_FutureTask_I_V(
-        void* this_handle, void* obj, int32_t value)
-{
-    (void)this_handle;
+        void* obj, int32_t value) {
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
     __atomic_store_n((int32_t*)((char*)obj + 8), value, __ATOMIC_RELEASE);
 }
 
+/* RUNNER.compareAndSet(this, null, Thread.currentThread()) — runner @ +32 */
 int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concurrent_FutureTask_Ljava_lang_Void_Ljava_lang_Thread__Z(
-        void* this_handle, void* obj, void* expected, void* newValue)
-{
-    (void)this_handle;
-    if (obj == NULL) {
-        __jnative_throw_null_pointer_exception();
-    }
-    return cas_ref((void**)((char*)obj + 24), expected, newValue);
-}
-
-int32_t __jnative_fn_java_lang_invoke_VarHandle_weakCompareAndSet__Ljava_util_concurrent_FutureTask_Ljava_util_concurrent_FutureTask_WaitNode_Ljava_lang_Void__Z(
-        void* this_handle, void* obj, void* expected, void* newValue)
-{
-    (void)this_handle;
+        void* obj, void* expected, void* newValue) {
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
     return cas_ref((void**)((char*)obj + 32), expected, newValue);
 }
 
-/*
- * ---- ConcurrentSkipListMap.Node ----
+/* WAITERS.compareAndSet(this, q, s) — waiters @ +40 */
+int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concurrent_FutureTask_Ljava_util_concurrent_FutureTask_WaitNode_Ljava_util_concurrent_FutureTask_WaitNode__Z(
+        void* obj, void* expected, void* newValue) {
+    if (obj == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    return cas_ref((void**)((char*)obj + 40), expected, newValue);
+}
+
+/* WAITERS.weakCompareAndSet(this, q, q') — waiters @ +40 */
+int32_t __jnative_fn_java_lang_invoke_VarHandle_weakCompareAndSet__Ljava_util_concurrent_FutureTask_Ljava_util_concurrent_FutureTask_WaitNode_Ljava_util_concurrent_FutureTask_WaitNode__Z(
+        void* obj, void* expected, void* newValue) {
+    if (obj == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    /* The weak form is defined to be allowed to fail spuriously; every
+     * caller wraps it in a retry loop. The primitive used here does
+     * not fail spuriously, so this implementation is strictly stronger
+     * than the contract requires. */
+    return cas_ref((void**)((char*)obj + 40), expected, newValue);
+}
+
+/* WAITERS.weakCompareAndSet(this, q, null) — waiters @ +40, newValue == null */
+int32_t __jnative_fn_java_lang_invoke_VarHandle_weakCompareAndSet__Ljava_util_concurrent_FutureTask_Ljava_util_concurrent_FutureTask_WaitNode_Ljava_lang_Void__Z(
+        void* obj, void* expected, void* newValue) {
+    if (obj == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    return cas_ref((void**)((char*)obj + 40), expected, newValue);
+}
+
+/* ===========================================================================
+ *  ConcurrentSkipListMap.Node / Index / ConcurrentSkipListMap
  *
- * value (Object, offset 16): Object / Object
- * value (Object, offset 16): Object / Void
- * next  (Node,   offset 24): Node / Node
- */
+ *      Node        +16 value, +24 next
+ *      Index       +24 right
+ *      CSLM        +24 head, +40 counter
+ * =========================================================================== */
 
 int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concurrent_ConcurrentSkipListMap_Node_Ljava_lang_Object_Ljava_lang_Object__Z(
-        void* this_handle, void* obj, void* expected, void* newValue)
-{
-    (void)this_handle;
+        void* obj, void* expected, void* newValue) {
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
@@ -828,9 +840,7 @@ int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concur
 }
 
 int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concurrent_ConcurrentSkipListMap_Node_Ljava_lang_Object_Ljava_lang_Void__Z(
-        void* this_handle, void* obj, void* expected, void* newValue)
-{
-    (void)this_handle;
+        void* obj, void* expected, void* newValue) {
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
@@ -838,26 +848,15 @@ int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concur
 }
 
 int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concurrent_ConcurrentSkipListMap_Node_Ljava_util_concurrent_ConcurrentSkipListMap_Node_Ljava_util_concurrent_ConcurrentSkipListMap_Node__Z(
-        void* this_handle, void* obj, void* expected, void* newValue)
-{
-    (void)this_handle;
+        void* obj, void* expected, void* newValue) {
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
     return cas_ref((void**)((char*)obj + 24), expected, newValue);
 }
 
-/*
- * ---- ConcurrentSkipListMap.Index ----
- *
- * right (Index, offset 24): Index / Index
- * right (Index, offset 24): Index / Void
- */
-
 int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concurrent_ConcurrentSkipListMap_Index_Ljava_util_concurrent_ConcurrentSkipListMap_Index_Ljava_util_concurrent_ConcurrentSkipListMap_Index__Z(
-        void* this_handle, void* obj, void* expected, void* newValue)
-{
-    (void)this_handle;
+        void* obj, void* expected, void* newValue) {
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
@@ -865,27 +864,15 @@ int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concur
 }
 
 int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concurrent_ConcurrentSkipListMap_Index_Ljava_util_concurrent_ConcurrentSkipListMap_Index_Ljava_lang_Void__Z(
-        void* this_handle, void* obj, void* expected, void* newValue)
-{
-    (void)this_handle;
+        void* obj, void* expected, void* newValue) {
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
     return cas_ref((void**)((char*)obj + 24), expected, newValue);
 }
 
-/*
- * ---- ConcurrentSkipListMap itself ----
- *
- * head    (Index,     offset 24): Index / Index
- * head    (Index,     offset 24): Void  / Index
- * counter (LongAdder, offset 40): Void  / LongAdder
- */
-
 int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concurrent_ConcurrentSkipListMap_Ljava_util_concurrent_ConcurrentSkipListMap_Index_Ljava_util_concurrent_ConcurrentSkipListMap_Index__Z(
-        void* this_handle, void* obj, void* expected, void* newValue)
-{
-    (void)this_handle;
+        void* obj, void* expected, void* newValue) {
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
@@ -893,9 +880,7 @@ int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concur
 }
 
 int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concurrent_ConcurrentSkipListMap_Ljava_lang_Void_Ljava_util_concurrent_ConcurrentSkipListMap_Index__Z(
-        void* this_handle, void* obj, void* expected, void* newValue)
-{
-    (void)this_handle;
+        void* obj, void* expected, void* newValue) {
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
@@ -903,70 +888,140 @@ int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concur
 }
 
 int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concurrent_ConcurrentSkipListMap_Ljava_lang_Void_Ljava_util_concurrent_atomic_LongAdder__Z(
-        void* this_handle, void* obj, void* expected, void* newValue)
-{
-    (void)this_handle;
+        void* obj, void* expected, void* newValue) {
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
     return cas_ref((void**)((char*)obj + 40), expected, newValue);
 }
 
-/*
- * ---- SharedThreadContainer ----
+/* ===========================================================================
+ *  SharedThreadContainer
  *
- * A single boolean field at offset 8. The CAS works on the first byte
- * of that slot; the surrounding bytes are left untouched.
- */
+ *      +8  boolean closed
+ *      +16 Set     threads
+ * =========================================================================== */
+
 int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljdk_internal_vm_SharedThreadContainer_ZZ_Z(
-        void* this_handle, void* obj, int32_t expected, int32_t newValue)
-{
-    (void)this_handle;
+        void* obj, int32_t expected, int32_t newValue) {
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
     return cas_bool((uint8_t*)((char*)obj + 8), expected, newValue);
 }
 
-/*
- * ===========================================================================
- * LinkedTransferQueue and its node hierarchy
+int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljdk_internal_vm_SharedThreadContainer_Ljava_lang_Void_Ljava_util_Set__Z(
+        void* obj, void* expected, void* newValue) {
+    if (obj == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    return cas_ref((void**)((char*)obj + 16), expected, newValue);
+}
+
+/* ===========================================================================
+ *  ConcurrentLinkedQueue
  *
- * LinkedTransferQueue extends AbstractQueue extends AbstractCollection.
- * Neither AbstractQueue nor AbstractCollection declares instance fields,
- * so head and tail are the only slots that matter:
+ *      CLQ.Node  +8 Object item, +16 Node next
+ *      CLQ       +8 Node   head, +16 Node tail
  *
- *   LinkedTransferQueue:
- *       offset  8 : DualNode head (volatile)
- *       offset 16 : DualNode tail (volatile)
- *       offset 24 : int      sweepNow      (see the sweepNow() method)
+ *  The Queue-typed CAS on head and tail share the same descriptor;
+ *  the primary symbol targets head (offset 8), and a `_T`-suffixed
+ *  symbol targets tail (offset 16). Both bodies are provided so a
+ *  future emitter that carries the VarHandle identity through the
+ *  dispatch can bind the two sites independently.
+ * =========================================================================== */
+
+void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_util_concurrent_ConcurrentLinkedQueue_Node_Ljava_lang_Object__V(
+        void* obj, void* newValue) {
+    if (obj == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    __atomic_store_n((void**)((char*)obj + 8), newValue, __ATOMIC_RELEASE);
+}
+
+int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concurrent_ConcurrentLinkedQueue_Node_Ljava_lang_Object_Ljava_lang_Object__Z(
+        void* obj, void* expected, void* newValue) {
+    if (obj == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    return cas_ref((void**)((char*)obj + 8), expected, newValue);
+}
+
+int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concurrent_ConcurrentLinkedQueue_Node_Ljava_lang_Void_Ljava_util_concurrent_ConcurrentLinkedQueue_Node__Z(
+        void* obj, void* expected, void* newValue) {
+    if (obj == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    return cas_ref((void**)((char*)obj + 8), expected, newValue);
+}
+
+void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_util_concurrent_ConcurrentLinkedQueue_Node_Ljava_util_concurrent_ConcurrentLinkedQueue_Node__V(
+        void* obj, void* newValue) {
+    if (obj == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    __atomic_store_n((void**)((char*)obj + 16), newValue, __ATOMIC_RELEASE);
+}
+
+void __jnative_fn_java_lang_invoke_VarHandle_setRelease__Ljava_util_concurrent_ConcurrentLinkedQueue_Node_Ljava_util_concurrent_ConcurrentLinkedQueue_Node__V(
+        void* obj, void* newValue) {
+    if (obj == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    __atomic_store_n((void**)((char*)obj + 16), newValue, __ATOMIC_RELEASE);
+}
+
+int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concurrent_ConcurrentLinkedQueue_Node_Ljava_util_concurrent_ConcurrentLinkedQueue_Node_Ljava_util_concurrent_ConcurrentLinkedQueue_Node__Z(
+        void* obj, void* expected, void* newValue) {
+    if (obj == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    return cas_ref((void**)((char*)obj + 16), expected, newValue);
+}
+
+int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concurrent_ConcurrentLinkedQueue_Ljava_util_concurrent_ConcurrentLinkedQueue_Node_Ljava_util_concurrent_ConcurrentLinkedQueue_Node__Z(
+        void* obj, void* expected, void* newValue) {
+    if (obj == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    return cas_ref((void**)((char*)obj + 8), expected, newValue);
+}
+
+int32_t __jnative_fn_java_lang_invoke_VarHandle_weakCompareAndSet__Ljava_util_concurrent_ConcurrentLinkedQueue_Ljava_util_concurrent_ConcurrentLinkedQueue_Node_Ljava_util_concurrent_ConcurrentLinkedQueue_Node__Z(
+        void* obj, void* expected, void* newValue) {
+    if (obj == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    return cas_ref((void**)((char*)obj + 8), expected, newValue);
+}
+
+int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concurrent_ConcurrentLinkedQueue_Ljava_util_concurrent_ConcurrentLinkedQueue_Node_Ljava_util_concurrent_ConcurrentLinkedQueue_Node_T_Z(
+        void* obj, void* expected, void* newValue) {
+    if (obj == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    return cas_ref((void**)((char*)obj + 16), expected, newValue);
+}
+
+int32_t __jnative_fn_java_lang_invoke_VarHandle_weakCompareAndSet__Ljava_util_concurrent_ConcurrentLinkedQueue_Ljava_util_concurrent_ConcurrentLinkedQueue_Node_Ljava_util_concurrent_ConcurrentLinkedQueue_Node_T_Z(
+        void* obj, void* expected, void* newValue) {
+    if (obj == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    return cas_ref((void**)((char*)obj + 16), expected, newValue);
+}
+
+/* ===========================================================================
+ *  LinkedTransferQueue and its Node / DualNode hierarchy
  *
- * LinkedTransferQueue.Node (declared order in the JDK source):
- *       final boolean isData
- *       volatile Object item
- *       volatile Node   next
- *       volatile Thread waiter
- *
- * Laid out by LlvmGlobalEmitter.getFieldOffset with 8-byte reference
- * alignment:
- *
- *   offset  8 : boolean isData  (1 byte, padded)
- *   offset 16 : Object  item    (volatile)
- *   offset 24 : Node    next    (volatile)
- *   offset 32 : Thread  waiter
- *
- * LinkedTransferQueue.DualNode extends Node and adds one field:
- *
- *       volatile DualNode prev
- *
- * which lands immediately after the inherited slot list, at offset 40.
- * ===========================================================================
- */
+ *      LTQ       +8 DualNode head, +16 DualNode tail, +24 int sweepNow
+ *      Node      +8 boolean isData, +16 Object item,
+ *                +24 Node next, +32 Thread waiter
+ *      DualNode  inherits Node and adds +40 DualNode prev
+ * =========================================================================== */
 
 int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concurrent_LinkedTransferQueue_Ljava_util_concurrent_LinkedTransferQueue_Node_Ljava_util_concurrent_LinkedTransferQueue_Node__Z(
-        void* this_handle, void* obj, void* expected, void* newValue)
-{
-    (void)this_handle;
+        void* obj, void* expected, void* newValue) {
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
@@ -974,9 +1029,7 @@ int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concur
 }
 
 int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concurrent_LinkedTransferQueue_Node_Ljava_lang_Object_Ljava_lang_Object__Z(
-        void* this_handle, void* obj, void* expected, void* newValue)
-{
-    (void)this_handle;
+        void* obj, void* expected, void* newValue) {
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
@@ -984,9 +1037,7 @@ int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concur
 }
 
 int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concurrent_LinkedTransferQueue_Node_Ljava_lang_Object_Ljava_lang_Void__Z(
-        void* this_handle, void* obj, void* expected, void* newValue)
-{
-    (void)this_handle;
+        void* obj, void* expected, void* newValue) {
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
@@ -994,27 +1045,23 @@ int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concur
 }
 
 int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concurrent_LinkedTransferQueue_Node_Ljava_util_concurrent_LinkedTransferQueue_Node_Ljava_util_concurrent_LinkedTransferQueue_Node__Z(
-        void* this_handle, void* obj, void* expected, void* newValue)
-{
-    (void)this_handle;
+        void* obj, void* expected, void* newValue) {
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
     return cas_ref((void**)((char*)obj + 24), expected, newValue);
 }
 
-/*
- * ---- LinkedTransferQueue.Node — set (plain publish) overloads ----
- *
- *   set(Node, Object)  — item, offset 16
- *   set(Node, Node)    — next, offset 24
- *   set(Node, Void)    — item, offset 16 (null write)
- */
-
 void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_util_concurrent_LinkedTransferQueue_Node_Ljava_lang_Object__V(
-        void* this_handle, void* obj, void* newValue)
-{
-    (void)this_handle;
+        void* obj, void* newValue) {
+    if (obj == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    __atomic_store_n((void**)((char*)obj + 16), newValue, __ATOMIC_RELEASE);
+}
+
+void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_util_concurrent_LinkedTransferQueue_Node_Ljava_lang_Void__V(
+        void* obj, void* newValue) {
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
@@ -1022,213 +1069,103 @@ void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_util_concurrent_LinkedTr
 }
 
 void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_util_concurrent_LinkedTransferQueue_Node_Ljava_util_concurrent_LinkedTransferQueue_Node__V(
-        void* this_handle, void* obj, void* newValue)
-{
-    (void)this_handle;
+        void* obj, void* newValue) {
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
     __atomic_store_n((void**)((char*)obj + 24), newValue, __ATOMIC_RELEASE);
-}
-
-void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_util_concurrent_LinkedTransferQueue_Node_Ljava_lang_Void__V(
-        void* this_handle, void* obj, void* newValue)
-{
-    (void)this_handle;
-    if (obj == NULL) {
-        __jnative_throw_null_pointer_exception();
-    }
-    __atomic_store_n((void**)((char*)obj + 16), newValue, __ATOMIC_RELEASE);
 }
 
 void __jnative_fn_java_lang_invoke_VarHandle_setRelease__Ljava_util_concurrent_LinkedTransferQueue_Node_Ljava_util_concurrent_LinkedTransferQueue_Node__V(
-        void* this_handle, void* obj, void* newValue)
-{
-    (void)this_handle;
+        void* obj, void* newValue) {
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
     __atomic_store_n((void**)((char*)obj + 24), newValue, __ATOMIC_RELEASE);
 }
 
-/*
- * ===========================================================================
- * LinkedTransferQueue.DualNode
- *
- * DualNode inherits every field of Node and adds one of its own at
- * offset 40:
- *
- *   offset  8 : boolean  isData
- *   offset 16 : Object   item
- *   offset 24 : Node     next
- *   offset 32 : Thread   waiter
- *   offset 40 : DualNode prev
- *
- * The specific call sites the LLVM backend emits for the JDK 21
- * LinkedTransferQueue rewrite are:
- *
- *   DualNode.next  (offset 24)  — CAS and plain set
- *   DualNode.item  (offset 16)  — CAS
- *   DualNode.prev  (offset 40)  — set (used by selfLink / unlink)
- * ===========================================================================
- */
-
-/*
- * set(DualNode, DualNode) — used by `selfLink` when it wants to publish
- * the next pointer to a sibling DualNode. The field is the inherited
- * `next` slot at offset 24.
- */
 void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_util_concurrent_LinkedTransferQueue_DualNode_Ljava_util_concurrent_LinkedTransferQueue_DualNode__V(
-        void* this_handle, void* obj, void* newValue)
-{
-    (void)this_handle;
+        void* obj, void* newValue) {
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
     __atomic_store_n((void**)((char*)obj + 24), newValue, __ATOMIC_RELEASE);
 }
 
-/*
- * compareAndExchange(DualNode, DualNode, DualNode) -> DualNode
- *
- * Used by `cmpExNext` — the CAS on the inherited `next` slot at
- * offset 24. Returns the witness value (the old next pointer).
- */
 void* __jnative_fn_java_lang_invoke_VarHandle_compareAndExchange__Ljava_util_concurrent_LinkedTransferQueue_DualNode_Ljava_util_concurrent_LinkedTransferQueue_DualNode_Ljava_util_concurrent_LinkedTransferQueue_DualNode__Ljava_util_concurrent_LinkedTransferQueue_DualNode_(
-        void* this_handle, void* obj, void* expected, void* newValue)
-{
-    (void)this_handle;
+        void* obj, void* expected, void* newValue) {
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
     return cax_ref((void**)((char*)obj + 24), expected, newValue);
 }
 
-/*
- * set(DualNode, Object) — used by `xfer` when it publishes the item
- * payload. The field is the inherited `item` slot at offset 16.
- */
 void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_util_concurrent_LinkedTransferQueue_DualNode_Ljava_lang_Object__V(
-        void* this_handle, void* obj, void* newValue)
-{
-    (void)this_handle;
+        void* obj, void* newValue) {
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
     __atomic_store_n((void**)((char*)obj + 16), newValue, __ATOMIC_RELEASE);
 }
 
-/*
- * compareAndExchange(DualNode, Object, Object) -> Object
- *
- * Used by `cmpExItem` — the CAS on the inherited `item` slot at
- * offset 16. Returns the witness value (the old item pointer).
- */
+void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_util_concurrent_LinkedTransferQueue_DualNode_Ljava_lang_Void__V(
+        void* obj, void* newValue) {
+    if (obj == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    __atomic_store_n((void**)((char*)obj + 16), newValue, __ATOMIC_RELEASE);
+}
+
 void* __jnative_fn_java_lang_invoke_VarHandle_compareAndExchange__Ljava_util_concurrent_LinkedTransferQueue_DualNode_Ljava_lang_Object_Ljava_lang_Object__Ljava_lang_Object_(
-        void* this_handle, void* obj, void* expected, void* newValue)
-{
-    (void)this_handle;
+        void* obj, void* expected, void* newValue) {
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
     return cax_ref((void**)((char*)obj + 16), expected, newValue);
 }
 
-/*
- * compareAndExchange(LinkedTransferQueue, DualNode, DualNode) -> DualNode
- *
- * Used by `cmpExHead` and `cmpExTail` — the CAS on the queue's own
- * `head` (offset 8) or `tail` (offset 16) slot. Because the two call
- * sites share the same descriptor (the DualNode parameter type is the
- * same in both), the runtime cannot tell which slot is intended from
- * the signature alone. The two slots have different dynamic roles but
- * the same layout, so the two functions below are provided under
- * distinct symbol suffixes. The one carrying the plain DualNode
- * descriptor targets the head slot, which is the first to be touched
- * during the JDK's own initialisation sequence; the tail variant, if
- * the linker ever asks for it, would need its own entry point with a
- * distinguishable descriptor (the JDK's own source declares head and
- * tail as separate fields and the reachability analysis emits a
- * distinct call site for each).
- */
-void* __jnative_fn_java_lang_invoke_VarHandle_compareAndExchange__Ljava_util_concurrent_LinkedTransferQueue_Ljava_util_concurrent_LinkedTransferQueue_DualNode_Ljava_util_concurrent_LinkedTransferQueue_DualNode__Ljava_util_concurrent_LinkedTransferQueue_DualNode_(
-        void* this_handle, void* obj, void* expected, void* newValue)
-{
-    (void)this_handle;
+void* __jnative_fn_java_lang_invoke_VarHandle_compareAndExchange__Ljava_util_concurrent_LinkedTransferQueue_DualNode_Ljava_lang_Object_Ljava_lang_Void__Ljava_lang_Object_(
+        void* obj, void* expected, void* newValue) {
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
-    /*
-     * The default slot for this descriptor is the queue's `head` field
-     * (offset 8), which is the first one that any LinkedTransferQueue
-     * operation touches. The `tail` variant is emitted through the
-     * `T`-suffixed symbol below.
-     */
+    return cax_ref((void**)((char*)obj + 16), expected, newValue);
+}
+
+void* __jnative_fn_java_lang_invoke_VarHandle_compareAndExchange__Ljava_util_concurrent_LinkedTransferQueue_Ljava_util_concurrent_LinkedTransferQueue_DualNode_Ljava_util_concurrent_LinkedTransferQueue_DualNode__Ljava_util_concurrent_LinkedTransferQueue_DualNode_(
+        void* obj, void* expected, void* newValue) {
+    if (obj == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    /* Primary symbol targets `head` (+8). */
     return cax_ref((void**)((char*)obj + 8), expected, newValue);
 }
 
-/*
- * compareAndExchange on the tail slot. Kept as a separate symbol so
- * that a build whose reachability analysis distinguishes head from
- * tail can bind the two call sites independently. The current
- * emitter emits the same descriptor for both, so this function is
- * reachable only via an explicit symbol reference; it is provided so
- * the module links cleanly either way.
- */
 void* __jnative_fn_java_lang_invoke_VarHandle_compareAndExchange__Ljava_util_concurrent_LinkedTransferQueue_Ljava_util_concurrent_LinkedTransferQueue_DualNode_Ljava_util_concurrent_LinkedTransferQueue_DualNode_T_Ljava_util_concurrent_LinkedTransferQueue_DualNode_(
-        void* this_handle, void* obj, void* expected, void* newValue)
-{
-    (void)this_handle;
+        void* obj, void* expected, void* newValue) {
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
+    /* Tail-suffixed symbol targets `tail` (+16). */
     return cax_ref((void**)((char*)obj + 16), expected, newValue);
 }
 
-/*
- * getAndAdd(LinkedTransferQueue, I) -> I
- *
- * Used by `sweepNow`, which increments the queue's internal sweep
- * counter on every call. The counter field is declared in the JDK's
- * LinkedTransferQueue as an int, and LlvmGlobalEmitter lays it out at
- * offset 24 (after the head and tail references at 8 and 16).
- */
 int32_t __jnative_fn_java_lang_invoke_VarHandle_getAndAdd__Ljava_util_concurrent_LinkedTransferQueue_I_I(
-        void* this_handle, void* obj, int32_t delta)
-{
-    (void)this_handle;
+        void* obj, int32_t delta) {
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
-    return __atomic_fetch_add((int32_t*)((char*)obj + 24), delta,
-                              __ATOMIC_SEQ_CST);
+    return __atomic_fetch_add((int32_t*)((char*)obj + 24), delta, __ATOMIC_SEQ_CST);
 }
 
-/*
- * ===========================================================================
- * ForEachOps.ForEachOrderedTask
+/* ===========================================================================
+ *  ForEachOps.ForEachOrderedTask
  *
- * Layout for the class hierarchy (ForkJoinTask -> CountedCompleter ->
- * ForEachOrderedTask):
- *
- *   offset  8 : int  status
- *   offset 16 : CC   parent
- *   offset 24 : CC   completion
- *   offset 32 : int  pending
- *   offset 40 : PipelineHelper helper
- *   offset 48 : Spliterator    spliterator
- *   offset 56 : long           targetSize
- *   offset 64 : ConcurrentHashMap completionMap
- *   offset 72 : Sink           action
- *   offset 80 : ForEachOrderedTask leftPredecessor
- *   offset 88 : Node           node
- * ===========================================================================
- */
+ *      +80 ForEachOrderedTask leftPredecessor
+ * =========================================================================== */
 
 int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_stream_ForEachOps_ForEachOrderedTask_Ljava_util_stream_ForEachOps_ForEachOrderedTask_Ljava_util_stream_ForEachOps_ForEachOrderedTask__Z(
-        void* this_handle, void* obj, void* expected, void* newValue)
-{
-    (void)this_handle;
+        void* obj, void* expected, void* newValue) {
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
@@ -1236,57 +1173,310 @@ int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_stream
 }
 
 void* __jnative_fn_java_lang_invoke_VarHandle_getAndSet__Ljava_util_stream_ForEachOps_ForEachOrderedTask_Ljava_lang_Void__Ljava_util_stream_ForEachOps_ForEachOrderedTask_(
-        void* this_handle, void* obj, void* newValue)
-{
-    (void)this_handle;
+        void* obj, void* newValue) {
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
     void* old;
-    __atomic_exchange((void**)((char*)obj + 80), &newValue, &old,
-                      __ATOMIC_SEQ_CST);
+    __atomic_exchange((void**)((char*)obj + 80), &newValue, &old, __ATOMIC_SEQ_CST);
     return old;
 }
 
-/*
- * ===========================================================================
- * SharedThreadContainer.threads
+/* ===========================================================================
+ *  jdk.internal.event.EventHelper
  *
- * threads (Set, offset 16): Void / Set
- * ===========================================================================
- */
-
-int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljdk_internal_vm_SharedThreadContainer_Ljava_lang_Void_Ljava_util_Set__Z(
-        void* this_handle, void* obj, void* expected, void* newValue)
-{
-    (void)this_handle;
-    if (obj == NULL) {
-        __jnative_throw_null_pointer_exception();
-    }
-    return cas_ref((void**)((char*)obj + 16), expected, newValue);
-}
-
-/*
- * ===========================================================================
- * jdk.internal.event.EventHelper
- *
- * `isLoggingSecurity` initializes the static `loggingLogger` field on
- * first use via a StaticVarHandle CAS. The static VarHandle carries no
- * instance receiver; the C function receives the VarHandle itself and
- * the (expected, newValue) pair, and performs the CAS on the emitted
- * LLVM global slot for the static field.
- * ===========================================================================
- */
+ *  EventHelper holds a single static field, loggingLogger, whose
+ *  storage is an LLVM global emitted by
+ *  LlvmGlobalEmitter.generateStaticFields. The VarHandle CAS against
+ *  that static field arrives with an explicit (expected, newValue)
+ *  pair and no instance receiver.
+ * =========================================================================== */
 
 extern void* gv_jdk_internal_event_EventHelper_loggingLogger __attribute__((weak));
 
 int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_lang_Void_Ljava_lang_System_Logger__Z(
-        void* this_handle, void* expected, void* newValue)
-{
-    (void)this_handle;
+        void* expected, void* newValue) {
     if (&gv_jdk_internal_event_EventHelper_loggingLogger != NULL) {
         return cas_ref(&gv_jdk_internal_event_EventHelper_loggingLogger,
                        expected, newValue);
     }
     return 1;
+}
+
+/* ===========================================================================
+ *  java.lang.foreign.MemorySegment accessors
+ *
+ *  Two concrete subclasses matter here:
+ *
+ *      NativeMemorySegmentImpl  +32 long min (absolute address)
+ *
+ *      HeapMemorySegmentImpl    +32 long offset (byte offset in array)
+ *                               +40 Object base (backing array)
+ * =========================================================================== */
+
+static void* segment_payload(void* segment) {
+    if (segment == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    JNativeVTable* vt = *(JNativeVTable**)segment;
+    const char* name = vt ? vt->name : NULL;
+    if (name == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    if (strstr(name, "NativeMemorySegmentImpl") != NULL) {
+        int64_t min = *(int64_t*)((char*)segment + 32);
+        return (void*)(intptr_t)min;
+    }
+    if (strstr(name, "HeapMemorySegmentImpl") != NULL) {
+        int64_t offset = *(int64_t*)((char*)segment + 32);
+        void*   base   = *(void**)((char*)segment + 40);
+        if (base == NULL) return NULL;
+        return (char*)base + JAVA_ARR_HDR + offset;
+    }
+    /* Unknown concrete subclass: assume native layout. */
+    int64_t min = *(int64_t*)((char*)segment + 32);
+    return (void*)(intptr_t)min;
+}
+
+void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_lang_foreign_MemorySegment_JZ_V(
+        void* segment, int64_t offset, int32_t value) {
+    char* p = (char*)segment_payload(segment);
+    *(uint8_t*)(p + offset) = (uint8_t)(value ? 1 : 0);
+}
+
+void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_lang_foreign_MemorySegment_JB_V(
+        void* segment, int64_t offset, int8_t value) {
+    char* p = (char*)segment_payload(segment);
+    *(int8_t*)(p + offset) = value;
+}
+
+void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_lang_foreign_MemorySegment_JS_V(
+        void* segment, int64_t offset, int16_t value) {
+    char* p = (char*)segment_payload(segment);
+    memcpy(p + offset, &value, 2);
+}
+
+void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_lang_foreign_MemorySegment_JC_V(
+        void* segment, int64_t offset, uint16_t value) {
+    char* p = (char*)segment_payload(segment);
+    memcpy(p + offset, &value, 2);
+}
+
+void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_lang_foreign_MemorySegment_JI_V(
+        void* segment, int64_t offset, int32_t value) {
+    char* p = (char*)segment_payload(segment);
+    memcpy(p + offset, &value, 4);
+}
+
+void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_lang_foreign_MemorySegment_JJ_V(
+        void* segment, int64_t offset, int64_t value) {
+    char* p = (char*)segment_payload(segment);
+    memcpy(p + offset, &value, 8);
+}
+
+void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_lang_foreign_MemorySegment_JF_V(
+        void* segment, int64_t offset, float value) {
+    char* p = (char*)segment_payload(segment);
+    memcpy(p + offset, &value, 4);
+}
+
+void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_lang_foreign_MemorySegment_JD_V(
+        void* segment, int64_t offset, double value) {
+    char* p = (char*)segment_payload(segment);
+    memcpy(p + offset, &value, 8);
+}
+
+void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_lang_foreign_MemorySegment_JLjava_lang_Object__V(
+        void* segment, int64_t offset, void* value) {
+    char* p = (char*)segment_payload(segment);
+    memcpy(p + offset, &value, 8);
+}
+
+void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_lang_foreign_MemorySegment_Z_V(
+        void* segment, int32_t value) {
+    char* p = (char*)segment_payload(segment);
+    *(uint8_t*)p = (uint8_t)(value ? 1 : 0);
+}
+
+void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_lang_foreign_MemorySegment_B_V(
+        void* segment, int8_t value) {
+    char* p = (char*)segment_payload(segment);
+    *(int8_t*)p = value;
+}
+
+void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_lang_foreign_MemorySegment_S_V(
+        void* segment, int16_t value) {
+    char* p = (char*)segment_payload(segment);
+    memcpy(p, &value, 2);
+}
+
+void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_lang_foreign_MemorySegment_C_V(
+        void* segment, uint16_t value) {
+    char* p = (char*)segment_payload(segment);
+    memcpy(p, &value, 2);
+}
+
+void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_lang_foreign_MemorySegment_I_V(
+        void* segment, int32_t value) {
+    char* p = (char*)segment_payload(segment);
+    memcpy(p, &value, 4);
+}
+
+void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_lang_foreign_MemorySegment_J_V(
+        void* segment, int64_t value) {
+    char* p = (char*)segment_payload(segment);
+    memcpy(p, &value, 8);
+}
+
+void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_lang_foreign_MemorySegment_F_V(
+        void* segment, float value) {
+    char* p = (char*)segment_payload(segment);
+    memcpy(p, &value, 4);
+}
+
+void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_lang_foreign_MemorySegment_D_V(
+        void* segment, double value) {
+    char* p = (char*)segment_payload(segment);
+    memcpy(p, &value, 8);
+}
+
+void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_lang_foreign_MemorySegment_Ljava_lang_Object__V(
+        void* segment, void* value) {
+    char* p = (char*)segment_payload(segment);
+    memcpy(p, &value, 8);
+}
+
+void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_lang_foreign_MemorySegment_JLjava_lang_foreign_MemorySegment__V(
+        void* target_segment, int64_t offset, void* value_segment) {
+    char* dst = (char*)segment_payload(target_segment);
+    void* src = segment_payload(value_segment);
+    memcpy(dst + offset, &src, sizeof(src));
+}
+
+void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_lang_foreign_MemorySegment_Ljava_lang_foreign_MemorySegment__V(
+        void* target_segment, void* value_segment) {
+    char* dst = (char*)segment_payload(target_segment);
+    void* src = segment_payload(value_segment);
+    memcpy(dst, &src, sizeof(src));
+}
+
+/* ===========================================================================
+ *  CompletableFuture and its Completion / BiCompletion hierarchy
+ *
+ *      CF       +8 Object result, +16 Completion stack
+ *      Completion +8 int status (ForkJoinTask), +16 Completion next
+ * =========================================================================== */
+
+int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concurrent_CompletableFuture_Ljava_lang_Void_Ljava_util_concurrent_CompletableFuture_AltResult__Z(
+        void* cf, void* expected, void* new_value) {
+    if (cf == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    return cas_ref((void**)((char*)cf + 8), expected, new_value);
+}
+
+int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concurrent_CompletableFuture_Ljava_lang_Void_Ljava_lang_Object__Z(
+        void* cf, void* expected, void* new_value) {
+    if (cf == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    return cas_ref((void**)((char*)cf + 8), expected, new_value);
+}
+
+int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concurrent_CompletableFuture_Ljava_util_concurrent_CompletableFuture_Completion_Ljava_util_concurrent_CompletableFuture_Completion__Z(
+        void* cf, void* expected, void* new_value) {
+    if (cf == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    return cas_ref((void**)((char*)cf + 16), expected, new_value);
+}
+
+void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_util_concurrent_CompletableFuture_Completion_Ljava_util_concurrent_CompletableFuture_Completion__V(
+        void* completion, void* new_value) {
+    if (completion == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    __atomic_store_n((void**)((char*)completion + 16), new_value, __ATOMIC_RELEASE);
+}
+
+void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_util_concurrent_CompletableFuture_Completion_Ljava_util_concurrent_CompletableFuture_Completion_T_V(
+        void* completion, void* new_value) {
+    __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_util_concurrent_CompletableFuture_Completion_Ljava_util_concurrent_CompletableFuture_Completion__V(
+        completion, new_value);
+}
+
+int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concurrent_CompletableFuture_Completion_Ljava_util_concurrent_CompletableFuture_Completion_Ljava_lang_Void__Z(
+        void* completion, void* expected, void* new_value) {
+    if (completion == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    return cas_ref((void**)((char*)completion + 16), expected, new_value);
+}
+
+int32_t __jnative_fn_java_lang_invoke_VarHandle_weakCompareAndSet__Ljava_util_concurrent_CompletableFuture_Ljava_util_concurrent_CompletableFuture_Completion_Ljava_util_concurrent_CompletableFuture_Completion__Z(
+        void* cf, void* expected, void* new_value) {
+    if (cf == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    return cas_ref((void**)((char*)cf + 16), expected, new_value);
+}
+
+int32_t __jnative_fn_java_lang_invoke_VarHandle_weakCompareAndSet__Ljava_util_concurrent_CompletableFuture_Completion_Ljava_util_concurrent_CompletableFuture_Completion_Ljava_util_concurrent_CompletableFuture_Completion__Z(
+        void* completion, void* expected, void* new_value) {
+    if (completion == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    return cas_ref((void**)((char*)completion + 16), expected, new_value);
+}
+
+void __jnative_fn_java_lang_invoke_VarHandle_setRelease__Ljava_util_concurrent_CompletableFuture_Ljava_lang_Object__V(
+        void* cf, void* new_value) {
+    if (cf == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    __atomic_store_n((void**)((char*)cf + 8), new_value, __ATOMIC_RELEASE);
+}
+
+void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_util_concurrent_CompletableFuture_Completion_Ljava_lang_Void__V(
+        void* completion, void* value) {
+    if (completion == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    __atomic_store_n((void**)((char*)completion + 16), value, __ATOMIC_RELEASE);
+}
+
+void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_util_concurrent_CompletableFuture_BiCompletion_Ljava_lang_Void__V(
+        void* bicomp, void* value) {
+    if (bicomp == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    __atomic_store_n((void**)((char*)bicomp + 16), value, __ATOMIC_RELEASE);
+}
+
+/* ===========================================================================
+ *  java.net.Socket.state
+ *
+ *      +40 int state
+ * =========================================================================== */
+
+int32_t __jnative_fn_java_lang_invoke_VarHandle_getAndBitwiseOr__Ljava_net_Socket_I_I(
+        void* socket, int32_t mask) {
+    if (socket == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    return __atomic_fetch_or((int32_t*)((char*)socket + 40), mask, __ATOMIC_SEQ_CST);
+}
+
+/* ===========================================================================
+ *  java.nio.channels.spi.AbstractSelector.closed
+ *
+ *      +24 boolean closed
+ * =========================================================================== */
+
+int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_nio_channels_spi_AbstractSelector_ZZ_Z(
+        void* selector, int32_t expected, int32_t new_value) {
+    if (selector == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    return cas_bool((uint8_t*)((char*)selector + 24), expected, new_value);
 }

@@ -135,7 +135,19 @@
  * descriptor), which is the state Module.isNamed() tests and the state
  * that steers Class.getResourceAsStream into its "unnamed module"
  * branch. LlvmGlobalEmitter.generateUnnamedModule() emits that object
- * as a constant; every @refclass_* mirror points at it.
+ * as a writable global; every @refclass_* mirror points at it.
+ *
+ * That object is emitted as a writable `global`, not as a `constant`.
+ * The JDK's own module bootstrap (`System.initPhase2` ->
+ * `ModuleBootstrap.boot` -> `ModuleLayer.defineModules`) takes it back
+ * out of Object.class.getModule() as the `java.base` module and writes
+ * its `reads` / `exports` / `opens` fields, and later its
+ * `name` / `loader` / `descriptor` fields. Emitting it as a `constant`
+ * places the object in `.data.rel.ro`, which RELRO maps read-only, and
+ * the first store then takes a SIGSEGV (SEGV_ACCERR at offset 0x30)
+ * inside `java.lang.Module.defineModules`. The writable emission is
+ * what keeps the JDK's module bootstrap working on every JDK release
+ * this runtime targets.
  *
  * The eight reserved slots are a stable landing pad for any
  * java.lang.Class field the emitter has not enumerated yet. An
@@ -510,12 +522,14 @@ extern int32_t JNATIVE_METHOD_RETURN_TYPE_OFFSET;
 extern int32_t JNATIVE_METHOD_PARAM_TYPES_OFFSET;
 extern int32_t JNATIVE_METHOD_EXC_TYPES_OFFSET;
 extern int32_t JNATIVE_METHOD_MODIFIERS_OFFSET;
+extern int32_t JNATIVE_METHOD_ROOT_OFFSET;
 
 extern int32_t JNATIVE_CTOR_CLAZZ_OFFSET;
 extern int32_t JNATIVE_CTOR_SLOT_OFFSET;
 extern int32_t JNATIVE_CTOR_PARAM_TYPES_OFFSET;
 extern int32_t JNATIVE_CTOR_EXC_TYPES_OFFSET;
 extern int32_t JNATIVE_CTOR_MODIFIERS_OFFSET;
+extern int32_t JNATIVE_CTOR_ROOT_OFFSET;
 
 /* JVM access-flag bits used by the reflection filter paths. */
 #ifndef JNATIVE_ACC_PUBLIC
@@ -536,6 +550,34 @@ extern const int64_t    jnative_symbol_class_map_size     JNATIVE_WEAK;
 
 extern const char* jnative_caller_sensitive_symbols[]     JNATIVE_WEAK;
 extern const int64_t jnative_caller_sensitive_symbols_size JNATIVE_WEAK;
+
+/* ---- Function index for stack walking ------------------------------ */
+
+/**
+ * One entry of @jnative_function_index. Layout is frozen by the emitted
+ * LLVM type; see LlvmGlobalEmitter.generateFunctionIndex().
+ */
+typedef struct {
+    void*            address;  /* function pointer, relocated by the loader */
+    const char*      symbol;   /* mangled symbol name */
+    ReflectionClass* cls;      /* owning class mirror, or NULL */
+} JNativeFunctionEntry;
+
+extern JNativeFunctionEntry jnative_function_index[]     JNATIVE_WEAK;
+extern const int64_t        jnative_function_index_size  JNATIVE_WEAK;
+
+/**
+ * Resolves `pc` to the symbol and owning class of the function that
+ * contains it. Returns 1 when the address is covered by the emitted
+ * function index, 0 otherwise (the caller is expected to fall back to
+ * dladdr, which it will rarely need to do).
+ *
+ * The implementation builds a sorted-by-address copy of the emitted
+ * table on first use, then answers queries with a binary search.
+ */
+extern int __jnative_function_at_address(uintptr_t pc,
+                                         const char** out_symbol,
+                                         ReflectionClass** out_cls);
 
 /* ---- Embedded resources -------------------------------------------- */
 
@@ -561,9 +603,70 @@ extern const int32_t jnative_builtin_resources_count             JNATIVE_WEAK;
 
 /* ---- Strings -------------------------------------------------------- */
 
+/*
+ * __jnative_read_string_bytes returns a pointer DIRECTLY INTO the payload
+ * of a Java string's backing byte array. For strings constructed by
+ * compiled Java code (Arrays.copyOf and its derivatives), that array has
+ * NO in-bounds NUL terminator: the emitter's allocator reserves exactly
+ * `len` bytes of payload. Therefore the returned pointer must never be
+ * used as a C string (strlen/strcmp/strchr/open/stat/access/...): the
+ * read escapes into the next heap chunk, and the first byte of that chunk
+ * (usually a glibc size word, e.g. 0x21) ends up appended to the string.
+ *
+ * That is exactly what happened to the path ".../lib/tzdb.dat": the
+ * 56-byte string was read as a 57-byte ".../lib/tzdb.dat!", the memcmp
+ * suffix check failed, open(2) returned ENOENT, and FileInputStream.c
+ * threw a NULL exception that catch(Exception) did not handle.
+ *
+ * The two helpers below are the safe replacement for any site that needs
+ * the string's bytes as an actual C string.
+ */
+
+/**
+ * Copies the payload of Java String `s` into the caller's buffer `out` and
+ * NUL-terminates the copy. Returns the number of bytes copied (not counting
+ * the terminator), or -1 on error.
+ *
+ * On error (s == NULL, buffer too small, invalid length) `out[0]` is set
+ * to '\0' (if out_cap > 0), the remaining buffer bytes are untouched, and
+ * -1 is returned.
+ *
+ * This is the only safe way to obtain a Java string's contents as a C
+ * string. The buffer size should be at least PATH_MAX (4096) for paths
+ * and 8192 for arbitrary names.
+ */
+extern int32_t __jnative_read_string_into(void* s, char* out, int32_t out_cap);
+
+/**
+ * Convenience wrapper around __jnative_read_string_into using a per-thread
+ * dynamically growing buffer. The returned pointer stays valid until the
+ * next call to this function on the same thread.
+ *
+ * IMPORTANT: two results of __jnative_read_string_cstr must not be alive
+ * at the same time — the second call overwrites the first. If two live
+ * pointers are needed, use __jnative_read_string_into with two separate
+ * buffers.
+ *
+ * Returns a pointer to an empty string when `s` == NULL. Returns NULL only
+ * if the internal buffer allocation itself failed.
+ */
+extern const char* __jnative_read_string_cstr(void* s, int32_t* out_len);
+
 extern void* __jnative_make_string_obj(const char* bytes, int32_t len);
 extern const char* __jnative_read_string_bytes(void* s, int32_t* out_len);
 extern void* __jnative_string_intern(void* this_str);
+
+/* ---- Exception construction ---------------------------------------- */
+
+/*
+ * __jnative_construct_exception (see the "Exception construction and
+ * throwers" section below) materialises real exception objects. Use it
+ * instead of __jnative_throw_exception(NULL) everywhere the JDK spec
+ * requires a concrete checked class: __jnative_catch_matches compares the
+ * exception vtable against the @__type_info_X tables, and a generic
+ * Throwable is not a subclass of Exception, so catch (Exception) will not
+ * catch it. A real FileNotFoundException will.
+ */
 
 /* ---- Type identity and dispatch ------------------------------------ */
 
@@ -576,6 +679,91 @@ extern void** __jnative_lookup_itable(JNativeIfaceMap* ifacemap, int32_t iface_i
 
 extern void __jnative_monitor_enter(void* obj);
 extern void __jnative_monitor_exit(void* obj);
+
+/* ============================================================================
+ *  Safe deallocation of Java reference fields.
+ * ============================================================================
+ *
+ * Destructors generated by the runtime call this entry point instead of
+ * libc free() when releasing a reference-typed field of a Java object.
+ * The reason: a field can legally hold a pointer that is not allocator
+ * owned -- most notably a Java String literal, which the emitter bakes
+ * into the module image as a static @jstr_* global in .data. Calling
+ * free() on such a pointer is undefined behaviour; glibc reports it as
+ * "free(): invalid pointer", and the process aborts.
+ *
+ * This helper checks whether the pointer falls inside the main
+ * executable's writable data segments. Everything outside that range is
+ * passed to free() unchanged; everything inside is a static object and
+ * is left alive for the lifetime of the process.
+ *
+ * See the implementation in jnative_runtime.c for the full reasoning,
+ * including why a per-allocation registry is unnecessary and why a
+ * range check is exact for the actual failure mode.
+ */
+extern void __jnative_free(void* p);
+
+/* ============================================================================
+ *  Cycle-safe destruction during shutdown.
+ * ============================================================================
+ *
+ * Java object graphs are DAGs with cycles. A shared singleton such as
+ * java.lang.module.Configuration.EMPTY_CONFIGURATION is reachable both as
+ * a static field of its own class and as a field of another static
+ * field's object; and pairs such as
+ *
+ *     UCharacterProperty.intProp      --->  UCharacterProperty$IntProperty
+ *     UCharacterProperty$IntProperty.this$0  --->  UCharacterProperty
+ *
+ * form genuine cycles. A naive recursive destructor would then
+ *   - on a DAG:    free a shared object twice (glibc "double free in tcache 2");
+ *   - on a cycle:  recurse forever between the two objects, exhausting the
+ *                  native stack and taking SIGSEGV on the guard page.
+ *
+ * The runtime exposes three entry points that together make the shutdown
+ * pass safe against both shapes.
+ *
+ *   __jnative_begin_shutdown()
+ *       Activates the machinery for the remainder of the process. Called
+ *       once, from the very beginning of fn___jnative_shutdown, before the
+ *       first destructor runs. Before it is called the two guards below
+ *       are no-ops; ordinary-execution destructor calls pay nothing.
+ *
+ *   __jnative_dtor_enter(this) -> int
+ *       Called at the entry of every generated destructor. Returns 1 if
+ *       the destructor may proceed, 0 if it must return immediately.
+ *       Returns 0 when
+ *         - `this` is NULL, or
+ *         - `this` has already been freed earlier in this shutdown pass
+ *           (freed set membership), or
+ *         - `this` is currently on the destruction call chain (claim stack
+ *           membership, i.e. a cycle or a re-entrant path).
+ *       Otherwise it adds `this` to the thread-local claim stack and
+ *       returns 1.
+ *
+ *   __jnative_dtor_unclaim(this)
+ *       Called immediately before the destructor delegates to its
+ *       superclass destructor or frees the object. It removes `this` from
+ *       the claim stack so that the superclass destructor (which receives
+ *       the same receiver) can claim it in turn. Without this call the
+ *       delegation chain would stop at the first level.
+ *
+ * Every free() in a destructor path is routed through __jnative_free,
+ * which adds the address to the freed set so any later arrival on the
+ * same address in the same shutdown pass is rejected by
+ * __jnative_dtor_enter.
+ *
+ * Threading model: the shutdown pass is single-threaded by construction
+ * (atexit runs on the main thread), so the claim stack is thread-local
+ * and both operations are lock-free. The freed set is process-wide and
+ * protected by a mutex, because it must remain valid if any thread ever
+ * invokes a destructor during shutdown (defensive, not needed today).
+ * ========================================================================== */
+
+extern void __jnative_begin_shutdown(void);
+extern int  __jnative_dtor_enter(void* this_obj);
+extern void __jnative_dtor_unclaim(void* this_obj);
+extern void __jnative_free(void* p);
 
 /* ---- Exception construction and throwers --------------------------- */
 
@@ -669,6 +857,41 @@ JNATIVE_NORETURN extern void __jnative_throw_bad_dispatch(void* obj,
  * LlvmGlobalEmitter.generateTypeInfo().
  */
 extern void* __jnative_own_class_vtable(const char* class_name);
+
+/**
+ * Builds the LLVM global symbol name of a static field, matching
+ * LlvmTypeMapper.sanitizeIdentifier on the Java side byte-for-byte:
+ *
+ *     "gv_" + sanitize(owner + "." + name)
+ *
+ * where sanitize replaces every character outside [a-zA-Z0-9_] with a
+ * single underscore. Both '/' and '.' are outside that set, so
+ * "java/util/concurrent/ForkJoinPool.poolIds" becomes
+ * "gv_java_util_concurrent_ForkJoinPool_poolIds".
+ *
+ * Returns 1 on success and 0 on failure (a NULL argument, or the output
+ * buffer is too small to hold the built name plus its terminator).
+ *
+ * This function is the single source of truth for the symbol-naming
+ * rule. Both reflective views of a static field — the java.lang.reflect
+ * .Field path implemented in jnative/jdk/internal/misc/Unsafe.c and the
+ * MemberName path implemented in
+ * jnative/lang/invoke/MethodHandleNatives.c — must construct the same
+ * symbol for the same field. If the two views disagreed, the runtime
+ * would silently believe the field lives at two different addresses
+ * depending on which reflective API the caller used, and the resulting
+ * write/read mismatch would only surface as corrupted state far from
+ * the point of the divergence.
+ *
+ * The build the symbol is constructed for is the build of the running
+ * process image; the caller is expected to have already dlopen'ed the
+ * process image (or to use RTLD_DEFAULT) and to dlsym the returned
+ * symbol name itself. The function does not touch the dynamic linker.
+ */
+extern int jnative_build_static_field_symbol(const char* owner,
+                                             const char* name,
+                                             int32_t name_len,
+                                             char* out, size_t out_size);
 
 /* ---- Try/catch setjmp bridge --------------------------------------- */
 
@@ -791,6 +1014,7 @@ extern void __jnative_thread_set_layout(
         int32_t thread_holder_offset,
         int32_t thread_tid_offset,
         int32_t thread_name_offset,
+        int32_t thread_interruptlock_offset,
         int32_t fh_object_size,
         int32_t fh_group_offset,
         int32_t fh_priority_offset,
@@ -842,7 +1066,9 @@ extern void __jnative_reflect_set_layout(
         int32_t ctor_slot_offset,
         int32_t ctor_param_types_offset,
         int32_t ctor_exc_types_offset,
-        int32_t ctor_modifiers_offset);
+        int32_t ctor_modifiers_offset,
+        int32_t ctor_root_offset,        /* NEW */
+        int32_t method_root_offset);     /* NEW */
 
 /* ========================================================================
  *  Inline helpers

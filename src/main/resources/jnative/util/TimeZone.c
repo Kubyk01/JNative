@@ -185,30 +185,66 @@ static int try_localtime_symlink(char* buf, size_t buf_size) {
 /*
  * static native String getSystemTimeZoneID(String javaHome);
  *
- * Returns the canonical zone ID of the host system's configured time
- * zone. The javaHome argument is used by the reference implementation
- * to locate a bundled tzdata file inside the JDK installation; this
- * runtime reads the OS's own configuration directly and does not need
- * the argument, but the symbol must accept it because the Java caller
- * passes it unconditionally.
+ * Always returns the offset form "GMT" / "GMT±HH:MM" computed from the
+ * machine's current UTC offset. The regional ID (for example
+ * "Europe/Warsaw") is deliberately NOT returned:
+ *
+ *   1. ZoneId.of("Europe/Warsaw", true) goes into ZoneRegion.ofId,
+ *      which calls ZoneRulesProvider.getRules ->
+ *      TzdbZoneRulesProvider -> reading tzdb.dat.
+ *
+ *   2. On this build reading tzdb.dat fails with
+ *      UTFDataFormatException (see the report), and the
+ *      catch (Exception) in the TzdbZoneRulesProvider constructor does
+ *      not fire because of the known exception-matching defect. The
+ *      exception escapes as unhandled.
+ *
+ *   3. ZoneId.of("GMT+01:00", true) resolves through ofWithPrefix ->
+ *      ZoneOffset.of -> ZoneOffset with no TZDB involved.
+ *
+ * The user can still request a specific offset through TZ: if the
+ * variable is set and holds an offset form (GMT/UTC/UT with or without
+ * a numeric offset), it is used verbatim. Regional values (non-offset
+ * forms) are ignored: they could not be resolved without TZDB anyway.
+ *
+ * This matches the behaviour of getSystemGMTOffsetID() below — both
+ * functions return offset forms and need no TZDB.
  */
 void* __jnative_fn_java_util_TimeZone_getSystemTimeZoneID__Ljava_lang_String__Ljava_lang_String_(
         void* java_home_str)
 {
     (void)java_home_str;
 
-    char buf[256];
+    /*
+     * Explicit offset forms from TZ. The check is strict: only values
+     * that ZoneId.of resolves without touching ZoneRegion.ofId.
+     * Bare "UTC", "GMT", "UT" yield ZoneOffset.UTC; forms with a
+     * numeric suffix resolve through ZoneOffset.of(suffix).
+     */
+    const char* tz = getenv("TZ");
+    if (tz != NULL && tz[0] != '\0' && tz[0] != ':') {
+        int is_offset_form =
+            (strcmp(tz, "UTC") == 0) ||
+            (strcmp(tz, "GMT") == 0) ||
+            (strcmp(tz, "UT")  == 0) ||
+            (strncmp(tz, "GMT+", 4) == 0) ||
+            (strncmp(tz, "GMT-", 4) == 0) ||
+            (strncmp(tz, "UTC+", 4) == 0) ||
+            (strncmp(tz, "UTC-", 4) == 0) ||
+            (strncmp(tz, "UT+",  3) == 0) ||
+            (strncmp(tz, "UT-",  3) == 0);
 
-    if (try_tz_env(buf, sizeof(buf)))            return jnative_string(buf);
-    if (try_etc_timezone(buf, sizeof(buf)))      return jnative_string(buf);
-    if (try_localtime_symlink(buf, sizeof(buf))) return jnative_string(buf);
+        if (is_offset_form) {
+            return jnative_string(tz);
+        }
+        /* Regional TZ — ignored; an offset form is returned below. */
+    }
 
     /*
-     * Fallback: synthesise a GMT offset from the machine's current UTC
-     * offset. The Java layer's TimeZone.getTimeZone() parses this form
-     * into a SimpleTimeZone with the matching offset, so the caller
-     * always ends up with a usable TimeZone.
+     * Always return an offset form. getSystemGMTOffsetID() below does
+     * the same, so both functions stay consistent.
      */
+    char buf[32];
     format_gmt_offset(buf, sizeof(buf));
     return jnative_string(buf);
 }

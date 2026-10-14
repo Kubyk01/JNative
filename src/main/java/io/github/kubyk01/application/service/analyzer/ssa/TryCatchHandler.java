@@ -6,6 +6,7 @@ import org.objectweb.asm.Label;
 import java.util.*;
 
 public class TryCatchHandler {
+
     private final Map<Label, BasicBlock> labelToBlock;
     private final List<TryCatchInfo> tryCatchBlocks = new ArrayList<>();
 
@@ -18,24 +19,44 @@ public class TryCatchHandler {
     }
 
     public void handle() {
+        final int n = tryCatchBlocks.size();
+        if (n == 0) return;
+
+        // -----------------------------------------------------------------
+        // Pass 1: resolve every range's body against the CURRENT CFG, which
+        // at this point contains no handler edges at all. Bodies are stored
+        // in a parallel list so no mutation of the CFG can influence a
+        // later range's body.
+        // -----------------------------------------------------------------
+        List<List<BasicBlock>> bodies = new ArrayList<>(n);
         for (TryCatchInfo info : tryCatchBlocks) {
             BasicBlock startBlock   = labelToBlock.get(info.start);
             BasicBlock endBlock     = labelToBlock.get(info.end);
             BasicBlock handlerBlock = labelToBlock.get(info.handler);
-            if (startBlock == null || endBlock == null || handlerBlock == null) continue;
+            if (startBlock == null || endBlock == null || handlerBlock == null) {
+                bodies.add(null);
+                continue;
+            }
+            bodies.add(GraphUtils.getBlocksBetween(
+                    startBlock, endBlock, handlerBlock));
+        }
 
-            // The handler is reached from the body by an exceptional edge,
-            // not by normal flow, so it must not be enumerated as part of
-            // the body. Excluding it here also prevents the handler from
-            // being given a normal self-edge when it contains a throwing
-            // instruction — that self-edge was the mechanism behind the
-            // structural livelock in NormalizerImpl.load and
-            // ScopedMemoryAccess.copyMemoryInternal.
-            List<BasicBlock> tryBlocks =
-                GraphUtils.getBlocksBetween(startBlock, endBlock, handlerBlock);
+        // -----------------------------------------------------------------
+        // Pass 2: now that every body is fixed, install the normal
+        // body -> handler edge for each range. Installing them all in a
+        // second pass is what prevents range N's freshly-added handler
+        // edge from contaminating range N+1's body.
+        // -----------------------------------------------------------------
+        for (int i = 0; i < n; i++) {
+            List<BasicBlock> tryBlocks = bodies.get(i);
+            if (tryBlocks == null) continue;
+
+            TryCatchInfo info = tryCatchBlocks.get(i);
+            BasicBlock handlerBlock = labelToBlock.get(info.handler);
+            if (handlerBlock == null) continue;
 
             for (BasicBlock b : tryBlocks) {
-                if (b == handlerBlock) continue;   // explicit, belt-and-braces
+                if (b == handlerBlock) continue;
                 if (!b.getSuccessors().contains(handlerBlock)) {
                     b.addSuccessor(handlerBlock);
                 }

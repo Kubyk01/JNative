@@ -3,6 +3,7 @@
 #include <stddef.h>
 #include <unistd.h>
 #include <errno.h>
+#include <sys/uio.h>
 
 #include "jnative_runtime.h"
 
@@ -114,4 +115,79 @@ int32_t __jnative_fn_sun_nio_ch_SocketDispatcher_write0__Ljava_io_FileDescriptor
         __jnative_throw_exception(NULL);
     }
     return (int32_t)n;
+}
+
+/*
+ * private native int writev0(FileDescriptor fd, long address, int len);
+ *
+ * Scatter-write a set of buffers to the socket. The packing convention
+ * is the one the JDK's Java-side Net.writev helper produces: the first
+ * four bytes of the native buffer at `address` hold the iovec count
+ * (as a native-endian int32), and the bytes immediately after hold
+ * that many struct iovec records. This is exactly the same layout the
+ * sibling UnixFileDispatcherImpl.writev0 consumes, so a caller that
+ * builds its iovec array once can hand it to either dispatcher without
+ * a conversion.
+ *
+ * The `len` argument is the total byte count the caller believes the
+ * iovec set describes. It is informational: the kernel reads exactly
+ * what the iovec array specifies, and a mismatch between the caller's
+ * expectation and the actual iovec contents would be a bug in the Java
+ * layer rather than something this native could correct.
+ *
+ * EINTR with no progress is retried transparently, so a signal
+ * delivered before the kernel has committed any bytes does not surface
+ * as a spurious short write to the Java caller. A partial write — the
+ * kernel committed some prefix of the iovec set — returns that prefix
+ * length, and the Java-side write loop drives the remainder.
+ */
+int64_t __jnative_fn_sun_nio_ch_SocketDispatcher_writev0__Ljava_io_FileDescriptor_JI_J(
+        void* fd_obj, int64_t address, int32_t len)
+{
+    (void)len;
+    int32_t fd = jnative_raw_fd(fd_obj);
+
+    int32_t* hdr = (int32_t*)(intptr_t)address;
+    int32_t count = *hdr;
+    struct iovec* iov = (struct iovec*)(hdr + 1);
+
+    ssize_t n;
+    do {
+        n = writev(fd, iov, (int)count);
+    } while (n < 0 && errno == EINTR);
+
+    if (n < 0) {
+        __jnative_throw_exception(NULL);
+    }
+    return (int64_t)n;
+}
+
+/*
+ * private native int readv0(FileDescriptor fd, long address, int len);
+ *
+ * Scatter-read from the socket into a set of buffers. The packing
+ * convention is identical to writev0: the first four bytes of the
+ * native buffer at `address` hold the iovec count, followed by that
+ * many struct iovec records. Same reasoning about the informational
+ * `len` argument, same EINTR retry policy, same error convention.
+ */
+int64_t __jnative_fn_sun_nio_ch_SocketDispatcher_readv0__Ljava_io_FileDescriptor_JI_J(
+        void* fd_obj, int64_t address, int32_t len)
+{
+    (void)len;
+    int32_t fd = jnative_raw_fd(fd_obj);
+
+    int32_t* hdr = (int32_t*)(intptr_t)address;
+    int32_t count = *hdr;
+    struct iovec* iov = (struct iovec*)(hdr + 1);
+
+    ssize_t n;
+    do {
+        n = readv(fd, iov, (int)count);
+    } while (n < 0 && errno == EINTR);
+
+    if (n < 0) {
+        __jnative_throw_exception(NULL);
+    }
+    return (int64_t)n;
 }

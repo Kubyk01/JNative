@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include <pthread.h>
+#include <link.h>
 #include <setjmp.h>
 #include <stdarg.h>
 #include <signal.h>
@@ -7,6 +8,7 @@
 #include <ucontext.h>
 #include <sys/ucontext.h>
 #include <execinfo.h>
+#include <ctype.h>
 
 #include "jnative_runtime.h"
 
@@ -38,6 +40,298 @@ static const char* __jnative_vtable_class_name(void* vtable) {
 }
 
 /* ============================================================================
+ * Safe deallocation and cycle-safe destruction.
+ * See the matching comment block in jnative_runtime.h.
+ * ========================================================================== */
+
+/* --- Static data-segment range (unchanged) ------------------------------ */
+
+static uintptr_t     jnative_static_low  = 0;
+static uintptr_t     jnative_static_high = 0;
+static pthread_once_t jnative_static_once = PTHREAD_ONCE_INIT;
+
+#if defined(__linux__)
+/**
+ * dl_iterate_phdr callback: accumulate the address range of every
+ * writable PT_LOAD segment of the main executable.
+ *
+ * Only the main executable is inspected. Every @jstr_* constant and
+ * every @strbytes_* payload is emitted into the executable image itself
+ * by the LLVM backend; no shared object produced by this runtime
+ * contains any. Walking every loaded object would unnecessarily widen
+ * the range -- the region between two different objects' data segments
+ * is mapped by other libraries or is unmapped entirely, and a pointer
+ * into that region would be misclassified as static. Restricting the
+ * walk to the main executable keeps the range exact.
+ */
+static int jnative_collect_main_writable_segments(struct dl_phdr_info* info,
+                                                  size_t size, void* data) {
+    (void)size;
+    (void)data;
+
+    /* The main executable is the object whose name is the empty string;
+     * every shared library has a non-empty path in dlpi_name. This is
+     * the same discriminator the function-index builder uses for the
+     * main text segment. */
+    if (info->dlpi_name != NULL && info->dlpi_name[0] != '\0') {
+        return 0;
+    }
+
+    for (int i = 0; i < info->dlpi_phnum; i++) {
+        const ElfW(Phdr)* ph = &info->dlpi_phdr[i];
+        if (ph->p_type != PT_LOAD) continue;
+        if (!(ph->p_flags & PF_W)) continue;
+
+        uintptr_t lo = (uintptr_t)info->dlpi_addr + (uintptr_t)ph->p_vaddr;
+        uintptr_t hi = lo + (uintptr_t)ph->p_memsz;
+
+        if (jnative_static_low  == 0 || lo < jnative_static_low)  jnative_static_low  = lo;
+        if (jnative_static_high == 0 || hi > jnative_static_high) jnative_static_high = hi;
+    }
+    return 0;
+}
+#endif
+
+static void jnative_build_static_range(void) {
+#if defined(__linux__)
+    dl_iterate_phdr(jnative_collect_main_writable_segments, NULL);
+#endif
+
+    /* Fallback and complement: the ELF linker always defines
+     * __data_start and _end in the main executable, and they bracket
+     * the entire writable data + bss region. Merging them into the
+     * range guarantees the guard is at least as strong as the segment
+     * walk, and covers any platform where the walk produced nothing
+     * usable. Weak references let the program link even on a target
+     * whose linker script does not provide either symbol. */
+#if defined(__linux__) || defined(__ELF__)
+    {
+        extern char __data_start[] __attribute__((weak));
+        extern char _end[]        __attribute__((weak));
+
+        if (__data_start != NULL && _end != NULL) {
+            uintptr_t lo = (uintptr_t)__data_start;
+            uintptr_t hi = (uintptr_t)_end;
+            if (lo != 0 && hi > lo) {
+                if (jnative_static_low  == 0 || lo < jnative_static_low)  jnative_static_low  = lo;
+                if (jnative_static_high == 0 || hi > jnative_static_high) jnative_static_high = hi;
+            }
+        }
+    }
+#endif
+}
+
+/* --- Shutdown flag ------------------------------------------------------ */
+
+static volatile int jnative_in_shutdown = 0;
+
+void __jnative_begin_shutdown(void) {
+    jnative_in_shutdown = 1;
+}
+
+/* --- Freed-address set (permanent for the process lifetime) ------------- */
+
+typedef struct {
+    uintptr_t* slots;
+    size_t     capacity;
+    size_t     size;
+} JNativeFreedSet;
+
+#define JNATIVE_FREED_INITIAL_CAPACITY ((size_t)1 << 12)
+
+static JNativeFreedSet jnative_freed_set  = { NULL, 0, 0 };
+static pthread_mutex_t jnative_freed_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static inline uintptr_t jnative_mix(uintptr_t p) {
+    p ^= p >> 33;
+    p *= 0xff51afd7ed558ccdULL;
+    p ^= p >> 33;
+    p *= 0xc4ceb9fe1a85ec53ULL;
+    p ^= p >> 33;
+    return p;
+}
+
+static int jnative_freed_grow_locked(void) {
+    size_t new_cap = (jnative_freed_set.capacity == 0)
+        ? JNATIVE_FREED_INITIAL_CAPACITY
+        : jnative_freed_set.capacity * 2;
+
+    uintptr_t* new_slots = (uintptr_t*)calloc(new_cap, sizeof(uintptr_t));
+    if (new_slots == NULL) return 0;
+
+    if (jnative_freed_set.slots != NULL) {
+        for (size_t i = 0; i < jnative_freed_set.capacity; i++) {
+            uintptr_t v = jnative_freed_set.slots[i];
+            if (v == 0) continue;
+            size_t j = (size_t)(jnative_mix(v) & (new_cap - 1));
+            while (new_slots[j] != 0) j = (j + 1) & (new_cap - 1);
+            new_slots[j] = v;
+        }
+        free(jnative_freed_set.slots);
+    }
+    jnative_freed_set.slots    = new_slots;
+    jnative_freed_set.capacity = new_cap;
+    return 1;
+}
+
+/* Inserts `p`; returns 1 on a fresh insert, 0 on duplicate or on
+ * allocator failure. A 0 from an allocator failure would be wrong to
+ * treat as "already freed", so in that case we return 1 (proceed to
+ * free) — the alternative is a leak, which is the lesser evil under
+ * memory exhaustion. */
+static int jnative_freed_insert(uintptr_t p) {
+    if (p == 0) return 0;
+
+    pthread_mutex_lock(&jnative_freed_lock);
+
+    if (jnative_freed_set.capacity == 0) {
+        if (!jnative_freed_grow_locked()) {
+            pthread_mutex_unlock(&jnative_freed_lock);
+            return 1;
+        }
+    }
+    if (jnative_freed_set.size * 2 >= jnative_freed_set.capacity) {
+        (void)jnative_freed_grow_locked();
+    }
+
+    size_t idx = (size_t)(jnative_mix(p) &
+                          (jnative_freed_set.capacity - 1));
+    while (jnative_freed_set.slots[idx] != 0) {
+        if (jnative_freed_set.slots[idx] == p) {
+            pthread_mutex_unlock(&jnative_freed_lock);
+            return 0;
+        }
+        idx = (idx + 1) & (jnative_freed_set.capacity - 1);
+    }
+    jnative_freed_set.slots[idx] = p;
+    jnative_freed_set.size++;
+    pthread_mutex_unlock(&jnative_freed_lock);
+    return 1;
+}
+
+static int jnative_freed_contains(uintptr_t p) {
+    if (p == 0) return 0;
+
+    pthread_mutex_lock(&jnative_freed_lock);
+    if (jnative_freed_set.capacity == 0) {
+        pthread_mutex_unlock(&jnative_freed_lock);
+        return 0;
+    }
+    size_t idx = (size_t)(jnative_mix(p) &
+                          (jnative_freed_set.capacity - 1));
+    while (jnative_freed_set.slots[idx] != 0) {
+        if (jnative_freed_set.slots[idx] == p) {
+            pthread_mutex_unlock(&jnative_freed_lock);
+            return 1;
+        }
+        idx = (idx + 1) & (jnative_freed_set.capacity - 1);
+    }
+    pthread_mutex_unlock(&jnative_freed_lock);
+    return 0;
+}
+
+/* --- Thread-local claim stack ------------------------------------------- */
+
+typedef struct {
+    uintptr_t* slots;
+    size_t     depth;
+    size_t     capacity;
+} JNativeClaimStack;
+
+static _Thread_local JNativeClaimStack jnative_claim_stack = { NULL, 0, 0 };
+
+static int jnative_claim_push(uintptr_t p) {
+    if (jnative_claim_stack.depth == jnative_claim_stack.capacity) {
+        size_t new_cap = (jnative_claim_stack.capacity == 0)
+            ? 64
+            : jnative_claim_stack.capacity * 2;
+        uintptr_t* grown = (uintptr_t*)realloc(
+            jnative_claim_stack.slots, new_cap * sizeof(uintptr_t));
+        if (grown == NULL) return 0;
+        jnative_claim_stack.slots    = grown;
+        jnative_claim_stack.capacity = new_cap;
+    }
+    jnative_claim_stack.slots[jnative_claim_stack.depth++] = p;
+    return 1;
+}
+
+static int jnative_claim_contains(uintptr_t p) {
+    for (size_t i = 0; i < jnative_claim_stack.depth; i++) {
+        if (jnative_claim_stack.slots[i] == p) return 1;
+    }
+    return 0;
+}
+
+static void jnative_claim_remove(uintptr_t p) {
+    for (size_t i = jnative_claim_stack.depth; i > 0; i--) {
+        if (jnative_claim_stack.slots[i - 1] == p) {
+            /* Swap with the last entry. The stack has no LIFO discipline
+             * worth preserving: each entry is independent and membership
+             * is what matters. */
+            jnative_claim_stack.slots[i - 1] =
+                jnative_claim_stack.slots[jnative_claim_stack.depth - 1];
+            jnative_claim_stack.depth--;
+            return;
+        }
+    }
+}
+
+/* --- Public destructor entry / unclaim ---------------------------------- */
+
+int __jnative_dtor_enter(void* this_obj) {
+    if (this_obj == NULL) return 0;
+    if (!jnative_in_shutdown) return 1;
+
+    uintptr_t p = (uintptr_t)this_obj;
+
+    if (jnative_freed_contains(p))     return 0;
+    if (jnative_claim_contains(p))     return 0;
+
+    if (!jnative_claim_push(p)) {
+        /* Allocation failed while growing the claim stack. Proceeding
+         * without a claim risks an unbounded cycle; refusing to proceed
+         * leaves the object un-freed. The safer direction is to
+         * proceed: a bounded double destruction is caught by the
+         * __jnative_free idempotence, while an unbounded cycle is not. */
+        return 1;
+    }
+    return 1;
+}
+
+void __jnative_dtor_unclaim(void* this_obj) {
+    if (this_obj == NULL) return;
+    if (!jnative_in_shutdown) return;
+    jnative_claim_remove((uintptr_t)this_obj);
+}
+
+/* --- Public deallocation entry point ------------------------------------ */
+
+__attribute__((noinline))
+void __jnative_free(void* p) {
+    if (p == NULL) return;
+
+    pthread_once(&jnative_static_once, jnative_build_static_range);
+
+    uintptr_t addr = (uintptr_t)p;
+    if (jnative_static_low != 0
+        && jnative_static_high != 0
+        && addr >= jnative_static_low
+        && addr <  jnative_static_high) {
+        /* Static object baked into the module image — not allocator-owned. */
+        return;
+    }
+
+    if (jnative_in_shutdown) {
+        if (!jnative_freed_insert(addr)) {
+            /* Already freed earlier in this shutdown pass. */
+            return;
+        }
+    }
+
+    free(p);
+}
+
+/* ============================================================================
  * Reflect-mirror field offsets
  *
  * These globals are declared extern in jnative_runtime.h and referenced by
@@ -66,12 +360,14 @@ int32_t JNATIVE_METHOD_RETURN_TYPE_OFFSET  = -1;
 int32_t JNATIVE_METHOD_PARAM_TYPES_OFFSET  = -1;
 int32_t JNATIVE_METHOD_EXC_TYPES_OFFSET    = -1;
 int32_t JNATIVE_METHOD_MODIFIERS_OFFSET    = -1;
+int32_t JNATIVE_METHOD_ROOT_OFFSET         = -1;
 
 int32_t JNATIVE_CTOR_CLAZZ_OFFSET       = -1;
 int32_t JNATIVE_CTOR_SLOT_OFFSET        = -1;
 int32_t JNATIVE_CTOR_PARAM_TYPES_OFFSET = -1;
 int32_t JNATIVE_CTOR_EXC_TYPES_OFFSET   = -1;
 int32_t JNATIVE_CTOR_MODIFIERS_OFFSET   = -1;
+int32_t JNATIVE_CTOR_ROOT_OFFSET        = -1;
 
 /* ============================================================================
  * Reflect-mirror layout hand-off
@@ -98,7 +394,9 @@ void __jnative_reflect_set_layout(
     int32_t ctor_slot_offset,
     int32_t ctor_param_types_offset,
     int32_t ctor_exc_types_offset,
-    int32_t ctor_modifiers_offset)
+    int32_t ctor_modifiers_offset,
+    int32_t ctor_root_offset,
+    int32_t method_root_offset)
 {
     /* First call wins. Everything after is either a no-op (identical
      * values, the common case in a well-formed image where @main runs
@@ -117,11 +415,13 @@ void __jnative_reflect_set_layout(
          || JNATIVE_METHOD_PARAM_TYPES_OFFSET  != method_param_types_offset
          || JNATIVE_METHOD_EXC_TYPES_OFFSET    != method_exc_types_offset
          || JNATIVE_METHOD_MODIFIERS_OFFSET    != method_modifiers_offset
+         || JNATIVE_METHOD_ROOT_OFFSET         != method_root_offset
          || JNATIVE_CTOR_CLAZZ_OFFSET       != ctor_clazz_offset
          || JNATIVE_CTOR_SLOT_OFFSET        != ctor_slot_offset
          || JNATIVE_CTOR_PARAM_TYPES_OFFSET != ctor_param_types_offset
          || JNATIVE_CTOR_EXC_TYPES_OFFSET   != ctor_exc_types_offset
-         || JNATIVE_CTOR_MODIFIERS_OFFSET   != ctor_modifiers_offset) {
+         || JNATIVE_CTOR_MODIFIERS_OFFSET   != ctor_modifiers_offset
+         || JNATIVE_CTOR_ROOT_OFFSET        != ctor_root_offset) {
             fprintf(stderr,
                 "jnative: warning: __jnative_reflect_set_layout called "
                 "twice with different values; ignoring the second call\n");
@@ -142,12 +442,14 @@ void __jnative_reflect_set_layout(
     JNATIVE_METHOD_PARAM_TYPES_OFFSET  = method_param_types_offset;
     JNATIVE_METHOD_EXC_TYPES_OFFSET    = method_exc_types_offset;
     JNATIVE_METHOD_MODIFIERS_OFFSET    = method_modifiers_offset;
+    JNATIVE_METHOD_ROOT_OFFSET         = method_root_offset;
 
     JNATIVE_CTOR_CLAZZ_OFFSET       = ctor_clazz_offset;
     JNATIVE_CTOR_SLOT_OFFSET        = ctor_slot_offset;
     JNATIVE_CTOR_PARAM_TYPES_OFFSET = ctor_param_types_offset;
     JNATIVE_CTOR_EXC_TYPES_OFFSET   = ctor_exc_types_offset;
     JNATIVE_CTOR_MODIFIERS_OFFSET   = ctor_modifiers_offset;
+    JNATIVE_CTOR_ROOT_OFFSET        = ctor_root_offset;
 }
 
 /* ============================================================================
@@ -259,8 +561,8 @@ void __jnative_monitor_exit(void* obj) {
  *     class whose <clinit> participates in a cyclic initialization
  *     group. That is tens of thousands of call sites on a large image.
  *
- *   - Their bodies contain a pthread_mutex_lock and a linear strcmp walk
- *     over clinit_table. Inlining them into every call site duplicates
+ *   - Their bodies contain a pthread_mutex_lock and a hashed strcmp probe
+ *     over the clinit bucket table. Inlining them into every call site duplicates
  *     the lock and the strcmp chain tens of thousands of times, bloating
  *     the binary and (more importantly) obscuring the CFG of the
  *     surrounding function under a heavyweight instruction sequence —
@@ -318,8 +620,25 @@ typedef struct ClinitEntry {
     struct ClinitEntry* next;
 } ClinitEntry;
 
-static ClinitEntry*    clinit_table = NULL;
+#define CLINIT_HASH_BUCKETS 1024
+
+static ClinitEntry*    clinit_buckets[CLINIT_HASH_BUCKETS] = {0};
 static pthread_mutex_t clinit_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/*
+ * FNV-1a over the class name bytes. All accesses to the table happen under
+ * clinit_lock, so the table needs no atomicity of its own; the hash only
+ * shortens the probe chain to O(1) for the typical number of classes with an
+ * instrumented <clinit> (tens to hundreds).
+ */
+static uint32_t clinit_hash(const char* name) {
+    uint32_t h = 2166136261u;
+    for (const char* p = name; *p; p++) {
+        h ^= (uint8_t)*p;
+        h *= 16777619u;
+    }
+    return h;
+}
 
 typedef struct ClinitFrame {
     char*               name;
@@ -354,25 +673,28 @@ const char* __jnative_current_clinit_class(void) {
 }
 
 static ClinitEntry* clinit_lookup(const char* name) {
-    for (ClinitEntry* e = clinit_table; e; e = e->next) {
+    uint32_t bucket = clinit_hash(name) & (CLINIT_HASH_BUCKETS - 1);
+    for (ClinitEntry* e = clinit_buckets[bucket]; e; e = e->next) {
         if (strcmp(e->name, name) == 0) return e;
     }
     return NULL;
 }
 
 static ClinitEntry* clinit_lookup_or_create(const char* name) {
-    ClinitEntry* e = clinit_lookup(name);
-    if (e != NULL) return e;
-    e = (ClinitEntry*)malloc(sizeof(ClinitEntry));
+    uint32_t bucket = clinit_hash(name) & (CLINIT_HASH_BUCKETS - 1);
+    for (ClinitEntry* e = clinit_buckets[bucket]; e; e = e->next) {
+        if (strcmp(e->name, name) == 0) return e;
+    }
+    ClinitEntry* e = (ClinitEntry*)malloc(sizeof(ClinitEntry));
     if (e == NULL) return NULL;
-    e->name  = strdup(name);
+    e->name = strdup(name);
     if (e->name == NULL) {
         free(e);
         return NULL;
     }
     e->state = CLINIT_STATE_NOT_STARTED;
-    e->next  = clinit_table;
-    clinit_table = e;
+    e->next = clinit_buckets[bucket];
+    clinit_buckets[bucket] = e;
     return e;
 }
 
@@ -422,6 +744,272 @@ void __jnative_clinit_exit(void* name_str) {
 }
 
 /* ============================================================================
+ * Function index for stack walking
+ * ============================================================================
+ *
+ * dladdr has no reverse index into the dynamic symbol table and therefore
+ * performs a linear scan of every exported symbol on every call. On an
+ * image that exports every reachable Java method (~271k dynamic symbols on
+ * the build that motivated this code) a single dladdr call costs ~9M
+ * instructions, and a stack walk of ten frames costs ~90M.
+ *
+ * This section builds a sorted-by-address copy of @jnative_function_index
+ * on first use. The copy is kept for the lifetime of the process; queries
+ * are answered with a binary search over the pointer values, which is
+ * O(log N) pointer comparisons and therefore independent of the size of
+ * the exported symbol table.
+ * ========================================================================== */
+
+typedef struct {
+    uintptr_t        address;
+    const char*      symbol;
+    ReflectionClass* cls;
+} FunctionIndexSortedEntry;
+
+static FunctionIndexSortedEntry* function_index_sorted = NULL;
+static int64_t                   function_index_count  = 0;
+static pthread_once_t            function_index_once   = PTHREAD_ONCE_INIT;
+
+/*
+ * Address range of the main executable's executable text. Queries outside
+ * this range belong to another image (the dynamic loader, libc, the stack,
+ * a JNI library) and must not be attributed to the nearest preceding
+ * generated function, which would otherwise turn a foreign frame into a
+ * bogus Java frame. Both bounds are 0 until build_function_index has run;
+ * a 0 upper bound means "unknown" and disables the range check.
+ */
+static uintptr_t function_index_text_low  = 0;
+static uintptr_t function_index_text_high = 0;
+
+#if defined(__linux__)
+static int jnative_find_main_text_end(struct dl_phdr_info* info,
+                                      size_t size, void* data) {
+    (void)size;
+    /* The main executable is the object whose name is the empty string;
+     * every shared library has a non-empty path in dlpi_name. */
+    if (info->dlpi_name == NULL || info->dlpi_name[0] == '\0') {
+        uintptr_t end = 0;
+        for (int i = 0; i < info->dlpi_phnum; i++) {
+            const ElfW(Phdr)* ph = &info->dlpi_phdr[i];
+            if (ph->p_type == PT_LOAD && (ph->p_flags & PF_X)) {
+                uintptr_t seg_end = (uintptr_t)info->dlpi_addr
+                                  + (uintptr_t)ph->p_vaddr
+                                  + (uintptr_t)ph->p_memsz;
+                if (seg_end > end) end = seg_end;
+            }
+        }
+        *(uintptr_t*)data = end;
+        return 1;
+    }
+    return 0;
+}
+#endif
+
+/* ----------------------------------------------------------------------------
+ * Sparse page index over the sorted function array
+ * ----------------------------------------------------------------------------
+ *
+ * The query is interval-based ("which function contains pc?"), so a hash on
+ * pc itself is wrong: it would miss every address inside a function except
+ * its first byte. The structure below hashes only the page number and then
+ * does a bounded forward scan in the sorted array — at most a few entries
+ * per page for any realistic code layout.
+ *
+ * Memory cost: 8 bytes per page that contains at least one function start.
+ * On a 111 MB image with ~271k functions this is on the order of a few
+ * thousand pages, i.e. tens of KiB — comfortably resident in L2.
+ * -------------------------------------------------------------------------- */
+
+#define PAGE_SHIFT          12
+#define PAGE_SIZE_BYTES     (1u << PAGE_SHIFT)
+#define PAGE_MASK           (PAGE_SIZE_BYTES - 1u)
+
+typedef struct {
+    uintptr_t page_number;   /* page >> PAGE_SHIFT                   */
+    int64_t   sorted_index;  /* index + 1 into function_index_sorted */
+} PageIndexEntry;
+
+static PageIndexEntry* page_index      = NULL;
+static size_t          page_index_size = 0;   /* power of two, 0 = none */
+
+static uintptr_t hash_page_number(uintptr_t p) {
+    /* Multiplicative hash; page numbers are dense and small, but the
+     * multiply spreads them across the table after the shift. */
+    return (p * 0x9E3779B97F4A7C15ULL);
+}
+
+static int compare_function_entries(const void* a, const void* b) {
+    uintptr_t aa = ((const FunctionIndexSortedEntry*)a)->address;
+    uintptr_t bb = ((const FunctionIndexSortedEntry*)b)->address;
+    if (aa < bb) return -1;
+    if (aa > bb) return  1;
+    return 0;
+}
+
+/*
+ * Rebuilds the page index from function_index_sorted. Called once after
+ * build_function_index. Walks the sorted array front-to-back and emits one
+ * entry per page that contains at least one function start.
+ *
+ * An open-addressed table with linear probing is used: it is never resized,
+ * never deleted from, and the load factor is kept below 0.5 by sizing to
+ * 2 * (number of distinct start pages).
+ */
+static void build_page_index(void) {
+    if (function_index_sorted == NULL || function_index_count == 0) return;
+
+    /* Count distinct pages that contain a function start. */
+    size_t distinct = 1;
+    uintptr_t last_page = function_index_sorted[0].address >> PAGE_SHIFT;
+    for (int64_t i = 1; i < function_index_count; i++) {
+        uintptr_t p = function_index_sorted[i].address >> PAGE_SHIFT;
+        if (p != last_page) {
+            distinct++;
+            last_page = p;
+        }
+    }
+
+    size_t cap = 16;
+    while (cap < distinct * 2) cap <<= 1;
+
+    PageIndexEntry* table = calloc(cap, sizeof(*table));
+    if (table == NULL) return;
+
+    int64_t first_in_page = 0;
+    uintptr_t current_page =
+        function_index_sorted[0].address >> PAGE_SHIFT;
+
+    for (int64_t i = 1; i <= function_index_count; i++) {
+        uintptr_t p = (i < function_index_count)
+            ? (function_index_sorted[i].address >> PAGE_SHIFT)
+            : (uintptr_t)-1;
+        if (p == current_page) continue;
+
+        /* Insert (current_page -> first_in_page) with linear probing. */
+        size_t slot = (size_t)(hash_page_number(current_page) & (cap - 1));
+        while (table[slot].sorted_index != 0) {
+            slot = (slot + 1) & (cap - 1);
+        }
+        table[slot].page_number  = current_page;
+        /* Encode index + 1 so that 0 means "empty slot". */
+        table[slot].sorted_index = first_in_page + 1;
+
+        if (i < function_index_count) {
+            current_page  = p;
+            first_in_page = i;
+        }
+    }
+
+    page_index      = table;
+    page_index_size = cap;
+}
+
+static void build_function_index(void) {
+    if ((uintptr_t)&jnative_function_index_size == 0) return;
+    if ((uintptr_t)&jnative_function_index      == 0) return;
+    int64_t n = jnative_function_index_size;
+    if (n <= 0) return;
+
+    FunctionIndexSortedEntry* arr = malloc((size_t)n * sizeof(*arr));
+    if (arr == NULL) return;
+
+    for (int64_t i = 0; i < n; i++) {
+        arr[i].address = (uintptr_t)jnative_function_index[i].address;
+        arr[i].symbol  = jnative_function_index[i].symbol;
+        arr[i].cls     = jnative_function_index[i].cls;
+    }
+    qsort(arr, (size_t)n, sizeof(*arr), compare_function_entries);
+
+    function_index_sorted = arr;
+    function_index_count  = n;
+    function_index_text_low = arr[0].address;
+#if defined(__linux__)
+    {
+        uintptr_t end = 0;
+        dl_iterate_phdr(jnative_find_main_text_end, &end);
+        function_index_text_high = end;
+    }
+#endif
+    build_page_index();
+}
+
+/*
+ * Returns the last entry whose start address does not exceed `pc`, or NULL
+ * if `pc` precedes every entry. With -flto and cross-function inlining, a pc
+ * may lie inside an inlined body whose start is not separately recorded; the
+ * query then resolves to the outermost function that contains the inlined
+ * body, which is the correct frame identity for a stack walk.
+ */
+static const FunctionIndexSortedEntry* function_index_lookup(uintptr_t pc) {
+    if (function_index_sorted == NULL || function_index_count == 0) {
+        return NULL;
+    }
+
+    /* Reject addresses outside the main executable's text before the
+     * nearest-preceding search can attach them to a generated function. */
+    if (function_index_text_high != 0
+        && (pc < function_index_text_low || pc >= function_index_text_high)) {
+        return NULL;
+    }
+
+    /* Fast path: the page index gives the first function whose start is on
+     * the page containing pc, plus a short scan for the function that
+     * actually contains pc. */
+    if (page_index != NULL && page_index_size > 0) {
+        uintptr_t page = pc >> PAGE_SHIFT;
+        size_t slot = (size_t)(hash_page_number(page) & (page_index_size - 1));
+        while (page_index[slot].sorted_index != 0) {
+            if (page_index[slot].page_number == page) {
+                int64_t idx = page_index[slot].sorted_index - 1;
+                /* The first start on pc's page may lie after pc when pc is
+                 * inside a function that began on an earlier page. Step
+                 * back to the last start not past pc. */
+                while (idx > 0
+                       && function_index_sorted[idx].address > pc) {
+                    idx--;
+                }
+                if (function_index_sorted[idx].address > pc) {
+                    /* pc precedes every recorded start; use the search. */
+                    break;
+                }
+                while (idx + 1 < function_index_count
+                       && function_index_sorted[idx + 1].address <= pc) {
+                    idx++;
+                }
+                return &function_index_sorted[idx];
+            }
+            slot = (slot + 1) & (page_index_size - 1);
+        }
+        /* pc lies on a page that has no function start of its own. The
+         * nearest preceding start lives on an earlier page, so fall
+         * through to the binary search — this is rare and only occurs for
+         * the tail of a function whose start is on a previous page, which
+         * the binary search handles directly. */
+    }
+
+    /* Fallback: binary search over the sorted array. */
+    int64_t lo = 0, hi = function_index_count;
+    while (lo < hi) {
+        int64_t mid = lo + (hi - lo) / 2;
+        if (function_index_sorted[mid].address <= pc) lo = mid + 1;
+        else                                          hi = mid;
+    }
+    if (lo == 0) return NULL;
+    return &function_index_sorted[lo - 1];
+}
+
+int __jnative_function_at_address(uintptr_t pc,
+                                  const char** out_symbol,
+                                  ReflectionClass** out_cls) {
+    pthread_once(&function_index_once, build_function_index);
+    const FunctionIndexSortedEntry* e = function_index_lookup(pc);
+    if (e == NULL || e->symbol == NULL) return 0;
+    if (out_symbol != NULL) *out_symbol = e->symbol;
+    if (out_cls    != NULL) *out_cls    = e->cls;
+    return 1;
+}
+
+/* ============================================================================
  * Canonical own-class-vtable resolution
  * ========================================================================== */
 
@@ -434,6 +1022,60 @@ void* __jnative_own_class_vtable(const char* class_name) {
     void** type_info = (void**)dlsym(RTLD_DEFAULT, symbol);
     if (type_info == NULL) return NULL;
     return type_info[0];
+}
+
+/* ============================================================================
+ * Static-field symbol construction
+ * ========================================================================== */
+
+/*
+ * The character-class predicate is spelled out inline rather than calling
+ * isalnum(), because the Java side's rule is exactly
+ *     [a-zA-Z0-9_] -> keep; anything else -> '_'
+ * and the C library's isalnum() is documented to be locale-dependent.
+ * The runtime never calls setlocale(), so the C locale is in effect and
+ * isalnum() would in fact agree, but matching the Java rule explicitly
+ * makes the two implementations provably identical rather than
+ * identical-by-accident-of-environment.
+ */
+static int jnative_is_word_char(unsigned char c) {
+    return (c >= 'a' && c <= 'z')
+        || (c >= 'A' && c <= 'Z')
+        || (c >= '0' && c <= '9')
+        || (c == '_');
+}
+
+int jnative_build_static_field_symbol(const char* owner,
+                                      const char* name,
+                                      int32_t name_len,
+                                      char* out, size_t out_size)
+{
+    if (owner == NULL || name == NULL) return 0;
+    if (name_len < 0) return 0;
+    /* Need room for "gv_" + owner + "_" + name + NUL. */
+    if (out_size < 4) return 0;
+
+    size_t pos = 0;
+    out[pos++] = 'g';
+    out[pos++] = 'v';
+    out[pos++] = '_';
+
+    for (const char* p = owner; *p != '\0'; p++) {
+        if (pos + 2 >= out_size) return 0;
+        unsigned char c = (unsigned char)*p;
+        out[pos++] = jnative_is_word_char(c) ? (char)c : '_';
+    }
+    if (pos + 2 >= out_size) return 0;
+    out[pos++] = '_';
+
+    for (int32_t i = 0; i < name_len; i++) {
+        if (pos + 2 >= out_size) return 0;
+        unsigned char c = (unsigned char)name[i];
+        out[pos++] = jnative_is_word_char(c) ? (char)c : '_';
+    }
+
+    out[pos] = '\0';
+    return 1;
 }
 
 /* ============================================================================
@@ -924,6 +1566,32 @@ int __jnative_catch_matches(void* exc, void* type_info) {
         if (*ti == vtable) return 1;
         ti++;
     }
+
+    /*
+     * Diagnostics: enabled with JNATIVE_DEBUG_CATCH=1. Prints which
+     * exception class was not found in the type_info table, plus the
+     * first few vtables from that table. Helps explain why
+     * catch (Exception) does not fire. No effect on production
+     * behaviour.
+     */
+    if (getenv("JNATIVE_DEBUG_CATCH") != NULL) {
+        const char* exc_name = "?";
+        if (vtable != NULL) {
+            const char* n = ((JNativeVTable*)vtable)->name;
+            if (n != NULL) exc_name = n;
+        }
+        fprintf(stderr, "[catch] MISS: exception class '%s' (vtable=%p) not in type_info %p\n",
+                exc_name, vtable, type_info);
+        fprintf(stderr, "[catch] type_info contains:\n");
+        ti = (void**)type_info;
+        int i = 0;
+        while (*ti != NULL && i < 16) {
+            const char* n = ((JNativeVTable*)*ti)->name;
+            fprintf(stderr, "  [%d] %s (vtable=%p)\n", i, n ? n : "?", *ti);
+            ti++;
+            i++;
+        }
+    }
     return 0;
 }
 
@@ -1225,6 +1893,20 @@ int __jnative_is_class_mirror(const void* ptr) {
     return 0;
 }
 
+/*
+ * Cached vtable of java/lang/Object, used when dispatching on an array.
+ * Arrays inherit all their methods from Object, so their effective vtable is
+ * Object's vtable. This path used to call dlsym on every invocation; it runs
+ * on every VIRTUAL_CALL with an array receiver, so cache it via pthread_once.
+ */
+static JNativeVTable* jnative_cached_object_vtable = NULL;
+static pthread_once_t jnative_object_vtable_once  = PTHREAD_ONCE_INIT;
+
+static void jnative_init_object_vtable(void) {
+    jnative_cached_object_vtable =
+        (JNativeVTable*)__jnative_own_class_vtable("java/lang/Object");
+}
+
 JNativeVTable* __jnative_resolve_dispatch_vtable(void* obj) {
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
@@ -1234,13 +1916,13 @@ JNativeVTable* __jnative_resolve_dispatch_vtable(void* obj) {
         __jnative_throw_bad_vtable("virtual dispatch", obj);
     }
     if (__jnative_is_class_mirror(first)) {
-        void* obj_vtable = __jnative_own_class_vtable("java/lang/Object");
-        if (obj_vtable == NULL) {
+        pthread_once(&jnative_object_vtable_once, jnative_init_object_vtable);
+        if (jnative_cached_object_vtable == NULL) {
             __jnative_throw_bad_vtable(
                 "virtual dispatch on array receiver "
                 "(java/lang/Object has no registered vtable)", obj);
         }
-        return (JNativeVTable*)obj_vtable;
+        return jnative_cached_object_vtable;
     }
     return (JNativeVTable*)first;
 }
@@ -1420,7 +2102,101 @@ const char* __jnative_read_string_bytes(void* s, int32_t* out_len) {
     return (const char*)value + JAVA_ARR_HDR;
 }
 
+/*
+ * Safe read of a Java string's payload into a caller-supplied C buffer.
+ *
+ * Returns:
+ *   >= 0 : the number of bytes copied (excluding the NUL terminator)
+ *   -1   : error (s == NULL, out == NULL, out_cap <= 0,
+ *          or the string's length does not fit in the buffer)
+ */
+int32_t __jnative_read_string_into(void* s, char* out, int32_t out_cap) {
+    if (out == NULL || out_cap <= 0) return -1;
+    out[0] = '\0';
+    if (s == NULL) return -1;
+
+    void* value = *(void**)((char*)s + 8);
+    if (value == NULL) return 0;
+
+    int32_t len = *(int32_t*)((char*)value + JAVA_ARR_LENGTH_OFFSET);
+    if (len < 0) return -1;
+    if (len >= out_cap) return -1;
+
+    const char* src = (const char*)value + JAVA_ARR_HDR;
+    if (len > 0) memcpy(out, src, (size_t)len);
+    out[len] = '\0';
+    return len;
+}
+
+/* ------------------------------------------------------------------
+ * Per-thread copy buffer for __jnative_read_string_cstr.
+ *
+ * Released by the pthread-key destructor when the thread exits, so there
+ * is no per-thread leak. The buffer grows as needed and never shrinks —
+ * a deliberate trade-off to avoid reallocating on every call.
+ * ------------------------------------------------------------------ */
+static pthread_key_t tls_cstr_key;
+static pthread_once_t tls_cstr_key_once = PTHREAD_ONCE_INIT;
+
+typedef struct {
+    char*  buf;
+    size_t cap;
+} TlsCstrBuf;
+
+static void tls_cstr_destroy(void* p) {
+    if (p != NULL) {
+        TlsCstrBuf* t = (TlsCstrBuf*)p;
+        free(t->buf);
+        free(t);
+    }
+}
+
+static void tls_cstr_key_init(void) {
+    pthread_key_create(&tls_cstr_key, tls_cstr_destroy);
+}
+
+const char* __jnative_read_string_cstr(void* s, int32_t* out_len) {
+    if (out_len != NULL) *out_len = 0;
+    if (s == NULL) return "";
+
+    void* value = *(void**)((char*)s + 8);
+    if (value == NULL) return "";
+
+    int32_t len = *(int32_t*)((char*)value + JAVA_ARR_LENGTH_OFFSET);
+    if (len < 0) len = 0;
+
+    pthread_once(&tls_cstr_key_once, tls_cstr_key_init);
+    TlsCstrBuf* tls = (TlsCstrBuf*)pthread_getspecific(tls_cstr_key);
+    if (tls == NULL) {
+        tls = (TlsCstrBuf*)calloc(1, sizeof(TlsCstrBuf));
+        if (tls == NULL) return NULL;
+        pthread_setspecific(tls_cstr_key, tls);
+    }
+
+    size_t need = (size_t)len + 1;
+    if (tls->cap < need) {
+        size_t new_cap = tls->cap ? tls->cap : 256;
+        while (new_cap < need) new_cap <<= 1;
+        char* nb = (char*)realloc(tls->buf, new_cap);
+        if (nb == NULL) return NULL;
+        tls->buf = nb;
+        tls->cap = new_cap;
+    }
+
+    const char* src = (const char*)value + JAVA_ARR_HDR;
+    if (len > 0) memcpy(tls->buf, src, (size_t)len);
+    tls->buf[len] = '\0';
+    if (out_len != NULL) *out_len = len;
+    return tls->buf;
+}
+
 static int32_t __jnative_string_eq(void* a, void* b) {
+    /*
+     * memcmp is length-bounded, so the lack of an in-bounds NUL
+     * terminator in the string payload is irrelevant here. Do not switch
+     * to __jnative_read_string_cstr: two consecutive calls overwrite the
+     * same thread-local buffer, and memcmp would compare b against itself.
+     */
     int32_t la = 0, lb = 0;
     const char* ba = __jnative_read_string_bytes(a, &la);
     const char* bb = __jnative_read_string_bytes(b, &lb);
@@ -1609,7 +2385,31 @@ void __jnative_invoke_runnable(void* runnable) {
  * <clinit> trace hook
  * ========================================================================== */
 
+/*
+ * <clinit> trace hook.
+ *
+ * Emitted into @main by earlier revisions of LlvmGenerator as a
+ * "call void @__jnative_debug_clinit(...)" before each eager <clinit>
+ * invocation and before each bootstrap phase. The current revision no
+ * longer emits those calls, but the symbol is kept declared so that:
+ *
+ *   - a previously-generated _module.ll that still contains the calls
+ *     links and runs without flooding stderr;
+ *
+ *   - the hook can be turned back on without rebuilding the JVM side,
+ *     by setting JNATIVE_TRACE_CLINIT=1 in the environment.
+ *
+ * The env-var gate is checked on every call. It is a single getenv()
+ * per <clinit>, of which there are at most a few thousand per process,
+ * so the cost is not measurable and the diagnostic remains one line
+ * away.
+ */
 void __jnative_debug_clinit(const char* name) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        enabled = (getenv("JNATIVE_TRACE_CLINIT") != NULL) ? 1 : 0;
+    }
+    if (!enabled) return;
     fprintf(stderr, "[clinit] %s\n", name);
     fflush(stderr);
 }

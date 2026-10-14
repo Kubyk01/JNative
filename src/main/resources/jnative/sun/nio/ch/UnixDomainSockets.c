@@ -451,3 +451,110 @@ int32_t __jnative_fn_sun_nio_ch_UnixDomainSockets_accept0__Ljava_io_FileDescript
 
     return 1;
 }
+
+/*
+ * static native byte[] localAddress0(FileDescriptor fd) throws IOException;
+ *
+ * JDK 22 (JDK-8310615) changed the native signature of the local /
+ * remote address queries. The older form took a caller-supplied byte[]
+ * and wrote the address into it; the new form allocates the byte[]
+ * itself and returns it, so the Java layer no longer has to know the
+ * size of struct sockaddr_un in advance.
+ *
+ * The returned array carries the raw sun_path bytes of the bound Unix
+ * socket, exactly as getsockname(2) reports them. For an abstract socket
+ * the first byte is NUL, matching the Linux abstract-namespace convention
+ * that the Java-side UnixDomainSocketAddress.toByteArray() expects to
+ * see; for a filesystem-path socket the bytes are the path without any
+ * trailing NUL. A socket that is bound but whose sun_path is empty
+ * returns a zero-length array, which the Java layer renders as the
+ * empty path.
+ */
+void* __jnative_fn_sun_nio_ch_UnixDomainSockets_localAddress0__Ljava_io_FileDescriptor___B(
+        void* fd_obj)
+{
+    int32_t fd = jnative_raw_fd(fd_obj);
+
+    struct sockaddr_un addr;
+    socklen_t addrlen = (socklen_t)sizeof(addr);
+    memset(&addr, 0, sizeof(addr));
+
+    if (getsockname(fd, (struct sockaddr*)&addr, &addrlen) < 0) {
+        __jnative_throw_exception(NULL);
+        return NULL;
+    }
+
+    size_t base = offsetof(struct sockaddr_un, sun_path);
+    if (addrlen <= (socklen_t)base) {
+        return jnative_byte_array(NULL, 0);
+    }
+    size_t name_len = (size_t)addrlen - base;
+    return jnative_byte_array(addr.sun_path, (int32_t)name_len);
+}
+
+void* __jnative_fn_sun_nio_ch_UnixDomainSockets_remoteAddress0__Ljava_io_FileDescriptor___B(
+        void* fd_obj)
+{
+    int32_t fd = jnative_raw_fd(fd_obj);
+
+    struct sockaddr_un addr;
+    socklen_t addrlen = (socklen_t)sizeof(addr);
+    memset(&addr, 0, sizeof(addr));
+
+    if (getpeername(fd, (struct sockaddr*)&addr, &addrlen) < 0) {
+        __jnative_throw_exception(NULL);
+        return NULL;
+    }
+
+    size_t base = offsetof(struct sockaddr_un, sun_path);
+    if (addrlen <= (socklen_t)base) {
+        return jnative_byte_array(NULL, 0);
+    }
+    size_t name_len = (size_t)addrlen - base;
+    return jnative_byte_array(addr.sun_path, (int32_t)name_len);
+}
+
+/*
+ * static native void bind0(FileDescriptor fd, byte[] path)
+ *     throws IOException;
+ *
+ * JDK 22 (JDK-8310615) simplified the Unix-domain-socket native
+ * signatures. The old form took both a String and a byte[] so that
+ * the Java layer could choose between a filesystem path and an abstract
+ * name; the new form takes only the byte[] and leaves the choice to
+ * the caller. For an abstract socket the array's first byte is NUL,
+ * matching the Linux abstract-namespace convention; for a filesystem
+ * path the array holds the raw bytes of the path with no terminator.
+ *
+ * The two forms are semantically identical, so this body delegates to
+ * the four-argument helper through a temporary wrapper that supplies
+ * the missing String slot as null. That keeps a single implementation
+ * of the sockaddr_un construction, so any future change to the
+ * layout rules only has to be made in one place.
+ */
+void __jnative_fn_sun_nio_ch_UnixDomainSockets_bind0__Ljava_io_FileDescriptor__B_V(
+        void* fd_obj, void* path_bytes)
+{
+    int32_t fd = jnative_raw_fd(fd_obj);
+    if (path_bytes == NULL) {
+        __jnative_throw_null_pointer_exception();
+        return;
+    }
+
+    int32_t path_len = jnative_array_length(path_bytes);
+    if (path_len <= 0) {
+        __jnative_throw_exception(NULL);
+        return;
+    }
+
+    struct sockaddr_un addr;
+    socklen_t addrlen = 0;
+    if (build_sockaddr_un(&addr, &addrlen, NULL, path_bytes, 0, path_len) < 0) {
+        __jnative_throw_exception(NULL);
+        return;
+    }
+
+    if (bind(fd, (struct sockaddr*)&addr, addrlen) < 0) {
+        __jnative_throw_exception(NULL);
+    }
+}

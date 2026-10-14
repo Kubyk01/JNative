@@ -104,6 +104,44 @@ public class DestructorSimplifier {
         // resurrect it into the IR while its body was no longer emitted.
         Set<Function> dead = new HashSet<>(destructors);
         dead.removeAll(called);
+
+        // ------------------------------------------------------------------
+        // Second-chance sanity check.
+        //
+        // collectCalls() is expected to find every STATIC_CALL whose callee
+        // is a __destruct_ / __destruct_array_ symbol present in the module.
+        // The check below is a safety net for the case where the scan missed
+        // one — for example because a symbol was added to the module after
+        // this pass's first snapshot — and prevents the LLVM backend from
+        // emitting a call to a symbol that the same pass is about to remove.
+        // Without it, clang rejects the emitted IR with
+        //
+        //     error: use of undefined value '@__destruct_...'
+        //
+        // and the whole build stops. Removing the call here is strictly
+        // better: the destructor had no live reference anyway, so the call
+        // was dead code.
+        // ------------------------------------------------------------------
+        if (!dead.isEmpty()) {
+            Set<String> deadNames = new HashSet<>();
+            for (Function f : dead) deadNames.add(f.getName());
+
+            for (Function func : module.getFunctions()) {
+                if (dead.contains(func)) continue;
+                if (func.getEntryBlock() == null) continue;
+                for (BasicBlock block : func.getBlocks()) {
+                    block.getInstructions().removeIf(inst -> {
+                        if (inst.getOpcode() != Opcode.STATIC_CALL) return false;
+                        if (inst.getOperands().isEmpty()) return false;
+                        Value callee = inst.getOperands().getFirst();
+                        if (!(callee instanceof Constant c)) return false;
+                        Object v = c.getValue();
+                        return v instanceof String s && deadNames.contains(s);
+                    });
+                }
+            }
+        }
+
         for (Function func : dead) {
             log.debug("Removing dead destructor: {}", func.getName());
             module.removeFunction(func);
@@ -182,47 +220,96 @@ public class DestructorSimplifier {
         log.debug("Simplified destructor: {}", func.getName());
     }
 
+    /**
+     * Replaces calls to trivial destructors with direct {@code FREE}
+     * instructions.
+     *
+     * <p>A destructor is trivial when its body was reduced by
+     * {@link #simplifyToFree} to a single {@code FREE} instruction. Such a call
+     * does not need to go through the linker: {@code FREE} is a built-in
+     * runtime operation.</p>
+     *
+     * <p>The replacement is performed <em>only</em> when the destructor
+     * argument is a live reference. Every other case — Java {@code null},
+     * {@code Constant(null)}, type {@code NULL}/{@code UNKNOWN} — causes the
+     * call to be removed outright. Reasons:</p>
+     *
+     * <ul>
+     *   <li>{@code free(NULL)} per the C standard is a no-op, so removal is
+     *       semantically equivalent to replacement;</li>
+     *   <li>but {@code free(i8* null)} in LLVM IR is not a no-op, it is a real
+     *       function call with a null pointer. It is redundant in the output,
+     *       hurts readability and masks more serious lifetime-analysis
+     *       problems.</li>
+     * </ul>
+     */
     private void inlineDestructors() {
-        // For each call to a trivial destructor, replace the call with FREE
         for (Function caller : module.getFunctions()) {
             if (caller.getEntryBlock() == null) continue;
             for (BasicBlock block : caller.getBlocks()) {
                 List<Instruction> instructions = block.getInstructions();
                 for (int i = 0; i < instructions.size(); i++) {
                     Instruction callInst = instructions.get(i);
-                    // Look for a static call
-                    if (callInst.getOpcode() == Opcode.STATIC_CALL && !callInst.getOperands().isEmpty()) {
-                        Value callee = callInst.getOperands().get(0);
-                        if (callee instanceof Constant c) {
-                            Object val = c.getValue();
-                            if (val instanceof String name) {
-                                Function dtor = module.getFunction(name);
-                                if (dtor != null && trivialDestructors.contains(dtor)) {
-                                    // Replace the call with FREE
-                                    // The argument (object) is at position 1
-                                    Value obj = callInst.getOperands().size() > 1 ? callInst.getOperands().get(1) : null;
-                                    if (obj != null) {
-                                        Instruction freeInst = new Instruction(Opcode.FREE);
-                                        freeInst.addOperand(obj);
-                                        instructions.set(i, freeInst);
-                                        log.debug("Inlined destructor call to FREE: {}", name);
-                                    } else {
-                                        // If there is no object (should not happen), remove the call
-                                        instructions.remove(i);
-                                        i--;
-                                    }
-                                }
-                            }
-                        }
+
+                    if (callInst.getOpcode() != Opcode.STATIC_CALL) continue;
+                    if (callInst.getOperands().isEmpty()) continue;
+
+                    Value callee = callInst.getOperands().getFirst();
+                    if (!(callee instanceof Constant c)) continue;
+
+                    Object val = c.getValue();
+                    if (!(val instanceof String name)) continue;
+
+                    Function dtor = module.getFunction(name);
+                    if (dtor == null || !trivialDestructors.contains(dtor)) continue;
+
+                    // The destructor argument is operand #1. It is precisely
+                    // the object the destructor must free.
+                    Value obj = callInst.getOperands().size() > 1
+                        ? callInst.getOperands().get(1)
+                        : null;
+
+                    // ---- dead-reference filtering -----------------------
+                    //
+                    // All three checks below guard against the same thing:
+                    // emitting a free() call with a null pointer into the IR.
+                    // The cases differ only in which form the "null pointer"
+                    // arrived in:
+                    //
+                    //   1. Java null: the operand is simply absent
+                    //      (DestructorInserter could not find a reference —
+                    //      this is the normal case for aliases such as
+                    //      `var c = a`, where a already owns the storage and
+                    //      is freed separately).
+                    //
+                    //   2. Constant(null): the same thing, but represented by
+                    //      an explicit null constant. The emitter turns it into
+                    //      the literal `null` in the IR text.
+                    //
+                    //   3. NULL/UNKNOWN type: a value with such a type cannot
+                    //      be the result of NEW; it is definitely an invalid
+                    //      reference left behind by some earlier pass.
+                    //
+                    // In all three cases the correct action is to remove the
+                    // call entirely rather than replace it with free(null).
+                    if (obj == null
+                        || (obj instanceof Constant oc && oc.getValue() == null)
+                        || obj.getType() == null
+                        || obj.getType().isNull()
+                        || obj.getType().isUnknown()) {
+                        instructions.remove(i);
+                        i--;
+                        continue;
                     }
+
+                    Instruction freeInst = new Instruction(Opcode.FREE);
+                    freeInst.addOperand(obj);
+                    freeInst.setParent(block);
+                    instructions.set(i, freeInst);
+                    log.debug("Inlined destructor call to FREE: {}", name);
                 }
             }
         }
-        // Remove trivial destructors that were inlined (and are no longer called)
-        // But they may still be called from other places, so we only remove those without calls.
-        // For simplicity we keep them; they will be removed later if unused.
-        // But we could check whether any calls remain.
-        // Not removing them for now.
     }
 
     private String destructorName(Type type) {

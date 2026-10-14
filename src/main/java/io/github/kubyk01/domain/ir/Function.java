@@ -19,6 +19,14 @@ public class Function {
     @Setter
     private List<TryCatchRange> tryCatchRanges = new ArrayList<>();
 
+    /**
+     * Internal class name that owns this function, or null for synthetic
+     * functions (main, shutdown, lambda adaptors). Drives per-class .ll
+     * file partitioning in LlvmGenerator.
+     */
+    @Setter
+    private String ownerClass;
+
     public Function(String name, Type returnType) {
         this.name = name;
         this.returnType = returnType;

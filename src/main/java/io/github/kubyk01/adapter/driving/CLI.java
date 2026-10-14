@@ -6,6 +6,7 @@ import io.github.kubyk01.domain.inspector.InspectionResult;
 import io.github.kubyk01.domain.inspector.MethodInfo;
 import io.github.kubyk01.port.primary.InspectorPort;
 import io.github.kubyk01.port.primary.OrchestratorPort;
+import io.github.kubyk01.util.LlvmUtil;
 import lombok.AllArgsConstructor;
 import picocli.CommandLine;
 import picocli.CommandLine.Command;
@@ -49,7 +50,7 @@ public class CLI implements Runnable {
             return;
         }
 
-        InspectionResult result = resultMono.block();
+        InspectionResult result = LlvmUtil.awaitMono(resultMono);
         if (result == null) {
             System.err.println("No result received.");
             return;
@@ -130,7 +131,14 @@ public class CLI implements Runnable {
             description = "Maximum number of CPU cores this run may use. "
                 + "A value of 0 (the default) means: use every core "
                 + "reported by Runtime.getRuntime().availableProcessors().")
-        int cores) {
+        int cores,
+        @CommandLine.Option(names = "-O",
+            description = "Native compiler optimization level (0-3, default: 2). "
+                + "Passed to clang as -O<level> for both the LLVM IR → bitcode "
+                + "compilation step and the ThinLTO link step. "
+                + "Accepts both attached form (-O3) and separated form (-O 3).",
+            defaultValue = "2")
+        int optimizationLevel) {
 
         if (entryClass == null && file.isFile()
             && file.getName().toLowerCase().endsWith(".jar")) {
@@ -154,11 +162,7 @@ public class CLI implements Runnable {
             return;
         }
 
-        boolean anyFlag = showClasses || showAlias || showEscape || showLifetime
-            || showDestructor || showClassesGraph || showAll;
-        if (!anyFlag) {
-            showClasses = showAlias = showEscape = showLifetime = showDestructor = true;
-        } else if (showAll) {
+        if (showAll) {
             showClasses = showAlias = showEscape = showLifetime = showDestructor = true;
         }
 
@@ -166,6 +170,6 @@ public class CLI implements Runnable {
         orchestrator.analyze(path, entryClass, entryMethod, descriptor,
             showClasses, showAlias, showEscape, showLifetime, showDestructor,
             outputFile, noCompile, includeSystem, debugName, showClassesGraph,
-            cores);
+            cores, optimizationLevel);
     }
 }

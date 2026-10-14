@@ -3,6 +3,7 @@ package io.github.kubyk01.application.service.codegen.llvm;
 import io.github.kubyk01.application.service.analyzer.dependencyresolver.DependencyResolver;
 import io.github.kubyk01.application.service.analyzer.ssa.TypeResolver;
 import io.github.kubyk01.application.service.codegen.llvm.nativepolymorphicfunctionresolver.PolymorphicResolver;
+import io.github.kubyk01.domain.analyzer.ClinitScheduleEntry;
 import io.github.kubyk01.domain.analyzer.aliasanalysis.AliasAnalysisResult;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.ClassNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.FieldNode;
@@ -29,15 +30,22 @@ import lombok.extern.slf4j.Slf4j;
 import org.objectweb.asm.Handle;
 import org.objectweb.asm.Opcodes;
 
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.Deque;
 import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
-import java.util.concurrent.TimeUnit;
+import java.util.Set;
 
 import static io.github.kubyk01.util.LlvmUtil.getElementSizeOfType;
 
@@ -52,32 +60,19 @@ public class LlvmGenerator {
     private final String entryDescriptor;
 
     private final LlvmGlobalEmitter globalEmitter;
-    private final LlvmFunctionEmitter functionEmitter;
 
     /**
      * The polymorphic-resolver instance handed to the constructor.
      *
      * <p>It is stored as a {@code final} field so that the
-     * {@link ThreadLocal} factory inside {@link #emitFunctions(List)}
-     * can capture it. Keeping it {@code final} makes the compiler
-     * reject any future revision that forgets to initialise it.</p>
+     * {@link ThreadLocal} factory inside {@link #generate()} can capture
+     * it. Keeping it {@code final} makes the compiler reject any future
+     * revision that forgets to initialise it.</p>
      */
     private final PolymorphicResolver polymorphicResolverRef;
 
-    private List<Function> clinitFunctions = new ArrayList<>();
+    private List<ClinitScheduleEntry> clinitSchedule = new ArrayList<>();
     private Map<String, String> clinitWrappers = new HashMap<>();
-
-    /**
-     * Maximum number of CPU cores the generator may use for the parallel
-     * function-emission phase.
-     *
-     * <p>The value is set by {@link
-     * io.github.kubyk01.application.service.Orchestrator} through
-     * {@link #setCores(int)}; it is never derived here. The default of 1
-     * keeps the class usable in tests and in any code path that emits a
-     * trivial module without an explicit core budget.</p>
-     */
-    private int cores = 1;
 
     /**
      * Resources to bake into the image, in the order the caller collected
@@ -92,8 +87,8 @@ public class LlvmGenerator {
      */
     private List<Map.Entry<String, byte[]>> embeddedResources = new ArrayList<>();
 
-    public void setClinitFunctions(List<Function> functions) {
-        this.clinitFunctions = functions != null ? functions : new ArrayList<>();
+    public void setClinitSchedule(List<ClinitScheduleEntry> schedule) {
+        this.clinitSchedule = (schedule != null) ? schedule : new ArrayList<>();
     }
 
     public void setEmbeddedResources(List<Map.Entry<String, byte[]>> resources) {
@@ -102,20 +97,6 @@ public class LlvmGenerator {
 
     public void setClinitWrappers(Map<String, String> wrappers) {
         this.clinitWrappers = wrappers != null ? wrappers : new HashMap<>();
-    }
-
-    /**
-     * Sets the maximum number of CPU cores the generator may use.
-     *
-     * <p>A value {@code <= 0} collapses to {@code 1}: the caller is
-     * expected to have resolved the effective core count before invoking
-     * this method, and the absence of a positive value means "run
-     * sequentially". The class deliberately does not call
-     * {@link Runtime#availableProcessors()} here — that decision belongs
-     * to {@link io.github.kubyk01.application.service.Orchestrator}.</p>
-     */
-    public void setCores(int cores) {
-        this.cores = (cores <= 0) ? 1 : cores;
     }
 
     public LlvmGenerator(Module module, DependencyResolver resolver,
@@ -130,8 +111,6 @@ public class LlvmGenerator {
         this.entryDescriptor = entryDescriptor;
         this.reflectInfo = reflectInfo;
         this.globalEmitter = new LlvmGlobalEmitter(module, resolver, aliasResult, reflectInfo);
-        this.functionEmitter = new LlvmFunctionEmitter(
-            module, globalEmitter, polymorphicResolver, resolver);
         this.polymorphicResolverRef = polymorphicResolver;
     }
 
@@ -145,142 +124,620 @@ public class LlvmGenerator {
         return wrapper != null ? wrapper : realClinitName;
     }
 
-    public String generate() {
+    public void generate(Path outputDir) throws IOException {
+        Files.createDirectories(outputDir);
         ensureExternalDeclarations();
+        generateLambdaAdaptors();
+        globalEmitter.prepareLayouts();
+
+        String structDefs   = globalEmitter.generateStructDefinitions();
+        String globalDefs   = globalEmitter.generateGlobalDefinitions();
+        String lambdaVts    = globalEmitter.emitLambdaVtables();
+
+        // The lambda struct text and the reflection ABI types take part in the
+        // per-file prelude filtering, so they are materialised once here.
+        StringBuilder extraBuf = new StringBuilder();
+        globalEmitter.emitExtraStructs(extraBuf);
+        String extraStructsText = extraBuf.toString();
+        String reflectionTypesText = globalEmitter.generateTypeDefinitions();
+
+        // ---- 1. Emit EVERY function body, grouped by owner class. The
+        //         bodies are accumulated in memory rather than streamed,
+        //         because the deferred strings they register are only known
+        //         once emission is finished. (Typically tens-to-hundreds of
+        //         MB, which fits the heap.) ----
+        List<Function> toEmit = new ArrayList<>();
+        for (Function f : module.getFunctions()) {
+            if (f.getEntryBlock() != null) toEmit.add(f);
+        }
+        toEmit.sort(Comparator.comparing(f ->
+            f.getOwnerClass() == null ? "" : f.getOwnerClass()));
+
+        LlvmFunctionEmitter emitter = new LlvmFunctionEmitter(
+            module, globalEmitter, polymorphicResolverRef, resolver);
+
+        Map<String, StringBuilder> classBodies = new LinkedHashMap<>();
+        StringBuilder moduleBodies = new StringBuilder();
+
+        for (Function func : toEmit) {
+            String body = emitter.emitFunction(func);
+            String owner = func.getOwnerClass();
+            if (owner != null && !owner.isEmpty()) {
+                classBodies.computeIfAbsent(owner, k -> new StringBuilder()).append(body);
+            } else {
+                moduleBodies.append(body);
+            }
+        }
+
+        // ---- 2. Deferred strings are now fully known. Collect them. ----
+        String deferred = globalEmitter.generateDeferredStringConstants();
+
+        // ---- 3. knownGlobals = every definition that lives in _module.ll,
+        //         deferred strings included. ----
+        Map<String, GlobalDecl> knownGlobals =
+            parseGlobalDecls(globalDefs + "\n" + lambdaVts + "\n" + deferred);
+
+        // ---- 4. Functions without bodies: declarations for _module.ll. ----
+        //         moduleAvailable = everything already defined OR declared in
+        //         _module.ll; the module extern pass must skip these, because
+        //         LLVM rejects both a redeclaration and a declaration of a
+        //         locally-defined symbol ("invalid redefinition of function"). ----
+        StringBuilder moduleDecls = new StringBuilder();
+        Set<String> moduleAvailable = new HashSet<>();
+        for (Function f : toEmit) {
+            if (f.getOwnerClass() == null || f.getOwnerClass().isEmpty()) {
+                moduleAvailable.add(f.getName());
+            }
+        }
+        for (Function func : new ArrayList<>(module.getFunctions())) {
+            if (func.getEntryBlock() == null
+                && moduleAvailable.add(func.getName())) {
+                moduleDecls.append(emitDeclaration(func));
+            }
+        }
+
+        // ---- 5. Write _module.ll. ----
+        //
+        // Order: the filtered prelude, then the externs, then the tail
+        // (globalDefs + lambdaVts + deferred + owner-less bodies +
+        // moduleDecls + main).
+        //
+        // The tail is assembled into a single string first, so the prelude
+        // filter and the extern pass both see exactly the same content and do
+        // not double-count it.
+        String main = generateMain();
+
+        String moduleTail = globalDefs
+            + "\n" + lambdaVts
+            + "\n" + deferred
+            + "\n" + moduleBodies
+            + moduleDecls
+            + main;
+
+        String moduleExterns = buildExterns(
+            moduleTail,
+            moduleAvailable,
+            Collections.emptyMap(),
+            module);
+
+        String modulePrelude = buildFilteredPrelude(
+            moduleTail + "\n" + moduleExterns,
+            structDefs,
+            extraStructsText,
+            reflectionTypesText);
+
+        String moduleSb = modulePrelude
+            + moduleExterns
+            + moduleTail;
+
+        Path modulePath = outputDir.resolve("_module.ll");
+        Files.writeString(modulePath, moduleSb, StandardCharsets.UTF_8);
+
+        // ---- 6. Write one .ll file per class. ----
+        for (Map.Entry<String, StringBuilder> e : classBodies.entrySet()) {
+            String className = e.getKey();
+            String body = e.getValue().toString();
+
+            Set<String> definedHere = new HashSet<>();
+            for (Function f : toEmit) {
+                if (className.equals(f.getOwnerClass())) {
+                    definedHere.add(f.getName());
+                }
+            }
+
+            String externs = buildExterns(body, definedHere, knownGlobals, module);
+
+            String prelude = buildFilteredPrelude(
+                body + "\n" + externs,
+                structDefs,
+                extraStructsText,
+                reflectionTypesText);
+
+            String sb = prelude + externs + body;
+
+            Path out = outputDir.resolve(className + ".ll");
+            if (out.getParent() != null) Files.createDirectories(out.getParent());
+            Files.writeString(out, sb, StandardCharsets.UTF_8);
+        }
+    }
+
+    /**
+     * Builds the prelude for a single .ll file, including only the type
+     * definitions and function declarations that are actually needed by
+     * {@code bodyContent}.
+     *
+     * <p>Algorithm:</p>
+     * <ol>
+     *   <li>Every possible candidate (vtable types, reflection ABI types,
+     *       lambda structs, class structs, runtime declares) is parsed into
+     *       one ordered map {@code name -> definition-line}.</li>
+     *   <li>All {@code %Type} and {@code @func} names occurring in
+     *       {@code bodyContent} are collected (string literals are
+     *       skipped).</li>
+     *   <li>From those names the ones present in the map are selected, and
+     *       their dependencies are added recursively: if a type definition
+     *       references other types, those are pulled in as well.</li>
+     *   <li>All definitions that made it into the set are emitted in their
+     *       original order. That order guarantees dependent types are declared
+     *       after their dependencies (the emitter already follows it).</li>
+     * </ol>
+     */
+    private String buildFilteredPrelude(String bodyContent,
+                                        String structDefsText,
+                                        String extraStructsText,
+                                        String reflectionTypesText) {
+
+        // Single ordered map of every potential definition. The insertion
+        // order matches the current (working) output order:
+        //   1) vtable types
+        //   2) reflection ABI types
+        //   3) lambda structs
+        //   4) class structs
+        //   5) runtime declares
+        Map<String, String> allDefs = new LinkedHashMap<>();
+        allDefs.putAll(parseSingleLineDefinitions(LlvmRuntime.getVtableTypeDefinition()));
+        allDefs.putAll(parseSingleLineDefinitions(reflectionTypesText));
+        allDefs.putAll(parseSingleLineDefinitions(extraStructsText));
+        allDefs.putAll(parseSingleLineDefinitions(structDefsText));
+        allDefs.putAll(parseSingleLineDefinitions(LlvmRuntime.getDeclarations()));
+
+        // Transitive closure of the set of used names.
+        Set<String> needed = new LinkedHashSet<>();
+        Deque<String> worklist = new ArrayDeque<>();
+
+        seedFilter(needed, worklist, allDefs, bodyContent);
+
+        while (!worklist.isEmpty()) {
+            String name = worklist.poll();
+            String def = allDefs.get(name);
+            if (def == null) continue;
+            seedFilter(needed, worklist, allDefs, def);
+        }
 
         StringBuilder sb = new StringBuilder();
-
         sb.append("target datalayout = \"e-m:e-p270:32:32-p271:64:64-i64:64-f80:128-n8:16:32:64-S128\"\n");
         sb.append("target triple = \"x86_64-pc-linux-gnu\"\n\n");
 
-        sb.append(LlvmRuntime.getVtableTypeDefinition());
-        sb.append("\n");
-
-        sb.append(LlvmRuntime.getDeclarations());
-
-        generateLambdaAdaptors();
-
-        globalEmitter.emitExtraStructs(sb);
-
-        sb.append(globalEmitter.emitLambdaVtables());
-        sb.append("\n");
-
-        sb.append(globalEmitter.generateGlobals());
-
-        // Freeze every lazily-built cache in LlvmGlobalEmitter before the
-        // parallel phase. After this call, classLayouts / interfaceLayouts /
-        // interfaceIds are complete and no longer written to.
-        globalEmitter.prepareLayouts();
-
-        List<Function> functionsCopy = new ArrayList<>(module.getFunctions());
-        List<Function> toEmit = new ArrayList<>(functionsCopy.size());
-        for (Function func : functionsCopy) {
-            if (func.getEntryBlock() != null) {
-                toEmit.add(func);
+        for (Map.Entry<String, String> e : allDefs.entrySet()) {
+            if (needed.contains(e.getKey())) {
+                sb.append(e.getValue()).append('\n');
             }
         }
-
-        for (String body : emitFunctions(toEmit)) {
-            sb.append(body);
-        }
-
-        for (Function func : new ArrayList<>(module.getFunctions())) {
-            if (func.getEntryBlock() == null) {
-                sb.append(emitDeclaration(func));
-            }
-        }
-
-        sb.append(globalEmitter.generateDeferredStringConstants());
-
-        sb.append(generateMain());
-
+        sb.append('\n');
         return sb.toString();
     }
 
     /**
-     * Emits the LLVM IR body of every function in {@code functions}.
+     * Parses a block of textual LLVM definitions into a {@code symbol -> line}
+     * map.
      *
-     * <p>When {@link #cores} is 1 (or there is only one function to emit)
-     * the loop runs on the calling thread and reuses the single
-     * {@link LlvmFunctionEmitter} instance created in the constructor.
-     * Otherwise a fixed-size thread pool is used, with one emitter per
-     * worker thread cached in a {@link ThreadLocal}.</p>
+     * <p>Only single-line definitions are recognised:</p>
+     * <ul>
+     *   <li>{@code %Name = type { ... }} — key {@code "%Name"};</li>
+     *   <li>{@code declare ... @name(...) ...} — key {@code "@name"}.</li>
+     * </ul>
      *
-     * <p>The returned list preserves the input order — the emitted bodies
-     * are collected via {@link Future#get()} in submission order — so the
-     * output is byte-for-byte identical to the sequential version.</p>
+     * <p>Every block produced by the runtime
+     * ({@code getVtableTypeDefinition}, {@code generateTypeDefinitions},
+     * {@code generateStructDefinitions}, {@code emitExtraStructs},
+     * {@code getDeclarations}) consists solely of single-line definitions, so
+     * a more elaborate parser is unnecessary.</p>
      */
-    private List<String> emitFunctions(List<Function> functions) {
-        int n = functions.size();
-        List<String> results = new ArrayList<>(n);
-        if (n == 0) {
-            return results;
-        }
+    private static Map<String, String> parseSingleLineDefinitions(String text) {
+        Map<String, String> out = new LinkedHashMap<>();
+        if (text == null) return out;
 
-        int threadCount = Math.max(1, Math.min(cores, n));
+        for (String rawLine : text.split("\n")) {
+            String line = rawLine.trim();
+            if (line.isEmpty() || line.startsWith(";")) continue;
 
-        if (threadCount == 1) {
-            for (Function func : functions) {
-                results.add(functionEmitter.emitFunction(func));
-            }
-            return results;
-        }
-
-        System.out.println("Emitting " + n + " function(s) using "
-            + threadCount + " thread(s)...");
-
-        final PolymorphicResolver polyResolver = this.polymorphicResolverRef;
-        final Module moduleRef = this.module;
-        final LlvmGlobalEmitter globalEmitterRef = this.globalEmitter;
-        final DependencyResolver resolverRef = this.resolver;
-
-        ThreadLocal<LlvmFunctionEmitter> emitterTl = ThreadLocal.withInitial(
-            () -> new LlvmFunctionEmitter(
-                moduleRef, globalEmitterRef, polyResolver, resolverRef));
-
-        // todo remake this to reactor
-        ExecutorService pool = Executors.newFixedThreadPool(threadCount, r -> {
-            Thread t = new Thread(r, "jnative-llvm-emit");
-            t.setDaemon(true);
-            return t;
-        });
-
-        try {
-            List<Future<String>> futures = new ArrayList<>(n);
-            for (Function func : functions) {
-                futures.add(pool.submit(() -> emitterTl.get().emitFunction(func)));
-            }
-
-            for (int i = 0; i < n; i++) {
-                try {
-                    results.add(futures.get(i).get());
-                } catch (InterruptedException ie) {
-                    Thread.currentThread().interrupt();
-                    throw new RuntimeException(
-                        "Interrupted while emitting LLVM IR for function "
-                            + functions.get(i).getName(), ie);
-                } catch (ExecutionException ee) {
-                    Throwable cause = ee.getCause();
-                    throw new RuntimeException(
-                        "Failed to emit LLVM IR for function "
-                            + functions.get(i).getName(),
-                        cause != null ? cause : ee);
+            if (line.startsWith("%")) {
+                int eq = line.indexOf(" = type ");
+                if (eq > 0) {
+                    String name = line.substring(0, eq).trim();
+                    out.put(name, line);
+                }
+            } else if (line.startsWith("declare ")) {
+                int at = line.indexOf('@');
+                if (at > 0) {
+                    int paren = line.indexOf('(', at);
+                    int nameEnd = (paren > 0) ? paren : line.length();
+                    out.put(line.substring(at, nameEnd), line);
                 }
             }
-        } finally {
-            pool.shutdown();
-            try {
-                if (!pool.awaitTermination(60, TimeUnit.SECONDS)) {
-                    pool.shutdownNow();
+        }
+        return out;
+    }
+
+    /**
+     * Adds every name from {@code text} that exists in {@code allDefs} to
+     * {@code needed}/{@code worklist}.
+     *
+     * <p>The content of string literals {@code "..."} is ignored: LLVM escapes
+     * {@code \\XX} are not expanded, but an escaped quote or backslash is
+     * skipped correctly. This guards against false positives on strings that
+     * contain {@code %} or {@code @}.</p>
+     */
+    private static void seedFilter(Set<String> needed,
+                                   Deque<String> worklist,
+                                   Map<String, String> allDefs,
+                                   String text) {
+        if (text == null || text.isEmpty()) return;
+
+        int n = text.length();
+        int i = 0;
+        while (i < n) {
+            char c = text.charAt(i);
+
+            // Skip a whole string literal.
+            if (c == '"') {
+                i++;
+                while (i < n) {
+                    char d = text.charAt(i);
+                    if (d == '\\' && i + 1 < n) { i += 2; continue; }
+                    if (d == '"') { i++; break; }
+                    i++;
                 }
-            } catch (InterruptedException ie) {
-                Thread.currentThread().interrupt();
-                pool.shutdownNow();
+                continue;
             }
-            emitterTl.remove();
+
+            // Reference to a type (%Type) or a symbol (@func).
+            if (c == '%' || c == '@') {
+                int start = i;
+                int j = i + 1;
+                while (j < n) {
+                    char d = text.charAt(j);
+                    boolean ident =
+                           (d >= 'a' && d <= 'z')
+                        || (d >= 'A' && d <= 'Z')
+                        || (d >= '0' && d <= '9')
+                        || d == '_' || d == '.' || d == '$' || d == '-';
+                    if (!ident) break;
+                    j++;
+                }
+                if (j > start + 1) {
+                    String key = text.substring(start, j);
+                    if (allDefs.containsKey(key) && needed.add(key)) {
+                        worklist.add(key);
+                    }
+                }
+                i = j;
+                continue;
+            }
+
+            i++;
+        }
+    }
+
+    /**
+     * Static prelude shared by {@code _module.ll} and every per-class file:
+     * datalayout/triple, the vtable ABI types, the runtime function
+     * declarations, the extra (lambda) structs, and the struct type
+     * definitions. Built exactly once.
+     */
+    private String buildStaticPrelude(String structDefs) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("target datalayout = \"e-m:e-p270:32:32-p271:64:64-i64:64-f80:128-n8:16:32:64-S128\"\n");
+        sb.append("target triple = \"x86_64-pc-linux-gnu\"\n\n");
+        sb.append(LlvmRuntime.getVtableTypeDefinition()).append("\n");
+        sb.append(LlvmRuntime.getDeclarations()).append("\n");
+
+        // Extra structs (lambda structs etc., registered by createLambdaAdaptor).
+        StringBuilder extra = new StringBuilder();
+        globalEmitter.emitExtraStructs(extra);
+        sb.append(extra);
+
+        // Struct type definitions, the reflection / resource ABI types, and
+        // the layout constants. They are duplicated into every file; LLVM
+        // unifies types by name. The ABI types (%ReflectionClass and friends)
+        // are referenced by the global definitions in _module.ll, so they
+        // must be present there, and per-class files carry them so body
+        // references resolve regardless of which file they land in.
+        sb.append(structDefs);
+        sb.append(globalEmitter.generateTypeDefinitions());
+        sb.append("\n");
+        return sb.toString();
+    }
+
+    /**
+     * Type of one top-level global as emitted in the textual IR: its LLVM
+     * type string and whether it was declared {@code constant}.
+     */
+    private static final class GlobalDecl {
+        final String type;
+        final boolean constant;
+        GlobalDecl(String type, boolean constant) {
+            this.type = type;
+            this.constant = constant;
+        }
+    }
+
+    /**
+     * Parses the textual form our own global emitter produces, mapping each
+     * top-level symbol to its LLVM type and whether it is a {@code constant}.
+     * Only the type string and the const flag are retained; the initializer
+     * is discarded, because the initializer is only ever needed in
+     * {@code _module.ll} which contains the full definitions.
+     *
+     * <p>A single {@code src} string carrying all sources (global defs,
+     * lambda vtables, deferred strings) is parsed in one pass. The parser is
+     * robust to multi-line initializers: after the type token the remainder
+     * of the definition — a brace/bracket-balanced initializer possibly
+     * spanning several lines — is skipped as a unit.</p>
+     *
+     * <p>Symbols emitted with {@code private}/{@code internal} linkage are
+     * skipped: they are file-local to {@code _module.ll} and must not be
+     * referenced from per-class files. Everything else is retained —
+     * {@code @.str.*} constants carry the default (external) linkage and the
+     * remaining globals are {@code linkonce_odr}, so both are visible across
+     * modules; per-class files reach them through a bare {@code external}
+     * declaration.</p>
+     */
+    private static Map<String, GlobalDecl> parseGlobalDecls(String src) {
+        Map<String, GlobalDecl> out = new HashMap<>();
+        int i = 0, n = src.length();
+        while (i < n) {
+            // Find the start of a definition line: '@' at column 0.
+            if (src.charAt(i) != '@') {
+                int lineEnd = src.indexOf('\n', i);
+                if (lineEnd < 0) break;
+                i = lineEnd + 1;
+                continue;
+            }
+            int eq = src.indexOf('=', i);
+            int lineEnd = src.indexOf('\n', i);
+            if (eq < 0) break;
+            if (lineEnd >= 0 && lineEnd < eq) {   // '@' not followed by '='
+                i = lineEnd + 1;
+                continue;
+            }
+
+            String name = src.substring(i, eq).trim();
+            int j = eq + 1;
+            int limit = lineEnd >= 0 ? lineEnd : n;
+            while (j < limit && Character.isWhitespace(src.charAt(j))) j++;
+
+            boolean isConst = false;
+            boolean isPrivate = false;
+            while (j < limit) {
+                int k = matchLinkageKeyword(src, j, limit);
+                if (k < 0) break;
+                String kw = src.substring(j, k);
+                if (kw.equals("private") || kw.equals("internal")) isPrivate = true;
+                if (kw.equals("constant")) isConst = true;
+                j = k;
+                while (j < limit && Character.isWhitespace(src.charAt(j))) j++;
+            }
+            int typeEnd = scanTypeToken(src, j, limit);
+            if (typeEnd > j && !isPrivate && !name.isEmpty()) {
+                out.put(name.substring(1),                       // strip '@'
+                    new GlobalDecl(src.substring(j, typeEnd), isConst));
+            }
+            i = skipInitializer(src, Math.max(typeEnd, j), n);
+        }
+        return out;
+    }
+
+    /**
+     * Matches one LLVM linkage/precedence keyword at offset {@code i} and
+     * returns the index just past it, or -1 when the next token is not a
+     * keyword. Never scans past {@code limit}.
+     */
+    private static int matchLinkageKeyword(String s, int i, int limit) {
+        String[] kws = {"private","internal","linkonce_odr","weak_odr",
+                        "linkonce","weak","external","common","appending",
+                        "extern_weak","dllimport","dllexport","thread_local",
+                        "unnamed_addr","local_unnamed_addr","constant","global"};
+        for (String kw : kws) {
+            int after = i + kw.length();
+            if (after > limit || after > s.length()) continue;
+            if (!s.regionMatches(i, kw, 0, kw.length())) continue;
+            if (after < s.length() && after != limit
+                && !Character.isWhitespace(s.charAt(after))) continue;
+            return after;
+        }
+        return -1;
+    }
+
+    /**
+     * Scans one LLVM type token starting at offset {@code i}; returns the
+     * index just past the token, or -1 when the position does not hold the
+     * start of a type. Bracketed array/struct types are consumed as a single
+     * balanced unit.
+     */
+    private static int scanTypeToken(String s, int i, int limit) {
+        if (i >= limit) return -1;
+        char c = s.charAt(i);
+        if (c == '[' || c == '{') {
+            char close = (c == '[') ? ']' : '}';
+            int depth = 0;
+            while (i < s.length()) {
+                char ch = s.charAt(i);
+                if (ch == c) depth++;
+                else if (ch == close) { depth--; if (depth == 0) return i + 1; }
+                i++;
+            }
+            return -1;
+        }
+        int start = i;
+        while (i < s.length()) {
+            char ch = s.charAt(i);
+            if (Character.isWhitespace(ch) || ch == ',' || ch == '}' || ch == ']') break;
+            i++;
+        }
+        return i > start ? i : -1;
+    }
+
+    /**
+     * Skips the remainder of a global definition — its initializer, which may
+     * span several lines and contain brace/bracket-balanced literals — so the
+     * next line begins at {@code i}.
+     *
+     * <p>The skip is string-literal aware. LLVM string literals (both
+     * {@code "..."} and {@code c"..."}) can legally contain raw {@code '['},
+     * {@code ']'}, {@code '{'} and {@code '}'} bytes, and the emitted
+     * {@code @.str.*} constants do exactly that: any Java string containing a
+     * bracket or a brace — for example the vtable slot string
+     * {@code class '[B', slot 'wait(JI)V'} — is emitted with the byte verbatim
+     * inside {@code c"..."}. Treating those bytes as structural nesting
+     * desynchronizes {@code depth}, the initializer skip never terminates at
+     * its own newline, and every subsequent global definition is swallowed by
+     * a single call. The result is that {@code knownGlobals} is truncated,
+     * {@code buildExterns} emits no {@code external constant} line for the
+     * dropped {@code @.str.*} symbols, and clang rejects every per-class
+     * module with "use of undefined value '@.str....'".</p>
+     *
+     * <p>While the scanner is inside a string, {@code depth} is left
+     * unchanged. A backslash consumes the following character so that an
+     * escaped quote ({@code \22}, which is how {@code typeStringConstant}
+     * renders {@code "}) or an escaped bracket ({@code \5B}) does not
+     * terminate the string early or perturb the counter.</p>
+     */
+    private static int skipInitializer(String s, int start, int n) {
+        int depth = 0, i = start;
+        boolean inString = false;
+        while (i < n) {
+            char c = s.charAt(i);
+            if (inString) {
+                if (c == '\\') {
+                    // Consume the backslash and the character it escapes.
+                    // LLVM escapes are either \" or \\ or a two-digit hex
+                    // escape \XX; in every form the byte immediately after
+                    // the backslash must not be interpreted as a quote or
+                    // as a bracket.
+                    i += 2;
+                    continue;
+                }
+                if (c == '"') {
+                    inString = false;
+                }
+                // Inside a string literal, '[', ']', '{', '}' are data,
+                // not structural nesting: `depth` must not change.
+            } else {
+                if (c == '"') {
+                    inString = true;
+                } else if (c == '{' || c == '[') {
+                    depth++;
+                } else if (c == '}' || c == ']') {
+                    depth--;
+                } else if (c == '\n' && depth == 0) {
+                    return i + 1;
+                }
+            }
+            i++;
+        }
+        return i;
+    }
+
+    /**
+     * Scans the emitted body for {@code @symbol} references and emits:
+     *
+     * <ul>
+     *   <li>an {@code external} global/constant declaration for each name
+     *       that maps to a known global defined in {@code _module.ll},</li>
+     *   <li>a {@code declare} line for each referenced function the current
+     *       file does not define ({@code module.getFunction(name)}).</li>
+     * </ul>
+     *
+     * Local SSA names ({@code %...}) and LLVM intrinsics
+     * ({@code @llvm.*}) are ignored.
+     *
+     * <p><b>Identifier character set.</b> LLVM permits {@code $} inside
+     * unquoted identifiers — every symbol that involves an inner or
+     * anonymous Java class carries at least one, because the JVM uses
+     * {@code $} as the separator between an outer class and its nested
+     * class, and {@code LlvmRuntime.mangleMethod} intentionally preserves
+     * it (it only replaces characters outside {@code [a-zA-Z0-9_]}) —
+     * and the mangled names produced for destructors use the raw internal
+     * class name with {@code '/'} and {@code '.'} folded to {@code '_'}
+     * but <em>not</em> {@code '$'}. A previous revision scanned only
+     * {@code [a-zA-Z0-9_.]} and therefore truncated
+     * {@code @__destruct_com_sun_crypto_provider_SunJCE$1} to
+     * {@code @__destruct_com_sun_crypto_provider_SunJCE}, looked up the
+     * wrong name in the module, found nothing, and emitted no
+     * {@code declare}. clang then rejected every per-class .ll file that
+     * contained a call to such a destructor with
+     *
+     * <pre>
+     * error: use of undefined value '@__destruct_...$1'
+     * </pre>
+     *
+     * <p>The character set below matches the one used by
+     * {@link #seedFilter(Set, Deque, Map, String)} and by every symbol
+     * that {@code LlvmRuntime.mangleMethod} actually produces.</p>
+     *
+     * <p>The body of a typical class references a few dozen globals, so the
+     * resulting extern block is a few KB rather than the tens of MB that the
+     * whole-module extern list would be.</p>
+     */
+    private String buildExterns(String bodyContent,
+                                Set<String> definedHere,
+                                Map<String, GlobalDecl> knownGlobals,
+                                Module module) {
+        Set<String> used = new HashSet<>();
+        int i = 0, n = bodyContent.length();
+        while ((i = bodyContent.indexOf("@", i)) >= 0) {
+            int j = i + 1;
+            while (j < n) {
+                char c = bodyContent.charAt(j);
+                // a-zA-Z0-9_ . $ - — the exact set LLVM accepts in
+                // unquoted identifiers and the exact set the mangler
+                // produces.
+                if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+                    || (c >= '0' && c <= '9') || c == '_' || c == '.'
+                    || c == '$' || c == '-') {
+                    j++;
+                } else {
+                    break;
+                }
+            }
+            if (j > i + 1) used.add(bodyContent.substring(i + 1, j));
+            i = j;
         }
 
-        return results;
+        StringBuilder sb = new StringBuilder();
+        List<String> sorted = new ArrayList<>(used);
+        Collections.sort(sorted);
+        for (String name : sorted) {
+            if (name.startsWith("llvm.")) continue;
+            if (definedHere.contains(name)) continue;
+            GlobalDecl d = knownGlobals.get(name);
+            if (d != null) {
+                if (d.constant) {
+                    sb.append("@").append(name).append(" = external constant ")
+                      .append(d.type).append("\n");
+                } else {
+                    sb.append("@").append(name).append(" = external global ")
+                      .append(d.type).append("\n");
+                }
+                continue;
+            }
+            Function func = module.getFunction(name);
+            if (func != null) {
+                sb.append(emitDeclaration(func));
+            }
+        }
+        return sb.toString();
     }
 
     private void ensureExternalDeclarations() {
@@ -331,9 +788,9 @@ public class LlvmGenerator {
         resolver.forceLoadSystemClass("java/lang/ThreadGroup");
 
         ensureExternalFunction("__jnative_thread_set_layout", Type.VOID,
-            Type.INT, Type.INT, Type.INT, Type.INT,   // Thread: size, holder, tid, name
+            Type.INT, Type.INT, Type.INT, Type.INT, Type.INT,  // Thread: size, holder, tid, name, interruptLock
             Type.INT, Type.INT, Type.INT, Type.INT, Type.INT,  // FieldHolder: size, group, priority, daemon, status
-            Type.INT, Type.INT, Type.INT, Type.INT);  // ThreadGroup: size, name, maxPriority, vmAllow
+            Type.INT, Type.INT, Type.INT, Type.INT);           // ThreadGroup: size, name, maxPriority, vmAllow
 
         // Reflection-mirror field-offset handoff.
         //
@@ -370,7 +827,8 @@ public class LlvmGenerator {
         ensureExternalFunction("__jnative_reflect_set_layout", Type.VOID,
             Type.INT, Type.INT, Type.INT, Type.INT, Type.INT,   // Field: clazz, slot, name, type, modifiers
             Type.INT, Type.INT, Type.INT, Type.INT, Type.INT, Type.INT, Type.INT,   // Method: clazz, slot, name, returnType, params, exc, modifiers
-            Type.INT, Type.INT, Type.INT, Type.INT, Type.INT);  // Constructor: clazz, slot, params, exc, modifiers
+            Type.INT, Type.INT, Type.INT, Type.INT, Type.INT,   // Constructor: clazz, slot, params, exc, modifiers
+            Type.INT, Type.INT);                                // Constructor root, Method root
 
         ensureExternalFunction(
             "__jnative_fn_jdk_internal_util_SystemProps_Raw_cmdProperties___Ljava_util_HashMap_",
@@ -483,9 +941,34 @@ public class LlvmGenerator {
     private String generateMain() {
         StringBuilder sb = new StringBuilder();
         sb.append("define i32 @main(i32 %argc, i8** %argv) {\n");
-        sb.append("  call i32 @atexit(void ()* @")
-            .append(LlvmRuntime.mangleFunction("__jnative_shutdown"))
-            .append(")\n");
+
+        // Shutdown-based destruction is deliberately NOT installed.
+        //
+        // Earlier revisions registered fn___jnative_shutdown with atexit()
+        // and had it walk every static field, calling each field's
+        // destructor. That design is unsafe against two structural
+        // properties of a real Java object graph:
+        //
+        //   1. DAG sharing — the same singleton reachable from two static
+        //      fields, or from a static field and from another object's
+        //      field, is destroyed twice by a flat per-field schedule.
+        //
+        //   2. Cycles — a pair of objects pointing at each other, such as
+        //      UCharacterProperty.intProp <-> IntProperty.this$0, makes
+        //      the recursive destructors enter each other forever and
+        //      exhausts the native stack.
+        //
+        // A correct fix would have to compute the full reachability
+        // closure of every static field, topologically order it, and
+        // destroy each object exactly once at its depth. That machinery
+        // is out of proportion to the benefit: the process is about to
+        // exit anyway, and the operating system reclaims every byte of
+        // the image's memory regardless of what the C side does here.
+        //
+        // Per-use destruction at ordinary destruction points is
+        // unaffected. DestructorInserter still generates destructors and
+        // still inserts calls at the DestructionPoints that
+        // LifetimeAnalyzer found. Only the shutdown aggregation is gone.
 
         // ------------------------------------------------------------------
         // Stage 0: layout handoffs.
@@ -519,6 +1002,31 @@ public class LlvmGenerator {
         int threadHolder = globalEmitter.getFieldOffset("java/lang/Thread", "holder");
         int threadTid    = globalEmitter.getFieldOffset("java/lang/Thread", "tid");
         int threadName   = globalEmitter.getFieldOffset("java/lang/Thread", "name");
+        /*
+         * interruptLock is the object that Thread.blockedOn() synchronises
+         * on when the current thread enters a blocking I/O operation. The
+         * C-synthesised main thread does not run Thread.<init>, so the
+         * field would be NULL without an explicit write. The first
+         * caller that hits this is
+         *
+         *     BasicImageReader.<init>
+         *         -> FileChannelImpl.readInternal
+         *             -> AbstractInterruptibleChannel.begin
+         *                 -> Thread.blockedOn
+         *                     -> synchronized (me.interruptLock)  // NPE
+         *
+         * and the NPE is immediately masked by an ArrayIndexOutOfBounds
+         * from the enclosing finally block (see jnative/lang/Thread.c for
+         * the full trace). Passing the offset through the layout handoff
+         * keeps the C side and the emitter in lockstep on any JDK whose
+         * field layout differs from the current one; the field has been
+         * present and named "interruptLock" across JDK 17-22, but the safe
+         * lookup below treats a rename or removal as "field absent" and
+         * falls back to -1, which the C side interprets as "skip this
+         * write".
+         */
+        int threadInterruptLock = safeFieldOffset(
+            "java/lang/Thread", "interruptLock", -1);
 
         int fhSize       = globalEmitter.computeObjectSize("java/lang/Thread$FieldHolder");
         int fhGroup      = globalEmitter.getFieldOffset("java/lang/Thread$FieldHolder", "group");
@@ -541,6 +1049,7 @@ public class LlvmGenerator {
                 .append("i32 ").append(threadHolder).append(", ")
                 .append("i32 ").append(threadTid).append(", ")
                 .append("i32 ").append(threadName).append(", ")
+                .append("i32 ").append(threadInterruptLock).append(", ")
                 .append("i32 ").append(fhSize).append(", ")
                 .append("i32 ").append(fhGroup).append(", ")
                 .append("i32 ").append(fhPriority).append(", ")
@@ -602,6 +1111,8 @@ public class LlvmGenerator {
         int ctorParams      = safeFieldOffset("java/lang/reflect/Constructor", "parameterTypes", 56);
         int ctorExc         = safeFieldOffset("java/lang/reflect/Constructor", "exceptionTypes", 64);
         int ctorMods        = safeFieldOffset("java/lang/reflect/Constructor", "modifiers",      72);
+        int ctorRoot        = safeFieldOffset("java/lang/reflect/Constructor", "root",           -1);
+        int methodRoot      = safeFieldOffset("java/lang/reflect/Method", "root",                -1);
 
         sb.append("  call void @__jnative_reflect_set_layout(")
             .append("i32 ").append(fieldClazz).append(", ")
@@ -620,7 +1131,9 @@ public class LlvmGenerator {
             .append("i32 ").append(ctorSlot).append(", ")
             .append("i32 ").append(ctorParams).append(", ")
             .append("i32 ").append(ctorExc).append(", ")
-            .append("i32 ").append(ctorMods).append(")\n");
+            .append("i32 ").append(ctorMods).append(", ")
+            .append("i32 ").append(ctorRoot).append(", ")
+            .append("i32 ").append(methodRoot).append(")\n");
 
         int poolSize = globalEmitter.getLiteralPoolSize();
         sb.append("  call void @__jnative_init_string_pool(i8** getelementptr inbounds ([")
@@ -639,7 +1152,6 @@ public class LlvmGenerator {
         String stringClinitName = "fn_java_lang_String__clinit____V";
         Function stringClinit = module.getFunction(stringClinitName);
         if (stringClinit != null && stringClinit.getEntryBlock() != null) {
-            emitDebugClinitCall(sb, stringClinitName);
             sb.append("  call void @").append(eagerTarget(stringClinitName)).append("()\n");
         } else {
             log.warn("java.lang.String.<clinit> is missing from the module; "
@@ -652,15 +1164,42 @@ public class LlvmGenerator {
         String systemClinitName = "fn_java_lang_System__clinit____V";
         String propsClinitName  = "fn_java_util_Properties__clinit____V";
         String unsafeClinitName = "fn_jdk_internal_misc_Unsafe__clinit____V";
+        String unsafeConstantsClinitName =
+            "fn_jdk_internal_misc_UnsafeConstants__clinit____V";
         String chmClinitName    = "fn_java_util_concurrent_ConcurrentHashMap__clinit____V";
         String arraysClinitName = "fn_jdk_internal_util_ArraysSupport__clinit____V";
         String setJlaName       = "fn_java_lang_System_setJavaLangAccess___V";
         String characterDataLatin1ClinitName = "fn_java_lang_CharacterDataLatin1__clinit____V";
         String accessibleObjectClinitName = "fn_java_lang_reflect_AccessibleObject__clinit____V";
+        /*
+         * <clinit> function of java.lang.StackTraceElement$HashedModules.
+         *
+         * Its static initializer unconditionally calls
+         *
+         *     ModuleLayer.boot().configuration().findModule("java.base")
+         *
+         * and ModuleLayer.boot() reads System.bootLayer. The System.bootLayer
+         * field is assigned EXCLUSIVELY inside System.initPhase2()
+         * (through ModuleBootstrap.boot()) — see System.java:2217-2242.
+         *
+         * Therefore any invocation of this <clinit> BEFORE Stage 5 runs
+         * initPhase2 is guaranteed to NPE. That is exactly what happened:
+         * Stage 4 (the eager-<clinit> schedule) invoked it through the
+         * lazy-wrapper (fn___lazy_clinit_run_java_lang_StackTraceElement_HashedModules),
+         * bypassing the isHashedInJavaBase / VM.isModuleSystemInited()
+         * guard inside StackTraceElement, and crashed on the first
+         * .configuration() call.
+         *
+         * Fix: the class is excluded from Stage 4 and initialised
+         * explicitly in the new Stage 5b — right after initPhase2, once
+         * bootLayer has been assigned, but before the user entry point
+         * gains control.
+         */
+        String hashedModulesClinitName =
+            "fn_java_lang_StackTraceElement_HashedModules__clinit____V";
 
         Function systemClinit = module.getFunction(systemClinitName);
         if (systemClinit != null && systemClinit.getEntryBlock() != null) {
-            emitDebugClinitCall(sb, systemClinitName);
             sb.append("  call void @").append(eagerTarget(systemClinitName)).append("()\n");
         }
 
@@ -678,33 +1217,67 @@ public class LlvmGenerator {
         // static-field read it performs will see the JVM default (null, 0,
         // false) instead of the value its own <clinit> would have installed.
         //
-        // CharacterDataLatin1 is the newest addition. VM.saveProperties()
-        // parses the "java.class.version" entry we install in
-        // __jnative_make_bootstrap_props() via Integer.parseInt("65"), and
-        // Integer.parseInt calls Character.digit(int, int), which calls
-        // CharacterData.of(int). The ASCII fast path in CharacterData.of is
+        // UnsafeConstants is listed *before* Unsafe and must stay that
+        // way. Unsafe.<clinit> reads ADDRESS_SIZE0, PAGE_SIZE,
+        // BIG_ENDIAN, UNALIGNED_ACCESS and DATA_CACHE_LINE_FLUSH_SIZE
+        // out of UnsafeConstants and folds them into Unsafe.ADDRESS_SIZE,
+        // Unsafe.PAGE_SIZE, Unsafe.unalignedAccess() and the rest of
+        // the derived static state. If UnsafeConstants.<clinit> has not
+        // run by then, Unsafe caches the placeholder zeros forever and
+        // every Unsafe.allocateMemory() call returns NULL. See
+        // UnsafeConstants.c for the full failure chain.
+        //
+        // CharacterDataLatin1 is the newest addition to the non-Unsafe
+        // part of this list. VM.saveProperties() parses the
+        // "java.class.version" entry we install in
+        // __jnative_make_bootstrap_props() via Integer.parseInt("65"),
+        // and Integer.parseInt calls Character.digit(int, int), which
+        // calls CharacterData.of(int). The ASCII fast path in
+        // CharacterData.of is
         //
         //     if (ch >>> 8 == 0) return CharacterDataLatin1.instance;
         //
-        // so it reads a static field of CharacterDataLatin1. If that class's
-        // <clinit> has not run yet, `instance` is still null and the
-        // subsequent virtual call NPEs on the null receiver. The same
-        // Character.digit path is reached by Long.parseLong("-1") for
-        // "sun.nio.MaxDirectMemorySize", so one entry covers both parses.
+        // so it reads a static field of CharacterDataLatin1. If that
+        // class's <clinit> has not run yet, `instance` is still null
+        // and the subsequent virtual call NPEs on the null receiver.
+        // The same Character.digit path is reached by Long.parseLong("-1")
+        // for "sun.nio.MaxDirectMemorySize", so one entry covers both
+        // parses.
         // ------------------------------------------------------------------
         String[] bootstrapPrereqClinits = {
             accessibleObjectClinitName,
             characterDataLatin1ClinitName,
+            unsafeConstantsClinitName,   // MUST precede unsafeClinitName
             unsafeClinitName,
             chmClinitName,
             propsClinitName,
             arraysClinitName,
         };
 
+        // ------------------------------------------------------------------
+        // Fail loudly if UnsafeConstants was somehow left out of the
+        // module. This can only happen if the reachability analysis
+        // stopped triggering clinit on UnsafeConstants when
+        // Unsafe.<clinit> reads its fields — which would itself be a
+        // bug — but the failure mode it prevents is a silent
+        // Unsafe.allocateMemory() == NULL, which is far harder to
+        // diagnose at run time than a build-time warning.
+        // ------------------------------------------------------------------
+        {
+            Function ucc = module.getFunction(unsafeConstantsClinitName);
+            if (ucc == null || ucc.getEntryBlock() == null) {
+                log.warn("jdk.internal.misc.UnsafeConstants.<clinit> is "
+                    + "missing from the module; Unsafe.ADDRESS_SIZE will "
+                    + "be read as 0 and every Unsafe.allocateMemory() call "
+                    + "will return NULL. Check that ReachabilityAnalysis "
+                    + "triggers clinit on UnsafeConstants when Unsafe.<clinit> "
+                    + "reads its fields.");
+            }
+        }
+
         for (String prereq : bootstrapPrereqClinits) {
             Function f = module.getFunction(prereq);
             if (f == null || f.getEntryBlock() == null) continue;
-            emitDebugClinitCall(sb, prereq);
             sb.append("  call void @").append(eagerTarget(prereq)).append("()\n");
         }
 
@@ -790,57 +1363,141 @@ public class LlvmGenerator {
         }
 
         // ------------------------------------------------------------------
-        // Stage 4: eager <clinit> schedule.
+        // Stage 4: unified initialization schedule.
         //
-        // Every reachable class initializer that was not part of the
-        // bootstrap prerequisites above. By the time this loop runs,
-        // VM.savedProps is populated and System.props holds the bootstrap
-        // property table, so any <clinit> that consults either of them
-        // observes a well-defined value.
-        // ------------------------------------------------------------------
-        for (Function clinit : clinitFunctions) {
-            if (clinit.getEntryBlock() == null) continue;
-            String name = clinit.getName();
-            if (name.equals(stringClinitName))  continue;
-            if (name.equals(systemClinitName))  continue;
-            if (name.equals(unsafeClinitName))  continue;
-            if (name.equals(chmClinitName))     continue;
-            if (name.equals(propsClinitName))   continue;
-            if (name.equals(arraysClinitName))  continue;
-            if (name.equals(characterDataLatin1ClinitName)) continue;
-            if (name.equals(accessibleObjectClinitName))    continue;
-
-            emitDebugClinitCall(sb, name);
-            sb.append("  call void @").append(eagerTarget(name)).append("()\n");
-        }
-
-        // ------------------------------------------------------------------
-        // Stage 5: VM bootstrap phases (initPhase1/2/3).
+        // clinitSchedule is the result of Analyzer.sortInitializers(), in
+        // which the <clinit> functions and the bootstrap phases
+        // System.initPhase1/2/3 are interleaved by a topological sort over
+        // the dependency graph. Every phase stands exactly where its
+        // dependencies require it: initPhase2, for example, stands before
+        // SecurityManager.<clinit>, ModuleLayer.<clinit> and any other
+        // <clinit> that (transitively) reads System.bootLayer, because the
+        // field-provenance analysis built the corresponding edge.
         //
-        // NOTE: these run last, exactly as before. System.initPhase1()
-        // calls SystemProps.initProperties(), which allocates a
-        // java.util.HashMap and fills it through putIfAbsent/put. The
-        // generated HashMap.putVal in this module contains no node
-        // allocation at all (see output.ll), so those inserts are silently
-        // dropped and initProperties() trips
-        // "assert java.home not set". That is a HashMap codegen defect,
-        // not an ordering problem, and moving the phases earlier does not
-        // help - it only makes the failure surface sooner. Only
-        // VM.saveProperties() is safe to hoist, which is stage 3 above.
+        // Bootstrap prerequisites (String.<clinit>, System.<clinit>,
+        // UnsafeConstants.<clinit>, Unsafe.<clinit>, Properties.<clinit>,
+        // ConcurrentHashMap.<clinit>, ArraysSupport.<clinit>,
+        // CharacterDataLatin1.<clinit>, AccessibleObject.<clinit>) have
+        // already run above and must be skipped.
+        //
+        // HashedModules.<clinit> (StackTraceElement$HashedModules) is
+        // skipped here and executed as a separate Stage 5b: its <clinit>
+        // reads System.bootLayer and must run after initPhase3, not right
+        // after initPhase2. Field provenance yields only the nearest
+        // dependency; the explicit exclusion preserves the "phases fully
+        // done" semantics.
         // ------------------------------------------------------------------
-        Function initPhase1 = module.getFunction("fn_java_lang_System_initPhase1___V");
-        if (initPhase1 != null && initPhase1.getEntryBlock() != null) {
-            sb.append("  call void @fn_java_lang_System_initPhase1___V()\n");
+
+        Set<String> bootstrapPrereqNames = Set.of(
+            stringClinitName,
+            systemClinitName,
+            unsafeClinitName,
+            unsafeConstantsClinitName,
+            chmClinitName,
+            propsClinitName,
+            arraysClinitName,
+            characterDataLatin1ClinitName,
+            accessibleObjectClinitName
+        );
+
+        int bootstrapPhaseIdx = 0;
+        for (ClinitScheduleEntry entry : clinitSchedule) {
+            Function f = entry.function();
+            String name = f.getName();
+
+            if (bootstrapPrereqNames.contains(name)) continue;
+            if (name.equals(hashedModulesClinitName)) continue;
+
+            // Deferred clinits are NOT in clinitSchedule: Analyzer.sortInitializers
+            // removes them before emitting the schedule so that Stage 4 cannot
+            // call them eagerly. They run on demand through their lazy wrapper
+            // at the first active-use site. See Analyzer.computeDeferredClinits
+            // for the full rationale.
+
+            if (entry.bootstrapPhase()) {
+                // Bootstrap phase: call it with zero arguments and discard
+                // the result. The arguments are taken from the phase's real
+                // signature, so initPhase2(ZZ)I and initPhase1()V are
+                // handled correctly and without hard-coding.
+                Type retType = f.getReturnType();
+                String retLlvm = LlvmTypeMapper.toLlvmType(retType);
+
+                StringBuilder args = new StringBuilder();
+                List<Parameter> params = f.getParameters();
+                for (int i = 0; i < params.size(); i++) {
+                    if (i > 0) args.append(", ");
+                    Type pt = params.get(i).getType();
+                    args.append(LlvmTypeMapper.toLlvmType(pt))
+                        .append(" ").append(zeroLiteralForType(pt));
+                }
+
+                if (retType.isVoid()) {
+                    sb.append("  call void @").append(name)
+                      .append("(").append(args).append(")\n");
+                } else {
+                    sb.append("  %bootstrap_phase_result_").append(bootstrapPhaseIdx++)
+                      .append(" = call ").append(retLlvm)
+                      .append(" @").append(name)
+                      .append("(").append(args).append(")\n");
+                }
+            } else {
+                // Ordinary <clinit>; eagerTarget substitutes the lazy wrapper
+                // when the class was marked cyclic.
+                sb.append("  call void @").append(eagerTarget(name)).append("()\n");
+            }
         }
 
-        Function initPhase2 = module.getFunction("fn_java_lang_System_initPhase2__ZZ_I");
-        if (initPhase2 != null && initPhase2.getEntryBlock() != null) {
-            sb.append("  call i32 @fn_java_lang_System_initPhase2__ZZ_I(i1 false, i1 false)\n");
-        }
-
-        Function initPhase3 = module.getFunction("fn_java_lang_System_initPhase3___V");
-        if (initPhase3 != null && initPhase3.getEntryBlock() != null) {
-            sb.append("  call void @fn_java_lang_System_initPhase3___V()\n");
+        // ------------------------------------------------------------------
+        // Stage 5b: post-bootstrap <clinit> schedule.
+        //
+        // Classes whose static initializer depends on state that only
+        // exists once the module system is fully up. The only member at
+        // present is java.lang.StackTraceElement$HashedModules:
+        //
+        //     static Set<String> HASHED_MODULES = hashedModules();
+        //     static Set<String> hashedModules() {
+        //         Optional<ResolvedModule> rm =
+        //             ModuleLayer.boot()            // <-- System.bootLayer
+        //                 .configuration()
+        //                 .findModule("java.base");
+        //         ...
+        //     }
+        //
+        // System.bootLayer is assigned EXCLUSIVELY inside initPhase2()
+        // (through ModuleBootstrap.boot()), so this <clinit> must run
+        // after Stage 5. It used to fall into the Stage 4 eager loop and
+        // crashed with NPE on ModuleLayer.boot() == null — see the
+        // detailed comment on hashedModulesClinitName above.
+        //
+        // The position within Stage 5b is deliberately AFTER initPhase3:
+        // initPhase3 (SystemImpl.initPhase3) installs the final hooks and
+        // activates the security managers; by the time it returns, the
+        // module layer is guaranteed to be fully functional, and any
+        // future class with the same dependency can be added to this same
+        // list without risking a race with the bootstrap phases.
+        //
+        // The call goes through eagerTarget(), not the raw name: the
+        // class is marked lazy (it has the wrapper
+        // fn___lazy_clinit_run_java_lang_StackTraceElement_HashedModules),
+        // and the wrapper owns the __jnative_clinit_enter /
+        // __jnative_clinit_exit state machine. Calling the body directly
+        // would bypass the state machine and leave the clinit_table in
+        // the "not started" state, which would cause a re-initialisation
+        // on a later lazy access from Java code.
+        // ------------------------------------------------------------------
+        {
+            Function hashedModulesClinit = module.getFunction(hashedModulesClinitName);
+            if (hashedModulesClinit != null && hashedModulesClinit.getEntryBlock() != null) {
+                sb.append("  call void @")
+                  .append(eagerTarget(hashedModulesClinitName))
+                  .append("()\n");
+            } else {
+                log.warn("java.lang.StackTraceElement$HashedModules.<clinit> "
+                    + "is missing from the module; the class will be initialised "
+                    + "lazily on the first real access through StackTraceElement. "
+                    + "If that access happens before System.initPhase2 has run, "
+                    + "the runtime will still NPE on ModuleLayer.boot().");
+            }
         }
 
         // ------------------------------------------------------------------
@@ -896,12 +1553,19 @@ public class LlvmGenerator {
         return sb.toString();
     }
 
-    private void emitDebugClinitCall(StringBuilder sb, String clinitName) {
-        int len = LlvmRuntime.typeStringArrayLength(clinitName);
-        String g = LlvmRuntime.typeStringGlobalName(clinitName);
-        sb.append("  call void @__jnative_debug_clinit(i8* getelementptr inbounds ([")
-            .append(len).append(" x i8], [").append(len)
-            .append(" x i8]* ").append(g).append(", i32 0, i32 0))\n");
+    /**
+     * LLVM literal "zero" for an IR type. Bootstrap phases are invoked with
+     * zero arguments; the returned result is discarded.
+     */
+    private String zeroLiteralForType(Type type) {
+        if (type == null) return "null";
+        if (type == Type.BOOLEAN) return "false";
+        if (type == Type.FLOAT || type == Type.DOUBLE) return "0.0";
+        if (type.isReference() || type.isArray() || type.isNull()
+            || type.isBlock() || type.isUnknown()) {
+            return "null";
+        }
+        return "0";
     }
 
     private void generateLambdaAdaptors() {

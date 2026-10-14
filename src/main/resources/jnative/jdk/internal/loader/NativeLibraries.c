@@ -24,14 +24,14 @@ void* __jnative_fn_jdk_internal_loader_NativeLibraries_findBuiltinLib__Ljava_lan
 {
     if (name_str == NULL) return NULL;
 
-    int32_t nameLen = 0;
-    const char* name = __jnative_read_string_bytes(name_str, &nameLen);
-    if (name[0] == '\0' || nameLen <= 0) return NULL;
-
+    char name[512];
+    int32_t name_len = __jnative_read_string_into(name_str, name,
+                                                  (int32_t)sizeof(name));
+    if (name_len <= 0) return NULL;
     if (strchr(name, '/') != NULL) return NULL;
 
     char base[256];
-    size_t n = (size_t)nameLen;
+    size_t n = (size_t)name_len;
     if (n >= sizeof(base)) return NULL;
     memcpy(base, name, n + 1);
 
@@ -166,4 +166,35 @@ void __jnative_fn_jdk_internal_loader_NativeLibraries_unload__Ljava_lang_String_
     (void)name_str;
     (void)is_builtin;
     (void)handle;
+}
+
+/*
+ * static native long findEntry0(NativeLibraryImpl lib, String name);
+ *
+ * Resolves the address of a native symbol by name. In HotSpot the body
+ * is a dlsym(3) call against the handle stored in lib->handle, and the
+ * returned address is stored into the java.lang.reflect.Field or
+ * Method that will subsequently be invoked through it.
+ *
+ * This runtime never resolves a symbol at run time: every native
+ * method has a statically-linked __jnative_fn_* symbol emitted by the
+ * LLVM backend, and the linkage between a Java-level method and its C
+ * body is made at code-generation time. Nevertheless, the reachability
+ * walk pulls in NativeLibraryImpl.find because the JDK's own
+ * reflective accessors reference it, and the linker needs a body.
+ *
+ * Returning 0 is the documented "no such symbol" answer: the Java-side
+ * caller (NativeLibraryImpl.find / NativeLibraries.find) treats a 0
+ * result as "not found" and raises UnsatisfiedLinkError with the symbol
+ * name attached. That is the truthful behaviour for a runtime that has
+ * no dynamic symbol table to look up in, and it produces a diagnostic
+ * that names the missing symbol rather than silently dereferencing
+ * address 0.
+ */
+int64_t __jnative_fn_jdk_internal_loader_NativeLibrary_findEntry0__JLjava_lang_String__J(
+        int64_t handle, void* name_str)
+{
+    (void)handle;
+    (void)name_str;
+    return 0;
 }

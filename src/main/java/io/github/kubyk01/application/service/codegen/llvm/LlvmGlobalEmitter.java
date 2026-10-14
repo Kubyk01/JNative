@@ -93,6 +93,21 @@ import static io.github.kubyk01.util.LlvmUtil.getElementSizeOfType;
  * as {@code constant} was the root cause of a SIGSEGV inside
  * {@code Class.getPackageName()} while the VarHandle bootstrap was
  * resolving {@code ConcurrentSkipListMap.<clinit>}.</p>
+ *
+ * <p>The bootstrap-loader module singleton
+ * {@code @jnative_unnamed_module} is the second exception. Its initial
+ * field values describe the unnamed module (all reference slots null,
+ * {@code isNamed == false}), but the JDK's own module bootstrap — which
+ * runs from {@code System.initPhase2()} through
+ * {@code ModuleLayer.defineModules()} — takes that same object back out
+ * of the class mirror registry as the {@code java.base} module and
+ * writes its {@code reads} / {@code exports} / {@code opens} fields, and
+ * later its {@code name} / {@code loader} / {@code descriptor} fields.
+ * The object is therefore emitted as a writable {@code global} rather
+ * than as a {@code constant}. See
+ * {@link #generateUnnamedModule()} for the full rationale and for the
+ * SIGSEGV ({@code SEGV_ACCERR} at offset {@code 0x30}) that the previous
+ * {@code constant} emission produced.</p>
  */
 @Slf4j
 @RequiredArgsConstructor
@@ -145,37 +160,36 @@ public class LlvmGlobalEmitter {
     private static final Map<String, Integer> JAVA_LANG_CLASS_FIELD_OFFSETS;
 
     static {
-        Map<String, Integer> m = new HashMap<>();
         // Field order and types are fixed by struct ReflectionClass
         // (jnative_runtime.h) and by the @refclass_* constant emission in
         // generateReflectionData() below. Change one, change all three.
-        m.put("name",                     8);   // Java String | null
-        m.put("superclass",              16);   // %ReflectionClass*
-        m.put("interfaces",              24);   // %ReflectionClass**
-        m.put("methods",                 32);   // C-only, Java code never reads it
-        m.put("fields",                  40);   // C-only
-        m.put("constructors",            48);   // C-only
-        m.put("modifiers",               56);   // i32
-        m.put("objectSize",              60);   // i32
-        m.put("cname",                   64);   // const char*
-        // Named tail slots. All are emitted as `i8* null` in every
-        // @refclass_* constant except `module`, which points at the shared
-        // unnamed-module singleton. See the class-level javadoc on
-        // ReflectionClass in jnative_runtime.h for the full rationale.
-        m.put("classLoader",             72);   // java/lang/ClassLoader | null
-        m.put("module",                  80);   // java/lang/Module      | @jnative_unnamed_module
-        m.put("componentType",           88);   // java/lang/Class       | null
-        m.put("packageName",             96);   // java/lang/String      | null
-        m.put("enumConstants",          104);   // Object[]              | null
-        m.put("annotationData",         112);   // Map                   | null
-        m.put("genericInfo",            120);   // Object                | null
-        m.put("reflectionData",         128);   // SoftReference         | null
-        m.put("classValueMap",          136);   // ClassValue            | null
-        m.put("enumConstantDirectory",  144);   // Map                   | null
         // +152..+216 is the reserved tail (CLASS_RESERVED_SLOT_COUNT slots,
         // each 8 bytes). An unknown java.lang.Class field falls back to
         // CLASS_RESERVED_OFFSET_START; see getFieldOffset().
-        JAVA_LANG_CLASS_FIELD_OFFSETS = Collections.unmodifiableMap(m);
+        // Map                   | null
+        JAVA_LANG_CLASS_FIELD_OFFSETS = Map.ofEntries(Map.entry("name", 8),   // Java String | null
+            Map.entry("superclass", 16),   // %ReflectionClass*
+            Map.entry("interfaces", 24),   // %ReflectionClass**
+            Map.entry("methods", 32),   // C-only, Java code never reads it
+            Map.entry("fields", 40),   // C-only
+            Map.entry("constructors", 48),   // C-only
+            Map.entry("modifiers", 56),   // i32
+            Map.entry("objectSize", 60),   // i32
+            Map.entry("cname", 64),   // const char*
+            // Named tail slots. All are emitted as `i8* null` in every
+            // @refclass_* constant except `module`, which points at the shared
+            // unnamed-module singleton. See the class-level javadoc on
+            // ReflectionClass in jnative_runtime.h for the full rationale.
+            Map.entry("classLoader", 72),   // java/lang/ClassLoader | null
+            Map.entry("module", 80),   // java/lang/Module      | @jnative_unnamed_module
+            Map.entry("componentType", 88),   // java/lang/Class       | null
+            Map.entry("packageName", 96),   // java/lang/String      | null
+            Map.entry("enumConstants", 104),   // Object[]              | null
+            Map.entry("annotationData", 112),   // Map                   | null
+            Map.entry("genericInfo", 120),   // Object                | null
+            Map.entry("reflectionData", 128),   // SoftReference         | null
+            Map.entry("classValueMap", 136),   // ClassValue            | null
+            Map.entry("enumConstantDirectory", 144));
     }
 
     /**
@@ -252,6 +266,15 @@ public class LlvmGlobalEmitter {
 
     private final Set<String> emittedVtableThunks = ConcurrentHashMap.newKeySet();
 
+    /**
+     * Internal class names for which {@link #generateReflectionData()} has
+     * emitted a {@code @refclass_*} mirror. Populated at the end of that
+     * method, so {@link #generateFunctionIndex()} (which runs after it in
+     * {@link #generateGlobalDefinitions()}) can decide whether a function's
+     * owning class has a mirror to point at.
+     */
+    private final Set<String> emittedRefClassNames = ConcurrentHashMap.newKeySet();
+
     public int getLiteralPoolSize() {
         return stringLiteralPool.size();
     }
@@ -276,6 +299,12 @@ public class LlvmGlobalEmitter {
     private final Map<String, Integer> lambdaVtableLengths = new ConcurrentHashMap<>();
 
     private final Map<String, String> typeInfoNames = new ConcurrentHashMap<>();
+
+    /** Cached output of {@link #generateStructs()} (struct type definitions only). */
+    private String cachedStructDefinitions;
+
+    /** Cached output of {@link #generateTypeDefinitions()}. */
+    private String cachedTypeDefinitions;
 
     private final Map<String, String> extraStructs = new ConcurrentHashMap<>();
     private final Map<String, String> extraVtables = new ConcurrentHashMap<>();
@@ -357,11 +386,22 @@ public class LlvmGlobalEmitter {
         String owner = className;
         Set<String> seen = new HashSet<>();
         while (owner != null && !owner.isEmpty() && seen.add(owner)) {
+
+            // 1. Explicit override registry (overrideMethod).
             String nativeName = methodOverrides.get(overrideKey(owner, name, descriptor));
             if (nativeName != null) {
                 ownerOut[0] = owner;
                 return nativeName;
             }
+
+            String rawSymbol = "__jnative_override_"
+                + owner.replace('/', '_')
+                + "_" + name;
+            if (module.getFunction(rawSymbol) != null) {
+                ownerOut[0] = owner;
+                return rawSymbol;
+            }
+
             ClassNode cn = resolver.getClassNode(owner);
             if (cn == null) return null;
             owner = cn.getSuperName();
@@ -586,15 +626,7 @@ public class LlvmGlobalEmitter {
                 for (MethodNode mn : cn.getMethods()) {
                     if (!isVtableVirtual(mn)) continue;
 
-                    int access = mn.getAccess();
-                    if ((access & Opcodes.ACC_STATIC) != 0) {
-                        throw new IllegalStateException(
-                            "Static method '" + cn.getName() + "." + mn.getName()
-                                + mn.getDescriptor() + "' was offered to the vtable "
-                                + "layout builder for class '" + className + "'. "
-                                + "isVtableVirtual() should have rejected it; the "
-                                + "resolver's access flags are inconsistent.");
-                    }
+                    int access = getAccess(className, mn, cn);
                     if ((access & Opcodes.ACC_PRIVATE) != 0) {
                         throw new IllegalStateException(
                             "Private method '" + cn.getName() + "." + mn.getName()
@@ -614,6 +646,19 @@ public class LlvmGlobalEmitter {
             classLayoutInProgress.remove(className);
             return layout;
         }
+    }
+
+    private static int getAccess(String className, MethodNode mn, ClassNode cn) {
+        int access = mn.getAccess();
+        if ((access & Opcodes.ACC_STATIC) != 0) {
+            throw new IllegalStateException(
+                "Static method '" + cn.getName() + "." + mn.getName()
+                    + mn.getDescriptor() + "' was offered to the vtable "
+                    + "layout builder for class '" + className + "'. "
+                    + "isVtableVirtual() should have rejected it; the "
+                    + "resolver's access flags are inconsistent.");
+        }
+        return access;
     }
 
     private VtableLayout getOrBuildInterfaceLayout(String ifaceName) {
@@ -737,22 +782,110 @@ public class LlvmGlobalEmitter {
         return "@refclass_" + LlvmTypeMapper.sanitizeIdentifier(className);
     }
 
+    /**
+     * Emits the type definitions only ({@code %struct.X = type {...}} and the
+     * reflection/resource ABI types), without any global variable
+     * definitions. Safe to duplicate across modules: LLVM unifies types by
+     * name, so identical definitions in every .ll file merge into one.
+     *
+     * <p>The result is cached: the types are a pure function of the loaded
+     * class map and the reachable instruction set, and every per-class file
+     * (plus the module file) is built from the same prelude.</p>
+     */
+    public String generateTypeDefinitions() {
+        if (cachedTypeDefinitions != null) {
+            return cachedTypeDefinitions;
+        }
+        cachedTypeDefinitions = "%JNativeResourceEntry = type { i8*, i8*, i32 }\n" +
+            "%ReflectionMethod = type { i8*, i8*, i8*, i32 }\n" +
+            "%ReflectionField = type { i8*, i8*, i32, i32 }\n" +
+            "%ReflectionConstructor = type { i8*, i8*, i32 }\n" +
+            // Must stay in lockstep with `struct ReflectionClass` in
+            // jnative_runtime.h and with the @refclass_* constant emission below.
+            //
+            // Layout:
+            //   [0]  %JNativeVTable*      vtable
+            //   [1]  i8*                  name (Java String cache, kept null)
+            //   [2]  %ReflectionClass*    superclass
+            //   [3]  %ReflectionClass**   interfaces
+            //   [4]  %ReflectionMethod**  methods
+            //   [5]  %ReflectionField**   fields
+            //   [6]  %ReflectionConstructor** constructors
+            //   [7]  i32                  modifiers
+            //   [8]  i32                  objectSize
+            //   [9]  i8*                  cname (const char*, internal name)
+            //   [10] i8*                  classLoader           (always null)
+            //   [11] i8*                  module                (always null)
+            //   [12] i8*                  componentType         (always null)
+            //   [13] i8*                  packageName           (always null)
+            //   [14] i8*                  enumConstants         (always null)
+            //   [15] i8*                  annotationData        (always null)
+            //   [16] i8*                  genericInfo           (always null)
+            //   [17] i8*                  reflectionData        (always null)
+            //   [18] i8*                  classValueMap         (always null)
+            //   [19] i8*                  enumConstantDirectory (always null)
+            //   [20..27] i8*              reserved[8]           (always null)
+            "%ReflectionClass = type { %JNativeVTable*, i8*, %ReflectionClass*, %ReflectionClass**, "
+            + "%ReflectionMethod**, %ReflectionField**, %ReflectionConstructor**, i32, i32, i8*, "
+            + "i8*, i8*, i8*, i8*, i8*, i8*, i8*, i8*, i8*, i8*, "
+            + "i8*, i8*, i8*, i8*, i8*, i8*, i8*, i8* }\n" +
+            "%JNativeSymbolClassEntry = type { i8*, %ReflectionClass* }\n" +
+            // One entry of @jnative_function_index; see
+            // generateFunctionIndex() and JNativeFunctionEntry in
+            // jnative_runtime.h. The three fields are the function pointer,
+            // its mangled symbol name, and the owning class mirror (NULL
+            // when the owning class has no emitted mirror).
+            "%JNativeFunctionEntry = type { i8*, i8*, %ReflectionClass* }\n";
+        return cachedTypeDefinitions;
+    }
+
+    /**
+     * Returns ONLY the struct type definitions ({@code %struct.X = type
+     * {...}}), without any global variable definitions. Safe to duplicate
+     * across modules; LLVM unifies types by name.
+     */
+    public String generateStructDefinitions() {
+        if (cachedStructDefinitions == null) {
+            cachedStructDefinitions = generateStructs();
+        }
+        return cachedStructDefinitions;
+    }
+
+    /**
+     * Returns ONLY the global variable definitions (static fields, vtables,
+     * string literals, reflection data, etc.), without struct type
+     * definitions. Every global is emitted with the default (external)
+     * linkage. It is defined exactly once, in _module.ll; the per-class files
+     * reference it through a bare external declaration. linkonce_odr is
+     * deliberately NOT used: the per-class .ll files are compiled as separate
+     * ThinLTO translation units with -O3, and LLVM drops every linkonce_odr
+     * global that has no reference inside its own module, which would leave
+     * the external references unresolved at link time.
+     */
+    public String generateGlobalDefinitions() {
+        prepareLayouts();
+        return generateStaticFields() +
+            // generateStringLiterals() depends on vtableNames, which only exists
+            // after generateVtables(); the reflection data depends on the string
+            // literal pool; the unnamed module and the embedded-resource table
+            // depend on the vtables. The ordering below is load-bearing and
+            // mirrors the original generateGlobals() chain.
+            generateVtables() +
+            generateTypeStringConstants() +
+            generateStringLiterals() +
+            generateTypeInfo() +
+            generateUnnamedModule() +
+            generateEmbeddedResources() +
+            generateReflectionData() +
+            generateFunctionIndex();
+    }
+
+    /** Existing entry point, preserved for backwards compatibility. */
     public String generateGlobals() {
         prepareLayouts();
-        return generateStructs()
-            + generateStaticFields()
-            + generateVtables()
-            + generateTypeStringConstants()
-            + generateStringLiterals()
-            + generateTypeInfo()
-            // Both of these must run after generateVtables(): the unnamed
-            // module points at @vtable_java_lang_Module, which only exists once
-            // vtableNames is populated. Both must run after generateStructs():
-            // the module object is a %struct.java_lang_Module literal, and the
-            // resource table is a %JNativeResourceEntry literal.
-            + generateUnnamedModule()
-            + generateEmbeddedResources()
-            + generateReflectionData();
+        return generateTypeDefinitions()
+            + generateStructDefinitions()
+            + generateGlobalDefinitions();
     }
 
     // =========================================================================
@@ -761,34 +894,86 @@ public class LlvmGlobalEmitter {
 
     /**
      * Emits the one shared {@code java.lang.Module} object that stands for the
-     * unnamed module of the bootstrap loader.
+     * bootstrap loader's module.
      *
      * <p>Every {@code @refclass_*} mirror has a {@code module} slot at offset
      * 80, and the bytecode of {@code Class.getModule()} is a plain read of
-     * that slot. Emitting null there means every {@code Class.getResourceAsStream}
-     * dereferences a null {@code Module} and dies with an NPE on the
-     * {@code thisModule.isNamed()} call that follows.
+     * that slot. Emitting {@code null} there makes every
+     * {@code Class.getResourceAsStream} dereference a null {@code Module} and
+     * die with an NPE on the {@code thisModule.isNamed()} call that follows.</p>
      *
-     * <p>So every mirror points at this object instead. It is a {@code Module}
-     * with all fields zeroed, which is exactly the JDK's unnamed module:
-     * {@code name == null}, {@code loader == null}, no descriptor. That is the
-     * state {@code Module.isNamed()} tests ({@code return name != null}), and
-     * it steers {@code Class.getResourceAsStream} down its "unnamed module"
-     * branch rather than the named-module branch.
+     * <p>So every mirror points at this object instead. Initially it describes
+     * the unnamed module of the bootstrap loader: {@code isNamed == false},
+     * {@code name == null}, {@code loader == null}, no descriptor — which is
+     * the state {@code Module.isNamed()} tests ({@code name != null}) and the
+     * state that steers {@code Class.getResourceAsStream} down its "unnamed
+     * module" branch.</p>
      *
-     * <p>The field list and their order come from {@link #collectInstanceFields},
-     * the same source {@link #generateStructs()} uses, so this literal has
-     * exactly the shape of the emitted {@code %struct.java_lang_Module} and LLVM
-     * lays it out with the same natural alignment. It is a {@code constant}, so
-     * it needs no run-time initialisation.
+     * <h2>Why this global must be writable</h2>
      *
-     * <p>Zero values are produced by {@link #zeroLiteralFor(Type)}, which is
-     * the single point where the Java-side {@link Type} and the LLVM
-     * spelling of "the zero of that type" are kept in correspondence. An
-     * integral literal {@code 0} is not valid where a pointer is expected —
-     * the LLVM parser rejects it with "integer constant must have integer
-     * type" — so the correspondence must be exact and must be maintained in
-     * one place.
+     * <p>The object is emitted as a plain, writable {@code global} — not as a
+     * {@code constant} — and that distinction is load-bearing. The JDK's own
+     * module bootstrap, running from {@code System.initPhase2()} through
+     * {@code ModuleBootstrap.boot()} into
+     * {@code ModuleLayer.defineModules()}, takes this same object back out of
+     * the class mirror registry as the {@code java.base} module and writes
+     * into its fields:</p>
+     *
+     * <pre>
+     *   Module.defineModules(Configuration, Function&lt;ClassLoader, List&lt;Module&gt;&gt;, ModuleLayer):
+     *       ...
+     *       Module module = Object.class.getModule();   // this global
+     *       modules[i] = module;
+     *       ...
+     *       module.reads = new HashSet&lt;&gt;();           // store into field 6 (offset 0x30)
+     *       ...
+     * </pre>
+     *
+     * <p>When this object is emitted as a {@code constant}, LLVM places it in
+     * {@code .data.rel.ro}, the linker applies RELRO, and the runtime maps the
+     * page {@code r--p}. The store at {@code module.reads} then takes a
+     * hardware write barrier and the process dies with {@code SIGSEGV} and
+     * {@code si_code == 2} ({@code SEGV_ACCERR}) inside
+     * {@code java.lang.Module.defineModules}, before any user code has
+     * produced output:</p>
+     *
+     * <pre>
+     *   RIP: fn_java_lang_Module_defineModules_..._+0xddb
+     *        mov %rax, 0x30(%r14)      ; r14 = &amp;jnative_unnamed_module
+     *   si_code = 2  (SEGV_ACCERR — write to a read-only page)
+     * </pre>
+     *
+     * <p>Emitting it as a writable {@code global} lets those stores succeed.
+     * Every field the JDK's module system writes to — {@code reads},
+     * {@code exports}, {@code opens}, and the identity fields {@code name} /
+     * {@code loader} / {@code descriptor} — is a slot inside this struct. The
+     * struct layout comes from {@link #collectInstanceFields(ClassNode)} and
+     * therefore covers every instance field that {@code java.lang.Module}
+     * declares on the JDK the image is built against, including any that a
+     * future JDK release adds.</p>
+     *
+     * <h2>Shared identity with the JDK's {@code java.base} module</h2>
+     *
+     * <p>All classes in the image initially share this object, because every
+     * {@code @refclass_*} mirror points its {@code module} slot at it. After
+     * the JDK's module bootstrap has run, that same object has become the
+     * {@code java.base} module, and every class that has not been assigned a
+     * module of its own still reports it as its module. That sharing is a
+     * deliberate simplification of this runtime's module model: the image has
+     * no user-defined module layer, no module path, and no resolver that could
+     * partition its classes into distinct named modules. The object must be
+     * writable precisely because the JDK's own bootstrap performs those writes
+     * unconditionally on every JDK release this runtime targets, and those
+     * writes are the difference between a well-formed {@code java.base} module
+     * and an NPE on {@code Module.isNamed()} three frames later.</p>
+     *
+     * <p>A future revision that wants fully separate unnamed / {@code java.base}
+     * module identities would have to emit a per-class module pointer rather
+     * than a single shared one, and teach {@code Object.class.getModule()} to
+     * return the {@code java.base} module while every other class returns the
+     * unnamed one. The current single-object model is the smallest change that
+     * keeps the JDK's own bootstrap working without giving up the rest of the
+     * runtime's module-free design.</p>
      */
     private String generateUnnamedModule() {
         ClassNode moduleNode = resolver.getClassNode("java/lang/Module");
@@ -815,8 +1000,15 @@ public class LlvmGlobalEmitter {
                 .append(" ").append(zeroLiteralFor(ft));
         }
 
-        return "\n; ----- Unnamed module singleton -----\n"
-            + "@jnative_unnamed_module = constant " + structName
+        // NOTE: `global`, not `constant`. The JDK's own module bootstrap writes
+        // into this object's fields (`reads`, `exports`, `opens`, and later
+        // `name`/`loader`/`descriptor`); emitting it as `constant` places it in
+        // `.data.rel.ro`, which RELRO maps read-only, and the first such store
+        // takes a SIGSEGV (SEGV_ACCERR) inside
+        // java.lang.Module.defineModules. See the method javadoc for the full
+        // chain of evidence.
+        return "\n; ----- Unnamed module singleton (mutable) -----\n"
+            + "@jnative_unnamed_module = global " + structName
             + " { " + init + " }, align 8\n\n";
     }
 
@@ -877,7 +1069,6 @@ public class LlvmGlobalEmitter {
     private String generateEmbeddedResources() {
         StringBuilder sb = new StringBuilder();
         sb.append("\n; ----- Embedded resources -----\n");
-        sb.append("%JNativeResourceEntry = type { i8*, i8*, i32 }\n");
 
         if (embeddedResources.isEmpty()) {
             sb.append("@jnative_builtin_resources = constant "
@@ -945,7 +1136,7 @@ public class LlvmGlobalEmitter {
         if (nulTerminate != 0) esc.append("\\00");
 
         sb.append("@").append(baseName)
-            .append(" = private unnamed_addr constant [")
+            .append(" = unnamed_addr constant [")
             .append(total).append(" x i8] c\"")
             .append(esc).append("\", align 1\n");
         return "getelementptr inbounds ([" + total + " x i8], [" + total
@@ -956,14 +1147,7 @@ public class LlvmGlobalEmitter {
     //  Internal value-type for vtable slot resolution
     // =========================================================================
 
-    private static final class ResolvedFn {
-        final String name;
-        final String type;
-
-        ResolvedFn(String name, String type) {
-            this.name = name;
-            this.type = type;
-        }
+    private record ResolvedFn(String name, String type) {
     }
 
     private ResolvedFn resolveVtableEntry(String className, String sig) {
@@ -1021,38 +1205,119 @@ public class LlvmGlobalEmitter {
                 className, name, desc, className);
             return null;
         }
-        if (mn.isAbstract()) {
-            // Abstract slot with no concrete override in the reachable set.
-            // The thunk is intentional: no call site can ever land here
-            // because no concrete receiver of this class can exist.
-            return null;
-        }
 
         String owner = foundOwner[0] != null ? foundOwner[0] : className;
         String baseName = LlvmRuntime.mangleMethod(owner, name, desc);
         String nativeName = "__jnative_" + baseName;
 
-        String funcName;
-        if (module.getFunction(baseName) != null) {
-            funcName = baseName;
-        } else if (module.getFunction(nativeName) != null) {
-            funcName = nativeName;
-        } else if (mn.isNative()) {
-            Type retType = mn.getReturnType();
-            List<Type> paramTypes = mn.getParameterTypes();
+        // ------------------------------------------------------------------
+        // Module-first resolution.
+        //
+        // The order of the branches below is deliberate, and it is the fix
+        // for an architectural gap in the previous revision.
+        //
+        // Abstract methods and native overrides interact through two
+        // separate mechanisms:
+        //
+        //   * BytecodeToIr.translate() walks the reachable method set and,
+        //     for every method for which a NativeOverride was discovered,
+        //     calls
+        //         module.registerAlias(mangleMethod(owner, name, desc),
+        //                              overrideFunction)
+        //     The alias is keyed by the bytecode method's own mangled name,
+        //     and it resolves through Module.getFunction() to a Function
+        //     whose name is the C symbol (__jnative_override_...). Such a
+        //     Function has no IR entry block: it is emitted by a linked
+        //     object, not by the LLVM backend.
+        //
+        //   * LlvmGlobalEmitter.resolveVtableEntry() looks up the slot's
+        //     target by mangleMethod(owner, name, desc) and consults the
+        //     module first, then the resolver's hierarchy information.
+        //
+        // For a concrete method the two mechanisms compose without
+        // trouble: the module lookup finds either a real IR body or an
+        // alias, and the resolver is only consulted when neither exists.
+        //
+        // For an *abstract* method the previous revision short-circuited
+        // before the module lookup, on the assumption that no call site
+        // can ever reach an abstract slot. That assumption is false when
+        // the abstract declaration has a native override: the override
+        // supplies a body, the walk registered it in the module, and the
+        // only reason the slot is unresolved is that resolveVtableEntry
+        // never got as far as looking for it. The concrete failure that
+        // motivated the reorder:
+        //
+        //     java.security.cert.X509Certificate declares
+        //         public abstract byte[] getEncoded() throws ...;
+        //     jnative/security/cert/X509Certificate.c provides
+        //         __jnative_override_java_security_cert_X509Certificate_getEncoded
+        //     BytecodeToIr.translate() registers the alias
+        //         fn_java_security_cert_X509Certificate_getEncoded____B
+        //             -> __jnative_override_java_security_cert_X509Certificate_getEncoded
+        //     and resolveVtableEntry then returns null because of the
+        //     abstract check, so the vtable slot is emitted as an
+        //     __jnative_vtable_missing_* thunk. The first caller to
+        //     dispatch through it — sun.security.validator.SimpleValidator.<init>
+        //     reached from javax.crypto.JarVerifier.<clinit> — aborts with
+        //     __jnative_unresolved_slot:
+        //
+        //         class 'java/security/cert/X509Certificate',
+        //         slot 'getEncoded()[B'
+        //
+        // The reorder below makes the module lookup happen first for every
+        // method, abstract included. If the lookup finds a body — either a
+        // real IR function or an alias to a differently-named Function —
+        // the slot is populated with it. Only when the module has nothing
+        // to offer does the resolver's own classification (abstract /
+        // native / missing) determine what to do next.
+        //
+        // The alias check is expressed as `!target.getName().equals(baseName)`:
+        // Module.registerAlias() stores the target under the alias key, so
+        // getFunction(baseName) returns a Function whose own name is the
+        // C symbol rather than baseName. A bare `declare` created by any
+        // other path has the same name as its key and no entry block; that
+        // case must still be treated as unresolved, because nothing
+        // defines the symbol at link time.
+        // ------------------------------------------------------------------
+        String funcName = null;
 
-            List<Type> allParams = new ArrayList<>();
-            allParams.add(Type.reference(owner));
-            allParams.addAll(paramTypes);
-
-            Function nf = new Function(nativeName, retType);
-            for (int i = 0; i < allParams.size(); i++) {
-                nf.addParameter(new Parameter(allParams.get(i), i));
+        Function target = module.getFunction(baseName);
+        if (target != null) {
+            boolean hasBody = target.getEntryBlock() != null;
+            boolean isAlias = !target.getName().equals(baseName);
+            if (hasBody || isAlias) {
+                funcName = target.getName();
             }
-            module.addFunction(nf);
-            funcName = nativeName;
-        } else {
-            return null;
+        }
+
+        if (funcName == null) {
+            Function nativeTarget = module.getFunction(nativeName);
+            if (nativeTarget != null) {
+                funcName = nativeName;
+            } else if (mn.isAbstract()) {
+                // Abstract slot with no override in the module. The thunk
+                // is intentional: no call site can reach a concrete
+                // receiver of this class, and any code path that does
+                // dispatch through this slot will produce a diagnostic
+                // that names the exact class and signature.
+                return null;
+            } else if (mn.isNative()) {
+                Type retType = mn.getReturnType();
+                List<Type> paramTypes = mn.getParameterTypes();
+
+                List<Type> allParams = new ArrayList<>();
+                allParams.add(Type.reference(owner));
+                allParams.addAll(paramTypes);
+
+                Function nf = new Function(nativeName, retType);
+                for (int i = 0; i < allParams.size(); i++) {
+                    nf.addParameter(new Parameter(allParams.get(i), i));
+                }
+                module.addFunction(nf);
+                funcName = nativeName;
+            } else {
+                return null;
+            }
         }
 
         String ret = LlvmTypeMapper.toLlvmType(mn.getReturnType());
@@ -1141,7 +1406,7 @@ public class LlvmGlobalEmitter {
             }
 
             String methodsName = "@vtable_methods_" + LlvmTypeMapper.sanitizeIdentifier(className);
-            sb.append(methodsName).append(" = private constant [")
+            sb.append(methodsName).append(" = constant [")
                 .append(length).append(" x i8*] [");
             for (int i = 0; i < length; i++) {
                 if (i > 0) sb.append(", ");
@@ -1180,7 +1445,7 @@ public class LlvmGlobalEmitter {
                 String itableName = "@itable_"
                     + LlvmTypeMapper.sanitizeIdentifier(className) + "_"
                     + LlvmTypeMapper.sanitizeIdentifier(iface);
-                sb.append(itableName).append(" = private constant [")
+                sb.append(itableName).append(" = constant [")
                     .append(len).append(" x i8*] [");
                 for (int i = 0; i < len; i++) {
                     if (i > 0) sb.append(", ");
@@ -1201,7 +1466,7 @@ public class LlvmGlobalEmitter {
             if (!sortedIfaces.isEmpty()) {
                 String entriesArrayName = "@ifacemap_entries_"
                     + LlvmTypeMapper.sanitizeIdentifier(className);
-                sb.append(entriesArrayName).append(" = private constant [")
+                sb.append(entriesArrayName).append(" = constant [")
                     .append(sortedIfaces.size()).append(" x %JNativeIfaceMapEntry] [");
                 for (int i = 0; i < sortedIfaces.size(); i++) {
                     if (i > 0) sb.append(", ");
@@ -1444,9 +1709,9 @@ public class LlvmGlobalEmitter {
             }
 
             String methodsName = "@vtable_methods_"
-                + LlvmTypeMapper.sanitizeIdentifier(lambdaClassName);
-            sb.append(methodsName).append(" = private constant [")
-                .append(methodLen).append(" x i8*] [");
+                    + LlvmTypeMapper.sanitizeIdentifier(lambdaClassName);
+            sb.append(methodsName).append(" = constant [")
+                    .append(methodLen).append(" x i8*] [");
             for (int i = 0; i < methodLen; i++) {
                 if (i > 0) sb.append(", ");
                 sb.append(methodEntries.get(i));
@@ -1469,12 +1734,36 @@ public class LlvmGlobalEmitter {
              * DisabledAlgorithmConstraints$Constraints.<init> reject its
              * own `denyAfter\s+(\d{4})-(\d{2})-(\d{2})` regex with
              * "Constraint unknown: denyAfter 2019-01-01".
+             *
+             * Every non-SAM slot is resolved through resolveVtableEntry()
+             * rather than being filled with an unresolved thunk. The
+             * lookup starts at the SAM interface — the most-derived
+             * interface in the closure — so findMethodInHierarchy walks
+             * the whole chain from there and returns the maximally-
+             * specific default, matching what the JVM's own resolution
+             * would pick. For a lambda whose SAM is BmpCharPredicate (which
+             * extends CharPredicate), a dispatch through
+             * CharPredicate.union(CharPredicate) therefore lands on
+             * BmpCharPredicate's own override of that method, not on
+             * CharPredicate's base default — which is exactly the semantics
+             * of default-method resolution in JVMS §5.4.3.3.
+             *
+             * Only if both lookups fail (no body was ever translated into
+             * the module for this slot) does the emitter fall back to the
+             * diagnostic thunk, which fires only if a call site ever
+             * actually lands on the slot at run time.
+             *
+             * The SAM slot itself is skipped in the loop and filled in with
+             * the adaptor afterwards. That keeps the slot bound to the
+             * lambda's own body rather than to any inherited default, and
+             * it avoids emitting an unreachable thunk that would have been
+             * immediately overwritten.
              */
             if (info.superInterfaces == null || info.superInterfaces.isEmpty()) {
                 throw new IllegalStateException(
-                    "Lambda '" + info.lambdaId + "' has an empty "
-                        + "super-interface closure; registerLambdaClass "
-                        + "must never produce this state");
+                        "Lambda '" + info.lambdaId + "' has an empty "
+                                + "super-interface closure; registerLambdaClass "
+                                + "must never produce this state");
             }
 
             List<String>  ifaceNames  = new ArrayList<>(info.superInterfaces);
@@ -1486,43 +1775,80 @@ public class LlvmGlobalEmitter {
                 Integer ifaceId = interfaceIds.get(iface);
                 if (ifaceId == null) {
                     throw new IllegalStateException(
-                        "Lambda '" + info.lambdaId + "' super-interface '"
-                            + iface + "' has no global interface id; "
-                            + "registerLambdaClass's closure pass missed it");
+                            "Lambda '" + info.lambdaId + "' super-interface '"
+                                    + iface + "' has no global interface id; "
+                                    + "registerLambdaClass's closure pass missed it");
                 }
 
                 VtableLayout ifaceLayout = getOrBuildInterfaceLayout(iface);
                 int len = Math.max(ifaceLayout.slots.size(), 1);
 
                 /*
-                 * The SAM signature may be absent from a given ancestor's
-                 * layout — for example when the SAM method is declared
-                 * only on the most-derived interface and we are building
-                 * the itable for one of its parents. In that case the
-                 * slot stays as a null thunk, which is correct: the
-                 * method is simply not reachable through that interface.
+                 * Locate the SAM method inside this interface's own layout.
+                 * For the SAM interface itself this is the abstract method
+                 * the lambda implements; for an ancestor the slot exists
+                 * only when the ancestor also declares (or inherits) the
+                 * same signature — otherwise the ancestor simply has no
+                 * entry for it and the adaptor is not placed here.
                  */
                 Integer slotObj = ifaceLayout.slotBySignature.get(info.samSig);
                 int adaptorSlot = (slotObj != null) ? slotObj : -1;
 
                 List<String> entries = new ArrayList<>(len);
                 for (int i = 0; i < len; i++) {
+                    // SAM slot: filled in below with the adaptor. Leaving
+                    // it out of the resolution loop avoids emitting an
+                    // unused thunk for the slot that the adaptor is about
+                    // to overwrite.
+                    if (i == adaptorSlot) {
+                        entries.add(null);
+                        continue;
+                    }
+
                     String sig = i < ifaceLayout.slots.size()
-                        ? ifaceLayout.slots.get(i)
-                        : "<unknown>";
-                    entries.add(vtableSlotEntry(lambdaClassName, iface, sig, null, sb));
+                            ? ifaceLayout.slots.get(i)
+                            : "<unknown>";
+
+                    ResolvedFn fn = null;
+                    if (!"<unknown>".equals(sig)) {
+                        // First try the SAM interface — the most-derived
+                        // interface of the closure — so that the
+                        // maximally-specific default wins, matching the
+                        // JVM's own resolution rule.
+                        fn = resolveVtableEntry(samInterface, sig);
+
+                        // Fall back to the interface whose itable we are
+                        // currently emitting.  With a correctly built
+                        // closure this should never be necessary (the SAM
+                        // hierarchy reaches every ancestor interface), but
+                        // the second lookup costs nothing and makes the
+                        // emitter robust against a closure that was built
+                        // from an incomplete class map.
+                        if (fn == null) {
+                            fn = resolveVtableEntry(iface, sig);
+                        }
+                    }
+
+                    entries.add(vtableSlotEntry(lambdaClassName, iface, sig, fn, sb));
                 }
+
+                // Bind the SAM slot to the lambda's own adaptor. The
+                // adaptor's calling convention is the generic
+                // `i8* (i8*, ...) *` shape, which the emitter's
+                // INTERFACE_CALL path is prepared to accept (it bitcasts
+                // the slot back to the concrete function-pointer type
+                // derived from the callee signature before invoking).
                 if (adaptorSlot >= 0) {
                     entries.set(adaptorSlot,
-                        "i8* bitcast (i8* (i8*, ...)* @" + info.adaptorName
-                            + " to i8*)");
+                            "i8* bitcast (i8* (i8*, ...)* @" + info.adaptorName
+                                    + " to i8*)");
                 }
 
                 String itableName = "@itable_"
-                    + LlvmTypeMapper.sanitizeIdentifier(lambdaClassName) + "_"
-                    + LlvmTypeMapper.sanitizeIdentifier(iface);
-                sb.append(itableName).append(" = private constant [")
-                    .append(len).append(" x i8*] [");
+                        + LlvmTypeMapper.sanitizeIdentifier(lambdaClassName) + "_"
+                        + LlvmTypeMapper.sanitizeIdentifier(iface);
+                sb.append(itableName).append(" = constant [")
+                        .append(len).append(" x i8*] [");
                 for (int i = 0; i < len; i++) {
                     if (i > 0) sb.append(", ");
                     sb.append(entries.get(i));
@@ -1535,37 +1861,37 @@ public class LlvmGlobalEmitter {
             }
 
             String ifacemapEntriesName = "@ifacemap_entries_"
-                + LlvmTypeMapper.sanitizeIdentifier(lambdaClassName);
+                    + LlvmTypeMapper.sanitizeIdentifier(lambdaClassName);
             String ifacemapName = "@ifacemap_"
-                + LlvmTypeMapper.sanitizeIdentifier(lambdaClassName);
+                    + LlvmTypeMapper.sanitizeIdentifier(lambdaClassName);
 
             sb.append(ifacemapEntriesName)
-                .append(" = private constant [")
-                .append(ifaceNames.size())
-                .append(" x %JNativeIfaceMapEntry] [");
+                    .append(" = constant [")
+                    .append(ifaceNames.size())
+                    .append(" x %JNativeIfaceMapEntry] [");
             for (int i = 0; i < ifaceNames.size(); i++) {
                 if (i > 0) sb.append(", ");
                 sb.append("%JNativeIfaceMapEntry { i32 ").append(ifaceIds.get(i))
-                    .append(", i8** bitcast ([").append(itableLens.get(i))
-                    .append(" x i8*]* ").append(itableNames.get(i))
-                    .append(" to i8**) }");
+                        .append(", i8** bitcast ([").append(itableLens.get(i))
+                        .append(" x i8*]* ").append(itableNames.get(i))
+                        .append(" to i8**) }");
             }
             sb.append("]\n");
 
             sb.append(ifacemapName)
-                .append(" = constant %JNativeIfaceMap { i32 ")
-                .append(ifaceNames.size())
-                .append(", %JNativeIfaceMapEntry* ")
-                .append(ifacemapEntriesName).append(" }\n");
+                    .append(" = constant %JNativeIfaceMap { i32 ")
+                    .append(ifaceNames.size())
+                    .append(", %JNativeIfaceMapEntry* ")
+                    .append(ifacemapEntriesName).append(" }\n");
 
             String vtableName = vtableNames.get(lambdaClassName);
             String lambdaNameRef = ensureStringConstantPtr(sb, lambdaClassName);
             sb.append(vtableName).append(" = constant %JNativeVTable {\n")
-                .append("  i8** bitcast ([").append(methodLen).append(" x i8*]* ")
-                .append(methodsName).append(" to i8**),\n")
-                .append("  %JNativeIfaceMap* ").append(ifacemapName).append(",\n")
-                .append("  i8* ").append(lambdaNameRef).append("\n")
-                .append("}\n");
+                    .append("  i8** bitcast ([").append(methodLen).append(" x i8*]* ")
+                    .append(methodsName).append(" to i8**),\n")
+                    .append("  %JNativeIfaceMap* ").append(ifacemapName).append(",\n")
+                    .append("  i8* ").append(lambdaNameRef).append("\n")
+                    .append("}\n");
 
             vtableLengths.put(lambdaClassName, methodLen);
             lambdaVtableLengths.put(info.lambdaId, methodLen);
@@ -1895,8 +2221,84 @@ public class LlvmGlobalEmitter {
      * <ul>
      *   <li>{@code @jstr_<hex>} — the {@link String} object itself, whose
      *       {@code value} field points at the matching {@code @strbytes_*}
-     *       global.</li>
+     *       global, and whose {@code coder} field selects the interpretation
+     *       of that array.</li>
      * </ul>
+     *
+     * <h2>Compact-string encoding of the payload</h2>
+     *
+     * <p>A {@link String} does not store characters directly. Its
+     * {@code value} field is a {@code byte[]}, and the {@code coder} field
+     * selects how those bytes are to be interpreted:</p>
+     *
+     * <ul>
+     *   <li>{@code coder == 0} — <b>LATIN1</b>. One byte per character;
+     *       the byte value is the character's low 8 bits. Valid only when
+     *       every character of the string is in {@code U+0000..U+00FF}.</li>
+     *
+     *   <li>{@code coder == 1} — <b>UTF-16</b>. Two bytes per character,
+     *       high byte first (big-endian), one pair per {@code char} code
+     *       unit. Surrogate pairs are therefore two consecutive code units
+     *       in the array, exactly as they appear in the Java {@code String}.</li>
+     * </ul>
+     *
+     * <p>This is the same representation that {@code java.lang.String} uses
+     * internally when {@code String.COMPACT_STRINGS} is {@code true} — the
+     * flag that {@code String.<clinit>} installs, and that
+     * {@code String.coder()} reads before returning either the byte at
+     * offset 16 of the object or the UTF-16 sentinel {@code 1}. The
+     * {@code @jstr_*} globals emitted below must therefore carry the same
+     * {@code coder} value the corresponding {@code @strbytes_*} payload was
+     * encoded with; the emitter cannot choose one and the runtime the
+     * other.</p>
+     *
+     * <p>The {@code length} word at offset 8 of {@code @strbytes_*} is the
+     * <b>byte</b> count of the payload, not the character count. That is
+     * what {@code String.length()} and every other length-sensitive method
+     * of {@code String} ultimately reads, via
+     *
+     * <pre>
+     *     length() == value.length &gt;&gt; coder
+     * </pre>
+     *
+     * For the LATIN1 branch the stored word equals the character count; for
+     * the UTF-16 branch it equals twice the character count, and the
+     * right-shift recovers the character count exactly.</p>
+     *
+     * <h2>Why the previous UTF-8 encoding was wrong</h2>
+     *
+     * <p>The earlier revision of this method encoded every literal as UTF-8
+     * bytes and hard-coded {@code coder == 0} in {@code @jstr_*}. That made
+     * the two halves of the runtime's {@code String} contract disagree
+     * whenever a literal contained a character above {@code U+007F}:</p>
+     *
+     * <ul>
+     *   <li>UTF-8 is not Latin-1, so a character such as {@code "\uFFFD"}
+     *       occupies three bytes in the array while {@code coder} still
+     *       claims one byte per character;</li>
+     *   <li>the {@code length} word therefore reports the UTF-8 byte count
+     *       (3 for {@code "\uFFFD"}), and {@code String.length()} returns
+     *       {@code 3 >> 0 == 3} instead of {@code 1};</li>
+     *   <li>every consumer of {@code length()}, {@code charAt()},
+     *       {@code substring()}, {@code indexOf()}, {@code hashCode()} and
+     *       the {@code makeConcatWithConstants} machinery is then wrong by
+     *       the ratio between the UTF-8 length and the character count.</li>
+     * </ul>
+     *
+     * <p>The concrete failure that motivated the change was a {@code
+     * java.lang.IllegalArgumentException: Replacement too long} raised from
+     * {@code CharsetDecoder.replaceWith} while
+     * {@code javax.crypto.JceSecurity.<clinit>} was initialising: the
+     * literal {@code "\uFFFD"} passed to the three-argument
+     * {@code CharsetDecoder} constructor reported a length of {@code 3}
+     * against a {@code maxCharsPerByte} of {@code 1.0}, and the
+     * {@code len > maxCharsPerByte} check rejected it.</p>
+     *
+     * <p>Encoding the payload as one of the two compact-string forms
+     * restores the invariant {@code length() == value.length >> coder} for
+     * every literal, including the ones that contain characters above
+     * {@code U+007F}, and leaves ASCII-only literals byte-identical to
+     * what the previous revision emitted.</p>
      *
      * <h2>Why the backing array is emitted as an anonymous struct</h2>
      *
@@ -1904,7 +2306,6 @@ public class LlvmGlobalEmitter {
      * {@code JAVA_ARR_LENGTH_OFFSET}, {@code JAVA_ARR_ELEM_SIZE_OFFSET} and
      * {@code JAVA_ARR_HDR} in {@code jnative_runtime.h}, and every other
      * array-producing site in this codebase writes those exact offsets:</p>
-     *
      *
      * <p>The earlier revision of this method emitted the backing array as
      * {@code [N x i8] c"..."} with the header laid out at
@@ -1941,7 +2342,7 @@ public class LlvmGlobalEmitter {
         String vtableName = vtableNames.get("java/lang/String");
         if (vtableName == null) {
             throw new IllegalStateException(
-                "vtable_java_lang_String must be emitted before string literals");
+                    "vtable_java_lang_String must be emitted before string literals");
         }
 
         /*
@@ -1960,7 +2361,77 @@ public class LlvmGlobalEmitter {
         Collections.sort(literals);
 
         for (String s : literals) {
-            byte[] bytes = s.getBytes(StandardCharsets.UTF_8);
+            /*
+             * Decide which of the two compact-string encodings the literal
+             * must use.
+             *
+             * The decision is made per character code unit, not per code
+             * point. A supplementary character (U+10000..U+10FFFF) is
+             * represented in the Java String as two surrogate code units
+             * in the range U+DC80..U+DFFF, both of which are greater than
+             * 0xFF; a string containing one therefore lands in the UTF-16
+             * branch automatically, with no separate surrogate-pair test
+             * required.
+             *
+             * A string consisting entirely of characters in U+0000..U+00FF
+             * is encoded in the compact LATIN1 form: one byte per character
+             * code unit, equal to the character's low 8 bits. This is the
+             * same representation java.lang.String uses internally when
+             * String.COMPACT_STRINGS is true.
+             *
+             * Every other string is encoded as UTF-16BE: two bytes per
+             * character code unit, high byte first. This is the same
+             * representation java.lang.String uses internally when the
+             * compact-string optimisation is not in effect.
+             */
+            boolean latin1 = true;
+            int charCount = s.length();
+            for (int i = 0; i < charCount; i++) {
+                if (s.charAt(i) > 0xFF) {
+                    latin1 = false;
+                    break;
+                }
+            }
+
+            byte[] bytes;
+            int coder;
+            int lengthField;
+
+            if (latin1) {
+                /*
+                 * Compact LATIN1 form. One byte per character code unit;
+                 * the byte value is the low 8 bits of the char, which for
+                 * a char <= 0xFF is the char itself.
+                 */
+                bytes = new byte[charCount];
+                for (int i = 0; i < charCount; i++) {
+                    bytes[i] = (byte) s.charAt(i);
+                }
+                coder = 0;
+                lengthField = charCount;
+            } else {
+                /*
+                 * UTF-16BE form. Two bytes per character code unit, high
+                 * byte first. Surrogate pairs are emitted as two
+                 * consecutive code units, exactly as they appear in the
+                 * Java String.
+                 *
+                 * The charCount used here is String.length(), i.e. the
+                 * number of char code units, not the number of Unicode
+                 * code points. That is the number of elements that
+                 * String.length() must report, and it is the number the
+                 * length word below is derived from.
+                 */
+                bytes = new byte[charCount * 2];
+                for (int i = 0; i < charCount; i++) {
+                    char ch = s.charAt(i);
+                    bytes[i * 2]     = (byte) (ch >>> 8);
+                    bytes[i * 2 + 1] = (byte) (ch & 0xFF);
+                }
+                coder = 1;
+                lengthField = charCount * 2;
+            }
+
             int len = bytes.length;
 
             /*
@@ -1970,24 +2441,11 @@ public class LlvmGlobalEmitter {
              * uppercase two-digit hex. A trailing NUL byte is appended so
              * that C-side consumers can treat the payload as a C string;
              * it is C-side slack, not a Java element — the `length` field
-             * below is the true Java-visible length.
+             * below is the true Java-visible byte count, and the NUL is
+             * never observed by String.length(), String.charAt() or any
+             * other method of String.
              */
-            StringBuilder escaped = new StringBuilder();
-            for (byte b : bytes) {
-                int v = b & 0xFF;
-                switch (v) {
-                    case '\\' -> escaped.append("\\5C");
-                    case '"' -> escaped.append("\\22");
-                    case '\n' -> escaped.append("\\0A");
-                    case '\r' -> escaped.append("\\0D");
-                    case '\t' -> escaped.append("\\09");
-                    default -> {
-                        if (v < 0x20 || v > 0x7E) escaped.append(String.format("\\%02X", v));
-                        else escaped.append((char) v);
-                    }
-                }
-            }
-            escaped.append("\\00");
+            StringBuilder escaped = getStringBuilder(bytes);
 
             String safe = LlvmRuntime.stringIdSuffix(s);
             String bytesGlobal = "strbytes_" + safe;
@@ -2008,19 +2466,25 @@ public class LlvmGlobalEmitter {
              * `align 8` matches the natural alignment of the i8* header
              * word; the alignment does not change the field offsets but
              * does keep the pointer slot addressable as a pointer.
+             *
+             * The value written into the length word is `lengthField`,
+             * which is the character count in the LATIN1 branch and twice
+             * the character count in the UTF-16 branch. That is the value
+             * String.length() derives the Java-level length from, via
+             * `value.length >> coder`.
              */
             int payloadLen = len + 1;   // NUL terminator is part of the array
 
             sb.append("@").append(bytesGlobal)
-                .append(" = private unnamed_addr constant { i8*, i32, i32, [")
-                .append(payloadLen).append(" x i8] } {\n")
-                .append("  i8* bitcast (%ReflectionClass* ").append(byteArrayKlassRef)
-                .append(" to i8*),\n")
-                .append("  i32 ").append(len).append(",\n")
-                .append("  i32 1,\n")
-                .append("  [").append(payloadLen).append(" x i8] c\"")
-                .append(escaped).append("\"\n")
-                .append("}, align 8\n");
+                    .append(" = unnamed_addr constant { i8*, i32, i32, [")
+                    .append(payloadLen).append(" x i8] } {\n")
+                    .append("  i8* bitcast (%ReflectionClass* ").append(byteArrayKlassRef)
+                    .append(" to i8*),\n")
+                    .append("  i32 ").append(lengthField).append(",\n")
+                    .append("  i32 1,\n")
+                    .append("  [").append(payloadLen).append(" x i8] c\"")
+                    .append(escaped).append("\"\n")
+                    .append("}, align 8\n");
 
             /*
              * The String object. Its `value` field is a bitcast of the
@@ -2028,16 +2492,31 @@ public class LlvmGlobalEmitter {
              * for that field in %struct.java_lang_String. The bitcast is
              * necessary because the struct type is anonymous and therefore
              * not nameable in the field declaration.
+             *
+             * The `coder` field carries the same value the payload was
+             * encoded with:
+             *
+             *     coder == 0  ->  LATIN1  (one byte per character)
+             *     coder == 1  ->  UTF-16  (two bytes per character)
+             *
+             * String.coder() reads it (after checking
+             * @gv_java_lang_String_COMPACT_STRINGS, which String.<clinit>
+             * sets to true) and String.length() applies it as the
+             * right-shift amount.
+             *
+             * The `hash` field is left at zero so the first hashCode()
+             * call computes and caches the real value lazily. The trailing
+             * i1 is left false for the same reason.
              */
             sb.append("@").append(objGlobal)
-                .append(" = global %struct.java_lang_String {\n")
-                .append("  i8* bitcast (%JNativeVTable* ").append(vtableName).append(" to i8*),\n")
-                .append("  i8* bitcast ({ i8*, i32, i32, [").append(payloadLen)
-                .append(" x i8] }* @").append(bytesGlobal).append(" to i8*),\n")
-                .append("  i8 0,\n")
-                .append("  i32 0,\n")
-                .append("  i1 false\n")
-                .append("}, align 8\n");
+                    .append(" = global %struct.java_lang_String {\n")
+                    .append("  i8* bitcast (%JNativeVTable* ").append(vtableName).append(" to i8*),\n")
+                    .append("  i8* bitcast ({ i8*, i32, i32, [").append(payloadLen)
+                    .append(" x i8] }* @").append(bytesGlobal).append(" to i8*),\n")
+                    .append("  i8 ").append(coder).append(",\n")
+                    .append("  i32 0,\n")
+                    .append("  i1 false\n")
+                    .append("}, align 8\n");
 
             stringLiteralPool.add(objGlobal);
         }
@@ -2051,6 +2530,26 @@ public class LlvmGlobalEmitter {
         sb.append("], align 8\n");
         sb.append("@__jnative_literal_pool_size = constant i32 ").append(n).append("\n");
         return sb.toString();
+    }
+
+    private static StringBuilder getStringBuilder(byte[] bytes) {
+        StringBuilder escaped = new StringBuilder();
+        for (byte b : bytes) {
+            int v = b & 0xFF;
+            switch (v) {
+                case '\\' -> escaped.append("\\5C");
+                case '"' -> escaped.append("\\22");
+                case '\n' -> escaped.append("\\0A");
+                case '\r' -> escaped.append("\\0D");
+                case '\t' -> escaped.append("\\09");
+                default -> {
+                    if (v < 0x20 || v > 0x7E) escaped.append(String.format("\\%02X", v));
+                    else escaped.append((char) v);
+                }
+            }
+        }
+        escaped.append("\\00");
+        return escaped;
     }
 
     // =========================================================================
@@ -2328,18 +2827,12 @@ public class LlvmGlobalEmitter {
         // Object, so this never produces a type error at emission time.
         if ("java/lang/Class".equals(className)) {
             return switch (fieldName) {
-                case "name" -> Type.reference("java/lang/String");
-                case "superclass" -> Type.reference("java/lang/Class");
+                case "name", "packageName" -> Type.reference("java/lang/String");
+                case "superclass", "componentType" -> Type.reference("java/lang/Class");
                 case "classLoader" -> Type.reference("java/lang/ClassLoader");
                 case "module" -> Type.reference("java/lang/Module");
-                case "componentType" -> Type.reference("java/lang/Class");
-                case "packageName" -> Type.reference("java/lang/String");
-                case "enumConstants" -> Type.reference("java/lang/Object");
-                case "annotationData" -> Type.reference("java/util/Map");
-                case "genericInfo" -> Type.reference("java/lang/Object");
-                case "reflectionData" -> Type.reference("java/lang/Object");
+                case "annotationData", "enumConstantDirectory" -> Type.reference("java/util/Map");
                 case "classValueMap" -> Type.reference("java/lang/ClassValue");
-                case "enumConstantDirectory" -> Type.reference("java/util/Map");
                 default -> Type.reference("java/lang/Object");
             };
         }
@@ -2388,53 +2881,6 @@ public class LlvmGlobalEmitter {
         StringBuilder sb = new StringBuilder();
         StringBuilder strConsts = new StringBuilder();
         sb.append("\n; ----- Reflection data -----\n");
-
-        sb.append("%ReflectionMethod = type { i8*, i8*, i8*, i32 }\n");
-        sb.append("%ReflectionField = type { i8*, i8*, i32, i32 }\n");
-        sb.append("%ReflectionConstructor = type { i8*, i8*, i32 }\n");
-        // Must stay in lockstep with `struct ReflectionClass` in
-        // jnative_runtime.h and with the @refclass_* constant emission below.
-        //
-        // Layout:
-        //   [0]  %JNativeVTable*      vtable
-        //   [1]  i8*                  name (Java String cache, kept null)
-        //   [2]  %ReflectionClass*    superclass
-        //   [3]  %ReflectionClass**   interfaces
-        //   [4]  %ReflectionMethod**  methods
-        //   [5]  %ReflectionField**   fields
-        //   [6]  %ReflectionConstructor** constructors
-        //   [7]  i32                  modifiers
-        //   [8]  i32                  objectSize
-        //   [9]  i8*                  cname (const char*, internal name)
-        //   [10] i8*                  classLoader           (always null)
-        //   [11] i8*                  module                (always null)
-        //   [12] i8*                  componentType         (always null)
-        //   [13] i8*                  packageName           (always null)
-        //   [14] i8*                  enumConstants         (always null)
-        //   [15] i8*                  annotationData        (always null)
-        //   [16] i8*                  genericInfo           (always null)
-        //   [17] i8*                  reflectionData        (always null)
-        //   [18] i8*                  classValueMap         (always null)
-        //   [19] i8*                  enumConstantDirectory (always null)
-        //   [20..27] i8*              reserved[8]           (always null)
-        //
-        // The nine named tail slots, enumConstantDirectory, and the eight
-        // reserved slots exist because generated bytecode under
-        // java.lang.Class reads them. checkPackageAccessForPermitted
-        // Subclasses reads classLoader, getEnumConstantsShared reads
-        // enumConstants, enumConstantDirectory reads/writes
-        // enumConstantDirectory, getAnnotation / getDeclaredAnnotations
-        // read annotationData, and the ReflectionData machinery reads
-        // reflectionData. The reserved tail is the fallback landing pad
-        // for any further Class field the emitter has not enumerated yet
-        // — see getFieldOffset() for the routing and the class-level
-        // javadoc on ReflectionClass in jnative_runtime.h for the
-        // rationale.
-        sb.append("%ReflectionClass = type { %JNativeVTable*, i8*, %ReflectionClass*, %ReflectionClass**, "
-            + "%ReflectionMethod**, %ReflectionField**, %ReflectionConstructor**, i32, i32, i8*, "
-            + "i8*, i8*, i8*, i8*, i8*, i8*, i8*, i8*, i8*, i8*, "
-            + "i8*, i8*, i8*, i8*, i8*, i8*, i8*, i8* }\n");
-        sb.append("%JNativeSymbolClassEntry = type { i8*, %ReflectionClass* }\n");
 
         String classVtableRef = vtableNames.get("java/lang/Class");
         if (classVtableRef == null) {
@@ -2647,10 +3093,109 @@ public class LlvmGlobalEmitter {
             String cleanClassName = LlvmTypeMapper.sanitizeIdentifier(className);
             String classVarName = "@refclass_" + cleanClassName;
 
-            int objectSize = OBJECT_HEADER_SIZE;
-            if (!isPrimitive && classNode != null && !isArrayPseudoClass) {
-                for (FieldNode f : collectInstanceFields(classNode)) {
-                    objectSize += getElementSizeOfType(f.getType());
+            /*
+             * object_size is the single number the C runtime uses for
+             * every allocation of this class: jnative_alloc_object(),
+             * Unsafe.allocateInstance(), and every per-class native
+             * that builds a mirror or a value object from C. It must
+             * match sizeof(%struct.<class>) byte-for-byte, because
+             * generated code writes instance fields at the offsets
+             * returned by getFieldOffset() (which applies the natural
+             * alignment of every field type), and the C side writes the
+             * same fields at the same offsets into the buffer
+             * object_size describes. If object_size is smaller than the
+             * LLVM struct, the last field of any class that has an
+             * alignment gap lies past the end of the allocation and the
+             * C-side value is read out of adjacent heap metadata.
+             *
+             * The previous computation — header plus the unaligned sum
+             * of field sizes — was correct only for classes whose
+             * fields happen to have no internal padding. It was wrong
+             * by 4 bytes for every class that declares an int or float
+             * immediately after a reference or long/double, and that
+             * includes ArrayList, LinkedList, StringBuilder, Hashtable,
+             * IdentityHashMap, Vector, Stack and many more. On a freshly
+             * calloc'ed chunk the four stray bytes happen to be zero
+             * (the allocator returned a virgin arena page) and the bug
+             * is invisible; on a recycled chunk they hold the previous
+             * occupant's prev_size field, the last field reads a stale
+             * non-zero value, and the field's reader takes the wrong
+             * branch.
+             *
+             * The concrete failure this fix closes:
+             *
+             *     java.time.zone.TzdbZoneRulesProvider.load was replaced
+             *     by a C override that installs an empty ArrayList into
+             *     the provider's regionIds field. ZoneRulesProvider's
+             *     registration loop then called provideZoneIds(), which
+             *     is new HashSet<>(regionIds). AbstractCollection.addAll
+             *     iterates that ArrayList; ArrayList.Itr.hasNext reads
+             *     `cursor != size`; size lives at offset 24 of a
+             *     24-byte allocation. The read returned a non-zero byte
+             *     from the adjacent glibc chunk header, hasNext()
+             *     returned true, next() was called, and the very next
+             *     instruction — elementData.length with elementData
+             *     still null — raised
+             *
+             *         NullPointerException: Cannot invoke
+             *             java.util.ArrayList.Itr.next(Ljava/lang/Object;)
+             *             because <array> is null
+             *
+             *     inside the <clinit> of ZoneRulesProvider.
+             *
+             * computeObjectSize(className) is the canonical,
+             * alignment-aware size computation. It is the same function
+             * LlvmGenerator.generateMain() already uses to publish the
+             * Thread, Thread$FieldHolder and ThreadGroup sizes to the C
+             * runtime, so it is the single source of truth for struct
+             * sizes in this codebase. Routing object_size through it
+             * makes the emitted constant agree with the LLVM struct
+             * layout for every class, without duplicating the alignment
+             * rules a second time.
+             *
+             * Primitives and array pseudo-classes do not have an emitted
+             * LLVM struct of their own and are never allocated through
+             * jnative_alloc_object() or Unsafe.allocateInstance();
+             * arrays go through jnative_array_alloc(), which uses
+             * JAVA_ARR_HDR rather than object_size. For those the header
+             * size is the only meaningful value, matching the previous
+             * behaviour.
+             */
+            int objectSize;
+            if (isPrimitive || isArrayPseudoClass || classNode == null) {
+                objectSize = OBJECT_HEADER_SIZE;
+            } else {
+                int computed = computeObjectSize(className);
+                if (computed > 0) {
+                    objectSize = computed;
+                } else {
+                    /*
+                     * computeObjectSize returns -1 only when the class
+                     * is not in the class map, is external, or is an
+                     * interface. The branch above already excludes the
+                     * interface and pseudo-class cases, and the
+                     * earlier loop in this method has already filtered
+                     * out classes that are absent or external, so this
+                     * fallback is unreachable under normal operation.
+                     *
+                     * It exists so that a future change to the filtering
+                     * above cannot silently reintroduce the alignment
+                     * bug by handing a value that computeObjectSize
+                     * refuses to compute to the naive sum instead. The
+                     * fallback performs the same alignment-aware walk
+                     * inline, using the same fieldAlignment / fieldSize
+                     * helpers that computeObjectSize and getFieldOffset
+                     * use internally, so it cannot disagree with either.
+                     */
+                    objectSize = OBJECT_HEADER_SIZE;
+                    for (FieldNode f : collectInstanceFields(classNode)) {
+                        Type ft = f.getType();
+                        int align = fieldAlignment(ft);
+                        int size  = fieldSize(ft);
+                        objectSize = (objectSize + align - 1) & -align;
+                        objectSize += size;
+                    }
+                    objectSize = (objectSize + 7) & ~7;
                 }
             }
 
@@ -3063,6 +3608,11 @@ public class LlvmGlobalEmitter {
             classPtrs.add("%ReflectionClass* " + classVarName);
         }
 
+        // Publish the set of classes that actually got a mirror, so that
+        // generateFunctionIndex() (called after this method) can attach the
+        // right @refclass_* pointer to every function whose owner is here.
+        emittedRefClassNames.addAll(classNames);
+
         sb.append("@reflect_all_classes = constant [")
             .append(classPtrs.size() + 1).append(" x %ReflectionClass*] [");
         for (String p : classPtrs) sb.append(p).append(", ");
@@ -3072,6 +3622,118 @@ public class LlvmGlobalEmitter {
         sb.append(generateCallerSensitiveSymbols(strConsts));
 
         sb.append(strConsts);
+        return sb.toString();
+    }
+
+    /**
+     * Emits {@code @jnative_function_index} — a flat table of every function
+     * with a body in the module, together with its mangled symbol name and
+     * (when the function belongs to a Java class) the {@code @refclass_*}
+     * mirror of that class.
+     *
+     * <p>The table is emitted as {@code global}, not {@code constant},
+     * because the runtime sorts it in place by address on first use.
+     *
+     * <p>The dynamic linker resolves every function pointer in the
+     * initializer at load time, so a query at run time maps an instruction
+     * pointer to a (symbol, class) pair with a single binary search — no
+     * {@code dladdr}, no per-symbol {@code dlsym}, no linear scan of
+     * {@code .dynsym}.
+     *
+     * <p>Functions whose owning class is not in the emitted mirror set get a
+     * NULL class pointer; the runtime then falls back to prefix-based
+     * classification, exactly as it does today.
+     */
+    private String generateFunctionIndex() {
+        StringBuilder sb = new StringBuilder();
+        sb.append("\n; ----- Function index for stack walking -----\n");
+
+        List<Function> allFuncs = new ArrayList<>();
+        for (Function f : module.getFunctions()) {
+            if (f.getEntryBlock() != null && hasFunctionIndexSignature(f)) {
+                allFuncs.add(f);
+            }
+        }
+        allFuncs.sort(Comparator.comparing(Function::getName));
+
+        if (allFuncs.isEmpty()) {
+            sb.append("@jnative_function_index = global [1 x %JNativeFunctionEntry] [")
+              .append("%JNativeFunctionEntry { i8* null, i8* null, %ReflectionClass* null }]\n");
+            sb.append("@jnative_function_index_size = constant i64 0\n");
+            return sb.toString();
+        }
+
+        StringBuilder strConsts = new StringBuilder();
+        List<String> lines = new ArrayList<>(allFuncs.size());
+        for (Function f : allFuncs) {
+            String name = f.getName();
+            String fnPtrTy = llvmFunctionPointerType(f);
+            String namePtr = ensureStringConstantPtr(strConsts, name);
+            String clsPtr = "null";
+            String owner = f.getOwnerClass();
+            if (owner != null && !owner.isEmpty() && hasRefClassMirror(owner)) {
+                clsPtr = getRefClassGlobalName(owner);
+            }
+            lines.add("  %JNativeFunctionEntry { i8* bitcast (" + fnPtrTy
+                      + " @" + name + " to i8*), i8* " + namePtr
+                      + ", %ReflectionClass* " + clsPtr + " }");
+        }
+
+        sb.append("@jnative_function_index = global [")
+          .append(allFuncs.size())
+          .append(" x %JNativeFunctionEntry] [\n");
+        for (int i = 0; i < lines.size(); i++) {
+            if (i > 0) sb.append(",\n");
+            sb.append(lines.get(i));
+        }
+        sb.append("\n]\n");
+        sb.append("@jnative_function_index_size = constant i64 ")
+          .append(allFuncs.size()).append("\n\n");
+
+        sb.append(strConsts);
+        return sb.toString();
+    }
+
+    /**
+     * True when the function's emitted definition has the same LLVM type as
+     * its IR signature, so that the {@code bitcast (... to i8*)} in the
+     * function index is well-typed.
+     *
+     * <p>{@link LlvmFunctionEmitter#emitFunction} replaces the body of a
+     * couple of functions with hand-written text. One of those replacement
+     * bodies — {@code fn_java_security_Provider_checkInitialized___V} —
+     * declares an extra {@code i8*} parameter that the IR signature does
+     * not have. A function-pointer bitcast cannot be validated for such a
+     * symbol, so it is left out of the index; the runtime then falls back
+     * to the symbol-class map for it, as it did before the index existed.
+     */
+    private static boolean hasFunctionIndexSignature(Function f) {
+        return !"fn_java_security_Provider_checkInitialized___V"
+            .equals(f.getName());
+    }
+
+    /**
+     * True when {@link #generateReflectionData()} emitted a
+     * {@code @refclass_*} mirror for this internal class name.
+     */
+    private boolean hasRefClassMirror(String className) {
+        return emittedRefClassNames.contains(className);
+    }
+
+    /**
+     * The LLVM spelling of the function-pointer type of {@code f}, e.g.
+     * {@code "void (i8*, i32)*"} or {@code "i8* ()*"}, used as the source
+     * type of the {@code bitcast (... to i8*)} in the function index.
+     */
+    private static String llvmFunctionPointerType(Function f) {
+        StringBuilder sb = new StringBuilder();
+        sb.append(LlvmTypeMapper.toLlvmType(f.getReturnType())).append(" (");
+        List<Parameter> params = f.getParameters();
+        for (int i = 0; i < params.size(); i++) {
+            if (i > 0) sb.append(", ");
+            sb.append(LlvmTypeMapper.toLlvmType(params.get(i).getType()));
+        }
+        sb.append(")*");
         return sb.toString();
     }
 
@@ -3245,14 +3907,6 @@ public class LlvmGlobalEmitter {
             };
         }
         return null;
-    }
-
-    private String ensureStringConstant(StringBuilder defsBuffer, String s) {
-        if (s == null) return "null";
-        if (emittedStringConstants.add(s)) {
-            defsBuffer.append(LlvmRuntime.typeStringConstant(s));
-        }
-        return LlvmRuntime.typeStringGlobalName(s);
     }
 
     private String ensureStringConstantPtr(StringBuilder defsBuffer, String s) {

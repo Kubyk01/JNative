@@ -21,6 +21,8 @@ public class Instruction {
     private Object invokedynamicData;
     @Setter
     private boolean polymorphicSignature;
+    @Setter
+    private boolean stackAllocated;
 
     public Instruction(Opcode opcode) {
         this.opcode = opcode;

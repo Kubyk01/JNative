@@ -3,7 +3,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
-#include <dlfcn.h>
 #include "jnative_runtime.h"
 
 #if defined(_WIN32)
@@ -210,9 +209,15 @@ static int is_caller_sensitive_symbol(const char* sym) {
 static int is_service_frame_symbol(const char* sym) {
     if (sym == NULL) return 0;
 
-    /* 1. Reflection trampolines. The ctor prefix is a strict extension
-     *    of the method prefix; checking it first is not required for
-     *    correctness but makes the two cases read symmetrically. */
+    /*
+     * 1. Defensive: these two prefixes are never produced by
+     *    is_java_frame_symbol()'s filter, but they are kept here so that
+     *    a future relaxation of that filter cannot accidentally let a
+     *    reflect trampoline through to the class-for-symbol lookup.
+     *    The ctor prefix is a strict extension of the method prefix;
+     *    checking it first is not required for correctness but makes
+     *    the two cases read symmetrically.
+     */
     if (has_prefix(sym, "__reflect_adaptor_ctor_")) return 1;
     if (has_prefix(sym, "__reflect_adaptor_"))      return 1;
 
@@ -283,12 +288,113 @@ static struct ReflectionClass* find_first_java_caller(void) {
      * frames are present, only on which frames are service frames.
      */
     for (int i = 0; i < n; i++) {
-        Dl_info info;
-        memset(&info, 0, sizeof(info));
-        if (dladdr(frames[i], &info) == 0) continue;
-        if (info.dli_sname == NULL) continue;
+        const char* sym = NULL;
+        struct ReflectionClass* entry_cls = NULL;
 
-        const char* sym = info.dli_sname;
+        if (!__jnative_function_at_address((uintptr_t)frames[i],
+                                           &sym, &entry_cls)) {
+            /*
+             * ------------------------------------------------------------------
+             * Address outside @jnative_function_index. Skip without dladdr.
+             * ------------------------------------------------------------------
+             *
+             * Why this is correct, and why dladdr is both unnecessary and
+             * catastrophically expensive here:
+             *
+             * 1. Cost of dladdr on this image.
+             *
+             *    dladdr() in glibc has no reverse index into .dynsym; it
+             *    performs a LINEAR scan of every exported FUNC symbol on
+             *    every call. On the image that motivated this code the
+             *    executable exports ~48 000 FUNC symbols (one per reachable
+             *    Java method plus every __jnative_* helper), so a single
+             *    dladdr call costs on the order of 9 million instructions
+             *    and takes ~2.5 ms. Twenty-four getCallerClass calls during
+             *    <clinit> processing produce 72 dladdr calls, i.e. ~185 ms
+             *    of the 345 ms total runtime — 54 % of the whole program,
+             *    spent inside _dl_addr. The profiler attributes 47 % of all
+             *    samples to this one glibc function.
+             *
+             * 2. What dladdr could have found that the index misses.
+             *
+             *    - __jnative_fn_* symbols: C implementations of Java native
+             *      methods. They are registered in the module as Function
+             *      objects WITHOUT an entry block (see
+             *      BytecodeToIr.translateMethod, the `isNative()` branch),
+             *      and both generateFunctionIndex() and
+             *      generateSymbolClassMap() filter on
+             *      `getEntryBlock() != null`. So:
+             *          - __jnative_function_at_address() cannot return them;
+             *          - class_for_symbol() has no entry for them;
+             *          - is_caller_sensitive_symbol() has no entry for them.
+             *      A __jnative_fn_* frame therefore falls through the loop
+             *      and produces no answer, with or without dladdr.
+             *
+             *    - __jnative_override_* symbols and their aliases: same
+             *      situation. registerOverrides() installs a body-less
+             *      Function; the alias registered via
+             *      Module.registerAlias() resolves to that same Function,
+             *      whose getEntryBlock() is null. Not in the index, not in
+             *      the symbol-class map. Transparent either way.
+             *
+             *    - __reflect_adaptor_* trampolines emitted by
+             *      emitAdaptorForMethod / emitAdaptorForConstructor: they
+             *      are written as raw IR text, not as Module Functions, so
+             *      they are not in the index. But their symbol prefix does
+             *      not match either `fn_` or `__jnative_fn_`, so
+             *      is_java_frame_symbol() rejects them on the first test.
+             *      Transparent either way.
+             *
+             *    - Runtime helpers, backtrace(), libc, ld, and this
+             *      function's own frame: not Java frames by construction.
+             *
+             * 3. The invariant that makes the skip unconditional.
+             *
+             *    Every Java bytecode-translated method (`fn_*`) has an
+             *    entry block, hence is in @jnative_function_index, hence is
+             *    resolved by __jnative_function_at_address() above. If the
+             *    lookup fails, the frame is NOT a `fn_*` method. The only
+             *    other Java-shaped frames are `__jnative_fn_*` and
+             *    `__jnative_override_*`, both of which are transparent to
+             *    the walk (item 2). Therefore skipping every non-indexed
+             *    frame is observationally equivalent to running dladdr on
+             *    it and acting on the result.
+             *
+             *    Two future changes would invalidate this invariant and
+             *    must therefore also update this comment:
+             *
+             *      (a) Adding body-less native Functions to
+             *          @jnative_function_index or @jnative_symbol_class_map.
+             *          If a __jnative_fn_* symbol gains a class entry, the
+             *          walk will then need to identify it, and this
+             *          unconditional continue will silently drop it.
+             *
+             *      (b) Removing the hasFunctionIndexSignature() exclusion
+             *          for fn_java_security_Provider_checkInitialized___V.
+             *          That function's emitted body has a signature that
+             *          does not match its IR declaration, which is why it
+             *          is currently omitted from the index. Until it is
+             *          fixed, a stack frame that lands on its symbol is
+             *          (harmlessly) treated as non-Java.
+             *
+             * 4. Cross-check with the profiling report.
+             *
+             *    The report's recommendation #1 is precisely this change:
+             *
+             *        "is_java_frame_symbol() accepts only symbols with the
+             *         prefix 'fn_' / '__jnative_fn_', and all generated Java
+             *         functions are already in
+             *         __jnative_function_at_address(). For the remaining
+             *         frames dladdr only leads to `continue` (foreign frame
+             *         == transparent). I.e. replacing the block with an
+             *         unconditional `continue;` produces the same result
+             *         and removes ~54 % of the time."
+             *
+             *    The measurement that backs it: 72 dladdr calls, 184.55 ms
+             *    total, ~2.56 ms per call, on a 344.9 ms end-to-end run.
+             */
+            continue;
+        }
 
         if (!is_java_frame_symbol(sym)) continue;
 
@@ -315,6 +421,11 @@ static struct ReflectionClass* find_first_java_caller(void) {
         }
 
         if (is_service_frame_symbol(sym)) continue;
+
+        /* Fast path: the emitter recorded the owning class directly in
+         * the function index, so no second lookup by symbol name is
+         * required for the common case of a Java method frame. */
+        if (entry_cls != NULL) return entry_cls;
 
         struct ReflectionClass* cls = class_for_symbol(sym);
         if (cls != NULL) return cls;

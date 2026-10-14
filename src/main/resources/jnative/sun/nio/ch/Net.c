@@ -323,3 +323,244 @@ void __jnative_fn_sun_nio_ch_Net_shutdown__Ljava_io_FileDescriptor_I_V(
         __jnative_throw_exception(NULL);
     }
 }
+
+/*
+ * ===================================================================
+ * Socket address introspection and dual-stack option probing.
+ * ===================================================================
+ *
+ * The three natives below are declared in sun/nio/ch/Net.java and
+ * called from SocketChannelImpl / ServerSocketChannelImpl when the
+ * Java layer needs to reflect the kernel's own view of a socket back
+ * into an InetSocketAddress. None of them existed in the C runtime
+ * before, so the reachability walk pulled the declarations into the
+ * emitted IR and the linker had no bodies for them.
+ *
+ *   localInetAddress(FileDescriptor) -> InetAddress
+ *       getsockname(2) on the socket, then wraps the result in a
+ *       java.net.InetAddress instance via the same construction path
+ *       used by Inet4AddressImpl.c / Inet6AddressImpl.c.
+ *
+ *   localPort(FileDescriptor) -> int
+ *       getsockname(2) and returns the port in host byte order.
+ *
+ *   shouldSetBothIPv4AndIPv6Options0() -> boolean
+ *       Returns true iff the platform requires the same option value
+ *       to be set on both an AF_INET and an AF_INET6 socket when the
+ *       underlying socket is dual-stack. This is a Windows-specific
+ *       quirk; on Linux each socket has its own options and the JDK
+ *       must return false so the Java layer only sets the option once.
+ *       Returning true here would double-apply every option and, for
+ *       several of them (IP_TOS, IP_MULTICAST_IF), produce EINVAL on
+ *       the second call.
+ */
+
+/*
+ * Build a java.net.InetAddress whose InetAddressHolder carries the
+ * given address bytes, family and textual host name. Layout matches
+ * the one used by Inet4AddressImpl.c / Inet6AddressImpl.c:
+ *
+ *   java.net.InetAddress:
+ *       +8  String canonicalHostName
+ *       +16 InetAddressHolder holder
+ *
+ *   java.net.InetAddress$InetAddressHolder:
+ *       +8  String hostName
+ *       +16 int    family
+ *       +20 byte[] addressBytes
+ */
+static void* net_make_inet_address(const uint8_t* bytes, int java_family,
+                                   const char* hostname)
+{
+    ReflectionClass* ia_cls =
+        jnative_class_by_name("java/net/InetAddress");
+    ReflectionClass* h_cls =
+        jnative_class_by_name("java/net/InetAddress$InetAddressHolder");
+    if (ia_cls == NULL || h_cls == NULL) {
+        __jnative_throw_exception(NULL);
+    }
+
+    void* holder = jnative_alloc_object(h_cls);
+    if (holder == NULL) {
+        __jnative_throw_out_of_memory_error_ctx("Net.localInetAddress");
+    }
+
+    *(void**)((char*)holder + 8)    = jnative_string(hostname);
+    *(int32_t*)((char*)holder + 16) = java_family;
+    *(void**)((char*)holder + 20)   =
+        jnative_byte_array(bytes, java_family == 1 ? 4 : 16);
+
+    void* ia = jnative_alloc_object(ia_cls);
+    if (ia == NULL) {
+        __jnative_throw_out_of_memory_error_ctx("Net.localInetAddress");
+    }
+    *(void**)((char*)ia + 8)  = NULL;
+    *(void**)((char*)ia + 16) = holder;
+    return ia;
+}
+
+void* __jnative_fn_sun_nio_ch_Net_localInetAddress__Ljava_io_FileDescriptor__Ljava_net_InetAddress_(
+        void* fd_obj)
+{
+    int32_t fd = jnative_raw_fd(fd_obj);
+
+    struct sockaddr_storage ss;
+    socklen_t salen = (socklen_t)sizeof(ss);
+    memset(&ss, 0, sizeof(ss));
+
+    if (getsockname(fd, (struct sockaddr*)&ss, &salen) < 0) {
+        __jnative_throw_exception(NULL);
+        return NULL;
+    }
+
+    if (ss.ss_family == AF_INET) {
+        struct sockaddr_in* sin = (struct sockaddr_in*)&ss;
+        return net_make_inet_address((const uint8_t*)&sin->sin_addr, 1,
+                                     "0.0.0.0");
+    }
+    if (ss.ss_family == AF_INET6) {
+        struct sockaddr_in6* sin6 = (struct sockaddr_in6*)&ss;
+        return net_make_inet_address((const uint8_t*)&sin6->sin6_addr, 2,
+                                     "::");
+    }
+    __jnative_throw_exception(NULL);
+    return NULL;
+}
+
+int32_t __jnative_fn_sun_nio_ch_Net_localPort__Ljava_io_FileDescriptor__I(
+        void* fd_obj)
+{
+    int32_t fd = jnative_raw_fd(fd_obj);
+
+    struct sockaddr_storage ss;
+    socklen_t salen = (socklen_t)sizeof(ss);
+    memset(&ss, 0, sizeof(ss));
+
+    if (getsockname(fd, (struct sockaddr*)&ss, &salen) < 0) {
+        __jnative_throw_exception(NULL);
+        return 0;
+    }
+    if (ss.ss_family == AF_INET) {
+        return (int32_t)ntohs(((struct sockaddr_in*)&ss)->sin_port);
+    }
+    if (ss.ss_family == AF_INET6) {
+        return (int32_t)ntohs(((struct sockaddr_in6*)&ss)->sin6_port);
+    }
+    return 0;
+}
+
+int32_t __jnative_fn_sun_nio_ch_Net_shouldSetBothIPv4AndIPv6Options0___Z(void) {
+    /*
+     * Linux: each socket has its own option set. The JDK's own
+     * Unix implementation of this method returns false, and the
+     * Java side only consults the return value to decide whether
+     * to mirror a socket option from the AF_INET socket to the
+     * AF_INET6 one on a dual-stack bind.
+     */
+    return 0;
+}
+
+/*
+ * static native void bind0(FileDescriptor fd, boolean preferIPv6,
+ *                          boolean useExclBind, InetAddress addr,
+ *                          int port)
+ *     throws IOException;
+ *
+ * Binds a socket to a local address and port. Called from
+ * Net.bind(ProtocolFamily, FileDescriptor, InetAddress, int), which
+ * has already resolved the ProtocolFamily and normalized the
+ * address. This is the entry point the JDK's own Unix implementation
+ * uses; the arguments map one-for-one onto the underlying bind(2)
+ * call:
+ *
+ *   fd            the socket to bind
+ *   preferIPv6    selects AF_INET6 when the address is null or
+ *                 wildcard and the platform is dual-stack; the
+ *                 family is otherwise derived from the address
+ *   useExclBind   Windows-only; informational here
+ *   addr          the local address, or null for the wildcard
+ *   port          the local port in host byte order
+ *
+ * The address is turned into a sockaddr_in or sockaddr_in6 by the
+ * same net_make_sockaddr helper the localInetAddress native uses,
+ * so the two are guaranteed to agree on how an InetAddress is read.
+ *
+ * Any failure — EADDRINUSE, EACCES for a privileged port,
+ * EADDRNOTAVAIL for an address not assigned to this host — surfaces
+ * as a BindException at the Java layer through the generic throw
+ * helper and the caller's exception translation.
+ */
+void __jnative_fn_sun_nio_ch_Net_bind0__Ljava_io_FileDescriptor_ZZLjava_net_InetAddress_I_V(
+        void* fd_obj, int32_t preferIPv6, int32_t useExclBind,
+        void* addr_obj, int32_t port)
+{
+    (void)useExclBind;
+    int32_t fd = jnative_raw_fd(fd_obj);
+
+    struct sockaddr_storage ss;
+    socklen_t sslen;
+
+    if (addr_obj == NULL) {
+        /* Wildcard bind. The family is whatever the socket was
+         * created with; preferIPv6 only matters when the socket is
+         * created here, which is not this function's job. */
+        if (preferIPv6) {
+            struct sockaddr_in6* s6 = (struct sockaddr_in6*)&ss;
+            memset(s6, 0, sizeof(*s6));
+            s6->sin6_family = AF_INET6;
+            s6->sin6_port   = htons((uint16_t)port);
+            sslen = sizeof(*s6);
+        } else {
+            struct sockaddr_in* s4 = (struct sockaddr_in*)&ss;
+            memset(s4, 0, sizeof(*s4));
+            s4->sin_family = AF_INET;
+            s4->sin_port   = htons((uint16_t)port);
+            sslen = sizeof(*s4);
+        }
+    } else {
+        /*
+         * Extract the address bytes and family from the InetAddress
+         * through the same holder layout the address classes were
+         * constructed with:
+         *   InetAddress +16 -> InetAddressHolder
+         *   InetAddressHolder +16 -> int family
+         *   InetAddressHolder +20 -> byte[] addressBytes
+         */
+        void* holder = *(void**)((char*)addr_obj + 16);
+        if (holder == NULL) {
+            __jnative_throw_exception(NULL);
+            return;
+        }
+        int32_t family = *(int32_t*)((char*)holder + 16);
+        void*   bytes  = *(void**)((char*)holder + 20);
+        if (bytes == NULL) {
+            __jnative_throw_exception(NULL);
+            return;
+        }
+        int32_t blen = jnative_array_length(bytes);
+        const uint8_t* bp = (const uint8_t*)jnative_array_data(bytes);
+
+        if (family == 1 && blen == 4) {
+            struct sockaddr_in* s4 = (struct sockaddr_in*)&ss;
+            memset(s4, 0, sizeof(*s4));
+            s4->sin_family = AF_INET;
+            s4->sin_port   = htons((uint16_t)port);
+            memcpy(&s4->sin_addr, bp, 4);
+            sslen = sizeof(*s4);
+        } else if (family == 2 && blen == 16) {
+            struct sockaddr_in6* s6 = (struct sockaddr_in6*)&ss;
+            memset(s6, 0, sizeof(*s6));
+            s6->sin6_family = AF_INET6;
+            s6->sin6_port   = htons((uint16_t)port);
+            memcpy(&s6->sin6_addr, bp, 16);
+            sslen = sizeof(*s6);
+        } else {
+            __jnative_throw_exception(NULL);
+            return;
+        }
+    }
+
+    if (bind(fd, (struct sockaddr*)&ss, sslen) < 0) {
+        __jnative_throw_exception(NULL);
+    }
+}

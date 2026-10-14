@@ -18,5 +18,6 @@ public interface OrchestratorPort {
                  boolean includeSystem,
                  String debugName,
                  boolean showClassesGraph,
-                 int cores);
+                 int cores,
+                 int optimizationLevel);
 }

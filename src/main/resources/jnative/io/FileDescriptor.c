@@ -10,6 +10,14 @@
  *   [ 8 bytes vtable ][ int32 fd ][ long handle ][ ... ]
  *
  */
+
+__attribute__((noreturn))
+static void fd_throw_io(const char* msg) {
+    void* exc = __jnative_construct_exception(
+        "vtable_java_io_IOException", msg ? msg : "I/O error");
+    __jnative_throw_exception(exc);
+}
+
 void __jnative_fn_java_io_FileDescriptor_close0___V(void* this_fd) {
     if (this_fd == NULL) {
         return;
@@ -33,7 +41,7 @@ void __jnative_fn_java_io_FileDescriptor_sync___V(void* this_fd) {
     }
 
     if (fsync(fd) < 0) {
-        __jnative_throw_exception(NULL);
+        fd_throw_io("fsync failed");
     }
 }
 
