@@ -22,6 +22,7 @@ import io.github.kubyk01.domain.analyzer.escapeanalysis.EscapeAnalysisResult;
 import io.github.kubyk01.domain.analyzer.lifetime.LifetimeAnalysisResult;
 import io.github.kubyk01.domain.ir.Function;
 import io.github.kubyk01.domain.ir.Module;
+import io.github.kubyk01.domain.ir.TargetPlatform;
 import io.github.kubyk01.port.primary.OrchestratorPort;
 import io.github.kubyk01.port.secondary.CompilerPort;
 import io.github.kubyk01.util.LlvmUtil;
@@ -68,7 +69,8 @@ public class Orchestrator implements OrchestratorPort {
                         String debugName,
                         boolean showClassesGraph,
                         int cores,
-                        int optimizationLevel) {
+                        int optimizationLevel,
+                        TargetPlatform targetPlatform) {
 
         final int effectiveCores = (cores <= 0)
                 ? Runtime.getRuntime().availableProcessors()
@@ -89,7 +91,7 @@ public class Orchestrator implements OrchestratorPort {
             runAnalysis(path, entryClass, entryMethod, entryDescriptor,
                     showClasses, showAlias, showEscape, showLifetime, showDestructor,
                     outputFile, noCompile, includeSystem, debugName, showClassesGraph,
-                    effectiveCores, optimizationLevel, scheduler);
+                    effectiveCores, optimizationLevel, scheduler, targetPlatform);
         } finally {
             scheduler.dispose();
         }
@@ -111,7 +113,8 @@ public class Orchestrator implements OrchestratorPort {
                              boolean showClassesGraph,
                              int effectiveCores,
                              int optimizationLevel,
-                             Scheduler scheduler) {
+                             Scheduler scheduler,
+                             TargetPlatform targetPlatform) {
 
         // --- 1. Dependency resolution -------------------------------------
         DependencyResolver resolver = new DependencyResolver();
@@ -382,6 +385,7 @@ public class Orchestrator implements OrchestratorPort {
         llvmGen.setClinitSchedule(analysisResult.clinitSchedule());
         llvmGen.setClinitWrappers(analysisResult.clinitWrappers());
         llvmGen.setEmbeddedResources(embedded);
+        llvmGen.setTargetPlatform(targetPlatform);
 
         Path genDir = Paths.get("target", "generated-jnative");
         try {
@@ -418,9 +422,11 @@ public class Orchestrator implements OrchestratorPort {
             Path exePath = outputFile != null ? Paths.get(outputFile) : Paths.get("a.out");
             try {
                 compiler.compileAndLink(llPaths, exePath, usedSystemClasses, module,
-                        resolver, effectiveCores, optimizationLevel);
+                        resolver, effectiveCores, optimizationLevel, targetPlatform);
                 System.out.println("Native executable built successfully: "
                         + exePath.toAbsolutePath());
+                System.out.println("  target triple: " + targetPlatform.triple());
+                System.out.println("  target datalayout: " + targetPlatform.dataLayout());
             } catch (IOException | InterruptedException e) {
                 log.error("Failed to build native executable", e);
                 System.err.println("Build failed: " + e.getMessage());

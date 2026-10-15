@@ -125,7 +125,7 @@ public class DependencyResolver {
      * Absolute path of the top-level input archive, if {@link #scan(Path)}
      * was given a Spring Boot fat jar. Used by {@link #loadFromNestedJarIndex}
      * to reopen the outer archive and stream out the requested .class entry.
-     *
+     * <p>
      * Null when the input is a plain jar, a directory, or a single .class
      * file; in those cases there are no nested jars to index.
      */
@@ -443,7 +443,7 @@ public class DependencyResolver {
                     .isExternal(true)
                     .build();
             classMap.putIfAbsent(internalName, stub);
-            log.warn("System class {} not found even via reflection, stub created", internalName);
+            //log.warn("System class {} not found even via reflection, stub created", internalName);
         } catch (Exception e) {
             log.warn("Failed to load class {} via reflection: {}", internalName, e.getMessage());
             missingClasses.add(internalName);
@@ -660,8 +660,7 @@ public class DependencyResolver {
      * That is the same resolution order a class loader would observe when
      * walking the equivalent flat classpath.</p>
      */
-    private void indexNestedJar(JarFile outerJar, JarEntry nestedEntry)
-            throws IOException {
+    private void indexNestedJar(JarFile outerJar, JarEntry nestedEntry) {
         String nestedName = nestedEntry.getName();
         try (InputStream is = outerJar.getInputStream(nestedEntry);
              ZipInputStream zis = new ZipInputStream(is)) {

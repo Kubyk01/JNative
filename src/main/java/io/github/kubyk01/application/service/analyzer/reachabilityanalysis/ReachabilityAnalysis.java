@@ -1298,7 +1298,7 @@ public class ReachabilityAnalysis {
         MethodNode method = findMethodInHierarchy(classNode, name, desc, actualOwnerHolder);
 
         if (method == null) {
-            log.warn("Method not found in class {}: {}{}", owner, name, desc);
+            //log.warn("Method not found in class {}: {}{}", owner, name, desc);
             return;
         }
 

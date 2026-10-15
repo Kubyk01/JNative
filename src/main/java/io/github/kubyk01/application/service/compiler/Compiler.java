@@ -5,6 +5,7 @@ import io.github.kubyk01.application.service.codegen.llvm.LlvmRuntime;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.ClassNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.MethodNode;
 import io.github.kubyk01.domain.ir.Module;
+import io.github.kubyk01.domain.ir.TargetPlatform;
 import io.github.kubyk01.port.secondary.CompilerPort;
 import lombok.extern.slf4j.Slf4j;
 
@@ -17,6 +18,7 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Set;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -113,7 +115,8 @@ public class Compiler implements CompilerPort {
                                Module module,
                                DependencyResolver resolver,
                                int cores,
-                               int optimizationLevel)
+                               int optimizationLevel,
+                               TargetPlatform targetPlatform)
         throws IOException, InterruptedException {
 
         // The caller (Orchestrator) is the single source of truth for the
@@ -129,6 +132,16 @@ public class Compiler implements CompilerPort {
         // is repeated here at the single point where the value actually
         // becomes an argument to clang.
         final int effectiveOptLevel = clampOptLevel(optimizationLevel);
+
+        // The target platform is required: it determines the --target=
+        // flag passed to clang for both compilation and linking, and
+        // which linker libraries are appended to the link command. A
+        // null argument is a programming error; fall back to the
+        // detected host platform rather than failing, so a caller that
+        // has not been updated still produces a working host build.
+        final TargetPlatform target = (targetPlatform != null)
+            ? targetPlatform
+            : TargetPlatform.detectFromBuildHost();
 
         Path tempDir = Files.createTempDirectory(BUILD_ROOT_NAME);
         tempDir.toFile().deleteOnExit();
@@ -204,9 +217,10 @@ public class Compiler implements CompilerPort {
             int threadCount = Math.min(effectiveCores, toCompile);
             System.out.println("Compiling " + toCompile + " translation unit(s) using "
                 + threadCount + " thread(s) (ThinLTO bitcode, -O"
-                + effectiveOptLevel + ")...");
+                + effectiveOptLevel + ", target " + target.triple() + ")...");
 
-            compileAll(compiler, tasks, tempDir, threadCount, effectiveOptLevel);
+            compileAll(compiler, tasks, tempDir, threadCount,
+                       effectiveOptLevel, target);
 
             // ------------------------------------------------------------------
             // 4. Link with ThinLTO. The link driver reads every bitcode
@@ -214,9 +228,17 @@ public class Compiler implements CompilerPort {
             //    and the backend splits it into partitions and runs the
             //    requested optimization level over them across
             //    --thinlto-jobs worker threads.
+            //
+            //    --target=<triple> is passed to the clang driver, not to
+            //    the linker directly: clang uses it to select the
+            //    correct linker flavour (-fuse-ld=lld resolves to
+            //    ld.lld / lld-link / ld64.lld based on the target),
+            //    the correct C runtime for the final link, and the
+            //    correct search paths for the target's sysroot.
             // ------------------------------------------------------------------
             List<String> linkCmd = new ArrayList<>();
             linkCmd.add(compiler);
+            linkCmd.add("--target=" + target.triple());
             linkCmd.add("-flto=thin");
             linkCmd.add("-fuse-ld=lld");
             linkCmd.add("-O" + effectiveOptLevel);
@@ -227,31 +249,15 @@ public class Compiler implements CompilerPort {
             linkCmd.add("-o");
             linkCmd.add(exePath.toString());
 
-            String os = System.getProperty("os.name").toLowerCase();
-            if (os.contains("linux")) {
-                linkCmd.add("-rdynamic");
-                linkCmd.add("-lpthread");
-                linkCmd.add("-ldl");
-                linkCmd.add("-lm");
-            } else if (os.contains("mac") || os.contains("darwin")) {
-                linkCmd.add("-Wl,-export_dynamic");
-                linkCmd.add("-lpthread");
-                linkCmd.add("-lm");
-            } else if (os.contains("win")) {
-                linkCmd.add("-lpthread");
-                linkCmd.add("-lm");
-            } else {
-                linkCmd.add("-rdynamic");
-                linkCmd.add("-lpthread");
-                linkCmd.add("-ldl");
-                linkCmd.add("-lm");
-            }
+            appendLinkerLibraries(linkCmd, target);
 
+            System.out.println("Linking for target " + target.triple() + "...");
             ProcessBuilder linkBuilder = new ProcessBuilder(linkCmd);
             linkBuilder.inheritIO();
             int exit = linkBuilder.start().waitFor();
             if (exit != 0) {
-                throw new RuntimeException("Linking failed with exit code " + exit);
+                throw new RuntimeException("Linking failed with exit code " + exit
+                    + " (target: " + target.triple() + ")");
             }
 
         } finally {
@@ -347,12 +353,13 @@ public class Compiler implements CompilerPort {
                             List<CompileTask> tasks,
                             Path includeDir,
                             int threadCount,
-                            int optimizationLevel)
+                            int optimizationLevel,
+                            TargetPlatform target)
         throws IOException, InterruptedException {
 
         if (threadCount <= 1 || tasks.size() <= 1) {
             for (CompileTask task : tasks) {
-                compileOne(compiler, task, includeDir, optimizationLevel);
+                compileOne(compiler, task, includeDir, optimizationLevel, target);
             }
             return;
         }
@@ -374,7 +381,8 @@ public class Compiler implements CompilerPort {
                 while ((idx = nextTask.getAndIncrement()) < tasks.size()) {
                     CompileTask task = tasks.get(idx);
                     try {
-                        compileOne(compiler, task, includeDir, optimizationLevel);
+                        compileOne(compiler, task, includeDir,
+                                   optimizationLevel, target);
                     } catch (Throwable t) {
                         failures.add(t);
                     }
@@ -448,9 +456,23 @@ public class Compiler implements CompilerPort {
      * Compiles one task into an LLVM bitcode object. C sources are passed
      * with {@code -x c}; generated LLVM IR modules with {@code -x ir}.
      * Every object participates in the same ThinLTO link step.
+     *
+     * <p>The {@code --target=<triple>} flag is passed to the clang
+     * driver for every translation unit — C and IR alike. For a C
+     * source it selects the target ABI and the corresponding header
+     * search paths (which must be present in the build host's sysroot
+     * for a true cross-compile). For an IR module it tells clang which
+     * target's validation rules and machine-code backend to apply when
+     * it lowers the module into ThinLTO bitcode.</p>
+     *
+     * <p>Without this flag clang would silently target its own host
+     * even when the IR header declares a different triple, producing
+     * either a warning-less mis-compile or a delayed error at link
+     * time. Passing it explicitly makes the target an intentional,
+     * visible property of the build.</p>
      */
     private void compileOne(String compiler, CompileTask task, Path includeDir,
-                            int optimizationLevel)
+                            int optimizationLevel, TargetPlatform target)
         throws IOException, InterruptedException {
 
         // clang does not create intermediate directories for -o. The object
@@ -464,6 +486,7 @@ public class Compiler implements CompilerPort {
 
         List<String> command = new ArrayList<>();
         command.add(compiler);
+        command.add("--target=" + target.triple());
         command.add("-c");
         command.add("-x");
         command.add(task.isIr ? "ir" : "c");
@@ -491,7 +514,8 @@ public class Compiler implements CompilerPort {
         int exit = pb.start().waitFor();
         if (exit != 0) {
             throw new RuntimeException(
-                "Compilation of " + task.src + " failed with exit code " + exit);
+                "Compilation of " + task.src + " failed with exit code " + exit
+                    + " (target: " + target.triple() + ")");
         }
     }
 
@@ -567,6 +591,81 @@ public class Compiler implements CompilerPort {
     // =========================================================================
     //  Native-class discovery
     // =========================================================================
+
+
+    /**
+     * Appends the linker libraries and export flags appropriate for the
+     * target platform to {@code linkCmd}.
+     *
+     * <p>The selection is driven by the target triple, not by the host
+     * {@code os.name} property. The two agree for a native build and
+     * differ for every cross-compile; keying on the host would make a
+     * Linux-to-FreeBSD cross-compile request {@code -ldl} from the
+     * FreeBSD sysroot, where that library does not exist under that
+     * name.</p>
+     *
+     * <p>The set of libraries is deliberately minimal — only the ones
+     * the runtime's C sources actually reference. Adding a library that
+     * the target does not ship is a link-time error, not a silent
+     * fallback, so an under-specified list is easier to diagnose than
+     * an over-specified one.</p>
+     *
+     * <ul>
+     *   <li><b>Windows</b> ({@code *-windows-*}): no {@code -rdynamic}
+     *       (the MSVC linker has no equivalent and interprets it as an
+     *       unknown flag), no {@code -lpthread} (Win32 threads are in
+     *       the CRT), no {@code -ldl} (no dynamic loader library). The
+     *       MinGW target still needs {@code -lm} because its C library
+     *       splits the math functions out of libc.</li>
+     *
+     *   <li><b>Darwin/macOS</b> ({@code *-apple-*}): the equivalent of
+     *       {@code -rdynamic} is {@code -Wl,-export_dynamic};
+     *       {@code -lpthread} is a system stub; there is no
+     *       {@code -ldl} (dlopen lives in libSystem).</li>
+     *
+     *   <li><b>BSD</b> ({@code *-freebsd}, {@code *-netbsd},
+     *       {@code *-openbsd}): {@code -rdynamic} is accepted;
+     *       {@code -lpthread} is a stub in libc on newer versions but
+     *       linking it explicitly is harmless; {@code -ldl} does not
+     *       exist on the BSDs and is omitted.</li>
+     *
+     *   <li><b>Linux and other ELF Unix</b>: the full set —
+     *       {@code -rdynamic -lpthread -ldl -lm} — which is what every
+     *       previous revision of this class has appended
+     *       unconditionally.</li>
+     * </ul>
+     */
+    private static void appendLinkerLibraries(List<String> linkCmd,
+                                              TargetPlatform target) {
+        String triple = target.triple().toLowerCase(Locale.ROOT);
+
+        if (triple.contains("windows")) {
+            linkCmd.add("-lm");
+            return;
+        }
+        if (triple.contains("darwin")
+            || triple.contains("apple")
+            || triple.contains("mac")) {
+            linkCmd.add("-Wl,-export_dynamic");
+            linkCmd.add("-lpthread");
+            linkCmd.add("-lm");
+            return;
+        }
+        if (triple.contains("freebsd")
+            || triple.contains("netbsd")
+            || triple.contains("openbsd")) {
+            linkCmd.add("-rdynamic");
+            linkCmd.add("-lpthread");
+            linkCmd.add("-lm");
+            return;
+        }
+
+        // Linux and every other ELF-based Unix target.
+        linkCmd.add("-rdynamic");
+        linkCmd.add("-lpthread");
+        linkCmd.add("-ldl");
+        linkCmd.add("-lm");
+    }
 
     private Set<String> collectReferencedNativeClasses(Module module,
                                                        DependencyResolver resolver) {

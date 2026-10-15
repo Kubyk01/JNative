@@ -4,6 +4,7 @@ import io.github.kubyk01.domain.inspector.ClassInfo;
 import io.github.kubyk01.domain.inspector.FieldInfo;
 import io.github.kubyk01.domain.inspector.InspectionResult;
 import io.github.kubyk01.domain.inspector.MethodInfo;
+import io.github.kubyk01.domain.ir.TargetPlatform;
 import io.github.kubyk01.port.primary.InspectorPort;
 import io.github.kubyk01.port.primary.OrchestratorPort;
 import io.github.kubyk01.util.LlvmUtil;
@@ -132,6 +133,25 @@ public class CLI implements Runnable {
                 + "A value of 0 (the default) means: use every core "
                 + "reported by Runtime.getRuntime().availableProcessors().")
         int cores,
+        @CommandLine.Option(names = "--target",
+            description = "LLVM target triple. Determines the target triple "
+                + "and (unless --data-layout overrides it) the target datalayout "
+                + "written into every emitted .ll file. "
+                + "Examples: x86_64-pc-linux-gnu, x86_64-pc-windows-msvc, "
+                + "aarch64-unknown-linux-gnu, arm64-apple-darwin. "
+                + "Default: auto-detected from the build host "
+                + "(os.name / os.arch).")
+        String targetTriple,
+
+        @CommandLine.Option(names = "--data-layout",
+            description = "LLVM target datalayout string. Overrides the value "
+                + "that would otherwise be derived from --target. Intended for "
+                + "targets not present in the runtime's table, or for unusual ABI "
+                + "variants (custom code model, soft-float, non-standard pointer "
+                + "width). When this option is used without --target, the triple "
+                + "is still auto-detected from the build host.")
+        String targetDataLayout,
+
         @CommandLine.Option(names = "-O",
             description = "Native compiler optimization level (0-3, default: 2). "
                 + "Passed to clang as -O<level> for both the LLVM IR → bitcode "
@@ -166,10 +186,26 @@ public class CLI implements Runnable {
             showClasses = showAlias = showEscape = showLifetime = showDestructor = true;
         }
 
+        // Resolve the target platform from the two optional overrides and
+        // the build host. The result is a self-consistent (triple,
+        // datalayout) pair: TargetPlatform.resolve() handles the four
+        // cases (no override, triple only, datalayout only, both) so the
+        // CLI does not need any branching of its own.
+        TargetPlatform platform =
+            TargetPlatform.resolve(targetTriple, targetDataLayout);
+
+        System.out.println("LLVM target platform:");
+        System.out.println("  triple      : " + platform.triple());
+        System.out.println("  datalayout  : " + platform.dataLayout());
+        if (targetTriple == null && targetDataLayout == null) {
+            System.out.println("  (auto-detected from os.name / os.arch; "
+                + "use --target or --data-layout to override)");
+        }
+
         Path path = file.toPath();
         orchestrator.analyze(path, entryClass, entryMethod, descriptor,
             showClasses, showAlias, showEscape, showLifetime, showDestructor,
             outputFile, noCompile, includeSystem, debugName, showClassesGraph,
-            cores, optimizationLevel);
+            cores, optimizationLevel, platform);
     }
 }

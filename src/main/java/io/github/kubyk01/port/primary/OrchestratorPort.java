@@ -1,5 +1,7 @@
 package io.github.kubyk01.port.primary;
 
+import io.github.kubyk01.domain.ir.TargetPlatform;
+
 import java.nio.file.Path;
 
 public interface OrchestratorPort {
@@ -19,5 +21,6 @@ public interface OrchestratorPort {
                  String debugName,
                  boolean showClassesGraph,
                  int cores,
-                 int optimizationLevel);
+                 int optimizationLevel,
+                 TargetPlatform targetPlatform);
 }

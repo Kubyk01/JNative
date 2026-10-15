@@ -2,6 +2,7 @@ package io.github.kubyk01.port.secondary;
 
 import io.github.kubyk01.application.service.analyzer.dependencyresolver.DependencyResolver;
 import io.github.kubyk01.domain.ir.Module;
+import io.github.kubyk01.domain.ir.TargetPlatform;
 
 import java.io.IOException;
 import java.nio.file.Path;
@@ -16,7 +17,8 @@ public interface CompilerPort {
                         Module module,
                         DependencyResolver resolver,
                         int cores,
-                        int optimizationLevel)
+                        int optimizationLevel,
+                        TargetPlatform targetPlatform)
         throws IOException, InterruptedException;
 
     boolean hasNativeSupport(String className);

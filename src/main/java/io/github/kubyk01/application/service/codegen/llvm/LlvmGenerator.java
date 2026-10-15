@@ -24,6 +24,7 @@ import io.github.kubyk01.domain.ir.ReturnTerminator;
 import io.github.kubyk01.domain.ir.Temporary;
 import io.github.kubyk01.domain.ir.Type;
 import io.github.kubyk01.domain.ir.Value;
+import io.github.kubyk01.domain.ir.TargetPlatform;
 import io.github.kubyk01.domain.analyzer.reflection.ReflectClassInfo;
 import io.github.kubyk01.domain.analyzer.reflection.ReflectInfo;
 import lombok.extern.slf4j.Slf4j;
@@ -75,6 +76,17 @@ public class LlvmGenerator {
     private Map<String, String> clinitWrappers = new HashMap<>();
 
     /**
+     * LLVM target platform: the {@code target datalayout} and
+     * {@code target triple} lines that head every emitted {@code .ll}
+     * file. Populated by {@link #setTargetPlatform(TargetPlatform)} from
+     * the orchestrator, which derives it from the CLI overrides and the
+     * build host. Defaults to the platform detected from the running
+     * JVM, so the class is usable from unit tests that never call the
+     * setter.
+     */
+    private TargetPlatform targetPlatform = TargetPlatform.detectFromBuildHost();
+
+    /**
      * Resources to bake into the image, in the order the caller collected
      * them. Each entry is a path and its bytes; the path is the internal
      * form {@code Class.getResourceAsStream} resolves to (leading {@code '/'}
@@ -97,6 +109,22 @@ public class LlvmGenerator {
 
     public void setClinitWrappers(Map<String, String> wrappers) {
         this.clinitWrappers = wrappers != null ? wrappers : new HashMap<>();
+    }
+
+    /**
+     * Overrides the LLVM target platform used in the module header.
+     *
+     * <p>Passing {@code null} keeps the currently configured platform.
+     * This mirrors the null-tolerant behaviour of
+     * {@link #setClinitSchedule(List)} and
+     * {@link #setEmbeddedResources(List)}, so a caller that builds the
+     * argument conditionally does not need a null check at the call
+     * site.</p>
+     */
+    public void setTargetPlatform(TargetPlatform platform) {
+        if (platform != null) {
+            this.targetPlatform = platform;
+        }
     }
 
     public LlvmGenerator(Module module, DependencyResolver resolver,
@@ -315,8 +343,13 @@ public class LlvmGenerator {
         }
 
         StringBuilder sb = new StringBuilder();
-        sb.append("target datalayout = \"e-m:e-p270:32:32-p271:64:64-i64:64-f80:128-n8:16:32:64-S128\"\n");
-        sb.append("target triple = \"x86_64-pc-linux-gnu\"\n\n");
+        // The module header carries the target platform configured for
+        // this build: the value detected from the build host by default,
+        // or whatever the CLI's --target / --data-layout options
+        // supplied. Both lines come from a single TargetPlatform value,
+        // so a partial override cannot produce a triple that disagrees
+        // with its datalayout.
+        sb.append(targetPlatform.preamble());
 
         for (Map.Entry<String, String> e : allDefs.entrySet()) {
             if (needed.contains(e.getKey())) {
@@ -427,36 +460,6 @@ public class LlvmGenerator {
 
             i++;
         }
-    }
-
-    /**
-     * Static prelude shared by {@code _module.ll} and every per-class file:
-     * datalayout/triple, the vtable ABI types, the runtime function
-     * declarations, the extra (lambda) structs, and the struct type
-     * definitions. Built exactly once.
-     */
-    private String buildStaticPrelude(String structDefs) {
-        StringBuilder sb = new StringBuilder();
-        sb.append("target datalayout = \"e-m:e-p270:32:32-p271:64:64-i64:64-f80:128-n8:16:32:64-S128\"\n");
-        sb.append("target triple = \"x86_64-pc-linux-gnu\"\n\n");
-        sb.append(LlvmRuntime.getVtableTypeDefinition()).append("\n");
-        sb.append(LlvmRuntime.getDeclarations()).append("\n");
-
-        // Extra structs (lambda structs etc., registered by createLambdaAdaptor).
-        StringBuilder extra = new StringBuilder();
-        globalEmitter.emitExtraStructs(extra);
-        sb.append(extra);
-
-        // Struct type definitions, the reflection / resource ABI types, and
-        // the layout constants. They are duplicated into every file; LLVM
-        // unifies types by name. The ABI types (%ReflectionClass and friends)
-        // are referenced by the global definitions in _module.ll, so they
-        // must be present there, and per-class files carry them so body
-        // references resolve regardless of which file they land in.
-        sb.append(structDefs);
-        sb.append(globalEmitter.generateTypeDefinitions());
-        sb.append("\n");
-        return sb.toString();
     }
 
     /**
