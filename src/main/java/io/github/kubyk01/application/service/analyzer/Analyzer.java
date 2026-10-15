@@ -58,6 +58,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicReference;
@@ -1141,36 +1142,172 @@ public class Analyzer {
             callGraph.put(func.getName(), callees);
         });
 
-        // ---- Parallel scope / nested computation ----
+        // =================================================================
+        //  Pre-computation pass 1: per-function direct facts.
+        //
+        //  For every live function we pre-collect:
+        //    - the set of trigger-owner classes it observes directly
+        //      (NEW / GET_STATIC / PUT_STATIC / STATIC_CALL owners);
+        //    - the set of static fields it reads directly;
+        //    - the set of static fields it writes directly.
+        //
+        //  These are stored as int[] arrays of IDs into two global
+        //  universes (trigger classes and static field keys).  Downstream
+        //  passes then only ever need OR / AND bit operations over long[]
+        //  bitsets instead of re-scanning the instructions of every
+        //  function in every init's scope.
+        // =================================================================
+
+        List<Function> liveFunctions = new ArrayList<>(functionsSnapshot.size());
+        for (Function f : functionsSnapshot) {
+            if (f.getEntryBlock() != null) liveFunctions.add(f);
+        }
+
+        Map<String, Integer> funcIndex = new HashMap<>(liveFunctions.size() * 2);
+        for (int i = 0; i < liveFunctions.size(); i++) {
+            funcIndex.put(liveFunctions.get(i).getName(), i);
+        }
+
+        // Serial deterministic pre-scan of the two universes.
+        TreeSet<String> triggerClassUniverse = new TreeSet<>();
+        TreeSet<String> fieldKeyUniverse     = new TreeSet<>();
+        for (Function f : liveFunctions) {
+            for (BasicBlock b : f.getBlocks()) {
+                for (Instruction inst : b.getInstructions()) {
+                    Opcode op = inst.getOpcode();
+                    if (op == Opcode.NEW || op == Opcode.GET_STATIC
+                        || op == Opcode.PUT_STATIC || op == Opcode.STATIC_CALL) {
+                        String owner = extractTriggerOwner(inst);
+                        if (owner != null && !owner.isEmpty()) {
+                            triggerClassUniverse.add(owner);
+                        }
+                    }
+                    if (op == Opcode.GET_STATIC || op == Opcode.PUT_STATIC) {
+                        String key = extractStaticFieldKey(inst);
+                        if (key != null) fieldKeyUniverse.add(key);
+                    }
+                }
+            }
+        }
+
+        final List<String> classList = new ArrayList<>(triggerClassUniverse);
+        final List<String> fieldList = new ArrayList<>(fieldKeyUniverse);
+
+        final Map<String, Integer> classIdMap = new HashMap<>(classList.size() * 2);
+        for (int i = 0; i < classList.size(); i++) classIdMap.put(classList.get(i), i);
+        final Map<String, Integer> fieldIdMap = new HashMap<>(fieldList.size() * 2);
+        for (int i = 0; i < fieldList.size(); i++) fieldIdMap.put(fieldList.get(i), i);
+
+        final int classWords = (classList.size() + 63) >>> 6;
+        final int fieldWords = (fieldList.size() + 63) >>> 6;
+
+        System.out.println("Pre-computing per-function initialization facts: "
+            + classList.size() + " distinct trigger class(es), "
+            + fieldList.size() + " distinct static field key(s)");
+
+        final int[][] funcTriggerIds = new int[liveFunctions.size()][];
+        final int[][] funcReadIds    = new int[liveFunctions.size()][];
+        final int[][] funcWriteIds   = new int[liveFunctions.size()][];
+
+        forEachParallel(liveFunctions, func -> {
+            int idx = funcIndex.get(func.getName());
+            ArrayList<Integer> trig = new ArrayList<>();
+            ArrayList<Integer> rd   = new ArrayList<>();
+            ArrayList<Integer> wr   = new ArrayList<>();
+            for (BasicBlock block : func.getBlocks()) {
+                for (Instruction inst : block.getInstructions()) {
+                    Opcode op = inst.getOpcode();
+                    if (op == Opcode.NEW || op == Opcode.GET_STATIC
+                        || op == Opcode.PUT_STATIC || op == Opcode.STATIC_CALL) {
+                        String owner = extractTriggerOwner(inst);
+                        if (owner != null && !owner.isEmpty()) {
+                            Integer id = classIdMap.get(owner);
+                            if (id != null) trig.add(id);
+                        }
+                    }
+                    if (op == Opcode.GET_STATIC || op == Opcode.PUT_STATIC) {
+                        String key = extractStaticFieldKey(inst);
+                        if (key != null) {
+                            Integer id = fieldIdMap.get(key);
+                            if (id != null) {
+                                if (op == Opcode.PUT_STATIC) wr.add(id);
+                                else                        rd.add(id);
+                            }
+                        }
+                    }
+                }
+            }
+            funcTriggerIds[idx] = toIntArray(trig);
+            funcReadIds[idx]    = toIntArray(rd);
+            funcWriteIds[idx]   = toIntArray(wr);
+        });
+
+        // =================================================================
+        //  Pre-computation pass 2: init-scope BFS with fact accumulation.
+        //
+        //  For each init (clinit or bootstrap phase) we BFS through the
+        //  call graph, never entering another init's body, and — instead
+        //  of building a huge Set<String> scope — we accumulate three
+        //  bitsets by OR-ing the small per-function id arrays of every
+        //  visited function.
+        //
+        //  This replaces the previous three independent passes
+        //  (initScope, triggeredClasses, fieldWriters/fieldReaders), each
+        //  of which walked the whole scope and all of its instructions.
+        // =================================================================
+
         Set<String> allInitializerNames = new HashSet<>(clinitNames);
         for (Function f : phaseFunctions) allInitializerNames.add(f.getName());
 
-        List<Function> allInit = new ArrayList<>(clinitFunctions.size() + phaseFunctions.size());
+        List<Function> allInit = new ArrayList<>(
+            clinitFunctions.size() + phaseFunctions.size());
         allInit.addAll(clinitFunctions);
         allInit.addAll(phaseFunctions);
 
-        Map<String, Set<String>> initScope = new ConcurrentHashMap<>();
-        Map<String, Set<String>> nestedInit = new ConcurrentHashMap<>();
+        final Map<String, long[]> initTriggerBits = new ConcurrentHashMap<>();
+        final Map<String, long[]> initReadBits    = new ConcurrentHashMap<>();
+        final Map<String, long[]> initWriteBits   = new ConcurrentHashMap<>();
+        final Map<String, Set<String>> nestedInit = new ConcurrentHashMap<>();
+        final Set<String> allInitializerNamesF = allInitializerNames;
+        final Map<String, Set<String>> callGraphF = callGraph;
+
         forEachParallel(allInit, init -> {
-            Set<String> scope  = new LinkedHashSet<>();
-            Set<String> nested = new LinkedHashSet<>();
+            String initName = init.getName();
+            long[] trig = new long[classWords];
+            long[] rd   = new long[fieldWords];
+            long[] wr   = new long[fieldWords];
+            Set<String> nested   = new LinkedHashSet<>();
+            Set<String> visited  = new HashSet<>();
             Deque<String> worklist = new ArrayDeque<>();
-            scope.add(init.getName());
-            worklist.push(init.getName());
+
+            visited.add(initName);
+            worklist.push(initName);
+            orInFunctionFacts(initName, funcIndex,
+                              funcTriggerIds, funcReadIds, funcWriteIds,
+                              trig, rd, wr);
+
             while (!worklist.isEmpty()) {
                 String cur = worklist.pop();
-                Set<String> callees = callGraph.get(cur);
+                Set<String> callees = callGraphF.get(cur);
                 if (callees == null) continue;
                 for (String callee : callees) {
-                    if (allInitializerNames.contains(callee)) {
+                    if (allInitializerNamesF.contains(callee)) {
                         nested.add(callee);
                         continue;
                     }
-                    if (scope.add(callee)) worklist.push(callee);
+                    if (visited.add(callee)) {
+                        worklist.push(callee);
+                        orInFunctionFacts(callee, funcIndex,
+                                          funcTriggerIds, funcReadIds, funcWriteIds,
+                                          trig, rd, wr);
+                    }
                 }
             }
-            initScope.put(init.getName(), scope);
-            nestedInit.put(init.getName(), nested);
+
+            initTriggerBits.put(initName, trig);
+            initReadBits.put(initName, rd);
+            initWriteBits.put(initName, wr);
+            nestedInit.put(initName, nested);
         });
 
         // ---- Parallel triggered-class collection ----
@@ -1200,18 +1337,18 @@ public class Analyzer {
                 }
             }
 
-            Set<String> scope = initScope.get(init.getName());
-            if (scope != null) {
-                for (String funcName : scope) {
-                    Function func = module.getFunction(funcName);
-                    if (func == null || func.getEntryBlock() == null) continue;
-                    for (BasicBlock block : func.getBlocks()) {
-                        for (Instruction inst : block.getInstructions()) {
-                            collectClassInitTriggers(inst, triggered);
-                        }
+            long[] bits = initTriggerBits.get(init.getName());
+            if (bits != null) {
+                for (int w = 0; w < bits.length; w++) {
+                    long word = bits[w];
+                    while (word != 0) {
+                        int bit = Long.numberOfTrailingZeros(word);
+                        triggered.add(classList.get((w << 6) + bit));
+                        word &= word - 1;
                     }
                 }
             }
+
             triggeredClasses.put(init, triggered);
         });
 
@@ -1231,28 +1368,36 @@ public class Analyzer {
             }
         }
 
-        // ---- Parallel static-field writer/reader collection ----
+        // ---- Field writer/reader maps, built from bitsets ----
         Map<String, Set<Function>> fieldWriters = new ConcurrentHashMap<>();
         Map<String, Set<Function>> fieldReaders = new ConcurrentHashMap<>();
+
         forEachParallel(allInit, init -> {
-            Set<String> scope = initScope.get(init.getName());
-            if (scope == null) return;
-            for (String funcName : scope) {
-                Function func = module.getFunction(funcName);
-                if (func == null || func.getEntryBlock() == null) continue;
-                for (BasicBlock block : func.getBlocks()) {
-                    for (Instruction inst : block.getInstructions()) {
-                        Opcode op = inst.getOpcode();
-                        if (op != Opcode.PUT_STATIC && op != Opcode.GET_STATIC) continue;
-                        String field = extractStaticFieldKey(inst);
-                        if (field == null) continue;
-                        if (op == Opcode.PUT_STATIC) {
-                            fieldWriters.computeIfAbsent(field, k ->
-                                ConcurrentHashMap.newKeySet()).add(init);
-                        } else {
-                            fieldReaders.computeIfAbsent(field, k ->
-                                ConcurrentHashMap.newKeySet()).add(init);
-                        }
+            long[] rbits = initReadBits.get(init.getName());
+            if (rbits != null) {
+                for (int w = 0; w < rbits.length; w++) {
+                    long word = rbits[w];
+                    while (word != 0) {
+                        int bit = Long.numberOfTrailingZeros(word);
+                        String field = fieldList.get((w << 6) + bit);
+                        fieldReaders
+                            .computeIfAbsent(field, k -> ConcurrentHashMap.newKeySet())
+                            .add(init);
+                        word &= word - 1;
+                    }
+                }
+            }
+            long[] wbits = initWriteBits.get(init.getName());
+            if (wbits != null) {
+                for (int w = 0; w < wbits.length; w++) {
+                    long word = wbits[w];
+                    while (word != 0) {
+                        int bit = Long.numberOfTrailingZeros(word);
+                        String field = fieldList.get((w << 6) + bit);
+                        fieldWriters
+                            .computeIfAbsent(field, k -> ConcurrentHashMap.newKeySet())
+                            .add(init);
+                        word &= word - 1;
                     }
                 }
             }
@@ -1360,7 +1505,9 @@ public class Analyzer {
         // use, which is by construction after the phase that provoked
         // that use. See computeDeferredClinits() for the full rationale.
         Set<String> deferred = computeDeferredClinits(
-            clinitOrder, phaseOrder, afterMap, initScope, module);
+            clinitOrder, phaseOrder, afterMap,
+            initReadBits, initWriteBits,
+            fieldIdMap, fieldWords);
 
         if (!deferred.isEmpty()) {
             this.deferredClinits.addAll(deferred);
@@ -1533,90 +1680,72 @@ public class Analyzer {
      * initialization because eager scheduling cannot satisfy them together
      * with the bootstrap phases.
      *
-     * <p>The conflict is structural. Between a phase {@code P} and the set of
-     * class initializers there are two opposing edge families:</p>
+     * <p>This method is a bitset-driven version of the original algorithm.
+     * Its correctness is identical to the previous implementation — the
+     * family-A / family-B split, the fixed point over the surviving
+     * schedule, and the {@code afterMap} clamping are unchanged — but the
+     * inner test is now two {@code long[] & long[]} operations instead of
+     * a nested walk over every instruction of every function in the
+     * candidate clinit's scope.</p>
+     *
+     * <p>The relevant sets are precomputed once, during the init-scope BFS
+     * in {@link #sortInitializers}:</p>
      *
      * <ul>
-     *   <li>{@code phase → clinit} (family A): the phase reads a static field
-     *       written by some initializer, so that initializer must run
-     *       <em>before</em> the phase;</li>
-     *   <li>{@code clinit → phase} (family B): an initializer reads a static
-     *       field written by the phase, so the phase must run <em>before</em>
-     *       that initializer.</li>
+     *   <li>{@code pWrites} = {@code initWriteBits.get(p.getName())} —
+     *       every static field written anywhere in the phase's transitive
+     *       scope;</li>
+     *   <li>{@code cReads} = {@code initReadBits.get(c.getName())} —
+     *       every static field read anywhere in the clinit's transitive
+     *       scope;</li>
+     *   <li>{@code cWrites} = {@code initWriteBits.get(c.getName())} —
+     *       every static field written anywhere in the clinit's scope;</li>
+     *   <li>{@code pDirectReads} — every static field read by the phase's
+     *       <em>own body only</em>. This is the only piece of information
+     *       that the init-scope BFS cannot supply, because it deliberately
+     *       collapses the phase's own body and its transitive scope into
+     *       one union. It is recomputed here directly from the phase's
+     *       instruction stream — a single pass over one function, once per
+     *       call.</li>
      * </ul>
      *
-     * <p>When the transitive closure of both families contains a cycle —
-     * which is always the case in {@code java.base} — no linear schedule can
-     * satisfy both. Every initializer that is <em>only</em> in family B is
-     * therefore removed from the eager schedule entirely. Its wrapper —
-     * installed by the lazy-clinit instrumenter — fires on first active use,
-     * which is necessarily after the phase that triggered that use.</p>
-     *
-     * <h2>Precision of the family-A test</h2>
-     *
-     * <p>Family A is evaluated against the fields read by the phase's
-     * <em>own body only</em>, not against the fields read anywhere in the
-     * phase's transitive scope.</p>
-     *
-     * <p>The rationale is the interaction with
-     * {@link LazyClinitInstrumenter}. When a class {@code C} is deferred,
-     * every active-use site of every field {@code C} writes is rewritten to
-     * call {@code C}'s wrapper before the read. A read that occurs deep in
-     * the phase's call chain therefore triggers {@code C} lazily at exactly
-     * the point where the read happens. If that point is after the phase has
-     * finished writing its own fields — the normal case, because the phase's
-     * job is precisely to write those fields early — deferring {@code C} is
-     * harmless. If that point is before, deferring {@code C} and keeping it
-     * eager would both fail identically: the read site triggers {@code C}
-     * at the same moment in either case, and the outcome is the same.</p>
-     *
-     * <p>A read in the phase's own body, by contrast, cannot be protected by
-     * the wrapper's instrumentation in the same way: the phase's body is the
-     * top frame of the eager execution, and any field it reads from
-     * {@code C} is read before the phase yields control. If the phase's own
-     * body reads a field written by {@code C}, then {@code C} must have run
-     * before the phase began; deferring {@code C} would only postpone the
-     * trigger to the same instruction, which is not necessarily after the
-     * phase's own writes.</p>
-     *
-     * <p>Narrowing family A to the phase's own body is therefore the
-     * tightest safe criterion. Using the full transitive scope — as an
-     * earlier revision did — makes {@code pReads} a set of thousands of
-     * fields, every candidate clinit is classified as "family A", and
-     * nothing is ever deferred. This is exactly the state that produced</p>
+     * <p>The three tests in the loop then become:</p>
      *
      * <pre>
-     *   java.lang.NullPointerException: Cannot invoke
-     *     java.lang.SecurityManager.addNonExportedPackages(Ljava/lang/ModuleLayer;)V
-     *     because receiver of
-     *     java/lang/ModuleLayer.modules()Ljava/util/Set; is null
-     *       at java.lang.SecurityManager.addNonExportedPackages
-     *       at java.lang.SecurityManager.&lt;clinit&gt;
+     *     cReadsP  == (cReads  &amp; pWrites)      != 0
+     *     cWritesP == (cWrites &amp; pDirectReads) != 0
      * </pre>
      *
-     * <p>with {@code java.lang.SecurityManager.<clinit>} left in the eager
-     * schedule at a position before {@code System.initPhase2} and reading
-     * {@code System.bootLayer} (assigned exclusively by initPhase2) while it
-     * was still null.</p>
-     *
-     * <h2>Iteration</h2>
-     *
-     * <p>The pass is repeated to a fixed point. Deferring a clinit removes
-     * it from the eager schedule, which shrinks the position index of every
-     * later clinit; a clinit that was previously past {@code after(P)} can
-     * therefore become a family-B candidate on the next iteration.
-     * Convergence is guaranteed because each iteration either defers at
-     * least one new clinit or terminates, and the total number of clinits
-     * is finite.</p>
-     *
-     * @return mangled names of the deferred {@code <clinit>} functions.
+     * <p>which is exactly the original semantics, evaluated on the same
+     * precomputed universes.</p>
      */
     private Set<String> computeDeferredClinits(
             List<Function> clinitOrder,
             List<Function> phaseOrder,
             Map<Function, Integer> afterMap,
-            Map<String, Set<String>> initScope,
-            Module module) {
+            Map<String, long[]> initReadBits,
+            Map<String, long[]> initWriteBits,
+            Map<String, Integer> fieldIdMap,
+            int fieldWords) {
+
+        // Per-phase direct reads (phase body only). This is the only
+        // piece of information that the scope BFS could not have provided
+        // — it aggregated scope-level unions, and pDirectReads is the
+        // phase's own body reads, which is a strictly smaller set.
+        Map<Function, long[]> phaseDirectReadBits = new HashMap<>();
+        for (Function p : phaseOrder) {
+            long[] bits = new long[fieldWords];
+            for (BasicBlock b : p.getBlocks()) {
+                for (Instruction inst : b.getInstructions()) {
+                    if (inst.getOpcode() != Opcode.GET_STATIC) continue;
+                    String key = extractStaticFieldKey(inst);
+                    if (key == null) continue;
+                    Integer id = fieldIdMap.get(key);
+                    if (id != null) bits[id >>> 6] |= 1L << (id & 63);
+                }
+            }
+            phaseDirectReadBits.put(p, bits);
+        }
 
         Set<String> deferred = new LinkedHashSet<>();
 
@@ -1631,39 +1760,10 @@ public class Analyzer {
                 int after = afterMap.getOrDefault(p, 0);
                 if (after <= 0) continue;
 
-                Set<String> pScope = initScope.get(p.getName());
-                if (pScope == null) continue;
+                long[] pWrites = initWriteBits.get(p.getName());
+                if (pWrites == null || bitsEmpty(pWrites)) continue;
 
-                // Fields written anywhere in the phase's transitive scope.
-                // A clinit that reads any of these is family B for this
-                // phase and is a deferral candidate.
-                Set<String> pWrites = new HashSet<>();
-                for (String fname : pScope) {
-                    Function f = module.getFunction(fname);
-                    if (f == null || f.getEntryBlock() == null) continue;
-                    for (BasicBlock b : f.getBlocks()) {
-                        for (Instruction inst : b.getInstructions()) {
-                            if (inst.getOpcode() == Opcode.PUT_STATIC) {
-                                String key = extractStaticFieldKey(inst);
-                                if (key != null) pWrites.add(key);
-                            }
-                        }
-                    }
-                }
-                if (pWrites.isEmpty()) continue;
-
-                // Fields read by the phase's OWN body. This is the only set
-                // that determines whether the phase still needs a candidate
-                // clinit eagerly placed before it. See the method javadoc.
-                Set<String> pDirectReads = new HashSet<>();
-                for (BasicBlock b : p.getBlocks()) {
-                    for (Instruction inst : b.getInstructions()) {
-                        if (inst.getOpcode() == Opcode.GET_STATIC) {
-                            String key = extractStaticFieldKey(inst);
-                            if (key != null) pDirectReads.add(key);
-                        }
-                    }
-                }
+                long[] pDirectReads = phaseDirectReadBits.get(p);
 
                 int scanEnd = Math.min(after, clinitOrder.size());
                 for (int i = 0; i < scanEnd; i++) {
@@ -1671,47 +1771,14 @@ public class Analyzer {
                     String cName = c.getName();
                     if (deferred.contains(cName)) continue;
 
-                    Set<String> cScope = initScope.get(cName);
-                    if (cScope == null) continue;
+                    long[] cReads  = initReadBits.get(cName);
+                    long[] cWrites = initWriteBits.get(cName);
+                    if (cReads == null || cWrites == null) continue;
 
-                    boolean cReadsP  = false;
-                    boolean cWritesP = false;
+                    boolean cReadsP  = bitsIntersect(cReads,  pWrites);
+                    boolean cWritesP = (pDirectReads != null)
+                        && bitsIntersect(cWrites, pDirectReads);
 
-                    outer:
-                    for (String fname : cScope) {
-                        Function f = module.getFunction(fname);
-                        if (f == null || f.getEntryBlock() == null) continue;
-                        for (BasicBlock b : f.getBlocks()) {
-                            for (Instruction inst : b.getInstructions()) {
-                                Opcode op = inst.getOpcode();
-                                if (op == Opcode.GET_STATIC) {
-                                    String key = extractStaticFieldKey(inst);
-                                    if (key != null && pWrites.contains(key)) {
-                                        cReadsP = true;
-                                    }
-                                } else if (op == Opcode.PUT_STATIC) {
-                                    String key = extractStaticFieldKey(inst);
-                                    if (key != null && pDirectReads.contains(key)) {
-                                        cWritesP = true;
-                                    }
-                                }
-                                if (cReadsP && cWritesP) break outer;
-                            }
-                        }
-                    }
-
-                    // Family B only: defer. Family A or A∩B: leave in the
-                    // eager schedule — the phase still depends on it.
-                    //
-                    // The verbose per-candidate trace ("defer candidate:
-                    // <clinit> (reads a field written by phase <p>, ...)")
-                    // was useful while the deferral rule was being debugged
-                    // against a full JDK closure, where it printed hundreds
-                    // of lines per pass and dominated the analysis log. The
-                    // aggregate is still reported once per run by the
-                    // "Deferring N <clinit>(s) ..." summary below, which is
-                    // the only line a caller needs; the per-candidate
-                    // detail is omitted.
                     if (cReadsP && !cWritesP) {
                         deferred.add(cName);
                         changed = true;
@@ -1719,9 +1786,12 @@ public class Analyzer {
                 }
             }
 
-            // Each pass may unblock new candidates because defers shift the
-            // index of later clinits. Recompute `after` against the trimmed
-            // schedule before the next pass.
+            // Each pass may unblock new candidates because defers shift
+            // the index of later clinits. Clamp `after` against the
+            // trimmed schedule before the next pass — same conservative
+            // approximation as the previous revision (a smaller `after`
+            // makes strictly more candidates eligible, which is the safe
+            // direction).
             if (changed) {
                 Map<Function, Integer> trimmedIdx = new HashMap<>();
                 int k = 0;
@@ -1731,20 +1801,6 @@ public class Analyzer {
                     }
                 }
                 for (Function p : phaseOrder) {
-                    // Re-derive from the same deps the phase had, but only
-                    // over clinits that survive the deferral.
-                    // (deps is not passed here; we approximate by scanning
-                    // the surviving order and taking the largest index whose
-                    // name is in the phase's written-field provenance.)
-                    //
-                    // The approximation is conservative: it can only fail to
-                    // shrink after(P), which leaves more candidates eligible,
-                    // never fewer. That is the safe direction.
-                    //
-                    // A tighter bound would require deps to be threaded
-                    // through; the conservative version is sufficient because
-                    // the fixed point terminates by exhausting the clinit
-                    // list.
                     Integer prev = afterMap.get(p);
                     if (prev != null && prev > trimmedIdx.size()) {
                         afterMap.put(p, trimmedIdx.size());
@@ -1760,6 +1816,82 @@ public class Analyzer {
         }
 
         return deferred;
+    }
+
+    /**
+     * ORs the pre-computed fact arrays of one function into three
+     * accumulator bitsets.
+     *
+     * <p>The three {@code int[]} arrays are indexed by function index
+     * (see {@code funcIndex}); every entry is an ID into the corresponding
+     * global universe. The bitsets are updated in place.</p>
+     *
+     * <p>Called from the init-scope BFS for every function newly visited
+     * by a given init. Because the per-function arrays are typically only
+     * a handful of elements long, this is a few dozen {@code OR}
+     * operations at most, versus the tens of thousands of instruction
+     * scans that the previous implementation performed per init.</p>
+     */
+    private static void orInFunctionFacts(String funcName,
+                                          Map<String, Integer> funcIndex,
+                                          int[][] funcTriggers,
+                                          int[][] funcReads,
+                                          int[][] funcWrites,
+                                          long[] trigBits,
+                                          long[] readBits,
+                                          long[] writeBits) {
+        Integer idxObj = funcIndex.get(funcName);
+        if (idxObj == null) return;
+        int idx = idxObj;
+
+        int[] trig = funcTriggers[idx];
+        for (int id : trig) {
+            trigBits[id >>> 6] |= 1L << (id & 63);
+        }
+        int[] rd = funcReads[idx];
+        for (int id : rd) {
+            readBits[id >>> 6] |= 1L << (id & 63);
+        }
+        int[] wr = funcWrites[idx];
+        for (int id : wr) {
+            writeBits[id >>> 6] |= 1L << (id & 63);
+        }
+    }
+
+    /**
+     * Converts a {@code List<Integer>} to an {@code int[]}. Used once per
+     * function during the pre-computation pass; the JIT folds the manual
+     * loop well enough that there is no reason to pull in a stream.
+     */
+    private static int[] toIntArray(List<Integer> list) {
+        int[] arr = new int[list.size()];
+        for (int i = 0; i < list.size(); i++) arr[i] = list.get(i);
+        return arr;
+    }
+
+    /**
+     * Word-wise intersection test with early exit on the first
+     * overlapping bit. Both arrays are expected to be the same length;
+     * the {@code Math.min} guard is purely defensive.
+     */
+    private static boolean bitsIntersect(long[] a, long[] b) {
+        int n = Math.min(a.length, b.length);
+        for (int i = 0; i < n; i++) {
+            if ((a[i] & b[i]) != 0) return true;
+        }
+        return false;
+    }
+
+    /**
+     * Returns true iff every word of {@code bits} is zero, i.e. the
+     * represented set is empty. Used as a fast-path skip for phases whose
+     * transitive scope writes nothing at all.
+     */
+    private static boolean bitsEmpty(long[] bits) {
+        for (long bit : bits) {
+            if (bit != 0) return false;
+        }
+        return true;
     }
 
     /**
@@ -1877,13 +2009,6 @@ public class Analyzer {
             }
             default:
                 break;
-        }
-    }
-
-    private static void collectClassInitTriggers(Instruction inst, Set<String> out) {
-        String owner = extractTriggerOwner(inst);
-        if (owner != null && !owner.isEmpty()) {
-            out.add(owner);
         }
     }
 

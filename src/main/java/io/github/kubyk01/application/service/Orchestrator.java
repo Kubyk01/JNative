@@ -27,6 +27,7 @@ import io.github.kubyk01.port.primary.OrchestratorPort;
 import io.github.kubyk01.port.secondary.CompilerPort;
 import io.github.kubyk01.util.LlvmUtil;
 import lombok.extern.slf4j.Slf4j;
+import reactor.core.publisher.Flux;
 import reactor.core.scheduler.Scheduler;
 import reactor.core.scheduler.Schedulers;
 
@@ -41,6 +42,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
 
@@ -129,6 +131,7 @@ public class Orchestrator implements OrchestratorPort {
 
         // --- 2. Reachability analysis -------------------------------------
         ReachabilityAnalysis analysis = new ReachabilityAnalysis(resolver);
+        analysis.setScheduler(scheduler);
         analysis.applyMetadata(resolver.getMetadata());
         analysis.analyzeFromEntry(entryClass, entryMethod, entryDescriptor);
 
@@ -212,26 +215,58 @@ public class Orchestrator implements OrchestratorPort {
         Set<String> allClasses = analysis.getReachableClasses();
         Set<MethodReference> allMethods = analysis.getReachableMethods();
 
-        Set<String> usedSystemClasses = new HashSet<>();
-        for (String cls : allClasses) {
-            if (LlvmUtil.isSystemClassName(cls) && compiler.hasNativeSupport(cls)) {
-                usedSystemClasses.add(cls);
-            }
-        }
+        Set<String> usedSystemClasses = ConcurrentHashMap.newKeySet();
+        Set<String> polymorphicClasses = ConcurrentHashMap.newKeySet();
 
-        // --- 3. Polymorphic-resolver warm-up ------------------------------
-        Set<String> polymorphicClasses = new HashSet<>();
-        for (String cls : allClasses) {
-            ClassNode node = resolver.getClassNode(cls);
-            if (node != null && node.getPolymorphicMethodNames() != null
-                    && !node.getPolymorphicMethodNames().isEmpty()) {
-                polymorphicClasses.add(cls);
-            }
-        }
+        // ---- Parallel collection of system classes with native support ----
+        //
+        // hasNativeSupport() opens one classpath resource per call; on a
+        // shaded jar with a few thousand system classes, doing this
+        // serially is measurable. The check is stateless and thread-safe
+        // (it only reads the current thread's context class loader and
+        // the classpath), so it parallelises cleanly.
+        LlvmUtil.awaitMono(
+            Flux.fromIterable(allClasses)
+                .parallel()
+                .runOn(scheduler)
+                .doOnNext(cls -> {
+                    if (LlvmUtil.isSystemClassName(cls)
+                        && compiler.hasNativeSupport(cls)) {
+                        usedSystemClasses.add(cls);
+                    }
+                })
+                .sequential()
+                .then()
+        );
+
+        // ---- Parallel collection of polymorphic-method-bearing classes ----
+        LlvmUtil.awaitMono(
+            Flux.fromIterable(allClasses)
+                .parallel()
+                .runOn(scheduler)
+                .doOnNext(cls -> {
+                    ClassNode node = resolver.getClassNode(cls);
+                    if (node != null && node.getPolymorphicMethodNames() != null
+                            && !node.getPolymorphicMethodNames().isEmpty()) {
+                        polymorphicClasses.add(cls);
+                    }
+                })
+                .sequential()
+                .then()
+        );
+
         Set<String> toLoad = new HashSet<>(polymorphicClasses);
         toLoad.retainAll(usedSystemClasses);
         PolymorphicResolver polymorphicResolver = new PolymorphicResolver();
-        polymorphicResolver.loadAll(toLoad);
+
+        // ---- Parallel C-source parsing ----
+        //
+        // ParserC.parse reads one resource per class and compiles a
+        // regex over a potentially large C file. Both operations are
+        // stateless and thread-safe (the compiled Pattern is shared
+        // read-only, Matcher instances are per-call), so the parse of
+        // distinct files runs concurrently on the analysis scheduler.
+        polymorphicResolver.loadAll(toLoad, scheduler);
 
         // --- 4. Filtering for user-visible listings -----------------------
         Set<String> classesToShow;

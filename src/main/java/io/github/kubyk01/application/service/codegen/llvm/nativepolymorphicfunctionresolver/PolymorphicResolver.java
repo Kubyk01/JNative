@@ -1,17 +1,35 @@
 package io.github.kubyk01.application.service.codegen.llvm.nativepolymorphicfunctionresolver;
 
 import io.github.kubyk01.domain.ir.Type;
+import io.github.kubyk01.util.LlvmUtil;
 import io.github.kubyk01.util.parserC.ParserC;
 import io.github.kubyk01.util.parserC.ParserC.NativeMethodInfo;
 import lombok.extern.slf4j.Slf4j;
+import reactor.core.publisher.Flux;
+import reactor.core.scheduler.Scheduler;
 
 import java.io.IOException;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 
 @Slf4j
 public class PolymorphicResolver {
 
-    private final Map<String, List<NativeMethodInfo>> methodsByClass = new HashMap<>();
+    /**
+     * Cache of parsed native-method lists, keyed by internal class name.
+     *
+     * <p>{@link #loadAll(Collection, Scheduler)} populates this map from
+     * several worker threads at once, and {@link #findBestMatch} reads
+     * from it during polymorphic dispatch on the code-generation
+     * thread. A plain {@link java.util.HashMap} would corrupt its
+     * internal table under concurrent {@code put} operations; the two
+     * worker-side operations that touch the map are
+     * {@code containsKey} and {@code put}, both of which are atomic
+     * in {@link ConcurrentHashMap} and admit the "two threads parse the
+     * same file, last write wins" race without any observable
+     * difference, since parsing is deterministic.</p>
+     */
+    private final Map<String, List<NativeMethodInfo>> methodsByClass = new ConcurrentHashMap<>();
 
     public void loadFromClass(String className) {
         if (className == null || className.isEmpty()) return;
@@ -34,6 +52,33 @@ public class PolymorphicResolver {
         for (String className : classNames) {
             loadFromClass(className);
         }
+    }
+
+    /**
+     * Parallel form of {@link #loadAll(Collection)}. Same contract, but
+     * the per-class load is dispatched through the analysis scheduler
+     * instead of being run serially on the calling thread.
+     *
+     * <p>The serial form is retained so that callers that do not own a
+     * scheduler (unit tests, embedding code) are not forced to
+     * construct one.</p>
+     */
+    public void loadAll(Collection<String> classNames, Scheduler scheduler) {
+        if (classNames == null || classNames.isEmpty()) {
+            return;
+        }
+        Scheduler sched = (scheduler != null)
+            ? scheduler
+            : reactor.core.scheduler.Schedulers.single();
+
+        LlvmUtil.awaitMono(
+            Flux.fromIterable(classNames)
+                .parallel()
+                .runOn(sched)
+                .doOnNext(this::loadFromClass)
+                .sequential()
+                .then()
+        );
     }
 
     /**
@@ -86,7 +131,6 @@ public class PolymorphicResolver {
         return type.contains("void") && type.contains("*");
     }
 
-    // ----- Fixed buildDescriptor method with array and reference support -----
     private String buildDescriptor(Type returnType, List<Type> paramTypes) {
         StringBuilder sb = new StringBuilder();
         sb.append('(');
@@ -129,11 +173,4 @@ public class PolymorphicResolver {
         return 'L';
     }
 
-    public boolean isLoaded(String className) {
-        return methodsByClass.containsKey(className);
-    }
-
-    public List<NativeMethodInfo> getMethodsForClass(String className) {
-        return methodsByClass.getOrDefault(className, Collections.emptyList());
-    }
 }

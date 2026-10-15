@@ -23,6 +23,7 @@ import io.github.kubyk01.domain.ir.Terminator;
 import io.github.kubyk01.domain.ir.ThrowTerminator;
 import io.github.kubyk01.domain.ir.Type;
 import io.github.kubyk01.domain.ir.Value;
+import io.github.kubyk01.util.LlvmUtil;
 import lombok.Getter;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -30,14 +31,32 @@ import org.objectweb.asm.ClassReader;
 import org.objectweb.asm.ClassVisitor;
 import org.objectweb.asm.MethodVisitor;
 import org.objectweb.asm.Opcodes;
+import reactor.core.publisher.Flux;
+import reactor.core.scheduler.Scheduler;
+import reactor.core.scheduler.Schedulers;
 
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 
 @Slf4j
 @RequiredArgsConstructor
 public class ReachabilityAnalysis {
 
     private final DependencyResolver resolver;
+
+    /**
+     * Scheduler for the parallel phases of this class. Set by the
+     * orchestrator right after construction. Defaults to
+     * {@link Schedulers#single()} so the class stays usable from unit
+     * tests that never touch the reactor runtime.
+     */
+    private Scheduler scheduler = Schedulers.single();
+
+    public void setScheduler(Scheduler scheduler) {
+        if (scheduler != null) {
+            this.scheduler = scheduler;
+        }
+    }
 
     @Getter
     private final Set<String> reachableClasses = new HashSet<>();
@@ -975,71 +994,90 @@ public class ReachabilityAnalysis {
         while (changed && pass++ < MAX_IMPLEMENTATION_PASSES) {
             changed = false;
 
-            // Snapshot the class-map keys. The map grows during the loop
-            // as DependencyResolver loads classes that were previously only
-            // referenced by name, and iterating a live map while it grows is
-            // exactly the kind of race that produced the bug this method
-            // exists to close.
+            // Snapshot the class map. It may grow during the parallel
+            // phase as new classes are force-loaded through
+            // resolver.getClassNode() -> loadSystemClass(); the snapshot
+            // is taken once so every worker sees the same starting set.
             List<String> classNames =
                 new ArrayList<>(resolver.getClassMap().keySet());
 
-            for (String cls : classNames) {
-                if (cls == null || cls.isEmpty()) continue;
-                // Array pseudo-classes have no interfaces of their own and
-                // no vtable of their own (they inherit java/lang/Object's).
-                if (cls.charAt(0) == '[') continue;
+            // Parallel collection phase. Every worker walks its slice of
+            // the class map and collects concrete implementations of
+            // interface methods that are not yet in the reachable set.
+            //
+            // The scan only READS reachableMethods (a plain HashSet) —
+            // nothing writes to it during the parallel phase, so a
+            // concurrent read is safe. Every mutation of reachableMethods,
+            // worklist and userReachableMethods happens in the sequential
+            // commit below.
+            Set<MethodReference> discovered = ConcurrentHashMap.newKeySet();
 
-                ClassNode cn = resolver.getClassNode(cls);
-                if (cn == null) continue;
-                if (cn.isInterface()) continue;
-                if (cn.isExternal()) continue;
+            LlvmUtil.awaitMono(
+                Flux.fromIterable(classNames)
+                    .parallel()
+                    .runOn(scheduler)
+                    .doOnNext(cls -> {
+                        if (cls == null || cls.isEmpty()) return;
+                        if (cls.charAt(0) == '[') return;
 
-                Set<String> ifaces = new LinkedHashSet<>();
-                collectAllInterfacesRec(cn, ifaces);
-                if (ifaces.isEmpty()) continue;
+                        ClassNode cn = resolver.getClassNode(cls);
+                        if (cn == null) return;
+                        if (cn.isInterface()) return;
+                        if (cn.isExternal()) return;
 
-                for (String iface : ifaces) {
-                    ClassNode ifaceNode = resolver.getClassNode(iface);
-                    if (ifaceNode == null) continue;
-                    if (!ifaceNode.isInterface()) continue;
-                    if (ifaceNode.isExternal()) continue;
+                        Set<String> ifaces = new LinkedHashSet<>();
+                        collectAllInterfacesRec(cn, ifaces);
+                        if (ifaces.isEmpty()) return;
 
-                    for (MethodNode im : ifaceNode.getMethods()) {
-                        if (im.isStatic()) continue;
-                        String mName = im.getName();
-                        if (mName == null || mName.isEmpty()) continue;
-                        // Constructors and class initializers are never
-                        // interface members; the JDK class-file format does
-                        // not allow them in an interface.
-                        if (mName.equals("<init>") || mName.equals("<clinit>")) continue;
-                        String mDesc = im.getDescriptor();
-                        if (mDesc == null || mDesc.isEmpty()) continue;
+                        for (String iface : ifaces) {
+                            ClassNode ifaceNode = resolver.getClassNode(iface);
+                            if (ifaceNode == null) continue;
+                            if (!ifaceNode.isInterface()) continue;
+                            if (ifaceNode.isExternal()) continue;
 
-                        String[] foundOwner = new String[1];
-                        MethodNode concrete = resolver.findMethodInHierarchy(
-                            cls, mName, mDesc, foundOwner);
-                        if (concrete == null) continue;
-                        if (concrete.isAbstract()) continue;
-                        // Native methods have their implementation in C,
-                        // which is emitted separately; adding them here
-                        // would just produce an external declaration with
-                        // no body.
-                        if (concrete.isNative()) continue;
+                            for (MethodNode im : ifaceNode.getMethods()) {
+                                if (im.isStatic()) continue;
+                                String mName = im.getName();
+                                if (mName == null || mName.isEmpty()) continue;
+                                if (mName.equals("<init>") || mName.equals("<clinit>")) continue;
+                                String mDesc = im.getDescriptor();
+                                if (mDesc == null || mDesc.isEmpty()) continue;
 
-                        String decl = foundOwner[0];
-                        if (decl == null || decl.isEmpty()) continue;
+                                String[] foundOwner = new String[1];
+                                MethodNode concrete = resolver.findMethodInHierarchy(
+                                    cls, mName, mDesc, foundOwner);
+                                if (concrete == null) continue;
+                                if (concrete.isAbstract()) continue;
+                                if (concrete.isNative()) continue;
 
-                        ClassNode declNode = resolver.getClassNode(decl);
-                        if (declNode == null) continue;
-                        if (declNode.isExternal()) continue;
+                                String decl = foundOwner[0];
+                                if (decl == null || decl.isEmpty()) continue;
 
-                        MethodReference ref =
-                            new MethodReference(decl, mName, mDesc);
-                        if (!reachableMethods.contains(ref)) {
-                            addMethod(ref, true);
-                            changed = true;
+                                ClassNode declNode = resolver.getClassNode(decl);
+                                if (declNode == null) continue;
+                                if (declNode.isExternal()) continue;
+
+                                MethodReference ref =
+                                    new MethodReference(decl, mName, mDesc);
+                                if (!reachableMethods.contains(ref)) {
+                                    discovered.add(ref);
+                                }
+                            }
                         }
-                    }
+                    })
+                    .sequential()
+                    .then()
+            );
+
+            // Sequential commit: the only place in this method that
+            // mutates reachableMethods / userReachableMethods / worklist.
+            // Because discovery is deduplicated by the ConcurrentHashMap
+            // key set, the same method cannot be added twice even if
+            // several classes expose the same implementation.
+            for (MethodReference ref : discovered) {
+                if (!reachableMethods.contains(ref)) {
+                    addMethod(ref, true);
+                    changed = true;
                 }
             }
 
