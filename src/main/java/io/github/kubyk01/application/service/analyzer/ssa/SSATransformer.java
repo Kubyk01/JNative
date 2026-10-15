@@ -96,6 +96,22 @@ public class SSATransformer {
     public void transform(Function function) {
         if (function.getEntryBlock() == null || function.getBlocks().isEmpty()) return;
 
+        /*
+         * Reset per-function state.
+         *
+         * The SSATransformer instance is reused across every function in
+         * the module (see BytecodeToIr.translate and Orchestrator's SSA
+         * loop). Without this reset the three maps below grow monotonically
+         * with the total number of LOAD results, PHI nodes and slot accesses
+         * of the whole module — on a full JDK closure that is several
+         * million entries and several hundred MB of retained heap. The maps
+         * are only meaningful within a single function, so clearing them at
+         * entry is not only safe, it is the only correct behaviour.
+         */
+        versionStacks.clear();
+        versionCounters.clear();
+        replacements.clear();
+
         this.currentFunction = function;
         this.unsafeLocals = identifyUnsafeLocals(function);
         domTree = new DominatorTree(function);

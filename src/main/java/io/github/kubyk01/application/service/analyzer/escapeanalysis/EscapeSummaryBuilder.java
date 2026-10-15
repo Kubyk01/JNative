@@ -35,6 +35,18 @@ public class EscapeSummaryBuilder {
      */
     private static final int MAX_SCC_ITERATIONS = 2000;
 
+    /**
+     * Maximum number of functions processed in one parallel batch inside
+     * {@link #processSCC}. Without this limit a single iteration can
+     * process the whole SCC at once, and each element of the batch is a
+     * freshly built summary — hundreds of bytes to kilobytes — so a large
+     * SCC translates into hundreds of MB of temporary memory for one
+     * batch. The fixpoint is still monotone in the summaries, so splitting
+     * a pass into chunks changes the order of work but not the final
+     * lattice value.
+     */
+    private static final int EVAL_BATCH_SIZE = 2048;
+
     private final Module module;
     private final AliasAnalysisResult aliasResult;
     private final DependencyResolver resolver;
@@ -268,8 +280,16 @@ public class EscapeSummaryBuilder {
                 break;
             }
 
-            List<Function> batch = new ArrayList<>(pending);
-            pending.clear();
+            List<Function> batch = new ArrayList<>(Math.min(EVAL_BATCH_SIZE, pending.size()));
+            Iterator<Function> it = pending.iterator();
+            while (it.hasNext() && batch.size() < EVAL_BATCH_SIZE) {
+                batch.add(it.next());
+                it.remove();
+            }
+            /* remaining functions stay in `pending` for the next iteration;
+               the fixpoint is still monotone in the summaries, so splitting a
+               pass into chunks changes the order of work but not the final
+               lattice value. */
             totalProcessed += batch.size();
 
             // The `summaries` map is a ConcurrentHashMap, and it is only

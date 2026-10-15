@@ -32,6 +32,16 @@ public class IrBuilder {
         }
         module.addFunction(func);
         currentFunction = func;
+        /*
+         * The IrBuilder instance is shared across the whole module (see
+         * BytecodeToIr.builder). Without this reset the `temporaries` list
+         * grows monotonically with the number of newTemporary() calls of
+         * every function in the module, which on a full JDK closure reaches
+         * several million entries. The list is only ever inspected as a
+         * per-function artifact; nothing outside this class reads across
+         * function boundaries.
+         */
+        temporaries.clear();
         return func;
     }
 
@@ -49,6 +59,7 @@ public class IrBuilder {
         }
         module.addFunction(func);
         currentFunction = func;
+        temporaries.clear();   // same reasoning as above
         return func;
     }
 

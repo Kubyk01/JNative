@@ -23,6 +23,16 @@ import static io.github.kubyk01.util.LlvmUtil.isLazyClinitWrapper;
 @Slf4j
 public class InterproceduralEscape {
 
+    /**
+     * Maximum number of functions processed in one parallel batch.
+     * Matches the constant used by InterproceduralPointsTo so that the two
+     * fix-point passes have the same memory footprint profile. Without
+     * this limit the very first batch on a full JDK closure is the entire
+     * reachable set (tens of thousands of functions) and each element is
+     * a freshly built Map<AllocationSite, EscapeStatus>.
+     */
+    private static final int EVAL_BATCH_SIZE = 2048;
+
     private final Module module;
     private final AliasAnalysisResult aliasResult;
     private final Map<String, EscapeSummary> summaries;
@@ -97,8 +107,8 @@ public class InterproceduralEscape {
         long lastLog = 0;
 
         while (!worklist.isEmpty()) {
-            List<Function> batch = new ArrayList<>();
-            while (!worklist.isEmpty()) {
+            List<Function> batch = new ArrayList<>(EVAL_BATCH_SIZE);
+            while (!worklist.isEmpty() && batch.size() < EVAL_BATCH_SIZE) {
                 Function f = worklist.poll();
                 inWorklist.remove(f);
                 batch.add(f);

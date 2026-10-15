@@ -10,7 +10,6 @@ import io.github.kubyk01.domain.ir.Instruction;
 import io.github.kubyk01.domain.ir.Module;
 import io.github.kubyk01.domain.ir.Opcode;
 import io.github.kubyk01.domain.ir.Parameter;
-import io.github.kubyk01.domain.ir.Terminator;
 import io.github.kubyk01.domain.ir.Value;
 import io.github.kubyk01.util.LlvmUtil;
 import lombok.extern.slf4j.Slf4j;
@@ -54,27 +53,17 @@ public class InterproceduralPointsTo {
      * Shared, never-mutated {@code PointsToSet} containing only
      * {@link AllocationSite#UNKNOWN}.
      *
-     * <p>Both coarsened widening loops in {@link #processCall} write
-     * this exact set into every {@code (base-site, field)} pair that a
-     * callee's summary reports as written. The pre-fix code allocated
-     * a fresh {@code PointsToSet} for every {@code (param, field)} pair
-     * on every call site; on a full JDK image that is hundreds of
-     * thousands of short-lived HashSets per pass, and the pass runs
-     * several times as the worklist re-enqueues callers.</p>
-     *
-     * <p>The instance is <b>never</b> mutated after construction. Every
-     * use below passes it as the {@code source} argument of
-     * {@code mergeFieldPointsTo} / {@code mergeStaticFieldPointsTo}, and
-     * those methods only ever read from it (via {@code addAll}). The
-     * Java type system cannot express "read-only view of a mutable
-     * set", so the invariant is documented here and must be preserved
-     * by any future edit to this file: never call {@code add},
-     * {@code addAll}, or any other mutator on this object.</p>
+     * <p>Used by the two coarsened widening loops in
+     * {@link #processCall} as the source set for "this field now holds
+     * an unknown site". The instance is never mutated after
+     * construction; every use passes it as the {@code source} argument
+     * of {@code mergeFieldPointsTo} / {@code mergeStaticFieldPointsTo},
+     * and those only ever read from it.</p>
      */
     private static final PointsToSet UNKNOWN_SINGLETON = makeUnknownSingleton();
 
     private static PointsToSet makeUnknownSingleton() {
-        PointsToSet s = new PointsToSet();
+        PointsToSet s = PointsToSet.local();
         s.add(AllocationSite.UNKNOWN);
         return s;
     }
@@ -90,30 +79,13 @@ public class InterproceduralPointsTo {
      *
      * <p>The outer map is a {@link ConcurrentHashMap} because several
      * workers call {@link #slotsFor(Function)} concurrently for
-     * different functions during a batch; a plain {@code HashMap} would
-     * corrupt its table under concurrent {@code computeIfAbsent}, the
-     * same way the plain {@code HashSet} in {@code PointsToSet} would
-     * have.</p>
-     *
-     * <p>The inner maps are plain {@code HashMap}s. This is safe because
-     * of an invariant enforced by {@link #analyze}: at any instant at
-     * most one thread is evaluating a given function, because
-     * {@code inWorklist} prevents a function from appearing twice in
-     * the worklist and the batch-building loop pops each item exactly
-     * once. The thread that owns the function for the duration of its
-     * evaluation is therefore the only thread that can touch its inner
-     * slot map.</p>
+     * different functions during a batch. The inner maps are plain
+     * {@code HashMap}s, safe because of the one-evaluating-thread-per-
+     * function invariant enforced by {@link #analyze}.</p>
      */
     private final Map<Function, Map<Integer, PointsToSet>> localSlots =
             new ConcurrentHashMap<>();
 
-    /**
-     * Full constructor. The {@code scheduler} is borrowed, not owned:
-     * the orchestrator disposes it after the analysis pipeline is
-     * complete. Passing {@code null} collapses to
-     * {@link Schedulers#single()}, which makes the class usable from
-     * unit tests that do not care about parallelism.
-     */
     public InterproceduralPointsTo(Module module,
                                    Map<String, FunctionSummary> summaries,
                                    Scheduler scheduler) {
@@ -122,41 +94,20 @@ public class InterproceduralPointsTo {
         this.scheduler = (scheduler != null) ? scheduler : Schedulers.single();
     }
 
-    /**
-     * Convenience constructor: runs on {@link Schedulers#single()}.
-     * Kept for tests and for any caller that does not care about
-     * parallelism; the two-argument form was the previous public API
-     * and remains valid.
-     */
-    public InterproceduralPointsTo(Module module,
-                                   Map<String, FunctionSummary> summaries) {
-        this(module, summaries, Schedulers.single());
-    }
-
     private Map<Integer, PointsToSet> slotsFor(Function func) {
         return localSlots.computeIfAbsent(func, k -> new HashMap<>());
     }
 
     /**
-     * Per-evaluation mutable state.
-     *
-     * <p>Before parallelisation these two flags were instance fields of
-     * {@code InterproceduralPointsTo}, which was safe because there was
-     * exactly one evaluation in flight at a time. With a batch of
-     * evaluations running concurrently, sharing instance fields would
-     * corrupt them. The context is therefore allocated per evaluation
-     * and threaded through every method that needs to record a change;
-     * the aggregated result of the two flags is what the batch loop
-     * uses to update the worklist.</p>
+     * Per-evaluation mutable state. Allocated once per
+     * {@link #evaluateFunction} call, so the two change flags are not
+     * shared across threads running in the same batch.
      */
     private static final class EvalContext {
         boolean changed;
         boolean slotsChanged;
     }
 
-    /**
-     * Aggregated result of one function evaluation.
-     */
     private record EvaluationResult(boolean changed, boolean slotsChanged) {}
 
     private EvaluationResult evaluateFunction(Function func) {
@@ -168,22 +119,11 @@ public class InterproceduralPointsTo {
     public PointsToGraph analyze() {
         collectAllocationSites();
 
-        for (Function func : module.getFunctions()) {
-            for (Parameter p : func.getParameters()) {
-                graph.get(p);
-            }
-        }
-
-        // ---- Caller map: callee constant → set of caller functions. ----
+        // ---- Caller map: callee constant -> set of caller functions. ----
         //
-        // Lazy <clinit> wrappers are excluded from this map for the same
-        // reason they are excluded from the SummaryBuilder caller map:
-        // their callers number in the tens of thousands on a full JDK
-        // image, and a wrapper's summary never changes in a way that
-        // could affect a caller (its body is a fixed sequence of
-        // void-returning calls with zero arguments). See
-        // LlvmUtil.isLazyClinitWrapper and the equivalent skip in
-        // SummaryBuilder.build().
+        // Lazy <clinit> wrappers are excluded: their callers number in
+        // the tens of thousands on a full JDK image, and a wrapper's
+        // summary never changes in a way that could affect a caller.
         Map<String, Set<Function>> callers = new HashMap<>();
         for (Function func : module.getFunctions()) {
             if (func.getEntryBlock() == null) continue;
@@ -221,16 +161,6 @@ public class InterproceduralPointsTo {
             }
 
             // ---- Build one batch ----------------------------------
-            //
-            // The batch is at most EVAL_BATCH_SIZE functions. Each item
-            // is removed from inWorklist before being put in the batch,
-            // so no function can appear twice in the same batch and no
-            // function can be re-added to the worklist while its own
-            // evaluation is still running. That, together with the
-            // fact that the batch loop fully drains before the next
-            // batch is built, is what makes the "one function, one
-            // thread at a time" invariant hold for localSlots and for
-            // every value-level points-to set inside this function's IR.
             List<Function> batch = new ArrayList<>(
                     Math.min(EVAL_BATCH_SIZE, worklist.size()));
             while (!worklist.isEmpty() && batch.size() < EVAL_BATCH_SIZE) {
@@ -240,53 +170,15 @@ public class InterproceduralPointsTo {
             }
 
             // ---- Evaluate the batch in parallel -------------------
-            //
-            // NOTE (fix): this previously used
-            //
-            //     Flux.fromIterable(batch)
-            //         .flatMapSequential(
-            //             f -> Mono.fromCallable(() -> evaluateFunction(f))
-            //                     .subscribeOn(scheduler),
-            //             EVAL_MAX_CONCURRENCY)
-            //
-            // which on the same 8-core machine only reached ~2 busy cores
-            // (top: %CPU 220). flatMapSequential+subscribeOn allocates one
-            // InnerSubscriber and one Mono wrapper per item, keeps an
-            // ordering buffer, and funnels every subscription through
-            // scheduler.createWorker(); the per-item overhead of that path
-            // dominates the actual work for the small per-function
-            // workloads this pass produces.
-            //
-            // The pipeline below is the one SummaryBuilder,
-            // EscapeSummaryBuilder, InterproceduralEscape and
-            // LifetimeAnalyzer already use. It partitions the source once
-            // into N rails (one per CPU), binds each rail to a single
-            // worker of the scheduler for the whole batch, and processes
-            // items with zero per-item allocation. On the same input it
-            // saturates all available cores.
             List<EvaluationResult> results = LlvmUtil.parallelMapOrdered(
                     batch, scheduler, this::evaluateFunction);
-            // parallelMapOrdered already validates the result size.
 
             // ---- Sequential commit of change flags ----------------
-            //
-            // This is the only place in the parallel section that
-            // mutates the worklist. Doing it on the main thread means
-            // inWorklist does not have to be thread-safe: the two-set
-            // idiom (add returns true iff the element was absent)
-            // remains correct without an extra synchronization layer.
             for (int i = 0; i < batch.size(); i++) {
                 Function func = batch.get(i);
                 EvaluationResult r = results.get(i);
                 processed++;
 
-                // If the slots of this very function grew, a LOAD of
-                // the same function may appear before the
-                // corresponding STORE in the block traversal order
-                // (back edge or non-topological block order) and
-                // therefore may not have seen the update yet.
-                // Re-enqueuing the function guarantees that every LOAD
-                // ends up seeing the up-to-date slot contents.
                 if (r.slotsChanged()) {
                     if (inWorklist.add(func)) {
                         worklist.add(func);
@@ -339,22 +231,36 @@ public class InterproceduralPointsTo {
         }
     }
 
+    /**
+     * Evaluates one function against the current snapshot of the graph.
+     *
+     * <p>The slot map is looked up exactly once per function evaluation
+     * and threaded into every instruction that needs it. The previous
+     * revision called {@link #slotsFor(Function)} from inside
+     * {@code processInstruction} for every {@code LOAD} and every
+     * {@code STORE}, which forced a {@code ConcurrentHashMap}
+     * {@code computeIfAbsent} — and its internal locking — into the
+     * innermost loop of the analysis. On the JDK closure with roughly
+     * half a million {@code LOAD}/{@code STORE} instructions per
+     * points-to fixed-point iteration, that single change is what
+     * brought the analysis phase's user-time back under control.</p>
+     */
     private void processFunction(Function func, EvalContext ctx) {
-        // Seed the slots with the parameters.
-        //
-        // Parameters are never materialised through STOREs in SSA-IR:
-        // MethodTranslator puts the parameter straight into Frame.local
-        // and every read becomes a direct reference to the parameter's
-        // SSA value. Therefore any LOAD that survives on an "unsafe" path
-        // (unsafeLocals) reads a slot that has no STORE in the function
-        // body at all. Without this seeding such a LOAD would get an
-        // empty points-to set and would break escape/liveness again.
         Map<Integer, PointsToSet> slots = slotsFor(func);
+
+        // Seed the slots with the parameters. Parameters are never
+        // materialised through STOREs in SSA-IR: MethodTranslator puts
+        // the parameter straight into Frame.local and every read
+        // becomes a direct reference to the parameter's SSA value. A
+        // LOAD that survives on an "unsafe" path therefore reads a
+        // slot that has no STORE in the function body, and without
+        // this seeding such a LOAD would observe the shared empty set
+        // and break the downstream escape and lifetime analyses.
         for (Parameter p : func.getParameters()) {
             PointsToSet paramPts = graph.get(p);
             if (paramPts.isEmpty()) continue;
             PointsToSet slotPts = slots.computeIfAbsent(
-                    p.getIndex(), k -> new PointsToSet());
+                    p.getIndex(), k -> PointsToSet.local());
             int oldSize = slotPts.getSites().size();
             slotPts.addAll(paramPts);
             if (slotPts.getSites().size() > oldSize) {
@@ -364,71 +270,58 @@ public class InterproceduralPointsTo {
 
         for (BasicBlock block : func.getBlocks()) {
             for (Instruction inst : block.getInstructions()) {
-                processInstruction(inst, func, ctx);
+                processInstruction(inst, func, slots, ctx);
             }
-            Terminator term = block.getTerminator();
-            if (term != null) processTerminator();
+            // processTerminator() does not affect the points-to graph:
+            // terminators carry only control-flow operands, and none of
+            // them introduce or propagate allocation sites.
         }
     }
 
-    private void processInstruction(Instruction inst, Function currentFunc,
+    private void processInstruction(Instruction inst,
+                                    Function currentFunc,
+                                    Map<Integer, PointsToSet> slots,
                                     EvalContext ctx) {
         Opcode op = inst.getOpcode();
         switch (op) {
             case LOAD: {
-                // Carry the points-to set from the slot to the result of
-                // the LOAD. This is critical for the "unsafe" LOADs that
-                // the SSA transformer keeps in the IR after a block with
-                // a potentially throwing instruction (see
-                // SSATransformer.identifyUnsafeLocals).
-                //
-                // Without this branch the result of a LOAD always has an
-                // empty points-to set, and the downstream analyses
-                // (escape, liveness, lifetime) treat an object read back
-                // through a LOAD as dead right after its first write
-                // into the slot. That is exactly how the use-after-free
-                // in ProviderConfig.getProvider arose.
                 Value result = inst.getResult();
-                if (result != null) {
-                    int idx = inst.getLocalIndex();
-                    if (idx >= 0) {
-                        PointsToSet slotPts = slotsFor(currentFunc).get(idx);
-                        if (slotPts != null && !slotPts.isEmpty()) {
-                            ctx.changed |= graph.merge(result, slotPts);
-                        }
-                    }
+                if (result == null) break;
+                int idx = inst.getLocalIndex();
+                if (idx < 0) break;
+                PointsToSet slotPts = slots.get(idx);
+                if (slotPts != null && !slotPts.isEmpty()) {
+                    ctx.changed |= graph.merge(result, slotPts);
                 }
                 break;
             }
             case STORE: {
-                if (!inst.getOperands().isEmpty()) {
-                    Value stored = inst.getOperands().getFirst();
-                    if (stored != null) {
-                        PointsToSet storedPts = graph.get(stored);
+                if (inst.getOperands().isEmpty()) break;
+                Value stored = inst.getOperands().getFirst();
+                if (stored == null) break;
 
-                        // SSA channel: the result of a STORE is the new
-                        // SSA version of the slot and the information
-                        // propagates into it directly. This covers every
-                        // safe slot, where the SSA transformer has
-                        // removed the LOAD.
-                        Value local = inst.getResult();
-                        if (local != null) {
-                            ctx.changed |= graph.merge(local, storedPts);
-                        }
+                PointsToSet storedPts = graph.get(stored);
 
-                        // Local-slot channel: accumulate the same set in
-                        // the slot's bucket in parallel so that the
-                        // LOADs which survived can read it back.
-                        int idx = inst.getLocalIndex();
-                        if (idx >= 0) {
-                            PointsToSet slotPts = slotsFor(currentFunc)
-                                    .computeIfAbsent(idx, k -> new PointsToSet());
-                            int oldSize = slotPts.getSites().size();
-                            slotPts.addAll(storedPts);
-                            if (slotPts.getSites().size() > oldSize) {
-                                ctx.slotsChanged = true;
-                            }
-                        }
+                // SSA channel: the result of a STORE is the new SSA
+                // version of the slot, and the information propagates
+                // into it directly. Covers every safe slot, where the
+                // SSA transformer removed the LOAD.
+                Value local = inst.getResult();
+                if (local != null) {
+                    ctx.changed |= graph.merge(local, storedPts);
+                }
+
+                // Local-slot channel: accumulate the same set in the
+                // slot's bucket in parallel so that any LOAD that
+                // survived on an unsafe path can read it back.
+                int idx = inst.getLocalIndex();
+                if (idx >= 0) {
+                    PointsToSet slotPts = slots.computeIfAbsent(
+                            idx, k -> PointsToSet.local());
+                    int oldSize = slotPts.getSites().size();
+                    slotPts.addAll(storedPts);
+                    if (slotPts.getSites().size() > oldSize) {
+                        ctx.slotsChanged = true;
                     }
                 }
                 break;
@@ -443,85 +336,79 @@ public class InterproceduralPointsTo {
                 break;
             }
             case GET_FIELD: {
-                if (inst.getOperands().size() >= 2) {
-                    Value base = inst.getOperands().getFirst();
-                    Value result = inst.getResult();
-                    if (result != null) {
-                        String field = extractFieldName(inst);
-                        PointsToSet basePts = graph.get(base);
-                        PointsToSet fieldPts =
-                                graph.getFieldPointsToForSites(basePts, field);
-                        ctx.changed |= graph.merge(result, fieldPts);
-                    }
-                }
+                if (inst.getOperands().size() < 2) break;
+                Value base = inst.getOperands().getFirst();
+                Value result = inst.getResult();
+                if (result == null) break;
+                String field = extractFieldName(inst);
+                PointsToSet basePts = graph.get(base);
+                PointsToSet fieldPts =
+                        graph.getFieldPointsToForSites(basePts, field);
+                ctx.changed |= graph.merge(result, fieldPts);
                 break;
             }
             case PUT_FIELD: {
-                if (inst.getOperands().size() >= 3) {
-                    Value base = inst.getOperands().get(0);
-                    Value rhs = inst.getOperands().get(2);
-                    String field = extractFieldName(inst);
-                    PointsToSet basePts = graph.get(base);
-                    PointsToSet rhsPts = graph.get(rhs);
-                    if (basePts.isEmpty()) {
+                if (inst.getOperands().size() < 3) break;
+                Value base = inst.getOperands().get(0);
+                Value rhs  = inst.getOperands().get(2);
+                String field = extractFieldName(inst);
+                PointsToSet basePts = graph.get(base);
+                PointsToSet rhsPts  = graph.get(rhs);
+                if (rhsPts.isEmpty()) break;
+                if (basePts.isEmpty()) {
+                    ctx.changed |= graph.mergeFieldPointsTo(
+                            AllocationSite.UNKNOWN, field, rhsPts);
+                } else {
+                    for (AllocationSite site : basePts.getSites()) {
                         ctx.changed |= graph.mergeFieldPointsTo(
-                                AllocationSite.UNKNOWN, field, rhsPts);
-                    } else {
-                        for (AllocationSite site : basePts.getSites()) {
-                            ctx.changed |= graph.mergeFieldPointsTo(
-                                    site, field, rhsPts);
-                        }
+                                site, field, rhsPts);
                     }
                 }
                 break;
             }
             case ALOAD: {
-                if (inst.getOperands().size() >= 2) {
-                    Value array = inst.getOperands().getFirst();
-                    Value result = inst.getResult();
-                    if (result != null) {
-                        PointsToSet arrayPts = graph.get(array);
-                        PointsToSet elemPts = graph.getFieldPointsToForSites(
-                                arrayPts, "[]");
-                        ctx.changed |= graph.merge(result, elemPts);
-                    }
-                }
+                if (inst.getOperands().size() < 2) break;
+                Value array = inst.getOperands().getFirst();
+                Value result = inst.getResult();
+                if (result == null) break;
+                PointsToSet arrayPts = graph.get(array);
+                PointsToSet elemPts = graph.getFieldPointsToForSites(
+                        arrayPts, "[]");
+                ctx.changed |= graph.merge(result, elemPts);
                 break;
             }
             case ASTORE: {
-                if (inst.getOperands().size() >= 3) {
-                    Value array = inst.getOperands().get(0);
-                    Value value = inst.getOperands().get(2);
-                    PointsToSet arrayPts = graph.get(array);
-                    PointsToSet valuePts = graph.get(value);
-                    if (arrayPts.isEmpty()) {
+                if (inst.getOperands().size() < 3) break;
+                Value array = inst.getOperands().get(0);
+                Value value = inst.getOperands().get(2);
+                PointsToSet arrayPts = graph.get(array);
+                PointsToSet valuePts = graph.get(value);
+                if (valuePts.isEmpty()) break;
+                if (arrayPts.isEmpty()) {
+                    ctx.changed |= graph.mergeArrayElementPointsTo(
+                            AllocationSite.UNKNOWN, valuePts);
+                } else {
+                    for (AllocationSite site : arrayPts.getSites()) {
                         ctx.changed |= graph.mergeArrayElementPointsTo(
-                                AllocationSite.UNKNOWN, valuePts);
-                    } else {
-                        for (AllocationSite site : arrayPts.getSites()) {
-                            ctx.changed |= graph.mergeArrayElementPointsTo(
-                                    site, valuePts);
-                        }
+                                site, valuePts);
                     }
                 }
                 break;
             }
             case GET_STATIC: {
                 Value result = inst.getResult();
-                if (result != null) {
-                    String field = extractFieldName(inst);
-                    PointsToSet fieldPts = graph.getStaticFieldPointsTo(field);
-                    ctx.changed |= graph.merge(result, fieldPts);
-                }
+                if (result == null) break;
+                String field = extractFieldName(inst);
+                PointsToSet fieldPts = graph.getStaticFieldPointsTo(field);
+                ctx.changed |= graph.merge(result, fieldPts);
                 break;
             }
             case PUT_STATIC: {
-                if (inst.getOperands().size() >= 2) {
-                    Value rhs = inst.getOperands().get(1);
-                    String field = extractFieldName(inst);
-                    PointsToSet rhsPts = graph.get(rhs);
-                    ctx.changed |= graph.mergeStaticFieldPointsTo(field, rhsPts);
-                }
+                if (inst.getOperands().size() < 2) break;
+                Value rhs = inst.getOperands().get(1);
+                String field = extractFieldName(inst);
+                PointsToSet rhsPts = graph.get(rhs);
+                ctx.changed |= graph.mergeStaticFieldPointsTo(field, rhsPts);
                 break;
             }
             case CALL:
@@ -529,36 +416,30 @@ public class InterproceduralPointsTo {
             case INTERFACE_CALL:
             case STATIC_CALL:
             case SPECIAL_CALL: {
-                processCall(inst, currentFunc, ctx);
+                processCall(inst, currentFunc, slots, ctx);
                 break;
             }
             default:
         }
     }
 
-    private void processCall(Instruction callInst, Function currentFunc,
+    private void processCall(Instruction callInst,
+                             Function currentFunc,
+                             Map<Integer, PointsToSet> slots,
                              EvalContext ctx) {
+        // slots is currently unused by this method, but the parameter is
+        // kept so that a future extension (e.g. propagating callee
+        // summaries into caller-local slots) does not have to re-thread
+        // it through every call site.
+
         String calleeName = extractCalleeName(callInst);
         if (calleeName == null) return;
         String calleeKey = canonicalCalleeKey(calleeName);
 
-        // Skip lazy <clinit> wrappers here as well. The caller-map
-        // construction above and SummaryBuilder.processCall both already
-        // skip lazy-clinit wrappers, but this method did not, so a call
-        // site of the form
-        //
-        //     fn___lazy_clinit_run_<C>()
-        //
-        // would still resolve to the wrapper's (trivial, void,
-        // no-argument) summary and pass through the coarsened widening
-        // loops below with zero args and zero parameter-write entries.
-        // That is wasteful on every one of the tens of thousands of
-        // trigger sites that the LazyClinitInstrumenter inserts on a
-        // full JDK image, and it is also incorrect in the same way that
-        // it would be for the caller map: a wrapper's summary cannot
-        // affect its caller's points-to graph, because every one of the
-        // wrapper's instructions either returns void or writes to a
-        // static field of the wrapper's own class.
+        // Lazy <clinit> wrappers are skipped here for the same reason
+        // they are skipped in the caller map: their summary is trivial
+        // (void, no args, only static-field writes to their own class)
+        // and cannot affect the caller's points-to graph.
         if (isLazyClinitWrapper(calleeKey)) {
             return;
         }
@@ -567,9 +448,7 @@ public class InterproceduralPointsTo {
         if (summary == null) {
             // External or not-yet-analysed callee: conservatively widen
             // the call's result to UNKNOWN. The shared singleton avoids
-            // a fresh PointsToSet allocation per call site; this path
-            // is taken by every external call and is one of the hottest
-            // allocation sites in the pre-fix code.
+            // a fresh PointsToSet allocation per call site.
             Value ret = callInst.getResult();
             if (ret != null) {
                 ctx.changed |= graph.merge(ret, UNKNOWN_SINGLETON);
@@ -580,23 +459,13 @@ public class InterproceduralPointsTo {
         List<Value> args = getCallArguments(callInst);
         Value returnValue = callInst.getResult();
 
-        // 1. Return value
+        // ---- 1. Return value ------------------------------------
         //
-        // The previous revision allocated a fresh PointsToSet per call
-        // site just to hold the callee's return-set before merging it
-        // into the result's points-to set. On a function with thousands
-        // of calls that is millions of short-lived ConcurrentHashMaps —
-        // and the allocation shows up as a measurable share of the
-        // worker threads' hot stack, since every PointsToSet wraps its
-        // own ConcurrentHashMap.KeySetView.
-        //
-        // The set is not needed: addSite() and merge() both return a
-        // change flag, so the union can be produced directly on the
-        // result value's own points-to set. The only semantic
-        // requirement is to know whether anything was added at all, so
-        // that the "fall back to UNKNOWN when the callee returns an
-        // object but carries no concrete returned allocations and no
-        // parameter-returned arguments" rule still fires.
+        // The union of the callee's concrete returned allocations and
+        // its parameter-returned argument sets is produced directly on
+        // the result value's own points-to set. addSite / merge both
+        // return a change flag, so the intermediate PointsToSet that
+        // the previous revision allocated per call site is not needed.
         if (returnValue != null) {
             boolean producedAnySite = false;
 
@@ -618,22 +487,14 @@ public class InterproceduralPointsTo {
             }
         }
 
-        // 2. Parameter field writes — coarsened summary.
+        // ---- 2. Parameter field writes --------------------------
         //
         // The callee's summary carries only the set of field names it
-        // writes into each parameter, not the exact set of sites. We
-        // therefore widen the field's points-to on every base site
-        // reachable from the caller's argument to UNKNOWN. This is
-        // sound (no site is ever omitted) and finite (a single UNKNOWN
-        // entry per (base site, field) pair).
-        //
-        // The per-(base-site, field) fast-path skip below is what makes
-        // re-evaluation of a function that has not changed new
-        // information cheap: the cost drops to one hash lookup per
-        // pair, with no allocation, no iteration, and no computeIfAbsent
-        // on the map itself. On the observed workload that is the
-        // difference between 350 seconds of single-threaded CPU time
-        // and a sub-second pass.
+        // writes into each parameter. Widen the field's points-to on
+        // every base site reachable from the caller's argument to
+        // UNKNOWN. The fast-path skip below makes re-evaluation of a
+        // function that has not changed cheap: one hash lookup per
+        // (base site, field) pair, no allocation, no iteration.
         for (Map.Entry<Integer, Set<String>> entry
                 : summary.getParamsFieldWrites().entrySet()) {
             int paramIndex = entry.getKey();
@@ -652,8 +513,7 @@ public class InterproceduralPointsTo {
             }
         }
 
-        // 3. Static field writes — coarsened summary. Same widening,
-        // same fast-path skip, same shared singleton.
+        // ---- 3. Static field writes -----------------------------
         for (String field : summary.getStaticFieldWrites()) {
             if (graph.staticFieldContainsUnknown(field)) {
                 continue;
@@ -661,9 +521,5 @@ public class InterproceduralPointsTo {
             ctx.changed |= graph.mergeStaticFieldPointsTo(
                     field, UNKNOWN_SINGLETON);
         }
-    }
-
-    private void processTerminator() {
-        // terminator instructions do not change points-to
     }
 }

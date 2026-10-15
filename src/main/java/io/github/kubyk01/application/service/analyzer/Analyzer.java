@@ -417,6 +417,16 @@ public class Analyzer {
         }
 
         // ---- Parallel call-graph construction (Reactor).
+        //
+        // The call graph is the only persistent structure this method
+        // keeps alive. It maps every live function to the set of
+        // functions it calls directly, and it is consumed twice: once
+        // by the BFS in the next block and once more by the
+        // activation-depth computation at the end. Its memory cost is
+        // proportional to the number of direct call edges in the
+        // module — on a full JDK closure a few hundred thousand
+        // entries, a few tens of megabytes — which is the only large
+        // data structure that survives the phase.
         Map<String, Set<String>> callGraph = new ConcurrentHashMap<>();
         List<Function> functionsSnapshot = new ArrayList<>(module.getFunctions());
         LlvmUtil.awaitMono(Flux.fromIterable(functionsSnapshot)
@@ -436,41 +446,59 @@ public class Analyzer {
             .then()
         );
 
-        // ---- Parallel scope / nested clinit construction (Reactor).
-        Map<String, Set<String>> clinitScope = new ConcurrentHashMap<>();
-        Map<String, Set<String>> nestedClinits = new ConcurrentHashMap<>();
-        LlvmUtil.awaitMono(Flux.fromIterable(clinitFunctions)
-            .parallel()
-            .runOn(scheduler)
-            .doOnNext(clinit -> {
-                Set<String> scope  = new LinkedHashSet<>();
-                Set<String> nested = new LinkedHashSet<>();
-                Deque<String> worklist = new ArrayDeque<>();
-                scope.add(clinit.getName());
-                worklist.push(clinit.getName());
-                while (!worklist.isEmpty()) {
-                    String cur = worklist.pop();
-                    Set<String> callees = callGraph.get(cur);
-                    if (callees == null) continue;
-                    for (String callee : callees) {
-                        if (clinitNames.contains(callee)) {
-                            nested.add(callee);
-                            continue;
-                        }
-                        if (scope.add(callee)) worklist.push(callee);
-                    }
-                }
-                clinitScope.put(clinit.getName(), scope);
-                nestedClinits.put(clinit.getName(), nested);
-            })
-            .sequential()
-            .then()
-        );
-
-        Map<String, Set<String>> classDeps = new LinkedHashMap<>();
-        for (String cls : allWithClinit) classDeps.put(cls, new LinkedHashSet<>());
-
+        // ---- Single-pass scope walk for every <clinit> body.
+        //
+        // This block replaces three separate parallel passes that used
+        // to run one after the other:
+        //
+        //   1. a pass that built a persistent Map<String, Set<String>>
+        //      holding the entire reachable call graph of every
+        //      <clinit> (the "clinitScope" map),
+        //
+        //   2. a pass that walked every such scope to build the
+        //      per-class dependency deltas,
+        //
+        //   3. a pass that walked every such scope again to build the
+        //      field-writer / field-reader maps.
+        //
+        // The old arrangement was O(#clinit x (V + E)) in memory, not
+        // just in time. For each of the ~500 to ~2500 <clinit>
+        // functions it retained a full LinkedHashSet of every
+        // function reachable without crossing another <clinit>. On
+        // the failing run that was several GB of live strings, all
+        // strongly referenced by the clinitScope map for the entire
+        // duration of the phase, none of it reachable by the garbage
+        // collector. G1 filled the 4-GB heap to 99.9 %, the
+        // concurrent cycle stopped making progress, and the JVM
+        // eventually aborted with
+        //
+        //     OutOfMemoryError: Java heap space: failed reallocation
+        //     of scalar replaced objects
+        //
+        // raised from C2's deoptimization path while the compiler was
+        // itself running out of heap.
+        //
+        // The rework below performs the same BFS once per clinit, but
+        // accumulates every derived fact DURING the walk and discards
+        // the scope set as soon as the walk returns. The three
+        // outputs the method actually needs — the set of directly
+        // nested <clinit> bodies, the per-class dependency delta, and
+        // the field writer/reader index — are all small relative to
+        // the scope. The scope is the only thing that grows with the
+        // reachable subgraph size, and it is exactly what the rework
+        // eliminates.
+        //
+        // Each BFS is still bounded by one clinit's own reachability,
+        // which is what makes the transient memory profile linear
+        // rather than quadratic in the number of clinit bodies. The
+        // instruction scan that used to run three times per scope
+        // member (once per consuming pass) now runs exactly once,
+        // folded into the BFS itself.
+        Map<String, Set<String>> nestedClinits  = new ConcurrentHashMap<>();
         Map<String, Set<String>> classDepDeltas = new ConcurrentHashMap<>();
+        Map<String, Set<String>> fieldWriters   = new ConcurrentHashMap<>();
+        Map<String, Set<String>> fieldReaders   = new ConcurrentHashMap<>();
+
         LlvmUtil.awaitMono(Flux.fromIterable(clinitFunctions)
             .parallel()
             .runOn(scheduler)
@@ -478,45 +506,128 @@ public class Analyzer {
                 String className = clinitNameToClassName.get(clinit.getName());
                 if (className == null) return;
 
-                Set<String> delta = new HashSet<>();
-
-                ClassNode cn = resolver.getClassNode(className);
+                // Transient visited set for the BFS. Bounded by this
+                // clinit's own reachable call graph; the moment the
+                // walk returns, the only reference to it dies with
+                // this stack frame and the whole set becomes garbage.
                 Set<String> visited = new HashSet<>();
-                while (cn != null && cn.getSuperName() != null
-                    && !cn.getSuperName().equals(cn.getName())
-                    && visited.add(cn.getSuperName())) {
+
+                // Retained outputs. `nested` is small: one entry per
+                // directly-triggered <clinit>. `delta` is small: one
+                // entry per class this clinit's scope touches, which
+                // on a large module is a few hundred at most.
+                Set<String> nested = new LinkedHashSet<>();
+                Set<String> delta  = new HashSet<>();
+
+                Deque<String> worklist = new ArrayDeque<>();
+                visited.add(clinit.getName());
+                worklist.push(clinit.getName());
+
+                while (!worklist.isEmpty()) {
+                    String cur = worklist.pop();
+
+                    // (a) Instruction scan. Every function the BFS
+                    // reaches is scanned exactly once, here, while its
+                    // name is on the stack. The previous revision
+                    // walked each scope three separate times, and
+                    // every one of those walks paid the same
+                    // per-instruction cost; folding the scan into the
+                    // BFS removes that threefold redundancy as a
+                    // side-effect of the memory fix.
+                    Function func = module.getFunction(cur);
+                    if (func != null && func.getEntryBlock() != null) {
+                        for (BasicBlock block : func.getBlocks()) {
+                            for (Instruction inst : block.getInstructions()) {
+                                Opcode op = inst.getOpcode();
+
+                                if (op == Opcode.NEW
+                                    || op == Opcode.GET_STATIC
+                                    || op == Opcode.PUT_STATIC
+                                    || op == Opcode.STATIC_CALL) {
+                                    String owner = extractTriggerOwner(inst);
+                                    if (owner != null
+                                        && !owner.isEmpty()
+                                        && !owner.equals(className)) {
+                                        delta.add(owner);
+                                    }
+                                }
+
+                                if (op == Opcode.GET_STATIC
+                                    || op == Opcode.PUT_STATIC) {
+                                    String field = extractStaticFieldKey(inst);
+                                    if (field != null) {
+                                        if (op == Opcode.PUT_STATIC) {
+                                            fieldWriters
+                                                .computeIfAbsent(field, k ->
+                                                    ConcurrentHashMap.newKeySet())
+                                                .add(className);
+                                        } else {
+                                            fieldReaders
+                                                .computeIfAbsent(field, k ->
+                                                    ConcurrentHashMap.newKeySet())
+                                                .add(className);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // (b) Call-graph expansion. A callee that is
+                    // itself a <clinit> body is recorded in `nested`
+                    // and not descended into: this clinit's scope
+                    // deliberately stops at another class's
+                    // initializer. A callee that is an ordinary
+                    // function is pushed onto the worklist exactly
+                    // once, guarded by `visited`.
+                    Set<String> callees = callGraph.get(cur);
+                    if (callees == null) continue;
+                    for (String callee : callees) {
+                        if (clinitNames.contains(callee)) {
+                            nested.add(callee);
+                            continue;
+                        }
+                        if (visited.add(callee)) {
+                            worklist.push(callee);
+                        }
+                    }
+                }
+
+                // (c) Superclass chain. The delta also carries every
+                // ancestor that declares a <clinit>, because JVMS
+                // §5.5 requires a superclass initializer to run
+                // before its subclass. This walk is independent of
+                // the call graph; it is done here so that all of this
+                // clinit's dependency edges are collected by exactly
+                // one task.
+                ClassNode cn = resolver.getClassNode(className);
+                Set<String> supVisited = new HashSet<>();
+                while (cn != null
+                       && cn.getSuperName() != null
+                       && !cn.getSuperName().equals(cn.getName())
+                       && supVisited.add(cn.getSuperName())) {
                     String sup = cn.getSuperName();
                     if ("java/lang/Object".equals(sup)) break;
                     delta.add(sup);
                     cn = resolver.getClassNode(sup);
                 }
 
-                Set<String> nested = nestedClinits.get(clinit.getName());
-                if (nested != null) {
-                    for (String nestedClinit : nested) {
-                        String nestedClass = clinitNameToClassName.get(nestedClinit);
-                        if (nestedClass != null && !nestedClass.equals(className)) {
-                            delta.add(nestedClass);
-                        }
+                // (d) Nested clinit classes contribute to the delta
+                // exactly as the superclass chain does. `nested` is
+                // the set of clinit function names collected in step
+                // (b); the corresponding class names are looked up
+                // through the same reverse index the rest of the
+                // method uses.
+                for (String nestedClinit : nested) {
+                    String nestedClass =
+                        clinitNameToClassName.get(nestedClinit);
+                    if (nestedClass != null
+                        && !nestedClass.equals(className)) {
+                        delta.add(nestedClass);
                     }
                 }
 
-                Set<String> scope = clinitScope.get(clinit.getName());
-                if (scope != null) {
-                    for (String funcName : scope) {
-                        Function func = module.getFunction(funcName);
-                        if (func == null || func.getEntryBlock() == null) continue;
-                        for (BasicBlock block : func.getBlocks()) {
-                            for (Instruction inst : block.getInstructions()) {
-                                String owner = extractTriggerOwner(inst);
-                                if (owner != null && !owner.isEmpty()
-                                    && !owner.equals(className)) {
-                                    delta.add(owner);
-                                }
-                            }
-                        }
-                    }
-                }
+                nestedClinits.put(clinit.getName(), nested);
 
                 if (!delta.isEmpty()) {
                     classDepDeltas.compute(className, (k, existing) -> {
@@ -530,8 +641,21 @@ public class Analyzer {
             .then()
         );
 
-        // Merge deltas into classDeps on the caller thread, preserving
-        // deterministic per-set iteration order by sorting each delta.
+        // ---- Class-dependency graph, assembled on the caller thread.
+        //
+        // The deltas collected by the parallel walk above are merged
+        // here, single-threaded, so that the LinkedHashSet inside
+        // each classDeps entry keeps a deterministic iteration order.
+        // Sorting each incoming delta before inserting it is what
+        // guarantees that two runs of the same build produce
+        // byte-identical emitted IR; the parallel producers cannot
+        // offer that guarantee on their own, because two threads can
+        // observe the same call graph in different orders.
+        Map<String, Set<String>> classDeps = new LinkedHashMap<>();
+        for (String cls : allWithClinit) {
+            classDeps.put(cls, new LinkedHashSet<>());
+        }
+
         for (Map.Entry<String, Set<String>> entry : classDepDeltas.entrySet()) {
             Set<String> deps = classDeps.get(entry.getKey());
             if (deps == null) continue;
@@ -540,41 +664,14 @@ public class Analyzer {
             deps.addAll(sorted);
         }
 
-        // ---- Parallel field writer/reader collection (Reactor).
-        Map<String, Set<String>> fieldWriters = new ConcurrentHashMap<>();
-        Map<String, Set<String>> fieldReaders = new ConcurrentHashMap<>();
-        LlvmUtil.awaitMono(Flux.fromIterable(clinitFunctions)
-            .parallel()
-            .runOn(scheduler)
-            .doOnNext(clinit -> {
-                String className = clinitNameToClassName.get(clinit.getName());
-                if (className == null) return;
-                Set<String> scope = clinitScope.get(clinit.getName());
-                if (scope == null) return;
-                for (String funcName : scope) {
-                    Function func = module.getFunction(funcName);
-                    if (func == null || func.getEntryBlock() == null) continue;
-                    for (BasicBlock block : func.getBlocks()) {
-                        for (Instruction inst : block.getInstructions()) {
-                            Opcode op = inst.getOpcode();
-                            if (op != Opcode.PUT_STATIC && op != Opcode.GET_STATIC) continue;
-                            String field = extractStaticFieldKey(inst);
-                            if (field == null) continue;
-                            if (op == Opcode.PUT_STATIC) {
-                                fieldWriters.computeIfAbsent(field, k ->
-                                    ConcurrentHashMap.newKeySet()).add(className);
-                            } else {
-                                fieldReaders.computeIfAbsent(field, k ->
-                                    ConcurrentHashMap.newKeySet()).add(className);
-                            }
-                        }
-                    }
-                }
-            })
-            .sequential()
-            .then()
-        );
-
+        // ---- Field-provenance edges.
+        //
+        // A class that reads a static field written by another class
+        // must be initialized after that writer's <clinit> has run.
+        // The fieldWriters / fieldReaders maps built in the
+        // single-pass walk above index both sides of that relation
+        // by field key; the loop below materialises the edges into
+        // classDeps.
         for (Map.Entry<String, Set<String>> entry : fieldReaders.entrySet()) {
             Set<String> writers = fieldWriters.get(entry.getKey());
             if (writers == null || writers.isEmpty()) continue;

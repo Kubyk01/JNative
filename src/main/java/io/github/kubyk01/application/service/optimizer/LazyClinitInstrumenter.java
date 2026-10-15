@@ -408,14 +408,23 @@ public class LazyClinitInstrumenter {
         List<Instruction> insts = block.getInstructions();
         if (insts.isEmpty()) return 0;
 
-        List<Instruction> rewritten = new ArrayList<>(insts.size() + 4);
+        // Lazy allocation: rewritten == null means no active trigger
+        // point has been found yet and the list has not been started.
+        // In the vast majority of blocks rewritten stays null and no
+        // ArrayList is allocated at all.
+        List<Instruction> rewritten = null;
         int added = 0;
 
-        for (Instruction inst : insts) {
+        for (int i = 0; i < insts.size(); i++) {
+            Instruction inst = insts.get(i);
             String triggered = triggeredClassFor(inst);
             if (triggered != null && !triggered.equals(ownerClass)) {
                 String wrapper = classToWrapper.get(triggered);
                 if (wrapper != null) {
+                    if (rewritten == null) {
+                        rewritten = new ArrayList<>(insts.size() + 4);
+                        for (int j = 0; j < i; j++) rewritten.add(insts.get(j));
+                    }
                     Instruction call = new Instruction(Opcode.STATIC_CALL);
                     call.addOperand(new Constant(Type.reference(wrapper), wrapper));
                     call.setParent(block);
@@ -423,10 +432,10 @@ public class LazyClinitInstrumenter {
                     added++;
                 }
             }
-            rewritten.add(inst);
+            if (rewritten != null) rewritten.add(inst);
         }
 
-        if (added > 0) {
+        if (rewritten != null) {
             insts.clear();
             insts.addAll(rewritten);
         }
