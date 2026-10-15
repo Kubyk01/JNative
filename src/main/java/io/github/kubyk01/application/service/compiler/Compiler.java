@@ -9,14 +9,21 @@ import io.github.kubyk01.domain.ir.TargetPlatform;
 import io.github.kubyk01.port.secondary.CompilerPort;
 import lombok.extern.slf4j.Slf4j;
 
+import io.github.kubyk01.domain.ir.Function;
+
+import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Comparator;
+import java.util.Enumeration;
 import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Set;
@@ -26,6 +33,9 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.jar.JarEntry;
+import java.util.jar.JarFile;
+import java.util.stream.Collectors;
 
 /**
  * Default {@link CompilerPort} implementation.
@@ -84,6 +94,7 @@ public class Compiler implements CompilerPort {
 
     private static final String RUNTIME_SOURCE_RESOURCE_PATH = "jnative_runtime.c";
     private static final String RUNTIME_HEADER_RESOURCE_PATH = "jnative_runtime.h";
+    private static final String JNI_BRIDGE_RESOURCE_PATH = "jnative_jni_bridge.c";
     private static final String NATIVE_BASE_PATH = "jnative/";
 
     /**
@@ -159,6 +170,12 @@ public class Compiler implements CompilerPort {
                 RUNTIME_HEADER_RESOURCE_PATH,
                 tempDir.resolve(RUNTIME_HEADER_RESOURCE_PATH));
 
+            // The JNI bridge supplies the thread-local JNIEnv* that every
+            // routed JNI native takes as its first argument.
+            Path jniBridgeSource = extractResource(
+                JNI_BRIDGE_RESOURCE_PATH,
+                tempDir.resolve(JNI_BRIDGE_RESOURCE_PATH));
+
             // ------------------------------------------------------------------
             // 2. Extract the per-class native support files.
             // ------------------------------------------------------------------
@@ -185,6 +202,9 @@ public class Compiler implements CompilerPort {
 
             Path runtimeObj = cDir.resolve("jnative_runtime.o");
             tasks.add(new CompileTask(runtimeSource, runtimeObj, false));
+
+            Path jniBridgeObj = cDir.resolve("jnative_jni_bridge.o");
+            tasks.add(new CompileTask(jniBridgeSource, jniBridgeObj, false));
 
             for (Path src : extraSources) {
                 // Duplicate basenames (different packages, same class name)
@@ -250,6 +270,25 @@ public class Compiler implements CompilerPort {
             linkCmd.add(exePath.toString());
 
             appendLinkerLibraries(linkCmd, target);
+
+            // ------------------------------------------------------------------
+            // 5. Discover and append platform native libraries. Only the
+            //    shared objects that actually export a JNI symbol the
+            //    module needs are linked. The .so files are not turned
+            //    into bitcode: they are added to the link command as
+            //    shared libraries.
+            // ------------------------------------------------------------------
+            List<Path> nativeLibs = collectNativeLibraries(module, resolver, target);
+            for (Path lib : nativeLibs) {
+                linkCmd.add("-Wl,--no-as-needed");
+                linkCmd.add(lib.toString());
+            }
+            // Export the runtime's rpath so the .so files are found at run
+            // time. $ORIGIN is the directory containing the produced
+            // executable; the user can either copy the .so files next to
+            // the executable or set LD_LIBRARY_PATH.
+            linkCmd.add("-Wl,-rpath,$ORIGIN");
+            linkCmd.add("-Wl,-rpath," + new File(".").getAbsolutePath());
 
             System.out.println("Linking for target " + target.triple() + "...");
             ProcessBuilder linkBuilder = new ProcessBuilder(linkCmd);
@@ -665,6 +704,184 @@ public class Compiler implements CompilerPort {
         linkCmd.add("-lpthread");
         linkCmd.add("-ldl");
         linkCmd.add("-lm");
+    }
+
+    // =========================================================================
+    //  Platform native library discovery
+    // =========================================================================
+
+    @Override
+    public List<Path> collectNativeLibraries(Module module,
+                                             DependencyResolver resolver,
+                                             TargetPlatform targetPlatform)
+        throws IOException {
+
+        // 1. The set of JNI symbols the module actually calls.
+        Set<String> wanted = new HashSet<>();
+        for (Function f : module.getFunctions()) {
+            if (f.isJniNative()) wanted.add(f.getName());
+        }
+        if (wanted.isEmpty()) return List.of();
+
+        // 2. Candidate directories and archives.
+        List<Path> candidates = new ArrayList<>();
+
+        // 2a. JDK platform libraries.
+        Path libDir = platformLibraryDir(targetPlatform);
+        if (libDir != null && Files.isDirectory(libDir)) {
+            try (var s = Files.walk(libDir, 2)) {
+                s.filter(Files::isRegularFile)
+                 .filter(p -> isDynamicLibrary(p, targetPlatform))
+                 .forEach(candidates::add);
+            }
+        }
+
+        // 2b. Native libraries bundled inside application JARs, which is how
+        //     Netty, SQLite, LevelDB and similar projects ship theirs.
+        //     Every JAR on the current classpath is scanned for entries under
+        //     META-INF/native/ (the conventional location) and extracted to a
+        //     stable temp directory so the linker can see them as real files.
+        Path extractDir = Files.createTempDirectory("jnative-natives-");
+        extractDir.toFile().deleteOnExit();
+        scanClasspathJarsForNatives(targetPlatform, extractDir, candidates);
+
+        // 3. Filter by exported symbols.
+        Set<String> stillWanted = new HashSet<>(wanted);
+        List<Path> result = new ArrayList<>();
+        Collections.sort(candidates);
+
+        for (Path lib : candidates) {
+            if (stillWanted.isEmpty()) break;
+            Set<String> exported = readExportedSymbols(lib);
+            Set<String> overlap = new HashSet<>(exported);
+            overlap.retainAll(stillWanted);
+            if (overlap.isEmpty()) continue;
+            result.add(lib);
+            stillWanted.removeAll(overlap);
+            log.info("Native library {} provides {} required JNI symbol(s)",
+                     lib, overlap.size());
+        }
+
+        if (!stillWanted.isEmpty()) {
+            log.warn("{} JNI symbol(s) still unresolved after scanning {} candidate "
+                    + "libraries. First 5: {}", stillWanted.size(), candidates.size(),
+                    stillWanted.stream().limit(5).collect(Collectors.joining(", ")));
+        }
+        return result;
+    }
+
+    /**
+     * Walks the JVM classpath, opens every JAR, and extracts every entry
+     * whose name matches {@code META-INF/native/<lib>.<so|dylib|dll>} (or
+     * simply ends with the platform suffix). The extracted files land under
+     * {@code extractDir} and are added to {@code out}.
+     *
+     * <p>This is the mechanism by which a Spring Boot fat jar's bundled
+     * Netty epoll libraries reach the linker. Their location inside the JAR
+     * is <em>conventional</em> — the same layout every JDK that ships native
+     * extensions uses — not a per-project hard-coded path.</p>
+     */
+    private void scanClasspathJarsForNatives(TargetPlatform target,
+                                             Path extractDir,
+                                             List<Path> out) throws IOException {
+        String suffix = target.triple().toLowerCase(Locale.ROOT).contains("windows")
+            ? ".dll"
+            : (target.triple().toLowerCase(Locale.ROOT).contains("darwin")
+                ? ".dylib" : ".so");
+
+        String cp = System.getProperty("java.class.path", "");
+        Set<Path> jars = new LinkedHashSet<>();
+        for (String entry : cp.split(File.pathSeparator)) {
+            if (entry.isEmpty()) continue;
+            Path p = Paths.get(entry);
+            if (Files.isRegularFile(p) && entry.endsWith(".jar")) {
+                jars.add(p);
+            }
+        }
+
+        for (Path jar : jars) {
+            try (JarFile jf = new JarFile(jar.toFile())) {
+                Enumeration<JarEntry> entries = jf.entries();
+                while (entries.hasMoreElements()) {
+                    JarEntry e = entries.nextElement();
+                    String n = e.getName();
+                    if (!n.endsWith(suffix)) continue;
+                    if (!n.contains("native/") && !n.contains("natives/")) continue;
+
+                    // Flatten the path: extract to <extractDir>/<basename>.
+                    String base = n.substring(n.lastIndexOf('/') + 1);
+                    Path dest = extractDir.resolve(base);
+                    if (Files.exists(dest)) continue;
+
+                    try (InputStream is = jf.getInputStream(e)) {
+                        Files.copy(is, dest, StandardCopyOption.REPLACE_EXISTING);
+                        out.add(dest);
+                        log.info("Extracted native library {} from {}", base, jar);
+                    }
+                }
+            } catch (IOException e) {
+                log.debug("Skipping JAR {}: {}", jar, e.getMessage());
+            }
+        }
+    }
+
+    private static boolean isDynamicLibrary(Path p, TargetPlatform t) {
+        String n = p.getFileName().toString();
+        String triple = t.triple().toLowerCase(Locale.ROOT);
+        if (triple.contains("windows")) return n.endsWith(".dll");
+        if (triple.contains("darwin") || triple.contains("apple")) {
+            return n.endsWith(".dylib");
+        }
+        return n.endsWith(".so");
+    }
+
+    private static Path platformLibraryDir(TargetPlatform t) {
+        String home = System.getProperty("java.home");
+        if (home == null) return null;
+        Path base = Paths.get(home);
+        String triple = t.triple().toLowerCase(Locale.ROOT);
+        if (triple.contains("windows")) return base.resolve("bin");
+        return base.resolve("lib");
+    }
+
+    /**
+     * Read the dynamic-symbol export list of {@code lib} by parsing the
+     * ELF export table directly. Avoids spawning {@code nm} for every
+     * file, which on JDK 21 means hundreds of subprocesses.
+     *
+     * <p>Falls back to {@code nm -D --defined-only} only if the parse
+     * fails, so a system without a working parser still functions.</p>
+     */
+    private static Set<String> readExportedSymbols(Path lib) throws IOException {
+        try {
+            return ElfSymbolReader.read(lib);
+        } catch (Throwable t) {
+            return readExportedSymbolsViaNm(lib);
+        }
+    }
+
+    private static Set<String> readExportedSymbolsViaNm(Path lib) {
+        try {
+            Process p = new ProcessBuilder("nm", "-D", "--defined-only",
+                lib.toString())
+                .redirectErrorStream(true)
+                .start();
+            Set<String> syms = new HashSet<>();
+            try (var r = new java.io.BufferedReader(
+                new java.io.InputStreamReader(p.getInputStream()))) {
+                String line;
+                while ((line = r.readLine()) != null) {
+                    int sp = line.lastIndexOf(' ');
+                    if (sp < 0 || sp + 1 >= line.length()) continue;
+                    String name = line.substring(sp + 1).trim();
+                    if (!name.isEmpty()) syms.add(name);
+                }
+            }
+            p.waitFor();
+            return syms;
+        } catch (Exception e) {
+            return Set.of();
+        }
     }
 
     private Set<String> collectReferencedNativeClasses(Module module,

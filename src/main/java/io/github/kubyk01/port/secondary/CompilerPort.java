@@ -22,4 +22,16 @@ public interface CompilerPort {
         throws IOException, InterruptedException;
 
     boolean hasNativeSupport(String className);
+
+    /**
+     * Discovers the platform native shared objects that provide the JNI
+     * symbols the module needs, by intersecting each library's exported
+     * symbol set with the set of JNI natives in {@code module}. Returns
+     * the libraries to append to the link command, in a deterministic
+     * order.
+     */
+    List<Path> collectNativeLibraries(Module module,
+                                      DependencyResolver resolver,
+                                      TargetPlatform targetPlatform)
+        throws IOException;
 }

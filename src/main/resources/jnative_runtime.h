@@ -893,6 +893,13 @@ extern int jnative_build_static_field_symbol(const char* owner,
                                              int32_t name_len,
                                              char* out, size_t out_size);
 
+/**
+ * Builds the @gv_* symbol for a static field and resolves its address
+ * through the dynamic linker (RTLD_DEFAULT). Returns NULL when the field
+ * is unknown to the running image.
+ */
+extern void* jnative_static_field_address(const char* owner, const char* name);
+
 /* ---- Try/catch setjmp bridge --------------------------------------- */
 
 extern void __jnative_push_catch(void* jmp_buf_ptr, void* type_info);

@@ -1900,6 +1900,7 @@ public class LlvmFunctionEmitter {
                         mangledCallee = nativeCandidate;
                     } else {
                         String nativeSymbol = null;
+                        Function nativeFunc = null;
                         int dotIdx = calleeName.lastIndexOf('.');
                         int parenIdx = calleeName.indexOf('(');
                         if (dotIdx > 0 && parenIdx > dotIdx) {
@@ -1915,13 +1916,24 @@ public class LlvmFunctionEmitter {
                             if (mn != null && mn.isNative()) {
                                 String actualOwner =
                                     nativeLookup[0] != null ? nativeLookup[0] : owner;
-                                nativeSymbol = "__jnative_"
-                                    + LlvmRuntime.mangleMethod(actualOwner, methodName, descriptor);
+                                // Prefer the function the translator already
+                                // registered for this native — either the
+                                // __jnative_ override or, when the class has
+                                // no JNative C file, its JNI symbol.
+                                Function resolved =
+                                    lookupNativeFunction(actualOwner, methodName, descriptor);
+                                if (resolved != null) {
+                                    nativeFunc = resolved;
+                                    nativeSymbol = resolved.getName();
+                                } else {
+                                    nativeSymbol = "__jnative_"
+                                        + LlvmRuntime.mangleMethod(actualOwner, methodName, descriptor);
+                                }
                             }
                         }
 
                         if (nativeSymbol != null) {
-                            if (module.getFunction(nativeSymbol) == null) {
+                            if (nativeFunc == null && module.getFunction(nativeSymbol) == null) {
                                 int paren2 = calleeName.indexOf('(');
                                 String desc2 = calleeName.substring(paren2);
                                 Type nRetType = TypeResolver.descToReturnType(desc2);
@@ -1933,6 +1945,9 @@ public class LlvmFunctionEmitter {
                                 module.addFunction(nFunc);
                             }
                             mangledCallee = nativeSymbol;
+                            if (nativeFunc != null) {
+                                calleeFunc = nativeFunc;
+                            }
                         } else {
                             if (dotIdx > 0 && parenIdx > dotIdx) {
                                 String owner = calleeName.substring(0, dotIdx);
@@ -1989,10 +2004,27 @@ public class LlvmFunctionEmitter {
                 final Function calleeForCall = calleeFunc;
                 final String mangledCalleeFinal = mangledCallee;
                 final Type retTypeForCall = retType;
+                final boolean isJni = calleeForCall != null && calleeForCall.isJniNative();
+                final boolean isStaticJni = calleeForCall != null && calleeForCall.isStaticJniNative();
+                final String jniClassRef = isJni && calleeForCall.getOwnerClass() != null
+                    ? globalEmitter.getRefClassGlobalName(calleeForCall.getOwnerClass())
+                    : null;
                 emitCall(sb, retTypeForCall, inst.getResult(), resultName, ranges, (callSb, resultReg) -> {
                     StringBuilder argList = new StringBuilder();
+                    // A JNI native never receives the Java receiver alone:
+                    // the C ABI requires the thread-local JNIEnv* first and,
+                    // for a static method, the jclass mirror second.
+                    if (isJni) {
+                        String env = newAux("jnienv");
+                        callSb.append("  ").append(env)
+                            .append(" = call i8* @__jnative_get_jnienv()\n");
+                        argList.append("i8* ").append(env);
+                        if (isStaticJni && jniClassRef != null) {
+                            argList.append(", i8* ").append(jniClassRef);
+                        }
+                    }
                     for (int i = 0; i < argsForCall.size(); i++) {
-                        if (i > 0) argList.append(", ");
+                        if (!argList.isEmpty()) argList.append(", ");
                         Value arg = argsForCall.get(i);
                         Type paramType;
                         if (calleeForCall != null && i < calleeForCall.getParameters().size()) {
@@ -2103,6 +2135,7 @@ public class LlvmFunctionEmitter {
                         mangledCallee = nativeCandidate;
                     } else {
                         String nativeSymbol = null;
+                        Function nativeFunc = null;
                         int dotIdx = calleeName.lastIndexOf('.');
                         int parenIdx = calleeName.indexOf('(');
                         if (dotIdx > 0 && parenIdx > dotIdx) {
@@ -2118,13 +2151,24 @@ public class LlvmFunctionEmitter {
                             if (mn != null && mn.isNative()) {
                                 String actualOwner =
                                     nativeLookup[0] != null ? nativeLookup[0] : owner;
-                                nativeSymbol = "__jnative_"
-                                    + LlvmRuntime.mangleMethod(actualOwner, methodName, descriptor);
+                                // Prefer the function the translator already
+                                // registered for this native — either the
+                                // __jnative_ override or, when the class has
+                                // no JNative C file, its JNI symbol.
+                                Function resolved =
+                                    lookupNativeFunction(actualOwner, methodName, descriptor);
+                                if (resolved != null) {
+                                    nativeFunc = resolved;
+                                    nativeSymbol = resolved.getName();
+                                } else {
+                                    nativeSymbol = "__jnative_"
+                                        + LlvmRuntime.mangleMethod(actualOwner, methodName, descriptor);
+                                }
                             }
                         }
 
                         if (nativeSymbol != null) {
-                            if (module.getFunction(nativeSymbol) == null) {
+                            if (nativeFunc == null && module.getFunction(nativeSymbol) == null) {
                                 int paren2 = calleeName.indexOf('(');
                                 String desc2 = calleeName.substring(paren2);
                                 Type nRetType = TypeResolver.descToReturnType(desc2);
@@ -2136,6 +2180,9 @@ public class LlvmFunctionEmitter {
                                 module.addFunction(nFunc);
                             }
                             mangledCallee = nativeSymbol;
+                            if (nativeFunc != null) {
+                                calleeFunc = nativeFunc;
+                            }
                         } else {
                             if (dotIdx > 0 && parenIdx > dotIdx) {
                                 String owner = calleeName.substring(0, dotIdx);
@@ -2177,10 +2224,27 @@ public class LlvmFunctionEmitter {
                 final Function calleeForCall = calleeFunc;
                 final String mangledCalleeFinal = mangledCallee;
                 final Type retTypeForCall = retType;
+                final boolean isJni = calleeForCall != null && calleeForCall.isJniNative();
+                final boolean isStaticJni = calleeForCall != null && calleeForCall.isStaticJniNative();
+                final String jniClassRef = isJni && calleeForCall.getOwnerClass() != null
+                    ? globalEmitter.getRefClassGlobalName(calleeForCall.getOwnerClass())
+                    : null;
                 emitCall(sb, retTypeForCall, inst.getResult(), resultName, ranges, (callSb, resultReg) -> {
                     StringBuilder argList = new StringBuilder();
+                    // A JNI native never receives the Java receiver alone:
+                    // the C ABI requires the thread-local JNIEnv* first and,
+                    // for a static method, the jclass mirror second.
+                    if (isJni) {
+                        String env = newAux("jnienv");
+                        callSb.append("  ").append(env)
+                            .append(" = call i8* @__jnative_get_jnienv()\n");
+                        argList.append("i8* ").append(env);
+                        if (isStaticJni && jniClassRef != null) {
+                            argList.append(", i8* ").append(jniClassRef);
+                        }
+                    }
                     for (int i = 0; i < argsForCall.size(); i++) {
-                        if (i > 0) argList.append(", ");
+                        if (!argList.isEmpty()) argList.append(", ");
                         Value arg = argsForCall.get(i);
                         Type paramType;
                         if (calleeForCall != null && i < calleeForCall.getParameters().size()) {
@@ -4058,7 +4122,15 @@ public class LlvmFunctionEmitter {
 
     private boolean isCallableSymbolDefined(String symbol) {
         if (symbol == null || symbol.isEmpty()) return false;
-        if (symbol.startsWith("__jnative_")) return true;
+        // Only the compiler-known override/adaptor families are treated as
+        // implicitly defined. A blanket "__jnative_" match would silently
+        // accept any typo'd or stale symbol and emit a call to a name the
+        // linker never resolves, which is exactly the failure mode the
+        // diagnostic trap below exists to catch.
+        if (symbol.startsWith("__jnative_override_")
+            || symbol.startsWith("__jnative_fn_")) {
+            return true;
+        }
         if (symbol.startsWith("llvm."))    return true;
         return switch (symbol) {
             case "malloc", "free", "printf", "abort", "atexit",
@@ -4066,6 +4138,13 @@ public class LlvmFunctionEmitter {
                 true;
             default -> {
                 Function f = module.getFunction(symbol);
+                // A JNI native is a declaration on purpose: its body lives
+                // in a platform shared object and is resolved by the
+                // linker, so it counts as "defined" even without an entry
+                // block.
+                if (f != null && f.isJniNative()) {
+                    yield true;
+                }
                 // A bare `declare` (no entry block) will fail at link time
                 // unless something else provides the body.  Only count the
                 // symbol as defined when the module really contains a
@@ -4073,6 +4152,46 @@ public class LlvmFunctionEmitter {
                 yield f != null && f.getEntryBlock() != null;
             }
         };
+    }
+
+    /**
+     * Resolves the {@link Function} the translator registered for a Java
+     * {@code native} method: the {@code __jnative_} override when the
+     * declaring class ships a JNative C file, or the JNI symbol
+     * ({@code Java_…}) when it does not. Returns {@code null} when
+     * neither has been registered.
+     */
+    private Function lookupNativeFunction(String owner, String methodName,
+                                          String descriptor) {
+        String jnative = "__jnative_"
+            + LlvmRuntime.mangleMethod(owner, methodName, descriptor);
+        Function f = module.getFunction(jnative);
+        if (f != null) {
+            return f;
+        }
+        String jni = LlvmRuntime.toJniSymbolName(owner, methodName, descriptor,
+            countOverloads(owner, methodName));
+        return module.getFunction(jni);
+    }
+
+    /**
+     * Number of methods named {@code methodName} declared by {@code owner}.
+     * Mirrors the helper in {@code BytecodeToIr} and decides whether the
+     * JNI symbol needs the {@code __<descriptor>} overload suffix.
+     */
+    private int countOverloads(String owner, String methodName) {
+        io.github.kubyk01.domain.analyzer.dependencyresolver.ClassNode cn =
+            resolver.getClassNode(owner);
+        if (cn == null) {
+            return 1;
+        }
+        int n = 0;
+        for (MethodNode mn : cn.getMethods()) {
+            if (mn.getName().equals(methodName)) {
+                n++;
+            }
+        }
+        return Math.max(n, 1);
     }
 
     private String emitBaseToI8Pointer(StringBuilder sb, Value base) {

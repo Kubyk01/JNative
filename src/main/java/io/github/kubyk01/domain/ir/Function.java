@@ -27,6 +27,26 @@ public class Function {
     @Setter
     private String ownerClass;
 
+    /**
+     * True when this function is an external JNI native that must be
+     * invoked through the JNI calling convention: a thread-local
+     * {@code JNIEnv*} is passed as the first operand, followed (for a
+     * static method) by the {@code jclass} mirror. Set by
+     * {@code BytecodeToIr} when the declaring class ships no JNative C
+     * implementation and the symbol is resolved from the platform's
+     * native shared objects at link time.
+     */
+    @Setter
+    private boolean jniNative;
+
+    /**
+     * True when the JNI native is {@code static}, so the emitter knows to
+     * prepend the {@code jclass} mirror after the {@code JNIEnv*}. Paired
+     * with {@link #jniNative}.
+     */
+    @Setter
+    private boolean staticJniNative;
+
     public Function(String name, Type returnType) {
         this.name = name;
         this.returnType = returnType;

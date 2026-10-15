@@ -1078,6 +1078,16 @@ int jnative_build_static_field_symbol(const char* owner,
     return 1;
 }
 
+void* jnative_static_field_address(const char* owner, const char* name) {
+    char symbol[1024];
+    if (!jnative_build_static_field_symbol(owner, name,
+                                           (int32_t)strlen(name),
+                                           symbol, sizeof(symbol))) {
+        return NULL;
+    }
+    return dlsym(RTLD_DEFAULT, symbol);
+}
+
 /* ============================================================================
  * Symbol demangling
  * ========================================================================== */
