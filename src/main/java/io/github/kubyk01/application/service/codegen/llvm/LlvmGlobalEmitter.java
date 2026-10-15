@@ -3,7 +3,6 @@ package io.github.kubyk01.application.service.codegen.llvm;
 import io.github.kubyk01.application.service.analyzer.dependencyresolver.DependencyResolver;
 import io.github.kubyk01.application.service.analyzer.ssa.TypeResolver;
 import io.github.kubyk01.domain.analyzer.aliasanalysis.AliasAnalysisResult;
-import io.github.kubyk01.domain.analyzer.aliasanalysis.PointsToSet;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.ClassNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.FieldNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.FieldReference;
@@ -37,6 +36,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.concurrent.ConcurrentHashMap;
 
 import static io.github.kubyk01.util.LlvmUtil.getElementSizeOfType;
+import static io.github.kubyk01.util.LlvmUtil.extractFieldName;
 
 /**
  * Emits the global data section of a generated LLVM module: struct type
@@ -474,22 +474,8 @@ public class LlvmGlobalEmitter {
     //  Extra struct / vtable registry
     // =========================================================================
 
-    public void addExtraStruct(String name, String definition) {
-        extraStructs.put(name, definition);
-    }
-
-    public void addExtraVtable(String name, String content) {
-        extraVtables.put(name, content);
-    }
-
     public void emitExtraStructs(StringBuilder sb) {
         for (String def : extraStructs.values()) {
-            sb.append(def).append("\n");
-        }
-    }
-
-    public void emitExtraVtables(StringBuilder sb) {
-        for (String def : extraVtables.values()) {
             sb.append(def).append("\n");
         }
     }
@@ -576,10 +562,6 @@ public class LlvmGlobalEmitter {
             totalInterfaces = nextInterfaceId;
             layoutsBuilt = true;
         }
-    }
-
-    public void prepareMethodIndex() {
-        prepareLayouts();
     }
 
     private VtableLayout getOrBuildClassLayout(String className) {
@@ -742,21 +724,8 @@ public class LlvmGlobalEmitter {
         return id != null ? id : -1;
     }
 
-    public int getTotalInterfaces() {
-        prepareLayouts();
-        return totalInterfaces;
-    }
-
     public String getVtableName(String className) {
         return vtableNames.get(className);
-    }
-
-    public int getVtableLength(String className) {
-        return vtableLengths.getOrDefault(className, -1);
-    }
-
-    public int getLambdaVtableLength(String lambdaId) {
-        return lambdaVtableLengths.getOrDefault(lambdaId, -1);
     }
 
     public String getStructName(String className) {
@@ -879,19 +848,6 @@ public class LlvmGlobalEmitter {
             generateReflectionData() +
             generateFunctionIndex();
     }
-
-    /** Existing entry point, preserved for backwards compatibility. */
-    public String generateGlobals() {
-        prepareLayouts();
-        return generateTypeDefinitions()
-            + generateStructDefinitions()
-            + generateGlobalDefinitions();
-    }
-
-    // =========================================================================
-    //  Unnamed-module singleton
-    // =========================================================================
-
     /**
      * Emits the one shared {@code java.lang.Module} object that stands for the
      * bootstrap loader's module.
@@ -1976,11 +1932,25 @@ public class LlvmGlobalEmitter {
     // =========================================================================
 
     private String generateStaticFields() {
+        Set<String> allFields = new TreeSet<>(aliasResult.getGraph().getStaticFieldPointsToMap().keySet());
+
+        for (Function function : module.getFunctions()) {
+            for (BasicBlock block : function.getBlocks()) {
+                for (Instruction inst : block.getInstructions()) {
+                    Opcode op = inst.getOpcode();
+                    if (op != Opcode.GET_STATIC && op != Opcode.PUT_STATIC) continue;
+                    String fullName = extractFieldName(inst);
+                    if (fullName == null || fullName.isEmpty()
+                        || "unknown".equals(fullName)) {
+                        continue;
+                    }
+                    allFields.add(fullName);
+                }
+            }
+        }
+
         StringBuilder sb = new StringBuilder();
-        Map<String, PointsToSet> staticFields = aliasResult.getGraph().getStaticFieldPointsToMap();
-        List<String> sorted = new ArrayList<>(staticFields.keySet());
-        Collections.sort(sorted);
-        for (String fullName : sorted) {
+        for (String fullName : allFields) {
             int dot = fullName.lastIndexOf('.');
             String owner = fullName.substring(0, dot);
             String fieldName = fullName.substring(dot + 1);
