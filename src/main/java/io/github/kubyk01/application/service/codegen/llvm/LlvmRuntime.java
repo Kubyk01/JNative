@@ -180,6 +180,9 @@ public class LlvmRuntime {
             declare i8* @__jnative_get_jnienv()
             declare i8* @__jnative_get_thread_jnienv()
 
+            declare i8* @__jnative_jni_resolve(i8*, i8*, i8*, i8*)
+            declare void @__jnative_jni_load_all(i8**, i32)
+
             declare i8* @jnative_static_field_address(i8*, i8*)
             """;
     }

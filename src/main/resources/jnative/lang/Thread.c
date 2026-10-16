@@ -1035,3 +1035,83 @@ void* __jnative_fn_java_lang_Thread_getThreads____Ljava_lang_Thread_(void) {
     }
     return array;
 }
+
+/*
+ * private static native StackTraceElement[][] dumpThreads(Thread[] threads);
+ *
+ * Called from Thread.getAllStackTraces. On HotSpot this walks the VM's
+ * stack-walking machinery and produces a StackTraceElement[] for every
+ * thread in the input array. This runtime has no per-frame metadata
+ * registered with any stack walker, so every per-thread stack trace is
+ * the empty array.
+ *
+ * The result shape is what matters: the caller iterates the outer
+ * array in lockstep with the input `threads` array and builds a
+ * Map<Thread, StackTraceElement[]> whose every value is a non-null
+ * (but empty) array. Returning an array of nulls instead would NPE
+ * the caller's for-loop on the first iteration; returning a null
+ * outer array would NPE on the first array access. Both are avoided
+ * by allocating a real StackTraceElement[][] of the right length,
+ * with one empty StackTraceElement[] per slot.
+ *
+ * The descriptor is ([Ljava/lang/Thread;)[[Ljava/lang/StackTraceElement;.
+ */
+void* __jnative_fn_java_lang_Thread_dumpThreads___Ljava_lang_Thread____Ljava_lang_StackTraceElement_(
+        void* threads_array)
+{
+    if (threads_array == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+
+    int32_t count = jnative_array_length(threads_array);
+    if (count < 0) {
+        __jnative_throw_null_pointer_exception();
+    }
+
+    void* outer = jnative_ref_array_of_class(
+        NULL, count, "[[Ljava/lang/StackTraceElement;");
+    if (outer == NULL) {
+        __jnative_throw_out_of_memory_error_ctx("Thread.dumpThreads");
+    }
+
+    void** slots = (void**)((char*)outer + JAVA_ARR_HDR);
+    for (int32_t i = 0; i < count; i++) {
+        void* empty = jnative_ref_array_of_class(
+            NULL, 0, "[Ljava/lang/StackTraceElement;");
+        if (empty == NULL) {
+            __jnative_throw_out_of_memory_error_ctx("Thread.dumpThreads");
+        }
+        slots[i] = empty;
+    }
+    return outer;
+}
+
+/*
+ * private native Object getStackTrace0();
+ *
+ * Called from Thread.asyncGetStackTrace. On HotSpot this captures the
+ * receiver's current stack trace via the VM's stack walker. This
+ * runtime has no such capture machinery; the truthful answer is "an
+ * empty stack trace", which the Java caller passes through to
+ * getStackTrace()'s caller as the array-typed result it expects.
+ *
+ * The return type in the descriptor is Object (the call site erases
+ * the concrete array type to Object); the actual value produced is a
+ * real StackTraceElement[] of length zero, indistinguishable from
+ * the array the JDK would produce for a thread whose stack had
+ * already been fully popped.
+ *
+ * The method is an INSTANCE native: the first C argument is the
+ * receiver and is deliberately unused — there is no per-thread
+ * metadata to consult.
+ */
+void* __jnative_fn_java_lang_Thread_getStackTrace0___Ljava_lang_Object_(void* self)
+{
+    (void)self;
+    void* result = jnative_ref_array_of_class(
+        NULL, 0, "[Ljava/lang/StackTraceElement;");
+    if (result == NULL) {
+        __jnative_throw_out_of_memory_error_ctx("Thread.getStackTrace0");
+    }
+    return result;
+}

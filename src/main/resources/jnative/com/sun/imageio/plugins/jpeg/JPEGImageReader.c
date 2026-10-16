@@ -290,7 +290,7 @@ void __jnative_fn_com_sun_imageio_plugins_jpeg_JPEGImageReader_setOutColorSpace_
  * outcome. They are accepted with their exact C signatures so the
  * LLVM-emitted call site links against this definition.
  */
-int32_t __jnative_fn_com_sun_imageio_plugins_jpeg_JPEGImageReader_readImage__IJ_BI_I_IIIIIII_Ljavax_imageio_plugins_jpeg_JPEGQTable__Ljavax_imageio_plugins_jpeg_JPEGHuffmanTable__Ljavax_imageio_plugins_jpeg_JPEGHuffmanTable__IIZ_Z(
+int32_t __jnative_fn_com_sun_imageio_plugins_jpeg_JPEGImageReader_readImage__IJ_BI_I_IIIIIII_Ljavax_imageio_plugins_jpeg_JPEGQTable__Ljavax_imageio_plugins_jpeg_JPEGHuffmanTable__Ljavax_imageio_plugins_jpeg_JPEGHuffmanTable_IIZ_Z(
         void* self,
         int32_t imageIndex,
         int64_t structPointer,

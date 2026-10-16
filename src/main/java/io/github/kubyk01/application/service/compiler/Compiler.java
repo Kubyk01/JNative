@@ -18,6 +18,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
+import java.util.AbstractMap;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
@@ -26,6 +27,7 @@ import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -736,13 +738,29 @@ public class Compiler implements CompilerPort {
             }
         }
 
-        // 2b. Native libraries bundled inside application JARs, which is how
-        //     Netty, SQLite, LevelDB and similar projects ship theirs.
-        //     Every JAR on the current classpath is scanned for entries under
-        //     META-INF/native/ (the conventional location) and extracted to a
-        //     stable temp directory so the linker can see them as real files.
+        // 2b. Native libraries bundled inside the analysed input archive,
+        //     including recursion into nested jars (Spring Boot fat jar
+        //     layout).
+        //
+        //     The extraction directory must outlive the whole build, so it is
+        //     created separately from the main build directory and its removal
+        //     is deferred to JVM exit (deleteOnExit). This matters: even after
+        //     compileAndLink() returns the extracted .so files stay valid and
+        //     can be reused by later runs.
         Path extractDir = Files.createTempDirectory("jnative-natives-");
         extractDir.toFile().deleteOnExit();
+
+        Path inputArchive = resolver.getInputArchive();
+        if (inputArchive != null) {
+            scanInputArchiveForNatives(inputArchive, targetPlatform,
+                                       extractDir, candidates);
+        }
+
+        // 2c. Native libraries bundled inside the jar files on the tool's own
+        //     classpath. Usually these are extra plugins rather than the
+        //     application's dependencies, but scanning costs almost nothing
+        //     and covers the case where the build system explicitly put a
+        //     .so-jar on the tool classpath.
         scanClasspathJarsForNatives(targetPlatform, extractDir, candidates);
 
         // 3. Filter by exported symbols.
@@ -770,25 +788,219 @@ public class Compiler implements CompilerPort {
         return result;
     }
 
+    // =========================================================================
+    //  Recursive scanning of the input archive
+    // =========================================================================
+
     /**
-     * Walks the JVM classpath, opens every JAR, and extracts every entry
-     * whose name matches {@code META-INF/native/<lib>.<so|dylib|dll>} (or
-     * simply ends with the platform suffix). The extracted files land under
-     * {@code extractDir} and are added to {@code out}.
+     * Maximum recursion depth when parsing jar-in-jar.
      *
-     * <p>This is the mechanism by which a Spring Boot fat jar's bundled
-     * Netty epoll libraries reach the linker. Their location inside the JAR
-     * is <em>conventional</em> — the same layout every JDK that ships native
-     * extensions uses — not a per-project hard-coded path.</p>
+     * <p>A Spring Boot fat jar has exactly one level of nesting: the outer
+     * archive contains {@code BOOT-INF/lib/*.jar} entries. A margin of 3
+     * levels is left for wrapper formats that put the executable jar one
+     * level deeper. The limit exists precisely so that a malicious or corrupt
+     * archive cannot make the scanner recurse without bound and exhaust the
+     * Java stack.</p>
+     */
+    private static final int MAX_NESTING_DEPTH = 4;
+
+    /**
+     * Scans the input archive for native libraries and adds each extracted
+     * file to {@code out}.
+     *
+     * <p>The input may be a jar, a Spring Boot fat jar, a directory tree of
+     * jars, or a single .class. Each case gets its own explicit branch so the
+     * recursion rules stay unambiguous:</p>
+     *
+     * <ul>
+     *   <li><b>Directory</b> — every {@code .jar} found beneath it is scanned
+     *       by {@link #scanOneJarForNatives}.</li>
+     *   <li><b>Jar</b> — scanned by {@link #scanOneJarForNatives}, which
+     *       extracts dynamic libraries and recurses into nested jars.</li>
+     *   <li><b>Single .class</b> — nothing to do; a .class cannot contain a
+     *       native library.</li>
+     * </ul>
+     */
+    private void scanInputArchiveForNatives(Path inputArchive,
+                                            TargetPlatform target,
+                                            Path extractDir,
+                                            List<Path> out) throws IOException {
+        if (Files.isDirectory(inputArchive)) {
+            try (var stream = Files.walk(inputArchive)) {
+                stream.filter(Files::isRegularFile)
+                      .filter(p -> p.getFileName().toString()
+                                    .toLowerCase(Locale.ROOT)
+                                    .endsWith(".jar"))
+                      .forEach(jar -> {
+                          try {
+                              scanOneJarForNatives(jar, target,
+                                                   extractDir, out, 0);
+                          } catch (IOException e) {
+                              log.debug("Skipping JAR {}: {}",
+                                        jar, e.getMessage());
+                          }
+                      });
+            }
+            return;
+        }
+
+        if (!Files.isRegularFile(inputArchive)) {
+            return;
+        }
+
+        String name = inputArchive.getFileName().toString()
+                                 .toLowerCase(Locale.ROOT);
+        if (name.endsWith(".jar")) {
+            scanOneJarForNatives(inputArchive, target, extractDir, out, 0);
+        }
+        // A .class input cannot contain a native library.
+    }
+
+    /**
+     * Scans a single jar (or nested jar) for native libraries and recurses
+     * into every nested jar.
+     *
+     * <p>Scanning is two-pass. In the first pass the outer jar's entry list is
+     * walked in full: each dynamic library is extracted to disk immediately,
+     * and each nested {@code .jar} entry is remembered for the second pass.
+     * The two-pass structure is mandatory because opening a nested jar consumes
+     * the outer jar entry's input stream (the entry stream must be drained
+     * before the next entry can be read), and interleaving the two kinds of
+     * processing would make the traversal order non-deterministic.</p>
+     *
+     * <p>In the second pass each remembered nested jar is materialised to a
+     * temp file, recursively scanned by this same method, and deleted.
+     * Materialisation is preferred over in-memory scanning because a Spring
+     * Boot fat jar normally stores nested jars in STORED (uncompressed) mode,
+     * and {@link java.util.zip.ZipInputStream} does not expose the offset that
+     * would let the nested archive be opened without copying. The temp file is
+     * deleted in a finally block, so a mid-scan failure leaves nothing
+     * behind.</p>
+     *
+     * <p>Nesting depth is bounded by {@link #MAX_NESTING_DEPTH}; a deeper
+     * structure is scanned to that depth and the remainder is skipped with a
+     * debug message. A Spring Boot fat jar uses exactly one level of nesting,
+     * so the limit is never reached in practice.</p>
+     */
+    private void scanOneJarForNatives(Path jarPath,
+                                      TargetPlatform target,
+                                      Path extractDir,
+                                      List<Path> out,
+                                      int depth) throws IOException {
+        if (depth > MAX_NESTING_DEPTH) {
+            log.debug("Jar nesting depth {} exceeded for {}; "
+                    + "not recursing further", depth, jarPath);
+            return;
+        }
+
+        String suffix = dynamicLibrarySuffix(target);
+
+        try (JarFile jf = new JarFile(jarPath.toFile())) {
+            List<JarEntry> nestedJars = new ArrayList<>();
+            Enumeration<JarEntry> entries = jf.entries();
+            while (entries.hasMoreElements()) {
+                JarEntry e = entries.nextElement();
+                if (e.isDirectory()) continue;
+                String en = e.getName();
+
+                if (en.endsWith(suffix)
+                    && (en.contains("native/") || en.contains("natives/"))) {
+                    String base = en.substring(en.lastIndexOf('/') + 1);
+                    Path dest = uniqueExtractPath(extractDir, base);
+                    try (InputStream is = jf.getInputStream(e)) {
+                        Files.copy(is, dest,
+                                   StandardCopyOption.REPLACE_EXISTING);
+                        out.add(dest);
+                        log.info("Extracted native library {} from {}!/{}",
+                                 base, jarPath.getFileName(), en);
+                    }
+                    continue;
+                }
+
+                if (en.endsWith(".jar")) {
+                    nestedJars.add(e);
+                }
+            }
+
+            for (JarEntry nested : nestedJars) {
+                Path nestedJarPath = null;
+                try {
+                    Path tmp = Files.createTempFile(extractDir,
+                                                    "nested-", ".jar");
+                    try (InputStream is = jf.getInputStream(nested)) {
+                        Files.copy(is, tmp,
+                                   StandardCopyOption.REPLACE_EXISTING);
+                    }
+                    nestedJarPath = tmp;
+                    scanOneJarForNatives(tmp, target, extractDir, out,
+                                         depth + 1);
+                } catch (IOException e) {
+                    log.debug("Failed to scan nested jar {}!/{}: {}",
+                              jarPath.getFileName(), nested.getName(),
+                              e.getMessage());
+                } finally {
+                    if (nestedJarPath != null) {
+                        try {
+                            Files.deleteIfExists(nestedJarPath);
+                        } catch (IOException ignored) {
+                            // Best-effort cleanup. A leftover file will be
+                            // deleted on JVM exit via the parent extractDir's
+                            // deleteOnExit.
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Returns the dynamic-library filename suffix for the given target
+     * platform: {@code .dll} on Windows, {@code .dylib} on macOS, {@code .so}
+     * everywhere else.
+     */
+    private static String dynamicLibrarySuffix(TargetPlatform t) {
+        String triple = t.triple().toLowerCase(Locale.ROOT);
+        if (triple.contains("windows")) return ".dll";
+        if (triple.contains("darwin") || triple.contains("apple")) return ".dylib";
+        return ".so";
+    }
+
+    /**
+     * Returns a path inside {@code extractDir} with the name {@code base},
+     * decorated with a numeric suffix if necessary to avoid collisions.
+     * Different jar files may carry native libraries with the same base name
+     * (for example two versions of the same dependency inside a fat jar), and
+     * the link command must be able to reference each one by a distinct path.
+     */
+    private static Path uniqueExtractPath(Path extractDir, String base) {
+        Path candidate = extractDir.resolve(base);
+        if (!Files.exists(candidate)) return candidate;
+
+        int dot = base.lastIndexOf('.');
+        String stem = (dot > 0) ? base.substring(0, dot) : base;
+        String ext  = (dot > 0) ? base.substring(dot) : "";
+
+        int i = 1;
+        while (Files.exists(candidate)) {
+            candidate = extractDir.resolve(stem + "_" + i + ext);
+            i++;
+        }
+        return candidate;
+    }
+
+    /**
+     * Walks the JVM classpath, opens every jar, and recursively scans it via
+     * {@link #scanOneJarForNatives}, extracting native libraries into
+     * {@code extractDir}.
+     *
+     * <p>This method used to do a flat scan of the top-level jar. It now
+     * delegates to the recursive implementation so that the same jar-in-jar
+     * handling applies both to the application and to the tool's classpath.
+     * Behaviour for jars without nested archives is unchanged.</p>
      */
     private void scanClasspathJarsForNatives(TargetPlatform target,
                                              Path extractDir,
-                                             List<Path> out) throws IOException {
-        String suffix = target.triple().toLowerCase(Locale.ROOT).contains("windows")
-            ? ".dll"
-            : (target.triple().toLowerCase(Locale.ROOT).contains("darwin")
-                ? ".dylib" : ".so");
-
+                                             List<Path> out) {
         String cp = System.getProperty("java.class.path", "");
         Set<Path> jars = new LinkedHashSet<>();
         for (String entry : cp.split(File.pathSeparator)) {
@@ -800,25 +1012,8 @@ public class Compiler implements CompilerPort {
         }
 
         for (Path jar : jars) {
-            try (JarFile jf = new JarFile(jar.toFile())) {
-                Enumeration<JarEntry> entries = jf.entries();
-                while (entries.hasMoreElements()) {
-                    JarEntry e = entries.nextElement();
-                    String n = e.getName();
-                    if (!n.endsWith(suffix)) continue;
-                    if (!n.contains("native/") && !n.contains("natives/")) continue;
-
-                    // Flatten the path: extract to <extractDir>/<basename>.
-                    String base = n.substring(n.lastIndexOf('/') + 1);
-                    Path dest = extractDir.resolve(base);
-                    if (Files.exists(dest)) continue;
-
-                    try (InputStream is = jf.getInputStream(e)) {
-                        Files.copy(is, dest, StandardCopyOption.REPLACE_EXISTING);
-                        out.add(dest);
-                        log.info("Extracted native library {} from {}", base, jar);
-                    }
-                }
+            try {
+                scanOneJarForNatives(jar, target, extractDir, out, 0);
             } catch (IOException e) {
                 log.debug("Skipping JAR {}: {}", jar, e.getMessage());
             }
@@ -852,7 +1047,7 @@ public class Compiler implements CompilerPort {
      * <p>Falls back to {@code nm -D --defined-only} only if the parse
      * fails, so a system without a working parser still functions.</p>
      */
-    private static Set<String> readExportedSymbols(Path lib) throws IOException {
+    private static Set<String> readExportedSymbols(Path lib) {
         try {
             return ElfSymbolReader.read(lib);
         } catch (Throwable t) {
@@ -909,5 +1104,62 @@ public class Compiler implements CompilerPort {
             }
         }
         return result;
+    }
+
+    /**
+     * Discovers every native library the input archive contributes and
+     * returns both the resource keys under which the runtime will load
+     * them and the (key, bytes) pairs the LLVM emitter must embed.
+     *
+     * <p>The method is idempotent and free of hidden state: it opens
+     * the input archive, extracts every {@code .so} / {@code .dylib} /
+     * {@code .dll} whose path contains {@code native/} or
+     * {@code natives/}, and returns the result. No field of this
+     * compiler instance is written; two invocations with the same
+     * arguments produce two equivalent records.</p>
+     *
+     * <p>Extraction uses the same recursive scan as
+     * {@link #collectNativeLibraries}, so a Netty {@code .so} inside a
+     * nested {@code BOOT-INF/lib/*.jar} of a Spring Boot fat jar is
+     * found by both code paths through exactly one implementation of
+     * the traversal.</p>
+     */
+    @Override
+    public EmbeddedNativeLibraries embedNativeLibraries(
+            Module module,
+            DependencyResolver resolver,
+            TargetPlatform targetPlatform)
+        throws IOException {
+
+        Path extractDir = Files.createTempDirectory("jnative-native-bytes-");
+        extractDir.toFile().deleteOnExit();
+
+        List<Path> candidates = new ArrayList<>();
+        Path inputArchive = resolver.getInputArchive();
+        if (inputArchive != null) {
+            scanInputArchiveForNatives(inputArchive, targetPlatform,
+                                       extractDir, candidates);
+        }
+
+        List<String> keys = new ArrayList<>(candidates.size());
+        List<Map.Entry<String, byte[]>> resources =
+            new ArrayList<>(candidates.size());
+
+        for (Path lib : candidates) {
+            try {
+                byte[] bytes = Files.readAllBytes(lib);
+                String base = lib.getFileName().toString();
+                String key = "jnative-natives/" + base;
+                keys.add(key);
+                resources.add(new AbstractMap.SimpleImmutableEntry<>(key, bytes));
+            } catch (IOException e) {
+                log.warn("Failed to read native library {}: {}",
+                         lib, e.getMessage());
+            }
+        }
+
+        return new EmbeddedNativeLibraries(
+            Collections.unmodifiableList(keys),
+            Collections.unmodifiableList(resources));
     }
 }

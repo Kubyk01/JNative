@@ -564,3 +564,105 @@ void __jnative_fn_sun_nio_ch_Net_bind0__Ljava_io_FileDescriptor_ZZLjava_net_Inet
         __jnative_throw_exception(NULL);
     }
 }
+
+/*
+ * static native int connect0(boolean preferIPv6,
+ *                            FileDescriptor fd,
+ *                            InetAddress remote,
+ *                            int port)
+ *     throws IOException;
+ *
+ * Initiates a connection to the remote address. `preferIPv6` is not
+ * consulted: the address family comes from the `family` field in
+ * InetAddressHolder, not from the caller's preference — the Java
+ * level has already resolved that preference before this call.
+ *
+ * The return value matches sun.nio.ch.UnixDomainSockets.connect0:
+ *
+ *    1 — connection established synchronously (connect returned 0);
+ *    0 — connection in progress (EINPROGRESS on a non-blocking
+ *        socket); the selector will report readiness later;
+ *   -1 — EINTR before the connection attempt was committed;
+ *
+ * All other errors (ECONNREFUSED, EHOSTUNREACH, ETIMEDOUT,
+ * ENETUNREACH) are terminal: the Java level has no meaningful retry
+ * for them, so they go through the generic throw helper as
+ * IOException.
+ */
+int32_t __jnative_fn_sun_nio_ch_Net_connect0__ZLjava_io_FileDescriptor_Ljava_net_InetAddress_I_I(
+        int32_t preferIPv6,
+        void* fd_obj,
+        void* remote_obj,
+        int32_t port)
+{
+    (void)preferIPv6;
+    int32_t fd = jnative_raw_fd(fd_obj);
+
+    if (remote_obj == NULL) {
+        __jnative_throw_null_pointer_exception();
+        return 0;
+    }
+
+    /*
+     * Extract the family and address bytes from InetAddressHolder.
+     * The layout matches what Inet4AddressImpl.c, Inet6AddressImpl.c
+     * and Net.bind0 use:
+     *
+     *   InetAddress:
+     *       +8  String canonicalHostName
+     *       +16 InetAddressHolder holder
+     *
+     *   InetAddress$InetAddressHolder:
+     *       +8  String hostName
+     *       +16 int    family
+     *       +20 byte[] addressBytes
+     */
+    void* holder = *(void**)((char*)remote_obj + 16);
+    if (holder == NULL) {
+        __jnative_throw_exception(NULL);
+        return 0;
+    }
+    int32_t family = *(int32_t*)((char*)holder + 16);
+    void*   bytes  = *(void**)((char*)holder + 20);
+    if (bytes == NULL) {
+        __jnative_throw_exception(NULL);
+        return 0;
+    }
+    int32_t blen = jnative_array_length(bytes);
+    const uint8_t* bp = (const uint8_t*)jnative_array_data(bytes);
+
+    struct sockaddr_storage ss;
+    socklen_t sslen;
+    memset(&ss, 0, sizeof(ss));
+
+    if (family == 1 && blen == 4) {
+        struct sockaddr_in* s4 = (struct sockaddr_in*)&ss;
+        s4->sin_family = AF_INET;
+        s4->sin_port   = htons((uint16_t)port);
+        memcpy(&s4->sin_addr, bp, 4);
+        sslen = sizeof(*s4);
+    } else if (family == 2 && blen == 16) {
+        struct sockaddr_in6* s6 = (struct sockaddr_in6*)&ss;
+        s6->sin6_family = AF_INET6;
+        s6->sin6_port   = htons((uint16_t)port);
+        memcpy(&s6->sin6_addr, bp, 16);
+        sslen = sizeof(*s6);
+    } else {
+        __jnative_throw_exception(NULL);
+        return 0;
+    }
+
+    int rc;
+    do {
+        rc = connect(fd, (struct sockaddr*)&ss, sslen);
+    } while (rc < 0 && errno == EINTR);
+
+    if (rc == 0) {
+        return 1;
+    }
+    if (errno == EINPROGRESS) {
+        return 0;
+    }
+    __jnative_throw_exception(NULL);
+    return 0;
+}

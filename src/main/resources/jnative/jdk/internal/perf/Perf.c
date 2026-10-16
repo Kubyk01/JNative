@@ -418,3 +418,46 @@ int64_t __jnative_fn_jdk_internal_perf_Perf_highResFrequency___J(void) {
  */
 void __jnative_fn_jdk_internal_perf_Perf_registerNatives___V(void) {
 }
+
+/*
+ * ByteBuffer attach0(int lvmid) throws IllegalArgumentException, IOException;
+ *
+ * Connects the Perf object to the performance-data file of the VM
+ * identified by `lvmid`. In a plain HotSpot this opens the shared
+ * memory segment that the target VM has mapped; in a compiled image
+ * there is no separate VM to attach to and no shared segment to map.
+ *
+ * The truthful answer is a fresh empty ByteBuffer: the Java-side
+ * callers (PerfCounter and friends) treat the buffer's capacity as a
+ * hint for the counter size and iterate over it zero times when its
+ * remaining() is zero, which is exactly what a fresh empty
+ * HeapByteBuffer reports.
+ */
+void* __jnative_fn_jdk_internal_perf_Perf_attach0__I_Ljava_nio_ByteBuffer_(
+        void* this_perf, int32_t lvmid)
+{
+    (void)this_perf;
+    (void)lvmid;
+    return perf_allocate_byte_buffer(0);
+}
+
+/*
+ * void detach(ByteBuffer buffer);
+ *
+ * Releases a ByteBuffer previously obtained from attach0. In a plain
+ * HotSpot this unmaps the shared segment and drops the reference;
+ * in this runtime the buffer is an ordinary heap-backed ByteBuffer
+ * whose only lifetime owner is the Java GC, so there is nothing to
+ * release. The call is a strict no-op.
+ *
+ * The buffer argument is captured and discarded. A null buffer is not
+ * an error: the JDK's own CleanerAction may run detach() after the
+ * buffer reference has already been cleared, and the reference
+ * implementation tolerates that case.
+ */
+void __jnative_fn_jdk_internal_perf_Perf_detach__Ljava_nio_ByteBuffer__V(
+        void* this_perf, void* buffer)
+{
+    (void)this_perf;
+    (void)buffer;
+}

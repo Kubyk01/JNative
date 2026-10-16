@@ -47,6 +47,32 @@ public class Function {
     @Setter
     private boolean staticJniNative;
 
+    /**
+     * Original Java-level method name of a JNI native.
+     *
+     * <p>For a JNI native the function's own {@link #getName()} is the
+     * mangled {@code Java_<class>_<method>} symbol. The original method
+     * name and the original JVM descriptor cannot be recovered from that
+     * symbol unambiguously, because JNI mangling is lossy (both {@code '/'}
+     * and {@code '_'} map to {@code '_'}, and the overload suffix encoding
+     * is not a bijection). This field therefore carries the original name
+     * forward so that the emitter can build the {@code (class, name,
+     * descriptor)} triple it passes to
+     * {@code __jnative_jni_resolve} at every call site.</p>
+     *
+     * <p>{@code null} for non-JNI functions.</p>
+     */
+    @Setter
+    private String jniMethodName;
+
+    /**
+     * Original JVM method descriptor of a JNI native, e.g. {@code "()I"} or
+     * {@code "([BI)I"}. See {@link #jniMethodName} for why this cannot be
+     * derived from the mangled symbol. {@code null} for non-JNI functions.
+     */
+    @Setter
+    private String jniDescriptor;
+
     public Function(String name, Type returnType) {
         this.name = name;
         this.returnType = returnType;

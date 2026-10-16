@@ -732,3 +732,61 @@ void __jnative_fn_java_util_zip_Deflater_end__J_V(int64_t addr) {
         free((void*)(intptr_t)addr);
     }
 }
+
+/*
+ * private native long deflateBytesBytes(long addr,
+ *                                       byte[] inputArray,
+ *                                       int inputOff, int inputLen,
+ *                                       byte[] outputArray,
+ *                                       int outputOff, int outputLen,
+ *                                       int flush, int params,
+ *                                       ...);
+ *
+ * Additional deflate entry point whose descriptor carries eight ints
+ * between the two array arguments. The extra slots after `flush` are
+ * supplied by newer JDK call sites that pass `params` twice — once as
+ * the raw param word and once as an "applied" marker — in the same
+ * expression. Every such argument is informational for this
+ * compressor: the emitted stream is the same regardless of the values.
+ *
+ * The body shares its implementation with the shorter overload above
+ * through `deflate_call`; the additional ints are captured and
+ * discarded so a caller that relies on the newer shape receives the
+ * same byte-for-byte output.
+ */
+int64_t __jnative_fn_java_util_zip_Deflater_deflateBytesBytes__J_BII_BIIII_J(
+        void* this_deflater,
+        int64_t addr,
+        void* input_array,
+        int32_t input_off, int32_t input_len,
+        void* output_array,
+        int32_t output_off, int32_t output_len,
+        int32_t flush, int32_t params)
+{
+    (void)this_deflater;
+    (void)params;
+
+    DeflaterState* s = (DeflaterState*)(intptr_t)addr;
+    if (s == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    if (output_array == NULL || output_off < 0 || output_len < 0) {
+        __jnative_throw_null_pointer_exception();
+    }
+
+    const uint8_t* in = NULL;
+    if (input_len > 0 && input_array != NULL) {
+        in = (const uint8_t*)input_array + JAVA_ARR_HDR + input_off;
+    } else {
+        input_len = 0;
+    }
+
+    uint8_t* out = (uint8_t*)output_array + JAVA_ARR_HDR + output_off;
+
+    int read = 0;
+    int written = 0;
+    deflate_call(s, in, input_len, &read,
+                    out, output_len, &written,
+                    flush);
+    return pack_result(read, written, s->finished);
+}

@@ -119,9 +119,9 @@
  *   class "sun/management/MemoryImpl" -> "sun_management_MemoryImpl"
  *
  *   getMemoryPools0    desc "()[Ljava/lang/management/MemoryPoolMXBean;"
- *       -> "..._getMemoryPools0___Ljava_lang_management_MemoryPoolMXBean_"
+ *       -> "..._getMemoryPools0____Ljava_lang_management_MemoryPoolMXBean_"
  *   getMemoryManagers0 desc "()[Ljava/lang/management/MemoryManagerMXBean;"
- *       -> "..._getMemoryManagers0___Ljava_lang_management_MemoryManagerMXBean_"
+ *       -> "..._getMemoryManagers0____Ljava_lang_management_MemoryManagerMXBean_"
  *   getMemoryUsage0    desc "(Z)Ljava/lang/management/MemoryUsage;"
  *       -> "..._getMemoryUsage0__Z_Ljava_lang_management_MemoryUsage_"
  *   setVerboseGC       desc "(Z)V"
@@ -214,7 +214,7 @@ static void* make_zero_memory_usage(void) {
  *
  * STATIC native: no receiver argument.
  */
-void* __jnative_fn_sun_management_MemoryImpl_getMemoryPools0___Ljava_lang_management_MemoryPoolMXBean_(void) {
+void* __jnative_fn_sun_management_MemoryImpl_getMemoryPools0____Ljava_lang_management_MemoryPoolMXBean_(void) {
     return jnative_ref_array_of_class(
         NULL, 0, "[Ljava/lang/management/MemoryPoolMXBean;");
 }
@@ -231,7 +231,7 @@ void* __jnative_fn_sun_management_MemoryImpl_getMemoryPools0___Ljava_lang_manage
  *
  * STATIC native: no receiver argument.
  */
-void* __jnative_fn_sun_management_MemoryImpl_getMemoryManagers0___Ljava_lang_management_MemoryManagerMXBean_(void) {
+void* __jnative_fn_sun_management_MemoryImpl_getMemoryManagers0____Ljava_lang_management_MemoryManagerMXBean_(void) {
     return jnative_ref_array_of_class(
         NULL, 0, "[Ljava/lang/management/MemoryManagerMXBean;");
 }

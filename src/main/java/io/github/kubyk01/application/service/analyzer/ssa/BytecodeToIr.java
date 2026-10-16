@@ -355,6 +355,8 @@ public class BytecodeToIr {
                 func.setOwnerClass(declaringOwner);
                 func.setJniNative(jni);
                 func.setStaticJniNative(jni && declaring.isStatic());
+                func.setJniMethodName(name);
+                func.setJniDescriptor(desc);
 
                 List<Type> allParams = new ArrayList<>();
                 if (!declaring.isStatic()) {

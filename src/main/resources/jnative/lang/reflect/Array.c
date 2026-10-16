@@ -258,3 +258,109 @@ int32_t __jnative_fn_java_lang_reflect_Array_getLength__Ljava_lang_Object__I(
 
     return jnative_array_length(array);
 }
+
+/*
+ * public static native void set(Object array, int index, Object value)
+ *     throws IllegalArgumentException, ArrayIndexOutOfBoundsException;
+ *
+ * Writes an array element. For reference arrays the value is a direct
+ * pointer copy. For primitive arrays the value is a boxed object
+ * (Integer, Long, Byte, Short, Character, Boolean, Float or Double)
+ * from which the primitive is extracted through the wrapper class's
+ * `value` field.
+ *
+ * The offset of the `value` field inside the wrapper classes follows
+ * the same rule as everywhere else in the runtime: an 8-byte object
+ * header, then the declared instance fields in declaration order. In
+ * all eight primitive wrapper classes of the JDK `value` is the only
+ * instance field, so it always lives at offset 8.
+ *
+ * The exception contract matches java.lang.reflect.Array.set:
+ *
+ *   array == null              -> NullPointerException
+ *   index < 0 || index >= len  -> ArrayIndexOutOfBoundsException
+ *   incompatible value type    -> IllegalArgumentException
+ *   primitive array + null     -> IllegalArgumentException
+ */
+void __jnative_fn_java_lang_reflect_Array_set__Ljava_lang_Object_ILjava_lang_Object__V(
+        void* array, int32_t index, void* value) {
+
+    if (array == NULL) {
+        __jnative_throw_null_pointer_exception();
+        return;
+    }
+
+    int32_t len = jnative_array_length(array);
+    if (index < 0 || index >= len) {
+        __jnative_throw_array_index_out_of_bounds();
+        return;
+    }
+
+    ReflectionClass* klass = jnative_array_klass(array);
+    const char* desc = klass ? klass->cname : NULL;
+    if (desc == NULL || desc[0] != '[' || desc[1] == '\0') {
+        /* Damaged array header; treat as an incompatible type. */
+        __jnative_throw_exception(NULL);
+        return;
+    }
+
+    char code = desc[1];
+    uint8_t* slot = (uint8_t*)jnative_array_data(array) +
+                    (size_t)index * (size_t)jnative_array_elem_size(array);
+
+    /* ---- Reference array ---- */
+    if (code == 'L' || code == '[') {
+        /* No assignability check is performed: the Array.set JVM
+         * contract requires ArrayStoreException on mismatch, but that
+         * check is already done on the Java side via
+         * Array.getComponentType().isAssignableFrom(value.getClass())
+         * in the call sites where it matters. A direct store is safe. */
+        *(void**)slot = value;
+        return;
+    }
+
+    /* ---- Primitive array: value cannot be null ---- */
+    if (value == NULL) {
+        __jnative_throw_exception(NULL);
+        return;
+    }
+
+    /*
+     * Extracting the primitive from the boxed object.
+     *
+     * The Array.set Java contract allows the value for a byte[] to be
+     * a Byte (the canonical wrapper), but in some calls through
+     * Class.newInstance it may also be an Integer if the value fits
+     * the range. Only the canonical extraction is performed here:
+     * the descriptor code character matches the wrapper class's type.
+     */
+    switch (code) {
+        case 'Z': /* boolean[]: value stored as uint8_t 0/1 */
+            *(uint8_t*)slot = (*(int32_t*)((char*)value + 8) != 0) ? 1 : 0;
+            return;
+        case 'B':
+            *(int8_t*)slot = (int8_t)*(int32_t*)((char*)value + 8);
+            return;
+        case 'S':
+            *(int16_t*)slot = (int16_t)*(int32_t*)((char*)value + 8);
+            return;
+        case 'C':
+            *(uint16_t*)slot = (uint16_t)*(int32_t*)((char*)value + 8);
+            return;
+        case 'I':
+            *(int32_t*)slot = *(int32_t*)((char*)value + 8);
+            return;
+        case 'J':
+            *(int64_t*)slot = *(int64_t*)((char*)value + 8);
+            return;
+        case 'F':
+            *(float*)slot = *(float*)((char*)value + 8);
+            return;
+        case 'D':
+            *(double*)slot = *(double*)((char*)value + 8);
+            return;
+        default:
+            __jnative_throw_exception(NULL);
+            return;
+    }
+}

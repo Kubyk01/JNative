@@ -128,7 +128,27 @@ public class DependencyResolver {
      * <p>
      * Null when the input is a plain jar, a directory, or a single .class
      * file; in those cases there are no nested jars to index.
+     * -- GETTER --
+     *  Returns the path to the input archive passed to
+     * .
+     *  <p>Used by
+     * <p>
+     *  to find native libraries packaged inside the analysed application —
+     *  above all in a Spring Boot fat jar, where dependencies (and their
+     *  .so / .dylib / .dll) live under
+     * .</p>
+     *  <p>Without this accessor the compiler sees only the tool's own
+     *  classpath, which does not contain the application being built, and
+     *  therefore skips every native library packaged inside it.</p>
+     *  <p>Returns
+     *  if
+     *  has not been called yet.
+     *  The caller must handle that value; the previous behaviour — not
+     *  scanning the input archive at all — corresponds exactly to the null
+     *  branch.</p>
+
      */
+    @Getter
     private volatile Path inputArchive;
 
     /**

@@ -158,7 +158,7 @@
  * Symbol names, one per Java declaration:
  *
  *   __jnative_fn_sun_font_FreetypeFontScaler_initIDs__Ljava_lang_Class__V
- *   __jnative_fn_sun_font_FreetypeFontScaler_initNativeScaler__Lsun_font_Font2D_IZII_J
+ *   __jnative_fn_sun_font_FreetypeFontScaler_initNativeScaler__Lsun_font_Font2D_IIZI_J
  *   __jnative_fn_sun_font_FreetypeFontScaler_getFontMetricsNative__Lsun_font_Font2D_JJ_Lsun_font_StrikeMetrics_
  *   __jnative_fn_sun_font_FreetypeFontScaler_getGlyphAdvanceNative__Lsun_font_Font2D_JJI_F
  *   __jnative_fn_sun_font_FreetypeFontScaler_getGlyphMetricsNative__Lsun_font_Font2D_JJILjava_awt_geom_Point2D_Float__V
@@ -219,16 +219,17 @@ void __jnative_fn_sun_font_FreetypeFontScaler_initIDs__Ljava_lang_Class__V(
  *                                      boolean supportsCJK,
  *                                      int filesize);
  *
- * Returns 0. On HotSpot this creates a FreeType scaler for the given
- * font and returns its native address, which the Java-side
- * constructor stores in the `nativeScaler` field. This runtime does
- * not link FreeType, so 0 is returned and every subsequent glyph
- * query method takes its `nativeScaler != 0L` false branch and
- * delegates to the Java-only NullFontScaler.
+ * The signature matches JDK 21. The parameter order — Font2D, int,
+ * int, boolean, int — is fixed by the descriptor
+ * (Lsun/font/Font2D;IIZI)J. This differs from older JDKs where the
+ * fourth parameter was int; a build against an older JDK generates a
+ * different symbol and this function simply never gets called.
  *
- * Every argument is captured and discarded.
+ * Returns 0 because FreeType is not linked: see the file-header
+ * comment. The Java-side FreetypeFontScaler constructor checks
+ * nativeScaler != 0L and falls back to NullFontScaler on zero.
  */
-int64_t __jnative_fn_sun_font_FreetypeFontScaler_initNativeScaler__Lsun_font_Font2D_IZII_J(
+int64_t __jnative_fn_sun_font_FreetypeFontScaler_initNativeScaler__Lsun_font_Font2D_IIZI_J(
         void* this_scaler,
         void* font,
         int32_t type,

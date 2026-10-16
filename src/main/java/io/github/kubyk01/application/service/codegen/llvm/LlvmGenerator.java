@@ -99,6 +99,24 @@ public class LlvmGenerator {
      */
     private List<Map.Entry<String, byte[]>> embeddedResources = new ArrayList<>();
 
+    /**
+     * Resource keys of native libraries whose bytes were embedded by the
+     * {@link io.github.kubyk01.application.service.compiler.Compiler} and
+     * whose {@code JNI_OnLoad} must be invoked before any Java code runs.
+     *
+     * <p>The keys are the same strings passed to
+     * {@link LlvmGlobalEmitter#addEmbeddedResource(String, byte[])}; the
+     * runtime looks them up in {@code @jnative_builtin_resources}. Libraries
+     * with no {@code JNI_OnLoad} are silently skipped by the runtime, so
+     * passing a key for a traditional {@code Java_*}-style library is
+     * harmless.</p>
+     */
+    private List<String> runtimeJniLibraryKeys = new ArrayList<>();
+
+    public void setRuntimeJniLibraryKeys(List<String> keys) {
+        this.runtimeJniLibraryKeys = (keys != null) ? keys : new ArrayList<>();
+    }
+
     public void setClinitSchedule(List<ClinitScheduleEntry> schedule) {
         this.clinitSchedule = (schedule != null) ? schedule : new ArrayList<>();
     }
@@ -198,6 +216,12 @@ public class LlvmGenerator {
         }
 
         // ---- 2. Deferred strings are now fully known. Collect them. ----
+        // The JNI library keys referenced by @main are registered here, before
+        // the deferred constants are materialised, because generateMain() runs
+        // after this point and only references the globals by name.
+        for (String jniKey : runtimeJniLibraryKeys) {
+            globalEmitter.registerDeferredString(jniKey);
+        }
         String deferred = globalEmitter.generateDeferredStringConstants();
 
         // ---- 3. knownGlobals = every definition that lives in _module.ll,
@@ -944,6 +968,39 @@ public class LlvmGenerator {
     private String generateMain() {
         StringBuilder sb = new StringBuilder();
         sb.append("define i32 @main(i32 %argc, i8** %argv) {\n");
+
+        // ------------------------------------------------------------------
+        // Stage -1: JNI library loading.
+        //
+        // Every native library that the input archive contributed as an
+        // embedded resource is dlopen'ed and its JNI_OnLoad is called.
+        // Netty's native transports install their entire Java-side native
+        // surface through JNI_OnLoad -> RegisterNatives; without this stage
+        // every JNI native call emitted for io.netty.* would resolve to
+        // nothing.
+        //
+        // The call is emitted unconditionally, even when the list is empty;
+        // the runtime helper is a no-op for an empty range.
+        // ------------------------------------------------------------------
+        if (!runtimeJniLibraryKeys.isEmpty()) {
+            int n = runtimeJniLibraryKeys.size();
+            sb.append("  %jni_keys = alloca i8*, i32 ").append(n).append("\n");
+            for (int i = 0; i < n; i++) {
+                String key = runtimeJniLibraryKeys.get(i);
+                int len = LlvmRuntime.typeStringArrayLength(key);
+                String g = LlvmRuntime.typeStringGlobalName(key);
+                String slot = "%jni_slot_" + i;
+                sb.append("  ").append(slot)
+                  .append(" = getelementptr i8*, i8** %jni_keys, i32 ")
+                  .append(i).append("\n");
+                sb.append("  store i8* getelementptr inbounds ([")
+                  .append(len).append(" x i8], [").append(len)
+                  .append(" x i8]* ").append(g)
+                  .append(", i32 0, i32 0), i8** ").append(slot).append("\n");
+            }
+            sb.append("  call void @__jnative_jni_load_all(i8** %jni_keys, i32 ")
+              .append(n).append(")\n");
+        }
 
         // Shutdown-based destruction is deliberately NOT installed.
         //

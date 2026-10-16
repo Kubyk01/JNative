@@ -4,9 +4,12 @@
 #include <stdlib.h>
 #include <errno.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <time.h>
 #include <limits.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 
 #include "jnative_runtime.h"
 
@@ -227,4 +230,231 @@ void* __jnative_fn_java_io_UnixFileSystem_canonicalize0__Ljava_lang_String__Ljav
     }
 
     return __jnative_make_string_obj(resolved, (int32_t)strlen(resolved));
+}
+
+/* ==========================================================================
+ *  Permission / metadata natives
+ * ========================================================================== */
+
+/*
+ * private native boolean setPermission0(File f, int access,
+ *                                       boolean ownerOnly,
+ *                                       boolean enable);
+ *
+ * Applies or removes one permission bit (READ / WRITE / EXECUTE) for the
+ * given file, for the owner alone or for owner+group+others.
+ *
+ * access bitmask matches the Java-side constants in
+ * java.io.UnixFileSystem:
+ *     4 = ACCESS_READ
+ *     2 = ACCESS_WRITE
+ *     1 = ACCESS_EXECUTE
+ *
+ * The current mode is read with stat(2), the corresponding permission
+ * bits are added or removed, and chmod(2) writes the new mode back.
+ * Any failure returns false; the Java caller (File.setReadable etc.)
+ * translates false into a SecurityException or a plain false return
+ * depending on context.
+ */
+int32_t __jnative_fn_java_io_UnixFileSystem_setPermission0__Ljava_io_File_IZZ_Z(
+        void* this_fs, void* file_obj,
+        int32_t access, int32_t ownerOnly, int32_t enable)
+{
+    (void)this_fs;
+    if (file_obj == NULL) {
+        __jnative_throw_null_pointer_exception();
+        return 0;
+    }
+
+    char path[PATH_MAX];
+    if (extract_file_path(file_obj, path, sizeof(path)) < 0) {
+        return 0;
+    }
+
+    struct stat st;
+    if (stat(path, &st) < 0) {
+        return 0;
+    }
+
+    mode_t mode = st.st_mode;
+    mode_t mask = 0;
+
+    if (access & 4) {
+        mask |= S_IRUSR;
+        if (!ownerOnly) mask |= S_IRGRP | S_IROTH;
+    }
+    if (access & 2) {
+        mask |= S_IWUSR;
+        if (!ownerOnly) mask |= S_IWGRP | S_IWOTH;
+    }
+    if (access & 1) {
+        mask |= S_IXUSR;
+        if (!ownerOnly) mask |= S_IXGRP | S_IXOTH;
+    }
+
+    if (enable) {
+        mode |= mask;
+    } else {
+        mode &= ~mask;
+    }
+
+    return chmod(path, mode) == 0 ? 1 : 0;
+}
+
+/*
+ * private native long getNameMax0(String path);
+ *
+ * Maximum length of a single path component on the filesystem that
+ * contains `path`. Uses pathconf(3) with _PC_NAME_MAX; a filesystem
+ * that does not define the limit returns -1, in which case the POSIX
+ * compile-time NAME_MAX is used. The Java-side default is 255 and is
+ * applied by the caller when this native returns a non-positive value.
+ */
+int64_t __jnative_fn_java_io_UnixFileSystem_getNameMax0__Ljava_lang_String__J(
+        void* this_fs, void* path_str)
+{
+    (void)this_fs;
+    if (path_str == NULL) {
+        __jnative_throw_null_pointer_exception();
+        return 0;
+    }
+
+    char path[PATH_MAX];
+    if (__jnative_read_string_into(path_str, path, (int32_t)sizeof(path)) < 0) {
+        return 0;
+    }
+
+    long max = pathconf(path, _PC_NAME_MAX);
+    if (max <= 0) {
+        max = NAME_MAX;
+    }
+    if (max <= 0) {
+        max = 255;
+    }
+    return (int64_t)max;
+}
+
+/*
+ * private native boolean rename0(File f1, File f2);
+ *
+ * Renames f1 to f2 using rename(2). Returns false on any failure —
+ * EXDEV for cross-filesystem moves, ENOENT for a missing source,
+ * EACCES for a missing parent write permission, and so on. The Java
+ * layer treats false as "rename did not happen" and leaves both files
+ * untouched.
+ */
+int32_t __jnative_fn_java_io_UnixFileSystem_rename0__Ljava_io_File_Ljava_io_File__Z(
+        void* this_fs, void* file1, void* file2)
+{
+    (void)this_fs;
+    if (file1 == NULL || file2 == NULL) {
+        __jnative_throw_null_pointer_exception();
+        return 0;
+    }
+
+    char path1[PATH_MAX];
+    char path2[PATH_MAX];
+    if (extract_file_path(file1, path1, sizeof(path1)) < 0) return 0;
+    if (extract_file_path(file2, path2, sizeof(path2)) < 0) return 0;
+
+    return rename(path1, path2) == 0 ? 1 : 0;
+}
+
+/*
+ * private native boolean setLastModifiedTime0(File f, long time);
+ *
+ * Sets the file's modification time to `time` milliseconds since the
+ * Unix epoch. The access time is left unchanged by passing UTIME_OMIT
+ * in the first slot of the timespec pair, which is the portable POSIX
+ * way of saying "do not touch atime" without having to read it first
+ * (and without racing another process that might be updating it).
+ *
+ * utimensat(2) and AT_FDCWD are declared in <fcntl.h>; UTIME_OMIT and
+ * struct timespec come from <sys/stat.h> and <time.h>. Both headers
+ * are included at the top of this file.
+ */
+int32_t __jnative_fn_java_io_UnixFileSystem_setLastModifiedTime0__Ljava_io_File_J_Z(
+        void* this_fs, void* file_obj, int64_t time)
+{
+    (void)this_fs;
+    if (file_obj == NULL) {
+        __jnative_throw_null_pointer_exception();
+        return 0;
+    }
+
+    char path[PATH_MAX];
+    if (extract_file_path(file_obj, path, sizeof(path)) < 0) {
+        return 0;
+    }
+
+    struct timespec ts[2];
+    ts[0].tv_sec  = 0;
+    ts[0].tv_nsec = UTIME_OMIT;
+    ts[1].tv_sec  = (time_t)(time / 1000);
+    ts[1].tv_nsec = (long)((time % 1000) * 1000000L);
+
+    return utimensat(AT_FDCWD, path, ts, 0) == 0 ? 1 : 0;
+}
+
+/*
+ * private native boolean createFileExclusively0(String pathname);
+ *
+ * Creates the file if and only if it does not already exist. Uses
+ * open(2) with O_CREAT | O_EXCL, which is the atomic primitive the
+ * Java contract requires: two concurrent calls on the same path must
+ * produce exactly one success and one false.
+ *
+ * open(2) and its O_* flags are declared in <fcntl.h>, included at the
+ * top of this file.
+ */
+int32_t __jnative_fn_java_io_UnixFileSystem_createFileExclusively0__Ljava_lang_String__Z(
+        void* this_fs, void* path_str)
+{
+    (void)this_fs;
+    if (path_str == NULL) {
+        __jnative_throw_null_pointer_exception();
+        return 0;
+    }
+
+    char path[PATH_MAX];
+    if (__jnative_read_string_into(path_str, path, (int32_t)sizeof(path)) < 0) {
+        return 0;
+    }
+
+    int fd = open(path, O_RDWR | O_CREAT | O_EXCL, (mode_t)0666);
+    if (fd < 0) {
+        if (errno == EEXIST) {
+            return 0;
+        }
+        return 0;
+    }
+    close(fd);
+    return 1;
+}
+
+/*
+ * private native boolean createDirectory0(File f);
+ *
+ * Creates a single directory component with mkdir(2). The mode 0777 is
+ * masked by the process's umask, matching the standard Java behaviour:
+ * a directory created by File.mkdir() is world-readable by default and
+ * the umask narrows it if the user has set one. Parent directories are
+ * not created — that is File.mkdirs(), which calls this native once
+ * per component in the Java layer.
+ */
+int32_t __jnative_fn_java_io_UnixFileSystem_createDirectory0__Ljava_io_File__Z(
+        void* this_fs, void* file_obj)
+{
+    (void)this_fs;
+    if (file_obj == NULL) {
+        __jnative_throw_null_pointer_exception();
+        return 0;
+    }
+
+    char path[PATH_MAX];
+    if (extract_file_path(file_obj, path, sizeof(path)) < 0) {
+        return 0;
+    }
+
+    return mkdir(path, (mode_t)0777) == 0 ? 1 : 0;
 }

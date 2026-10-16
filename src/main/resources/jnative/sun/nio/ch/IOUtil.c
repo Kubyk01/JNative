@@ -197,3 +197,34 @@ void __jnative_fn_sun_nio_ch_IOUtil_configureBlocking__Ljava_io_FileDescriptor_Z
         return;
     }
 }
+
+/*
+ * static native void setfdVal(FileDescriptor fd, int value);
+ *
+ * Writes the raw kernel fd into the FileDescriptor slot. Called from
+ * IOUtil.newFD(int), which constructs a fresh FileDescriptor and
+ * immediately assigns it a numeric descriptor value:
+ *
+ *     public static FileDescriptor newFD(int i) {
+ *         FileDescriptor fd = new FileDescriptor();
+ *         setfdVal(fd, i);
+ *         return fd;
+ *     }
+ *
+ * FD_OFFSET matches what every other native in the runtime uses
+ * (FileInputStream.c, UnixFileDispatcherImpl.c, Net.c, …), so the
+ * value written here is read identically everywhere.
+ *
+ * A negative value is allowed: FileDescriptor.close() stores -1
+ * there as the "already closed" sentinel, and every reader checks
+ * the sign.
+ */
+void __jnative_fn_sun_nio_ch_IOUtil_setfdVal__Ljava_io_FileDescriptor_I_V(
+        void* fd_obj, int32_t value)
+{
+    if (fd_obj == NULL) {
+        __jnative_throw_null_pointer_exception();
+        return;
+    }
+    *(int32_t*)((char*)fd_obj + FD_OFFSET) = value;
+}

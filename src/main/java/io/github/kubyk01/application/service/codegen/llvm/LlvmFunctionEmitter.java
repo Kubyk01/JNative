@@ -2009,6 +2009,14 @@ public class LlvmFunctionEmitter {
                 final String jniClassRef = isJni && calleeForCall.getOwnerClass() != null
                     ? globalEmitter.getRefClassGlobalName(calleeForCall.getOwnerClass())
                     : null;
+                // For a JNI native the implementation is resolved at run time
+                // by its (class, method, descriptor) triple instead of
+                // referencing an exported Java_* symbol, so RegisterNatives
+                // libraries (Netty's native transports) and traditional
+                // Java_* libraries both link. See emitJniResolve.
+                final String jniTypedPtr = isJni
+                    ? emitJniResolve(sb, calleeForCall, retTypeForCall)
+                    : null;
                 emitCall(sb, retTypeForCall, inst.getResult(), resultName, ranges, (callSb, resultReg) -> {
                     StringBuilder argList = new StringBuilder();
                     // A JNI native never receives the Java receiver alone:
@@ -2035,7 +2043,17 @@ public class LlvmFunctionEmitter {
                         String val = castValueToType(callSb, getLlvmValue(callSb, arg), arg.getType(), paramType);
                         argList.append(LlvmTypeMapper.toLlvmType(paramType)).append(" ").append(val);
                     }
-                    if (resultReg != null) {
+                    if (isJni) {
+                        if (resultReg != null) {
+                            callSb.append("  ").append(resultReg).append(" = call ")
+                                .append(LlvmTypeMapper.toLlvmType(retTypeForCall)).append(" ")
+                                .append(jniTypedPtr).append("(").append(argList).append(")\n");
+                        } else {
+                            callSb.append("  call ")
+                                .append(LlvmTypeMapper.toLlvmType(retTypeForCall)).append(" ")
+                                .append(jniTypedPtr).append("(").append(argList).append(")\n");
+                        }
+                    } else if (resultReg != null) {
                         callSb.append("  ").append(resultReg).append(" = call ")
                             .append(LlvmTypeMapper.toLlvmType(retTypeForCall)).append(" @").append(mangledCalleeFinal)
                             .append("(").append(argList).append(")\n");
@@ -2229,6 +2247,14 @@ public class LlvmFunctionEmitter {
                 final String jniClassRef = isJni && calleeForCall.getOwnerClass() != null
                     ? globalEmitter.getRefClassGlobalName(calleeForCall.getOwnerClass())
                     : null;
+                // For a JNI native the implementation is resolved at run time
+                // by its (class, method, descriptor) triple instead of
+                // referencing an exported Java_* symbol, so RegisterNatives
+                // libraries (Netty's native transports) and traditional
+                // Java_* libraries both link. See emitJniResolve.
+                final String jniTypedPtr = isJni
+                    ? emitJniResolve(sb, calleeForCall, retTypeForCall)
+                    : null;
                 emitCall(sb, retTypeForCall, inst.getResult(), resultName, ranges, (callSb, resultReg) -> {
                     StringBuilder argList = new StringBuilder();
                     // A JNI native never receives the Java receiver alone:
@@ -2255,7 +2281,17 @@ public class LlvmFunctionEmitter {
                         String val = castValueToType(callSb, getLlvmValue(callSb, arg), arg.getType(), paramType);
                         argList.append(LlvmTypeMapper.toLlvmType(paramType)).append(" ").append(val);
                     }
-                    if (resultReg != null) {
+                    if (isJni) {
+                        if (resultReg != null) {
+                            callSb.append("  ").append(resultReg).append(" = call ")
+                                .append(LlvmTypeMapper.toLlvmType(retTypeForCall)).append(" ")
+                                .append(jniTypedPtr).append("(").append(argList).append(")\n");
+                        } else {
+                            callSb.append("  call ")
+                                .append(LlvmTypeMapper.toLlvmType(retTypeForCall)).append(" ")
+                                .append(jniTypedPtr).append("(").append(argList).append(")\n");
+                        }
+                    } else if (resultReg != null) {
                         callSb.append("  ").append(resultReg).append(" = call ")
                             .append(LlvmTypeMapper.toLlvmType(retTypeForCall)).append(" @").append(mangledCalleeFinal)
                             .append("(").append(argList).append(")\n");
@@ -3379,6 +3415,69 @@ public class LlvmFunctionEmitter {
         if (slotRef != null) {
             valueSlots.put(resultValue, slotRef);
         }
+    }
+
+    /**
+     * Emits the runtime resolution of a JNI native implementation and
+     * returns the SSA register holding a function pointer typed for the
+     * call.
+     *
+     * <p>Libraries such as Netty's native transports (and every library
+     * that installs its natives through {@code JNI_OnLoad} +
+     * {@code RegisterNatives}) export no {@code Java_*} symbols, so a
+     * direct call to the mangled JNI name would leave an unresolved symbol
+     * at link time. The sequence emitted here resolves the implementation
+     * by its {@code (class, name, descriptor)} triple through
+     * {@code __jnative_jni_resolve}, which falls back to the traditional
+     * {@code Java_*} symbol when the library does not register its
+     * natives. The returned pointer is then called indirectly through the
+     * same typed signature the direct call would have used.</p>
+     *
+     * <p>The pointer type is built from the JNI ABI: {@code JNIEnv*}
+     * first, the {@code jclass} mirror second for a static method, then the
+     * callee's own parameters (which already include the Java receiver for
+     * an instance method). The emitted argument list in the caller matches
+     * this shape exactly, so no per-argument re-casting is required here.</p>
+     */
+    private String emitJniResolve(StringBuilder sb, Function calleeFunc, Type retType) {
+        String owner = calleeFunc.getOwnerClass();
+        String method = calleeFunc.getJniMethodName();
+        String descriptor = calleeFunc.getJniDescriptor();
+        if (owner == null || method == null || descriptor == null) {
+            throw new IllegalStateException(
+                "JNI native " + calleeFunc.getName()
+                    + " is missing its (owner, method, descriptor) triple; "
+                    + "BytecodeToIr must set jniMethodName and jniDescriptor "
+                    + "when creating a JNI native Function");
+        }
+
+        String ownerRef = stringRef(owner);
+        String methodRef = stringRef(method);
+        String descRef = stringRef(descriptor);
+        String symbolRef = stringRef(calleeFunc.getName());
+
+        String fnPtr = newAux("jni_fn");
+        sb.append("  ").append(fnPtr)
+          .append(" = call i8* @__jnative_jni_resolve(i8* ")
+          .append(ownerRef).append(", i8* ")
+          .append(methodRef).append(", i8* ")
+          .append(descRef).append(", i8* ")
+          .append(symbolRef).append(")\n");
+
+        StringBuilder fpType = new StringBuilder();
+        fpType.append(LlvmTypeMapper.toLlvmType(retType)).append(" (i8*");
+        if (calleeFunc.isStaticJniNative()) {
+            fpType.append(", i8*");
+        }
+        for (Parameter p : calleeFunc.getParameters()) {
+            fpType.append(", ").append(LlvmTypeMapper.toLlvmType(p.getType()));
+        }
+        fpType.append(")*");
+
+        String typedPtr = newAux("jni_fn_typed");
+        sb.append("  ").append(typedPtr).append(" = bitcast i8* ")
+          .append(fnPtr).append(" to ").append(fpType).append("\n");
+        return typedPtr;
     }
 
     private void emitDivByZeroCheck(StringBuilder sb, Value divisor, List<TryCatchRange> ranges) {

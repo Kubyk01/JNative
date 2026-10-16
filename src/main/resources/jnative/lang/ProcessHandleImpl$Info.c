@@ -448,3 +448,20 @@ void __jnative_fn_java_lang_ProcessHandleImpl_Info_info0__J_V(
         }
     }
 }
+
+/*
+ * private static native void initIDs();
+ *
+ * Called from ProcessHandleImpl$Info.<clinit>. On HotSpot this hook
+ * caches the JNI field IDs of the class's instance fields so that
+ * info0 can reach into the object without repeated lookups.
+ *
+ * This runtime accesses every field through its LLVM-computed byte
+ * offset and never consults JNI field IDs, so there is nothing to
+ * cache. The symbol must nevertheless exist because the class's
+ * static initializer emits a native call to it.
+ *
+ * STATIC native: no receiver argument.
+ */
+void __jnative_fn_java_lang_ProcessHandleImpl_Info_initIDs___V(void) {
+}

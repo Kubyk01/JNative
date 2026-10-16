@@ -198,10 +198,12 @@ void __jnative_fn_sun_java2d_pipe_ShapeSpanIterator_initIDs___V(void) {
  * public native void appendPoly(int[] xPoints, int[] yPoints,
  *                               int nPoints, int xoff, int yoff);
  *
- * No-op. On HotSpot this appends the given polygon points to the
- * native path-elements list. There is no native list in this runtime.
+ * Descriptor ([I[IIII)V — two int arrays and three int parameters.
+ * The sanitizer produces __I_IIII_V; the previous version of this
+ * file contained an extra _I_ (descriptor (I[I[IIII)V) and the
+ * linker could not find the symbol.
  */
-void __jnative_fn_sun_java2d_pipe_ShapeSpanIterator_appendPoly__I_I_IIII_V(
+void __jnative_fn_sun_java2d_pipe_ShapeSpanIterator_appendPoly__I_IIII_V(
         void* this_iter,
         void* x_points, void* y_points,
         int32_t n_points, int32_t x_off, int32_t y_off)

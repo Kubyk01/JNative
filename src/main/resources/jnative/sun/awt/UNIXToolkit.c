@@ -141,3 +141,76 @@ int32_t __jnative_fn_sun_awt_UNIXToolkit_gtkCheckVersionImpl__III_Z(
     (void)micro;
     return 0;
 }
+
+/*
+ * private static native boolean check_gtk(int version);
+ *
+ * Returns true if the GTK library of the given version is available
+ * on the host. In a headless runtime GTK is neither linked nor
+ * loadable, so the answer is false. This matches HotSpot's behaviour
+ * on a Linux machine without GTK installed: the Java layer
+ * (XToolkit.isNativeGTKAvailable) reads false and falls back to the
+ * Motif-compatible path.
+ */
+int32_t __jnative_fn_sun_awt_UNIXToolkit_check_gtk__I_Z(int32_t version) {
+    (void)version;
+    return 0;
+}
+
+/*
+ * private static native boolean load_gtk(int version, boolean verbose);
+ *
+ * Loads GTK of the given version. This runtime neither links GTK nor
+ * supports the Java-side dynamic loading of native libraries, so
+ * loading is impossible and the answer is false. The Java side
+ * (XToolkit.loadGTK) reads false and does not switch to GTK.
+ */
+int32_t __jnative_fn_sun_awt_UNIXToolkit_load_gtk__IZ_Z(
+        int32_t version, int32_t verbose)
+{
+    (void)version;
+    (void)verbose;
+    return 0;
+}
+
+/*
+ * private static native boolean load_stock_icon(int widget_type,
+ *                                               String widget_name,
+ *                                               int icon_size,
+ *                                               int icon_type,
+ *                                               String filename);
+ *
+ * Loads a stock GTK icon and stores it in a file. Without GTK there
+ * is no icon theme, no GtkIconTheme and no gtk_icon_theme_load_icon
+ * function, so the icon cannot be loaded. Returning false — the Java
+ * side (UNIXToolkit.getStockIcon) reads this as "no icon" and returns
+ * null to its caller, which AWT already handles (the icon is
+ * optional).
+ */
+int32_t __jnative_fn_sun_awt_UNIXToolkit_load_stock_icon__ILjava_lang_String_IILjava_lang_String__Z(
+        int32_t widget_type,
+        void* widget_name,
+        int32_t icon_size,
+        int32_t icon_type,
+        void* filename)
+{
+    (void)widget_type;
+    (void)widget_name;
+    (void)icon_size;
+    (void)icon_type;
+    (void)filename;
+    return 0;
+}
+
+/*
+ * private static native void nativeSync();
+ *
+ * In HotSpot this calls XSync(display, false) to flush the X request
+ * queue to the server. There is no X connection and nothing to
+ * synchronise; the call is a strict no-op.
+ *
+ * The counterpart in jnative/sun/java2d/opengl/OGLRenderQueue.c —
+ * flushBuffer — is also a no-op because there is no GL context.
+ */
+void __jnative_fn_sun_awt_UNIXToolkit_nativeSync___V(void) {
+}

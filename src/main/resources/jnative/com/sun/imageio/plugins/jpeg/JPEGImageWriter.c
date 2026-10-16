@@ -173,7 +173,7 @@ void __jnative_fn_com_sun_imageio_plugins_jpeg_JPEGImageWriter_setDest__J_V(
  *
  * All twenty-six arguments are captured but not consulted.
  */
-int32_t __jnative_fn_com_sun_imageio_plugins_jpeg_JPEGImageWriter_writeImage__J_BIII_IIIIII_Ljavax_imageio_plugins_jpeg_JPEGQTable_Z_Ljavax_imageio_plugins_jpeg_JPEGHuffmanTable__Ljavax_imageio_plugins_jpeg_JPEGHuffmanTable__ZZZI_I_I_I_I_IZI_Z(
+int32_t __jnative_fn_com_sun_imageio_plugins_jpeg_JPEGImageWriter_writeImage__J_BIII_IIIIII_Ljavax_imageio_plugins_jpeg_JPEGQTable_Z_Ljavax_imageio_plugins_jpeg_JPEGHuffmanTable__Ljavax_imageio_plugins_jpeg_JPEGHuffmanTable_ZZZI_I_I_I_I_IZI_Z(
         void* self,
         int64_t structPointer,
         void* data,

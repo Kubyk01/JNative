@@ -408,11 +408,46 @@ public class Orchestrator implements OrchestratorPort {
         // both kinds. The C-side dispatch is by resource key, not by
         // kind, so no consumer needs to know which source an entry came
         // from.
+        // ------------------------------------------------------------------
+        // Native libraries and JDK resources share a single embedded table.
+        //
+        // Netty's native transports are dlopen'ed at program start-up by
+        // __jnative_jni_load_all, but the .so bytes themselves have to
+        // travel inside the executable: the runtime machine may not have
+        // the original jar, and even when it does the path through the
+        // archive is not guaranteed to be readable at run time. The
+        // bytes are therefore registered as embedded resources alongside
+        // the JDK resource table, and the runtime's resource lookup
+        // (jnative_find_resource) is the single access path for both
+        // kinds.
+        //
+        // embedNativeLibraries returns both halves of the registration:
+        //   - the ordered list of resource keys, which @main turns into
+        //     the __jnative_jni_load_all argument array;
+        //   - the (key, bytes) pairs, which the LLVM emitter embeds into
+        //     the @jnative_builtin_resources table.
+        //
+        // Neither half is stored on the compiler; both are returned
+        // directly so no hidden state survives this block.
+        // ------------------------------------------------------------------
+        CompilerPort.EmbeddedNativeLibraries embeddedNatives;
+        try {
+            embeddedNatives = compiler.embedNativeLibraries(
+                module, resolver, targetPlatform);
+        } catch (IOException e) {
+            log.warn("Failed to embed native libraries: {}", e.getMessage());
+            embeddedNatives = CompilerPort.EmbeddedNativeLibraries.empty();
+        }
+
+        List<String> jniLibraryKeys = embeddedNatives.keys();
+
         List<Map.Entry<String, byte[]>> embedded = new ArrayList<>();
         embedded.addAll(ResourceEmbedder.collectJavaBaseResources());
         embedded.addAll(ResourceEmbedder.collectJdkRuntimeData());
+        embedded.addAll(embeddedNatives.resources());
         System.out.println("Embedding " + embedded.size()
-            + " built-in resource(s) from java.base and JDK runtime data.");
+            + " built-in resource(s) from java.base, JDK runtime data, and "
+            + jniLibraryKeys.size() + " native library/ies.");
 
         LlvmGenerator llvmGen = new LlvmGenerator(module, resolver, aliasResult,
                 entryClass, entryMethod, entryDescriptor, analysis.getReflectInfo(),
@@ -420,6 +455,7 @@ public class Orchestrator implements OrchestratorPort {
         llvmGen.setClinitSchedule(analysisResult.clinitSchedule());
         llvmGen.setClinitWrappers(analysisResult.clinitWrappers());
         llvmGen.setEmbeddedResources(embedded);
+        llvmGen.setRuntimeJniLibraryKeys(jniLibraryKeys);
         llvmGen.setTargetPlatform(targetPlatform);
 
         Path genDir = Paths.get("target", "generated-jnative");

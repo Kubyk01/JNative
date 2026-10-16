@@ -597,3 +597,39 @@ int32_t __jnative_fn_java_net_NetworkInterface_boundInetAddress0__Ljava_net_Inet
     freeifaddrs(ifaddr);
     return found;
 }
+
+/*
+ * private static native NetworkInterface getByInetAddress0(InetAddress addr)
+ *     throws SocketException;
+ *
+ * Returns the NetworkInterface that carries the given address, or null
+ * if no local interface is bound to it.
+ *
+ * In this runtime `init()` populates the NetworkInterface class's
+ * static lookup tables with every local interface's name, display name
+ * and index, but deliberately leaves the per-interface address lists
+ * empty: there is no place to synthesise InetAddress objects from a
+ * C-side getifaddrs() walk that would agree with the runtime's own
+ * InetAddress layout without duplicating a large chunk of the JDK's
+ * Inet4AddressImpl / Inet6AddressImpl logic.
+ *
+ * The consequence is that no local interface ever reports a non-empty
+ * address list, and therefore no address can match this lookup. The
+ * truthful answer is null, and every caller of
+ * NetworkInterface.getByInetAddress in the JDK treats a null result
+ * as "no interface carries this address", which is exactly the state
+ * of a runtime whose interface enumeration is intentionally name-only.
+ *
+ * The addr argument is captured and discarded: there is no address
+ * list to compare it against. A null addr is still raised as an NPE,
+ * matching the contract of the public entry point that wraps this
+ * native.
+ */
+void* __jnative_fn_java_net_NetworkInterface_getByInetAddress0__Ljava_net_InetAddress__Ljava_net_NetworkInterface_(
+        void* addr)
+{
+    if (addr == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    return NULL;
+}

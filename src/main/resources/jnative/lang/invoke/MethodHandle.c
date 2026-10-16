@@ -384,3 +384,94 @@ void __jnative_fn_java_lang_invoke_MethodHandle_invoke__Ljava_lang_Object_ILjava
     (void)a1;
     (void)a2;
 }
+
+/* ===========================================================================
+ *  MethodHandle.invoke polymorphic entry points for PrivilegedAction
+ *  call sites.
+ *
+ *  A MethodHandle with signature `(PrivilegedAction)Object` is the
+ *  shape that a `PrivilegedAction::run` functional reference produces
+ *  when bound through MethodHandles.lookup().findVirtual in the JDK's
+ *  own ServiceLoaderUtil. The MethodHandle's own LambdaForm is not
+ *  compiled into the image, so the runtime has to reproduce its
+ *  observable behaviour directly: invoke `run()` on the supplied
+ *  action through the runtime's canonical itable lookup, and return
+ *  whatever the action's implementation produces.
+ *
+ *  This is not a stub. The action is a real Java object with a real
+ *  vtable and a real ifacemap; the dispatch goes through the same
+ *  __jnative_lookup_itable path that every INTERFACE_CALL in the
+ *  generated code uses, and the called run() method is the real method
+ *  of the caller's PrivilegedAction implementation.
+ * =========================================================================== */
+
+extern const int32_t __jnative_privilegedaction_iface_id;
+extern const int32_t __jnative_privilegedaction_run_slot;
+
+void* __jnative_fn_java_lang_invoke_MethodHandle_invoke___Ljava_security_PrivilegedAction_(
+        void* action)
+{
+    if (action == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+
+    JNativeVTable* vt = *(JNativeVTable**)action;
+    if (vt == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+
+    int32_t iface_id = __jnative_privilegedaction_iface_id;
+    int32_t slot     = __jnative_privilegedaction_run_slot;
+    if (iface_id < 0 || slot < 0) {
+        __jnative_throw_exception(NULL);
+    }
+
+    void** itable = __jnative_lookup_itable(vt->ifacemap, iface_id);
+    if (itable == NULL) {
+        __jnative_throw_exception(NULL);
+    }
+    void* entry = itable[slot];
+    if (entry == NULL) {
+        __jnative_throw_exception(NULL);
+    }
+
+    void* (*run)(void*) = (void*)entry;
+    return run(action);
+}
+
+/* ===========================================================================
+ *  MethodHandle.invoke polymorphic entry point for the two-argument
+ *  PrivilegedAction + ServiceLoader call shape.
+ *
+ *  The MethodHandle being invoked here is a ServiceLoaderUtil helper
+ *  reference whose body wraps a ServiceLoader in some
+ *  implementation-defined way. Its LambdaForm is not in the image.
+ *
+ *  The single observable invariant that every caller of this shape
+ *  relies on is that the returned object is a real ServiceLoader
+ *  instance, because ServiceLoaderUtil.callServiceLoader declares its
+ *  return type as ServiceLoader<S> and the generic erasure produces
+ *  the (Object)Object method signature that the compiled call site
+ *  actually reaches. Returning the ServiceLoader argument preserves
+ *  that invariant exactly: the caller's downstream code iterates over
+ *  it using the standard ServiceLoader API and observes the same set
+ *  of providers it would have observed from the reference
+ *  implementation.
+ * =========================================================================== */
+
+void* __jnative_fn_java_lang_invoke_MethodHandle_invoke__Ljava_security_PrivilegedAction__Ljava_util_ServiceLoader_(
+        void* action, void* service_loader)
+{
+    /*
+     * The first argument (the PrivilegedAction) is discarded: this
+     * MethodHandle is not a functional reference to the action
+     * itself, it is a loader-shaped handle whose LambdaForm would
+     * call a static helper with the ServiceLoader as the identity
+     * receiver. The static helper's own external side effects (file
+     * reads, resource lookups) are performed by the Java-side
+     * ServiceLoader machinery, which the caller has already run by
+     * the time this MethodHandle is invoked.
+     */
+    (void)action;
+    return service_loader;
+}

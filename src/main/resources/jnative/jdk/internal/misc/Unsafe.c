@@ -909,7 +909,7 @@ void __jnative_fn_jdk_internal_misc_Unsafe_ensureClassInitialized__Ljava_lang_Cl
     (void)this_unsafe;
     (void)cls;
 }
-int32_t __jnative_fn_jdk_internal_misc_Unsafe_getLoadAverage___D_I(void* this_unsafe, double* loadavg, int32_t nelems) {
+int32_t __jnative_fn_jdk_internal_misc_Unsafe_getLoadAverage___DI_I(void* this_unsafe, double* loadavg, int32_t nelems) {
     (void)this_unsafe;
     if (!loadavg || nelems <= 0) return -1;
     double v = 0.0;
@@ -1076,3 +1076,32 @@ void __jnative_fn_jdk_internal_misc_Unsafe_writeback0__J_V(int64_t address) {
 
 void __jnative_fn_jdk_internal_misc_Unsafe_writebackPostSync0___V(void) {
 }
+
+/*
+ * int getLoadAverage0(double[] loadavg, int nelems);
+ *
+ * JDK 17+ spelling of getLoadAverage. Same contract and same body as
+ * the legacy getLoadAverage above: one sample via getloadavg(3), with
+ * a -1 return on failure. Extract every non-numeric int is a
+ * straightforward delegation.
+ */
+int32_t __jnative_fn_jdk_internal_misc_Unsafe_getLoadAverage0___DI_I(
+        void* this_unsafe, void* loadavg, int32_t nelems)
+{
+    return __jnative_fn_jdk_internal_misc_Unsafe_getLoadAverage___DI_I(
+        this_unsafe, loadavg, nelems);
+}
+
+/*
+ * long reallocateMemory0(long address, long bytes);
+ *
+ * JDK 17+ spelling of reallocateMemory. Forwarded rather than
+ * re-implemented so the cleanup path lives in a single place.
+ */
+void* __jnative_fn_jdk_internal_misc_Unsafe_reallocateMemory0__JJ_J(
+        void* this_unsafe, void* addr, int64_t bytes)
+{
+    return __jnative_fn_jdk_internal_misc_Unsafe_reallocateMemory__JJ_J(
+        this_unsafe, addr, bytes);
+}
+

@@ -226,13 +226,13 @@ void __jnative_fn_sun_java2d_xr_XRBackendNative_initIDs___V(void) {
  * rectangles described by the packed int[] (x, y, w, h per rectangle).
  * There is no display and no GC to fill on.
  */
-void __jnative_fn_sun_java2d_xr_XRBackendNative_GCRectanglesNative__IJ_I_I_V(
-        int32_t drawable, int64_t gc, void* rect_array, int32_t rect_cnt)
+/* ---------- GCRectanglesNative: descriptor (IJ[II)V ---------- */
+void __jnative_fn_sun_java2d_xr_XRBackendNative_GCRectanglesNative__IJ_II_V(
+        int32_t drawable, int64_t gc,
+        void* rect_array, int32_t rect_cnt, int32_t extra_reserved)
 {
-    (void)drawable;
-    (void)gc;
-    (void)rect_array;
-    (void)rect_cnt;
+    (void)drawable; (void)gc;
+    (void)rect_array; (void)rect_cnt; (void)extra_reserved;
 }
 
 /*
@@ -245,19 +245,15 @@ void __jnative_fn_sun_java2d_xr_XRBackendNative_GCRectanglesNative__IJ_I_I_V(
  * picture with the colour and the packed rectangles. There is no
  * picture to fill.
  */
-void __jnative_fn_sun_java2d_xr_XRBackendNative_XRenderRectanglesNative__IBSSSS_I_I_V(
+/* ---------- XRenderRectanglesNative: descriptor (IBSSSS[II)V ---------- */
+void __jnative_fn_sun_java2d_xr_XRBackendNative_XRenderRectanglesNative__IBSSSS_II_V(
         int32_t dst, int8_t op,
         int16_t red, int16_t green, int16_t blue, int16_t alpha,
-        void* rects, int32_t rect_cnt)
+        void* rects, int32_t rect_cnt, int32_t extra_reserved)
 {
-    (void)dst;
-    (void)op;
-    (void)red;
-    (void)green;
-    (void)blue;
-    (void)alpha;
-    (void)rects;
-    (void)rect_cnt;
+    (void)dst; (void)op;
+    (void)red; (void)green; (void)blue; (void)alpha;
+    (void)rects; (void)rect_cnt; (void)extra_reserved;
 }
 
 /*
@@ -300,21 +296,19 @@ int32_t __jnative_fn_sun_java2d_xr_XRBackendNative_XRCreateLinearGradientPaintNa
  * Returns 0. Same reasoning as the linear-gradient counterpart above:
  * no display, no picture, and 0 is the caller's "not created" sentinel.
  */
+/* ---------- XRCreateRadialGradientPaintNative: descriptor ([F[SIIIIIII)I ---------- */
 int32_t __jnative_fn_sun_java2d_xr_XRBackendNative_XRCreateRadialGradientPaintNative___F_SIIIIIII_I(
         void* fractions_array, void* pixels_array,
         int32_t num_stops,
         int32_t center_x, int32_t center_y,
         int32_t inner_radius, int32_t outer_radius,
-        int32_t repeat)
+        int32_t repeat, int32_t extra_reserved)
 {
-    (void)fractions_array;
-    (void)pixels_array;
+    (void)fractions_array; (void)pixels_array;
     (void)num_stops;
-    (void)center_x;
-    (void)center_y;
-    (void)inner_radius;
-    (void)outer_radius;
-    (void)repeat;
+    (void)center_x; (void)center_y;
+    (void)inner_radius; (void)outer_radius;
+    (void)repeat; (void)extra_reserved;
     return 0;
 }
 
@@ -354,7 +348,8 @@ void __jnative_fn_sun_java2d_xr_XRBackendNative_XRSetClipNative__JIIIILsun_java2
  * glyph bitmaps with the server-side glyph cache. There is no glyph
  * set to register into.
  */
-void __jnative_fn_sun_java2d_xr_XRBackendNative_XRAddGlyphsNative__I_J_I_B_I_V(
+/* ---------- XRAddGlyphsNative: descriptor (I[JI[BI)V ---------- */
+void __jnative_fn_sun_java2d_xr_XRBackendNative_XRAddGlyphsNative__I_JI_BI_V(
         int32_t glyph_set,
         void* glyph_info_ptrs, int32_t glyph_cnt,
         void* pixel_data, int32_t pixel_data_length)
@@ -374,7 +369,8 @@ void __jnative_fn_sun_java2d_xr_XRBackendNative_XRAddGlyphsNative__I_J_I_B_I_V(
  * No-op. On HotSpot this calls XRenderFreeGlyphs to release the given
  * glyph ids from the server-side cache. There is no glyph set.
  */
-void __jnative_fn_sun_java2d_xr_XRBackendNative_XRFreeGlyphsNative__I_I_I_V(
+/* ---------- XRFreeGlyphsNative: descriptor (I[II)V ---------- */
+void __jnative_fn_sun_java2d_xr_XRBackendNative_XRFreeGlyphsNative__I_II_V(
         int32_t glyph_set, void* gids, int32_t id_cnt)
 {
     (void)glyph_set;
@@ -393,22 +389,19 @@ void __jnative_fn_sun_java2d_xr_XRBackendNative_XRFreeGlyphsNative__I_I_I_V(
  * from the source picture into the destination picture. There is
  * neither a source nor a destination to draw between.
  */
-void __jnative_fn_sun_java2d_xr_XRBackendNative_XRenderCompositeTextNative__IIIIIJ_I_I_II_V(
+/* ---------- XRenderCompositeTextNative: descriptor (IIIIIJ[I[III)V ---------- */
+void __jnative_fn_sun_java2d_xr_XRBackendNative_XRenderCompositeTextNative__IIIIIJ_I_III_V(
         int32_t op, int32_t src, int32_t dst,
         int32_t src_x, int32_t src_y, int64_t mask_format,
         void* elt_array, void* glyph_ids,
-        int32_t elt_cnt, int32_t glyph_cnt)
+        int32_t elt_cnt, int32_t glyph_cnt,
+        int32_t glyphset_or_reserved)
 {
-    (void)op;
-    (void)src;
-    (void)dst;
-    (void)src_x;
-    (void)src_y;
-    (void)mask_format;
-    (void)elt_array;
-    (void)glyph_ids;
-    (void)elt_cnt;
-    (void)glyph_cnt;
+    (void)op; (void)src; (void)dst;
+    (void)src_x; (void)src_y; (void)mask_format;
+    (void)elt_array; (void)glyph_ids;
+    (void)elt_cnt; (void)glyph_cnt;
+    (void)glyphset_or_reserved;
 }
 
 /*
@@ -438,7 +431,8 @@ int32_t __jnative_fn_sun_java2d_xr_XRBackendNative_XRenderCreateGlyphSetNative__
  * calls) and blits it to the destination drawable through the given GC.
  * There is no drawable and no GC to blit onto.
  */
-void __jnative_fn_sun_java2d_xr_XRBackendNative_putMaskNative__IJ_BIIIIIIIIFLJ_V(
+/* ---------- putMaskNative: descriptor (IJ[BIIIIIIIIFJ)V ---------- */
+void __jnative_fn_sun_java2d_xr_XRBackendNative_putMaskNative__IJ_BIIIIIIIIFJ_V(
         int32_t drawable, int64_t gc,
         void* image_data,
         int32_t sx, int32_t sy, int32_t dx, int32_t dy,
@@ -446,19 +440,11 @@ void __jnative_fn_sun_java2d_xr_XRBackendNative_putMaskNative__IJ_BIIIIIIIIFLJ_V
         int32_t mask_off, int32_t mask_scan,
         float ea, int64_t x_img)
 {
-    (void)drawable;
-    (void)gc;
-    (void)image_data;
-    (void)sx;
-    (void)sy;
-    (void)dx;
-    (void)dy;
-    (void)width;
-    (void)height;
-    (void)mask_off;
-    (void)mask_scan;
-    (void)ea;
-    (void)x_img;
+    (void)drawable; (void)gc; (void)image_data;
+    (void)sx; (void)sy; (void)dx; (void)dy;
+    (void)width; (void)height;
+    (void)mask_off; (void)mask_scan;
+    (void)ea; (void)x_img;
 }
 
 /*
