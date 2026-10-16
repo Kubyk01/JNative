@@ -643,3 +643,141 @@ int32_t __jnative_fn_sun_nio_fs_UnixNativeDispatcher_exists0__J_Z(
     struct stat st;
     return (stat(path_of(pathAddress), &st) == 0) ? 1 : 0;
 }
+
+/* ===========================================================================
+ *  More Unix natives that JDK 21 requires but the first version of this
+ *  file did not have. They are all thin wrappers around libc.
+ * =========================================================================== */
+
+/*
+ * static native int read0(int fd, long address, int len);
+ *
+ * Reads up to `len` bytes into the native buffer. EINTR retry; errors
+ * go through the generic throw helper. Corresponds to the fixed-size
+ * buffer read signature that UnixFileSystemProvider uses to load file
+ * contents.
+ */
+int32_t __jnative_fn_sun_nio_fs_UnixNativeDispatcher_read0__IJI_I(
+        int32_t fd, int64_t address, int32_t len)
+{
+    if (address == 0 || len < 0) {
+        __jnative_throw_exception(NULL);
+        return 0;
+    }
+    void* buf = (void*)(intptr_t)address;
+    ssize_t n;
+    do {
+        n = read((int)fd, buf, (size_t)len);
+    } while (n < 0 && errno == EINTR);
+    if (n < 0) {
+        throw_unix_exception(errno);
+    }
+    return (int32_t)n;
+}
+
+/*
+ * static native int write0(int fd, long address, int len);
+ *
+ * Symmetric to read0. Returns the number of bytes written; may be less
+ * than len on a partial write to a channel/socket, with the caller
+ * filling in the rest.
+ */
+int32_t __jnative_fn_sun_nio_fs_UnixNativeDispatcher_write0__IJI_I(
+        int32_t fd, int64_t address, int32_t len)
+{
+    if (address == 0 || len < 0) {
+        __jnative_throw_exception(NULL);
+        return 0;
+    }
+    const void* buf = (const void*)(intptr_t)address;
+    ssize_t n;
+    do {
+        n = write((int)fd, buf, (size_t)len);
+    } while (n < 0 && errno == EINTR);
+    if (n < 0) {
+        throw_unix_exception(errno);
+    }
+    return (int32_t)n;
+}
+
+/*
+ * static native void rename0(long oldPathAddress,
+ *                            long newPathAddress);
+ *
+ * Plain rename(2). The case "destination exists across filesystems" is
+ * handled by the Java level, which tries rename first and then a copy.
+ */
+void __jnative_fn_sun_nio_fs_UnixNativeDispatcher_rename0__JJ_V(
+        int64_t old_path, int64_t new_path)
+{
+    if (rename(path_of(old_path), path_of(new_path)) < 0) {
+        throw_unix_exception(errno);
+    }
+}
+
+/*
+ * static native void mknod0(long pathAddress, int mode, long dev);
+ *
+ * Creates a filesystem node: FIFO, block or character device. The Java
+ * level uses it for mkfifo through UnixFileSystemProvider and related
+ * operations. Device nodes require root; FIFO is available to an
+ * ordinary user.
+ */
+void __jnative_fn_sun_nio_fs_UnixNativeDispatcher_mknod0__JIJ_V(
+        int64_t path_address, int32_t mode, int64_t dev)
+{
+    if (mknod(path_of(path_address), (mode_t)mode, (dev_t)dev) < 0) {
+        throw_unix_exception(errno);
+    }
+}
+
+/*
+ * static native int getlinelen(long fp);
+ *
+ * Returns the length of the current line in a stream. Used by
+ * LinuxFileSystem.getMountEntries to measure the size of a line in
+ * /proc/mounts before reading it. Implemented with getline(3) into a
+ * temporary buffer that is freed after measuring: the line is not
+ * actually consumed here, only measured.
+ *
+ * If the FILE* pointer is NULL, returns 0.
+ */
+int32_t __jnative_fn_sun_nio_fs_UnixNativeDispatcher_getlinelen__J_I(
+        int64_t fp)
+{
+    FILE* f = (FILE*)(intptr_t)fp;
+    if (f == NULL) return 0;
+
+    char* line = NULL;
+    size_t cap = 0;
+    ssize_t n = getline(&line, &cap, f);
+    if (n < 0) {
+        free(line);
+        if (errno == 0) return 0;   /* EOF */
+        return -1;                   /* error */
+    }
+
+    /*
+     * Return the length without the trailing \n, if present.
+     * libc's getline includes the \n in the count.
+     */
+    int32_t len = (int32_t)n;
+    if (len > 0 && line[len - 1] == '\n') len--;
+
+    free(line);
+    return len;
+}
+
+/*
+ * static native void rewind(long fp);
+ *
+ * Rewinds a FILE* to the beginning. Corresponds to rewind(3), which
+ * also clears the error state.
+ */
+void __jnative_fn_sun_nio_fs_UnixNativeDispatcher_rewind__J_V(int64_t fp)
+{
+    FILE* f = (FILE*)(intptr_t)fp;
+    if (f != NULL) {
+        rewind(f);
+    }
+}

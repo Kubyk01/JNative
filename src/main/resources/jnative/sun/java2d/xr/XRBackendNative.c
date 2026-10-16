@@ -172,7 +172,7 @@
  *   static XRenderRectanglesNative(IBSSSS[II)V
  *   XRSetTransformNative(IIIIIII)V
  *   static XRCreateLinearGradientPaintNative([F[SIIIIII)I
- *   static XRCreateRadialGradientPaintNative([F[SIIIIIII)I
+ *   static XRCreateRadialGradientPaintNative([F[SIIIIII)I
  *   setFilter(II)V
  *   static XRSetClipNative(JIIIILsun/java2d/pipe/Region;Z)V
  *   static XRAddGlyphsNative(I[JI[BI)V
@@ -296,19 +296,22 @@ int32_t __jnative_fn_sun_java2d_xr_XRBackendNative_XRCreateLinearGradientPaintNa
  * Returns 0. Same reasoning as the linear-gradient counterpart above:
  * no display, no picture, and 0 is the caller's "not created" sentinel.
  */
-/* ---------- XRCreateRadialGradientPaintNative: descriptor ([F[SIIIIIII)I ---------- */
-int32_t __jnative_fn_sun_java2d_xr_XRBackendNative_XRCreateRadialGradientPaintNative___F_SIIIIIII_I(
+/* ---------- XRCreateRadialGradientPaintNative: descriptor ([F[SIIIIII)I ---------- */
+int32_t __jnative_fn_sun_java2d_xr_XRBackendNative_XRCreateRadialGradientPaintNative___F_SIIIIII_I(
         void* fractions_array, void* pixels_array,
         int32_t num_stops,
         int32_t center_x, int32_t center_y,
         int32_t inner_radius, int32_t outer_radius,
-        int32_t repeat, int32_t extra_reserved)
+        int32_t repeat)
 {
-    (void)fractions_array; (void)pixels_array;
+    (void)fractions_array;
+    (void)pixels_array;
     (void)num_stops;
-    (void)center_x; (void)center_y;
-    (void)inner_radius; (void)outer_radius;
-    (void)repeat; (void)extra_reserved;
+    (void)center_x;
+    (void)center_y;
+    (void)inner_radius;
+    (void)outer_radius;
+    (void)repeat;
     return 0;
 }
 

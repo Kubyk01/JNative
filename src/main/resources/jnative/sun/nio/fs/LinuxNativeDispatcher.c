@@ -1,10 +1,13 @@
 #define _GNU_SOURCE
 #include <stdint.h>
 #include <stddef.h>
+#include <stdio.h>
 #include <errno.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/types.h>
+#include <sys/stat.h>
+#include <mntent.h>
 
 #include "jnative_runtime.h"
 
@@ -155,4 +158,96 @@ int32_t __jnative_fn_sun_nio_fs_LinuxNativeDispatcher_directCopy0__IIJ_I(
     (void)src; (void)dst; (void)count;
     return -ENOSYS;
 #endif
+}
+
+/* ===========================================================================
+ *  Mount-table natives.
+ * =========================================================================== */
+
+static inline const char* linux_path_of(int64_t address) {
+    return (const char*)(intptr_t)address;
+}
+
+/*
+ * static native long setmntent0(long pathAddress, long typeAddress);
+ *
+ * Opens the mount-table file (/proc/mounts or /etc/mtab) and returns a
+ * FILE* which is then used through getmntent0 and endmntent.
+ * Corresponds to setmntent(3). Returns 0 on error.
+ */
+int64_t __jnative_fn_sun_nio_fs_LinuxNativeDispatcher_setmntent0__JJ_J(
+        int64_t path_address, int64_t type_address)
+{
+    const char* path = linux_path_of(path_address);
+    const char* type = linux_path_of(type_address);
+    FILE* f = setmntent(path, type != NULL ? type : "r");
+    return (int64_t)(intptr_t)f;
+}
+
+/*
+ * static native int getmntent0(long fp, UnixMountEntry entry,
+ *                              long buffer, int bufLen);
+ *
+ * Reads the next entry from an open mount table. Uses getmntent_r(3),
+ * which writes into a caller-supplied buffer to avoid the shared
+ * static state in a multi-threaded runtime.
+ *
+ * Fills the UnixMountEntry fields:
+ *     +8  byte[] name     (device name)
+ *     +16 byte[] dir      (mount point)
+ *     +24 byte[] fstype   (filesystem type)
+ *     +32 long   dev      (device id from stat(dir))
+ *     +40 byte[] opts     (comma-separated options)
+ *
+ * Return values:
+ *     1  — an entry was read
+ *     0  — EOF
+ *    -1  — read error
+ */
+int32_t __jnative_fn_sun_nio_fs_LinuxNativeDispatcher_getmntent0__JLsun_nio_fs_UnixMountEntry_JI_I(
+        int64_t fp, void* entry_obj, int64_t buffer, int32_t buf_len)
+{
+    FILE* f = (FILE*)(intptr_t)fp;
+    if (f == NULL) return 0;
+    if (entry_obj == NULL || buffer == 0 || buf_len <= 0) {
+        return -1;
+    }
+
+    struct mntent mnt;
+    struct mntent* res = getmntent_r(f, &mnt,
+                                     (char*)(intptr_t)buffer, (int)buf_len);
+    if (res == NULL) {
+        /* EOF or error. getmntent_r does not distinguish them; return 0. */
+        return 0;
+    }
+
+    /* Fill the UnixMountEntry fields. */
+    char* p = (char*)entry_obj;
+    *(void**)(p + 8)  = jnative_string(mnt.mnt_fsname != NULL ? mnt.mnt_fsname : "");
+    *(void**)(p + 16) = jnative_string(mnt.mnt_dir    != NULL ? mnt.mnt_dir    : "");
+    *(void**)(p + 24) = jnative_string(mnt.mnt_type   != NULL ? mnt.mnt_type   : "");
+    *(void**)(p + 40) = jnative_string(mnt.mnt_opts   != NULL ? mnt.mnt_opts   : "");
+
+    /* dev is obtained via stat() on the mount point. */
+    struct stat st;
+    if (mnt.mnt_dir != NULL && stat(mnt.mnt_dir, &st) == 0) {
+        *(int64_t*)(p + 32) = (int64_t)st.st_dev;
+    } else {
+        *(int64_t*)(p + 32) = 0;
+    }
+
+    return 1;
+}
+
+/*
+ * static native void endmntent(long fp);
+ *
+ * Closes the mount table. Corresponds to endmntent(3).
+ */
+void __jnative_fn_sun_nio_fs_LinuxNativeDispatcher_endmntent__J_V(int64_t fp)
+{
+    FILE* f = (FILE*)(intptr_t)fp;
+    if (f != NULL) {
+        endmntent(f);
+    }
 }

@@ -7,12 +7,20 @@
 /*
  * sun.java2d.loops.MaskBlit — native entry point.
  *
- * The masked-blit GraphicsPrimitive: blit the source rectangle into
- * the destination rectangle, modulating each pixel's contribution by
- * the corresponding byte in `mask`. The `maskoff` and `maskscan`
- * arguments give the mask's byte offset within its array and its row
- * stride. Reachable through the primitive table walk; never invoked
- * from a live path in a headless runtime.
+ * Masked blit: copies the rectangle [srcx, srcy, width, height) of the
+ * source into [dstx, dsty, width, height) of the destination,
+ * modulating each pixel with the corresponding byte mask. `maskoff` is
+ * the mask offset into the array, `maskscan` is the mask row stride.
+ *
+ * The implementation is a no-op: the accelerated java2d pipeline that
+ * would call this function is never instantiated in a headless runtime
+ * (see jnative/sun/awt/X11GraphicsEnvironment.c: every
+ * isXXXAvailable() returns false). The remaining java2d paths run on
+ * the Java side through the software primitive tables.
+ *
+ * The symbol must exist because it appears in
+ * vtable_methods_sun_java2d_loops_MaskBlit and, transitively, in all
+ * MaskBlit subclasses (OGLMaskBlit, XRMaskBlit, D3DMaskBlit).
  */
 void __jnative_fn_sun_java2d_loops_MaskBlit_MaskBlit__Lsun_java2d_SunGraphics2D_Lsun_java2d_SurfaceData_Lsun_java2d_SurfaceData_Ljava_awt_Composite_Lsun_java2d_pipe_Region_IIIIII_BII_V(
         void* this_prim,

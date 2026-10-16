@@ -666,3 +666,214 @@ int32_t __jnative_fn_sun_nio_ch_Net_connect0__ZLjava_io_FileDescriptor_Ljava_net
     __jnative_throw_exception(NULL);
     return 0;
 }
+
+/*
+ * static native int socket0(boolean preferIPv6, boolean stream,
+ *                           boolean reuse, boolean fastLoopback)
+ *     throws IOException;
+ *
+ * Creates a socket of the requested family and type. `preferIPv6`
+ * selects AF_INET6 in a dual-stack configuration. `stream` selects
+ * SOCK_STREAM versus SOCK_DGRAM. `reuse` sets SO_REUSEADDR at creation
+ * time so a listening socket can be reused after TIME_WAIT.
+ * `fastLoopback` is a Windows-specific flag (SO_LOOPBACK_FAST_PATH),
+ * ignored on Linux.
+ *
+ * Returns the raw kernel fd. Errors go through the generic throw
+ * helper.
+ */
+int32_t __jnative_fn_sun_nio_ch_Net_socket0__ZZZZ_I(
+        int32_t preferIPv6, int32_t stream,
+        int32_t reuse, int32_t fastLoopback)
+{
+    (void)fastLoopback;
+
+    int family = preferIPv6 ? AF_INET6 : AF_INET;
+    int type   = stream    ? SOCK_STREAM : SOCK_DGRAM;
+
+    int fd = socket(family, type, 0);
+    if (fd < 0 && preferIPv6) {
+        /* Fallback: AF_INET6 may be unavailable. */
+        fd = socket(AF_INET, type, 0);
+    }
+    if (fd < 0) {
+        __jnative_throw_exception(NULL);
+        return -1;
+    }
+
+    if (reuse) {
+        int one = 1;
+        (void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    }
+
+    return (int32_t)fd;
+}
+
+/*
+ * static native void listen(FileDescriptor fd, int backlog)
+ *     throws IOException;
+ *
+ * Puts the socket into listening mode. `backlog` is the maximum length
+ * of the queue of incoming connections waiting for accept(). A value
+ * of 0 translates to SOMAXCONN, because POSIX does not require any
+ * particular behaviour for backlog = 0.
+ */
+void __jnative_fn_sun_nio_ch_Net_listen__Ljava_io_FileDescriptor_I_V(
+        void* fd_obj, int32_t backlog)
+{
+    int32_t fd = jnative_raw_fd(fd_obj);
+    int bl = (backlog <= 0) ? SOMAXCONN : (int)backlog;
+    if (listen(fd, bl) < 0) {
+        __jnative_throw_exception(NULL);
+    }
+}
+
+/*
+ * static native int accept(FileDescriptor fd,
+ *                          FileDescriptor newfd,
+ *                          InetSocketAddress isaa)
+ *     throws IOException;
+ *
+ * Accepts an incoming connection. The new kernel fd is written into the
+ * FileDescriptor `newfd` slot; the peer address (if present) is written
+ * into `isaa` through its own InetAddressHolder. Returns the new kernel
+ * fd (the same value written into newfd) — this signature matches the
+ * variant the emitter generates for JDK 21.
+ *
+ * The return value 0 means "connection accepted, see newfd"; some JDK
+ * versions expect exactly that. If the address cannot be written
+ * (isaa == NULL), that is not an error — the address is optional.
+ */
+int32_t __jnative_fn_sun_nio_ch_Net_accept__Ljava_io_FileDescriptor_Ljava_io_FileDescriptor__Ljava_net_InetSocketAddress__I(
+        void* fd_obj, void* newfd_obj, void* isaa)
+{
+    int32_t listen_fd = jnative_raw_fd(fd_obj);
+    if (newfd_obj == NULL) {
+        __jnative_throw_null_pointer_exception();
+        return 0;
+    }
+
+    struct sockaddr_storage ss;
+    socklen_t sslen = (socklen_t)sizeof(ss);
+    memset(&ss, 0, sizeof(ss));
+
+    int new_fd;
+    do {
+        new_fd = accept(listen_fd, (struct sockaddr*)&ss, &sslen);
+    } while (new_fd < 0 && errno == EINTR);
+
+    if (new_fd < 0) {
+        __jnative_throw_exception(NULL);
+        return 0;
+    }
+
+    /* Set CLOEXEC on the accepted descriptor. */
+    (void)fcntl(new_fd, F_SETFD, FD_CLOEXEC);
+
+    *(int32_t*)((char*)newfd_obj + FD_OFFSET) = new_fd;
+
+    /*
+     * Fill in the peer address if the Java side requested it.
+     * InetSocketAddress has a `holder` field of type
+     * InetSocketAddressHolder, whose `addr` field is a
+     * java.net.InetAddress. If isaa == NULL or the structure is not
+     * initialised, just skip.
+     */
+    if (isaa != NULL) {
+        /* InetSocketAddress +8 = String hostname, +16 = InetSocketAddressHolder */
+        void* holder = *(void**)((char*)isaa + 16);
+        if (holder != NULL) {
+            /* InetSocketAddressHolder +8 = String hostname,
+             * InetSocketAddressHolder +16 = InetAddress addr */
+            void* addr_obj = *(void**)((char*)holder + 16);
+            if (addr_obj != NULL && ss.ss_family == AF_INET) {
+                struct sockaddr_in* s4 = (struct sockaddr_in*)&ss;
+                void* inner = *(void**)((char*)addr_obj + 16);
+                if (inner != NULL) {
+                    *(int32_t*)((char*)inner + 16) = 1;
+                    void* bytes = jnative_byte_array(&s4->sin_addr, 4);
+                    if (bytes != NULL) {
+                        *(void**)((char*)inner + 20) = bytes;
+                    }
+                }
+            } else if (addr_obj != NULL && ss.ss_family == AF_INET6) {
+                struct sockaddr_in6* s6 = (struct sockaddr_in6*)&ss;
+                void* inner = *(void**)((char*)addr_obj + 16);
+                if (inner != NULL) {
+                    *(int32_t*)((char*)inner + 16) = 2;
+                    void* bytes = jnative_byte_array(&s6->sin6_addr, 16);
+                    if (bytes != NULL) {
+                        *(void**)((char*)inner + 20) = bytes;
+                    }
+                }
+            }
+        }
+    }
+
+    return (int32_t)new_fd;
+}
+
+/*
+ * static native boolean pollConnect(FileDescriptor fd, long timeout)
+ *     throws IOException;
+ *
+ * Checks whether the non-blocking connection started by connect0,
+ * which returned 0 (EINPROGRESS), has completed. Implemented with
+ * poll(2) with POLLOUT on the socket and getsockopt(SO_ERROR) after
+ * readiness.
+ *
+ * Returns:
+ *     true  — the connection completed (successfully or with an error;
+ *             the error is picked up by the subsequent read/write
+ *             through ordinary socket errors)
+ *     false — timeout, the connection is still in progress
+ *
+ * `timeout` is in milliseconds; 0 returns the result immediately; a
+ * negative value waits indefinitely.
+ */
+int32_t __jnative_fn_sun_nio_ch_Net_pollConnect__Ljava_io_FileDescriptor_J_Z(
+        void* fd_obj, int64_t timeout)
+{
+    int32_t fd = jnative_raw_fd(fd_obj);
+
+    struct pollfd pfd;
+    pfd.fd = fd;
+    pfd.events = POLLOUT;
+    pfd.revents = 0;
+
+    int ctimeout;
+    if (timeout < 0) ctimeout = -1;
+    else if (timeout > INT32_MAX) ctimeout = INT32_MAX;
+    else ctimeout = (int)timeout;
+
+    int rv;
+    do {
+        rv = poll(&pfd, 1, ctimeout);
+    } while (rv < 0 && errno == EINTR);
+
+    if (rv < 0) {
+        __jnative_throw_exception(NULL);
+        return 0;
+    }
+    if (rv == 0) {
+        return 0;   /* timeout */
+    }
+
+    /* Socket is ready: check SO_ERROR. */
+    int err = 0;
+    socklen_t elen = (socklen_t)sizeof(err);
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &elen) < 0) {
+        __jnative_throw_exception(NULL);
+        return 0;
+    }
+
+    /*
+     * A non-zero SO_ERROR means the connection completed
+     * unsuccessfully. Per the Java-level contract this still counts
+     * as "ready": the subsequent I/O operation will itself throw an
+     * IOException carrying the error text. Return true so the caller
+     * exits the wait loop.
+     */
+    (void)err;
+    return 1;
+}

@@ -198,12 +198,22 @@ void __jnative_fn_sun_java2d_pipe_ShapeSpanIterator_initIDs___V(void) {
  * public native void appendPoly(int[] xPoints, int[] yPoints,
  *                               int nPoints, int xoff, int yoff);
  *
- * Descriptor ([I[IIII)V — two int arrays and three int parameters.
- * The sanitizer produces __I_IIII_V; the previous version of this
- * file contained an extra _I_ (descriptor (I[I[IIII)V) and the
- * linker could not find the symbol.
+ * Descriptor ([I[IIII)V. The sanitizer:
+ *     (  -> _
+ *     [  -> _
+ *     I  -> I     (1st int[])
+ *     [  -> _
+ *     I  -> I     (2nd int[])
+ *     I  -> I     (nPoints)
+ *     I  -> I     (xoff)
+ *     I  -> I     (yoff)
+ *     )  -> _
+ *     V  -> V
+ * yields __I_IIII_V; with the method separator this becomes
+ * ___I_IIII_V. The previous version used __I_IIII_V (two
+ * underscores) and the linker could not find it.
  */
-void __jnative_fn_sun_java2d_pipe_ShapeSpanIterator_appendPoly__I_IIII_V(
+void __jnative_fn_sun_java2d_pipe_ShapeSpanIterator_appendPoly___I_IIII_V(
         void* this_iter,
         void* x_points, void* y_points,
         int32_t n_points, int32_t x_off, int32_t y_off)

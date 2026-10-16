@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include <stdint.h>
 #include <stddef.h>
+#include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
@@ -500,4 +501,85 @@ void __jnative_fn_sun_nio_ch_UnixFileDispatcherImpl_release0__Ljava_io_FileDescr
      * locks automatically on close, so there is no side table to walk
      * and no unlock operation to issue. */
     (void)jnative_fd_of(fd_obj);
+}
+
+/*
+ * static native int force0(FileDescriptor fd, boolean metaData);
+ *
+ * JDK 18+ signature: returns 0 on success. An error is still surfaced
+ * through the generic throw helper so the Java side catches it through
+ * the existing catch (IOException). The return value is only the
+ * "success" sentinel that the newer signature expects.
+ */
+int32_t __jnative_fn_sun_nio_ch_UnixFileDispatcherImpl_force0__Ljava_io_FileDescriptor_Z_I(
+        void* fd_obj, int32_t meta_data)
+{
+    int32_t fd = jnative_raw_fd(fd_obj);
+    int rc = meta_data ? fsync(fd) : fdatasync(fd);
+    if (rc < 0) {
+        __jnative_throw_exception(NULL);
+    }
+    return 0;
+}
+
+/*
+ * static native int lock0(FileDescriptor fd, boolean blocking,
+ *                         long pos, long size, boolean shared);
+ *
+ * Establishes a file lock through fcntl(2) with F_SETLK (non-blocking)
+ * or F_SETLKW (blocking). java.nio.channels.FileLock semantics:
+ *
+ *     blocking == false -> F_SETLK; on contention return
+ *                          NO_LOCK (=1) instead of an error
+ *     blocking == true  -> F_SETLKW; wait until the lock becomes
+ *                          available, or EINTR
+ *
+ * Return codes (matching the FileDispatcher constants):
+ *     INTERRUPTED (-3) — EINTR
+ *     NO_LOCK     ( 1) — contention in non-blocking mode
+ *     LOCKED      ( 0) — lock acquired
+ *     RET_EX_LOCK ( 2) — lock acquired but not exclusive because of
+ *                        other locks on an overlapping range in this
+ *                        process (indistinguishable from LOCKED on
+ *                        Unix, so never returned)
+ * All other errors go through the generic throw helper as exceptions.
+ *
+ * `size == Long.MAX_VALUE` means "to end of file" and translates to
+ * l_len = 0 (the POSIX convention).
+ */
+int32_t __jnative_fn_sun_nio_ch_UnixFileDispatcherImpl_lock0__Ljava_io_FileDescriptor_ZJJZ_I(
+        void* fd_obj, int32_t blocking, int64_t pos, int64_t size, int32_t shared)
+{
+    int32_t fd = jnative_raw_fd(fd_obj);
+    if (pos < 0 || size < 0) {
+        __jnative_throw_exception(NULL);
+        return 0;
+    }
+
+    struct flock fl;
+    memset(&fl, 0, sizeof(fl));
+    fl.l_type   = shared ? F_RDLCK : F_WRLCK;
+    fl.l_whence = SEEK_SET;
+    fl.l_start  = (off_t)pos;
+    fl.l_len    = (size == INT64_MAX) ? 0 : (off_t)size;
+    fl.l_pid    = 0;
+
+    int cmd = blocking ? F_SETLKW : F_SETLK;
+    int rc;
+    do {
+        rc = fcntl(fd, cmd, &fl);
+    } while (rc < 0 && errno == EINTR && !blocking);
+
+    if (rc == 0) {
+        return 0;   /* LOCKED */
+    }
+
+    if (errno == EINTR) {
+        return -3;  /* INTERRUPTED */
+    }
+    if (!blocking && (errno == EACCES || errno == EAGAIN)) {
+        return 1;   /* NO_LOCK */
+    }
+    __jnative_throw_exception(NULL);
+    return 0;
 }
