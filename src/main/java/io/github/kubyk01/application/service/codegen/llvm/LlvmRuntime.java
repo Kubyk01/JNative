@@ -94,23 +94,27 @@ public class LlvmRuntime {
      */
     public static String getDeclarations() {
         return """
+            ; ----- Initialization and diagnostics -----
             declare void @__jnative_debug_clinit(i8*)
             declare void @__jnative_init_string_pool(i8**, i32)
+    
+            ; ----- libc allocation and process control -----
             declare i8* @malloc(i64)
             declare i8* @calloc(i64, i64)
             declare void @free(i8*)
             declare void @__jnative_free(i8*)
-
+    
             declare void @__jnative_begin_shutdown()
             declare i32  @__jnative_dtor_enter(i8*)
             declare void @__jnative_dtor_unclaim(i8*)
-
+    
             declare i32 @printf(i8*, ...)
             declare void @abort() noreturn
             declare i32 @atexit(void ()*)
             declare i64 @llvm.objectsize.i64.p0i8(i8*, i1)
             declare void @llvm.memset.p0i8.i64(i8* nocapture writeonly, i8, i64, i1 immarg)
-
+    
+            ; ----- pthread mutex primitives -----
             declare i32 @pthread_mutex_lock(i8*)
             declare i32 @pthread_mutex_unlock(i8*)
             declare i32 @pthread_mutex_init(i8*, i8*)
@@ -118,10 +122,12 @@ public class LlvmRuntime {
             declare i32 @pthread_mutexattr_init(i8*)
             declare i32 @pthread_mutexattr_settype(i8*, i32)
             declare i32 @pthread_mutexattr_destroy(i8*)
-
+    
+            ; ----- setjmp/longjmp used by the try-guard lowering -----
             declare i32 @_setjmp(i8*) returns_twice
             declare void @longjmp(i8*, i32) noreturn
-
+    
+            ; ----- Runtime identity, monitors and dispatch -----
             declare i8* @__jnative_create_string_array(i32, i8**)
             declare i8* @__jnative_make_bootstrap_props(i32, i32, i32, i32, i32, i32, i32, i32, i32, i32)
             declare i8* @__jnative_new_multi_array(i8*, i32, i32*, i32)
@@ -133,37 +139,41 @@ public class LlvmRuntime {
             declare void @__jnative_throw_exception(i8*)
             declare i8* @__jnative_get_exception_object()
             declare i1 @__jnative_catch_matches(i8*, i8**)
-
+    
             declare i8** @__jnative_lookup_itable(%JNativeIfaceMap*, i32)
-
-            ; ----- dispatch receiver resolution -----
+    
+            ; ----- Dispatch receiver resolution -----
             declare i1 @__jnative_is_class_mirror(i8*)
             declare %JNativeVTable* @__jnative_resolve_dispatch_vtable(i8*)
-
+    
+            ; ----- Exception construction and throwers -----
             declare void @__jnative_throw_null_pointer_exception()
             declare void @__jnative_throw_array_index_out_of_bounds()
             declare void @__jnative_throw_class_cast_exception()
             declare void @__jnative_throw_arithmetic_exception()
-
+    
             declare void @__jnative_throw_exception_ctx(i8*, i8*)
             declare void @__jnative_throw_null_pointer_exception_ctx(i8*, i8*)
             declare void @__jnative_throw_array_index_out_of_bounds_ctx(i8*)
             declare void @__jnative_throw_class_cast_exception_ctx(i8*)
             declare void @__jnative_throw_arithmetic_exception_ctx(i8*)
-
+    
             declare void @__jnative_unresolved_slot(i8*) noreturn
-
+    
+            ; ----- Lazy <clinit> state machine -----
             declare i32 @__jnative_clinit_enter(i8*)
             declare void @__jnative_clinit_exit(i8*)
-
+    
+            ; ----- Unsafe platform probes (used by UnsafeConstants.<clinit>) -----
             declare i32 @__jnative_unsafe_address_size()
             declare i32 @__jnative_unsafe_page_size()
             declare i32 @__jnative_unsafe_big_endian()
             declare i32 @__jnative_unsafe_unaligned_access()
             declare i32 @__jnative_unsafe_data_cache_line_flush_size()
-
+    
+            ; ----- String conversion and concatenation helpers -----
             declare i8* @__jnative_concat_strings(i32, ...)
-
+    
             declare i8* @__jnative_value_to_string_int(i32)
             declare i8* @__jnative_value_to_string_long(i64)
             declare i8* @__jnative_value_to_string_float(float)
@@ -173,18 +183,43 @@ public class LlvmRuntime {
             declare i8* @__jnative_value_to_string_byte(i32)
             declare i8* @__jnative_value_to_string_short(i32)
             declare i8* @__jnative_value_to_string_object(i8*)
-
+    
+            ; ----- Reflection trampolines -----
             declare i8* @__jnative_invoke_method(i8*, i8*, i8**)
             declare i8* @__jnative_new_instance(i8*, i8**)
-
+    
+            ; ----- JNI bridge -----
+            ;
+            ; __jnative_get_jnienv and __jnative_get_thread_jnienv return the
+            ; process-wide JNIEnv_t. JNI_OnLoad receives a JavaVM_t* whose
+            ; GetEnv slot returns the same JNIEnv_t; the bridge owns the
+            ; single JavaVM instance and hands its address to each library.
+            ;
+            ; __jnative_jni_resolve takes four arguments:
+            ;   class_name   — internal form (with '/') of the declaring class
+            ;   method_name  — bare Java method name
+            ;   signature    — JVM descriptor
+            ;   symbol_name  — the mangled C symbol the emitter resolved
+            ;
+            ; It first consults the RegisterNatives dispatch table populated
+            ; by JNI_OnLoad, and falls back to dlsym(RTLD_DEFAULT, symbol_name)
+            ; for libraries that export traditional Java_* symbols. Both
+            ; mechanisms are required: Netty's native transports register
+            ; through JNI_OnLoad and export no Java_* symbols at all, while
+            ; the JDK's own platform libraries (libawt.so, libjava.so, …) do
+            ; the opposite. The third argument is deliberately part of the
+            ; signature even though the reference implementation ignored it
+            ; in the past; the current bridge uses it to build the
+            ; diagnostic message when both lookups fail.
             declare i8* @__jnative_get_jnienv()
             declare i8* @__jnative_get_thread_jnienv()
-
+    
             declare i8* @__jnative_jni_resolve(i8*, i8*, i8*, i8*)
             declare void @__jnative_jni_load_all(i8**, i32)
-
+    
+            ; ----- Static-field address lookup for reflection paths -----
             declare i8* @jnative_static_field_address(i8*, i8*)
-            """;
+        """;
     }
 
     /**

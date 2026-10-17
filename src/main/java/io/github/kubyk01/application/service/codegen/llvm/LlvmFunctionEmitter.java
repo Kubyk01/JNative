@@ -88,6 +88,85 @@ public class LlvmFunctionEmitter {
      */
     private static final String CLINIT_SUFFIX = "__clinit____V";
 
+    /**
+     * Names of the runtime helper functions that are declared in
+     * {@link LlvmRuntime#getDeclarations()} and defined in the compiled
+     * {@code jnative_runtime.c} translation unit.
+     *
+     * <p>A call to one of these names from the emitted IR is a call to a
+     * real C function that the linker will resolve against
+     * {@code jnative_runtime.o}; the LLVM module itself carries only the
+     * {@code declare} line. The IR-level check that prevents emitting a
+     * call to an undefined symbol (see {@link #isCallableSymbolDefined})
+     * must therefore treat these names as defined, even though no
+     * {@link Function} with an entry block exists in the module for
+     * them.</p>
+     *
+     * <p>The set is populated once, lazily, by scanning the declaration
+     * text that {@link LlvmRuntime#getDeclarations()} returns. Parsing
+     * the canonical source of declarations — rather than duplicating
+     * the list here — guarantees that the two cannot drift: any symbol
+     * that the emitter declares is also a symbol that the
+     * call-emission path accepts as defined.</p>
+     *
+     * <p>Two functions are added explicitly because they are emitted by
+     * {@code LlvmGenerator.generateMain()} through
+     * {@code ensureExternalFunction(...)} rather than being declared in
+     * {@link LlvmRuntime#getDeclarations()}: the two layout hand-off
+     * entry points that publish {@code Thread}/{@code ThreadGroup} and
+     * {@code java.lang.reflect.*} field offsets to the C side. Both are
+     * defined in {@code jnative_runtime.c} and {@code jnative/lang/Thread.c}
+     * respectively.</p>
+     */
+    private static final Set<String> RUNTIME_HELPER_SYMBOLS =
+        buildRuntimeHelperSymbols();
+
+    private static Set<String> buildRuntimeHelperSymbols() {
+        Set<String> out = new HashSet<>();
+
+        String decls = LlvmRuntime.getDeclarations();
+        /*
+         * Every declaration has the form:
+         *
+         *     declare <ret> @<name>(<args>)
+         *
+         * The name is delimited by '@' on the left and the first '(' on
+         * the right. Lines that do not match the shape are skipped
+         * silently, which is harmless: the pattern is a strict
+         * superset of every line the runtime actually emits, and a
+         * line that fails the match is a line that does not name a
+         * symbol anyway.
+         */
+        for (String rawLine : decls.split("\n")) {
+            String line = rawLine.trim();
+            if (!line.startsWith("declare ")) continue;
+            int at = line.indexOf('@');
+            if (at < 0) continue;
+            int paren = line.indexOf('(', at);
+            if (paren < 0) continue;
+            String name = line.substring(at + 1, paren);
+            if (!name.isEmpty()) {
+                out.add(name);
+            }
+        }
+
+        /*
+         * Two additional symbols that are emitted by
+         * LlvmGenerator.generateMain through ensureExternalFunction()
+         * and are defined in the runtime C sources, but are not listed
+         * in LlvmRuntime.getDeclarations() because the emitter calls
+         * them by direct textual emission rather than by resolving them
+         * through the module. They are added explicitly so that a future
+         * change which routes them through the ordinary STATIC_CALL
+         * path does not silently reintroduce the trap that this set
+         * exists to prevent.
+         */
+        out.add("__jnative_thread_set_layout");
+        out.add("__jnative_reflect_set_layout");
+
+        return Collections.unmodifiableSet(out);
+    }
+
     @FunctionalInterface
     private interface CallEmitter {
         void emit(StringBuilder sb, String resultReg);
@@ -596,6 +675,127 @@ public class LlvmFunctionEmitter {
                     .append(" ").append(zero).append("\n");
             }
         }
+        return sb.toString();
+    }
+
+    /**
+     * Emits the body of a bodiless JNI native Function.
+     *
+     * <p>JNI native Functions are registered in the module with the Java-level
+     * signature (receiver if instance, then declared parameters) but no entry
+     * block: the C implementation lives in a shared object that is embedded in
+     * the executable and dlopen'd at program start. The vtable slot that
+     * points at the Function's own name therefore cannot be a bare {@code
+     * declare} — the linker would have nothing to resolve it against.</p>
+     *
+     * <p>The trampoline is emitted under the same symbol name as the
+     * Function, replacing the declaration. At run time it:</p>
+     *
+     * <ol>
+     *   <li>calls {@code __jnative_jni_resolve(owner, method, desc, symbol)}
+     *       to obtain the C implementation pointer. The resolver consults
+     *       the RegisterNatives table populated by every embedded library's
+     *       {@code JNI_OnLoad}, then falls back to {@code dlsym(RTLD_DEFAULT,
+     *       symbol)} for traditional {@code Java_*} libraries. On failure it
+     *       throws a diagnostic and never returns;</li>
+     *   <li>obtains the thread-local {@code JNIEnv*} from
+     *       {@code __jnative_get_jnienv()};</li>
+     *   <li>for a static native, passes the owning class mirror as the second
+     *       C argument (the JNI ABI's {@code jclass});</li>
+     *   <li>calls through the typed pointer with the JNI ABI argument list;</li>
+     *   <li>returns the C function's result.</li>
+     * </ol>
+     *
+     * <p>The trampoline body is fully emitted as LLVM IR text, so the
+     * resolver and the JNIEnv helpers are the only external C symbols it
+     * needs, and both are already declared in
+     * {@link LlvmRuntime#getDeclarations()}.</p>
+     */
+    public String emitJniTrampoline(Function func) {
+        if (func == null || !func.isJniNative()) return "";
+
+        String owner      = func.getOwnerClass();
+        String methodName = func.getJniMethodName();
+        String descriptor = func.getJniDescriptor();
+        if (owner == null || methodName == null || descriptor == null) {
+            throw new IllegalStateException(
+                "JNI native " + func.getName()
+                    + " is missing its (owner, method, descriptor) triple; "
+                    + "BytecodeToIr.translateMethod must set jniMethodName and "
+                    + "jniDescriptor when creating a JNI native Function");
+        }
+
+        List<Parameter> params = func.getParameters();
+        Type retType = func.getReturnType();
+
+        StringBuilder sb = new StringBuilder();
+
+        // ---- signature: identical to the Function's Java-level signature ----
+        sb.append("define ")
+          .append(LlvmTypeMapper.toLlvmType(retType))
+          .append(" @").append(func.getName()).append("(");
+        for (int i = 0; i < params.size(); i++) {
+            if (i > 0) sb.append(", ");
+            sb.append(LlvmTypeMapper.toLlvmType(params.get(i).getType()))
+              .append(" %param_").append(i);
+        }
+        sb.append(") {\nentry:\n");
+
+        // ---- 1. resolve the C implementation ----
+        String ownerRef  = stringRef(owner);
+        String methodRef = stringRef(methodName);
+        String descRef   = stringRef(descriptor);
+        String symbolRef = stringRef(func.getName());
+
+        sb.append("  %jni_fn = call i8* @__jnative_jni_resolve(i8* ")
+          .append(ownerRef).append(", i8* ")
+          .append(methodRef).append(", i8* ")
+          .append(descRef).append(", i8* ")
+          .append(symbolRef).append(")\n");
+
+        // ---- 2. build the C-side function-pointer type: (JNIEnv*, [jclass,] recv?, params...) -> ret ----
+        StringBuilder fpType = new StringBuilder();
+        fpType.append(LlvmTypeMapper.toLlvmType(retType)).append(" (i8*");
+        if (func.isStaticJniNative()) {
+            fpType.append(", i8*");
+        }
+        for (Parameter p : params) {
+            fpType.append(", ").append(LlvmTypeMapper.toLlvmType(p.getType()));
+        }
+        fpType.append(")*");
+
+        sb.append("  %jni_fn_typed = bitcast i8* %jni_fn to ")
+          .append(fpType).append("\n");
+
+        // ---- 3. JNIEnv* + optional jclass + Java-level args ----
+        sb.append("  %jnienv = call i8* @__jnative_get_jnienv()\n");
+
+        StringBuilder args = new StringBuilder();
+        args.append("i8* %jnienv");
+
+        if (func.isStaticJniNative()) {
+            args.append(", i8* bitcast (%ReflectionClass* ")
+                .append(globalEmitter.getRefClassGlobalName(owner))
+                .append(" to i8*)");
+        }
+        for (int i = 0; i < params.size(); i++) {
+            args.append(", ")
+                .append(LlvmTypeMapper.toLlvmType(params.get(i).getType()))
+                .append(" %param_").append(i);
+        }
+
+        // ---- 4. the call ----
+        if (retType.isVoid()) {
+            sb.append("  call void %jni_fn_typed(").append(args).append(")\n");
+            sb.append("  ret void\n");
+        } else {
+            String retLlvm = LlvmTypeMapper.toLlvmType(retType);
+            sb.append("  %result = call ").append(retLlvm)
+              .append(" %jni_fn_typed(").append(args).append(")\n");
+            sb.append("  ret ").append(retLlvm).append(" %result\n");
+        }
+
+        sb.append("}\n\n");
         return sb.toString();
     }
 
@@ -4221,33 +4421,104 @@ public class LlvmFunctionEmitter {
 
     private boolean isCallableSymbolDefined(String symbol) {
         if (symbol == null || symbol.isEmpty()) return false;
-        // Only the compiler-known override/adaptor families are treated as
-        // implicitly defined. A blanket "__jnative_" match would silently
-        // accept any typo'd or stale symbol and emit a call to a name the
-        // linker never resolves, which is exactly the failure mode the
-        // diagnostic trap below exists to catch.
+
+        /*
+         * Runtime C helper.
+         *
+         * These symbols have a declare line in the emitted module (from
+         * LlvmRuntime.getDeclarations()), but no Function object with an
+         * entry block, because their bodies live in jnative_runtime.c
+         * and are linked into the executable rather than generated by
+         * the LLVM backend. The diagnostics trap that the rest of this
+         * method exists to trigger must not fire for them, or every
+         * lazy-clinit wrapper (which calls __jnative_clinit_enter and
+         * __jnative_clinit_exit), every destructor (which calls
+         * __jnative_dtor_enter and __jnative_dtor_unclaim), every
+         * exception raise (which calls __jnative_throw_*_ctx), every
+         * string concatenation (which calls __jnative_concat_strings),
+         * and every string-to-value conversion (which calls
+         * __jnative_value_to_string_*) would be replaced with a trap at
+         * build time. That is precisely the failure this branch
+         * prevents.
+         */
+        if (RUNTIME_HELPER_SYMBOLS.contains(symbol)) {
+            return true;
+        }
+
+        /*
+         * Compiler-known override and adaptor families.
+         *
+         * __jnative_override_* — hand-written C replacements for Java
+         * methods, registered by BytecodeToIr.translate() from the
+         * NativeOverrideScanner output. The body lives in a per-class
+         * C file under src/main/resources/jnative/.
+         *
+         * __jnative_fn_*      — hand-written C implementations of
+         * native Java methods. The body lives in the same per-class C
+         * files and is reached through a direct call rather than
+         * through the JNI resolution machinery.
+         *
+         * Both are provided by C sources that are compiled and linked
+         * into the executable alongside the LLVM-generated objects.
+         */
         if (symbol.startsWith("__jnative_override_")
             || symbol.startsWith("__jnative_fn_")) {
             return true;
         }
-        if (symbol.startsWith("llvm."))    return true;
+
+        /*
+         * LLVM intrinsics. The linker never sees these as undefined:
+         * the backend recognises the intrinsic names directly.
+         */
+        if (symbol.startsWith("llvm.")) return true;
+
+        /*
+         * Well-known libc entry points that are always present in a
+         * dynamically linked executable. The list is small on purpose:
+         * it names only the functions the emitter calls by bare symbol
+         * (malloc/free from NEW and FREE handling, printf/abort/atexit
+         * from diagnostics and shutdown, the mem* family from
+         * aggregate initialisation, and setjmp/longjmp from the
+         * try-guard lowering). Every other external function is either
+         * declared in LlvmRuntime.getDeclarations() — and therefore
+         * already in RUNTIME_HELPER_SYMBOLS — or is a JNI native
+         * handled below.
+         */
         return switch (symbol) {
             case "malloc", "free", "printf", "abort", "atexit",
                  "memcpy", "memmove", "memset", "_setjmp", "longjmp" ->
                 true;
             default -> {
                 Function f = module.getFunction(symbol);
-                // A JNI native is a declaration on purpose: its body lives
-                // in a platform shared object and is resolved by the
-                // linker, so it counts as "defined" even without an entry
-                // block.
+
+                /*
+                 * A JNI native is a declaration on purpose: its body
+                 * lives in a platform shared object and is resolved by
+                 * the linker or, when the library is loaded through
+                 * JNI_OnLoad + RegisterNatives, by dlsym at run time.
+                 * Such a symbol counts as defined even though no IR
+                 * entry block exists for it, because the runtime
+                 * resolution path (__jnative_jni_resolve) is what
+                 * actually provides the implementation.
+                 */
                 if (f != null && f.isJniNative()) {
                     yield true;
                 }
-                // A bare `declare` (no entry block) will fail at link time
-                // unless something else provides the body.  Only count the
-                // symbol as defined when the module really contains a
-                // definition for it.
+
+                /*
+                 * Everything else must have a definition in the
+                 * module. A Function object with no entry block is a
+                 * bare declare — the symbol must be provided by a
+                 * linked-in C object (which is either the runtime
+                 * source, already covered above, or a per-class native
+                 * file, already covered by the __jnative_fn_* /
+                 * __jnative_override_* branches) or the link will fail.
+                 * If none of those apply, the correct behaviour is to
+                 * emit a diagnostic trap so the missing translation is
+                 * visible at build time rather than as a link error
+                 * buried inside the thousands of symbols in the final
+                 * executable.
+                 */
                 yield f != null && f.getEntryBlock() != null;
             }
         };

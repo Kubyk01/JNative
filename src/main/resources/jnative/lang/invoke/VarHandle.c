@@ -2037,3 +2037,186 @@ int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_lang_Void_L
         &exp, newValue, 0,
         __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;
 }
+
+/* ===========================================================================
+ *  java.util.concurrent.SynchronousQueue — the two transfer data structures.
+ *
+ *  Both SynchronousQueue.TransferQueue and SynchronousQueue.TransferStack
+ *  expose a small set of VarHandle CAS operations on their node fields.
+ *  The same descriptor is used for head, tail and cleanMe on the queue
+ *  side (all three are QNode-typed), and for match and next on the stack
+ *  side (both SNode-typed). At the C ABI level the VarHandle itself is
+ *  not part of the signature — see the header comment at the top of this
+ *  file — so the emitter cannot tell the three apart.
+ *
+ *  The helpers below therefore search the plausible field names in the
+ *  receiver and CAS whichever one currently holds `expected`. A fresh node
+ *  reference held by one field is never simultaneously held by another,
+ *  so the search resolves unambiguously in every reachable call.
+ * =========================================================================== */
+
+static int sq_field_offset_for_class(const char* cls_name, const char* field) {
+    ReflectionClass* cls = jnative_class_by_name(cls_name);
+    if (cls == NULL) return -1;
+    return var_handle_find_field_offset(cls, field);
+}
+
+/*
+ * CAS the first field in `fields[]` whose current value equals `expected`.
+ * Returns 1 on success, 0 on either "no field held expected" or a
+ * compare-exchange that lost a race.
+ */
+static int32_t sq_cas_any_ref(const char* cls_name,
+                              void* obj,
+                              const char* const* fields,
+                              int field_count,
+                              void* expected,
+                              void* new_value)
+{
+    if (obj == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    for (int i = 0; i < field_count; i++) {
+        int off = sq_field_offset_for_class(cls_name, fields[i]);
+        if (off < 0) continue;
+        void** slot = (void**)((char*)obj + off);
+        void* cur = __atomic_load_n(slot, __ATOMIC_SEQ_CST);
+        if (cur != expected) continue;
+        void* exp = expected;
+        return __atomic_compare_exchange_n(slot, &exp, new_value,
+                                           0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)
+            ? 1 : 0;
+    }
+    return 0;
+}
+
+static int32_t sq_set_any_ref(const char* cls_name,
+                              void* obj,
+                              const char* const* fields,
+                              int field_count,
+                              void* value)
+{
+    if (obj == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    for (int i = 0; i < field_count; i++) {
+        int off = sq_field_offset_for_class(cls_name, fields[i]);
+        if (off < 0) continue;
+        __atomic_store_n((void**)((char*)obj + off), value, __ATOMIC_RELEASE);
+        return 0;
+    }
+    return 0;
+}
+
+/* -------- TransferQueue: {head, tail, cleanMe} (all QNode) ------------- */
+
+int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concurrent_SynchronousQueue_TransferQueue_Ljava_util_concurrent_SynchronousQueue_TransferQueue_QNode_Ljava_util_concurrent_SynchronousQueue_TransferQueue_QNode__Z(
+        void* obj, void* expected, void* new_value)
+{
+    static const char* const FIELDS[] = { "head", "tail", "cleanMe" };
+    return sq_cas_any_ref(
+        "java/util/concurrent/SynchronousQueue$TransferQueue",
+        obj, FIELDS, 3, expected, new_value);
+}
+
+/* -------- TransferQueue.QNode: {next} (QNode -> QNode) ---------------- */
+
+int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concurrent_SynchronousQueue_TransferQueue_QNode_Ljava_util_concurrent_SynchronousQueue_TransferQueue_QNode_Ljava_util_concurrent_SynchronousQueue_TransferQueue_QNode__Z(
+        void* obj, void* expected, void* new_value)
+{
+    static const char* const FIELDS[] = { "next" };
+    return sq_cas_any_ref(
+        "java/util/concurrent/SynchronousQueue$TransferQueue$QNode",
+        obj, FIELDS, 1, expected, new_value);
+}
+
+/* -------- TransferQueue.QNode: {item} (Object -> Object) -------------- */
+/*
+ * The descriptor carries Object/Object, which matches both the "item"
+ * field of QNode and the tryCancel path where the new value is a QNode
+ * reference stored through the Object slot. In both cases the field
+ * touched is `item`; the two symbols are distinguished only by the
+ * declared static type of the new-value argument.
+ */
+int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concurrent_SynchronousQueue_TransferQueue_QNode_Ljava_lang_Object_Ljava_lang_Object__Z(
+        void* obj, void* expected, void* new_value)
+{
+    static const char* const FIELDS[] = { "item" };
+    return sq_cas_any_ref(
+        "java/util/concurrent/SynchronousQueue$TransferQueue$QNode",
+        obj, FIELDS, 1, expected, new_value);
+}
+
+/* -------- TransferQueue.QNode: {item}, new value typed QNode ----------- */
+
+int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concurrent_SynchronousQueue_TransferQueue_QNode_Ljava_lang_Object_Ljava_util_concurrent_SynchronousQueue_TransferQueue_QNode__Z(
+        void* obj, void* expected, void* new_value)
+{
+    static const char* const FIELDS[] = { "item" };
+    return sq_cas_any_ref(
+        "java/util/concurrent/SynchronousQueue$TransferQueue$QNode",
+        obj, FIELDS, 1, expected, new_value);
+}
+
+/* -------- TransferQueue.QNode: {waiter = null} ------------------------ */
+
+void __jnative_fn_java_lang_invoke_VarHandle_setOpaque__Ljava_util_concurrent_SynchronousQueue_TransferQueue_QNode_Ljava_lang_Void__V(
+        void* obj, void* value)
+{
+    static const char* const FIELDS[] = { "waiter" };
+    (void)value;
+    sq_set_any_ref(
+        "java/util/concurrent/SynchronousQueue$TransferQueue$QNode",
+        obj, FIELDS, 1, NULL);
+}
+
+/* -------- TransferStack: {head} (SNode -> SNode) ---------------------- */
+
+int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concurrent_SynchronousQueue_TransferStack_Ljava_util_concurrent_SynchronousQueue_TransferStack_SNode_Ljava_util_concurrent_SynchronousQueue_TransferStack_SNode__Z(
+        void* obj, void* expected, void* new_value)
+{
+    static const char* const FIELDS[] = { "head" };
+    return sq_cas_any_ref(
+        "java/util/concurrent/SynchronousQueue$TransferStack",
+        obj, FIELDS, 1, expected, new_value);
+}
+
+/* -------- TransferStack.SNode: {match} (null -> SNode) ---------------- */
+/*
+ * tryMatch does:
+ *     SMATCH.compareAndSet(this, null, s)
+ * The descriptor types the expected value as Void (the compiler knew it
+ * was the literal null). At the C boundary it arrives as NULL.
+ */
+int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concurrent_SynchronousQueue_TransferStack_SNode_Ljava_lang_Void_Ljava_util_concurrent_SynchronousQueue_TransferStack_SNode__Z(
+        void* obj, void* expected, void* new_value)
+{
+    static const char* const FIELDS[] = { "match" };
+    (void)expected;
+    return sq_cas_any_ref(
+        "java/util/concurrent/SynchronousQueue$TransferStack$SNode",
+        obj, FIELDS, 1, NULL, new_value);
+}
+
+/* -------- TransferStack.SNode: {next} (SNode -> SNode) ---------------- */
+
+int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concurrent_SynchronousQueue_TransferStack_SNode_Ljava_util_concurrent_SynchronousQueue_TransferStack_SNode_Ljava_util_concurrent_SynchronousQueue_TransferStack_SNode__Z(
+        void* obj, void* expected, void* new_value)
+{
+    static const char* const FIELDS[] = { "next" };
+    return sq_cas_any_ref(
+        "java/util/concurrent/SynchronousQueue$TransferStack$SNode",
+        obj, FIELDS, 1, expected, new_value);
+}
+
+/* -------- TransferStack.SNode: {waiter = null} ------------------------ */
+
+void __jnative_fn_java_lang_invoke_VarHandle_setOpaque__Ljava_util_concurrent_SynchronousQueue_TransferStack_SNode_Ljava_lang_Void__V(
+        void* obj, void* value)
+{
+    static const char* const FIELDS[] = { "waiter" };
+    (void)value;
+    sq_set_any_ref(
+        "java/util/concurrent/SynchronousQueue$TransferStack$SNode",
+        obj, FIELDS, 1, NULL);
+}

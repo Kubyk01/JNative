@@ -49,3 +49,29 @@ void __jnative_fn_sun_java2d_loops_MaskBlit_MaskBlit__Lsun_java2d_SunGraphics2D_
     (void)maskoff;
     (void)maskscan;
 }
+
+/*
+ * Second descriptor form of the MaskBlit native, emitted by JDK builds
+ * whose sun.java2d.loops.MaskBlit declares the method without the
+ * SunGraphics2D receiver — the shape that the LLVM backend picks up
+ * when the class was compiled against a JDK whose source does not
+ * declare the parameter. Same semantics, so the body is a no-op.
+ */
+void __jnative_fn_sun_java2d_loops_MaskBlit_MaskBlit__Lsun_java2d_SurfaceData_Lsun_java2d_SurfaceData_Ljava_awt_Composite_Lsun_java2d_pipe_Region_IIIIII_BII_V(
+        void* this_prim,
+        void* src,
+        void* dst,
+        void* comp,
+        void* clip,
+        int32_t srcx, int32_t srcy,
+        int32_t dstx, int32_t dsty,
+        int32_t width, int32_t height,
+        void* mask,
+        int32_t maskoff,
+        int32_t maskscan)
+{
+    (void)this_prim; (void)src; (void)dst; (void)comp; (void)clip;
+    (void)srcx; (void)srcy; (void)dstx; (void)dsty;
+    (void)width; (void)height;
+    (void)mask; (void)maskoff; (void)maskscan;
+}

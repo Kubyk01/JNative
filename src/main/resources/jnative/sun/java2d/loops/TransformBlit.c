@@ -43,3 +43,27 @@ void __jnative_fn_sun_java2d_loops_TransformBlit_TransformBlit__Lsun_java2d_SunG
     (void)dx1; (void)dy1;
     (void)dx2; (void)dy2;
 }
+
+/*
+ * Second descriptor form of TransformBlit.Transform, emitted by JDK
+ * builds that declare the method without the leading SunGraphics2D
+ * parameter. Same semantics as the existing SunGraphics2D-prefixed
+ * variant, so the body is a no-op.
+ */
+void __jnative_fn_sun_java2d_loops_TransformBlit_Transform__Lsun_java2d_SurfaceData_Lsun_java2d_SurfaceData_Ljava_awt_Composite_Lsun_java2d_pipe_Region_Ljava_awt_geom_AffineTransform_IIIIIII_V(
+        void* this_prim,
+        void* src,
+        void* dst,
+        void* comp,
+        void* clip,
+        void* at,
+        int32_t txtype,
+        int32_t sx, int32_t sy,
+        int32_t dx, int32_t dy,
+        int32_t w,  int32_t h)
+{
+    (void)this_prim; (void)src; (void)dst; (void)comp; (void)clip;
+    (void)at; (void)txtype;
+    (void)sx; (void)sy; (void)dx; (void)dy;
+    (void)w;  (void)h;
+}

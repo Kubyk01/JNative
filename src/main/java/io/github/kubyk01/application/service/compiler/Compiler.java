@@ -24,6 +24,7 @@ import java.util.Collections;
 import java.util.Comparator;
 import java.util.Enumeration;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
@@ -47,6 +48,43 @@ import java.util.stream.Collectors;
  * everything with {@code clang} (falling back to {@code gcc}), and links
  * the final executable.</p>
  *
+ * <h2>Self-contained executables</h2>
+ *
+ * <p>The produced binary does <b>not</b> depend on an installed JDK, on
+ * {@code JAVA_HOME}, on {@code LD_LIBRARY_PATH}, or on the presence of
+ * any external {@code .so} at run time. Every native library the compiled
+ * image can call into — the JDK's own {@code libawt.so},
+ * {@code libjava.so}, {@code libnio.so}, {@code libnetty_transport_*.so}
+ * and so on — is read as bytes, embedded into the executable, written to
+ * a private directory at program start, {@code dlopen}'d with
+ * {@code RTLD_GLOBAL}, and (for libraries that ship a {@code JNI_OnLoad})
+ * initialised before any Java code runs.</p>
+ *
+ * <p>The link line therefore contains no {@code -Wl,--no-as-needed} for
+ * JDK libraries. The previous approach — passing
+ * {@code $JAVA_HOME/lib/libawt.so} to the linker — recorded only the
+ * library's SONAME ({@code "libawt.so"}) in {@code DT_NEEDED}, forcing
+ * the dynamic loader to find that file again at run time through
+ * {@code RUNPATH}/{@code LD_LIBRARY_PATH}, which fails on any machine
+ * that does not carry the exact JDK the binary was built against.</p>
+ *
+ * <h2>Transitive closure of JDK libraries</h2>
+ *
+ * <p>Selecting JDK libraries only by the JNI symbols the module
+ * references is not sufficient for a truly self-contained image. A
+ * library that exports a needed symbol is itself a dynamic object: its
+ * ELF {@code .dynamic} section names its own dependencies by SONAME
+ * ({@code libjvm.so}, {@code libjava.so}, {@code libawt_headless.so},
+ * {@code libfreetype.so}, …), and the loader refuses to {@code dlopen}
+ * it unless every one of those SONAMEs can be satisfied. The embed step
+ * therefore walks the {@code DT_NEEDED} graph from the initial
+ * symbol-filtered set until it reaches a fixed point, and embeds every
+ * transitively required library that lives under {@code $JAVA_HOME}.
+ * Dependencies on system libraries ({@code libc}, {@code libm},
+ * {@code libX11}, {@code libz}, …) are deliberately not embedded: the
+ * target machine has its own copies, and shadowing them with the build
+ * host's binaries would break on any system whose ABI differs.</p>
+ *
  * <h2>Optimization level</h2>
  *
  * <p>The level passed to clang as {@code -O<level>} is user-supplied
@@ -62,9 +100,7 @@ import java.util.stream.Collectors;
  *
  * <p>The default of {@code 2} matches the previous hard-coded value.
  * The value is clamped to {@code [0, 3]} before use, so a caller that
- * passes an out-of-range value (or the interface's implicit default of
- * {@code 0} when no explicit choice was made) still gets a valid clang
- * invocation.</p>
+ * passes an out-of-range value still gets a valid clang invocation.</p>
  *
  * <h2>Parallelism</h2>
  *
@@ -84,12 +120,6 @@ import java.util.stream.Collectors;
  *       optimization to the ThinLTO backend, which splits the module into
  *       partitions and optimizes them across {@code N} worker threads.</li>
  * </ol>
- *
- * <p>The generated {@code .ll} modules are emitted to bitcode with the
- * user-supplied {@code -O<level>}; the expensive passes run only during
- * the link step, where they are parallelized. This arrangement is what
- * turns a single-threaded {@code clang} invocation into a fully parallel
- * build.</p>
  */
 @Slf4j
 public class Compiler implements CompilerPort {
@@ -107,6 +137,35 @@ public class Compiler implements CompilerPort {
     private static final String BUILD_ROOT_NAME = "jnative_build_";
 
     /**
+     * Prefix used for the extraction directory that holds the native
+     * library bytes during the build. Kept separate from the main build
+     * root so that its lifetime can be managed independently: the main
+     * build root is deleted when {@code compileAndLink} returns, while
+     * the extracted natives must survive at least until the LLVM
+     * generator has read them.
+     */
+    private static final String NATIVE_BYTES_DIR_NAME = "jnative-native-bytes-";
+
+    /**
+     * Prefix used for the extraction directory that holds native library
+     * files which are candidates for linking (input archive and tool
+     * classpath).
+     */
+    private static final String NATIVE_LINK_DIR_NAME = "jnative-natives-";
+
+    /**
+     * Resource-key prefixes under which the two kinds of native library
+     * are registered in the executable's built-in resource table.
+     *
+     * <p>Both strings are opaque to the C side: they are simply keys
+     * looked up in {@code @jnative_builtin_resources}. Choosing distinct,
+     * non-colliding prefixes keeps the two categories visually separable
+     * in a diagnostic dump of that table.</p>
+     */
+    private static final String KEY_PREFIX_JDK_LIBS = "jnative-jdk-libs/";
+    private static final String KEY_PREFIX_BUNDLED_NATIVES = "jnative-natives/";
+
+    /**
      * Lower bound of the optimization level that clang accepts on its
      * command line. {@code -O0} disables optimization entirely.
      */
@@ -120,6 +179,10 @@ public class Compiler implements CompilerPort {
      * is still a build-log defect, so the clamp normalizes it here.
      */
     private static final int MAX_OPT_LEVEL = 3;
+
+    // =========================================================================
+    //  compileAndLink
+    // =========================================================================
 
     @Override
     public void compileAndLink(List<Path> llPaths,
@@ -148,10 +211,7 @@ public class Compiler implements CompilerPort {
 
         // The target platform is required: it determines the --target=
         // flag passed to clang for both compilation and linking, and
-        // which linker libraries are appended to the link command. A
-        // null argument is a programming error; fall back to the
-        // detected host platform rather than failing, so a caller that
-        // has not been updated still produces a working host build.
+        // which linker libraries are appended to the link command.
         final TargetPlatform target = (targetPlatform != null)
             ? targetPlatform
             : TargetPlatform.detectFromBuildHost();
@@ -194,11 +254,6 @@ public class Compiler implements CompilerPort {
             // ------------------------------------------------------------------
             List<CompileTask> tasks = new ArrayList<>();
 
-            // ------------------------------------------------------------------
-            // 3a. C sources — runtime + per-class natives. They live under
-            //     c/ so the object naming is predictable and never collides
-            //     with the IR objects under ir/.
-            // ------------------------------------------------------------------
             Path cDir = tempDir.resolve("c");
             Files.createDirectories(cDir);
 
@@ -209,9 +264,6 @@ public class Compiler implements CompilerPort {
             tasks.add(new CompileTask(jniBridgeSource, jniBridgeObj, false));
 
             for (Path src : extraSources) {
-                // Duplicate basenames (different packages, same class name)
-                // must not overwrite each other — mirror the source's path
-                // under c/.
                 Path rel = tempDir.relativize(src);
                 Path objWithPath = cDir.resolve(
                     rel.toString().replaceAll("\\.c$", ".o"));
@@ -219,16 +271,10 @@ public class Compiler implements CompilerPort {
                 tasks.add(new CompileTask(src, objWithPath, false));
             }
 
-            // ------------------------------------------------------------------
-            // 3b. LLVM IR files (one per class + _module.ll). Object names are
-            //     sanitized ($, ':', whitespace) and made unique with an index.
-            // ------------------------------------------------------------------
             List<Path> llObjPaths = new ArrayList<>(llPaths.size());
             int irIndex = 0;
             for (Path ll : llPaths) {
                 String base = sanitizeForObjName(ll.getFileName().toString());
-                // The index guarantees uniqueness even if two classes collide
-                // after sanitizing (e.g. Foo$Bar and Foo_Bar).
                 Path obj = tempDir.resolve("ir")
                     .resolve(String.format("%05d_%s.o", irIndex++, base));
                 tasks.add(new CompileTask(ll, obj, true));
@@ -242,21 +288,10 @@ public class Compiler implements CompilerPort {
                 + effectiveOptLevel + ", target " + target.triple() + ")...");
 
             compileAll(compiler, tasks, tempDir, threadCount,
-                       effectiveOptLevel, target);
+                effectiveOptLevel, target);
 
             // ------------------------------------------------------------------
-            // 4. Link with ThinLTO. The link driver reads every bitcode
-            //    object, hands the merged module to the ThinLTO backend,
-            //    and the backend splits it into partitions and runs the
-            //    requested optimization level over them across
-            //    --thinlto-jobs worker threads.
-            //
-            //    --target=<triple> is passed to the clang driver, not to
-            //    the linker directly: clang uses it to select the
-            //    correct linker flavour (-fuse-ld=lld resolves to
-            //    ld.lld / lld-link / ld64.lld based on the target),
-            //    the correct C runtime for the final link, and the
-            //    correct search paths for the target's sysroot.
+            // 4. Link with ThinLTO.
             // ------------------------------------------------------------------
             List<String> linkCmd = new ArrayList<>();
             linkCmd.add(compiler);
@@ -274,20 +309,29 @@ public class Compiler implements CompilerPort {
             appendLinkerLibraries(linkCmd, target);
 
             // ------------------------------------------------------------------
-            // 5. Discover and append platform native libraries. Only the
-            //    shared objects that actually export a JNI symbol the
-            //    module needs are linked. The .so files are not turned
-            //    into bitcode: they are added to the link command as
-            //    shared libraries.
+            // 5. Discover and append the native libraries the input archive
+            //    itself contributes (Spring Boot fat jar, shaded jar, etc.).
+            //
+            //    These are the ONLY libraries that end up on the link line.
+            //    JDK platform libraries are no longer linked here: they are
+            //    embedded into the executable and dlopen'd at run time. See
+            //    embedNativeLibraries() for the rationale.
+            //
+            //    A library placed on the link line by absolute path records
+            //    only its SONAME in DT_NEEDED, which is exactly the
+            //    portability bug this fix removes. Placing an application
+            //    library on the link line is safe in that respect because
+            //    the library is copied next to the executable by the
+            //    extractor and found through $ORIGIN.
             // ------------------------------------------------------------------
-            List<Path> nativeLibs = collectNativeLibraries(module, resolver, target);
-            for (Path lib : nativeLibs) {
+            List<Path> bundledNativeLibs = collectNativeLibraries(module, resolver, target);
+            for (Path lib : bundledNativeLibs) {
                 linkCmd.add("-Wl,--no-as-needed");
                 linkCmd.add(lib.toString());
             }
-            // Export the runtime's rpath so the .so files are found at run
-            // time. $ORIGIN is the directory containing the produced
-            // executable; the user can either copy the .so files next to
+
+            // $ORIGIN is the directory containing the produced executable;
+            // the user can either copy the application .so files next to
             // the executable or set LD_LIBRARY_PATH.
             linkCmd.add("-Wl,-rpath,$ORIGIN");
             linkCmd.add("-Wl,-rpath," + new File(".").getAbsolutePath());
@@ -314,32 +358,20 @@ public class Compiler implements CompilerPort {
         }
     }
 
+    // =========================================================================
+    //  Compilation helpers
+    // =========================================================================
+
     /**
      * Normalizes a user-supplied optimization level into the range
      * clang accepts on its command line ({@code [0, 3]}).
-     *
-     * <p>The clamp is deliberately silent: passing an out-of-range
-     * value to the CLI is not an error condition worth aborting the
-     * build for, because the resulting behaviour is well defined
-     * (anything below {@code 0} becomes {@code -O0}, anything above
-     * {@code 3} becomes {@code -O3}). The compiler driver handles the
-     * same inputs the same way.</p>
      */
     private static int clampOptLevel(int level) {
         if (level < MIN_OPT_LEVEL) return MIN_OPT_LEVEL;
         return Math.min(level, MAX_OPT_LEVEL);
     }
 
-    // =========================================================================
-    //  Parallel compilation
-    // =========================================================================
-
-    /**
-     * One compilation unit in the build: either a C source of the runtime /
-     * per-class native files, or a generated LLVM IR module.
-     */
     private static final class CompileTask {
-
         private final Path src;
         private final Path obj;
         private final boolean isIr;
@@ -351,16 +383,6 @@ public class Compiler implements CompilerPort {
         }
     }
 
-    /**
-     * Returns a filesystem-safe form of a Java class-file basename for use
-     * as the base of an object-file name.
-     *
-     * <p>Replaces every character outside {@code [A-Za-z0-9._-]} with
-     * {@code '_'}. This is enough to cover {@code $} in nested-class names,
-     * the {@code :} that appears in some Windows-style internal names, and
-     * any stray whitespace that the class-file format technically
-     * permits.</p>
-     */
     private static String sanitizeForObjName(String name) {
         StringBuilder sb = new StringBuilder(name.length());
         for (int i = 0; i < name.length(); i++) {
@@ -375,21 +397,6 @@ public class Compiler implements CompilerPort {
         return sb.toString();
     }
 
-    /**
-     * Compiles every task using a fixed-size thread pool.
-     *
-     * <p>Work is distributed through a shared atomic counter rather than a
-     * pre-partitioned queue: a slow translation unit (say, a per-class
-     * native file that pulls in heavy system headers) does not leave a
-     * worker idle while other sources sit unassigned. Each worker grabs
-     * the next free index, compiles it, and moves on.</p>
-     *
-     * <p>When a compilation fails, the failure is propagated as soon as
-     * {@link Future#get()} is called on that worker's future. The
-     * remaining futures are still drained, so that no compiler process is
-     * left running after the method returns, and the original exception
-     * is rethrown wrapped in a {@link RuntimeException}.</p>
-     */
     private void compileAll(String compiler,
                             List<CompileTask> tasks,
                             Path includeDir,
@@ -423,7 +430,7 @@ public class Compiler implements CompilerPort {
                     CompileTask task = tasks.get(idx);
                     try {
                         compileOne(compiler, task, includeDir,
-                                   optimizationLevel, target);
+                            optimizationLevel, target);
                     } catch (Throwable t) {
                         failures.add(t);
                     }
@@ -490,36 +497,13 @@ public class Compiler implements CompilerPort {
     }
 
     // =========================================================================
-    //  Compilation of a single unit
+    //  Single-unit compilation
     // =========================================================================
 
-    /**
-     * Compiles one task into an LLVM bitcode object. C sources are passed
-     * with {@code -x c}; generated LLVM IR modules with {@code -x ir}.
-     * Every object participates in the same ThinLTO link step.
-     *
-     * <p>The {@code --target=<triple>} flag is passed to the clang
-     * driver for every translation unit — C and IR alike. For a C
-     * source it selects the target ABI and the corresponding header
-     * search paths (which must be present in the build host's sysroot
-     * for a true cross-compile). For an IR module it tells clang which
-     * target's validation rules and machine-code backend to apply when
-     * it lowers the module into ThinLTO bitcode.</p>
-     *
-     * <p>Without this flag clang would silently target its own host
-     * even when the IR header declares a different triple, producing
-     * either a warning-less mis-compile or a delayed error at link
-     * time. Passing it explicitly makes the target an intentional,
-     * visible property of the build.</p>
-     */
     private void compileOne(String compiler, CompileTask task, Path includeDir,
                             int optimizationLevel, TargetPlatform target)
         throws IOException, InterruptedException {
 
-        // clang does not create intermediate directories for -o. The object
-        // path of a per-class IR file mirrors the class's package path, so
-        // the directory must be created explicitly — otherwise the build
-        // fails with "No such file or directory".
         Path parent = task.obj.getParent();
         if (parent != null) {
             Files.createDirectories(parent);
@@ -532,16 +516,10 @@ public class Compiler implements CompilerPort {
         command.add("-x");
         command.add(task.isIr ? "ir" : "c");
         command.add("-O" + optimizationLevel);
-        // Emit LLVM bitcode for ThinLTO. Every translation unit (including
-        // the runtime itself) participates in the same link-time
-        // optimization pipeline.
         command.add("-flto=thin");
         command.add("-g");
         command.add("-fno-omit-frame-pointer");
 
-        // -I only makes sense for C sources. For the IR frontend clang
-        // prints "argument unused during compilation" for every file, which
-        // turns the log of 3000+ files into noise.
         if (!task.isIr) {
             command.add("-I" + includeDir.toString());
         }
@@ -633,47 +611,27 @@ public class Compiler implements CompilerPort {
     //  Native-class discovery
     // =========================================================================
 
-
     /**
      * Appends the linker libraries and export flags appropriate for the
      * target platform to {@code linkCmd}.
      *
      * <p>The selection is driven by the target triple, not by the host
      * {@code os.name} property. The two agree for a native build and
-     * differ for every cross-compile; keying on the host would make a
-     * Linux-to-FreeBSD cross-compile request {@code -ldl} from the
-     * FreeBSD sysroot, where that library does not exist under that
-     * name.</p>
+     * differ for every cross-compile.</p>
      *
      * <p>The set of libraries is deliberately minimal — only the ones
-     * the runtime's C sources actually reference. Adding a library that
-     * the target does not ship is a link-time error, not a silent
-     * fallback, so an under-specified list is easier to diagnose than
-     * an over-specified one.</p>
+     * the runtime's C sources actually reference.</p>
      *
      * <ul>
-     *   <li><b>Windows</b> ({@code *-windows-*}): no {@code -rdynamic}
-     *       (the MSVC linker has no equivalent and interprets it as an
-     *       unknown flag), no {@code -lpthread} (Win32 threads are in
-     *       the CRT), no {@code -ldl} (no dynamic loader library). The
-     *       MinGW target still needs {@code -lm} because its C library
-     *       splits the math functions out of libc.</li>
-     *
+     *   <li><b>Windows</b> ({@code *-windows-*}): no {@code -rdynamic},
+     *       no {@code -lpthread}, no {@code -ldl}; only {@code -lm}.</li>
      *   <li><b>Darwin/macOS</b> ({@code *-apple-*}): the equivalent of
      *       {@code -rdynamic} is {@code -Wl,-export_dynamic};
-     *       {@code -lpthread} is a system stub; there is no
-     *       {@code -ldl} (dlopen lives in libSystem).</li>
-     *
+     *       {@code -lpthread} is a system stub; no {@code -ldl}.</li>
      *   <li><b>BSD</b> ({@code *-freebsd}, {@code *-netbsd},
-     *       {@code *-openbsd}): {@code -rdynamic} is accepted;
-     *       {@code -lpthread} is a stub in libc on newer versions but
-     *       linking it explicitly is harmless; {@code -ldl} does not
-     *       exist on the BSDs and is omitted.</li>
-     *
+     *       {@code *-openbsd}): {@code -rdynamic -lpthread -lm}.</li>
      *   <li><b>Linux and other ELF Unix</b>: the full set —
-     *       {@code -rdynamic -lpthread -ldl -lm} — which is what every
-     *       previous revision of this class has appended
-     *       unconditionally.</li>
+     *       {@code -rdynamic -lpthread -ldl -lm}.</li>
      * </ul>
      */
     private static void appendLinkerLibraries(List<String> linkCmd,
@@ -701,7 +659,6 @@ public class Compiler implements CompilerPort {
             return;
         }
 
-        // Linux and every other ELF-based Unix target.
         linkCmd.add("-rdynamic");
         linkCmd.add("-lpthread");
         linkCmd.add("-ldl");
@@ -709,9 +666,39 @@ public class Compiler implements CompilerPort {
     }
 
     // =========================================================================
-    //  Platform native library discovery
+    //  Native library discovery — LINK-TIME candidates
     // =========================================================================
 
+    /**
+     * Discovers native libraries bundled inside the analysed application
+     * itself (the input archive and the tool's own classpath) that export
+     * at least one {@code Java_*} symbol the compiled module needs, and
+     * returns them for the LINK LINE.
+     *
+     * <h2>What is deliberately not scanned here</h2>
+     *
+     * <p>JDK platform libraries — anything under {@code $JAVA_HOME/lib}
+     * or {@code $JAVA_HOME/lib/server} — are NOT candidates for the link
+     * line. Linking them by absolute path records only their SONAME in
+     * {@code DT_NEEDED}, forcing the dynamic loader to find the same file
+     * again at run time through {@code RUNPATH}/{@code LD_LIBRARY_PATH}.
+     * That is the exact portability defect this fix removes.</p>
+     *
+     * <p>Those libraries are instead read as bytes, embedded into the
+     * executable, extracted to a private directory at program start, and
+     * {@code dlopen}'d with {@code RTLD_GLOBAL} before any Java code
+     * runs. See {@link #embedNativeLibraries(Module, DependencyResolver,
+     * TargetPlatform)} for the implementation and the resource-key
+     * convention.</p>
+     *
+     * <p>Application libraries bundled inside the input archive (a Spring
+     * Boot fat jar's {@code BOOT-INF/lib/*.jar} contents, a shaded jar's
+     * {@code native/} directories, and so on) stay on the link line
+     * because they are copied to a directory next to the executable at
+     * build time and found through {@code $ORIGIN}. They are also
+     * embedded as a fallback so that a build without {@code $ORIGIN}
+     * still runs.</p>
+     */
     @Override
     public List<Path> collectNativeLibraries(Module module,
                                              DependencyResolver resolver,
@@ -725,42 +712,18 @@ public class Compiler implements CompilerPort {
         }
         if (wanted.isEmpty()) return List.of();
 
-        // 2. Candidate directories and archives.
+        // 2. Candidate directories and archives (application side only).
         List<Path> candidates = new ArrayList<>();
 
-        // 2a. JDK platform libraries.
-        Path libDir = platformLibraryDir(targetPlatform);
-        if (libDir != null && Files.isDirectory(libDir)) {
-            try (var s = Files.walk(libDir, 2)) {
-                s.filter(Files::isRegularFile)
-                 .filter(p -> isDynamicLibrary(p, targetPlatform))
-                 .forEach(candidates::add);
-            }
-        }
-
-        // 2b. Native libraries bundled inside the analysed input archive,
-        //     including recursion into nested jars (Spring Boot fat jar
-        //     layout).
-        //
-        //     The extraction directory must outlive the whole build, so it is
-        //     created separately from the main build directory and its removal
-        //     is deferred to JVM exit (deleteOnExit). This matters: even after
-        //     compileAndLink() returns the extracted .so files stay valid and
-        //     can be reused by later runs.
-        Path extractDir = Files.createTempDirectory("jnative-natives-");
+        Path extractDir = Files.createTempDirectory(NATIVE_LINK_DIR_NAME);
         extractDir.toFile().deleteOnExit();
 
         Path inputArchive = resolver.getInputArchive();
         if (inputArchive != null) {
             scanInputArchiveForNatives(inputArchive, targetPlatform,
-                                       extractDir, candidates);
+                extractDir, candidates);
         }
 
-        // 2c. Native libraries bundled inside the jar files on the tool's own
-        //     classpath. Usually these are extra plugins rather than the
-        //     application's dependencies, but scanning costs almost nothing
-        //     and covers the case where the build system explicitly put a
-        //     .so-jar on the tool classpath.
         scanClasspathJarsForNatives(targetPlatform, extractDir, candidates);
 
         // 3. Filter by exported symbols.
@@ -776,16 +739,382 @@ public class Compiler implements CompilerPort {
             if (overlap.isEmpty()) continue;
             result.add(lib);
             stillWanted.removeAll(overlap);
-            log.info("Native library {} provides {} required JNI symbol(s)",
-                     lib, overlap.size());
+            log.info("Application native library {} provides {} required JNI symbol(s)",
+                lib, overlap.size());
         }
 
         if (!stillWanted.isEmpty()) {
-            log.warn("{} JNI symbol(s) still unresolved after scanning {} candidate "
-                    + "libraries. First 5: {}", stillWanted.size(), candidates.size(),
-                    stillWanted.stream().limit(5).collect(Collectors.joining(", ")));
+            log.warn("{} JNI symbol(s) still unresolved after scanning {} application "
+                    + "library(ies). First 5: {}",
+                stillWanted.size(), candidates.size(),
+                stillWanted.stream().limit(5).collect(Collectors.joining(", ")));
         }
         return result;
+    }
+
+    // =========================================================================
+    //  Native library discovery — EMBED-TIME candidates
+    // =========================================================================
+
+    /**
+     * Discovers every native library the produced executable must be
+     * able to load at run time, reads its bytes, and returns them
+     * together with the resource keys under which they must be
+     * registered.
+     *
+     * <h2>Two categories</h2>
+     *
+     * <ol>
+     *   <li><b>JDK platform libraries.</b> Starting from the set of
+     *       libraries that directly export a JNI symbol the module
+     *       needs, the algorithm walks the ELF {@code DT_NEEDED} graph
+     *       until it reaches a fixed point and embeds every JDK
+     *       library that appears anywhere in the transitive closure.
+     *       The initial symbol filter is what keeps the embedded set
+     *       small: a full {@code $JAVA_HOME/lib} contains a few
+     *       hundred shared objects, most of them irrelevant to a given
+     *       image, and only the ones that ultimately satisfy an
+     *       unresolved symbol are embedded. The transitive closure on
+     *       top of that initial filter is what makes the resulting
+     *       image self-contained: a library that exports a needed
+     *       symbol is useless on a machine without a JDK unless every
+     *       library it names in {@code DT_NEEDED} travels with it.</li>
+     *
+     *   <li><b>Application native libraries.</b> Every native library
+     *       bundled inside the input archive, plus every native library
+     *       on the tool's own classpath. These are embedded
+     *       <b>unconditionally</b>, without symbol filtering, because a
+     *       {@code RegisterNatives}-style library (Netty's native
+     *       transports among them) exports no {@code Java_*} symbols at
+     *       all — it exposes a {@code JNI_OnLoad} entry point and
+     *       installs its entire native surface through
+     *       {@code RegisterNatives} at load time. Filtering them by
+     *       exported {@code Java_*} symbols would drop exactly the
+     *       libraries this runtime needs.</li>
+     * </ol>
+     *
+     * <h2>Which dependencies are NOT embedded</h2>
+     *
+     * <p>The transitive closure step only follows {@code DT_NEEDED}
+     * entries whose SONAME matches a file that actually lives in one of
+     * the JDK library directories. Dependencies on system libraries —
+     * {@code libc.so.6}, {@code libm.so.6}, {@code libpthread.so.0},
+     * {@code libX11.so.6}, {@code libz.so.1} and so on — are not
+     * embedded, for two reasons:</p>
+     *
+     * <ul>
+     *   <li>The target machine has its own copies. The whole point of
+     *       not depending on a JDK is to run on systems that already
+     *       have a working libc, X11 stack, and zlib; shadowing those
+     *       with the build host's binaries would break on any system
+     *       whose ABI differs.</li>
+     *
+     *   <li>Embedding them would inflate the executable by hundreds of
+     *       megabytes on a typical Linux distribution — the transitive
+     *       closure of {@code libawt.so} alone reaches
+     *       {@code libcups.so}, {@code libgssapi_krb5.so}, the entire
+     *       kerberos stack, and eventually half of {@code /usr/lib}.</li>
+     * </ul>
+     *
+     * <p>This is the same policy the reference JDK's own
+     * {@code jlink} applies to system libraries: the image carries the
+     * modules, and the operating system carries the C library. It is
+     * also the only policy under which a portable executable exists:
+     * a fully static closure of every JDK library would not even link
+     * on a modern glibc distribution, because glibc itself refuses to
+     * be statically linked into a dynamic executable.</p>
+     *
+     * <h2>How the executable consumes the result</h2>
+     *
+     * <p>The returned {@link EmbeddedNativeLibraries} record carries two
+     * parallel views of the same set of libraries. {@code resources} is
+     * passed to {@code LlvmGenerator.setEmbeddedResources}, which emits
+     * each library as a byte array into the
+     * {@code @jnative_builtin_resources} table. {@code keys} is passed to
+     * {@code LlvmGenerator.setRuntimeJniLibraryKeys}, which makes
+     * {@code @main} emit a call to {@code __jnative_jni_load_all} with
+     * that key list as its argument.</p>
+     *
+     * <p>At program start, before any Java code runs,
+     * {@code __jnative_jni_load_all} creates a private directory,
+     * materialises every embedded library into it under its original
+     * basename, and {@code dlopen}'s each one with
+     * {@code RTLD_NOW | RTLD_GLOBAL}. Libraries are loaded in multiple
+     * passes until no further progress is made, so that a library whose
+     * {@code DT_NEEDED} names a dependency that appears later in the
+     * key list is retried once that dependency is in the loaded set.
+     * Each library's {@code JNI_OnLoad} is invoked immediately after its
+     * own {@code dlopen} succeeds.</p>
+     *
+     * <p>The order of the keys is preserved: JDK libraries first, then
+     * application natives. That order matters when an application
+     * library depends on a JDK library's exported symbols — for example
+     * Netty's transport depends on symbols from {@code libnio.so},
+     * which is materialised and available in the private directory
+     * before the transport's own {@code JNI_OnLoad} runs.</p>
+     */
+    @Override
+    public EmbeddedNativeLibraries embedNativeLibraries(
+        Module module,
+        DependencyResolver resolver,
+        TargetPlatform targetPlatform)
+        throws IOException {
+
+        // ------------------------------------------------------------------
+        // 0. Symbols the module actually needs. Used only to decide which
+        //    JDK libraries to seed the closure from; the second category
+        //    (application natives) is embedded unconditionally.
+        // ------------------------------------------------------------------
+        Set<String> stillWanted = new HashSet<>();
+        for (Function f : module.getFunctions()) {
+            if (f.isJniNative()) stillWanted.add(f.getName());
+        }
+
+        Path extractDir = Files.createTempDirectory(NATIVE_BYTES_DIR_NAME);
+        extractDir.toFile().deleteOnExit();
+
+        List<String> keys = new ArrayList<>();
+        List<Map.Entry<String, byte[]>> resources = new ArrayList<>();
+
+        // ------------------------------------------------------------------
+        // 1. JDK platform libraries — symbol-filtered seed, then
+        //    transitive DT_NEEDED closure.
+        //
+        //    Both <jdk>/lib and <jdk>/lib/server are scanned. libjvm.so
+        //    lives in the second, and several of the libraries in the
+        //    first transitively need it.
+        // ------------------------------------------------------------------
+        Set<Path> jdkLibsToEmbed = computeJdkLibraryClosure(stillWanted, targetPlatform);
+
+        for (Path lib : jdkLibsToEmbed) {
+            try {
+                byte[] bytes = Files.readAllBytes(lib);
+                String base  = lib.getFileName().toString();
+                String key   = KEY_PREFIX_JDK_LIBS + base;
+                keys.add(key);
+                resources.add(new AbstractMap.SimpleImmutableEntry<>(key, bytes));
+                log.info("Embedded JDK library {} (transitive closure)", lib);
+            } catch (IOException e) {
+                log.warn("Failed to read JDK library {}: {}", lib, e.getMessage());
+            }
+        }
+
+        if (!stillWanted.isEmpty()) {
+            log.warn("{} JNI symbol(s) still unresolved after scanning all "
+                    + "JDK library directories. First 5: {}",
+                stillWanted.size(),
+                stillWanted.stream().limit(5).collect(Collectors.joining(", ")));
+        }
+
+        // ------------------------------------------------------------------
+        // 2. Application native libraries — embedded unconditionally.
+        //
+        //    These include RegisterNatives-style libraries that export no
+        //    Java_* symbols and therefore could not pass the JDK filter
+        //    above. They are the libraries whose JNI_OnLoad populates the
+        //    dispatch table used by __jnative_jni_resolve.
+        // ------------------------------------------------------------------
+        List<Path> candidates = new ArrayList<>();
+
+        Path inputArchive = resolver.getInputArchive();
+        if (inputArchive != null) {
+            scanInputArchiveForNatives(inputArchive, targetPlatform,
+                extractDir, candidates);
+        }
+        scanClasspathJarsForNatives(targetPlatform, extractDir, candidates);
+
+        for (Path lib : candidates) {
+            try {
+                byte[] bytes = Files.readAllBytes(lib);
+                String base = lib.getFileName().toString();
+                String key = KEY_PREFIX_BUNDLED_NATIVES + base;
+                keys.add(key);
+                resources.add(new AbstractMap.SimpleImmutableEntry<>(key, bytes));
+                log.info("Embedded application native library {}", lib);
+            } catch (IOException e) {
+                log.warn("Failed to read application native library {}: {}",
+                    lib, e.getMessage());
+            }
+        }
+
+        if (keys.isEmpty()) {
+            return EmbeddedNativeLibraries.empty();
+        }
+
+        return new EmbeddedNativeLibraries(
+            Collections.unmodifiableList(keys),
+            Collections.unmodifiableList(resources));
+    }
+
+    // =========================================================================
+    //  JDK library closure
+    // =========================================================================
+
+    /**
+     * Computes the set of JDK shared objects that must be embedded into
+     * the executable for the module's JNI references to resolve at run
+     * time on a machine without a JDK.
+     *
+     * <h2>Algorithm</h2>
+     *
+     * <ol>
+     *   <li><b>Seed.</b> Scan every directory returned by
+     *       {@link #jdkNativeLibraryDirs(TargetPlatform)}, read each
+     *       library's exported dynamic symbol set with
+     *       {@link ElfSymbolReader#read(Path)}, and keep every library
+     *       whose exports intersect the set of JNI symbols the module
+     *       references. Symbols that remain unsatisfied after this pass
+     *       are left in {@code stillWanted} so the caller can log them;
+     *       they will normally be provided by an application library
+     *       embedded in the second pass of {@code embedNativeLibraries}.</li>
+     *
+     *   <li><b>Transitive closure.</b> For every library in the set,
+     *       read its {@code DT_NEEDED} list with
+     *       {@link ElfSymbolReader#readNeededLibraries(Path)}. For each
+     *       required SONAME, look it up in the same universe of JDK
+     *       directories; a hit that is not yet in the set is added and
+     *       the loop repeats. The iteration terminates because the set
+     *       grows monotonically and the universe of JDK libraries is
+     *       finite.</li>
+     * </ol>
+     *
+     * <h2>Why the closure is required</h2>
+     *
+     * <p>The concrete failure the closure eliminates is the same one
+     * that motivates the whole embed step: an executable that embeds
+     * {@code libawt.so} because that library exports
+     * {@code Java_sun_awt_X11_XlibWrapper_DisplayHeight} (or one of the
+     * hundreds of other X11 JNI symbols the AWT pipeline references)
+     * still fails to start on a machine without a JDK, because
+     * {@code libawt.so}'s own {@code DT_NEEDED} list names
+     * {@code libawt_headless.so}, {@code libjvm.so},
+     * {@code libjava.so}, and (transitively through those)
+     * {@code libfontmanager.so}, {@code libfreetype.so},
+     * {@code liblcms.so}, {@code libnio.so}, {@code libnet.so},
+     * {@code libzip.so}. The loader refuses to {@code dlopen} a library
+     * whose {@code DT_NEEDED} cannot be satisfied by the already-loaded
+     * set plus the ordinary path search, and with the previous
+     * single-pass approach the missing dependencies never made it into
+     * the image.</p>
+     *
+     * <h2>What the closure does not do</h2>
+     *
+     * <p>It does not follow SONAMEs into system library directories.
+     * A {@code DT_NEEDED} entry of {@code libc.so.6} or
+     * {@code libX11.so.6} matches no file in any of the JDK directories
+     * and is therefore silently skipped, leaving the dependency to be
+     * resolved against the target host's own copy. See the javadoc of
+     * {@link #embedNativeLibraries} for the full rationale.</p>
+     *
+     * @param stillWanted the set of JNI symbols the module references;
+     *                    modified in place: symbols satisfied by an
+     *                    embedded library are removed, so the caller can
+     *                    log whatever remains
+     * @param targetPlatform used to locate the JDK library directories
+     * @return the set of JDK shared objects to embed, in a deterministic
+     *         order
+     */
+    private Set<Path> computeJdkLibraryClosure(Set<String> stillWanted,
+                                               TargetPlatform targetPlatform) {
+
+        // ----------------------------------------------------------------
+        // 0. Snapshot every JDK shared object once. The result is a
+        //    sorted list so that two builds against the same JDK produce
+        //    the same embedded set in the same order.
+        // ----------------------------------------------------------------
+        List<Path> allJdkLibs = new ArrayList<>();
+        for (Path libDir : jdkNativeLibraryDirs(targetPlatform)) {
+            if (!Files.isDirectory(libDir)) continue;
+            try (var s = Files.walk(libDir, 1)) {
+                s.filter(Files::isRegularFile)
+                    .filter(p -> isDynamicLibrary(p, targetPlatform))
+                    .sorted()
+                    .forEach(allJdkLibs::add);
+            } catch (IOException e) {
+                log.debug("Failed to scan JDK library directory {}: {}",
+                    libDir, e.getMessage());
+            }
+        }
+        if (allJdkLibs.isEmpty()) {
+            return new LinkedHashSet<>();
+        }
+
+        // ----------------------------------------------------------------
+        // 1. Seed the closure with the symbol-filtered set.
+        // ----------------------------------------------------------------
+        Set<Path> closure = new LinkedHashSet<>();
+        if (!stillWanted.isEmpty()) {
+            for (Path lib : allJdkLibs) {
+                if (stillWanted.isEmpty()) break;
+
+                Set<String> exported;
+                try {
+                    exported = ElfSymbolReader.read(lib);
+                } catch (IOException e) {
+                    log.debug("Failed to read symbols from {}: {}",
+                        lib, e.getMessage());
+                    continue;
+                }
+                if (exported.isEmpty()) continue;
+
+                Set<String> overlap = new HashSet<>(exported);
+                overlap.retainAll(stillWanted);
+                if (overlap.isEmpty()) continue;
+
+                closure.add(lib);
+                stillWanted.removeAll(overlap);
+            }
+        }
+
+        if (closure.isEmpty()) {
+            return closure;
+        }
+
+        // ----------------------------------------------------------------
+        // 2. Close the set under DT_NEEDED. On each pass, walk every
+        //    library already in the closure, read its dependency list,
+        //    and add any dependency whose SONAME names a file present
+        //    in the JDK library directories. The loop repeats until a
+        //    full pass adds nothing, which is guaranteed to happen
+        //    because the closure grows monotonically and its universe
+        //    is finite.
+        //
+        //    The SONAME -> Path index is built once; without it, every
+        //    dependency lookup on every pass would be a linear scan of
+        //    allJdkLibs, and on a full JDK 21 the closure reaches a
+        //    few dozen libraries, each with a dozen dependencies, so
+        //    the quadratic form is not catastrophic but is also not
+        //    free. The index makes each lookup a single hash-map hit.
+        // ----------------------------------------------------------------
+        Map<String, Path> bySoname = new LinkedHashMap<>();
+        for (Path lib : allJdkLibs) {
+            bySoname.putIfAbsent(lib.getFileName().toString(), lib);
+        }
+
+        boolean changed = true;
+        while (changed) {
+            changed = false;
+            for (Path lib : new ArrayList<>(closure)) {
+                Set<String> needed;
+                try {
+                    needed = ElfSymbolReader.readNeededLibraries(lib);
+                } catch (IOException e) {
+                    log.debug("Failed to read DT_NEEDED of {}: {}",
+                        lib, e.getMessage());
+                    continue;
+                }
+                for (String soname : needed) {
+                    Path dep = bySoname.get(soname);
+                    if (dep != null && closure.add(dep)) {
+                        changed = true;
+                        log.debug("JDK closure: {} -> {} (DT_NEEDED)",
+                            lib.getFileName(), soname);
+                    }
+                }
+            }
+        }
+
+        return closure;
     }
 
     // =========================================================================
@@ -793,34 +1122,13 @@ public class Compiler implements CompilerPort {
     // =========================================================================
 
     /**
-     * Maximum recursion depth when parsing jar-in-jar.
-     *
-     * <p>A Spring Boot fat jar has exactly one level of nesting: the outer
-     * archive contains {@code BOOT-INF/lib/*.jar} entries. A margin of 3
-     * levels is left for wrapper formats that put the executable jar one
-     * level deeper. The limit exists precisely so that a malicious or corrupt
-     * archive cannot make the scanner recurse without bound and exhaust the
-     * Java stack.</p>
+     * Maximum recursion depth when parsing jar-in-jar. A Spring Boot fat
+     * jar has exactly one level of nesting; a margin is left for wrapper
+     * formats. The limit exists so a malicious or corrupt archive cannot
+     * make the scanner recurse without bound.
      */
     private static final int MAX_NESTING_DEPTH = 4;
 
-    /**
-     * Scans the input archive for native libraries and adds each extracted
-     * file to {@code out}.
-     *
-     * <p>The input may be a jar, a Spring Boot fat jar, a directory tree of
-     * jars, or a single .class. Each case gets its own explicit branch so the
-     * recursion rules stay unambiguous:</p>
-     *
-     * <ul>
-     *   <li><b>Directory</b> — every {@code .jar} found beneath it is scanned
-     *       by {@link #scanOneJarForNatives}.</li>
-     *   <li><b>Jar</b> — scanned by {@link #scanOneJarForNatives}, which
-     *       extracts dynamic libraries and recurses into nested jars.</li>
-     *   <li><b>Single .class</b> — nothing to do; a .class cannot contain a
-     *       native library.</li>
-     * </ul>
-     */
     private void scanInputArchiveForNatives(Path inputArchive,
                                             TargetPlatform target,
                                             Path extractDir,
@@ -828,18 +1136,18 @@ public class Compiler implements CompilerPort {
         if (Files.isDirectory(inputArchive)) {
             try (var stream = Files.walk(inputArchive)) {
                 stream.filter(Files::isRegularFile)
-                      .filter(p -> p.getFileName().toString()
-                                    .toLowerCase(Locale.ROOT)
-                                    .endsWith(".jar"))
-                      .forEach(jar -> {
-                          try {
-                              scanOneJarForNatives(jar, target,
-                                                   extractDir, out, 0);
-                          } catch (IOException e) {
-                              log.debug("Skipping JAR {}: {}",
-                                        jar, e.getMessage());
-                          }
-                      });
+                    .filter(p -> p.getFileName().toString()
+                        .toLowerCase(Locale.ROOT)
+                        .endsWith(".jar"))
+                    .forEach(jar -> {
+                        try {
+                            scanOneJarForNatives(jar, target,
+                                extractDir, out, 0);
+                        } catch (IOException e) {
+                            log.debug("Skipping JAR {}: {}",
+                                jar, e.getMessage());
+                        }
+                    });
             }
             return;
         }
@@ -849,39 +1157,12 @@ public class Compiler implements CompilerPort {
         }
 
         String name = inputArchive.getFileName().toString()
-                                 .toLowerCase(Locale.ROOT);
+            .toLowerCase(Locale.ROOT);
         if (name.endsWith(".jar")) {
             scanOneJarForNatives(inputArchive, target, extractDir, out, 0);
         }
-        // A .class input cannot contain a native library.
     }
 
-    /**
-     * Scans a single jar (or nested jar) for native libraries and recurses
-     * into every nested jar.
-     *
-     * <p>Scanning is two-pass. In the first pass the outer jar's entry list is
-     * walked in full: each dynamic library is extracted to disk immediately,
-     * and each nested {@code .jar} entry is remembered for the second pass.
-     * The two-pass structure is mandatory because opening a nested jar consumes
-     * the outer jar entry's input stream (the entry stream must be drained
-     * before the next entry can be read), and interleaving the two kinds of
-     * processing would make the traversal order non-deterministic.</p>
-     *
-     * <p>In the second pass each remembered nested jar is materialised to a
-     * temp file, recursively scanned by this same method, and deleted.
-     * Materialisation is preferred over in-memory scanning because a Spring
-     * Boot fat jar normally stores nested jars in STORED (uncompressed) mode,
-     * and {@link java.util.zip.ZipInputStream} does not expose the offset that
-     * would let the nested archive be opened without copying. The temp file is
-     * deleted in a finally block, so a mid-scan failure leaves nothing
-     * behind.</p>
-     *
-     * <p>Nesting depth is bounded by {@link #MAX_NESTING_DEPTH}; a deeper
-     * structure is scanned to that depth and the remainder is skipped with a
-     * debug message. A Spring Boot fat jar uses exactly one level of nesting,
-     * so the limit is never reached in practice.</p>
-     */
     private void scanOneJarForNatives(Path jarPath,
                                       TargetPlatform target,
                                       Path extractDir,
@@ -889,7 +1170,7 @@ public class Compiler implements CompilerPort {
                                       int depth) throws IOException {
         if (depth > MAX_NESTING_DEPTH) {
             log.debug("Jar nesting depth {} exceeded for {}; "
-                    + "not recursing further", depth, jarPath);
+                + "not recursing further", depth, jarPath);
             return;
         }
 
@@ -909,10 +1190,10 @@ public class Compiler implements CompilerPort {
                     Path dest = uniqueExtractPath(extractDir, base);
                     try (InputStream is = jf.getInputStream(e)) {
                         Files.copy(is, dest,
-                                   StandardCopyOption.REPLACE_EXISTING);
+                            StandardCopyOption.REPLACE_EXISTING);
                         out.add(dest);
                         log.info("Extracted native library {} from {}!/{}",
-                                 base, jarPath.getFileName(), en);
+                            base, jarPath.getFileName(), en);
                     }
                     continue;
                 }
@@ -926,26 +1207,24 @@ public class Compiler implements CompilerPort {
                 Path nestedJarPath = null;
                 try {
                     Path tmp = Files.createTempFile(extractDir,
-                                                    "nested-", ".jar");
+                        "nested-", ".jar");
                     try (InputStream is = jf.getInputStream(nested)) {
                         Files.copy(is, tmp,
-                                   StandardCopyOption.REPLACE_EXISTING);
+                            StandardCopyOption.REPLACE_EXISTING);
                     }
                     nestedJarPath = tmp;
                     scanOneJarForNatives(tmp, target, extractDir, out,
-                                         depth + 1);
+                        depth + 1);
                 } catch (IOException e) {
                     log.debug("Failed to scan nested jar {}!/{}: {}",
-                              jarPath.getFileName(), nested.getName(),
-                              e.getMessage());
+                        jarPath.getFileName(), nested.getName(),
+                        e.getMessage());
                 } finally {
                     if (nestedJarPath != null) {
                         try {
                             Files.deleteIfExists(nestedJarPath);
                         } catch (IOException ignored) {
-                            // Best-effort cleanup. A leftover file will be
-                            // deleted on JVM exit via the parent extractDir's
-                            // deleteOnExit.
+                            // Best-effort cleanup.
                         }
                     }
                 }
@@ -953,11 +1232,6 @@ public class Compiler implements CompilerPort {
         }
     }
 
-    /**
-     * Returns the dynamic-library filename suffix for the given target
-     * platform: {@code .dll} on Windows, {@code .dylib} on macOS, {@code .so}
-     * everywhere else.
-     */
     private static String dynamicLibrarySuffix(TargetPlatform t) {
         String triple = t.triple().toLowerCase(Locale.ROOT);
         if (triple.contains("windows")) return ".dll";
@@ -965,13 +1239,6 @@ public class Compiler implements CompilerPort {
         return ".so";
     }
 
-    /**
-     * Returns a path inside {@code extractDir} with the name {@code base},
-     * decorated with a numeric suffix if necessary to avoid collisions.
-     * Different jar files may carry native libraries with the same base name
-     * (for example two versions of the same dependency inside a fat jar), and
-     * the link command must be able to reference each one by a distinct path.
-     */
     private static Path uniqueExtractPath(Path extractDir, String base) {
         Path candidate = extractDir.resolve(base);
         if (!Files.exists(candidate)) return candidate;
@@ -988,16 +1255,6 @@ public class Compiler implements CompilerPort {
         return candidate;
     }
 
-    /**
-     * Walks the JVM classpath, opens every jar, and recursively scans it via
-     * {@link #scanOneJarForNatives}, extracting native libraries into
-     * {@code extractDir}.
-     *
-     * <p>This method used to do a flat scan of the top-level jar. It now
-     * delegates to the recursive implementation so that the same jar-in-jar
-     * handling applies both to the application and to the tool's classpath.
-     * Behaviour for jars without nested archives is unchanged.</p>
-     */
     private void scanClasspathJarsForNatives(TargetPlatform target,
                                              Path extractDir,
                                              List<Path> out) {
@@ -1020,6 +1277,10 @@ public class Compiler implements CompilerPort {
         }
     }
 
+    // =========================================================================
+    //  JDK library directories
+    // =========================================================================
+
     private static boolean isDynamicLibrary(Path p, TargetPlatform t) {
         String n = p.getFileName().toString();
         String triple = t.triple().toLowerCase(Locale.ROOT);
@@ -1030,14 +1291,49 @@ public class Compiler implements CompilerPort {
         return n.endsWith(".so");
     }
 
-    private static Path platformLibraryDir(TargetPlatform t) {
+    /**
+     * Returns every directory under {@code $JAVA_HOME} that may contain
+     * JDK native libraries:
+     *
+     * <ul>
+     *   <li>{@code <jdk>/lib} — {@code libawt.so}, {@code libjava.so},
+     *       {@code libnio.so}, {@code libnetty_transport_*.so} (when a
+     *       user has installed one), etc.</li>
+     *   <li>{@code <jdk>/lib/server} — {@code libjvm.so}. This library
+     *       is a transitive dependency of several of the first
+     *       directory's libraries, so a machine without it on
+     *       {@code LD_LIBRARY_PATH} will fail to load them unless the
+     *       executable is prepared to supply it directly.</li>
+     *   <li>{@code <jdk>/bin} — on Windows the JDK ships its native
+     *       libraries next to the executables.</li>
+     * </ul>
+     *
+     * <p>On a JDK whose layout differs from this canonical one, the
+     * directories are simply absent from the returned list and the
+     * scanner silently skips them; the diagnostic warning printed by
+     * {@link #embedNativeLibraries} names the unresolved symbols, so the
+     * cause is always visible in the build log.</p>
+     */
+    private static List<Path> jdkNativeLibraryDirs(TargetPlatform t) {
         String home = System.getProperty("java.home");
-        if (home == null) return null;
+        if (home == null) return List.of();
+
         Path base = Paths.get(home);
         String triple = t.triple().toLowerCase(Locale.ROOT);
-        if (triple.contains("windows")) return base.resolve("bin");
-        return base.resolve("lib");
+
+        if (triple.contains("windows")) {
+            return List.of(base.resolve("bin"));
+        }
+
+        List<Path> dirs = new ArrayList<>(2);
+        dirs.add(base.resolve("lib"));
+        dirs.add(base.resolve("lib").resolve("server"));
+        return dirs;
     }
+
+    // =========================================================================
+    //  Symbol export reading
+    // =========================================================================
 
     /**
      * Read the dynamic-symbol export list of {@code lib} by parsing the
@@ -1104,62 +1400,5 @@ public class Compiler implements CompilerPort {
             }
         }
         return result;
-    }
-
-    /**
-     * Discovers every native library the input archive contributes and
-     * returns both the resource keys under which the runtime will load
-     * them and the (key, bytes) pairs the LLVM emitter must embed.
-     *
-     * <p>The method is idempotent and free of hidden state: it opens
-     * the input archive, extracts every {@code .so} / {@code .dylib} /
-     * {@code .dll} whose path contains {@code native/} or
-     * {@code natives/}, and returns the result. No field of this
-     * compiler instance is written; two invocations with the same
-     * arguments produce two equivalent records.</p>
-     *
-     * <p>Extraction uses the same recursive scan as
-     * {@link #collectNativeLibraries}, so a Netty {@code .so} inside a
-     * nested {@code BOOT-INF/lib/*.jar} of a Spring Boot fat jar is
-     * found by both code paths through exactly one implementation of
-     * the traversal.</p>
-     */
-    @Override
-    public EmbeddedNativeLibraries embedNativeLibraries(
-            Module module,
-            DependencyResolver resolver,
-            TargetPlatform targetPlatform)
-        throws IOException {
-
-        Path extractDir = Files.createTempDirectory("jnative-native-bytes-");
-        extractDir.toFile().deleteOnExit();
-
-        List<Path> candidates = new ArrayList<>();
-        Path inputArchive = resolver.getInputArchive();
-        if (inputArchive != null) {
-            scanInputArchiveForNatives(inputArchive, targetPlatform,
-                                       extractDir, candidates);
-        }
-
-        List<String> keys = new ArrayList<>(candidates.size());
-        List<Map.Entry<String, byte[]>> resources =
-            new ArrayList<>(candidates.size());
-
-        for (Path lib : candidates) {
-            try {
-                byte[] bytes = Files.readAllBytes(lib);
-                String base = lib.getFileName().toString();
-                String key = "jnative-natives/" + base;
-                keys.add(key);
-                resources.add(new AbstractMap.SimpleImmutableEntry<>(key, bytes));
-            } catch (IOException e) {
-                log.warn("Failed to read native library {}: {}",
-                         lib, e.getMessage());
-            }
-        }
-
-        return new EmbeddedNativeLibraries(
-            Collections.unmodifiableList(keys),
-            Collections.unmodifiableList(resources));
     }
 }

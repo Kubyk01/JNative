@@ -215,25 +215,27 @@ public class LlvmGenerator {
             }
         }
 
-        // ---- 2. Deferred strings are now fully known. Collect them. ----
-        // The JNI library keys referenced by @main are registered here, before
-        // the deferred constants are materialised, because generateMain() runs
-        // after this point and only references the globals by name.
-        for (String jniKey : runtimeJniLibraryKeys) {
-            globalEmitter.registerDeferredString(jniKey);
-        }
-        String deferred = globalEmitter.generateDeferredStringConstants();
-
-        // ---- 3. knownGlobals = every definition that lives in _module.ll,
-        //         deferred strings included. ----
-        Map<String, GlobalDecl> knownGlobals =
-            parseGlobalDecls(globalDefs + "\n" + lambdaVts + "\n" + deferred);
-
-        // ---- 4. Functions without bodies: declarations for _module.ll. ----
-        //         moduleAvailable = everything already defined OR declared in
-        //         _module.ll; the module extern pass must skip these, because
-        //         LLVM rejects both a redeclaration and a declaration of a
-        //         locally-defined symbol ("invalid redefinition of function"). ----
+        // ------------------------------------------------------------------
+        // 2. Emit definitions for bodiless functions.
+        //
+        // A JNI native's C implementation lives in an embedded, dlopen'd
+        // shared object and is not visible to the linker as a static
+        // symbol. Emitting a bare `declare` for it leaves the vtable slot
+        // unresolvable at link time — this is what produced the
+        // ld.lld "undefined symbol Java_sun_java2d_x11_X11Renderer_XDrawLine"
+        // family of errors. Instead, emit a per-native trampoline that
+        // resolves the C function pointer at run time via
+        // __jnative_jni_resolve and calls through it with the JNI ABI.
+        // The trampoline replaces the declaration under the same symbol
+        // name, so the vtable reference resolves.
+        //
+        // This pass MUST run BEFORE generateDeferredStringConstants(),
+        // because the trampoline registers four string literals per native
+        // (owner, method, descriptor, symbol) with the global emitter and
+        // those need to land in the deferred set. It must also run BEFORE
+        // parseGlobalDecls() below, because the trampoline is what makes
+        // the JNI symbol a definition rather than a declaration.
+        // ------------------------------------------------------------------
         StringBuilder moduleDecls = new StringBuilder();
         Set<String> moduleAvailable = new HashSet<>();
         for (Function f : toEmit) {
@@ -242,11 +244,33 @@ public class LlvmGenerator {
             }
         }
         for (Function func : new ArrayList<>(module.getFunctions())) {
-            if (func.getEntryBlock() == null
-                && moduleAvailable.add(func.getName())) {
+            if (func.getEntryBlock() != null) continue;
+
+            if (func.isJniNative()) {
+                // Replace the declaration with a run-time-resolving
+                // trampoline. Always add to moduleAvailable so buildExterns()
+                // does not re-declare the same symbol in per-class .ll files.
+                moduleAvailable.add(func.getName());
+                moduleDecls.append(emitter.emitJniTrampoline(func));
+            } else if (moduleAvailable.add(func.getName())) {
                 moduleDecls.append(emitDeclaration(func));
             }
         }
+
+        // ---- 3. Deferred strings are now fully known, trampoline literals
+        //         included. Collect them. ----
+        // The JNI library keys referenced by @main are registered here, before
+        // the deferred constants are materialised, because generateMain() runs
+        // after this point and only references the globals by name.
+        for (String jniKey : runtimeJniLibraryKeys) {
+            globalEmitter.registerDeferredString(jniKey);
+        }
+        String deferred = globalEmitter.generateDeferredStringConstants();
+
+        // ---- 4. knownGlobals = every definition that lives in _module.ll,
+        //         deferred strings included. ----
+        Map<String, GlobalDecl> knownGlobals =
+            parseGlobalDecls(globalDefs + "\n" + lambdaVts + "\n" + deferred);
 
         // ---- 5. Write _module.ll. ----
         //
@@ -465,10 +489,10 @@ public class LlvmGenerator {
                 while (j < n) {
                     char d = text.charAt(j);
                     boolean ident =
-                           (d >= 'a' && d <= 'z')
-                        || (d >= 'A' && d <= 'Z')
-                        || (d >= '0' && d <= '9')
-                        || d == '_' || d == '.' || d == '$' || d == '-';
+                        (d >= 'a' && d <= 'z')
+                            || (d >= 'A' && d <= 'Z')
+                            || (d >= '0' && d <= '9')
+                            || d == '_' || d == '.' || d == '$' || d == '-';
                     if (!ident) break;
                     j++;
                 }
@@ -572,9 +596,9 @@ public class LlvmGenerator {
      */
     private static int matchLinkageKeyword(String s, int i, int limit) {
         String[] kws = {"private","internal","linkonce_odr","weak_odr",
-                        "linkonce","weak","external","common","appending",
-                        "extern_weak","dllimport","dllexport","thread_local",
-                        "unnamed_addr","local_unnamed_addr","constant","global"};
+            "linkonce","weak","external","common","appending",
+            "extern_weak","dllimport","dllexport","thread_local",
+            "unnamed_addr","local_unnamed_addr","constant","global"};
         for (String kw : kws) {
             int after = i + kw.length();
             if (after > limit || after > s.length()) continue;
@@ -752,10 +776,10 @@ public class LlvmGenerator {
             if (d != null) {
                 if (d.constant) {
                     sb.append("@").append(name).append(" = external constant ")
-                      .append(d.type).append("\n");
+                        .append(d.type).append("\n");
                 } else {
                     sb.append("@").append(name).append(" = external global ")
-                      .append(d.type).append("\n");
+                        .append(d.type).append("\n");
                 }
                 continue;
             }
@@ -991,15 +1015,15 @@ public class LlvmGenerator {
                 String g = LlvmRuntime.typeStringGlobalName(key);
                 String slot = "%jni_slot_" + i;
                 sb.append("  ").append(slot)
-                  .append(" = getelementptr i8*, i8** %jni_keys, i32 ")
-                  .append(i).append("\n");
+                    .append(" = getelementptr i8*, i8** %jni_keys, i32 ")
+                    .append(i).append("\n");
                 sb.append("  store i8* getelementptr inbounds ([")
-                  .append(len).append(" x i8], [").append(len)
-                  .append(" x i8]* ").append(g)
-                  .append(", i32 0, i32 0), i8** ").append(slot).append("\n");
+                    .append(len).append(" x i8], [").append(len)
+                    .append(" x i8]* ").append(g)
+                    .append(", i32 0, i32 0), i8** ").append(slot).append("\n");
             }
             sb.append("  call void @__jnative_jni_load_all(i8** %jni_keys, i32 ")
-              .append(n).append(")\n");
+                .append(n).append(")\n");
         }
 
         // Shutdown-based destruction is deliberately NOT installed.
@@ -1493,12 +1517,12 @@ public class LlvmGenerator {
 
                 if (retType.isVoid()) {
                     sb.append("  call void @").append(name)
-                      .append("(").append(args).append(")\n");
+                        .append("(").append(args).append(")\n");
                 } else {
                     sb.append("  %bootstrap_phase_result_").append(bootstrapPhaseIdx++)
-                      .append(" = call ").append(retLlvm)
-                      .append(" @").append(name)
-                      .append("(").append(args).append(")\n");
+                        .append(" = call ").append(retLlvm)
+                        .append(" @").append(name)
+                        .append("(").append(args).append(")\n");
                 }
             } else {
                 // Ordinary <clinit>; eagerTarget substitutes the lazy wrapper
@@ -1549,8 +1573,8 @@ public class LlvmGenerator {
             Function hashedModulesClinit = module.getFunction(hashedModulesClinitName);
             if (hashedModulesClinit != null && hashedModulesClinit.getEntryBlock() != null) {
                 sb.append("  call void @")
-                  .append(eagerTarget(hashedModulesClinitName))
-                  .append("()\n");
+                    .append(eagerTarget(hashedModulesClinitName))
+                    .append("()\n");
             } else {
                 log.warn("java.lang.StackTraceElement$HashedModules.<clinit> "
                     + "is missing from the module; the class will be initialised "

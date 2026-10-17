@@ -760,3 +760,31 @@ void __jnative_fn_sun_java2d_xr_XRBackendNative_setFilter__II_V(
     (void)picture;
     (void)filter;
 }
+/*
+ * renderComposite — the eleven-int descriptor form.
+ *
+ * The existing renderComposite in this file uses twelve ints between
+ * the byte opcode and the tail (four rectangle triples), matching the
+ * JDK 21 declaration. Earlier JDKs declared eleven (three rectangle
+ * triples plus a combined width/height pair), and the LLVM backend
+ * emits whichever descriptor the class file it parsed carries.
+ *
+ * Both are no-ops in this runtime: no accelerated XRender pipeline is
+ * ever selected, so the primitive is never dispatched to.
+ */
+void __jnative_fn_sun_java2d_xr_XRBackendNative_renderComposite__BIIIIIIIIIII_V(
+        void* this_backend,
+        int8_t op,
+        int32_t src, int32_t mask, int32_t dst,
+        int32_t src_x, int32_t src_y,
+        int32_t mask_x, int32_t mask_y,
+        int32_t dst_x, int32_t dst_y,
+        int32_t width, int32_t height)
+{
+    (void)this_backend; (void)op;
+    (void)src; (void)mask; (void)dst;
+    (void)src_x; (void)src_y;
+    (void)mask_x; (void)mask_y;
+    (void)dst_x; (void)dst_y;
+    (void)width; (void)height;
+}

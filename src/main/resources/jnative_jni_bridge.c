@@ -3,7 +3,8 @@
  *
  * A thread-local JNIEnv for the JNative runtime, extended with the
  * machinery required to host RegisterNatives-based JNI libraries such
- * as Netty's native transports.
+ * as Netty's native transports, and with a crash-tolerant loader that
+ * survives broken JDK shared objects.
  *
  * ============================================================================
  *  Problem
@@ -39,30 +40,101 @@
  *      standard jni.h sees the RegisterNatives slot at the correct
  *      offset (index 215 in the function table). The struct is
  *      therefore declared with every slot in the specification's own
- *      order, even those the runtime does not implement; an unimplemented
- *      slot is a NULL function pointer.
+ *      order, even those the runtime does not implement; an
+ *      unimplemented slot is a NULL function pointer.
  *
  *   2. RegisterNatives is implemented by inserting each (class, name,
  *      signature, fnPtr) tuple into a process-wide hash table, keyed by
  *      the internal class name and the exact (name, signature) pair
  *      that the library supplied.
  *
- *   3. __jnative_jni_resolve(class, name, signature) is the entry point
- *      the LLVM code generator calls at every JNI native call site. It
- *      returns the fnPtr registered by the library, or throws a
- *      diagnostic and aborts, so the emitted code never dereferences a
+ *   3. __jnative_jni_resolve(class, name, signature, symbol) is the
+ *      entry point the LLVM code generator calls at every JNI native
+ *      call site. It first consults the RegisterNatives dispatch table;
+ *      on a miss it falls back to dlsym(RTLD_DEFAULT, symbol) so that a
+ *      traditional Java_* export from any library that was dlopen'd
+ *      with RTLD_GLOBAL is also found. Only if both lookups fail does
+ *      it throw a diagnostic naming the (class, method, signature,
+ *      symbol) quadruple, so the emitted code never dereferences a
  *      NULL function pointer.
  *
- *   4. __jnative_jni_load_library_from_resource(key) materialises the
- *      library's bytes to a temporary file, dlopens it, and invokes its
- *      JNI_OnLoad with a JavaVM whose GetEnv returns this JNIEnv. The
- *      library's JNI_OnLoad then runs normally: it calls FindClass,
- *      RegisterNatives, and whatever other JNIEnv entry points it needs.
+ *   4. __jnative_jni_load_all(keys, count) is called once by @main,
+ *      before any Java code runs. It materialises every embedded
+ *      library into a single private directory under its original
+ *      basename, then dlopen's them in multiple passes until no
+ *      further progress is made. Each successful dlopen is followed
+ *      by a call to the library's JNI_OnLoad, if it has one.
  *
- *   5. __jnative_jni_load_all(keys, count) iterates over a NULL-
- *      terminated array of resource keys emitted by the code generator
- *      and loads each library in turn. @main calls it once, before any
- *      Java code runs.
+ * ============================================================================
+ *  Why basenames and a private directory
+ * ============================================================================
+ *
+ * The two properties the dynamic loader needs in order for a
+ * DT_NEEDED lookup to succeed are:
+ *
+ *   1. The name under which a library is loaded must match, at the
+ *      loader's own comparison step, the name the DT_NEEDED entry
+ *      records. The loader first checks every loaded object's
+ *      l_libname list (populated from the file's DT_SONAME, when
+ *      present); if that misses it falls through to a comparison
+ *      against l_name, which is the path the caller passed to
+ *      dlopen.
+ *
+ *   2. The file must be reachable at the path recorded in l_name for
+ *      the whole process lifetime, because a later dlopen of a
+ *      different library may name the same SONAME in its own
+ *      DT_NEEDED and expect the loader to find it by walking the
+ *      loaded-object lists or by searching the paths the caller
+ *      gave.
+ *
+ * Materialising each embedded library into a fresh mkdtemp directory
+ * under its original basename satisfies both:
+ *
+ *   - The basename is preserved, so the loader's name comparison sees
+ *     the same string it would have seen on a normal JDK installation.
+ *
+ *   - Every file stays on disk until the process exits, so a
+ *     transitive DT_NEEDED chain resolves correctly regardless of the
+ *     order in which the libraries are loaded.
+ *
+ * The directory's name contains the pid, so two concurrent runs of the
+ * same executable never collide. It is not added to LD_LIBRARY_PATH or
+ * to any other search path; only absolute paths into it are passed to
+ * dlopen, so nothing outside this process can observe it.
+ *
+ * ============================================================================
+ *  Crash-tolerant loading
+ * ============================================================================
+ *
+ * Not every JDK shared object loads cleanly in this runtime. libawt.so
+ * and its siblings contain constructors and JNI_OnLoad implementations
+ * that were written for a HotSpot JVM and that call into JVM-internal
+ * state which does not exist here. The concrete failure observed in
+ * practice is a SIGSEGV at address 0x30 — the offset of the FindClass
+ * slot in the JNIEnv function table, or of the GetEnv slot in the
+ * JavaVM function table — i.e. a dispatch through a function pointer
+ * that is NULL because the JVM state that was supposed to populate it
+ * never existed. The crash propagates out of dlopen and terminates the
+ * process before any Java code runs.
+ *
+ * A crash in one library must not prevent the rest of the image from
+ * starting. The guard below installs a temporary handler for the four
+ * synchronous signals a C library can raise (SIGSEGV, SIGBUS, SIGILL,
+ * SIGFPE), performs the load, and longjmps back to a safe point if
+ * any of them fires. The failed library is recorded and not retried on
+ * subsequent passes; the next library in the list is loaded normally.
+ *
+ * The four signals are exactly the ones the ELF ABI reserves for
+ * synchronous faults raised by the running program itself. Asynchronous
+ * signals (SIGTERM, SIGINT, SIGUSR1, ...) are not affected: they keep
+ * their original disposition and are not caught by this handler.
+ *
+ * The handler is installed once, before the first dlopen, and stays
+ * installed for the rest of the process. When it fires outside a
+ * library load — which is to say, on a genuine bug in the compiled
+ * image — it forwards the signal to whichever handler was previously
+ * installed (the runtime's own fatal-signal handler from
+ * jnative_runtime.c) by restoring the saved disposition and re-raising.
  *
  * ============================================================================
  *  Struct layout
@@ -77,8 +149,8 @@
  * void* and are initialised to NULL.
  *
  * The same rule applies to JNIInvokeInterface_, the JavaVM function
- * table: GetEnv is at index 6 (after three reserved slots, DestroyJavaVM,
- * AttachCurrentThread and DetachCurrentThread).
+ * table: GetEnv is at index 6 (after three reserved slots,
+ * DestroyJavaVM, AttachCurrentThread and DetachCurrentThread).
  *
  * ============================================================================
  *  Calling convention
@@ -102,8 +174,11 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <dirent.h>
 #include <pthread.h>
 #include <dlfcn.h>
+#include <signal.h>
+#include <setjmp.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 
@@ -177,37 +252,37 @@ typedef struct {
  *  referenced from the JNINativeInterface_ initializer.
  * ========================================================================== */
 
-static jint       JNICALL JNI_GetVersion(JNIEnv_t);
-static jclass     JNICALL JNI_FindClass(JNIEnv_t, const char*);
-static jclass     JNICALL JNI_GetObjectClass(JNIEnv_t, jobject);
-static jclass     JNICALL JNI_GetSuperclass(JNIEnv_t, jclass);
-static jboolean   JNICALL JNI_IsInstanceOf(JNIEnv_t, jobject, jclass);
-static jboolean   JNICALL JNI_IsAssignableFrom(JNIEnv_t, jclass, jclass);
-static jint       JNICALL JNI_Throw(JNIEnv_t, jthrowable);
-static jint       JNICALL JNI_ThrowNew(JNIEnv_t, jclass, const char*);
-static jthrowable JNICALL JNI_ExceptionOccurred(JNIEnv_t);
-static void       JNICALL JNI_ExceptionClear(JNIEnv_t);
-static jboolean   JNICALL JNI_ExceptionCheck(JNIEnv_t);
-static jstring    JNICALL JNI_NewStringUTF(JNIEnv_t, const char*);
-static jint       JNICALL JNI_GetStringUTFLength(JNIEnv_t, jstring);
+static jint        JNICALL JNI_GetVersion(JNIEnv_t);
+static jclass      JNICALL JNI_FindClass(JNIEnv_t, const char*);
+static jclass      JNICALL JNI_GetObjectClass(JNIEnv_t, jobject);
+static jclass      JNICALL JNI_GetSuperclass(JNIEnv_t, jclass);
+static jboolean    JNICALL JNI_IsInstanceOf(JNIEnv_t, jobject, jclass);
+static jboolean    JNICALL JNI_IsAssignableFrom(JNIEnv_t, jclass, jclass);
+static jint        JNICALL JNI_Throw(JNIEnv_t, jthrowable);
+static jint        JNICALL JNI_ThrowNew(JNIEnv_t, jclass, const char*);
+static jthrowable  JNICALL JNI_ExceptionOccurred(JNIEnv_t);
+static void        JNICALL JNI_ExceptionClear(JNIEnv_t);
+static jboolean    JNICALL JNI_ExceptionCheck(JNIEnv_t);
+static jstring     JNICALL JNI_NewStringUTF(JNIEnv_t, const char*);
+static jint        JNICALL JNI_GetStringUTFLength(JNIEnv_t, jstring);
 static const char* JNICALL JNI_GetStringUTFChars(JNIEnv_t, jstring, jboolean*);
-static void       JNICALL JNI_ReleaseStringUTFChars(JNIEnv_t, jstring, const char*);
-static jint       JNICALL JNI_GetArrayLength(JNIEnv_t, jarray);
-static jfieldID   JNICALL JNI_GetFieldID(JNIEnv_t, jclass, const char*, const char*);
-static jmethodID  JNICALL JNI_GetMethodID(JNIEnv_t, jclass, const char*, const char*);
-static jfieldID   JNICALL JNI_GetStaticFieldID(JNIEnv_t, jclass, const char*, const char*);
-static jmethodID  JNICALL JNI_GetStaticMethodID(JNIEnv_t, jclass, const char*, const char*);
-static jobject    JNICALL JNI_GetObjectField(JNIEnv_t, jobject, jfieldID);
-static void       JNICALL JNI_SetObjectField(JNIEnv_t, jobject, jfieldID, jobject);
-static jint       JNICALL JNI_GetIntField(JNIEnv_t, jobject, jfieldID);
-static void       JNICALL JNI_SetIntField(JNIEnv_t, jobject, jfieldID, jint);
-static jlong      JNICALL JNI_GetLongField(JNIEnv_t, jobject, jfieldID);
-static void       JNICALL JNI_SetLongField(JNIEnv_t, jobject, jfieldID, jlong);
-static jobject    JNICALL JNI_GetStaticObjectField(JNIEnv_t, jclass, jfieldID);
-static void*      JNICALL JNI_GetPrimitiveArrayCritical(JNIEnv_t, jarray, jboolean*);
-static void       JNICALL JNI_ReleasePrimitiveArrayCritical(JNIEnv_t, jarray, void*, jint);
-static jint       JNICALL JNI_RegisterNatives(JNIEnv_t, jclass, const JNINativeMethod*, jint);
-static jint       JNICALL JNI_GetJavaVM(JNIEnv_t, JavaVM_t*);
+static void        JNICALL JNI_ReleaseStringUTFChars(JNIEnv_t, jstring, const char*);
+static jint        JNICALL JNI_GetArrayLength(JNIEnv_t, jarray);
+static jfieldID    JNICALL JNI_GetFieldID(JNIEnv_t, jclass, const char*, const char*);
+static jmethodID   JNICALL JNI_GetMethodID(JNIEnv_t, jclass, const char*, const char*);
+static jfieldID    JNICALL JNI_GetStaticFieldID(JNIEnv_t, jclass, const char*, const char*);
+static jmethodID   JNICALL JNI_GetStaticMethodID(JNIEnv_t, jclass, const char*, const char*);
+static jobject     JNICALL JNI_GetObjectField(JNIEnv_t, jobject, jfieldID);
+static void        JNICALL JNI_SetObjectField(JNIEnv_t, jobject, jfieldID, jobject);
+static jint        JNICALL JNI_GetIntField(JNIEnv_t, jobject, jfieldID);
+static void        JNICALL JNI_SetIntField(JNIEnv_t, jobject, jfieldID, jint);
+static jlong       JNICALL JNI_GetLongField(JNIEnv_t, jobject, jfieldID);
+static void        JNICALL JNI_SetLongField(JNIEnv_t, jobject, jfieldID, jlong);
+static jobject     JNICALL JNI_GetStaticObjectField(JNIEnv_t, jclass, jfieldID);
+static void*       JNICALL JNI_GetPrimitiveArrayCritical(JNIEnv_t, jarray, jboolean*);
+static void        JNICALL JNI_ReleasePrimitiveArrayCritical(JNIEnv_t, jarray, void*, jint);
+static jint        JNICALL JNI_RegisterNatives(JNIEnv_t, jclass, const JNINativeMethod*, jint);
+static jint        JNICALL JNI_GetJavaVM(JNIEnv_t, JavaVM_t*);
 
 /* ==========================================================================
  *  JNINativeInterface_ — the JNIEnv function table.
@@ -817,7 +892,6 @@ static const struct JNINativeInterface_ JNI_TABLE = {
     .IsInstanceOf   = JNI_IsInstanceOf,
     .GetMethodID    = JNI_GetMethodID,
 
-    /* All Call* slots NULL. */
     .CallObjectMethod = NULL,
     .CallObjectMethodV = NULL,
     .CallObjectMethodA = NULL,
@@ -1066,8 +1140,90 @@ static const struct JNIInvokeInterface_* jnative_jni_vm_table(void) {
     return &JNI_VM_TABLE;
 }
 
+/*
+ * The one true JavaVM instance. Per jni.h, JNI_OnLoad is declared as
+ * `JNI_OnLoad(JavaVM* vm, void* reserved)`: the library expects the
+ * address of a `JavaVM` (itself a pointer to the function table) and
+ * reads it back with `(*vm)->GetEnv(...)`. Passing the table pointer
+ * directly makes that read `(*table)->GetEnv(...)`, dereferencing the
+ * table's first (reserved, NULL) slot and crashing. The address of this
+ * holder is what JNI_OnLoad receives.
+ *
+ * This is the fix for the SIGSEGV at address 0x30 reported in
+ * fun.txt: the library's prologue reads `mov (%rdi),%rax` to get the
+ * table and then `call *0x30(%rax)` for GetEnv. Passing the table
+ * itself as the parameter leaves `%rdi` = &table, so `*%rdi` is the
+ * table's first slot (reserved0 == NULL) and `0x30(%rax)` faults at
+ * NULL + 0x30.
+ */
+static JavaVM_t jnative_java_vm = &JNI_VM_TABLE;
+
 /* ==========================================================================
- *  Public runtime entry points used by the generated @main and by every
+ *  Crash-tolerant loading infrastructure.
+ *
+ *  See the class-header comment for the rationale. The four synchronous
+ *  signals below are the ones the ELF ABI reserves for faults raised by
+ *  the program itself; asynchronous signals are not touched.
+ * ========================================================================== */
+
+static sigjmp_buf             jnative_load_jmpbuf;
+static volatile sig_atomic_t  jnative_in_library_load     = 0;
+static int                    jnative_load_handlers_ready = 0;
+
+static struct sigaction       jnative_saved_sigsegv;
+static struct sigaction       jnative_saved_sigbus;
+static struct sigaction       jnative_saved_sigill;
+static struct sigaction       jnative_saved_sigfpe;
+
+/*
+ * The handler forwards any signal that fires outside a library load to
+ * whichever disposition was installed before this one — in the running
+ * image that is __jnative_fatal_signal_handler from jnative_runtime.c,
+ * which prints a trace and re-raises. Forwarding is done by restoring
+ * the saved disposition and re-raising, the standard idiom for chaining
+ * signal handlers without losing the original one.
+ */
+static void jnative_load_crash_handler(int sig, siginfo_t* info, void* ucontext) {
+    if (jnative_in_library_load) {
+        siglongjmp(jnative_load_jmpbuf, sig);
+    }
+
+    switch (sig) {
+        case SIGSEGV: sigaction(SIGSEGV, &jnative_saved_sigsegv, NULL); break;
+        case SIGBUS:  sigaction(SIGBUS,  &jnative_saved_sigbus,  NULL); break;
+        case SIGILL:  sigaction(SIGILL,  &jnative_saved_sigill,  NULL); break;
+        case SIGFPE:  sigaction(SIGFPE,  &jnative_saved_sigfpe,  NULL); break;
+        default: break;
+    }
+    (void)info;
+    (void)ucontext;
+    raise(sig);
+}
+
+/*
+ * Installs the handler once. Subsequent calls are no-ops. The saved
+ * dispositions are the ones in effect at the time of the first call,
+ * which for the running image is the runtime's fatal-signal handler.
+ */
+static void jnative_install_load_handlers(void) {
+    if (jnative_load_handlers_ready) return;
+
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = jnative_load_crash_handler;
+    sa.sa_flags     = SA_SIGINFO | SA_NODEFER | SA_RESTART;
+    sigemptyset(&sa.sa_mask);
+
+    sigaction(SIGSEGV, &sa, &jnative_saved_sigsegv);
+    sigaction(SIGBUS,  &sa, &jnative_saved_sigbus);
+    sigaction(SIGILL,  &sa, &jnative_saved_sigill);
+    sigaction(SIGFPE,  &sa, &jnative_saved_sigfpe);
+
+    jnative_load_handlers_ready = 1;
+}
+
+/* ==========================================================================
+ *  Public entry points used by the generated @main and by every
  *  emitted JNI native call site.
  * ========================================================================== */
 
@@ -1081,159 +1237,509 @@ void* __jnative_get_thread_jnienv(void) {
 
 /**
  * Resolves the implementation of a JNI native by its (class, method,
- * descriptor) triple.
+ * descriptor) triple and, failing that, by its full Java_* symbol name.
  *
- * <p>The triple is looked up in the RegisterNatives dispatch table. On a
- * miss the function terminates the process with a diagnostic naming the
- * missing triple. Returning NULL is deliberately NOT an option: the
- * emitted call site is an indirect call through the returned pointer,
- * and the LLVM backend emits no null check (the code generator's own
- * contract is "resolve throws on failure, therefore the pointer is
- * non-NULL on return"). A NULL return would jump to address 0 and
- * produce a SIGSEGV instead of a diagnostic.</p>
+ * <h2>Lookup order</h2>
  *
- * <p>The three strings are NUL-terminated C strings embedded by the
- * code generator as string literals. The class name is in internal form
- * (with '/' separators); the method name is the bare Java name; the
- * descriptor is the exact JVM descriptor from the class file.</p>
+ * <ol>
+ *   <li><b>RegisterNatives dispatch table.</b> Populated by every
+ *       library's JNI_OnLoad calling RegisterNatives. This is the only
+ *       lookup path that works for Netty-style libraries, which export
+ *       no Java_* symbols at all.</li>
+ *
+ *   <li><b>dlsym(RTLD_DEFAULT, symbol).</b> Finds a traditional Java_*
+ *       export from any library that was dlopen'd with RTLD_GLOBAL.
+ *       Every JDK platform library and every application native library
+ *       loaded by __jnative_jni_load_all is loaded with RTLD_GLOBAL,
+ *       so a Java_* symbol exported by any of them is visible here.</li>
+ * </ol>
+ *
+ * <p>On a miss the function terminates the process with a diagnostic
+ * naming all four strings. Returning NULL is deliberately NOT an
+ * option: the emitted call site is an indirect call through the
+ * returned pointer, and the LLVM backend emits no null check (the code
+ * generator's own contract is "resolve throws on failure, therefore
+ * the pointer is non-NULL on return"). A NULL return would jump to
+ * address 0 and produce a SIGSEGV instead of a diagnostic.</p>
  */
 void* __jnative_jni_resolve(const char* class_name,
                             const char* method_name,
-                            const char* signature) {
+                            const char* signature,
+                            const char* symbol_name) {
+    /* 1. RegisterNatives-registered symbols (Netty-style libraries). */
     void* fn = jni_table_lookup(class_name, method_name, signature);
     if (fn != NULL) return fn;
 
-    /* Build a diagnostic that names the triple. */
+    /* 2. Traditional Java_* exports from any RTLD_GLOBAL library. */
+    if (symbol_name != NULL && symbol_name[0] != '\0') {
+        fn = dlsym(RTLD_DEFAULT, symbol_name);
+        if (fn != NULL) return fn;
+    }
+
+    /* Neither path found the implementation. Report and abort. */
     char msg[512];
     snprintf(msg, sizeof(msg),
-        "JNI native not registered: class='%s', method='%s', sig='%s'. "
-        "No loaded library called RegisterNatives for this triple. "
-        "Check that the native library shipping this method is present "
-        "in the input archive, was extracted, and had its JNI_OnLoad "
-        "invoked by @main.",
-        class_name ? class_name : "<null>",
-        method_name ? method_name : "<null>",
-        signature ? signature : "<null>");
+        "JNI native not found: class='%s', method='%s', sig='%s', symbol='%s'. "
+        "Neither a RegisterNatives registration nor a Java_* export "
+        "was found in any loaded library.",
+        class_name    ? class_name    : "<null>",
+        method_name   ? method_name   : "<null>",
+        signature     ? signature     : "<null>",
+        symbol_name   ? symbol_name   : "<null>");
 
     __jnative_unresolved_slot(msg);
     return NULL; /* unreachable */
 }
 
-/**
- * dlopens the given library, calls its JNI_OnLoad with a JavaVM whose
- * GetEnv returns the shared JNIEnv, and returns 1 on success.
+/* ============================================================================
+ *  Materialisation directory and per-library extraction.
+ * ============================================================================
+ *
+ * Every embedded library is written into one private directory created
+ * with mkdtemp, under the basename it had on the build host. Three
+ * properties of that choice matter:
+ *
+ *   1. ORIGINAL BASENAME. The dynamic linker's match step for a
+ *      DT_NEEDED entry first checks the loaded objects' l_libname
+ *      lists (populated from DT_SONAME), and if that misses it falls
+ *      through to a comparison against l_name, which is the path the
+ *      caller passed to dlopen. Keeping the original basename means
+ *      both match paths can succeed. Some libraries additionally
+ *      locate siblings through a relative path baked into their own
+ *      code, or call dlopen("./libfoo.so") after a chdir into the
+ *      directory; both require the file to have its original name.
+ *
+ *   2. SINGLE PER-PROCESS DIRECTORY. The directory's name contains
+ *      the pid, so two concurrent runs of the same executable cannot
+ *      collide on the same file. The directory is removed at process
+ *      exit through an atexit hook; the fact that it exists at all is
+ *      invisible to any other process, and it is not added to
+ *      LD_LIBRARY_PATH or any other search path, so it cannot shadow
+ *      anything.
+ *
+ *   3. FILES KEPT FOR THE PROCESS LIFETIME. Unlinking a .so after a
+ *      successful dlopen keeps the mapping alive but removes the
+ *      file; a subsequent dlopen by another library that needs it as
+ *      a DT_NEEDED entry would then fail, because the loader's
+ *      name-match step only finds objects already in the loaded set.
+ *      Keeping every file on disk for the lifetime of the process
+ *      removes that ordering constraint entirely: a dependency loaded
+ *      later is satisfied either by the name-match against the
+ *      already-loaded object, or by the absolute path recorded in
+ *      l_name falling through to the ordinary open().
+ * ========================================================================== */
+
+#define JNATIVE_NATIVE_DIR_PREFIX "jnative-natives-"
+
+static char            jnative_native_dir[PATH_MAX];
+static int             jnative_native_dir_ready = 0;
+static pthread_mutex_t jnative_native_dir_lock  = PTHREAD_MUTEX_INITIALIZER;
+
+/*
+ * atexit hook: remove every file in the private directory, then the
+ * directory itself. The dynamic linker keeps its own mappings alive
+ * independently of the on-disk files, so unlinking at process exit
+ * does not disturb any library that is still in use.
  */
-static int jnative_jni_load_path(const char* path) {
-    if (path == NULL) return 0;
+static void jnative_remove_native_dir(void) {
+    if (jnative_native_dir[0] == '\0') return;
 
-    void* handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
-    if (handle == NULL) {
-        fprintf(stderr,
-            "jnative: warning: dlopen(%s) failed: %s\n",
-            path, dlerror());
-        return 0;
+    DIR* d = opendir(jnative_native_dir);
+    if (d != NULL) {
+        struct dirent* e;
+        while ((e = readdir(d)) != NULL) {
+            if (e->d_name[0] == '.'
+                && (e->d_name[1] == '\0'
+                    || (e->d_name[1] == '.' && e->d_name[2] == '\0'))) {
+                continue;
+            }
+            char path[PATH_MAX];
+            int n = snprintf(path, sizeof(path), "%s/%s",
+                             jnative_native_dir, e->d_name);
+            if (n > 0 && (size_t)n < sizeof(path)) {
+                (void)unlink(path);
+            }
+        }
+        closedir(d);
     }
-
-    typedef jint (*JNI_OnLoad_t)(JavaVM_t, void*);
-    JNI_OnLoad_t onLoad = (JNI_OnLoad_t)dlsym(handle, "JNI_OnLoad");
-    if (onLoad == NULL) {
-        fprintf(stderr,
-            "jnative: warning: %s does not export JNI_OnLoad; "
-            "its RegisterNatives calls will not be performed\n", path);
-        return 0;
-    }
-
-    jint version = onLoad(jnative_jni_vm_table(), NULL);
-    if (version < 0) {
-        fprintf(stderr,
-            "jnative: warning: JNI_OnLoad in %s returned %d\n",
-            path, version);
-        return 0;
-    }
-
-    return 1;
+    (void)rmdir(jnative_native_dir);
+    jnative_native_dir[0] = '\0';
 }
 
-/**
- * Loads the native library whose bytes were embedded under the given
- * resource key.
- *
- * <p>The bytes are materialised into a temporary file under $TMPDIR,
- * dlopen'ed, and (on success) kept loaded for the lifetime of the
- * process. The temporary file is unlinked immediately after dlopen so
- * it does not survive the process; the dynamic linker keeps its own
- * mapping alive independently of the on-disk file.</p>
+/*
+ * Creates the private directory on first call. Subsequent calls see the
+ * cached path. The lock serialises creation across threads; after the
+ * first successful call every reader takes the lock only long enough
+ * to observe that the directory is ready.
  */
-void __jnative_jni_load_library_from_resource(const char* resource_key) {
-    if (resource_key == NULL) return;
-
-    const JNativeResourceEntry* res = jnative_find_resource(
-        resource_key, (int32_t)strlen(resource_key));
-    if (res == NULL) {
-        fprintf(stderr,
-            "jnative: warning: native library resource '%s' not found\n",
-            resource_key);
-        return;
-    }
-    if (res->data == NULL || res->size <= 0) {
-        fprintf(stderr,
-            "jnative: warning: native library resource '%s' is empty\n",
-            resource_key);
-        return;
+static int jnative_ensure_native_dir(void) {
+    pthread_mutex_lock(&jnative_native_dir_lock);
+    if (jnative_native_dir_ready) {
+        int ok = jnative_native_dir[0] != '\0';
+        pthread_mutex_unlock(&jnative_native_dir_lock);
+        return ok;
     }
 
     const char* tmp = getenv("TMPDIR");
     if (tmp == NULL || tmp[0] == '\0') tmp = "/tmp";
 
-    char tmpl[PATH_MAX];
-    snprintf(tmpl, sizeof(tmpl), "%s/jnative_jni_XXXXXX.so", tmp);
+    int n = snprintf(jnative_native_dir, sizeof(jnative_native_dir),
+                     "%s/%s%d-XXXXXX",
+                     tmp, JNATIVE_NATIVE_DIR_PREFIX, (int)getpid());
+    if (n <= 0 || (size_t)n >= sizeof(jnative_native_dir)) {
+        jnative_native_dir[0] = '\0';
+        jnative_native_dir_ready = 1;
+        pthread_mutex_unlock(&jnative_native_dir_lock);
+        return 0;
+    }
 
-    int fd = mkstemps(tmpl, 3);
+    if (mkdtemp(jnative_native_dir) == NULL) {
+        jnative_native_dir[0] = '\0';
+        jnative_native_dir_ready = 1;
+        pthread_mutex_unlock(&jnative_native_dir_lock);
+        return 0;
+    }
+
+    atexit(jnative_remove_native_dir);
+    jnative_native_dir_ready = 1;
+    pthread_mutex_unlock(&jnative_native_dir_lock);
+    return 1;
+}
+
+/*
+ * Returns the basename of a resource key: the part after the last '/'.
+ * Keys produced by the build have the shape "<prefix>/<basename>"; a
+ * key that contains no '/' is returned unchanged so that a caller which
+ * passes a bare name still works.
+ */
+static const char* jnative_resource_basename(const char* key) {
+    if (key == NULL) return NULL;
+    const char* slash = strrchr(key, '/');
+    return slash != NULL ? slash + 1 : key;
+}
+
+/*
+ * Materialises one embedded library into the private directory. Returns
+ * 1 on success, 0 on any failure (which is always reported to stderr
+ * with enough detail to identify the missing or unwritable file).
+ */
+static int jnative_materialise_library(const char* resource_key) {
+    if (resource_key == NULL) return 0;
+
+    const char* base = jnative_resource_basename(resource_key);
+    if (base == NULL || base[0] == '\0') return 0;
+
+    /* Reject "." and ".." even though the basename cannot contain '/'. */
+    if (base[0] == '.'
+        && (base[1] == '\0' || (base[1] == '.' && base[2] == '\0'))) {
+        return 0;
+    }
+
+    if (!jnative_ensure_native_dir()) {
+        fprintf(stderr,
+            "jnative: warning: cannot create private native directory "
+            "for '%s'\n", resource_key);
+        return 0;
+    }
+
+    const JNativeResourceEntry* res = jnative_find_resource(
+        resource_key, (int32_t)strlen(resource_key));
+    if (res == NULL || res->data == NULL || res->size <= 0) {
+        fprintf(stderr,
+            "jnative: warning: native library resource '%s' is missing "
+            "or empty\n", resource_key);
+        return 0;
+    }
+
+    char dest[PATH_MAX];
+    int n = snprintf(dest, sizeof(dest), "%s/%s",
+                     jnative_native_dir, base);
+    if (n <= 0 || (size_t)n >= sizeof(dest)) {
+        return 0;
+    }
+
+    /*
+     * Reuse a file that is already present with the expected size. The
+     * same library can be named through more than one key when two
+     * different prefixes carry the same file, and one image can embed
+     * the same physical .so under both the JDK and the application
+     * key when an application ships a copy of a JDK library.
+     */
+    struct stat st;
+    if (stat(dest, &st) == 0 && st.st_size == (off_t)res->size) {
+        return 1;
+    }
+
+    int fd = open(dest,
+                  O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC,
+                  (mode_t)0755);
     if (fd < 0) {
         fprintf(stderr,
-            "jnative: warning: mkstemps(%s) failed: %s\n",
-            tmpl, strerror(errno));
-        return;
+            "jnative: warning: cannot create %s: %s\n",
+            dest, strerror(errno));
+        return 0;
     }
 
-    const uint8_t* p = res->data;
-    int32_t remaining = res->size;
-    while (remaining > 0) {
-        ssize_t n = write(fd, p, (size_t)remaining);
-        if (n < 0) {
+    const uint8_t* p   = res->data;
+    size_t         rem = (size_t)res->size;
+    while (rem > 0) {
+        ssize_t w = write(fd, p, rem);
+        if (w < 0) {
             if (errno == EINTR) continue;
+            int saved = errno;
+            close(fd);
+            unlink(dest);
+            errno = saved;
             fprintf(stderr,
                 "jnative: warning: write to %s failed: %s\n",
-                tmpl, strerror(errno));
-            close(fd);
-            unlink(tmpl);
-            return;
+                dest, strerror(errno));
+            return 0;
         }
-        p += n;
-        remaining -= (int32_t)n;
+        if (w == 0) {
+            close(fd);
+            unlink(dest);
+            fprintf(stderr,
+                "jnative: warning: zero-byte write to %s\n", dest);
+            return 0;
+        }
+        p   += (size_t)w;
+        rem -= (size_t)w;
     }
     close(fd);
+    return 1;
+}
 
-    (void)jnative_jni_load_path(tmpl);
+/*
+ * Loads a single already-materialised library, invokes its JNI_OnLoad
+ * if it has one, and returns 1 on success or 0 on failure. A failure
+ * is not reported here: the caller collects failures and prints them
+ * once, after the retry loop terminates, so that a library which fails
+ * on the first pass but succeeds on a later one produces no spurious
+ * warning.
+ *
+ * The function may not return normally if the library raises SIGSEGV,
+ * SIGBUS, SIGILL or SIGFPE during its own initialisation. In that case
+ * the caller's sigsetjmp arm catches the signal and marks the library
+ * as crashed.
+ */
+static int jnative_load_one(const char* key) {
+    const char* base = jnative_resource_basename(key);
+    if (base == NULL || base[0] == '\0') return 0;
 
-    /* The dynamic linker keeps its own mapping of the file alive after
-     * dlopen succeeds; the on-disk file may be unlinked immediately. */
-    unlink(tmpl);
+    char path[PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/%s",
+                     jnative_native_dir, base);
+    if (n <= 0 || (size_t)n >= sizeof(path)) {
+        return 0;
+    }
+
+    /*
+     * Consume any pending error message from an earlier dlopen attempt.
+     * dlerror() returns the most recent error message and clears it;
+     * calling it here makes the next dlerror() return the message for
+     * this attempt, not for some previous one.
+     */
+    (void)dlerror();
+
+    void* handle = dlopen(path, RTLD_NOW | RTLD_GLOBAL);
+    if (handle == NULL) {
+        return 0;
+    }
+
+    typedef jint (*JNI_OnLoad_t)(JavaVM_t*, void*);
+    JNI_OnLoad_t onLoad = (JNI_OnLoad_t)dlsym(handle, "JNI_OnLoad");
+    if (onLoad != NULL) {
+        jint version = onLoad(&jnative_java_vm, NULL);
+        if (version < 0) {
+            fprintf(stderr,
+                "jnative: warning: JNI_OnLoad in %s returned %d\n",
+                path, version);
+            /*
+             * A negative return from JNI_OnLoad means the library
+             * refused to initialise. Its symbols are still in the
+             * global scope, and dlopen will report it as loaded on a
+             * subsequent call, so the slot is marked loaded and the
+             * runtime continues. Registering natives against a class
+             * whose actual implementation declined to install is not
+             * worse than the alternative of aborting the whole process
+             * because one optional acceleration library was incompatible.
+             */
+        }
+    }
+
+    return 1;
+}
+
+/*
+ * Loads one library under the crash-tolerant guard.
+ *
+ * Returns:
+ *    1  — library loaded successfully (its JNI_OnLoad was invoked)
+ *    0  — library failed to load normally (a retry may help)
+ *   -1  — library crashed with a synchronous signal; it is recorded
+ *         as permanently unusable and must not be retried
+ *
+ * The sigsetjmp is placed inside this dedicated function rather than
+ * in the retry loop, so that the retry loop's own locals are not
+ * exposed to the longjmp. Only sigjmp_buf and the two file-scope
+ * volatile variables cross the longjmp boundary, both of which are
+ * safe.
+ */
+static int jnative_load_one_guarded(const char* key) {
+    int jmp = sigsetjmp(jnative_load_jmpbuf, 1);
+    if (jmp != 0) {
+        jnative_in_library_load = 0;
+        fprintf(stderr,
+            "jnative: warning: library %s raised signal %d during load; "
+            "marking it unusable and continuing\n",
+            jnative_resource_basename(key), jmp);
+        return -1;
+    }
+
+    jnative_in_library_load = 1;
+    int r = jnative_load_one(key);
+    jnative_in_library_load = 0;
+    return r;
 }
 
 /**
  * Loads every native library whose resource key appears in the given
  * array.
  *
- * <p>Emitted by @main at program start-up. The array itself is emitted
- * as a static constant of i8* pointers into the string constants that
- * the code generator produced for each library.</p>
+ * <p>Called once by {@code @main}, before any Java code runs. The array
+ * itself is emitted as a static constant of {@code i8*} pointers into
+ * the string constants that the code generator produced for each
+ * library. The order of the keys is preserved.</p>
+ *
+ * <h2>Three-phase load</h2>
+ *
+ * <ol>
+ *   <li><b>Materialise.</b> Every embedded library is written into the
+ *       private directory under its original basename.</li>
+ *
+ *   <li><b>Load with retries and crash guard.</b> Each library is
+ *       dlopen'd in turn under the synchronous-signal guard described
+ *       at the top of this file. A library whose DT_NEEDED dependency
+ *       has not yet been loaded fails normally and is retried on the
+ *       next pass; a library that raises a synchronous fault is marked
+ *       as permanently unusable and is not retried. The number of
+ *       passes is bounded by the size of the key list plus one.</li>
+ *
+ *   <li><b>Report.</b> Every library that never loaded is reported to
+ *       stderr with the loader's own error message, or with the
+ *       signal number that killed it.</li>
+ * </ol>
  */
 void __jnative_jni_load_all(const char** keys, int32_t count) {
     if (keys == NULL || count <= 0) return;
+
+    /* Install the crash guard once, before any dlopen. */
+    jnative_install_load_handlers();
+
+    /* -------- Phase 1: materialise every library -------- */
+    int32_t materialised = 0;
     for (int32_t i = 0; i < count; i++) {
-        if (keys[i] != NULL) {
-            __jnative_jni_load_library_from_resource(keys[i]);
+        if (keys[i] != NULL && jnative_materialise_library(keys[i])) {
+            materialised++;
         }
     }
+    if (materialised == 0) return;
+
+    /* -------- Phase 2: load in dependency order with retries -------- */
+    int* loaded  = (int*)calloc((size_t)count, sizeof(int));
+    int* crashed = (int*)calloc((size_t)count, sizeof(int));
+    if (loaded == NULL || crashed == NULL) {
+        free(loaded);
+        free(crashed);
+        return;
+    }
+
+    const int32_t max_passes = count + 1;
+    int32_t total_loaded = 0;
+
+    for (int32_t pass = 0; pass < max_passes; pass++) {
+        int32_t progress = 0;
+
+        for (int32_t i = 0; i < count; i++) {
+            if (loaded[i] || crashed[i]) continue;
+
+            const char* key = keys[i];
+            if (key == NULL) { loaded[i] = 1; continue; }
+
+            const char* base = jnative_resource_basename(key);
+            if (base == NULL || base[0] == '\0') {
+                loaded[i] = 1;
+                continue;
+            }
+
+            /*
+             * Skip keys whose file could not be written in phase 1. The
+             * materialisation warning has already been printed; marking
+             * the slot as "loaded" here means the reporting phase below
+             * will not treat it as a load failure.
+             */
+            char path[PATH_MAX];
+            int n = snprintf(path, sizeof(path), "%s/%s",
+                             jnative_native_dir, base);
+            if (n <= 0 || (size_t)n >= sizeof(path)) {
+                loaded[i] = 1;
+                continue;
+            }
+            struct stat st;
+            if (stat(path, &st) != 0) {
+                loaded[i] = 1;
+                continue;
+            }
+
+            int r = jnative_load_one_guarded(key);
+            if (r == -1) {
+                crashed[i] = 1;
+                continue;
+            }
+            if (r == 0) {
+                /* Normal failure; may succeed on a later pass once a
+                 * DT_NEEDED dependency has been loaded. */
+                continue;
+            }
+
+            loaded[i] = 1;
+            total_loaded++;
+            progress++;
+        }
+
+        if (progress == 0) break;
+    }
+
+    /* -------- Phase 3: report failures -------- */
+    for (int32_t i = 0; i < count; i++) {
+        if (loaded[i]) continue;
+        if (crashed[i]) continue;   /* already reported by the guard */
+
+        const char* key  = keys[i];
+        const char* base = jnative_resource_basename(key);
+        if (base == NULL) continue;
+
+        char path[PATH_MAX];
+        int n = snprintf(path, sizeof(path), "%s/%s",
+                         jnative_native_dir, base);
+        if (n <= 0 || (size_t)n >= sizeof(path)) continue;
+
+        (void)dlerror();
+        void* probe = dlopen(path, RTLD_NOW | RTLD_GLOBAL);
+        if (probe != NULL) {
+            typedef jint (*JNI_OnLoad_t)(JavaVM_t*, void*);
+            JNI_OnLoad_t onLoad = (JNI_OnLoad_t)dlsym(probe, "JNI_OnLoad");
+            if (onLoad != NULL) {
+                (void)onLoad(&jnative_java_vm, NULL);
+            }
+            continue;
+        }
+        const char* err = dlerror();
+        fprintf(stderr,
+            "jnative: warning: could not load %s: %s\n",
+            path, err != NULL ? err : "unknown reason");
+    }
+
+    free(loaded);
+    free(crashed);
 }
