@@ -153,13 +153,22 @@ public class IntraproceduralEscape {
         // base escape. Only the stored value becomes reachable from the
         // base, so its escape level is the maximum of the base's own
         // level and whatever the field already held.
+        //
+        // When the base cannot be proven to be a locally-allocated,
+        // non-escaping object (its points-to set is empty, e.g. it is a
+        // LOAD of a synthetic local or a PHI carrying a parameter), we
+        // cannot assume the field is private to this method. Treat the
+        // store as escaping so the stored value is never stack-allocated.
+        PointsToSet basePts = aliasResult.getPointsTo(base);
         EscapeStatus baseEsc = valueEscapeStatus(base);
+        if (basePts.isEmpty()) {
+            baseEsc = maxEscape(baseEsc, EscapeStatus.HEAP);
+        }
         markEscaped(rhs, baseEsc);
 
         EscapeStatus rhsEsc   = valueEscapeStatus(rhs);
         EscapeStatus fieldEsc = maxEscape(baseEsc, rhsEsc);
 
-        PointsToSet basePts = aliasResult.getPointsTo(base);
         if (basePts.isEmpty() && base instanceof Parameter) {
             updateFieldStatus(AllocationSite.UNKNOWN, field,
                     maxEscape(fieldEsc, EscapeStatus.HEAP));
@@ -241,13 +250,20 @@ public class IntraproceduralEscape {
         // Same reasoning as PUT_FIELD: writing into an array modifies it
         // in place. The array reference does not escape; only the stored
         // value does, and only when the array is externally observable.
+        //
+        // As with PUT_FIELD, if the array cannot be proven to be a
+        // locally-allocated, non-escaping object, conservatively treat the
+        // store as escaping so the stored value is never stack-allocated.
+        PointsToSet arrayPts = aliasResult.getPointsTo(array);
         EscapeStatus arrayEsc = valueEscapeStatus(array);
+        if (arrayPts.isEmpty()) {
+            arrayEsc = maxEscape(arrayEsc, EscapeStatus.HEAP);
+        }
         markEscaped(value, arrayEsc);
 
         EscapeStatus valueEsc = valueEscapeStatus(value);
         EscapeStatus fieldEsc = maxEscape(arrayEsc, valueEsc);
 
-        PointsToSet arrayPts = aliasResult.getPointsTo(array);
         if (arrayPts.isEmpty() && array instanceof Parameter) {
             updateFieldStatus(AllocationSite.UNKNOWN, "[]",
                     maxEscape(fieldEsc, EscapeStatus.HEAP));

@@ -684,8 +684,15 @@ void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_lang_Thread_I_V(
 /* ===========================================================================
  *  Striped64 and Striped64.Cell
  *
- *      Striped64   +8 long base, +16 int cellsBusy
- *      Cell        +8 long value
+ *      Striped64   +8  Cell[] cells, +16 long base, +24 int cellsBusy
+ *      Cell        +8  long value
+ *
+ *  WARNING: the first instance field of Striped64 is `cells` (a Cell[]
+ *  reference) and it occupies +8. Because of that `base` lives at +16 and
+ *  `cellsBusy` at +24. Any CAS targeting base/cellsBusy must use the correct
+ *  offsets; writing to +8 or +16 corrupts the neighboring field (see bug
+ *  history: casBase wrote the counter into cells, and LongAdder.sum()
+ *  dereferenced it as a Cell[]).
  * =========================================================================== */
 
 int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concurrent_atomic_Striped64_II_Z(
@@ -693,7 +700,9 @@ int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concur
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
-    return cas_int((int32_t*)((char*)obj + 16), expected, newValue);
+    /* CELLSBUSY is at +24 (see block comment above).
+     * This used to be +16, i.e. a write into `base` — that was the bug. */
+    return cas_int((int32_t*)((char*)obj + 24), expected, newValue);
 }
 
 int32_t __jnative_fn_java_lang_invoke_VarHandle_weakCompareAndSetRelease__Ljava_util_concurrent_atomic_Striped64_JJ_Z(
@@ -701,8 +710,11 @@ int32_t __jnative_fn_java_lang_invoke_VarHandle_weakCompareAndSetRelease__Ljava_
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
+    /* BASE is at +16 (see block comment above).
+     * This used to be +8, i.e. a write into `cells` — that was the bug that
+     * made LongAdder.sum() dereference a counter as a Cell[]. */
     int64_t exp = expected;
-    return __atomic_compare_exchange_n((int64_t*)((char*)obj + 8), &exp, newValue,
+    return __atomic_compare_exchange_n((int64_t*)((char*)obj + 16), &exp, newValue,
                                        0, __ATOMIC_RELEASE, __ATOMIC_RELAXED) ? 1 : 0;
 }
 
@@ -828,7 +840,11 @@ int32_t __jnative_fn_java_lang_invoke_VarHandle_weakCompareAndSet__Ljava_util_co
  *
  *      Node        +16 value, +24 next
  *      Index       +24 right
- *      CSLM        +24 head, +40 counter
+ *      CSLM        +24 comparator, +32 head, +40 adder
+ *
+ *  ВНИМАНИЕ: смещение +24 у CSLM — это ПЕРВОЕ инстанс-поле
+ *  (comparator), а НЕ head. head лежит на +32, adder — на +40.
+ *  Любой CAS, нацеленный на head, обязан использовать +32.
  * =========================================================================== */
 
 int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concurrent_ConcurrentSkipListMap_Node_Ljava_lang_Object_Ljava_lang_Object__Z(
@@ -876,7 +892,8 @@ int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concur
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
-    return cas_ref((void**)((char*)obj + 24), expected, newValue);
+    /* HEAD — смещение +32 (см. комментарий блока выше). */
+    return cas_ref((void**)((char*)obj + 32), expected, newValue);
 }
 
 int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concurrent_ConcurrentSkipListMap_Ljava_lang_Void_Ljava_util_concurrent_ConcurrentSkipListMap_Index__Z(
@@ -884,7 +901,8 @@ int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concur
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
-    return cas_ref((void**)((char*)obj + 24), expected, newValue);
+    /* HEAD — смещение +32 (см. комментарий блока выше). */
+    return cas_ref((void**)((char*)obj + 32), expected, newValue);
 }
 
 int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concurrent_ConcurrentSkipListMap_Ljava_lang_Void_Ljava_util_concurrent_atomic_LongAdder__Z(

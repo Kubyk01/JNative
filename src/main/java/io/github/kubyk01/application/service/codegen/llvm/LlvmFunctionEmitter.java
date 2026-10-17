@@ -731,7 +731,11 @@ public class LlvmFunctionEmitter {
         StringBuilder sb = new StringBuilder();
 
         // ---- signature: identical to the Function's Java-level signature ----
-        sb.append("define ")
+        // `hidden` (not `internal`): the trampoline must stay resolvable at
+        // static link time from other .ll modules (by its Java_* name) but
+        // must disappear from .dynsym so dlsym(RTLD_DEFAULT, ...) cannot
+        // find it.
+        sb.append("define hidden ")
           .append(LlvmTypeMapper.toLlvmType(retType))
           .append(" @").append(func.getName()).append("(");
         for (int i = 0; i < params.size(); i++) {

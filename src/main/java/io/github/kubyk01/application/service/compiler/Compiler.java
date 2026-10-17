@@ -951,6 +951,63 @@ public class Compiler implements CompilerPort {
     // =========================================================================
 
     /**
+     * JDK shared objects that cannot work outside a live HotSpot JVM
+     * process and therefore must NOT be embedded into the executable.
+     *
+     * <p>Each of these libraries either IS the JVM (libjvm.so), links
+     * against it and depends on its thread/monitor/class-loader
+     * internals (libjava.so), or is itself a JVM-aware front-end whose
+     * {@code JNI_OnLoad} calls {@code (*env)->CallStaticBooleanMethod}
+     * and dozens of other JNI functions that this runtime's stub JNIEnv
+     * leaves NULL (libawt*, libfontmanager, liblcms, libmanagement,
+     * libnet, libnio, libprefs). Loading them produces one of three
+     * outcomes, none of them useful:</p>
+     *
+     * <ul>
+     *   <li>{@code JNI_OnLoad} crashes on the first NULL JNIEnv slot;
+     *       the crash guard catches the fault and marks the library
+     *       unusable, but the library is still in memory and its
+     *       exports are still visible to {@code dlsym}. A later call
+     *       to one of its natives — outside the guard — crashes for
+     *       real.</li>
+     *   <li>{@code JNI_OnLoad} succeeds but {@code RegisterNatives}
+     *       never runs, so the library's natives are still unreachable
+     *       through the RegisterNatives table. The trampoline falls
+     *       back to {@code dlsym}, finds the broken function pointer,
+     *       and crashes when the function is called.</li>
+     *   <li>{@code dlopen} itself fails on an unsatisfied DT_NEEDED
+     *       that could not be embedded (system library such as
+     *       {@code libX11.so}), and the whole chain is unusable.</li>
+     * </ul>
+     *
+     * <p>The correct replacement for each of these libraries is a
+     * JNative C file that supplies the natives the reachable set
+     * actually invokes. The tree already contains such files for
+     * {@code java.lang.*}, {@code java.io.*}, {@code java.nio.*},
+     * {@code sun.nio.ch.*}, {@code sun.java2d.loops.*}, and dozens of
+     * other classes; the ones still missing appear in the build log as
+     * "N JNI symbol(s) still unresolved" and must be added as they are
+     * reached.</p>
+     */
+    private static final Set<String> NON_PORTABLE_JDK_LIBS = Set.of(
+        "libjvm.so",          // HotSpot VM itself
+        "libjava.so",         // HotSpot's shared libjava
+        "libawt.so",          // AWT, HotSpot- and X11-coupled
+        "libawt_headless.so", // ditto
+        "libawt_xawt.so",     // ditto
+        "libfontmanager.so",  // HotSpot- and fontconfig-coupled
+        "liblcms.so",         // part of the fontmanager chain
+        "libmanagement.so",   // HotSpot-coupled
+        "libnet.so",          // HotSpot-coupled
+        "libnio.so",          // HotSpot-coupled
+        "libprefs.so",        // HotSpot-coupled
+        "libverify.so",       // HotSpot-coupled
+        "libzip.so",          // HotSpot-coupled
+        "libjimage.so",       // HotSpot-coupled
+        "libjli.so"           // JVM launcher, cannot be embedded
+    );
+
+    /**
      * Computes the set of JDK shared objects that must be embedded into
      * the executable for the module's JNI references to resolve at run
      * time on a machine without a JDK.
@@ -1028,6 +1085,10 @@ public class Compiler implements CompilerPort {
             try (var s = Files.walk(libDir, 1)) {
                 s.filter(Files::isRegularFile)
                     .filter(p -> isDynamicLibrary(p, targetPlatform))
+                    // Skip JDK libraries that cannot work outside a live
+                    // HotSpot JVM. See NON_PORTABLE_JDK_LIBS.
+                    .filter(p -> !NON_PORTABLE_JDK_LIBS.contains(
+                        p.getFileName().toString()))
                     .sorted()
                     .forEach(allJdkLibs::add);
             } catch (IOException e) {
