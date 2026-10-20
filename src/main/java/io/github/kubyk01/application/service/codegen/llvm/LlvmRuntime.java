@@ -95,7 +95,6 @@ public class LlvmRuntime {
     public static String getDeclarations() {
         return """
             declare void @__jnative_debug_clinit(i8*)
-            declare void @__jnative_init_string_pool(i8**, i32)
             declare i8* @malloc(i64)
             declare i8* @calloc(i64, i64)
             declare void @free(i8*)

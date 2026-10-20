@@ -228,11 +228,12 @@ public class LlvmGenerator {
         //
         // Order: the filtered prelude, then the externs, then the tail
         // (globalDefs + lambdaVts + deferred + owner-less bodies +
-        // moduleDecls + main).
+        // moduleDecls + runInit + main).
         //
         // The tail is assembled into a single string first, so the prelude
         // filter and the extern pass both see exactly the same content and do
         // not double-count it.
+        String runInit = generateRunAllInitializers();
         String main = generateMain();
 
         String moduleTail = globalDefs
@@ -240,6 +241,7 @@ public class LlvmGenerator {
             + "\n" + deferred
             + "\n" + moduleBodies
             + moduleDecls
+            + runInit
             + main;
 
         String moduleExterns = buildExterns(
@@ -785,53 +787,12 @@ public class LlvmGenerator {
         // offsets to synthesise the main thread, its holder and its thread
         // group with the same object layout the LLVM backend uses. Loading
         // the three classes here guarantees they are visible to
-        // getFieldOffset() at codegen time.
+        // getFieldOffset() at codegen time, where LlvmGlobalEmitter's
+        // generateLayoutConstants() turns them into @THREAD_* /
+        // @FH_* / @TG_* LLVM globals.
         resolver.forceLoadSystemClass("java/lang/Thread");
         resolver.forceLoadSystemClass("java/lang/Thread$FieldHolder");
         resolver.forceLoadSystemClass("java/lang/ThreadGroup");
-
-        ensureExternalFunction("__jnative_thread_set_layout", Type.VOID,
-            Type.INT, Type.INT, Type.INT, Type.INT, Type.INT,  // Thread: size, holder, tid, name, interruptLock
-            Type.INT, Type.INT, Type.INT, Type.INT, Type.INT,  // FieldHolder: size, group, priority, daemon, status
-            Type.INT, Type.INT, Type.INT, Type.INT);           // ThreadGroup: size, name, maxPriority, vmAllow
-
-        // Reflection-mirror field-offset handoff.
-        //
-        // Class.c's create_field_mirror / create_method_mirror /
-        // create_constructor_mirror write into java.lang.reflect.{Field,
-        // Method, Constructor} instance slots at hard-coded offsets
-        // (JNATIVE_FIELD_*_OFFSET / JNATIVE_METHOD_*_OFFSET /
-        // JNATIVE_CTOR_*_OFFSET in jnative_runtime.h). Those offsets
-        // must agree byte-for-byte with what LlvmGlobalEmitter's
-        // collectInstanceFields() produced for the same three classes,
-        // because the Java-side reflection code reads the same slots
-        // through the LLVM-computed offsets. They only agree by accident
-        // if the JDK reshuffles a field between releases.
-        //
-        // The concrete failure this handoff closes: on JDK builds where
-        // `parameterTypes` is declared on Executable rather than on
-        // Method, the hard-coded JNATIVE_METHOD_PARAM_TYPES_OFFSET (72)
-        // is off by one slot. Class.c then wrote the (correct) parameter
-        // array into an unrelated field, and every java.lang.reflect.Method
-        // constructed by getDeclaredMethods0 carried a null
-        // parameterTypes. The first consumer to iterate that array without
-        // a null check — Executable.sharedToString, reached from
-        // Method.toString inside MethodHandleImpl$CountingWrapper.<clinit>
-        // — aborted with
-        //
-        //     java.lang.NullPointerException: Cannot invoke
-        //     java.lang.reflect.Executable.sharedToString(...) because
-        //     <array> is null
-        //
-        // Passing the real offsets in from @main makes the C side and the
-        // Java side agree regardless of how the JDK orders the fields.
-        // The signature mirrors the JNATIVE_*_OFFSET constants one for
-        // one; see jnative_runtime.h for the C-side declaration.
-        ensureExternalFunction("__jnative_reflect_set_layout", Type.VOID,
-            Type.INT, Type.INT, Type.INT, Type.INT, Type.INT,   // Field: clazz, slot, name, type, modifiers
-            Type.INT, Type.INT, Type.INT, Type.INT, Type.INT, Type.INT, Type.INT,   // Method: clazz, slot, name, returnType, params, exc, modifiers
-            Type.INT, Type.INT, Type.INT, Type.INT, Type.INT,   // Constructor: clazz, slot, params, exc, modifiers
-            Type.INT, Type.INT);                                // Constructor root, Method root
 
         ensureExternalFunction(
             "__jnative_fn_jdk_internal_util_SystemProps_Raw_cmdProperties___Ljava_util_HashMap_",
@@ -941,217 +902,10 @@ public class LlvmGenerator {
         }
     }
 
-    private String generateMain() {
+    private String generateRunAllInitializers() {
         StringBuilder sb = new StringBuilder();
-        sb.append("define i32 @main(i32 %argc, i8** %argv) {\n");
+        sb.append("define void @__jnative_run_all_initializers() {\n");
 
-        // Shutdown-based destruction is deliberately NOT installed.
-        //
-        // Earlier revisions registered fn___jnative_shutdown with atexit()
-        // and had it walk every static field, calling each field's
-        // destructor. That design is unsafe against two structural
-        // properties of a real Java object graph:
-        //
-        //   1. DAG sharing — the same singleton reachable from two static
-        //      fields, or from a static field and from another object's
-        //      field, is destroyed twice by a flat per-field schedule.
-        //
-        //   2. Cycles — a pair of objects pointing at each other, such as
-        //      UCharacterProperty.intProp <-> IntProperty.this$0, makes
-        //      the recursive destructors enter each other forever and
-        //      exhausts the native stack.
-        //
-        // A correct fix would have to compute the full reachability
-        // closure of every static field, topologically order it, and
-        // destroy each object exactly once at its depth. That machinery
-        // is out of proportion to the benefit: the process is about to
-        // exit anyway, and the operating system reclaims every byte of
-        // the image's memory regardless of what the C side does here.
-        //
-        // Per-use destruction at ordinary destruction points is
-        // unaffected. DestructorInserter still generates destructors and
-        // still inserts calls at the DestructionPoints that
-        // LifetimeAnalyzer found. Only the shutdown aggregation is gone.
-
-        // ------------------------------------------------------------------
-        // Stage 0: layout handoffs.
-        //
-        // Two C subsystems need the exact byte offsets that the LLVM
-        // backend used for a handful of JDK classes, because they write
-        // into instances of those classes from C and the Java side reads
-        // the same slots through the LLVM-computed offsets. A single
-        // value that disagrees between the two sides is not a compile
-        // error and not a link error — it is a silent write into a
-        // neighbouring slot, discovered only when the Java code that
-        // reads the intended slot crashes on a null or a garbage value
-        // far from the point of the mismatch.
-        //
-        // Both handoffs take their arguments from the same functions
-        // (LlvmGlobalEmitter.getFieldOffset / computeObjectSize) that the
-        // emitter used to lay out the struct types, so the C side and the
-        // emitted code can never drift apart, no matter how the JDK
-        // reorders or renames the fields between releases.
-        // ------------------------------------------------------------------
-
-        // ----- 0a. Thread / FieldHolder / ThreadGroup layout. -----
-        //
-        // The C runtime synthesises the "main" java.lang.Thread lazily,
-        // on the first Thread.currentThread() call. That call happens
-        // before any Java-level Thread constructor has run — inside
-        // jdk.internal.misc.CarrierThread.<clinit> — so the object has
-        // to be constructible from C, carrying a valid Thread$FieldHolder
-        // whose group is a valid ThreadGroup.
-        int threadSize   = globalEmitter.computeObjectSize("java/lang/Thread");
-        int threadHolder = globalEmitter.getFieldOffset("java/lang/Thread", "holder");
-        int threadTid    = globalEmitter.getFieldOffset("java/lang/Thread", "tid");
-        int threadName   = globalEmitter.getFieldOffset("java/lang/Thread", "name");
-        /*
-         * interruptLock is the object that Thread.blockedOn() synchronises
-         * on when the current thread enters a blocking I/O operation. The
-         * C-synthesised main thread does not run Thread.<init>, so the
-         * field would be NULL without an explicit write. The first
-         * caller that hits this is
-         *
-         *     BasicImageReader.<init>
-         *         -> FileChannelImpl.readInternal
-         *             -> AbstractInterruptibleChannel.begin
-         *                 -> Thread.blockedOn
-         *                     -> synchronized (me.interruptLock)  // NPE
-         *
-         * and the NPE is immediately masked by an ArrayIndexOutOfBounds
-         * from the enclosing finally block (see jnative/lang/Thread.c for
-         * the full trace). Passing the offset through the layout handoff
-         * keeps the C side and the emitter in lockstep on any JDK whose
-         * field layout differs from the current one; the field has been
-         * present and named "interruptLock" across JDK 17-22, but the safe
-         * lookup below treats a rename or removal as "field absent" and
-         * falls back to -1, which the C side interprets as "skip this
-         * write".
-         */
-        int threadInterruptLock = safeFieldOffset(
-            "java/lang/Thread", "interruptLock", -1);
-
-        int fhSize       = globalEmitter.computeObjectSize("java/lang/Thread$FieldHolder");
-        int fhGroup      = globalEmitter.getFieldOffset("java/lang/Thread$FieldHolder", "group");
-        int fhPriority   = globalEmitter.getFieldOffset("java/lang/Thread$FieldHolder", "priority");
-        int fhDaemon     = globalEmitter.getFieldOffset("java/lang/Thread$FieldHolder", "daemon");
-        int fhStatus     = globalEmitter.getFieldOffset("java/lang/Thread$FieldHolder", "threadStatus");
-
-        int tgSize       = globalEmitter.computeObjectSize("java/lang/ThreadGroup");
-        int tgName       = globalEmitter.getFieldOffset("java/lang/ThreadGroup", "name");
-        int tgMaxPrio    = globalEmitter.getFieldOffset("java/lang/ThreadGroup", "maxPriority");
-        // ThreadGroup.vmAllowSuspension exists up to JDK 17 and was removed
-        // later on (JDK-8283117). The C side treats a negative offset as
-        // "this field does not exist on this JDK" and skips the write, so a
-        // missing field must not abort codegen the way getFieldOffset() does.
-        int tgVmAllow    = safeFieldOffset("java/lang/ThreadGroup", "vmAllowSuspension", -1);
-
-        if (threadSize > 0 && fhSize > 0 && tgSize > 0) {
-            sb.append("  call void @__jnative_thread_set_layout(")
-                .append("i32 ").append(threadSize).append(", ")
-                .append("i32 ").append(threadHolder).append(", ")
-                .append("i32 ").append(threadTid).append(", ")
-                .append("i32 ").append(threadName).append(", ")
-                .append("i32 ").append(threadInterruptLock).append(", ")
-                .append("i32 ").append(fhSize).append(", ")
-                .append("i32 ").append(fhGroup).append(", ")
-                .append("i32 ").append(fhPriority).append(", ")
-                .append("i32 ").append(fhDaemon).append(", ")
-                .append("i32 ").append(fhStatus).append(", ")
-                .append("i32 ").append(tgSize).append(", ")
-                .append("i32 ").append(tgName).append(", ")
-                .append("i32 ").append(tgMaxPrio).append(", ")
-                .append("i32 ").append(tgVmAllow).append(")\n");
-        } else {
-            log.error("Thread layout setup skipped: Thread={}, FieldHolder={}, ThreadGroup={}",
-                threadSize, fhSize, tgSize);
-        }
-
-        // ----- 0b. java.lang.reflect.{Field,Method,Constructor} layout. -----
-        //
-        // Class.c's create_field_mirror / create_method_mirror /
-        // create_constructor_mirror populate the mirror objects that
-        // Class.getDeclaredFields0 / getDeclaredMethods0 /
-        // getDeclaredConstructors0 hand back to the JDK. Each write goes
-        // to a hard-coded slot name in C (JNATIVE_*_OFFSET, declared in
-        // jnative_runtime.h) that must equal the LLVM-computed offset for
-        // the same Java-level field. Any drift — a JDK that moves
-        // `parameterTypes` from Method to Executable, for example —
-        // silently redirects the write into an unrelated slot.
-        //
-        // The concrete failure this handoff closes: the hard-coded
-        // JNATIVE_METHOD_PARAM_TYPES_OFFSET put the parameter array into
-        // the wrong slot on every JDK where Executable declares
-        // `parameterTypes`. Every mirror built afterwards carried a null
-        // `parameterTypes`, and the first reflective toString inside
-        // MethodHandleImpl$CountingWrapper.<clinit> aborted the process
-        // with
-        //
-        //     java.lang.NullPointerException: Cannot invoke
-        //     java.lang.reflect.Executable.sharedToString(...) because
-        //     <array> is null
-        //
-        // The values below are the same numbers that were used to build
-        // the emitted %struct.java_lang_reflect_* types, so passing them
-        // to the C side is what makes the write offsets agree with the
-        // read offsets on every JDK.
-        int fieldClazz      = safeFieldOffset("java/lang/reflect/Field", "clazz",      24);
-        int fieldSlot       = safeFieldOffset("java/lang/reflect/Field", "slot",       32);
-        int fieldName       = safeFieldOffset("java/lang/reflect/Field", "name",       40);
-        int fieldType       = safeFieldOffset("java/lang/reflect/Field", "type",       48);
-        int fieldModifiers  = safeFieldOffset("java/lang/reflect/Field", "modifiers",  56);
-
-        int methodClazz     = safeFieldOffset("java/lang/reflect/Method", "clazz",          40);
-        int methodSlot      = safeFieldOffset("java/lang/reflect/Method", "slot",           48);
-        int methodName      = safeFieldOffset("java/lang/reflect/Method", "name",           56);
-        int methodReturn    = safeFieldOffset("java/lang/reflect/Method", "returnType",     64);
-        int methodParams    = safeFieldOffset("java/lang/reflect/Method", "parameterTypes", 72);
-        int methodExc       = safeFieldOffset("java/lang/reflect/Method", "exceptionTypes", 80);
-        int methodMods      = safeFieldOffset("java/lang/reflect/Method", "modifiers",      88);
-
-        int ctorClazz       = safeFieldOffset("java/lang/reflect/Constructor", "clazz",          40);
-        int ctorSlot        = safeFieldOffset("java/lang/reflect/Constructor", "slot",           48);
-        int ctorParams      = safeFieldOffset("java/lang/reflect/Constructor", "parameterTypes", 56);
-        int ctorExc         = safeFieldOffset("java/lang/reflect/Constructor", "exceptionTypes", 64);
-        int ctorMods        = safeFieldOffset("java/lang/reflect/Constructor", "modifiers",      72);
-        int ctorRoot        = safeFieldOffset("java/lang/reflect/Constructor", "root",           -1);
-        int methodRoot      = safeFieldOffset("java/lang/reflect/Method", "root",                -1);
-
-        sb.append("  call void @__jnative_reflect_set_layout(")
-            .append("i32 ").append(fieldClazz).append(", ")
-            .append("i32 ").append(fieldSlot).append(", ")
-            .append("i32 ").append(fieldName).append(", ")
-            .append("i32 ").append(fieldType).append(", ")
-            .append("i32 ").append(fieldModifiers).append(", ")
-            .append("i32 ").append(methodClazz).append(", ")
-            .append("i32 ").append(methodSlot).append(", ")
-            .append("i32 ").append(methodName).append(", ")
-            .append("i32 ").append(methodReturn).append(", ")
-            .append("i32 ").append(methodParams).append(", ")
-            .append("i32 ").append(methodExc).append(", ")
-            .append("i32 ").append(methodMods).append(", ")
-            .append("i32 ").append(ctorClazz).append(", ")
-            .append("i32 ").append(ctorSlot).append(", ")
-            .append("i32 ").append(ctorParams).append(", ")
-            .append("i32 ").append(ctorExc).append(", ")
-            .append("i32 ").append(ctorMods).append(", ")
-            .append("i32 ").append(ctorRoot).append(", ")
-            .append("i32 ").append(methodRoot).append(")\n");
-
-        int poolSize = globalEmitter.getLiteralPoolSize();
-        sb.append("  call void @__jnative_init_string_pool(i8** getelementptr inbounds ([")
-            .append(poolSize).append(" x i8*], [").append(poolSize)
-            .append(" x i8*]* @__jnative_literal_pool, i32 0, i32 0), i32 ")
-            .append(poolSize).append(")\n");
-
-        // ------------------------------------------------------------------
-        // Stage 1: minimal bootstrap prerequisites.
-        //
-        // These <clinit> bodies and the setJavaLangAccess hook must run
-        // before System.props exists (some of them allocate the very
-        // structures the bootstrap Properties table is built on), and they
-        // must run before initPhase1, which reads System.props.
-        // ------------------------------------------------------------------
         String stringClinitName = "fn_java_lang_String__clinit____V";
         Function stringClinit = module.getFunction(stringClinitName);
         if (stringClinit != null && stringClinit.getEntryBlock() != null) {
@@ -1519,11 +1273,19 @@ public class LlvmGenerator {
         sb.append("  store i8* %final_props, i8** @gv_java_lang_System_props\n");
 
         // ------------------------------------------------------------------
-        // Stage 7: user entry point.
+        // End of initializers
         // ------------------------------------------------------------------
-        String mainFunc = LlvmRuntime.mangleMethod(entryClass, entryMethod, entryDescriptor);
-        sb.append("  %args_array = call i8* @__jnative_create_string_array(i32 %argc, i8** %argv)\n");
-        sb.append("  call void @").append(mainFunc).append("(i8* %args_array)\n");
+        sb.append("  ret void\n");
+        sb.append("}\n\n");
+
+        return sb.toString();
+    }
+
+    private String generateMain() {
+        StringBuilder sb = new StringBuilder();
+        sb.append("define i32 @main(i32 %argc, i8** %argv) {\n");
+        sb.append("  %args = call i8* @__jnative_create_string_array(i32 %argc, i8** %argv)\n");
+        sb.append("  call void @").append(LlvmRuntime.mangleMethod(entryClass, entryMethod, entryDescriptor)).append("(i8* %args)\n");
         sb.append("  ret i32 0\n");
         sb.append("}\n\n");
 

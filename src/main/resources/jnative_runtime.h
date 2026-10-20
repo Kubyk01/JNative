@@ -216,16 +216,17 @@
  * mirror. The C write had succeeded; it just landed in the wrong byte.
  *
  * To make the layout independent of the JDK, the numeric offsets are
- * no longer #defines in this header. They are declared extern here and
- * assigned at program start-up by @main, which reads them from the
- * same LlvmGlobalEmitter.getFieldOffset() the LLVM emitter used to lay
- * out every object. See __jnative_reflect_set_layout() below and its
- * emitter-side caller in LlvmGenerator.generateMain().
+ * no longer #defines in this header. They are declared extern const here
+ * and defined as LLVM `constant i32` globals in _module.ll by
+ * LlvmGlobalEmitter.generateLayoutConstants(), which computes them with
+ * the same getFieldOffset() the LLVM emitter used to lay out every
+ * object. The values therefore exist from process start — there is no
+ * start-up hand-off, and -1 means "this JDK does not declare that field".
  *
  * Every consumer that used to write JNATIVE_METHOD_PARAM_TYPES_OFFSET
- * (a compile-time constant) now writes JNATIVE_METHOD_PARAM_TYPES_OFFSET
- * as an ordinary variable read; the syntax is identical, so no source
- * file outside this header needed to change.
+ * (a #define) now reads an extern const int32_t of the same name; the
+ * syntax is identical, so no source file outside this header needed to
+ * change.
  *
  * -----------------------------------------------------------------------
  * <clinit> identity preservation
@@ -485,51 +486,50 @@ struct JNativeVTable {
  * metadata, and that Unsafe.c reads back when it answers
  * Unsafe.objectFieldOffset / staticFieldOffset.
  *
- * They are NOT compile-time constants. The JDK declaration order of
- * these three classes is not stable across releases: on some JDK 21
- * builds `parameterTypes` is declared on java.lang.reflect.Method
- * itself, on others it is declared on the superclass
- * java.lang.reflect.Executable. That single difference shifts every
- * field of Method by one slot. When the offset was hard-coded and the
- * layout assumption was wrong, the C side wrote a valid, non-null
+ * They are emitted as LLVM `constant i32` globals, not #defines: the JDK
+ * declaration order of these three classes is not stable across
+ * releases — on some JDK 21 builds `parameterTypes` is declared on
+ * java.lang.reflect.Method itself, on others it is declared on the
+ * superclass java.lang.reflect.Executable. That single difference shifts
+ * every field of Method by one slot. When the offset was hard-coded and
+ * the layout assumption was wrong, the C side wrote a valid, non-null
  * empty parameter-types array at the wrong byte of the freshly-
  * allocated mirror, Java read `parameterTypes` from a different byte
  * and observed null, and the NPE was raised much later inside
  * Executable.sharedToString when a <clinit> stringified the mirror.
  *
- * The values are assigned at program start-up by @main through
- * __jnative_reflect_set_layout(), which reads them from the same
- * LlvmGlobalEmitter.getFieldOffset() the LLVM emitter used to lay out
- * every object. Until that call runs, every offset is -1 and any
- * consumer that dereferences one of them is making a genuine
- * programming error — the runtime refuses to write into a mirror
- * before the layout it was compiled for has been published.
+ * The values come from LlvmGlobalEmitter.generateLayoutConstants(),
+ * which computes them with the same getFieldOffset() the LLVM emitter
+ * used to lay out every object, and emits them into _module.ll's .rodata.
+ * They are therefore valid for the whole process lifetime; -1 means "this
+ * JDK does not declare that field" and any consumer that dereferences a
+ * -1 offset without testing it is making a genuine programming error.
  *
  * Consumers use them exactly as if they were the previous #defines:
  * the syntax is unchanged, only the storage class differs.
  */
 
-extern int32_t JNATIVE_FIELD_CLAZZ_OFFSET;
-extern int32_t JNATIVE_FIELD_SLOT_OFFSET;
-extern int32_t JNATIVE_FIELD_NAME_OFFSET;
-extern int32_t JNATIVE_FIELD_TYPE_OFFSET;
-extern int32_t JNATIVE_FIELD_MODIFIERS_OFFSET;
+extern const int32_t JNATIVE_FIELD_CLAZZ_OFFSET;
+extern const int32_t JNATIVE_FIELD_SLOT_OFFSET;
+extern const int32_t JNATIVE_FIELD_NAME_OFFSET;
+extern const int32_t JNATIVE_FIELD_TYPE_OFFSET;
+extern const int32_t JNATIVE_FIELD_MODIFIERS_OFFSET;
 
-extern int32_t JNATIVE_METHOD_CLAZZ_OFFSET;
-extern int32_t JNATIVE_METHOD_SLOT_OFFSET;
-extern int32_t JNATIVE_METHOD_NAME_OFFSET;
-extern int32_t JNATIVE_METHOD_RETURN_TYPE_OFFSET;
-extern int32_t JNATIVE_METHOD_PARAM_TYPES_OFFSET;
-extern int32_t JNATIVE_METHOD_EXC_TYPES_OFFSET;
-extern int32_t JNATIVE_METHOD_MODIFIERS_OFFSET;
-extern int32_t JNATIVE_METHOD_ROOT_OFFSET;
+extern const int32_t JNATIVE_METHOD_CLAZZ_OFFSET;
+extern const int32_t JNATIVE_METHOD_SLOT_OFFSET;
+extern const int32_t JNATIVE_METHOD_NAME_OFFSET;
+extern const int32_t JNATIVE_METHOD_RETURN_TYPE_OFFSET;
+extern const int32_t JNATIVE_METHOD_PARAM_TYPES_OFFSET;
+extern const int32_t JNATIVE_METHOD_EXC_TYPES_OFFSET;
+extern const int32_t JNATIVE_METHOD_MODIFIERS_OFFSET;
+extern const int32_t JNATIVE_METHOD_ROOT_OFFSET;
 
-extern int32_t JNATIVE_CTOR_CLAZZ_OFFSET;
-extern int32_t JNATIVE_CTOR_SLOT_OFFSET;
-extern int32_t JNATIVE_CTOR_PARAM_TYPES_OFFSET;
-extern int32_t JNATIVE_CTOR_EXC_TYPES_OFFSET;
-extern int32_t JNATIVE_CTOR_MODIFIERS_OFFSET;
-extern int32_t JNATIVE_CTOR_ROOT_OFFSET;
+extern const int32_t JNATIVE_CTOR_CLAZZ_OFFSET;
+extern const int32_t JNATIVE_CTOR_SLOT_OFFSET;
+extern const int32_t JNATIVE_CTOR_PARAM_TYPES_OFFSET;
+extern const int32_t JNATIVE_CTOR_EXC_TYPES_OFFSET;
+extern const int32_t JNATIVE_CTOR_MODIFIERS_OFFSET;
+extern const int32_t JNATIVE_CTOR_ROOT_OFFSET;
 
 /* JVM access-flag bits used by the reflection filter paths. */
 #ifndef JNATIVE_ACC_PUBLIC
@@ -994,7 +994,27 @@ extern void* __jnative_value_to_string_object(void* obj);
 
 /* ---- Literal pool -------------------------------------------------- */
 
-extern void __jnative_init_string_pool(void** pool, int32_t size);
+/**
+ * String literal pool emitted by LlvmGlobalEmitter.generateStringLiterals().
+ * `constant`, so it is read directly from .rodata with no initialisation
+ * function involved.
+ */
+extern void* __jnative_literal_pool[];
+extern const int32_t __jnative_literal_pool_size;
+
+/* ---- Runtime initialisation ---------------------------------------- */
+
+/**
+ * Runs the whole program initialisation: bootstrap-<clinit>s, the
+ * bootstrap phases System.initPhase1/2/3, the eager-schedule <clinit>s,
+ * the post-bootstrap HashedModules and the final System.props.
+ *
+ * Defined in _module.ll and invoked from the C constructor
+ * __jnative_auto_init (see jnative_runtime.c) before main(). If the built
+ * module contains no initialiser at all, the body degenerates to a single
+ * `ret void`.
+ */
+extern void __jnative_run_all_initializers(void);
 
 /* ---- Diagnostic hooks ---------------------------------------------- */
 
@@ -1014,68 +1034,22 @@ extern void* __jnative_make_bootstrap_props(
         int32_t chm_basecount_off,
         int32_t chm_sizectl_off);
 
-/* ---- Thread layout handoff ----------------------------------------- */
+/* ---- Thread layout (compile-time) --------------------------------- */
 
-extern void __jnative_thread_set_layout(
-        int32_t thread_object_size,
-        int32_t thread_holder_offset,
-        int32_t thread_tid_offset,
-        int32_t thread_name_offset,
-        int32_t thread_interruptlock_offset,
-        int32_t fh_object_size,
-        int32_t fh_group_offset,
-        int32_t fh_priority_offset,
-        int32_t fh_daemon_offset,
-        int32_t fh_status_offset,
-        int32_t tg_object_size,
-        int32_t tg_name_offset,
-        int32_t tg_maxpriority_offset,
-        int32_t tg_vmallow_offset);
-
-/* ---- Reflect-mirror layout handoff --------------------------------- */
-/*
- * Hand-off from LlvmGenerator.generateMain. The 17 offset arguments
- * below are the byte offsets of the fields that Class.c's mirror-
- * construction routines write into a freshly allocated
- * java.lang.reflect.{Field,Method,Constructor}, and that Unsafe.c's
- * field-offset accessors read back out. Each one comes from the same
- * LlvmGlobalEmitter.getFieldOffset() that laid out the mirror's
- * %struct type, so the values are guaranteed to agree with what
- * generated bytecode reads.
- *
- * Idempotent: a second call with the same values is a no-op. A second
- * call with different values is a programming error and is reported
- * to stderr; the second call is ignored so that a caller which
- * happens to invoke @main twice cannot silently corrupt the layout.
- *
- * A value of -1 for any offset means "the field does not exist on
- * this JDK". Callers that construct mirrors must check the field they
- * are about to write and skip it if the offset is negative. Consumers
- * that only read a mirror (Unsafe.objectFieldOffset, Unsafe.static
- * FieldOffset) will not encounter -1 unless the class was never
- * loaded by the emitter, in which case the mirror would not exist in
- * the first place.
- */
-extern void __jnative_reflect_set_layout(
-        int32_t field_clazz_offset,
-        int32_t field_slot_offset,
-        int32_t field_name_offset,
-        int32_t field_type_offset,
-        int32_t field_modifiers_offset,
-        int32_t method_clazz_offset,
-        int32_t method_slot_offset,
-        int32_t method_name_offset,
-        int32_t method_return_type_offset,
-        int32_t method_param_types_offset,
-        int32_t method_exc_types_offset,
-        int32_t method_modifiers_offset,
-        int32_t ctor_clazz_offset,
-        int32_t ctor_slot_offset,
-        int32_t ctor_param_types_offset,
-        int32_t ctor_exc_types_offset,
-        int32_t ctor_modifiers_offset,
-        int32_t ctor_root_offset,        /* NEW */
-        int32_t method_root_offset);     /* NEW */
+extern const int32_t THREAD_OBJECT_SIZE;
+extern const int32_t THREAD_HOLDER_OFFSET;
+extern const int32_t THREAD_TID_OFFSET;
+extern const int32_t THREAD_NAME_OFFSET;
+extern const int32_t THREAD_INTERRUPTLOCK_OFFSET;
+extern const int32_t FH_OBJECT_SIZE;
+extern const int32_t FH_GROUP_OFFSET;
+extern const int32_t FH_PRIORITY_OFFSET;
+extern const int32_t FH_DAEMON_OFFSET;
+extern const int32_t FH_STATUS_OFFSET;
+extern const int32_t TG_OBJECT_SIZE;
+extern const int32_t TG_NAME_OFFSET;
+extern const int32_t TG_MAXPRIORITY_OFFSET;
+extern const int32_t TG_VMALLOW_OFFSET;
 
 /* ========================================================================
  *  Inline helpers

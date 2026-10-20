@@ -334,123 +334,17 @@ void __jnative_free(void* p) {
 /* ============================================================================
  * Reflect-mirror field offsets
  *
- * These globals are declared extern in jnative_runtime.h and referenced by
- * jnative/lang/Class.c (mirror construction) and jnative/jdk/internal/misc/
- * Unsafe.c (field-offset queries). Until @main publishes the real values,
- * every offset is -1, which means "not yet set"; any consumer that reads a
- * -1 offset is making a genuine programming error and the runtime refuses
- * to write into a reflect mirror. See __jnative_reflect_set_layout below.
+ * These globals are declared extern const in jnative_runtime.h and are
+ * defined as LLVM `constant i32` globals by
+ * LlvmGlobalEmitter.generateLayoutConstants(), which emits them into
+ * _module.ll's .rodata. The same emitter computes the values that build
+ * %struct.* / %ReflectionClass, so the C side reads exactly the bytes the
+ * LLVM backend writes — no runtime hand-off is involved any more.
  *
- * NOTE: the analogous __jnative_thread_set_layout function and its 13
- * static variables live in jnative/lang/Thread.c, not here. They are
- * owned by the Thread class because every consumer of those offsets is
- * in Thread.c and its sibling files.
+ * A value of -1 means "this JDK does not declare that field" (for example
+ * vmAllowSuspension was removed in JDK 19 by JDK-8283117); consumers must
+ * test `offset >= 0` before writing through it.
  * ========================================================================== */
-
-int32_t JNATIVE_FIELD_CLAZZ_OFFSET     = -1;
-int32_t JNATIVE_FIELD_SLOT_OFFSET      = -1;
-int32_t JNATIVE_FIELD_NAME_OFFSET      = -1;
-int32_t JNATIVE_FIELD_TYPE_OFFSET      = -1;
-int32_t JNATIVE_FIELD_MODIFIERS_OFFSET = -1;
-
-int32_t JNATIVE_METHOD_CLAZZ_OFFSET        = -1;
-int32_t JNATIVE_METHOD_SLOT_OFFSET         = -1;
-int32_t JNATIVE_METHOD_NAME_OFFSET         = -1;
-int32_t JNATIVE_METHOD_RETURN_TYPE_OFFSET  = -1;
-int32_t JNATIVE_METHOD_PARAM_TYPES_OFFSET  = -1;
-int32_t JNATIVE_METHOD_EXC_TYPES_OFFSET    = -1;
-int32_t JNATIVE_METHOD_MODIFIERS_OFFSET    = -1;
-int32_t JNATIVE_METHOD_ROOT_OFFSET         = -1;
-
-int32_t JNATIVE_CTOR_CLAZZ_OFFSET       = -1;
-int32_t JNATIVE_CTOR_SLOT_OFFSET        = -1;
-int32_t JNATIVE_CTOR_PARAM_TYPES_OFFSET = -1;
-int32_t JNATIVE_CTOR_EXC_TYPES_OFFSET   = -1;
-int32_t JNATIVE_CTOR_MODIFIERS_OFFSET   = -1;
-int32_t JNATIVE_CTOR_ROOT_OFFSET        = -1;
-
-/* ============================================================================
- * Reflect-mirror layout hand-off
- *
- * Idempotent. A second call with the same values is a no-op; a second call
- * with different values is a programming error and is reported to stderr
- * without corrupting the previously published layout.
- * ========================================================================== */
-
-void __jnative_reflect_set_layout(
-    int32_t field_clazz_offset,
-    int32_t field_slot_offset,
-    int32_t field_name_offset,
-    int32_t field_type_offset,
-    int32_t field_modifiers_offset,
-    int32_t method_clazz_offset,
-    int32_t method_slot_offset,
-    int32_t method_name_offset,
-    int32_t method_return_type_offset,
-    int32_t method_param_types_offset,
-    int32_t method_exc_types_offset,
-    int32_t method_modifiers_offset,
-    int32_t ctor_clazz_offset,
-    int32_t ctor_slot_offset,
-    int32_t ctor_param_types_offset,
-    int32_t ctor_exc_types_offset,
-    int32_t ctor_modifiers_offset,
-    int32_t ctor_root_offset,
-    int32_t method_root_offset)
-{
-    /* First call wins. Everything after is either a no-op (identical
-     * values, the common case in a well-formed image where @main runs
-     * exactly once) or a warning that the caller is trying to change
-     * the layout under our feet. */
-    if (JNATIVE_FIELD_CLAZZ_OFFSET >= 0) {
-        if (JNATIVE_FIELD_CLAZZ_OFFSET     != field_clazz_offset
-         || JNATIVE_FIELD_SLOT_OFFSET      != field_slot_offset
-         || JNATIVE_FIELD_NAME_OFFSET      != field_name_offset
-         || JNATIVE_FIELD_TYPE_OFFSET      != field_type_offset
-         || JNATIVE_FIELD_MODIFIERS_OFFSET != field_modifiers_offset
-         || JNATIVE_METHOD_CLAZZ_OFFSET        != method_clazz_offset
-         || JNATIVE_METHOD_SLOT_OFFSET         != method_slot_offset
-         || JNATIVE_METHOD_NAME_OFFSET         != method_name_offset
-         || JNATIVE_METHOD_RETURN_TYPE_OFFSET  != method_return_type_offset
-         || JNATIVE_METHOD_PARAM_TYPES_OFFSET  != method_param_types_offset
-         || JNATIVE_METHOD_EXC_TYPES_OFFSET    != method_exc_types_offset
-         || JNATIVE_METHOD_MODIFIERS_OFFSET    != method_modifiers_offset
-         || JNATIVE_METHOD_ROOT_OFFSET         != method_root_offset
-         || JNATIVE_CTOR_CLAZZ_OFFSET       != ctor_clazz_offset
-         || JNATIVE_CTOR_SLOT_OFFSET        != ctor_slot_offset
-         || JNATIVE_CTOR_PARAM_TYPES_OFFSET != ctor_param_types_offset
-         || JNATIVE_CTOR_EXC_TYPES_OFFSET   != ctor_exc_types_offset
-         || JNATIVE_CTOR_MODIFIERS_OFFSET   != ctor_modifiers_offset
-         || JNATIVE_CTOR_ROOT_OFFSET        != ctor_root_offset) {
-            fprintf(stderr,
-                "jnative: warning: __jnative_reflect_set_layout called "
-                "twice with different values; ignoring the second call\n");
-        }
-        return;
-    }
-
-    JNATIVE_FIELD_CLAZZ_OFFSET     = field_clazz_offset;
-    JNATIVE_FIELD_SLOT_OFFSET      = field_slot_offset;
-    JNATIVE_FIELD_NAME_OFFSET      = field_name_offset;
-    JNATIVE_FIELD_TYPE_OFFSET      = field_type_offset;
-    JNATIVE_FIELD_MODIFIERS_OFFSET = field_modifiers_offset;
-
-    JNATIVE_METHOD_CLAZZ_OFFSET        = method_clazz_offset;
-    JNATIVE_METHOD_SLOT_OFFSET         = method_slot_offset;
-    JNATIVE_METHOD_NAME_OFFSET         = method_name_offset;
-    JNATIVE_METHOD_RETURN_TYPE_OFFSET  = method_return_type_offset;
-    JNATIVE_METHOD_PARAM_TYPES_OFFSET  = method_param_types_offset;
-    JNATIVE_METHOD_EXC_TYPES_OFFSET    = method_exc_types_offset;
-    JNATIVE_METHOD_MODIFIERS_OFFSET    = method_modifiers_offset;
-    JNATIVE_METHOD_ROOT_OFFSET         = method_root_offset;
-
-    JNATIVE_CTOR_CLAZZ_OFFSET       = ctor_clazz_offset;
-    JNATIVE_CTOR_SLOT_OFFSET        = ctor_slot_offset;
-    JNATIVE_CTOR_PARAM_TYPES_OFFSET = ctor_param_types_offset;
-    JNATIVE_CTOR_EXC_TYPES_OFFSET   = ctor_exc_types_offset;
-    JNATIVE_CTOR_MODIFIERS_OFFSET   = ctor_modifiers_offset;
-    JNATIVE_CTOR_ROOT_OFFSET        = ctor_root_offset;
-}
 
 /* ============================================================================
  * Monitor table
@@ -1317,7 +1211,6 @@ static void __jnative_fatal_signal_handler(int sig, siginfo_t* info, void* ucont
     _exit(128 + sig);
 }
 
-__attribute__((constructor))
 static void __jnative_install_fatal_handlers(void) {
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
@@ -1328,6 +1221,33 @@ static void __jnative_install_fatal_handlers(void) {
     sigaction(SIGBUS,  &sa, NULL);
     sigaction(SIGFPE,  &sa, NULL);
     sigaction(SIGILL,  &sa, NULL);
+}
+
+/**
+ * C-side initialisation entry point.
+ *
+ * The order is fixed and mandatory:
+ *
+ *   1. Install the fatal signal handlers. Any <clinit> run below can die
+ *      with SIGSEGV/SIGBUS; without the handlers installed the death would
+ *      be silent.
+ *
+ *   2. Run the whole Java initialisation plan: bootstrap-<clinit>s,
+ *      bootstrap phases, eager-<clinit>s, HashedModules, final
+ *      System.props. When __jnative_run_all_initializers returns, every
+ *      class whose <clinit> Analyzer.computeDeferredClinits did not defer
+ *      is initialised and every static field holds the value it would
+ *      have after a normal JVM start.
+ *
+ *      Deferred <clinit>s are still triggered lazily by their wrappers;
+ *      that is orthogonal to this move.
+ *
+ *   3. main() starts on a fully initialised image.
+ */
+__attribute__((constructor))
+static void __jnative_auto_init(void) {
+    __jnative_install_fatal_handlers();
+    __jnative_run_all_initializers();
 }
 
 /* ============================================================================
@@ -2213,14 +2133,7 @@ static int32_t __jnative_string_eq(void* a, void* b) {
     return la == lb && memcmp(ba, bb, (size_t)la) == 0;
 }
 
-/* ---- Literal pool ---- */
-static void**  __jnative_pool = NULL;
-static int32_t __jnative_pool_size = 0;
 
-void __jnative_init_string_pool(void** pool, int32_t size) {
-    __jnative_pool = pool;
-    __jnative_pool_size = size;
-}
 
 /* ---- Runtime intern table ---- */
 typedef struct JNativeInternEntry {
@@ -2342,9 +2255,11 @@ void* __jnative_value_to_string_object(void* obj) {
 void* __jnative_string_intern(void* this_str) {
     if (this_str == NULL) return NULL;
 
-    for (int32_t i = 0; i < __jnative_pool_size; i++) {
-        if (__jnative_pool[i] != NULL && __jnative_string_eq(this_str, __jnative_pool[i])) {
-            return __jnative_pool[i];
+    if (__jnative_literal_pool_size > 0) {
+        for (int32_t i = 0; i < __jnative_literal_pool_size; i++) {
+            if (__jnative_literal_pool[i] != NULL && __jnative_string_eq(this_str, __jnative_literal_pool[i])) {
+                return __jnative_literal_pool[i];
+            }
         }
     }
 

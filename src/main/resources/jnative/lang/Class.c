@@ -17,13 +17,12 @@ extern const char* __jnative_read_string_bytes(void* s, int32_t* out_len);
  * --------------------------------------------------------------------------
  * Guard for the reflect-mirror "root" fields.
  *
- * JNATIVE_METHOD_ROOT_OFFSET and JNATIVE_CTOR_ROOT_OFFSET are published by
- * @main through __jnative_reflect_set_layout. The call site in
- * LlvmGenerator.generateMain currently passes only 17 arguments to a
- * function whose signature declares 19 — the two new root offsets were
- * never threaded through. The C side therefore observes two stack slots
- * worth of stale data, and a value that happens to be a plausible-looking
- * positive integer drives a write to method + <garbage>.
+ * JNATIVE_METHOD_ROOT_OFFSET and JNATIVE_CTOR_ROOT_OFFSET are emitted by
+ * LlvmGlobalEmitter.generateLayoutConstants() as `constant i32` globals.
+ * The guard exists because the value is not guaranteed to be meaningful
+ * on every JDK: a field that a given JDK release no longer declares is
+ * published as -1, and a future rename could surface any other value the
+ * layout computation produced.
  *
  * The bounds check below is the last line of defence: it is better to
  * silently skip the root write (which only matters for one corner case of
@@ -32,9 +31,8 @@ extern const char* __jnative_read_string_bytes(void* s, int32_t* out_len);
  * Method and Constructor both put root within the first ~256 bytes of the
  * object.
  *
- * A root offset of -1 (the initial value, and the value after the
- * mis-signature is corrected on the Java side) means "not set" and the
- * write is skipped.
+ * A root offset of -1 (the value published when the JDK does not declare
+ * the field) means "not set" and the write is skipped.
  */
 #define JNATIVE_ROOT_OFFSET_MAX 512
 
@@ -308,9 +306,9 @@ static void* build_parameter_types_array(const char* desc)
  * Build a java.lang.reflect.Field from a native ReflectionField
  * descriptor.
  *
- * The mirror is sized generously: the offsets published by @main
- * through __jnative_reflect_set_layout are checked, and the allocation
- * covers every field the routine writes.
+ * The mirror is sized generously: the offsets read from the .rodata
+ * constants emitted by LlvmGlobalEmitter.generateLayoutConstants() are
+ * checked, and the allocation covers every field the routine writes.
  */
 static void* create_field_mirror(ReflectionClass* declaring_cls,
                                  ReflectionField* rf)
@@ -374,10 +372,9 @@ static void* create_field_mirror(ReflectionClass* declaring_cls,
  *
  * The `root` write — which is what makes Method.copy() work on a mirror
  * that has already had its methodAccessor set — is gated on a bounds
- * check. When the offset published by __jnative_reflect_set_layout is
- * either -1 (because the emitter-side argument was never threaded
- * through) or a garbage value that happens to be inside the plausible
- * range, the write is skipped rather than performed at a wild address.
+ * check. When the emitted constant is -1 (this JDK does not declare the
+ * field) or a value that does not fall inside the plausible range, the
+ * write is skipped rather than performed at a wild address.
  * A mirror that is not marked as its own root will fail Method.copy()
  * with "Can not copy a non-root Method", which is a clean Java-level
  * error rather than a segfault.

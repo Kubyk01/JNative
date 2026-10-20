@@ -15,15 +15,18 @@
  *
  * The real body lives in NativeMethodAccessorImpl.c alongside
  * NativeMethodAccessorImpl.invoke0, because the two share all of the
- * reflect-mirror layout helpers:
+ * descriptor/lookup helpers:
  *
- *   - detect_reflect_layout       (Method/Constructor hierarchy sniff)
  *   - build_parameter_list
  *   - build_method_descriptor     (invoke0 only)
  *   - build_constructor_descriptor (newInstance0 only)
  *   - lookup_reflection_method    (invoke0 only)
  *   - lookup_reflection_constructor (newInstance0 only)
  *   - append_class_descriptor
+ *
+ * The reflect-mirror offsets they read (JNATIVE_METHOD_*_OFFSET,
+ * JNATIVE_CTOR_*_OFFSET) are compile-time constants emitted into
+ * _module.ll, so no per-JDK layout detection is needed any more.
  *
  * Splitting the helper code across two files would mean duplicating
  * ~150 lines of layout code, which is worse than this thin shim.
@@ -62,7 +65,7 @@
  *                NativeConstructorAccessorImpl_newInstance0__…       (this file)
  *             -> __jnative_impl_reflect_
  *                    NativeConstructorAccessorImpl_newInstance0__     (NativeMethodAccessorImpl.c)
- *                 -> shared reflect-layout helpers
+ *                 -> shared descriptor/lookup helpers
  *                     -> ReflectionConstructor.adaptor(args)
  *
  * Each layer is a direct C call. No dlsym, no JNI registration, no

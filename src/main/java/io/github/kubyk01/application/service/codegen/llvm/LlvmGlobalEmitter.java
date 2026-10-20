@@ -307,7 +307,6 @@ public class LlvmGlobalEmitter {
     private String cachedTypeDefinitions;
 
     private final Map<String, String> extraStructs = new ConcurrentHashMap<>();
-    private final Map<String, String> extraVtables = new ConcurrentHashMap<>();
 
     // =========================================================================
     //  Native overrides and embedded resources
@@ -833,7 +832,8 @@ public class LlvmGlobalEmitter {
      */
     public String generateGlobalDefinitions() {
         prepareLayouts();
-        return generateStaticFields() +
+        return generateLayoutConstants() +
+            generateStaticFields() +
             // generateStringLiterals() depends on vtableNames, which only exists
             // after generateVtables(); the reflection data depends on the string
             // literal pool; the unnamed module and the embedded-resource table
@@ -847,6 +847,102 @@ public class LlvmGlobalEmitter {
             generateEmbeddedResources() +
             generateReflectionData() +
             generateFunctionIndex();
+    }
+
+    public String generateLayoutConstants() {
+        StringBuilder sb = new StringBuilder();
+        sb.append("\n; ----- Layout constants (compile-time) -----\n");
+
+        // Thread
+        int threadSize = computeObjectSize("java/lang/Thread");
+        int threadHolder = safeGlobalFieldOffset("java/lang/Thread", "holder");
+        int threadTid = safeGlobalFieldOffset("java/lang/Thread", "tid");
+        int threadName = safeGlobalFieldOffset("java/lang/Thread", "name");
+        int threadInterruptLock = safeGlobalFieldOffsetAllowMissing("java/lang/Thread", "interruptLock");
+
+        int fhSize = computeObjectSize("java/lang/Thread$FieldHolder");
+        int fhGroup = safeGlobalFieldOffset("java/lang/Thread$FieldHolder", "group");
+        int fhPriority = safeGlobalFieldOffset("java/lang/Thread$FieldHolder", "priority");
+        int fhDaemon = safeGlobalFieldOffset("java/lang/Thread$FieldHolder", "daemon");
+        int fhStatus = safeGlobalFieldOffset("java/lang/Thread$FieldHolder", "threadStatus");
+
+        int tgSize = computeObjectSize("java/lang/ThreadGroup");
+        int tgName = safeGlobalFieldOffset("java/lang/ThreadGroup", "name");
+        int tgMaxPrio = safeGlobalFieldOffset("java/lang/ThreadGroup", "maxPriority");
+        int tgVmAllow = safeGlobalFieldOffsetAllowMissing("java/lang/ThreadGroup", "vmAllowSuspension");
+
+        sb.append("@THREAD_OBJECT_SIZE          = constant i32 ").append(threadSize).append("\n");
+        sb.append("@THREAD_HOLDER_OFFSET        = constant i32 ").append(threadHolder).append("\n");
+        sb.append("@THREAD_TID_OFFSET           = constant i32 ").append(threadTid).append("\n");
+        sb.append("@THREAD_NAME_OFFSET          = constant i32 ").append(threadName).append("\n");
+        sb.append("@THREAD_INTERRUPTLOCK_OFFSET = constant i32 ").append(threadInterruptLock).append("\n");
+        sb.append("@FH_OBJECT_SIZE              = constant i32 ").append(fhSize).append("\n");
+        sb.append("@FH_GROUP_OFFSET             = constant i32 ").append(fhGroup).append("\n");
+        sb.append("@FH_PRIORITY_OFFSET          = constant i32 ").append(fhPriority).append("\n");
+        sb.append("@FH_DAEMON_OFFSET            = constant i32 ").append(fhDaemon).append("\n");
+        sb.append("@FH_STATUS_OFFSET            = constant i32 ").append(fhStatus).append("\n");
+        sb.append("@TG_OBJECT_SIZE              = constant i32 ").append(tgSize).append("\n");
+        sb.append("@TG_NAME_OFFSET              = constant i32 ").append(tgName).append("\n");
+        sb.append("@TG_MAXPRIORITY_OFFSET       = constant i32 ").append(tgMaxPrio).append("\n");
+        sb.append("@TG_VMALLOW_OFFSET           = constant i32 ").append(tgVmAllow).append("\n\n");
+
+        // reflect
+        int fieldClazz = safeGlobalFieldOffsetAllowMissing("java/lang/reflect/Field", "clazz");
+        int fieldSlot = safeGlobalFieldOffsetAllowMissing("java/lang/reflect/Field", "slot");
+        int fieldName = safeGlobalFieldOffsetAllowMissing("java/lang/reflect/Field", "name");
+        int fieldType = safeGlobalFieldOffsetAllowMissing("java/lang/reflect/Field", "type");
+        int fieldModifiers = safeGlobalFieldOffsetAllowMissing("java/lang/reflect/Field", "modifiers");
+        int methodClazz = safeGlobalFieldOffsetAllowMissing("java/lang/reflect/Method", "clazz");
+        int methodSlot = safeGlobalFieldOffsetAllowMissing("java/lang/reflect/Method", "slot");
+        int methodName = safeGlobalFieldOffsetAllowMissing("java/lang/reflect/Method", "name");
+        int methodReturn = safeGlobalFieldOffsetAllowMissing("java/lang/reflect/Method", "returnType");
+        int methodParams = safeGlobalFieldOffsetAllowMissing("java/lang/reflect/Method", "parameterTypes");
+        int methodExc = safeGlobalFieldOffsetAllowMissing("java/lang/reflect/Method", "exceptionTypes");
+        int methodMods = safeGlobalFieldOffsetAllowMissing("java/lang/reflect/Method", "modifiers");
+        int ctorClazz = safeGlobalFieldOffsetAllowMissing("java/lang/reflect/Constructor", "clazz");
+        int ctorSlot = safeGlobalFieldOffsetAllowMissing("java/lang/reflect/Constructor", "slot");
+        int ctorParams = safeGlobalFieldOffsetAllowMissing("java/lang/reflect/Constructor", "parameterTypes");
+        int ctorExc = safeGlobalFieldOffsetAllowMissing("java/lang/reflect/Constructor", "exceptionTypes");
+        int ctorMods = safeGlobalFieldOffsetAllowMissing("java/lang/reflect/Constructor", "modifiers");
+        int ctorRoot = safeGlobalFieldOffsetAllowMissing("java/lang/reflect/Constructor", "root");
+        int methodRoot = safeGlobalFieldOffsetAllowMissing("java/lang/reflect/Method", "root");
+
+        sb.append("@JNATIVE_FIELD_CLAZZ_OFFSET      = constant i32 ").append(fieldClazz).append("\n");
+        sb.append("@JNATIVE_FIELD_SLOT_OFFSET       = constant i32 ").append(fieldSlot).append("\n");
+        sb.append("@JNATIVE_FIELD_NAME_OFFSET       = constant i32 ").append(fieldName).append("\n");
+        sb.append("@JNATIVE_FIELD_TYPE_OFFSET       = constant i32 ").append(fieldType).append("\n");
+        sb.append("@JNATIVE_FIELD_MODIFIERS_OFFSET  = constant i32 ").append(fieldModifiers).append("\n");
+        sb.append("@JNATIVE_METHOD_CLAZZ_OFFSET          = constant i32 ").append(methodClazz).append("\n");
+        sb.append("@JNATIVE_METHOD_SLOT_OFFSET           = constant i32 ").append(methodSlot).append("\n");
+        sb.append("@JNATIVE_METHOD_NAME_OFFSET           = constant i32 ").append(methodName).append("\n");
+        sb.append("@JNATIVE_METHOD_RETURN_TYPE_OFFSET    = constant i32 ").append(methodReturn).append("\n");
+        sb.append("@JNATIVE_METHOD_PARAM_TYPES_OFFSET    = constant i32 ").append(methodParams).append("\n");
+        sb.append("@JNATIVE_METHOD_EXC_TYPES_OFFSET      = constant i32 ").append(methodExc).append("\n");
+        sb.append("@JNATIVE_METHOD_MODIFIERS_OFFSET      = constant i32 ").append(methodMods).append("\n");
+        sb.append("@JNATIVE_METHOD_ROOT_OFFSET           = constant i32 ").append(methodRoot).append("\n");
+        sb.append("@JNATIVE_CTOR_CLAZZ_OFFSET            = constant i32 ").append(ctorClazz).append("\n");
+        sb.append("@JNATIVE_CTOR_SLOT_OFFSET             = constant i32 ").append(ctorSlot).append("\n");
+        sb.append("@JNATIVE_CTOR_PARAM_TYPES_OFFSET      = constant i32 ").append(ctorParams).append("\n");
+        sb.append("@JNATIVE_CTOR_EXC_TYPES_OFFSET        = constant i32 ").append(ctorExc).append("\n");
+        sb.append("@JNATIVE_CTOR_MODIFIERS_OFFSET        = constant i32 ").append(ctorMods).append("\n");
+        sb.append("@JNATIVE_CTOR_ROOT_OFFSET             = constant i32 ").append(ctorRoot).append("\n\n");
+        return sb.toString();
+    }
+
+    private int safeGlobalFieldOffset(String owner, String field) {
+        try {
+            return getFieldOffset(owner, field);
+        } catch (Exception e) {
+            return 0;
+        }
+    }
+
+    private int safeGlobalFieldOffsetAllowMissing(String owner, String field) {
+        try {
+            return getFieldOffset(owner, field);
+        } catch (Exception e) {
+            return -1;
+        }
     }
     /**
      * Emits the one shared {@code java.lang.Module} object that stands for the
