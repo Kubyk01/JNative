@@ -1082,39 +1082,15 @@ static inline void jnative_type_info_name(const char* class_name,
     }
 }
 
-static inline ReflectionClass* jnative_class_by_name(const char* name)
-{
-    if (name == NULL) return NULL;
-    if (reflect_all_classes == NULL) return NULL;
+/* ---- Class lookup (defined in jnative_runtime.c, hashed) ---- */
 
-    ReflectionClass** pp = reflect_all_classes;
-    while (*pp != NULL) {
-        ReflectionClass* cls = *pp;
-        const char* cls_name = cls->cname;
-        if (cls_name != NULL && strcmp(cls_name, name) == 0) {
-            return cls;
-        }
-        pp++;
-    }
-    return NULL;
-}
+extern ReflectionClass* jnative_class_by_name(const char* name);
+extern ReflectionClass* jnative_class_by_dotted_name(const char* name);
 
-static inline ReflectionClass* jnative_class_by_dotted_name(const char* name)
-{
-    if (name == NULL) return NULL;
-
-    ReflectionClass* cls = jnative_class_by_name(name);
-    if (cls != NULL) return cls;
-
-    char buf[512];
-    size_t n = strlen(name);
-    if (n >= sizeof(buf)) return NULL;
-    memcpy(buf, name, n + 1);
-    for (char* p = buf; *p; p++) {
-        if (*p == '.') *p = '/';
-    }
-    return jnative_class_by_name(buf);
-}
+/* Cached "[B" mirror, initialised once via pthread_once. Used by the
+ * String-creation fast path — the single most frequent array allocation
+ * in the entire runtime. */
+extern ReflectionClass* jnative_get_byte_array_class(void);
 
 static inline void* jnative_lookup_class_vtable(ReflectionClass* cls)
 {
@@ -1178,20 +1154,32 @@ static inline void* jnative_string(const char* s)
  * "[[I", ...). The mirror is looked up in reflect_all_classes[]; a NULL
  * mirror is tolerated and simply propagates.
  */
-static inline void* jnative_array_alloc(const char* klass_name,
-                                        int32_t length,
-                                        int32_t elem_size)
+/**
+ * Allocation with an already-resolved ReflectionClass*. Avoids the
+ * jnative_class_by_name lookup entirely for callers that know the class
+ * (String's backing [B, the fixed klass of a lambda, ...).
+ */
+static inline void* jnative_array_alloc_with_class(ReflectionClass* cls,
+                                                   int32_t length,
+                                                   int32_t elem_size)
 {
     if (length < 0) length = 0;
     size_t total = (size_t)JAVA_ARR_HDR + (size_t)length * (size_t)elem_size;
     void* arr = calloc(1, total);
     if (arr == NULL) return NULL;
 
-    ReflectionClass* cls = jnative_class_by_name(klass_name);
     *(ReflectionClass**)((char*)arr + JAVA_ARR_KLASS_OFFSET) = cls;
     *(int32_t*)((char*)arr + JAVA_ARR_LENGTH_OFFSET)         = length;
     *(int32_t*)((char*)arr + JAVA_ARR_ELEM_SIZE_OFFSET)      = elem_size;
     return arr;
+}
+
+static inline void* jnative_array_alloc(const char* klass_name,
+                                        int32_t length,
+                                        int32_t elem_size)
+{
+    return jnative_array_alloc_with_class(
+        jnative_class_by_name(klass_name), length, elem_size);
 }
 
 static inline void* jnative_byte_array(const void* data, int32_t len)

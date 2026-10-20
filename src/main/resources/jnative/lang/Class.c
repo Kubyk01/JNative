@@ -635,6 +635,7 @@ static void* cached_dotted_class_name(struct ReflectionClass* cls) {
     if (internal == NULL) return NULL;
 
     size_t len = strlen(internal);
+    if (len == 0) return NULL;
 
     char* out = (char*)malloc(len + 1);
     if (out == NULL) return NULL;

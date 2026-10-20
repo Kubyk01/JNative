@@ -40,6 +40,149 @@ static const char* __jnative_vtable_class_name(void* vtable) {
 }
 
 /* ============================================================================
+ * Class-name hash map
+ *
+ * reflect_all_classes[] is a NULL-terminated, compile-time-constant array
+ * emitted by LlvmGlobalEmitter.generateReflectionData(). Every jnative_*
+ * native that needs to resolve a class by name — most importantly
+ * jnative_array_alloc, called on every Java array allocation, i.e. on
+ * every single String the program creates — used to walk it linearly.
+ * On a full JDK closure that is ~6000 strcmp() calls per allocation.
+ *
+ * The map is built exactly once, on first use, and is read-only
+ * afterwards. reflect_all_classes[] cannot grow: it is emitted as a
+ * `constant` LLVM global whose initializer is fully resolved by the
+ * dynamic linker at process start, and no JNative code path ever writes
+ * to it. The pthread_once is therefore sufficient for thread-safety;
+ * no mutex is needed on the hot path.
+ *
+ * Size policy: next power of two ≥ 2 × class count, i.e. load factor
+ * ≤ 0.5. On a full JDK that is 16384 buckets for ~6000 classes, a few
+ * hundred KiB of .bss — resident in L2, one probe per lookup in the
+ * overwhelming majority of calls.
+ * ========================================================================== */
+
+typedef struct {
+    const char*      name;   /* points into cls->cname, not owned */
+    ReflectionClass* cls;
+} ClassNameEntry;
+
+typedef struct {
+    ClassNameEntry* entries;
+    size_t          capacity;   /* power of two; 0 → build failed */
+} ClassNameMap;
+
+static ClassNameMap    class_name_map      = { NULL, 0 };
+static pthread_once_t  class_name_map_once = PTHREAD_ONCE_INIT;
+
+/* ---- Cached "[B" class ---------------------------------------------- */
+
+static ReflectionClass* jnative_byte_array_class = NULL;
+static pthread_once_t   jnative_byte_array_class_once = PTHREAD_ONCE_INIT;
+
+static uint32_t hash_class_name(const char* s) {
+    uint32_t h = 2166136261u;
+    for (const char* p = s; *p; p++) {
+        h ^= (unsigned char)*p;
+        h *= 16777619u;
+    }
+    return h;
+}
+
+static void build_class_name_map(void) {
+    if (reflect_all_classes == NULL) return;
+
+    size_t count = 0;
+    while (reflect_all_classes[count] != NULL) count++;
+    if (count == 0) return;
+
+    size_t cap = 64;
+    while (cap < count * 2) cap <<= 1;
+
+    ClassNameEntry* entries =
+        (ClassNameEntry*)calloc(cap, sizeof(ClassNameEntry));
+    if (entries == NULL) return;   /* fallback below keeps working */
+
+    size_t mask = cap - 1;
+    for (size_t i = 0; i < count; i++) {
+        ReflectionClass* cls = reflect_all_classes[i];
+        if (cls == NULL || cls->cname == NULL) continue;
+
+        uint32_t h = hash_class_name(cls->cname);
+        size_t idx = (size_t)(h & mask);
+        while (entries[idx].name != NULL) {
+            if (strcmp(entries[idx].name, cls->cname) == 0) break;
+            idx = (idx + 1) & mask;
+        }
+        if (entries[idx].name == NULL) {
+            entries[idx].name = cls->cname;
+            entries[idx].cls  = cls;
+        }
+    }
+
+    class_name_map.entries  = entries;
+    class_name_map.capacity = cap;
+}
+
+ReflectionClass* jnative_class_by_name(const char* name) {
+    if (name == NULL) return NULL;
+    if (reflect_all_classes == NULL) return NULL;
+
+    pthread_once(&class_name_map_once, build_class_name_map);
+
+    if (class_name_map.capacity == 0) {
+        /* calloc failed at build time — fall back to the linear scan
+         * rather than returning NULL for every lookup. This branch
+         * fires only under memory exhaustion and is never observed on
+         * a normal run. */
+        ReflectionClass** pp = reflect_all_classes;
+        while (*pp != NULL) {
+            if ((*pp)->cname != NULL && strcmp((*pp)->cname, name) == 0) {
+                return *pp;
+            }
+            pp++;
+        }
+        return NULL;
+    }
+
+    size_t mask = class_name_map.capacity - 1;
+    uint32_t h = hash_class_name(name);
+    size_t idx = (size_t)(h & mask);
+    while (class_name_map.entries[idx].name != NULL) {
+        if (strcmp(class_name_map.entries[idx].name, name) == 0) {
+            return class_name_map.entries[idx].cls;
+        }
+        idx = (idx + 1) & mask;
+    }
+    return NULL;
+}
+
+ReflectionClass* jnative_class_by_dotted_name(const char* name) {
+    if (name == NULL) return NULL;
+
+    ReflectionClass* cls = jnative_class_by_name(name);
+    if (cls != NULL) return cls;
+
+    char buf[512];
+    size_t n = strlen(name);
+    if (n >= sizeof(buf)) return NULL;
+    memcpy(buf, name, n + 1);
+    for (char* p = buf; *p; p++) {
+        if (*p == '.') *p = '/';
+    }
+    return jnative_class_by_name(buf);
+}
+
+static void init_byte_array_class(void) {
+    jnative_byte_array_class = jnative_class_by_name("[B");
+}
+
+ReflectionClass* jnative_get_byte_array_class(void) {
+    pthread_once(&jnative_byte_array_class_once, init_byte_array_class);
+    return jnative_byte_array_class;
+}
+
+/* ============================================================================
  * Safe deallocation and cycle-safe destruction.
  * See the matching comment block in jnative_runtime.h.
  * ========================================================================== */
@@ -447,6 +590,51 @@ void __jnative_monitor_exit(void* obj) {
 }
 
 /* ============================================================================
+ * Catch context stack
+ *
+ * Declared here, ahead of the lazy <clinit> state machine, because
+ * mark_abandoned_clinits() — whose body sits right below
+ * __jnative_clinit_exit() — must order the catch stack against the
+ * <clinit> frame stack.
+ * ========================================================================== */
+
+typedef struct CatchContext {
+    struct CatchContext* next;
+    void* type_info;
+    jmp_buf buf;
+
+    /* Strictly monotonic per-thread id assigned in
+     * __jnative_push_catch. Used only by mark_abandoned_clinits() to
+     * order the catch stack against the clinit stack. */
+    uint64_t id;
+} CatchContext;
+
+static _Thread_local CatchContext* current_context = NULL;
+static _Thread_local void* current_exception = NULL;
+static _Thread_local uint64_t jnative_catch_id_counter = 1;
+
+void __jnative_push_catch(void* jmp_buf_ptr, void* type_info) {
+    CatchContext* ctx = (CatchContext*)malloc(sizeof(CatchContext));
+    if (ctx == NULL) {
+        fprintf(stderr, "Exception in thread \"main\": out of memory while installing handler\n");
+        abort();
+    }
+    ctx->type_info = type_info;
+    ctx->id        = jnative_catch_id_counter++;
+    memcpy(ctx->buf, jmp_buf_ptr, sizeof(jmp_buf));
+    ctx->next      = current_context;
+    current_context = ctx;
+}
+
+void __jnative_pop_catch(void) {
+    if (current_context) {
+        CatchContext* old = current_context;
+        current_context = old->next;
+        free(old);
+    }
+}
+
+/* ============================================================================
  * Lazy <clinit> state machine
  *
  * The two entry points below are deliberately marked __attribute__((noinline)):
@@ -507,12 +695,23 @@ void __jnative_monitor_exit(void* obj) {
 #define CLINIT_STATE_NOT_STARTED 0
 #define CLINIT_STATE_IN_PROGRESS 1
 #define CLINIT_STATE_DONE        2
+#define CLINIT_STATE_FAILED      3
 
 typedef struct ClinitEntry {
     char* name;
     int   state;
     struct ClinitEntry* next;
+
+    /* Only meaningful while state == CLINIT_STATE_IN_PROGRESS.
+     * Records which thread is running the body, so that (a) a re-entrant
+     * enter() on the same thread returns immediately without deadlocking
+     * on its own cond var, and (b) mark_abandoned_clinits() can clear the
+     * field and broadcast done_cond to wake cross-thread waiters. */
+    pthread_t      initializing_thread;
+    pthread_cond_t done_cond;
 } ClinitEntry;
+
+static void mark_abandoned_clinits(CatchContext* target);
 
 #define CLINIT_HASH_BUCKETS 1024
 
@@ -537,6 +736,15 @@ static uint32_t clinit_hash(const char* name) {
 typedef struct ClinitFrame {
     char*               name;
     struct ClinitFrame* prev;
+
+    /* Id of the CatchContext that was current (i.e. the innermost
+     * try-guard active on the caller's side of the wrapper) when this
+     * frame was pushed. mark_abandoned_clinits() uses it to decide
+     * whether a propagating exception abandons this frame: it does iff
+     * target->id <= recorded_ctx_id, i.e. the longjmp is going to a
+     * context at or outside this frame's own try-guard, so control will
+     * never return to the body to call exit(). */
+    uint64_t            recorded_ctx_id;
 } ClinitFrame;
 
 static _Thread_local ClinitFrame* tls_clinit_stack = NULL;
@@ -551,6 +759,12 @@ static void clinit_stack_push(const char* name) {
         return;
     }
     f->prev = tls_clinit_stack;
+    /* Capture the innermost try-guard active at the caller of the
+     * wrapper. If no try-guard is active (target will be NULL anyway),
+     * use 0; mark_abandoned_clinits() early-returns on a NULL target. */
+    f->recorded_ctx_id = (current_context != NULL)
+        ? current_context->id
+        : 0;
     tls_clinit_stack = f;
 }
 
@@ -586,7 +800,9 @@ static ClinitEntry* clinit_lookup_or_create(const char* name) {
         free(e);
         return NULL;
     }
-    e->state = CLINIT_STATE_NOT_STARTED;
+    e->state               = CLINIT_STATE_NOT_STARTED;
+    e->initializing_thread = (pthread_t)0;
+    pthread_cond_init(&e->done_cond, NULL);
     e->next = clinit_buckets[bucket];
     clinit_buckets[bucket] = e;
     return e;
@@ -606,13 +822,45 @@ int32_t __jnative_clinit_enter(void* name_str) {
         return 0;
     }
 
-    int32_t result;
-    if (e->state == CLINIT_STATE_DONE
-        || e->state == CLINIT_STATE_IN_PROGRESS) {
-        result = 1;
-    } else {
-        e->state = CLINIT_STATE_IN_PROGRESS;
+    int32_t result = 0;
+    for (;;) {
+        if (e->state == CLINIT_STATE_DONE) {
+            result = 1;                                 /* already done */
+            break;
+        }
+        if (e->state == CLINIT_STATE_FAILED) {
+            /* Previously failed. Raise NoClassDefFoundError just like
+             * HotSpot does on the second reference to a class whose
+             * <clinit> threw. The lock MUST be released first, both to
+             * avoid deadlocking the throw path's mark_abandoned_clinits
+             * and to make the state visible to any thread that will
+             * subsequently take the same branch. */
+            pthread_mutex_unlock(&clinit_lock);
+            char buf[600];
+            snprintf(buf, sizeof(buf),
+                     "Could not initialize class %.*s", (int)len, name);
+            void* exc = __jnative_construct_exception(
+                "vtable_java_lang_NoClassDefFoundError", buf);
+            __jnative_throw_exception_ctx(exc, NULL);
+        }
+        if (e->state == CLINIT_STATE_IN_PROGRESS) {
+            if (pthread_equal(e->initializing_thread, pthread_self())) {
+                /* Recursive same-thread request: JVMS 5.5 step 3 says to
+                 * complete normally without running the body again. */
+                result = 1;
+                break;
+            }
+            /* Another thread is initializing. Wait for it to finish,
+             * then re-check the state (DONE or FAILED). Spurious
+             * wakeups are handled by the loop. */
+            pthread_cond_wait(&e->done_cond, &clinit_lock);
+            continue;
+        }
+        /* NOT_STARTED: we claim it. */
+        e->state               = CLINIT_STATE_IN_PROGRESS;
+        e->initializing_thread = pthread_self();
         result = 0;
+        break;
     }
     pthread_mutex_unlock(&clinit_lock);
 
@@ -633,7 +881,69 @@ void __jnative_clinit_exit(void* name_str) {
 
     pthread_mutex_lock(&clinit_lock);
     ClinitEntry* e = clinit_lookup(name);
-    if (e != NULL) e->state = CLINIT_STATE_DONE;
+    if (e != NULL) {
+        e->state               = CLINIT_STATE_DONE;
+        e->initializing_thread = (pthread_t)0;
+        pthread_cond_broadcast(&e->done_cond);
+    }
+    pthread_mutex_unlock(&clinit_lock);
+}
+
+/*
+ * Called from every throw helper immediately before its longjmp, while
+ * the exception object is already in current_exception.
+ *
+ * Walks this thread's <clinit> frame stack from the innermost frame out
+ * and abandons every frame the propagating exception will skip over. A
+ * frame is abandoned iff target->id <= frame->recorded_ctx_id, i.e. the
+ * longjmp is going to a catch context at or outside the frame's own
+ * try-guard, so control never returns to the body to call
+ * __jnative_clinit_exit(). Abandoned frames are popped here for exactly
+ * the same reason — leaving them would also desynchronise the stack for
+ * the outer frames whose exit() still runs.
+ *
+ * Each abandoned entry flips to CLINIT_STATE_FAILED and broadcasts its
+ * done_cond, so any other thread parked in __jnative_clinit_enter()
+ * wakes, re-reads the state and raises NoClassDefFoundError.
+ *
+ * recorded_ctx_id never decreases as the stack grows (an inner frame's
+ * try-guard is at or inside its outer frame's), so once a frame is not
+ * abandoned no outer frame is either — the walk stops there.
+ *
+ * target == NULL means there is no catch context at all (the exception
+ * would be unhandled); there is no destination to reason about, so
+ * nothing is abandoned and the unhandled-exception report takes over.
+ */
+static void mark_abandoned_clinits(CatchContext* target) {
+    if (target == NULL || tls_clinit_stack == NULL) return;
+
+    const char* exc_msg = NULL;
+    if (current_exception != NULL) {
+        void* msg_obj = *(void**)((char*)current_exception + 16);
+        if (msg_obj != NULL) {
+            exc_msg = __jnative_read_string_bytes(msg_obj, NULL);
+        }
+    }
+
+    pthread_mutex_lock(&clinit_lock);
+    while (tls_clinit_stack != NULL) {
+        ClinitFrame* f = tls_clinit_stack;
+        if (target->id > f->recorded_ctx_id) break;
+
+        ClinitEntry* e = clinit_lookup(f->name);
+        if (e != NULL && e->state == CLINIT_STATE_IN_PROGRESS) {
+            e->state               = CLINIT_STATE_FAILED;
+            e->initializing_thread = (pthread_t)0;
+            pthread_cond_broadcast(&e->done_cond);
+        }
+
+        fprintf(stderr, "jnative: <clinit> of %s abandoned: %s\n",
+                f->name, exc_msg != NULL ? exc_msg : "<no message>");
+
+        tls_clinit_stack = f->prev;
+        free(f->name);
+        free(f);
+    }
     pthread_mutex_unlock(&clinit_lock);
 }
 
@@ -1038,39 +1348,6 @@ static void __jnative_demangle(const char* sym, char* out, size_t out_size) {
     }
     out[w] = '\0';
 #undef PUT
-}
-
-/* ============================================================================
- * Catch context stack
- * ========================================================================== */
-
-typedef struct CatchContext {
-    struct CatchContext* next;
-    void* type_info;
-    jmp_buf buf;
-} CatchContext;
-
-static _Thread_local CatchContext* current_context = NULL;
-static _Thread_local void* current_exception = NULL;
-
-void __jnative_push_catch(void* jmp_buf_ptr, void* type_info) {
-    CatchContext* ctx = (CatchContext*)malloc(sizeof(CatchContext));
-    if (ctx == NULL) {
-        fprintf(stderr, "Exception in thread \"main\": out of memory while installing handler\n");
-        abort();
-    }
-    ctx->type_info = type_info;
-    memcpy(ctx->buf, jmp_buf_ptr, sizeof(jmp_buf));
-    ctx->next = current_context;
-    current_context = ctx;
-}
-
-void __jnative_pop_catch(void) {
-    if (current_context) {
-        CatchContext* old = current_context;
-        current_context = old->next;
-        free(old);
-    }
 }
 
 /* ============================================================================
@@ -1582,7 +1859,10 @@ void __jnative_throw_exception_ctx(void* exc, const char* caller) {
     }
     current_exception = exc;
     CatchContext* ctx = current_context;
-    if (ctx) longjmp(ctx->buf, 1);
+    if (ctx) {
+        mark_abandoned_clinits(ctx);
+        longjmp(ctx->buf, 1);
+    }
     __jnative_log_unhandled_exception(exc, NULL, caller, NULL);
 }
 
@@ -1591,7 +1871,10 @@ void __jnative_throw_null_pointer_exception_ctx(const char* caller, const char* 
     void* npe = __jnative_make_null_pointer_exception(caller, var_desc);
     current_exception = npe;
     CatchContext* ctx = current_context;
-    if (ctx) longjmp(ctx->buf, 1);
+    if (ctx) {
+        mark_abandoned_clinits(ctx);
+        longjmp(ctx->buf, 1);
+    }
     __jnative_log_unhandled_exception(npe, "java.lang.NullPointerException",
                                       caller, var_desc);
 }
@@ -1601,7 +1884,10 @@ void __jnative_throw_array_index_out_of_bounds_ctx(const char* caller) {
     void* exc = __jnative_make_array_index_out_of_bounds_exception(caller);
     current_exception = exc;
     CatchContext* ctx = current_context;
-    if (ctx) longjmp(ctx->buf, 1);
+    if (ctx) {
+        mark_abandoned_clinits(ctx);
+        longjmp(ctx->buf, 1);
+    }
     __jnative_log_unhandled_exception(exc,
         "java.lang.ArrayIndexOutOfBoundsException", caller, NULL);
 }
@@ -1611,7 +1897,10 @@ void __jnative_throw_class_cast_exception_ctx(const char* caller) {
     void* exc = __jnative_make_class_cast_exception(caller);
     current_exception = exc;
     CatchContext* ctx = current_context;
-    if (ctx) longjmp(ctx->buf, 1);
+    if (ctx) {
+        mark_abandoned_clinits(ctx);
+        longjmp(ctx->buf, 1);
+    }
     __jnative_log_unhandled_exception(exc,
         "java.lang.ClassCastException", caller, NULL);
 }
@@ -1621,7 +1910,10 @@ void __jnative_throw_arithmetic_exception_ctx(const char* caller) {
     void* exc = __jnative_make_arithmetic_exception(caller);
     current_exception = exc;
     CatchContext* ctx = current_context;
-    if (ctx) longjmp(ctx->buf, 1);
+    if (ctx) {
+        mark_abandoned_clinits(ctx);
+        longjmp(ctx->buf, 1);
+    }
     __jnative_log_unhandled_exception(exc,
         "java.lang.ArithmeticException", caller, NULL);
 }
@@ -1685,7 +1977,10 @@ void __jnative_throw_clone_not_supported_exception_ctx(const char* caller) {
     }
     current_exception = exc;
     CatchContext* ctx = current_context;
-    if (ctx) longjmp(ctx->buf, 1);
+    if (ctx) {
+        mark_abandoned_clinits(ctx);
+        longjmp(ctx->buf, 1);
+    }
     __jnative_log_unhandled_exception(exc,
         "java.lang.CloneNotSupportedException", caller, NULL);
 }
@@ -1725,7 +2020,10 @@ void __jnative_throw_out_of_memory_error_ctx(const char* caller) {
     }
     current_exception = exc;
     CatchContext* ctx = current_context;
-    if (ctx) longjmp(ctx->buf, 1);
+    if (ctx) {
+        mark_abandoned_clinits(ctx);
+        longjmp(ctx->buf, 1);
+    }
     __jnative_log_unhandled_exception(exc, "java.lang.OutOfMemoryError",
                                       caller, NULL);
 }
@@ -1998,20 +2296,34 @@ extern JNativeVTable vtable_java_lang_String;
 
 void* __jnative_make_string_obj(const char* bytes, int32_t len) {
     if (len < 0) len = 0;
-    void* value = jnative_array_alloc("[B", len + 1, JNATIVE_ELEM_SIZE_BYTE);
+
+    /*
+     * Fast path: use the cached [B mirror, avoiding the class-name hash
+     * lookup entirely. Every String creation in the program goes through
+     * here — 18 % of the benchmark's loop cycles, per the profile — and
+     * this is the single most frequent array allocation in the runtime.
+     */
+    ReflectionClass* ba_cls = jnative_get_byte_array_class();
+    void* value = jnative_array_alloc_with_class(
+        ba_cls, len + 1, JNATIVE_ELEM_SIZE_BYTE);
     if (value == NULL) {
         __jnative_throw_out_of_memory_error_ctx("__jnative_make_string_obj");
     }
+    /* Java-visible length is `len`, not `len + 1`; the extra byte is the
+     * NUL terminator that C-side consumers read as a C string, and it
+     * sits beyond the Java-level array bounds (see jnative_array_data). */
     *(int32_t*)((char*)value + JAVA_ARR_LENGTH_OFFSET) = len;
-    if (len > 0 && bytes != NULL) memcpy((char*)value + JAVA_ARR_HDR, bytes, (size_t)len);
+    if (len > 0 && bytes != NULL) {
+        memcpy((char*)value + JAVA_ARR_HDR, bytes, (size_t)len);
+    }
     ((char*)value)[JAVA_ARR_HDR + len] = '\0';
 
     void* s = calloc(1, 32);
     if (s == NULL) {
         __jnative_throw_out_of_memory_error_ctx("__jnative_make_string_obj");
     }
-    *(void**)((char*)s + 0)  = (void*)&vtable_java_lang_String;
-    *(void**)((char*)s + 8)  = value;
+    *(void**)((char*)s + 0)    = (void*)&vtable_java_lang_String;
+    *(void**)((char*)s + 8)    = value;
     *(uint8_t*)((char*)s + 16) = 0;
     *(int32_t*)((char*)s + 20) = 0;
     *(uint8_t*)((char*)s + 24) = 0;
