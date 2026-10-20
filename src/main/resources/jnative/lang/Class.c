@@ -557,28 +557,123 @@ int __jnative_fn_java_lang_Class_isPrimitive___Z(void* this_cls) {
            strcmp(name, "void")    == 0;
 }
 
-void* __jnative_fn_java_lang_Class_getName___Ljava_lang_String_(void* this_cls) {
-    if (this_cls == NULL) return NULL;
-    const char* name = ((struct ReflectionClass*)this_cls)->cname;
-    if (name == NULL) return NULL;
-    return __jnative_make_string_obj(name, (int32_t)strlen(name));
-}
+/* ============================================================================
+ * Class.getName() / Class.initClassName() — cached dotted class name.
+ *
+ * Both the JDK-level Class.getName() and the native initClassName() are
+ * specified to return the same thing: the binary name of the class, with
+ * every '/' replaced by '.'. (For array types, the JVM descriptor is kept
+ * verbatim: "[I", "[Ljava.lang.String;", "[[I" — only the '/' characters
+ * inside the "L...;" component are folded, which is exactly what the
+ * documented JDK behaviour requires.)
+ *
+ * The JDK-level implementation of Class.getName() caches the result in the
+ * Class object's `name` field (see java.base/java/lang/Class.java:
+ *
+ *     public String getName() {
+ *         String name = this.name;
+ *         if (name == null) {
+ *             name = initClassName();
+ *             this.name = name;
+ *         }
+ *         return name;
+ *     }
+ *
+ * ). In this runtime, that field lives at offset 8 of the Class mirror
+ * (ReflectionClass.name in jnative_runtime.h), is emitted as "i8* null" in
+ * every @refclass_* constant, and is *supposed* to be written back by the
+ * emitted IR the first time the JDK path runs. In practice that write does
+ * not take effect: profiling shows initClassName being called on every
+ * single getName(), and because initClassName delegates to
+ * __jnative_make_string_obj -> jnative_array_alloc("[B") ->
+ * jnative_class_by_name("[B"), which is a linear scan over
+ * reflect_all_classes[], the cost is O(N) per call — 29 % of the whole
+ * benchmark in the report.
+ *
+ * To make the caching independent of the emitted bytecode, both C functions
+ * below publish the result into the same slot the JDK path reads from:
+ *
+ *     1. Load the `name` slot at offset 8 with acquire semantics.
+ *     2. If it is non-NULL, return it directly (fast path, O(1)).
+ *     3. Otherwise compute the dotted name, publish it into the slot with
+ *        a release store, and return it.
+ *
+ * The publish is a compare-and-swap against NULL, so if two threads race on
+ * the first call they both end up returning the same String — the loser's
+ * computed String is leaked (one per class, only under contention) and the
+ * winner's is returned. This matches the JDK's own behaviour: the Java
+ * field is not synchronized, and a torn write would be a JMM violation
+ * anyway, so the JDK code relies on idempotent recomputation under races.
+ *
+ * After the first call, the fast path is a single acquire-load of the slot.
+ * It does not allocate, does not call into __jnative_make_string_obj, and
+ * does not touch jnative_class_by_name. The 29 % of the benchmark that was
+ * spent recomputing the name every iteration collapses to one-time setup
+ * cost per class.
+ *
+ * Arrays: the descriptor form is preserved as required by the JDK
+ * documentation for Class.getName():
+ *
+ *     [I          -> "[I"
+ *     [Ljava/lang/String; -> "[Ljava.lang.String;"
+ *     [[Ljava/lang/Object; -> "[[Ljava.lang.Object;"
+ *
+ * because the transformation is a pure '/' -> '.' substitution: the leading
+ * '[' characters, the primitive single-letter codes, and the surrounding
+ * 'L' / ';' all pass through unchanged.
+ * ========================================================================== */
 
-void* __jnative_fn_java_lang_Class_initClassName___Ljava_lang_String_(void* this_cls) {
-    if (this_cls == NULL) return NULL;
-    const char* internal = ((struct ReflectionClass*)this_cls)->cname;
+static void* cached_dotted_class_name(struct ReflectionClass* cls) {
+    if (cls == NULL) return NULL;
+
+    /* Fast path: another caller (either the JDK bytecode path or a
+     * previous invocation of this function) already published the name.
+     * The acquire barrier pairs with the release in the CAS below, so a
+     * non-NULL slot here implies the backing String's fields are visible
+     * to this thread. */
+    void* cached = __atomic_load_n(&cls->name, __ATOMIC_ACQUIRE);
+    if (cached != NULL) return cached;
+
+    const char* internal = cls->cname;
     if (internal == NULL) return NULL;
 
     size_t len = strlen(internal);
-    char* out = malloc(len + 1);
+
+    char* out = (char*)malloc(len + 1);
     if (out == NULL) return NULL;
+
     for (size_t i = 0; i < len; i++) {
         out[i] = (internal[i] == '/') ? '.' : internal[i];
     }
     out[len] = '\0';
-    void* result = __jnative_make_string_obj(out, (int32_t)len);
+
+    void* computed = __jnative_make_string_obj(out, (int32_t)len);
     free(out);
-    return result;
+
+    if (computed == NULL) return NULL;
+
+    /* Publish into the Class mirror's `name` slot with a release store.
+     * If another thread won the race, discard our duplicate (its memory
+     * is small and only ever allocated once per class per contending
+     * thread) and return the winner's instance — that guarantees all
+     * callers observe the same String object, which is what the JDK's
+     * own caching documents. */
+    void* expected = NULL;
+    if (!__atomic_compare_exchange_n(&cls->name, &expected, computed, 0,
+                                      __ATOMIC_RELEASE, __ATOMIC_ACQUIRE)) {
+        return expected;
+    }
+    return computed;
+}
+
+void* __jnative_fn_java_lang_Class_getName___Ljava_lang_String_(void* this_cls) {
+    if (this_cls == NULL) return NULL;
+    return cached_dotted_class_name((struct ReflectionClass*)this_cls);
+}
+
+void* __jnative_fn_java_lang_Class_initClassName___Ljava_lang_String_(void* this_cls) {
+    if (this_cls == NULL) return NULL;
+    return cached_dotted_class_name((struct ReflectionClass*)this_cls);
 }
 
 void* __jnative_fn_java_lang_Class_getClassLoader___Ljava_lang_ClassLoader_(void* this_cls) {
