@@ -23,14 +23,6 @@ import static io.github.kubyk01.util.LlvmUtil.isLazyClinitWrapper;
 @Slf4j
 public class InterproceduralEscape {
 
-    /**
-     * Maximum number of functions processed in one parallel batch.
-     * Matches the constant used by InterproceduralPointsTo so that the two
-     * fix-point passes have the same memory footprint profile. Without
-     * this limit the very first batch on a full JDK closure is the entire
-     * reachable set (tens of thousands of functions) and each element is
-     * a freshly built Map<AllocationSite, EscapeStatus>.
-     */
     private static final int EVAL_BATCH_SIZE = 2048;
 
     private final Module module;
@@ -39,6 +31,7 @@ public class InterproceduralEscape {
     private final DependencyResolver resolver;
     private final Scheduler scheduler;
     private final Map<AllocationSite, EscapeStatus> globalStatus = new HashMap<>();
+    private final Map<AllocationSite, Function> siteToFunction = new HashMap<>();
 
     public InterproceduralEscape(Module module,
                                  AliasAnalysisResult aliasResult,
@@ -60,6 +53,9 @@ public class InterproceduralEscape {
     }
 
     public Map<AllocationSite, EscapeStatus> analyze() {
+        // Seed: every allocation site observed in the module starts as
+        // STACK. The site-to-function map lets propagation enqueue the
+        // defining function when a site's status improves.
         for (Function func : module.getFunctions()) {
             if (func.getEntryBlock() == null) continue;
             for (BasicBlock block : func.getBlocks()) {
@@ -68,6 +64,7 @@ public class InterproceduralEscape {
                         PointsToSet pts = aliasResult.getPointsTo(inst.getResult());
                         for (AllocationSite site : pts.getSites()) {
                             globalStatus.put(site, EscapeStatus.STACK);
+                            siteToFunction.put(site, func);
                         }
                     }
                 }
@@ -80,10 +77,6 @@ public class InterproceduralEscape {
         }
         if (live.isEmpty()) return globalStatus;
 
-        // Reverse call graph: when a function's local status grows, only
-        // its callers need to be re-analyzed. Building this once avoids
-        // re-deriving it (and the module-wide scans that would otherwise
-        // be required) on every iteration.
         Map<String, Set<Function>> callersOf = new HashMap<>();
         for (Function f : live) {
             for (BasicBlock b : f.getBlocks()) {
@@ -91,10 +84,7 @@ public class InterproceduralEscape {
                     String callee = extractCalleeName(inst);
                     if (callee == null) continue;
                     String calleeKey = canonicalCalleeKey(callee);
-
-                    // See the comment on LlvmUtil.isLazyClinitWrapper.
                     if (isLazyClinitWrapper(calleeKey)) continue;
-
                     callersOf.computeIfAbsent(calleeKey, k -> new HashSet<>()).add(f);
                 }
             }
@@ -118,8 +108,7 @@ public class InterproceduralEscape {
                 LlvmUtil.parallelMapOrdered(
                     batch, scheduler,
                     func -> new IntraproceduralEscape(
-                            func, aliasResult, summaries, resolver).analyze());
-            // parallelMapOrdered already validates the result size.
+                        func, aliasResult, summaries, resolver).analyze());
 
             for (int i = 0; i < batch.size(); i++) {
                 Function func = batch.get(i);
@@ -128,11 +117,13 @@ public class InterproceduralEscape {
 
                 boolean functionChanged = false;
                 for (Map.Entry<AllocationSite, EscapeStatus> entry : localStatus.entrySet()) {
-                    EscapeStatus old = globalStatus.getOrDefault(
-                        entry.getKey(), EscapeStatus.STACK);
-                    if (entry.getValue().ordinal() > old.ordinal()) {
-                        globalStatus.put(entry.getKey(), entry.getValue());
+                    AllocationSite site = entry.getKey();
+                    EscapeStatus newEsc = entry.getValue();
+                    EscapeStatus old = globalStatus.getOrDefault(site, EscapeStatus.STACK);
+                    if (newEsc.ordinal() > old.ordinal()) {
+                        globalStatus.put(site, newEsc);
                         functionChanged = true;
+                        propagateThroughFields(site, newEsc, worklist, inWorklist);
                     }
                 }
 
@@ -156,5 +147,60 @@ public class InterproceduralEscape {
         System.out.println("InterproceduralEscape: converged after "
             + processed + " function evaluations");
         return globalStatus;
+    }
+
+    /**
+     * Transitive escape propagation through heap reachability.
+     *
+     * <p>If a site {@code A} reaches status {@code S}, every site stored
+     * into any field of {@code A} reaches status at least {@code S}, and
+     * the same applies recursively. Without this, a {@code MethodType}
+     * stored into {@code VarForm.types[i]} would remain {@code STACK} even
+     * after {@code VarForm} became {@code GLOBAL} via a static {@code VarHandle},
+     * causing its destructor to free the ptypes array while a live reference
+     * remained.</p>
+     *
+     * <p>The propagation is monotone: a site's status only ever grows, so
+     * the recursive walk terminates after at most one pass per escape level
+     * per site. Improved sites are pushed onto the worklist so that the
+     * defining function's {@link IntraproceduralEscape} runs again with the
+     * new status available for reading through {@code seedFromOwnSummary}.</p>
+     *
+     * <p>{@link AllocationSite#UNKNOWN} is skipped: it represents an
+     * "external source" whose own escape status is unknowable.</p>
+     */
+    private void propagateThroughFields(AllocationSite startSite,
+                                        EscapeStatus status,
+                                        Deque<Function> worklist,
+                                        Set<Function> inWorklist) {
+        Deque<AllocationSite> work = new ArrayDeque<>();
+        work.push(startSite);
+        Set<AllocationSite> visited = new HashSet<>();
+        visited.add(startSite);
+
+        while (!work.isEmpty()) {
+            AllocationSite cur = work.poll();
+            Map<String, PointsToSet> fields =
+                aliasResult.getGraph().getFieldPointsToMap(cur);
+            if (fields == null) continue;
+            for (PointsToSet pts : fields.values()) {
+                for (AllocationSite fieldSite : pts.getSites()) {
+                    if (fieldSite == AllocationSite.UNKNOWN) continue;
+                    if (!visited.add(fieldSite)) continue;
+
+                    EscapeStatus old = globalStatus.getOrDefault(
+                        fieldSite, EscapeStatus.STACK);
+                    if (status.ordinal() > old.ordinal()) {
+                        globalStatus.put(fieldSite, status);
+
+                        Function f = siteToFunction.get(fieldSite);
+                        if (f != null && inWorklist.add(f)) {
+                            worklist.add(f);
+                        }
+                        work.push(fieldSite);
+                    }
+                }
+            }
+        }
     }
 }
