@@ -1016,6 +1016,36 @@ extern const int32_t __jnative_literal_pool_size;
  */
 extern void __jnative_run_all_initializers(void);
 
+/* ============================================================================
+ *  Parallel <clinit> scheduling.
+ * ============================================================================
+ *
+ * Runs the N clinits whose function pointers are stored in @fns
+ * concurrently. The arrays passed in are the `private constant` batches
+ * that LlvmGenerator.generateRunAllInitializers() emits for each
+ * SCC-condensation level. The `count` argument is the batch size.
+ *
+ *   - count == 0  → no-op
+ *   - count == 1  → single call, no thread spawned
+ *   - count  > 1  → work is distributed across at most
+ *                   sysconf(_SC_NPROCESSORS_ONLN) pthreads
+ *
+ * The function never throws and never returns control to the caller
+ * until every function pointer in the array has been invoked and its
+ * pthread has joined. If thread creation or the internal bookkeeping
+ * allocation fails, the affected sub-batch is executed synchronously
+ * on the calling thread — correctness is preserved under exhaustion,
+ * only the parallelism is lost.
+ *
+ * The batch is guaranteed by the scheduler (Analyzer.sortInitializers +
+ * computeClinitLevelsAndCyclic) to consist of clinits from distinct
+ * SCCs at the same condensation level. Those clinits therefore have no
+ * dependency edges between them and cannot trigger one another in the
+ * eager dependency graph, which is what makes running them in parallel
+ * sound.
+ */
+extern void __jnative_run_parallel(void** fns, int32_t count);
+
 /* ---- Diagnostic hooks ---------------------------------------------- */
 
 extern void __jnative_debug_clinit(const char* name);

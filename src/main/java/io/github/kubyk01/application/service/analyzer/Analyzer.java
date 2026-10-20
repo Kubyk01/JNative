@@ -1652,11 +1652,59 @@ public class Analyzer {
             }
         }
 
+        // ============================================================
+        // Level-sort AFTER deferred is finalized, and recompute
+        // afterMap/beforeMap to reflect new positions.
+        // ============================================================
+        //
+        // Cyclic clinits (SCC size > 1) must run sequentially: their linear
+        // order within the SCC is a deliberate choice of orderScc() that must
+        // be preserved, and the lazy-<clinit> state machine already makes them
+        // safe under cross-thread triggering. Non-cyclic clinits have no
+        // dependency edges between them at the same level and are therefore
+        // safe to parallelise.
+        Map<Function, Integer> clinitLevels = new HashMap<>();
+        Set<Function> cyclicClinits = new HashSet<>();
+        computeClinitLevelsAndCyclic(clinitOrder, clinitDeps,
+                                     clinitLevels, cyclicClinits);
+
+        // Re-sort by level so that same-level clinits are adjacent. Stable
+        // sort preserves intra-SCC ordering for multi-member SCCs (they all
+        // share one level). Preserves topological validity: for any edge
+        // A -> B (A depends on B), level(B) < level(A), so B still precedes A.
+        clinitOrder.sort(Comparator.comparingInt(
+            f -> clinitLevels.getOrDefault(f, 0)));
+
+        // Positions changed — recompute the phase placement bounds.
+        Map<Function, Integer> trimmedIdx = new HashMap<>();
+        for (int i = 0; i < clinitOrder.size(); i++) {
+            trimmedIdx.put(clinitOrder.get(i), i);
+        }
+        for (Function p : phaseOrder) {
+            Set<Function> depsOfP = transitiveClosure(deps, p);
+            int after = 0;
+            for (Function d : depsOfP) {
+                Integer idx = trimmedIdx.get(d);
+                if (idx != null && idx + 1 > after) after = idx + 1;
+            }
+            afterMap.put(p, after);
+
+            Set<Function> dependentsOfP = transitiveClosure(revDeps, p);
+            int before = clinitOrder.size();
+            for (Function d : dependentsOfP) {
+                Integer idx = trimmedIdx.get(d);
+                if (idx != null && idx < before) before = idx;
+            }
+            beforeMap.put(p, before);
+        }
+
         // ---- Merge: clinits + phases with a hard phase order ----
         List<ClinitScheduleEntry> result =
             new ArrayList<>(clinitOrder.size() + phaseOrder.size());
         int ci = 0;
         int prevPhaseSlot = 0;
+        int groupCounter = 0;
+        int currentLevel = -2;
         for (Function p : phaseOrder) {
             int after  = afterMap.get(p);
             int before = beforeMap.get(p);
@@ -1712,13 +1760,34 @@ public class Analyzer {
             }
 
             while (ci < target && ci < clinitOrder.size()) {
-                result.add(new ClinitScheduleEntry(clinitOrder.get(ci++), false));
+                Function c = clinitOrder.get(ci++);
+                int pg;
+                if (cyclicClinits.contains(c)) {
+                    pg = -1;
+                    currentLevel = -2;
+                } else {
+                    int lvl = clinitLevels.getOrDefault(c, 0);
+                    if (lvl != currentLevel) { groupCounter++; currentLevel = lvl; }
+                    pg = groupCounter;
+                }
+                result.add(new ClinitScheduleEntry(c, false, pg));
             }
-            result.add(new ClinitScheduleEntry(p, true));
+            result.add(new ClinitScheduleEntry(p, true, -1));
+            currentLevel = -2;  // phase is a hard barrier
             prevPhaseSlot = target;
         }
         while (ci < clinitOrder.size()) {
-            result.add(new ClinitScheduleEntry(clinitOrder.get(ci++), false));
+            Function c = clinitOrder.get(ci++);
+            int pg;
+            if (cyclicClinits.contains(c)) {
+                pg = -1;
+                currentLevel = -2;
+            } else {
+                int lvl = clinitLevels.getOrDefault(c, 0);
+                if (lvl != currentLevel) { groupCounter++; currentLevel = lvl; }
+                pg = groupCounter;
+            }
+            result.add(new ClinitScheduleEntry(c, false, pg));
         }
 
         int cycles = countBrokenCycleEdges(clinitOrder, clinitDeps);
@@ -2106,6 +2175,68 @@ public class Analyzer {
             }
             default:
                 break;
+        }
+    }
+
+    /**
+     * Computes the SCC-condensation level of every clinit and marks every
+     * clinit that belongs to a non-trivial SCC as cyclic.
+     *
+     * <p>The level is the length of the longest path in the SCC-condensation
+     * DAG starting at a source. Clinits sharing a level belong to different
+     * SCCs and therefore have no dependency edges between them — they may run
+     * concurrently.</p>
+     *
+     * <p>Tarjan emits SCCs in reverse topological order (sinks first), so
+     * iterating them in emission order guarantees that every SCC's dependency
+     * levels are already known when its own level is computed.</p>
+     */
+    private static void computeClinitLevelsAndCyclic(
+            List<Function> clinitOrder,
+            Map<Function, Set<Function>> clinitDeps,
+            Map<Function, Integer> outLevels,
+            Set<Function> outCyclic) {
+
+        Map<Function, Integer> index   = new HashMap<>();
+        Map<Function, Integer> lowlink = new HashMap<>();
+        Deque<Function>        stack   = new ArrayDeque<>();
+        Set<Function>          onStack = new HashSet<>();
+        List<List<Function>>   sccs    = new ArrayList<>();
+        int[] counter = {0};
+
+        for (Function c : clinitOrder) {
+            if (!index.containsKey(c)) {
+                strongConnect(c, clinitDeps, index, lowlink, stack, onStack, sccs, counter);
+            }
+        }
+
+        Map<Function, Integer> clinitToScc = new HashMap<>();
+        for (int i = 0; i < sccs.size(); i++) {
+            for (Function f : sccs.get(i)) clinitToScc.put(f, i);
+        }
+
+        Map<Integer, Integer> sccLevels = new HashMap<>();
+        for (int i = 0; i < sccs.size(); i++) {
+            int level = 0;
+            for (Function c : sccs.get(i)) {
+                Set<Function> deps = clinitDeps.get(c);
+                if (deps == null) continue;
+                for (Function d : deps) {
+                    Integer dScc = clinitToScc.get(d);
+                    if (dScc == null || dScc == i) continue;
+                    Integer dLevel = sccLevels.get(dScc);
+                    if (dLevel != null) level = Math.max(level, dLevel + 1);
+                }
+            }
+            sccLevels.put(i, level);
+        }
+
+        for (Function c : clinitOrder) {
+            Integer scc = clinitToScc.get(c);
+            outLevels.put(c, scc != null ? sccLevels.getOrDefault(scc, 0) : 0);
+        }
+        for (List<Function> scc : sccs) {
+            if (scc.size() > 1) outCyclic.addAll(scc);
         }
     }
 

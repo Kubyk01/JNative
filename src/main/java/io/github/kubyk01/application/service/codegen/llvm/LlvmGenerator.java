@@ -903,6 +903,7 @@ public class LlvmGenerator {
     }
 
     private String generateRunAllInitializers() {
+        StringBuilder globals = new StringBuilder();
         StringBuilder sb = new StringBuilder();
         sb.append("define void @__jnative_run_all_initializers() {\n");
 
@@ -1158,6 +1159,9 @@ public class LlvmGenerator {
         );
 
         int bootstrapPhaseIdx = 0;
+        List<ClinitScheduleEntry> currentBatch = new ArrayList<>();
+        int batchIdCounter = 0;
+
         for (ClinitScheduleEntry entry : clinitSchedule) {
             Function f = entry.function();
             String name = f.getName();
@@ -1172,6 +1176,10 @@ public class LlvmGenerator {
             // for the full rationale.
 
             if (entry.bootstrapPhase()) {
+                if (!currentBatch.isEmpty()) {
+                    emitParallelBatch(sb, globals, currentBatch, batchIdCounter++);
+                    currentBatch.clear();
+                }
                 // Bootstrap phase: call it with zero arguments and discard
                 // the result. The arguments are taken from the phase's real
                 // signature, so initPhase2(ZZ)I and initPhase1()V are
@@ -1200,8 +1208,25 @@ public class LlvmGenerator {
             } else {
                 // Ordinary <clinit>; eagerTarget substitutes the lazy wrapper
                 // when the class was marked cyclic.
-                sb.append("  call void @").append(eagerTarget(name)).append("()\n");
+                int pg = entry.parallelGroup();
+                if (pg == -1) {
+                    if (!currentBatch.isEmpty()) {
+                        emitParallelBatch(sb, globals, currentBatch, batchIdCounter++);
+                        currentBatch.clear();
+                    }
+                    sb.append("  call void @").append(eagerTarget(name)).append("()\n");
+                } else {
+                    if (!currentBatch.isEmpty()
+                        && currentBatch.getFirst().parallelGroup() != pg) {
+                        emitParallelBatch(sb, globals, currentBatch, batchIdCounter++);
+                        currentBatch.clear();
+                    }
+                    currentBatch.add(entry);
+                }
             }
+        }
+        if (!currentBatch.isEmpty()) {
+            emitParallelBatch(sb, globals, currentBatch, batchIdCounter++);
         }
 
         // ------------------------------------------------------------------
@@ -1278,7 +1303,40 @@ public class LlvmGenerator {
         sb.append("  ret void\n");
         sb.append("}\n\n");
 
-        return sb.toString();
+        return globals.toString() + sb;
+    }
+
+    /**
+     * Emits one parallel batch. Batches of size 1 degrade to a plain
+     * sequential call — spawning a thread to run one function costs more
+     * than it saves, and the emitter cannot know at compile time whether a
+     * size-1 batch is a corner case of a larger level or a genuinely
+     * singleton level.
+     */
+    private void emitParallelBatch(StringBuilder body, StringBuilder globals,
+                                   List<ClinitScheduleEntry> batch, int batchId) {
+        if (batch.isEmpty()) return;
+
+        if (batch.size() == 1) {
+            String name = batch.getFirst().function().getName();
+            body.append("  call void @").append(eagerTarget(name)).append("()\n");
+            return;
+        }
+
+        String arrayName = "__jnative_par_batch_" + batchId;
+        globals.append("@").append(arrayName).append(" = private constant [")
+               .append(batch.size()).append(" x i8*] [");
+        for (int i = 0; i < batch.size(); i++) {
+            if (i > 0) globals.append(", ");
+            String target = eagerTarget(batch.get(i).function().getName());
+            globals.append("i8* bitcast (void ()* @").append(target)
+                   .append(" to i8*)");
+        }
+        globals.append("]\n");
+
+        body.append("  call void @__jnative_run_parallel(i8** bitcast ([")
+            .append(batch.size()).append(" x i8*]* @").append(arrayName)
+            .append(" to i8**), i32 ").append(batch.size()).append(")\n");
     }
 
     private String generateMain() {

@@ -2710,3 +2710,92 @@ void* __jnative_make_byte_array_input_stream(void* bytes)
     return bais;
 }
 
+
+/* ============================================================================
+ * Parallel <clinit> scheduling.
+ *
+ * See the contract in jnative_runtime.h. The chunked distribution below
+ * caps thread count at sysconf(_SC_NPROCESSORS_ONLN) regardless of how
+ * many clinits a level happens to contain, so a wide level does not spawn
+ * hundreds of threads on a 16-core machine.
+ * ========================================================================== */
+
+typedef struct {
+    void**  fns;
+    int32_t start;
+    int32_t end;
+} JNativeParallelChunk;
+
+static void* jnative_run_parallel_chunk(void* arg) {
+    JNativeParallelChunk* c = (JNativeParallelChunk*)arg;
+    for (int32_t i = c->start; i < c->end; i++) {
+        ((void (*)(void))c->fns[i])();
+    }
+    return NULL;
+}
+
+void __jnative_run_parallel(void** fns, int32_t count) {
+    if (fns == NULL || count <= 0) return;
+    if (count == 1) {
+        ((void (*)(void))fns[0])();
+        return;
+    }
+
+    int32_t max_threads = (int32_t)sysconf(_SC_NPROCESSORS_ONLN);
+    if (max_threads <= 0) max_threads = 4;
+    if (max_threads > count) max_threads = count;
+
+    if (max_threads <= 1) {
+        for (int32_t i = 0; i < count; i++) {
+            ((void (*)(void))fns[i])();
+        }
+        return;
+    }
+
+    int32_t chunk_size = (count + max_threads - 1) / max_threads;
+    int32_t n_chunks   = (count + chunk_size - 1) / chunk_size;
+
+    pthread_t*             threads = (pthread_t*)malloc(
+        (size_t)n_chunks * sizeof(pthread_t));
+    JNativeParallelChunk*  chunks  = (JNativeParallelChunk*)malloc(
+        (size_t)n_chunks * sizeof(JNativeParallelChunk));
+
+    if (threads == NULL || chunks == NULL) {
+        free(threads);
+        free(chunks);
+        for (int32_t i = 0; i < count; i++) {
+            ((void (*)(void))fns[i])();
+        }
+        return;
+    }
+
+    /*
+     * threads[c] == 0 is used as the "not created" sentinel: a real
+     * pthread_t is a small positive integer on every platform this
+     * runtime targets, never zero. When pthread_create fails, the
+     * chunk runs synchronously on the calling thread and the slot
+     * stays zero so the join loop skips it.
+     */
+    for (int32_t c = 0; c < n_chunks; c++) {
+        chunks[c].fns   = fns;
+        chunks[c].start = c * chunk_size;
+        chunks[c].end   = (c + 1) * chunk_size;
+        if (chunks[c].end > count) chunks[c].end = count;
+
+        if (pthread_create(&threads[c], NULL,
+                           jnative_run_parallel_chunk,
+                           &chunks[c]) != 0) {
+            threads[c] = 0;
+            jnative_run_parallel_chunk(&chunks[c]);
+        }
+    }
+
+    for (int32_t c = 0; c < n_chunks; c++) {
+        if (threads[c] != 0) {
+            pthread_join(threads[c], NULL);
+        }
+    }
+
+    free(threads);
+    free(chunks);
+}
