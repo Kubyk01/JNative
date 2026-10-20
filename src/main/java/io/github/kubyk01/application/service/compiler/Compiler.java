@@ -18,9 +18,11 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.Deque;
 import java.util.Enumeration;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
@@ -279,16 +281,24 @@ public class Compiler implements CompilerPort {
             //    shared libraries.
             // ------------------------------------------------------------------
             List<Path> nativeLibs = collectNativeLibraries(module, resolver, target);
+            Set<Path> nativeLibDirs = new LinkedHashSet<>();
             for (Path lib : nativeLibs) {
                 linkCmd.add("-Wl,--no-as-needed");
                 linkCmd.add(lib.toString());
+                Path parent = lib.toAbsolutePath().getParent();
+                if (parent != null) nativeLibDirs.add(parent);
             }
-            // Export the runtime's rpath so the .so files are found at run
-            // time. $ORIGIN is the directory containing the produced
-            // executable; the user can either copy the .so files next to
-            // the executable or set LD_LIBRARY_PATH.
+
+            // DT_RPATH instead of DT_RUNPATH: --disable-new-dtags makes
+            // the loader consult these paths when resolving a dependency
+            // of a dependency, so libjava.so finds libjvm.so in the same
+            // directory a.out found libjava.so.
+            linkCmd.add("-Wl,--disable-new-dtags");
             linkCmd.add("-Wl,-rpath,$ORIGIN");
             linkCmd.add("-Wl,-rpath," + new File(".").getAbsolutePath());
+            for (Path dir : nativeLibDirs) {
+                linkCmd.add("-Wl,-rpath," + dir);
+            }
 
             System.out.println("Linking for target " + target.triple() + "...");
             ProcessBuilder linkBuilder = new ProcessBuilder(linkCmd);
@@ -298,6 +308,8 @@ public class Compiler implements CompilerPort {
                 throw new RuntimeException("Linking failed with exit code " + exit
                     + " (target: " + target.triple() + ")");
             }
+
+            bundleNativeLibraries(exePath, nativeLibs, nativeLibDirs);
 
         } finally {
             Files.walk(tempDir)
@@ -562,22 +574,34 @@ public class Compiler implements CompilerPort {
     //  Resource extraction
     // =========================================================================
 
-    private String getNativeResourcePath(String className) {
-        if (className.startsWith("java/")) {
-            return NATIVE_BASE_PATH + className.substring("java/".length()) + ".c";
+    /**
+     * Returns the classpath resource path of the C source that provides
+     * native support for {@code className}, or null when there is none.
+     *
+     * <p>Two shapes are looked up, in order: the exact
+     * {@code <Class>.c}, then the JDK's own {@code <Class>Support.c}
+     * convention (Continuation + ContinuationSupport, IntegerPolynomial +
+     * IntegerPolynomial1305, …).</p>
+     */
+    private String findNativeResourcePath(String className) {
+        String base = className.startsWith("java/")
+            ? NATIVE_BASE_PATH + className.substring("java/".length())
+            : NATIVE_BASE_PATH + className;
+        ClassLoader cl = Thread.currentThread().getContextClassLoader();
+        for (String suffix : new String[]{".c", "Support.c"}) {
+            String path = base + suffix;
+            try (InputStream is = cl.getResourceAsStream(path)) {
+                if (is != null) return path;
+            } catch (IOException ignored) {
+                // Treat an unreadable resource as absent.
+            }
         }
-        return NATIVE_BASE_PATH + className + ".c";
+        return null;
     }
 
     @Override
     public boolean hasNativeSupport(String className) {
-        String path = getNativeResourcePath(className);
-        try (InputStream is = Thread.currentThread().getContextClassLoader()
-            .getResourceAsStream(path)) {
-            return is != null;
-        } catch (IOException e) {
-            return false;
-        }
+        return findNativeResourcePath(className) != null;
     }
 
     private Path extractResource(String resourcePath, Path destination) throws IOException {
@@ -599,13 +623,16 @@ public class Compiler implements CompilerPort {
         throws IOException {
 
         List<Path> extracted = new ArrayList<>();
+        // One resource can back several classes (Continuation +
+        // ContinuationSupport both resolve to ContinuationSupport.c);
+        // extract it once or the objects define the same symbols twice.
+        Set<String> seenResources = new HashSet<>();
 
         for (String cls : usedClasses) {
-            if (!hasNativeSupport(cls)) {
+            String resourcePath = findNativeResourcePath(cls);
+            if (resourcePath == null || !seenResources.add(resourcePath)) {
                 continue;
             }
-
-            String resourcePath = getNativeResourcePath(cls);
             Path targetPath = tempDir.resolve(
                 cls.replace('/', java.io.File.separatorChar) + ".c");
 
@@ -625,6 +652,53 @@ public class Compiler implements CompilerPort {
         }
 
         return extracted;
+    }
+
+    /**
+     * Copies the JDK shared objects the freshly linked executable needs —
+     * plus their transitive DT_NEEDED closure — next to it, so the
+     * {@code $ORIGIN} rpath resolves every one of them at load time and
+     * the directory can be shipped to a machine without a JDK installed.
+     */
+    private void bundleNativeLibraries(Path exePath, List<Path> nativeLibs,
+                                       Set<Path> nativeLibDirs) throws IOException {
+
+        if (nativeLibs.isEmpty()) {
+            return;
+        }
+
+        Path exeDir = exePath.toAbsolutePath().getParent();
+        Set<Path> copied = new LinkedHashSet<>();
+
+        // Native libraries the module directly needs.
+        for (Path lib : nativeLibs) {
+            Path dest = exeDir.resolve(lib.getFileName().toString());
+            if (Files.exists(dest)) continue;
+            Files.copy(lib, dest, StandardCopyOption.REPLACE_EXISTING);
+            copied.add(dest);
+        }
+
+        // Their transitive DT_NEEDED closure.
+        Deque<Path> toVisit = new ArrayDeque<>(copied);
+        while (!toVisit.isEmpty()) {
+            Path lib = toVisit.poll();
+            for (String soname : ElfSymbolReader.readNeededLibraries(lib)) {
+                if (soname.startsWith("/")) continue;           // absolute: system
+                Path source = nativeLibDirs.stream()
+                    .map(d -> d.resolve(soname))
+                    .filter(Files::isRegularFile)
+                    .findFirst()
+                    .orElse(null);
+                if (source == null) continue;                   // system library, leave it
+                Path dest = exeDir.resolve(soname);
+                if (Files.exists(dest)) continue;
+                Files.copy(source, dest, StandardCopyOption.REPLACE_EXISTING);
+                toVisit.add(dest);
+            }
+        }
+
+        System.out.println("Bundled " + copied.size()
+            + " JDK native library/libraries next to " + exePath);
     }
 
     // =========================================================================
@@ -716,36 +790,61 @@ public class Compiler implements CompilerPort {
                                              TargetPlatform targetPlatform)
         throws IOException {
 
-        // 1. The set of JNI symbols the module actually calls.
+        // Every JNI native that made it into the module without a JNative
+        // C implementation is, by construction, a call site that will try
+        // to bind a Java_* symbol at link time. We only ever try to satisfy
+        // those from third-party shared objects bundled inside application
+        // JARs — never from the JDK's own libraries.
         Set<String> wanted = new HashSet<>();
         for (Function f : module.getFunctions()) {
             if (f.isJniNative()) wanted.add(f.getName());
         }
         if (wanted.isEmpty()) return List.of();
 
-        // 2. Candidate directories and archives.
         List<Path> candidates = new ArrayList<>();
 
-        // 2a. JDK platform libraries.
-        Path libDir = platformLibraryDir(targetPlatform);
-        if (libDir != null && Files.isDirectory(libDir)) {
-            try (var s = Files.walk(libDir, 2)) {
-                s.filter(Files::isRegularFile)
-                 .filter(p -> isDynamicLibrary(p, targetPlatform))
-                 .forEach(candidates::add);
-            }
-        }
+        // ------------------------------------------------------------------
+        // JDK platform libraries are deliberately NOT scanned.
+        //
+        // Standard JDK natives must all be provided by the JNative C
+        // sources under jnative/ — that is the entire premise of the
+        // project. Linking libjava.so / libjvm.so / libnet.so / libzip.so /
+        // anything else from $JAVA_HOME/lib would:
+        //
+        //   (a) make the produced executable depend on a full JDK
+        //       installation at run time, defeating the purpose of
+        //       building an ahead-of-time image;
+        //
+        //   (b) silently mask any JNI native whose JNative implementation
+        //       is missing — which is exactly the class of defect the
+        //       isJniNative() flag exists to surface. If a JDK native has
+        //       no jnative/**.c counterpart, the correct action is to add
+        //       one, not to drag the whole JVM into the link command;
+        //
+        //   (c) break the bundling invariant: libjava.so carries a
+        //       DT_NEEDED entry for libjvm.so, which lives in
+        //       $JAVA_HOME/lib/server — a directory that only appears in
+        //       nativeLibDirs when libjvm.so itself matched a symbol
+        //       check. It never does (libjvm exports JVM_* rather than
+        //       Java_*), so libjvm.so is not bundled, and the produced
+        //       binary aborts at start-up with
+        //
+        //           error while loading shared libraries: libjvm.so:
+        //           cannot open shared object file: No such file or
+        //           directory
+        //
+        // That last failure is what motivated removing this scan.
+        // ------------------------------------------------------------------
 
-        // 2b. Native libraries bundled inside application JARs, which is how
-        //     Netty, SQLite, LevelDB and similar projects ship theirs.
-        //     Every JAR on the current classpath is scanned for entries under
-        //     META-INF/native/ (the conventional location) and extracted to a
-        //     stable temp directory so the linker can see them as real files.
+        // Native libraries bundled inside application JARs, under the
+        // conventional META-INF/native/ layout (Netty, SQLite JDBC,
+        // LevelDB, RocksDB JDBC, …). This is the only source of external
+        // .so/.dylib/.dll files that the linker will ever see.
         Path extractDir = Files.createTempDirectory("jnative-natives-");
         extractDir.toFile().deleteOnExit();
         scanClasspathJarsForNatives(targetPlatform, extractDir, candidates);
 
-        // 3. Filter by exported symbols.
+        // Filter by exported symbols.
         Set<String> stillWanted = new HashSet<>(wanted);
         List<Path> result = new ArrayList<>();
         Collections.sort(candidates);
@@ -763,9 +862,23 @@ public class Compiler implements CompilerPort {
         }
 
         if (!stillWanted.isEmpty()) {
-            log.warn("{} JNI symbol(s) still unresolved after scanning {} candidate "
-                    + "libraries. First 5: {}", stillWanted.size(), candidates.size(),
-                    stillWanted.stream().limit(5).collect(Collectors.joining(", ")));
+            // These symbols had no JNative C implementation and no
+            // third-party shared object provides them. The link step will
+            // fail with an undefined-symbol error naming the first one.
+            //
+            // That is the desired behaviour: the message tells the
+            // developer exactly which native needs a jnative/**.c
+            // implementation, instead of the previous behaviour — where
+            // dragging in libjava.so made the build "succeed" and turned
+            // the problem into a SIGSEGV / NPE three frames deep at run
+            // time.
+            log.warn("{} JNI symbol(s) have neither a JNative C "
+                    + "implementation under jnative/** nor a matching "
+                    + "third-party shared object under META-INF/native/. "
+                    + "The link step will fail. Missing symbols: {}",
+                     stillWanted.size(),
+                     stillWanted.stream().limit(5)
+                                .collect(Collectors.joining(", ")));
         }
         return result;
     }
@@ -823,25 +936,6 @@ public class Compiler implements CompilerPort {
                 log.debug("Skipping JAR {}: {}", jar, e.getMessage());
             }
         }
-    }
-
-    private static boolean isDynamicLibrary(Path p, TargetPlatform t) {
-        String n = p.getFileName().toString();
-        String triple = t.triple().toLowerCase(Locale.ROOT);
-        if (triple.contains("windows")) return n.endsWith(".dll");
-        if (triple.contains("darwin") || triple.contains("apple")) {
-            return n.endsWith(".dylib");
-        }
-        return n.endsWith(".so");
-    }
-
-    private static Path platformLibraryDir(TargetPlatform t) {
-        String home = System.getProperty("java.home");
-        if (home == null) return null;
-        Path base = Paths.get(home);
-        String triple = t.triple().toLowerCase(Locale.ROOT);
-        if (triple.contains("windows")) return base.resolve("bin");
-        return base.resolve("lib");
     }
 
     /**

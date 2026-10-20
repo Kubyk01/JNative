@@ -503,19 +503,32 @@ public class BytecodeToIr {
     private String findJNativeFileOwner(String declaringOwner) {
         String candidate = declaringOwner;
         while (candidate != null && !candidate.isEmpty()) {
-            String resourcePath = candidate.startsWith("java/")
-                ? "jnative/" + candidate.substring("java/".length()) + ".c"
-                : "jnative/" + candidate + ".c";
-            try (InputStream is = Thread.currentThread().getContextClassLoader()
-                    .getResourceAsStream(resourcePath)) {
-                if (is != null) return candidate;
-            } catch (IOException ignored) {}
+            String base = candidate.startsWith("java/")
+                ? "jnative/" + candidate.substring("java/".length())
+                : "jnative/" + candidate;
+
+            // 1. Exact match: Foo.c
+            if (resourceExists(base + ".c")) return candidate;
+
+            // 2. JDK convention: FooSupport.c (Continuation +
+            //    ContinuationSupport, IntegerPolynomial +
+            //    IntegerPolynomial1305, ...)
+            if (resourceExists(base + "Support.c")) return candidate;
 
             int dollar = candidate.lastIndexOf('$');
             if (dollar < 0) break;
             candidate = candidate.substring(0, dollar);
         }
         return null;
+    }
+
+    private static boolean resourceExists(String resourcePath) {
+        try (InputStream is = Thread.currentThread().getContextClassLoader()
+                .getResourceAsStream(resourcePath)) {
+            return is != null;
+        } catch (IOException ignored) {
+            return false;
+        }
     }
 
     /**

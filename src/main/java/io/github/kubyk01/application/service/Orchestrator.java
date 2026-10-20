@@ -322,8 +322,8 @@ public class Orchestrator implements OrchestratorPort {
         // bytecode is not translated into IR at all, and every call site
         // — direct, virtual, or reflective — is aliased onto the C symbol.
         //
-        // The C resource path is derived with exactly the same rule
-        // Compiler.getNativeResourcePath uses: strip a leading "java/"
+        // The C resource path is derived with the same base rule
+        // Compiler.findNativeResourcePath uses: strip a leading "java/"
         // from the class name and prepend "jnative/". So for
         // java.security.SecureRandom the path is
         // "jnative/security/SecureRandom.c".
@@ -538,10 +538,11 @@ public class Orchestrator implements OrchestratorPort {
      * Maps an internal class name to the classpath-relative path of its
      * C runtime source.
      *
-     * <p>This is byte-for-byte the same mapping
-     * {@link io.github.kubyk01.application.service.compiler.Compiler#getNativeResourcePath}
-     * performs, and it must stay that way: the override scanner and the
-     * native compiler must find the same files.</p>
+     * <p>This is the same base mapping
+     * {@code Compiler.findNativeResourcePath} performs before it probes
+     * {@code <Class>.c} and then {@code <Class>Support.c}. The scanner
+     * only looks at {@code <Class>.c}: override bodies live in the
+     * class's own file.</p>
      */
     private static String cResourcePathForClass(String internalName) {
         if (internalName.startsWith("java/")) {

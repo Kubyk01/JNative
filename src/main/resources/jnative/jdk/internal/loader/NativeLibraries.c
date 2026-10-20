@@ -12,6 +12,38 @@
 #define PATH_MAX 4096
 #endif
 
+/*
+ * jdk.internal.loader.NativeLibraries — the class that owns the native
+ * loading machinery for `System.loadLibrary` / `NativeLibrary.load`.
+ *
+ * -----------------------------------------------------------------------
+ * Note on findEntry0
+ * -----------------------------------------------------------------------
+ *
+ * This file previously also contained the implementation of
+ * jdk.internal.loader.NativeLibrary.findEntry0 (singular), which is
+ * the symbol-lookup entry point used by the JDK's reflective accessors.
+ *
+ * That implementation now lives in NativeLibrary.c (singular), in a
+ * file whose name matches the declaring class. The reason is that
+ * BytecodeToIr.findJNativeFileOwner and Compiler.hasNativeSupport both
+ * decide whether a native method has a JNative C implementation by
+ * probing for a C file whose name matches the declaring class:
+ *
+ *     jnative/<package>/<SimpleClassName>.c
+ *
+ * For NativeLibrary.findEntry0 the declaring class is NativeLibrary
+ * (singular). With the body in NativeLibraries.c (plural), both
+ * helpers concluded "no JNative implementation exists" and BytecodeToIr
+ * fell back to JNI symbol naming:
+ *
+ *     Java_jdk_internal_loader_NativeLibrary_findEntry0
+ *
+ * which nothing provides, so the link failed with an undefined-symbol
+ * error. Moving the implementation to NativeLibrary.c satisfies the
+ * probe without touching the probe itself.
+ */
+
 /* --------------------------------------------------------------------------
  * static native String findBuiltinLib(String name);
  *
@@ -166,35 +198,4 @@ void __jnative_fn_jdk_internal_loader_NativeLibraries_unload__Ljava_lang_String_
     (void)name_str;
     (void)is_builtin;
     (void)handle;
-}
-
-/*
- * static native long findEntry0(NativeLibraryImpl lib, String name);
- *
- * Resolves the address of a native symbol by name. In HotSpot the body
- * is a dlsym(3) call against the handle stored in lib->handle, and the
- * returned address is stored into the java.lang.reflect.Field or
- * Method that will subsequently be invoked through it.
- *
- * This runtime never resolves a symbol at run time: every native
- * method has a statically-linked __jnative_fn_* symbol emitted by the
- * LLVM backend, and the linkage between a Java-level method and its C
- * body is made at code-generation time. Nevertheless, the reachability
- * walk pulls in NativeLibraryImpl.find because the JDK's own
- * reflective accessors reference it, and the linker needs a body.
- *
- * Returning 0 is the documented "no such symbol" answer: the Java-side
- * caller (NativeLibraryImpl.find / NativeLibraries.find) treats a 0
- * result as "not found" and raises UnsatisfiedLinkError with the symbol
- * name attached. That is the truthful behaviour for a runtime that has
- * no dynamic symbol table to look up in, and it produces a diagnostic
- * that names the missing symbol rather than silently dereferencing
- * address 0.
- */
-int64_t __jnative_fn_jdk_internal_loader_NativeLibrary_findEntry0__JLjava_lang_String__J(
-        int64_t handle, void* name_str)
-{
-    (void)handle;
-    (void)name_str;
-    return 0;
 }

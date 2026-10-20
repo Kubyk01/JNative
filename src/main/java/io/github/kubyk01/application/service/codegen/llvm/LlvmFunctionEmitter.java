@@ -88,6 +88,68 @@ public class LlvmFunctionEmitter {
      */
     private static final String CLINIT_SUFFIX = "__clinit____V";
 
+    /**
+     * Every external symbol the generated prelude declares, extracted from
+     * {@link LlvmRuntime#getDeclarations()} at class-initialisation time.
+     *
+     * <p>{@link #isCallableSymbolDefined} treats membership in this set as
+     * proof that a call to the symbol will resolve at link time. That is
+     * exactly what the prelude guarantees: every {@code declare …} line it
+     * emits has a matching definition in {@code jnative_runtime.c} or one
+     * of its sibling per-class native files, and the linker will find it.
+     *
+     * <p>Why this is needed and why it is derived rather than hand-written:
+     * several optimizer passes ({@code LazyClinitInstrumenter},
+     * {@code DestructorInserter}, {@code InstructionHandlers}) construct
+     * {@code STATIC_CALL} instructions whose callee operand is the raw
+     * runtime-helper name — {@code __jnative_clinit_enter},
+     * {@code __jnative_clinit_exit}, {@code __jnative_get_exception_object},
+     * {@code __jnative_dtor_enter}, {@code __jnative_dtor_unclaim}.
+     * Those names do not match {@code __jnative_fn_*} (they are not Java
+     * methods) and are not represented as {@code Function} objects in the
+     * {@code Module} (they live in the prelude as bare {@code declare}s),
+     * so a hand-written check that looked only at those two families
+     * classified them as undefined and rewrote the call into
+     * {@code __jnative_unresolved_slot} at program start-up:
+     *
+     * <pre>
+     *   === JNative unresolved vtable/itable slot ===
+     *   unresolved call target '__jnative_clinit_enter'
+     *   (original: __jnative_clinit_enter)
+     * </pre>
+     *
+     * <p>Deriving the set from {@code LlvmRuntime.getDeclarations()}
+     * guarantees the predicate and the prelude can never drift: the
+     * declaration of every runtime helper and the recognition of that
+     * helper as callable come from the same string.
+     */
+    private static final Set<String> DECLARED_RUNTIME_HELPERS =
+        parseDeclaredRuntimeHelpers();
+
+    /**
+     * Parses the {@code declare …} lines of {@link LlvmRuntime#getDeclarations()}
+     * and returns the set of symbol names (without the leading {@code @}).
+     *
+     * <p>The input format is entirely under this codebase's control, so
+     * the parser only has to recognise what {@code getDeclarations()}
+     * emits: one {@code declare <return-type> @<name>(<params>)} per line,
+     * with the symbol name between the first {@code @} and the first
+     * {@code (} that follows it.</p>
+     */
+    private static Set<String> parseDeclaredRuntimeHelpers() {
+        Set<String> names = new HashSet<>();
+        for (String line : LlvmRuntime.getDeclarations().split("\n")) {
+            String trimmed = line.trim();
+            if (!trimmed.startsWith("declare ")) continue;
+            int at = trimmed.indexOf('@');
+            if (at < 0) continue;
+            int paren = trimmed.indexOf('(', at);
+            if (paren < 0) continue;
+            names.add(trimmed.substring(at + 1, paren));
+        }
+        return names;
+    }
+
     @FunctionalInterface
     private interface CallEmitter {
         void emit(StringBuilder sb, String resultReg);
@@ -4122,16 +4184,37 @@ public class LlvmFunctionEmitter {
 
     private boolean isCallableSymbolDefined(String symbol) {
         if (symbol == null || symbol.isEmpty()) return false;
-        // Only the compiler-known override/adaptor families are treated as
-        // implicitly defined. A blanket "__jnative_" match would silently
-        // accept any typo'd or stale symbol and emit a call to a name the
-        // linker never resolves, which is exactly the failure mode the
-        // diagnostic trap below exists to catch.
+
+        // Java methods that carry a JNative C implementation, and the
+        // aliases that the override machinery installs, are always
+        // callable: their bodies come from the compiled C sources that
+        // ship with the runtime, and the linker will resolve them.
         if (symbol.startsWith("__jnative_override_")
             || symbol.startsWith("__jnative_fn_")) {
             return true;
         }
-        if (symbol.startsWith("llvm."))    return true;
+
+        // LLVM intrinsics are lowered by the backend; there is no
+        // declaration to look up and nothing for the linker to resolve.
+        if (symbol.startsWith("llvm.")) return true;
+
+        // Runtime helpers. Every symbol declared by
+        // LlvmRuntime.getDeclarations() has a matching definition in
+        // jnative_runtime.c (or a sibling per-class native file) and is
+        // therefore guaranteed to resolve at link time. Membership in
+        // the derived set is the proof. See
+        // DECLARED_RUNTIME_HELPERS for the concrete failure this check
+        // exists to close.
+        if (DECLARED_RUNTIME_HELPERS.contains(symbol)) return true;
+
+        // C library entry points. Kept explicit rather than relying on
+        // the helper set because these are also called from C code that
+        // does not go through the prelude filter (the declarations in
+        // LlvmRuntime.getDeclarations() overlap with this set but are
+        // not identical to it — `printf` and `atexit`, for example,
+        // are declared there, but the switch is also reached for
+        // call sites that the emitter's helper-detection did not
+        // route through the prelude).
         return switch (symbol) {
             case "malloc", "free", "printf", "abort", "atexit",
                  "memcpy", "memmove", "memset", "_setjmp", "longjmp" ->
@@ -4146,7 +4229,7 @@ public class LlvmFunctionEmitter {
                     yield true;
                 }
                 // A bare `declare` (no entry block) will fail at link time
-                // unless something else provides the body.  Only count the
+                // unless something else provides the body. Only count the
                 // symbol as defined when the module really contains a
                 // definition for it.
                 yield f != null && f.getEntryBlock() != null;

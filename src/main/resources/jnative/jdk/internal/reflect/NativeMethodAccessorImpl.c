@@ -273,7 +273,61 @@ void* __jnative_fn_jdk_internal_reflect_NativeMethodAccessorImpl_invoke0__Ljava_
     return fn(obj, args_payload);
 }
 
-void* __jnative_fn_jdk_internal_reflect_NativeConstructorAccessorImpl_newInstance0__Ljava_lang_reflect_Constructor__Ljava_lang_Object__Ljava_lang_Object_(
+/* --------------------------------------------------------------------------
+ * NativeConstructorAccessorImpl.newInstance0 — implementation.
+ * --------------------------------------------------------------------------
+ *
+ * The public mangled symbol
+ *
+ *     __jnative_fn_jdk_internal_reflect_NativeConstructorAccessorImpl_newInstance0__…
+ *
+ * is defined by the forwarding shim in NativeConstructorAccessorImpl.c.
+ * That shim has three responsibilities:
+ *
+ *   1. It satisfies BytecodeToIr.findJNativeFileOwner and
+ *      Compiler.hasNativeSupport, both of which decide "does class C
+ *      have a JNative implementation?" by probing for a C file whose
+ *      name matches <package>/<SimpleClassName>.c.
+ *
+ *   2. It keeps the single definition of that symbol unambiguous —
+ *      there is exactly one function whose name is the mangled form.
+ *
+ *   3. It keeps the actual logic in this file, where it can share the
+ *      reflect-layout helpers (detect_reflect_layout,
+ *      build_constructor_descriptor, lookup_reflection_constructor,
+ *      append_class_descriptor, build_parameter_list) with invoke0.
+ *      Splitting the helpers across two files would mean duplicating
+ *      ~150 lines of layout code, which is worse than the one-function
+ *      shim.
+ *
+ * The implementation itself is unchanged; only the function's external
+ * symbol name has changed, from the mangled form to a plain
+ * __jnative_impl_* identifier that no tool treats specially. The
+ * forwarding shim in NativeConstructorAccessorImpl.c is the only
+ * caller, and DirectConstructorHandleAccessor.c forwards through the
+ * same shim, so the whole delegation chain (NativeConstructorAccessorImpl
+ * -> DirectConstructorHandleAccessor -> this implementation) remains
+ * intact.
+ *
+ * The consequences of the previous arrangement — where the mangled
+ * symbol was defined here, in a file named after a sibling class — were:
+ *
+ *   - both the reachability probe and the JNI fallback thought
+ *     NativeConstructorAccessorImpl had no JNative implementation;
+ *
+ *   - BytecodeToIr produced a JNI symbol
+ *     Java_jdk_internal_reflect_NativeConstructorAccessorImpl_newInstance0;
+ *
+ *   - the compiler's JNI-native discovery found no C file to satisfy
+ *     it, so the link step failed with:
+ *
+ *         ld.lld: error: undefined symbol:
+ *             Java_jdk_internal_reflect_NativeConstructorAccessorImpl_newInstance0
+ *
+ * Renaming the implementation and providing the shim in the correct
+ * file keeps everything together without that mismatch.
+ * ------------------------------------------------------------------------ */
+void* __jnative_impl_reflect_NativeConstructorAccessorImpl_newInstance0__(
         void* constructor_obj, void* args_array)
 {
     if (constructor_obj == NULL) {
