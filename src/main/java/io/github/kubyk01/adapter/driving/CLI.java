@@ -118,7 +118,12 @@ public class CLI implements Runnable {
             description = "Show all analysis stages (default if none specified)")
         boolean showAll,
         @CommandLine.Option(names = "--output",
-            description = "Output executable file name (default: a.out)") String outputFile,
+            description = "Output executable file name. When omitted, the executable "
+                + "is placed next to the input file and named after it with the .jar "
+                + "or .class extension removed; the .exe suffix is appended when the "
+                + "target triple is Windows. Example: Test.jar -> Test (Unix) / "
+                + "Test.exe (Windows).")
+        String outputFile,
         @CommandLine.Option(names = "--no-compile",
             description = "Do not compile to native executable") boolean noCompile,
         @CommandLine.Option(names = "--include-system",

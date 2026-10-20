@@ -566,6 +566,41 @@ typedef struct {
 extern JNativeFunctionEntry jnative_function_index[]     JNATIVE_WEAK;
 extern const int64_t        jnative_function_index_size  JNATIVE_WEAK;
 
+/* ---- Lazy <clinit> map ---------------------------------------------- */
+
+/**
+ * One entry of @jnative_lazy_clinit_map. Layout is frozen by the
+ * emitted LLVM type (see LlvmGlobalEmitter.emitLazyClinitMap):
+ *
+ *   cls      : %ReflectionClass*  — the class whose <clinit> is lazy
+ *   wrapper  : void ()*           — its guard wrapper
+ *
+ * MethodHandleObjectFieldAccessorImpl.c consults this table to run the
+ * class initializer before performing a MemberName-targeted field
+ * access (see the file's header comment for the access-order
+ * invariant it enforces).
+ */
+typedef struct {
+    ReflectionClass* cls;
+    void*            wrapper;   /* void (*)(void) */
+} JNativeLazyClinitEntry;
+
+/**
+ * The map, and its length. Declared as a weak array: if the LLVM
+ * backend has not emitted a matching @jnative_lazy_clinit_map, the
+ * linker resolves the symbol to zero, `jnative_lazy_clinit_map`
+ * decays to a null pointer, and MethodHandleObjectFieldAccessorImpl's
+ * `if (map == NULL)` guard short-circuits the function.
+ *
+ * The array form (not JNativeLazyClinitEntry*) is deliberate: a weak
+ * undefined *array* symbol resolves to address 0, so the identifier
+ * itself decays to a null pointer. A weak undefined *pointer* symbol
+ * would make the first use a load from address 0 — a null dereference
+ * before any guard could fire.
+ */
+extern JNativeLazyClinitEntry jnative_lazy_clinit_map[]      JNATIVE_WEAK;
+extern const int64_t          jnative_lazy_clinit_map_size   JNATIVE_WEAK;
+
 /**
  * Resolves `pc` to the symbol and owning class of the function that
  * contains it. Returns 1 when the address is covered by the emitted

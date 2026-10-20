@@ -275,6 +275,28 @@ public class LlvmGlobalEmitter {
      */
     private final Set<String> emittedRefClassNames = ConcurrentHashMap.newKeySet();
 
+    /**
+     * Lazy-{@code <clinit>} guard wrappers: mangled {@code <clinit>} symbol
+     * to wrapper symbol, as produced by
+     * {@link io.github.kubyk01.application.service.optimizer.LazyClinitInstrumenter}
+     * and handed over by {@link LlvmGenerator#setClinitWrappers(Map)}.
+     *
+     * <p>Consumed by {@link #emitLazyClinitMap()}, which runs (after
+     * {@link #generateReflectionData()} has populated
+     * {@link #emittedRefClassNames}) inside
+     * {@link #generateGlobalDefinitions()}.
+     */
+    private Map<String, String> lazyClinitWrappers = new HashMap<>();
+
+    /**
+     * Supplies the lazy-{@code <clinit>} wrapper map to the emitter. Called
+     * from {@link LlvmGenerator#setClinitWrappers(Map)}; null-tolerant in the
+     * same way as that setter.
+     */
+    public void setLazyClinitWrappers(Map<String, String> wrappers) {
+        this.lazyClinitWrappers = (wrappers != null) ? wrappers : new HashMap<>();
+    }
+
     public int getLiteralPoolSize() {
         return stringLiteralPool.size();
     }
@@ -291,12 +313,10 @@ public class LlvmGlobalEmitter {
 
     private final Map<String, Integer> interfaceIds = new ConcurrentHashMap<>();
     private int nextInterfaceId = 0;
-    private int totalInterfaces = 0;
     private volatile boolean layoutsBuilt = false;
 
     private final Map<String, String> vtableNames = new ConcurrentHashMap<>();
     private final Map<String, Integer> vtableLengths = new ConcurrentHashMap<>();
-    private final Map<String, Integer> lambdaVtableLengths = new ConcurrentHashMap<>();
 
     private final Map<String, String> typeInfoNames = new ConcurrentHashMap<>();
 
@@ -423,7 +443,6 @@ public class LlvmGlobalEmitter {
         String samInterface;
         String samSig;
         String adaptorName;
-        List<Type> capturedTypes;
 
         /**
          * All interfaces this lambda is an instance of: the SAM interface
@@ -558,7 +577,6 @@ public class LlvmGlobalEmitter {
                 interfaceIds.put(name, nextInterfaceId++);
                 getOrBuildInterfaceLayout(name);
             }
-            totalInterfaces = nextInterfaceId;
             layoutsBuilt = true;
         }
     }
@@ -798,6 +816,11 @@ public class LlvmGlobalEmitter {
             + "i8*, i8*, i8*, i8*, i8*, i8*, i8*, i8*, i8*, i8*, "
             + "i8*, i8*, i8*, i8*, i8*, i8*, i8*, i8* }\n" +
             "%JNativeSymbolClassEntry = type { i8*, %ReflectionClass* }\n" +
+            // One entry of @jnative_lazy_clinit_map; see emitLazyClinitMap()
+            // and JNativeLazyClinitEntry in jnative_runtime.h. The two fields
+            // are the class whose <clinit> is lazy and the guard wrapper that
+            // runs it on first use.
+            "%JNativeLazyClinitEntry = type { %ReflectionClass*, i8* }\n" +
             // One entry of @jnative_function_index; see
             // generateFunctionIndex() and JNativeFunctionEntry in
             // jnative_runtime.h. The three fields are the function pointer,
@@ -846,7 +869,11 @@ public class LlvmGlobalEmitter {
             generateUnnamedModule() +
             generateEmbeddedResources() +
             generateReflectionData() +
-            generateFunctionIndex();
+            generateFunctionIndex() +
+            // Runs last so that emittedRefClassNames (filled by
+            // generateReflectionData) is complete: every row of the map points
+            // at an @refclass_* constant that already exists.
+            emitLazyClinitMap(lazyClinitWrappers);
     }
 
     public String generateLayoutConstants() {
@@ -1666,7 +1693,6 @@ public class LlvmGlobalEmitter {
         synchronized (this) {
             if (!interfaceIds.containsKey(samInterface)) {
                 interfaceIds.put(samInterface, nextInterfaceId++);
-                totalInterfaces = nextInterfaceId;
             }
             getOrBuildInterfaceLayout(samInterface);
 
@@ -1692,7 +1718,6 @@ public class LlvmGlobalEmitter {
             for (String iface : superIfacesList) {
                 if (!interfaceIds.containsKey(iface)) {
                     interfaceIds.put(iface, nextInterfaceId++);
-                    totalInterfaces = nextInterfaceId;
                 }
                 getOrBuildInterfaceLayout(iface);
             }
@@ -1705,7 +1730,6 @@ public class LlvmGlobalEmitter {
             info.samInterface = samInterface;
             info.samSig = samSig;
             info.adaptorName = adaptorName;
-            info.capturedTypes = new ArrayList<>(capturedTypes);
             info.superInterfaces = superIfacesList;
             lambdaRegistry.put(lambdaId, info);
 
@@ -1946,7 +1970,6 @@ public class LlvmGlobalEmitter {
                     .append("}\n");
 
             vtableLengths.put(lambdaClassName, methodLen);
-            lambdaVtableLengths.put(info.lambdaId, methodLen);
         }
         return sb.toString();
     }
@@ -3761,6 +3784,82 @@ public class LlvmGlobalEmitter {
     }
 
     /**
+     * Emits {@code @jnative_lazy_clinit_map} and
+     * {@code @jnative_lazy_clinit_map_size}: one row per class whose
+     * {@code <clinit>} was given a lazy guard wrapper, pairing the class
+     * mirror with the wrapper that runs the initializer on first use.
+     *
+     * <p>The consumer is the hand-written native file
+     * {@code jdk/internal/reflect/MethodHandleObjectFieldAccessorImpl.c},
+     * which must run the class initializer before performing a
+     * MemberName-targeted field access (see that file's header comment for
+     * the access-order invariant). The C side reads the table through the
+     * weak declarations in {@code jnative_runtime.h}, so an image with no
+     * lazy classes simply resolves the symbols to null and short-circuits.
+     *
+     * <p>The wrapper column is stored as an {@code i8*} (bitcast of
+     * {@code void ()*}), matching {@code JNativeLazyClinitEntry.wrapper}.
+     *
+     * <p>Must run after {@link #generateReflectionData()} — it needs
+     * {@link #emittedRefClassNames} to decide which {@code @refclass_*}
+     * constants actually exist.
+     *
+     * @param clinitWrappers mangled {@code <clinit>} symbol to wrapper
+     *                       symbol, as filled by LazyClinitInstrumenter
+     */
+    public String emitLazyClinitMap(Map<String, String> clinitWrappers) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("\n; ----- Lazy <clinit> map -----\n");
+
+        // Resolve each clinitName back to its owning internal class name
+        // through the IR function itself (ownerClass is set by
+        // BytecodeToIr / MethodTranslator when the <clinit> body is built).
+        List<String[]> rows = new ArrayList<>();   // {className, wrapperName}
+        if (clinitWrappers != null) {
+            for (Map.Entry<String, String> e : clinitWrappers.entrySet()) {
+                String clinitName = e.getKey();     // e.g. fn_java_lang_Foo__clinit____V
+                String wrapperName = e.getValue();
+                if (wrapperName == null || wrapperName.isEmpty()) continue;
+
+                Function clinitFn = module.getFunction(clinitName);
+                if (clinitFn == null || clinitFn.getEntryBlock() == null) continue;
+                String className = clinitFn.getOwnerClass();
+                if (className == null || className.isEmpty()) continue;
+
+                Function wrapperFn = module.getFunction(wrapperName);
+                if (wrapperFn == null || wrapperFn.getEntryBlock() == null) continue;
+
+                if (!emittedRefClassNames.contains(className)) continue;
+                rows.add(new String[]{className, wrapperName});
+            }
+        }
+        rows.sort(Comparator.comparing(r -> r[0]));
+
+        if (rows.isEmpty()) {
+            sb.append("@jnative_lazy_clinit_map = constant [1 x %JNativeLazyClinitEntry] ")
+              .append("[%JNativeLazyClinitEntry { %ReflectionClass* null, i8* null }]\n");
+            sb.append("@jnative_lazy_clinit_map_size = constant i64 0\n");
+            return sb.toString();
+        }
+
+        sb.append("@jnative_lazy_clinit_map = constant [")
+          .append(rows.size())
+          .append(" x %JNativeLazyClinitEntry] [\n");
+        for (int i = 0; i < rows.size(); i++) {
+            String cls = rows.get(i)[0];
+            String wrapper = rows.get(i)[1];
+            if (i > 0) sb.append(",\n");
+            sb.append("  %JNativeLazyClinitEntry { %ReflectionClass* @refclass_")
+              .append(LlvmTypeMapper.sanitizeIdentifier(cls))
+              .append(", i8* bitcast (void ()* @").append(wrapper).append(" to i8*) }");
+        }
+        sb.append("\n]\n");
+        sb.append("@jnative_lazy_clinit_map_size = constant i64 ")
+          .append(rows.size()).append("\n");
+        return sb.toString();
+    }
+
+    /**
      * True when the function's emitted definition has the same LLVM type as
      * its IR signature, so that the {@code bitcast (... to i8*)} in the
      * function index is well-typed.
@@ -4149,7 +4248,6 @@ public class LlvmGlobalEmitter {
         synchronized (this) {
             if (!interfaceIds.containsKey(ifaceName)) {
                 interfaceIds.put(ifaceName, nextInterfaceId++);
-                totalInterfaces = nextInterfaceId;
             }
             getOrBuildInterfaceLayout(ifaceName);
         }

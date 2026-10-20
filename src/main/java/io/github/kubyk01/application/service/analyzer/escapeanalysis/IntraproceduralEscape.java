@@ -325,43 +325,73 @@ public class IntraproceduralEscape {
         // The callee's summary tells us WHICH of its parameters escape
         // (indices in getParamsEscaped) and WHICH are returned (indices
         // in getParamsReturned). It does NOT record, for a parameter
-        // that escapes, whether the escape was to a heap object or to a
-        // static field. The escapesGlobally flag says "somewhere in this
-        // callee's transitive body, a value was stored into global
+        // that escapes, whether the escape was to a heap object or to
+        // a static field. The escapesGlobally flag says "somewhere in
+        // this callee's transitive body, a value was stored into global
         // state", but it does not say WHICH value.
         //
         // Because of that, the caller's policy is:
         //
         //   * An argument the callee does NOT escape (its index is not
-        //     in paramsEscaped and not in paramsReturned) is left alone,
-        //     regardless of escapesGlobally. The callee's global escapes
-        //     must have come from values it created itself — fresh
-        //     allocations, values read from static state, values read
-        //     out of objects reachable from static state. Nothing the
-        //     caller passed in is at risk through this particular call.
+        //     in paramsEscaped) is left alone, regardless of
+        //     escapesGlobally. The callee's global escapes must have
+        //     come from values it created itself — fresh allocations,
+        //     values read from static state, values read out of objects
+        //     reachable from static state. Nothing the caller passed in
+        //     is at risk through this particular call.
         //
         //   * An argument the callee DOES escape is promoted to GLOBAL
         //     if the callee escapes globally, and to HEAP otherwise:
         //     the summary cannot distinguish the two cases, so the
         //     coarser (higher) status wins.
         //
-        // The previous revision promoted EVERY argument of a globally
-        // escaping callee to GLOBAL, without consulting paramsEscaped.
-        // On a callee such as Object.toString — whose body creates
-        // fresh intermediate objects (StringBuilder, String) that
-        // themselves reach state that makes escapesGlobally true, but
-        // which never store the receiver into any global location —
-        // that unconditional promotion raised the receiver of
-        //     new Test2(i).toString()
-        // in the reported benchmark to EscapeStatus.GLOBAL and made
-        // stack allocation of Test2 impossible.
+        //   * An argument the callee RETURNS (its index is in
+        //     paramsReturned) is NOT promoted at the call site. The
+        //     callee returning a value tells us that the return value
+        //     is an alias of that argument; it does NOT tell us that
+        //     the argument escapes the caller's frame. The caller's
+        //     own analysis of what it does with the return value —
+        //     its return terminator, a field store, another call —
+        //     determines whether the aliased argument actually
+        //     escapes. The alias relationship itself is already
+        //     recorded by InterproceduralPointsTo.processCall, which
+        //     merges the return value's points-to set with every
+        //     argument named in paramsReturned.
         //
-        // The return-value branch below keeps its previous shape: a
-        // globally escaping callee might return the globally escaped
-        // value, and the returned reference outlives the call in any
-        // case, so the return value is promoted to GLOBAL when the
-        // callee escapes globally, and to RETURN when it merely
-        // returns an object.
+        //   * The return value itself is NOT promoted to RETURN
+        //     merely because the callee has isReturnsObject == true.
+        //     isReturnsObject is a coarse boolean: it is true for a
+        //     fresh allocation (where the callee already marked the
+        //     site RETURN via its own return terminator) and for an
+        //     aliased argument (where the caller's subsequent use
+        //     decides). Unconditionally promoting the return value to
+        //     RETURN conflates the two cases and, through the shared
+        //     points-to site, promotes the aliased argument as well.
+        //
+        // The concrete failure the old promotions produced:
+        //
+        //     Object.toString() {
+        //         return getClass().getName() + "@"
+        //              + Integer.toHexString(hashCode());
+        //     }
+        //
+        // compiles to a chain of StringBuilder.append calls on a
+        // fresh `new StringBuilder()`. The receiver is never returned
+        // by toString, never stored in a field, and never passed to
+        // an escaping call: it is a local builder whose only role is
+        // to be consumed by StringBuilder.toString() at the end of
+        // the expression. With the old promotion, the receiver's
+        // site was marked RETURN on the first append call. The
+        // generated IR then had (a) a calloc for the StringBuilder,
+        // (b) no __destruct_java_lang_StringBuilder anywhere, and
+        // (c) no free for the returned byte[] — one StringBuilder
+        // plus its internal buffer leaked on every toString() call.
+        //
+        // The fix is semantic, not a heuristic and not a special case
+        // for any particular class or method name. It applies to every
+        // callee uniformly: a call never changes the escape status of
+        // its arguments on the basis of what the callee returns; only
+        // the caller's subsequent use of the return value does.
         // ------------------------------------------------------------------
         EscapeStatus escapedArgStatus = summary.isEscapesGlobally()
                 ? EscapeStatus.GLOBAL
@@ -371,18 +401,15 @@ public class IntraproceduralEscape {
             if (summary.getParamsEscaped().contains(i)) {
                 markEscaped(args.get(i), escapedArgStatus);
             }
-            if (summary.getParamsReturned().contains(i)) {
-                markEscaped(args.get(i), EscapeStatus.RETURN);
-            }
+            // paramsReturned is deliberately NOT propagated as RETURN
+            // here. See the block comment above for the full rationale.
         }
 
         if (summary.isEscapesGlobally() && returnValue != null) {
             markEscaped(returnValue, EscapeStatus.GLOBAL);
         }
-
-        if (summary.isReturnsObject() && returnValue != null) {
-            markEscaped(returnValue, EscapeStatus.RETURN);
-        }
+        // isReturnsObject is deliberately NOT propagated as RETURN
+        // here. See the block comment above for the full rationale.
 
         // Map the callee's parameter-to-parameter edges to the caller's
         // argument values. The escape propagation step inside analyze()

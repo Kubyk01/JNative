@@ -109,6 +109,9 @@ public class LlvmGenerator {
 
     public void setClinitWrappers(Map<String, String> wrappers) {
         this.clinitWrappers = wrappers != null ? wrappers : new HashMap<>();
+        // Forwarded so that LlvmGlobalEmitter.emitLazyClinitMap() can emit
+        // @jnative_lazy_clinit_map from generateGlobalDefinitions().
+        globalEmitter.setLazyClinitWrappers(this.clinitWrappers);
     }
 
     /**

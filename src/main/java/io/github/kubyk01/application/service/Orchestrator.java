@@ -454,7 +454,9 @@ public class Orchestrator implements OrchestratorPort {
 
         // --- 11. Native compilation ---------------------------------------
         if (!noCompile) {
-            Path exePath = outputFile != null ? Paths.get(outputFile) : Paths.get("a.out");
+            Path exePath = outputFile != null
+                ? Paths.get(outputFile)
+                : defaultOutputPath(path, targetPlatform);
             try {
                 compiler.compileAndLink(llPaths, exePath, usedSystemClasses, module,
                         resolver, effectiveCores, optimizationLevel, targetPlatform);
@@ -728,5 +730,92 @@ public class Orchestrator implements OrchestratorPort {
     private static boolean matchesDebug(String debugName, String name) {
         if (debugName == null) return true;
         return name != null && name.contains(debugName);
+    }
+
+    // =====================================================================
+    //  Default output-file naming
+    // =====================================================================
+
+    /**
+     * Derives the default executable path from the input path when the user
+     * does not supply an explicit {@code --output}.
+     *
+     * <p>The naming rule is the one every AOT compiler follows: the
+     * executable is named after its input, with the language-specific
+     * extension dropped, and the platform's own executable suffix appended
+     * when the target is Windows.</p>
+     *
+     * <ul>
+     *   <li>{@code Test.jar} &rarr; {@code Test} (Unix) /
+     *       {@code Test.exe} (Windows target).</li>
+     *   <li>{@code Foo.class} &rarr; {@code Foo} / {@code Foo.exe}.</li>
+     *   <li>A directory {@code build/} &rarr; the file {@code build} placed
+     *       next to that directory, or {@code build.exe} on Windows. The
+     *       directory itself is untouched.</li>
+     *   <li>An input with no parent (a bare relative name such as
+     *       {@code Test.jar}) yields a result relative to the current
+     *       working directory, matching the resolution the previous
+     *       hard-coded {@code "a.out"} used.</li>
+     * </ul>
+     *
+     * <p>The output is always placed <b>next to the input</b>, never inside
+     * the current directory unless the input is itself relative. This is
+     * the natural layout for build artefacts: {@code jnative analyze
+     * jars/Test.jar} produces {@code jars/Test}, which sits next to its
+     * source and can be shipped as one directory. It also means that two
+     * invocations on different jars in different directories cannot
+     * silently collide on a shared name.</p>
+     *
+     * <p>The Windows suffix is chosen from the <em>target</em> triple, not
+     * from the build host's {@code os.name}. A Linux build with
+     * {@code --target x86_64-pc-windows-msvc} produces a PE binary that
+     * the user will want to name {@code .exe} in order for the receiving
+     * Windows system to run it as an executable; keying the suffix off
+     * the host would produce {@code Test} on that build and the file would
+     * not be double-clickable.</p>
+     *
+     * @param input          the JAR, directory or single {@code .class}
+     *                       file the analysis was run on
+     * @param targetPlatform the resolved target platform for this build;
+     *                       may be {@code null} only if the caller did not
+     *                       resolve one, in which case the host {@code os.name}
+     *                       is used as a fallback
+     * @return the default executable path
+     */
+    private static Path defaultOutputPath(Path input, TargetPlatform targetPlatform) {
+        Path fileNamePath = input.getFileName();
+        String fileName = (fileNamePath != null) ? fileNamePath.toString() : "";
+
+        // Root path ("/", "C:\") or empty input: no sensible stem exists.
+        // Fall back to a stable, explicit name rather than producing a path
+        // that resolves to the filesystem root.
+        if (fileName.isEmpty() || fileName.equals(".") || fileName.equals("..")) {
+            fileName = "output";
+        }
+
+        // Strip a trailing .jar or .class so that the executable is named
+        // after its input rather than after its input's format. Any other
+        // extension is left in place: "Test.foo" is not a known JNative
+        // input and stripping ".foo" would surprise the user.
+        String baseName = fileName;
+        int dotIdx = fileName.lastIndexOf('.');
+        if (dotIdx > 0) {
+            String ext = fileName.substring(dotIdx).toLowerCase(java.util.Locale.ROOT);
+            if (ext.equals(".jar") || ext.equals(".class")) {
+                baseName = fileName.substring(0, dotIdx);
+            }
+        }
+
+        boolean targetIsWindows = targetPlatform != null
+            ? targetPlatform.triple().toLowerCase(java.util.Locale.ROOT).contains("windows")
+            : System.getProperty("os.name", "")
+                  .toLowerCase(java.util.Locale.ROOT).contains("win");
+
+        if (targetIsWindows) {
+            baseName = baseName + ".exe";
+        }
+
+        Path parent = input.getParent();
+        return (parent != null) ? parent.resolve(baseName) : Paths.get(baseName);
     }
 }
