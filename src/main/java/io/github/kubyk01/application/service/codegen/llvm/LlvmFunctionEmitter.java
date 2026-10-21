@@ -2954,6 +2954,34 @@ public class LlvmFunctionEmitter {
                 break;
             }
 
+            case SELECT: {
+                if (inst.getOperands().size() < 3 || inst.getResult() == null) {
+                    sb.append("  ; malformed SELECT\n");
+                    break;
+                }
+                Value cond     = inst.getOperands().get(0);
+                Value trueVal  = inst.getOperands().get(1);
+                Value falseVal = inst.getOperands().get(2);
+                Type  resType  = inst.getResult().getType();
+
+                String condRef  = getLlvmValue(sb, cond);
+                String trueRef  = getLlvmValue(sb, trueVal);
+                String falseRef = getLlvmValue(sb, falseVal);
+
+                String trueConverted  = castValueToType(sb, trueRef,
+                        trueVal.getType(),  resType);
+                String falseConverted = castValueToType(sb, falseRef,
+                        falseVal.getType(), resType);
+
+                String llvmRes = LlvmTypeMapper.toLlvmType(resType);
+                sb.append("  ").append(resultName).append(" = select i1 ")
+                  .append(condRef)
+                  .append(", ").append(llvmRes).append(" ").append(trueConverted)
+                  .append(", ").append(llvmRes).append(" ").append(falseConverted)
+                  .append("\n");
+                break;
+            }
+
             default:
                 sb.append("  ; unsupported opcode: ").append(op).append("\n");
         }
@@ -3981,6 +4009,25 @@ public class LlvmFunctionEmitter {
             && val instanceof String s) {
             return "bitcast (%struct.java_lang_String* @"
                 + LlvmRuntime.stringObjectGlobalName(s) + " to i8*)";
+        }
+
+        // Marker type: value is a class internal name; emits a bitcast of that
+        // class's %JNativeVTable global to i8*, so the result can be compared
+        // against the receiver's vtable slot (also i8*) or used as a raw pointer.
+        //
+        // A value that starts with '[' is an array descriptor instead: the word
+        // at offset 0 of an array is the array's class mirror (%ReflectionClass*),
+        // not a %JNativeVTable*, so the comparison has to be made against the
+        // @refclass_* global of that descriptor.
+        if (type.isReference()
+                && "__llvm_vtable_ptr__".equals(type.getClassName())) {
+            String className = String.valueOf(val);
+            if (className.startsWith("[")) {
+                return "bitcast (%ReflectionClass* @refclass_"
+                     + LlvmTypeMapper.sanitizeIdentifier(className) + " to i8*)";
+            }
+            return "bitcast (%JNativeVTable* @vtable_"
+                 + LlvmTypeMapper.sanitizeIdentifier(className) + " to i8*)";
         }
 
         if (type.isReference() && val instanceof String s) {

@@ -53,6 +53,26 @@ public class BasicBlock {
         }
     }
 
+    public void removeSuccessor(BasicBlock block) {
+        if (successors.remove(block)) {
+            // Predecessor link is dropped only when block is no longer a
+            // successor via either path. The exceptional-successor list is a
+            // separate relation; if it still contains `block`, the predecessor
+            // link must stay.
+            if (!exceptionalSuccessors.contains(block)) {
+                block.predecessors.remove(this);
+            }
+        }
+    }
+
+    public void removeExceptionalSuccessor(BasicBlock block) {
+        if (exceptionalSuccessors.remove(block)) {
+            if (!successors.contains(block)) {
+                block.predecessors.remove(this);
+            }
+        }
+    }
+
     public List<BasicBlock> getSuccessors() {
         if (exceptionalSuccessors.isEmpty()) {
             return new ArrayList<>(successors);

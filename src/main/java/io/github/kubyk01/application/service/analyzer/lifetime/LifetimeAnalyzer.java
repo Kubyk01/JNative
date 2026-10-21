@@ -209,65 +209,55 @@ public class LifetimeAnalyzer {
         EscapeStatus status = escapeResult.getSiteStatus(site);
 
         // ------------------------------------------------------------------
-        // Ownership rule for HEAP sites.
+        // Ownership rule for GLOBAL / THREAD / RETURN.
         //
-        // A HEAP allocation is one whose only remaining reference is inside
-        // a field of another object. That owner is the sole entity entitled
-        // to release the storage: DestructorInserter.createClassDestructor
-        // already emits a destructor that walks every reference-typed field
-        // of the owner and calls the field's destructor recursively, and
-        // the single-free rule (delegatedToSuper) guarantees that the
-        // object is freed exactly once along that chain.
+        // An object that reaches a static field, another thread, or the
+        // caller outlives the frame that allocated it. Its lifetime is
+        // bounded by an entity outside the destruction-point machinery, so
+        // there is no point inside the defining function at which a
+        // destructor could legally run: any such call would free storage
+        // that the new owner still observes.
+        // ------------------------------------------------------------------
+        if (status == EscapeStatus.GLOBAL
+                || status == EscapeStatus.THREAD
+                || status == EscapeStatus.RETURN) {
+            return new SiteResult(site, List.of(), false);
+        }
+
+        // ------------------------------------------------------------------
+        // HEAP sites DO get a per-use destruction point.
         //
-        // Emitting a per-use destruction point for a HEAP site would create
-        // a second, competing owner of the same allocation -- the store
-        // site. Its destructor runs while the real owner still holds a
-        // reference to the object, and the results are exactly the two
-        // failures observed in the previous two runs:
+        // A HEAP allocation is one whose only remaining reference is a
+        // field of another object. The usual reclaim path for such an
+        // object is the owner's destructor chain: DestructorInserter's
+        // createClassDestructor walks every reference-typed field of the
+        // owner and releases it recursively.
         //
-        //   1. Use-after-free: the owner's field points at freed memory,
-        //      and the first read through the field observes whatever the
-        //      allocator wrote into the recycled chunk. On the run that
-        //      produced this report the recycled chunk happened to contain
-        //      the string "/usr/lib", which was then interpreted as a vtable
-        //      by AccessController.executePrivileged.
+        // That chain, however, only exists when the owner itself has a
+        // destructor. The owner may be a STACK object -- an object that
+        // does not escape its defining function. A STACK object's storage
+        // is released by the frame teardown; no destructor ever runs for
+        // it, so the chain stops at the container and the HEAP object it
+        // holds is never released. The only way to reclaim such an object
+        // is to free it at its last use, BEFORE the container becomes
+        // unreachable.
         //
-        //   2. Double free: the owner's destructor walks the field and
-        //      frees the same storage again, which glibc's tcache detects
-        //      and turns into a "free(): double free detected in tcache 2"
-        //      abort.
+        // The per-use destructor emitted for a HEAP site is therefore
+        // paired with a null-out of the field that held the object (see
+        // DestructorInserter.insertDestructorCall). The null-out is what
+        // keeps the two reclaim paths from colliding:
         //
-        // The reproduced crash was the deep form of the same defect:
+        //   - when the container's own destructor does run, it observes
+        //     NULL instead of a dangling pointer and does not free the
+        //     storage a second time;
+        //   - the field-overwrite instrumentation of the next loop
+        //     iteration loads NULL and skips the release, so no double
+        //     free can happen there either.
         //
-        //     ReferenceQueue.<init>:
-        //         new ReentrantLock()               -> stored into this.lock
-        //             ReentrantLock.<init>:
-        //                 new NonfairSync()         -> stored into this.sync
-        //                 per-use destructor for the Sync       (wrong)
-        //         per-use destructor for the Lock           (wrong)
-        //     ... later, an owner's destructor walks the field ...
-        //     __destruct_ReentrantLock -> __destruct_Sync -> __destruct_AQS
-        //         -> __destruct_AOS loads the (already freed) field
-        //         -> loads a garbage exclusiveOwnerThread
-        //         -> calls __destruct_java_lang_Thread(garbage)
-        //         -> SIGSEGV
-        //
-        // The correct treatment of a HEAP site is therefore the same as for
-        // GLOBAL / THREAD / RETURN: its lifetime is bounded by an entity
-        // outside the destruction-point machinery, and no per-use destructor
-        // is emitted for it. Storage is reclaimed through the owner's
-        // destructor chain, which is the only correct owner of a HEAP
-        // object.
-        //
-        // The per-store release that DestructorInserter emits at every
-        // reference-typed PUT_FIELD is what closes the "overwritten field"
-        // hole in this rule: when the container's field is overwritten,
-        // the previous value's only remaining owner (the field) is
-        // replaced, so the previous value must be released at the store.
-        // That release is gated by the live-out map published above, so
-        // it only fires when nothing else can observe the previous value.
-        // This is what makes TestHeap's loop non-leaking without breaking
-        // HashMap.resize's "oldTab" pattern.
+        // The runtime's single-free rule (__jnative_dtor_enter /
+        // __jnative_dtor_unclaim) stays the last line of defence: the
+        // first destructor call claims the object, every later call on
+        // the same pointer is a no-op.
         //
         // STACK is intentionally not listed here. A STACK object that is
         // used as an object is materialised via alloca (see
@@ -280,16 +270,8 @@ public class LifetimeAnalyzer {
         // by EscapeAnalysisResult.getSiteStatus for a site that the
         // analysis did not classify at all; treating such a site as
         // potentially free-able at its last use preserves the previous
-        // conservative behaviour and cannot introduce the HEAP double-free,
-        // because an UNKNOWN site was never observed being stored into
-        // another object's field.
+        // conservative behaviour.
         // ------------------------------------------------------------------
-        if (status == EscapeStatus.GLOBAL
-                || status == EscapeStatus.THREAD
-                || status == EscapeStatus.RETURN
-                || status == EscapeStatus.HEAP) {
-            return new SiteResult(site, List.of(), false);
-        }
 
         Function func = module.getFunction(site.getMethodName());
         if (func == null || func.getEntryBlock() == null) {

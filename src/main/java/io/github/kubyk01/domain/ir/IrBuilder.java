@@ -170,7 +170,8 @@ public class IrBuilder {
                  NEW, NEW_ARRAY, MULTI_NEW_ARRAY,
                  INSTANCEOF, CHECKCAST,
                  ARRAYLENGTH,
-                 ALOAD
+                 ALOAD,
+                 SELECT
                 -> true;
             default -> false;
         };
@@ -254,6 +255,13 @@ public class IrBuilder {
                 yield operands.length > 0 ? operands[0].getType() : Type.UNKNOWN;
             }
             case ARRAYLENGTH -> Type.INT;
+            case SELECT -> {
+                // operands: [cond, trueVal, falseVal]
+                if (operands.length >= 2 && operands[1] != null) {
+                    yield operands[1].getType();
+                }
+                yield Type.UNKNOWN;
+            }
             case ALOAD -> {
                 if (operands.length > 0 && operands[0].getType().isArray()) {
                     yield operands[0].getType().getElementType();
