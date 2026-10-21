@@ -21,6 +21,25 @@ public class EscapeSummary {
     private Set<String> fieldsEscaped = new HashSet<>();
 
     /**
+     * Parameters whose value is stored into a <b>static</b> field.
+     *
+     * <p>This is an exact subset of {@link #paramsEscaped}:
+     * {@code paramsEscapedToStatic ⊆ paramsEscaped}.</p>
+     *
+     * <p>Why a separate set is needed: {@link #escapesGlobally} is a
+     * coarse flag meaning "somewhere in the transitive closure of this
+     * function a value was written into a static field". It does not say
+     * <em>which</em> parameter ended up there. Treating every escaped
+     * argument as {@code GLOBAL} on the strength of that flag is exactly
+     * the error that turned a local {@code StringBuilder} inside
+     * {@code Object.toString} into a {@code GLOBAL} allocation. With an
+     * exact set, only the argument that really landed in a static field
+     * is promoted to {@code GLOBAL}; the others stay {@code HEAP}.</p>
+     */
+    @Builder.Default
+    private Set<Integer> paramsEscapedToStatic = new HashSet<>();
+
+    /**
      * Parameter-to-parameter escape edges.
      *
      * <p>For each key {@code i}, {@code paramEscapeEdges.get(i)} is the set
@@ -50,6 +69,33 @@ public class EscapeSummary {
     private Map<Integer, Set<Integer>> paramEscapeEdges = new HashMap<>();
 
     /**
+     * Parameters that are <b>reachable from the returned value</b>
+     * (the param &rarr; return edge).
+     *
+     * <p>Semantics: for each {@code i ∈ paramsEscapedToReturn}, the object
+     * that was passed as parameter {@code i} can be reached by following
+     * references that start at the returned value.</p>
+     *
+     * <p>Example: {@code Map.entry(k, v)} returns a {@code KeyValueHolder}
+     * whose {@code key}/{@code value} fields hold {@code k}/{@code v}. Then
+     * {@code Map.entry.paramsEscapedToReturn = {0, 1}}.</p>
+     *
+     * <p>How it is used. In {@code IntraproceduralEscape.processCall} an
+     * edge {@code args[i] -> returnValue} is added to
+     * {@code localEscapeEdges} for every {@code i ∈ paramsEscapedToReturn}.
+     * The fixed point then raises the status of the argument to the status
+     * of the returned value. If the returned value becomes {@code HEAP}
+     * (for example because the object is stored in a field of some
+     * container), the argument becomes {@code HEAP} as well, and its
+     * allocation no longer receives a per-use destructor.</p>
+     *
+     * <p>{@link #paramsReturned} means "the returned value <b>is</b> an alias
+     * of parameter {@code i}" (the parameter <b>is</b> the returned value).</p>
+     */
+    @Builder.Default
+    private Set<Integer> paramsEscapedToReturn = new HashSet<>();
+
+    /**
      * Monotone join. ⊥ is the empty summary (all sets empty, all flags
      * false) and ⊤ is "every parameter escapes, every field escapes, all
      * flags true". Merging only ever grows the stored value, which is what
@@ -60,6 +106,8 @@ public class EscapeSummary {
      */
     public void merge(EscapeSummary other) {
         paramsEscaped.addAll(other.paramsEscaped);
+        paramsEscapedToStatic.addAll(other.paramsEscapedToStatic);
+        paramsEscapedToReturn.addAll(other.paramsEscapedToReturn);
         paramsReturned.addAll(other.paramsReturned);
         fieldsEscaped.addAll(other.fieldsEscaped);
         returnsObject = returnsObject || other.returnsObject;

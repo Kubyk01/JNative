@@ -459,15 +459,215 @@ public class EscapeSummaryBuilder {
     }
 
     // =====================================================================
+    //  Fixed point over localToParams (which Parameters are reachable
+    //  from each Value's object)
+    // =====================================================================
+
+    /**
+     * Computes the set of parameters whose objects are <b>reachable</b> from
+     * the value {@code v} (through a chain of fields, array elements,
+     * arguments or call results).
+     *
+     * <p>Semantics: {@code v} contains {@code p.ordinal} in its result if and
+     * only if the object that was passed as parameter {@code p} can be reached
+     * from {@code v} by following references.</p>
+     *
+     * <p>Used for:</p>
+     * <ul>
+     *   <li>{@code PUT_FIELD base, field, rhs}: if {@code localToParams[rhs]}
+     *       is non-empty, all those parameters escape (either into
+     *       {@code paramsEscaped}, or into {@code paramsEscapedToStatic} at
+     *       the {@code PUT_STATIC} level);</li>
+     *   <li>{@code return v}: {@code localToParams[v]} is what has to be added
+     *       to {@code paramsEscapedToReturn}.</li>
+     * </ul>
+     *
+     * <p>The algorithm is a monotone fixed point: the sets only ever grow, so
+     * the iteration terminates after at most {@code |params|} steps; in
+     * practice after two or three.</p>
+     */
+    private Map<Value, Set<Integer>> computeLocalToParams(Function func,
+                                                          Map<String, EscapeSummary> snapshot) {
+        Map<Value, Set<Integer>> map = new HashMap<>();
+        Map<Integer, Set<Integer>> slotMap = new HashMap<>();
+
+        // A Parameter's object "contains" itself. Only reference-typed
+        // parameters are seeded: a primitive parameter can never be reached
+        // through a reference chain, and seeding it would make every
+        // primitive argument look like an escaping object.
+        for (Parameter p : func.getParameters()) {
+            if (!isReferenceLike(p.getType())) continue;
+            Set<Integer> s = new HashSet<>();
+            s.add(p.getOrdinal());
+            map.put(p, s);
+        }
+
+        int maxIterations = 2 * func.getParameters().size() + 64;
+
+        for (int iter = 0; iter < maxIterations; iter++) {
+            boolean changed = false;
+
+            for (BasicBlock block : func.getBlocks()) {
+                for (Instruction inst : block.getInstructions()) {
+                    Opcode op = inst.getOpcode();
+
+                    if (op == Opcode.LOAD) {
+                        Value result = inst.getResult();
+                        int idx = inst.getLocalIndex();
+                        if (result == null || idx < 0) continue;
+                        Set<Integer> sp = slotMap.get(idx);
+                        if (sp == null || sp.isEmpty()) continue;
+                        Set<Integer> cur = map.computeIfAbsent(result, k -> new HashSet<>());
+                        int before = cur.size();
+                        cur.addAll(sp);
+                        if (cur.size() > before) changed = true;
+                    } else if (op == Opcode.STORE) {
+                        if (inst.getOperands().isEmpty()) continue;
+                        Value stored = inst.getOperands().getFirst();
+                        int idx = inst.getLocalIndex();
+                        if (idx < 0) continue;
+                        Set<Integer> sp = map.get(stored);
+                        if (sp == null || sp.isEmpty()) continue;
+                        Set<Integer> cur = slotMap.computeIfAbsent(idx, k -> new HashSet<>());
+                        int before = cur.size();
+                        cur.addAll(sp);
+                        if (cur.size() > before) changed = true;
+                    } else if (op == Opcode.PHI) {
+                        Value result = inst.getResult();
+                        if (result == null) continue;
+                        Set<Integer> cur = map.computeIfAbsent(result, k -> new HashSet<>());
+                        int before = cur.size();
+                        for (Value operand : inst.getOperands()) {
+                            if (operand == null) continue;
+                            Set<Integer> sp = map.get(operand);
+                            if (sp != null) cur.addAll(sp);
+                        }
+                        if (cur.size() > before) changed = true;
+                    } else if (op == Opcode.CAST || op == Opcode.CHECKCAST) {
+                        if (inst.getOperands().isEmpty()) continue;
+                        Value src = inst.getOperands().getFirst();
+                        Value result = inst.getResult();
+                        if (result == null) continue;
+                        Set<Integer> sp = map.get(src);
+                        if (sp == null || sp.isEmpty()) continue;
+                        Set<Integer> cur = map.computeIfAbsent(result, k -> new HashSet<>());
+                        int before = cur.size();
+                        cur.addAll(sp);
+                        if (cur.size() > before) changed = true;
+                    } else if (op == Opcode.PUT_FIELD) {
+                        if (inst.getOperands().size() < 3) continue;
+                        Value base = inst.getOperands().get(0);
+                        Value rhs = inst.getOperands().get(2);
+                        Set<Integer> sp = map.get(rhs);
+                        if (sp == null || sp.isEmpty()) continue;
+                        Set<Integer> cur = map.computeIfAbsent(base, k -> new HashSet<>());
+                        int before = cur.size();
+                        cur.addAll(sp);
+                        if (cur.size() > before) changed = true;
+                    } else if (op == Opcode.ASTORE) {
+                        if (inst.getOperands().size() < 3) continue;
+                        Value array = inst.getOperands().get(0);
+                        Value value = inst.getOperands().get(2);
+                        Set<Integer> sp = map.get(value);
+                        if (sp == null || sp.isEmpty()) continue;
+                        Set<Integer> cur = map.computeIfAbsent(array, k -> new HashSet<>());
+                        int before = cur.size();
+                        cur.addAll(sp);
+                        if (cur.size() > before) changed = true;
+                    } else if (op == Opcode.ALOAD) {
+                        if (inst.getOperands().size() < 2) continue;
+                        Value array = inst.getOperands().getFirst();
+                        Value result = inst.getResult();
+                        if (result == null) continue;
+                        Set<Integer> sp = map.get(array);
+                        if (sp == null || sp.isEmpty()) continue;
+                        Set<Integer> cur = map.computeIfAbsent(result, k -> new HashSet<>());
+                        int before = cur.size();
+                        cur.addAll(sp);
+                        if (cur.size() > before) changed = true;
+                    } else if (op == Opcode.CALL || op == Opcode.VIRTUAL_CALL
+                            || op == Opcode.INTERFACE_CALL || op == Opcode.STATIC_CALL
+                            || op == Opcode.SPECIAL_CALL) {
+                        String calleeName = extractCalleeName(inst);
+                        if (calleeName == null) continue;
+                        String calleeKey = canonicalCalleeKey(calleeName);
+                        EscapeSummary calleeSum = snapshot.get(calleeKey);
+                        if (calleeSum == null) continue;
+
+                        List<Value> args = getCallArguments(inst);
+                        Value ret = inst.getResult();
+
+                        // Return value: inherit params from the args the
+                        // callee either aliases (paramsReturned) or stores
+                        // inside the returned object (paramsEscapedToReturn).
+                        if (ret != null) {
+                            Set<Integer> cur = map.computeIfAbsent(ret, k -> new HashSet<>());
+                            int before = cur.size();
+                            for (int i = 0; i < args.size(); i++) {
+                                if (calleeSum.getParamsReturned().contains(i)
+                                    || calleeSum.getParamsEscapedToReturn().contains(i)) {
+                                    Set<Integer> sp = map.get(args.get(i));
+                                    if (sp != null) cur.addAll(sp);
+                                }
+                            }
+                            if (cur.size() > before) changed = true;
+                        }
+
+                        // paramEscapeEdges: `args[from]` flows into `args[to]`.
+                        for (Map.Entry<Integer, Set<Integer>> e
+                                : calleeSum.getParamEscapeEdges().entrySet()) {
+                            int fromIdx = e.getKey();
+                            if (fromIdx >= args.size()) continue;
+                            Set<Integer> sp = map.get(args.get(fromIdx));
+                            if (sp == null || sp.isEmpty()) continue;
+                            for (int toIdx : e.getValue()) {
+                                if (toIdx >= args.size()) continue;
+                                Set<Integer> cur = map.computeIfAbsent(
+                                    args.get(toIdx), k -> new HashSet<>());
+                                int before = cur.size();
+                                cur.addAll(sp);
+                                if (cur.size() > before) changed = true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (!changed) break;
+        }
+
+        return map;
+    }
+
+    /**
+     * A type that can hold a reference: anything that is not a primitive.
+     * Null and unknown types are treated as references, because a value of
+     * unknown type may well be an object.
+     */
+    private static boolean isReferenceLike(Type type) {
+        if (type == null) return true;
+        return type.isReference() || type.isArray()
+                || type.isNull() || type.isUnknown();
+    }
+
+    // =====================================================================
     //  Per-function summary analysis (semantics unchanged)
     // =====================================================================
 
     private EscapeSummary analyzeFunction(Function func,
                                           Map<String, EscapeSummary> snapshot) {
-        Set<Integer> paramsEscaped  = new HashSet<>();
-        Set<Integer> paramsReturned = new HashSet<>();
-        Set<String>  fieldsEscaped  = new HashSet<>();
-        boolean[]    flags          = new boolean[3];   // [0]=returnsObject, [1]=escapesGlobally, [2]=createsThread
+        // Phase 0: which Parameters are reachable from each Value's object.
+        // Computed once per function; used to (a) detect parameters stored
+        // into fields through local aliases (requireNonNull-style chains),
+        // and (b) populate paramsEscapedToReturn in return terminators.
+        Map<Value, Set<Integer>> localToParams = computeLocalToParams(func, snapshot);
+
+        Set<Integer> paramsEscaped         = new HashSet<>();
+        Set<Integer> paramsReturned        = new HashSet<>();
+        Set<Integer> paramsEscapedToStatic = new HashSet<>();
+        Set<Integer> paramsEscapedToReturn = new HashSet<>();
+        Set<String>  fieldsEscaped         = new HashSet<>();
+        boolean[]    flags                 = new boolean[3];   // [0]=returnsObject, [1]=escapesGlobally, [2]=createsThread
 
         Map<Integer, Set<Integer>> paramAliases = computeParamAliases(func);
         Map<Value, Value> valueOrigin = new HashMap<>();
@@ -476,19 +676,22 @@ public class EscapeSummaryBuilder {
         for (BasicBlock block : func.getBlocks()) {
             for (Instruction inst : block.getInstructions()) {
                 processInstruction(inst, paramAliases, paramsEscaped,
-                        paramsReturned, fieldsEscaped, flags, snapshot, valueOrigin,
-                        paramEscapeEdges);
+                        paramsReturned, paramsEscapedToStatic, fieldsEscaped, flags,
+                        snapshot, valueOrigin, paramEscapeEdges, localToParams);
             }
             Terminator term = block.getTerminator();
             if (term != null) {
                 processTerminator(term, paramAliases, paramsEscaped,
-                        paramsReturned, flags, valueOrigin);
+                        paramsReturned, paramsEscapedToReturn, flags, valueOrigin,
+                        localToParams);
             }
         }
 
         EscapeSummary result = EscapeSummary.builder()
                 .paramsEscaped(paramsEscaped)
                 .paramsReturned(paramsReturned)
+                .paramsEscapedToStatic(paramsEscapedToStatic)
+                .paramsEscapedToReturn(paramsEscapedToReturn)
                 .fieldsEscaped(fieldsEscaped)
                 .returnsObject(flags[0])
                 .escapesGlobally(flags[1])
@@ -509,8 +712,10 @@ public class EscapeSummaryBuilder {
      */
     private static void validateSummaryIndices(Function func, EscapeSummary s) {
         int n = func.getParameters().size();
-        checkIndices(func, "paramsEscaped",  s.getParamsEscaped(),  n);
-        checkIndices(func, "paramsReturned", s.getParamsReturned(), n);
+        checkIndices(func, "paramsEscaped",         s.getParamsEscaped(),         n);
+        checkIndices(func, "paramsReturned",        s.getParamsReturned(),        n);
+        checkIndices(func, "paramsEscapedToStatic", s.getParamsEscapedToStatic(), n);
+        checkIndices(func, "paramsEscapedToReturn", s.getParamsEscapedToReturn(), n);
     }
 
     private static void checkIndices(Function func, String name,
@@ -546,23 +751,26 @@ public class EscapeSummaryBuilder {
                                     Map<Integer, Set<Integer>> paramAliases,
                                     Set<Integer> paramsEscaped,
                                     Set<Integer> paramsReturned,
+                                    Set<Integer> paramsEscapedToStatic,
                                     Set<String>  fieldsEscaped,
                                     boolean[]    flags,
                                     Map<String, EscapeSummary> snapshot,
                                     Map<Value, Value> valueOrigin,
-                                    Map<Integer, Set<Integer>> paramEscapeEdges) {
+                                    Map<Integer, Set<Integer>> paramEscapeEdges,
+                                    Map<Value, Set<Integer>> localToParams) {
         Opcode op = inst.getOpcode();
         switch (op) {
             case PUT_FIELD -> processPutField(inst, paramAliases, paramsEscaped, fieldsEscaped, flags,
-                    paramEscapeEdges);
+                    paramEscapeEdges, localToParams);
             case GET_FIELD -> processGetField(inst, flags);
             case MONITOR_ENTER, MONITOR_EXIT -> processMonitor(inst, paramAliases, paramsEscaped, flags);
-            case PUT_STATIC -> processPutStatic(inst, paramAliases, paramsEscaped, flags);
+            case PUT_STATIC -> processPutStatic(inst, paramAliases, paramsEscaped,
+                    paramsEscapedToStatic, flags);
             case ALOAD -> processALoad(inst, valueOrigin);
             case ASTORE -> processAStore(inst, paramAliases, paramsEscaped, fieldsEscaped);
             case CALL, VIRTUAL_CALL, INTERFACE_CALL, STATIC_CALL, SPECIAL_CALL ->
                     processCall(inst, paramAliases, paramsEscaped, paramsReturned,
-                            flags, snapshot, paramEscapeEdges);
+                            paramsEscapedToStatic, flags, snapshot, paramEscapeEdges);
             default -> { }
         }
     }
@@ -572,9 +780,11 @@ public class EscapeSummaryBuilder {
                                  Set<Integer> paramsEscaped,
                                  Set<String>  fieldsEscaped,
                                  boolean[]    flags,
-                                 Map<Integer, Set<Integer>> paramEscapeEdges) {
+                                 Map<Integer, Set<Integer>> paramEscapeEdges,
+                                 Map<Value, Set<Integer>> localToParams) {
         if (inst.getOperands().size() < 3) return;
 
+        Value base = inst.getOperands().get(0);
         Value rhs  = inst.getOperands().get(2);
         String[] of = extractFieldOwnerAndName(inst);
         String owner = of[0];
@@ -599,46 +809,39 @@ public class EscapeSummaryBuilder {
             fieldsEscaped.add(c.getValue().toString());
         }
 
-        // --- FIX: type-dependent check ---
-        // A primitive value stored into a field stays a primitive and
-        // cannot make any allocation site reachable from another object
-        // or another thread.
-        Type rhsType = (rhs != null) ? rhs.getType() : null;
-        boolean rhsIsReference = (rhsType == null)
-                || rhsType.isReference()
-                || rhsType.isArray()
-                || rhsType.isNull()
-                || rhsType.isUnknown();
-
-        // The stored value becomes reachable from the base object. Since
-        // the summary is by construction an over-approximation of what
-        // this function may do to its parameters, and since the summary
-        // builder does not perform per-function local escape analysis,
-        // any reference parameter written into any field is reported as
-        // escaping. (The IntraproceduralEscape pass handles the more
-        // precise case where the base is a local whose escape status is
-        // known within the function.)
-        if (rhsIsReference && rhs instanceof Parameter pr) {
-            paramsEscaped.add(pr.getOrdinal());
-            addAliases(pr.getOrdinal(), paramAliases, paramsEscaped);
-
-            // Record the param-to-param edge when the base of the
-            // write is itself a parameter. This is the only way the
-            // caller can learn that the stored value's escape status
-            // is at least as high as the base's. See the javadoc on
-            // EscapeSummary.paramEscapeEdges for the full rationale.
-            if (inst.getOperands().getFirst() instanceof Parameter bp) {
-                paramEscapeEdges
-                    .computeIfAbsent(pr.getOrdinal(), k -> new HashSet<>())
-                    .add(bp.getOrdinal());
+        // ------------------------------------------------------------------
+        // A reference-typed rhs: whatever parameters are reachable from it
+        // escape into `base`'s fields. localToParams[rhs] contains every
+        // Parameter whose object is reachable from rhs — either rhs is the
+        // Parameter itself (directly stored), or rhs is a local that
+        // aliases a Parameter through a chain of requireNonNull-style calls,
+        // PHI nodes, or slot round-trips.
+        // ------------------------------------------------------------------
+        Set<Integer> rhsParams = localToParams.get(rhs);
+        if (rhsParams != null && !rhsParams.isEmpty()) {
+            for (int prd : rhsParams) {
+                paramsEscaped.add(prd);
+                addAliases(prd, paramAliases, paramsEscaped);
+                // Also record the param -> param edge when base is a
+                // Parameter, so that the caller can propagate the escape
+                // chain across the call boundary.
+                if (base instanceof Parameter bp) {
+                    paramEscapeEdges
+                        .computeIfAbsent(prd, k -> new HashSet<>())
+                        .add(bp.getOrdinal());
+                }
             }
         }
 
-        if (isVolatile && rhsIsReference) {
+        if (isVolatile && rhs != null) {
+            // A volatile store exposes the value to other threads.
             flags[1] = true;
-            if (rhs instanceof Parameter pr) {
-                paramsEscaped.add(pr.getOrdinal());
-                addAliases(pr.getOrdinal(), paramAliases, paramsEscaped);
+            Set<Integer> rp = localToParams.get(rhs);
+            if (rp != null) {
+                for (int prd : rp) {
+                    paramsEscaped.add(prd);
+                    addAliases(prd, paramAliases, paramsEscaped);
+                }
             }
         }
     }
@@ -672,6 +875,7 @@ public class EscapeSummaryBuilder {
     private void processPutStatic(Instruction inst,
                                   Map<Integer, Set<Integer>> paramAliases,
                                   Set<Integer> paramsEscaped,
+                                  Set<Integer> paramsEscapedToStatic,
                                   boolean[]    flags) {
         if (inst.getOperands().size() < 2) return;
         Value rhs = inst.getOperands().get(1);
@@ -698,6 +902,15 @@ public class EscapeSummaryBuilder {
         if (rhs instanceof Parameter p) {
             paramsEscaped.add(p.getOrdinal());
             addAliases(p.getOrdinal(), paramAliases, paramsEscaped);
+            if (rhsIsReference) {
+                // Writing a parameter into a static field is the only way
+                // a parameter can become truly GLOBAL. Record it in the
+                // exact set as well, so that the caller can promote this
+                // one argument to GLOBAL instead of promoting every
+                // escaped argument of the callee.
+                paramsEscapedToStatic.add(p.getOrdinal());
+                addAliases(p.getOrdinal(), paramAliases, paramsEscapedToStatic);
+            }
         }
         if (rhsIsReference) {
             flags[1] = true;
@@ -738,6 +951,7 @@ public class EscapeSummaryBuilder {
                              Map<Integer, Set<Integer>> paramAliases,
                              Set<Integer> paramsEscaped,
                              Set<Integer> paramsReturned,
+                             Set<Integer> paramsEscapedToStatic,
                              boolean[]    flags,
                              Map<String, EscapeSummary> snapshot,
                              Map<Integer, Set<Integer>> paramEscapeEdges) {
@@ -791,6 +1005,16 @@ public class EscapeSummaryBuilder {
                 paramsEscaped.add(p.getOrdinal());
                 addAliases(p.getOrdinal(), paramAliases, paramsEscaped);
             }
+            if (calleeSum.getParamsEscapedToStatic().contains(i) && arg instanceof Parameter p) {
+                // The callee stores this argument into a static field, so
+                // the caller's argument is GLOBAL as well. Keep it in the
+                // exact set so that the caller does not have to promote
+                // every escaped argument of the callee to GLOBAL.
+                paramsEscaped.add(p.getOrdinal());
+                paramsEscapedToStatic.add(p.getOrdinal());
+                addAliases(p.getOrdinal(), paramAliases, paramsEscaped);
+                addAliases(p.getOrdinal(), paramAliases, paramsEscapedToStatic);
+            }
             if (calleeSum.getParamsReturned().contains(i) && arg instanceof Parameter p) {
                 paramsReturned.add(p.getOrdinal());
                 addAliases(p.getOrdinal(), paramAliases, paramsReturned);
@@ -836,22 +1060,40 @@ public class EscapeSummaryBuilder {
                                    Map<Integer, Set<Integer>> paramAliases,
                                    Set<Integer> paramsEscaped,
                                    Set<Integer> paramsReturned,
+                                   Set<Integer> paramsEscapedToReturn,
                                    boolean[]    flags,
-                                   Map<Value, Value> valueOrigin) {
+                                   Map<Value, Value> valueOrigin,
+                                   Map<Value, Set<Integer>> localToParams) {
         if (term instanceof ReturnTerminator rt) {
             Value retVal = rt.getValue();
             if (retVal != null && retVal.getType() != Type.VOID) {
                 flags[0] = true;
+
                 if (retVal instanceof Parameter p) {
-                    paramsEscaped.add(p.getOrdinal());
+                    // return param; — the returned value IS the parameter.
+                    // Both paramsReturned (alias) and paramsEscapedToReturn
+                    // (param reachable from the return value) are true.
                     paramsReturned.add(p.getOrdinal());
-                    addAliases(p.getOrdinal(), paramAliases, paramsEscaped);
+                    paramsEscapedToReturn.add(p.getOrdinal());
                     addAliases(p.getOrdinal(), paramAliases, paramsReturned);
+                    addAliases(p.getOrdinal(), paramAliases, paramsEscapedToReturn);
                 } else {
+                    // return <local>; — the return value might be a fresh
+                    // object with some parameters stored in its fields,
+                    // or a temporary that aliases parameters through a
+                    // chain of requireNonNull-style calls.
+                    Set<Integer> contained = localToParams.get(retVal);
+                    if (contained != null && !contained.isEmpty()) {
+                        for (int prd : contained) {
+                            paramsEscapedToReturn.add(prd);
+                            addAliases(prd, paramAliases, paramsEscapedToReturn);
+                        }
+                    }
+                    // The valueOrigin map handles the ALOAD-then-RETURN case
+                    // (return from array element).
                     Value origin = valueOrigin.get(retVal);
                     if (origin instanceof Parameter p) {
-                        paramsReturned.add(p.getOrdinal());
-                        addAliases(p.getOrdinal(), paramAliases, paramsReturned);
+                        paramsEscapedToReturn.add(p.getOrdinal());
                     }
                 }
             }
@@ -860,16 +1102,16 @@ public class EscapeSummaryBuilder {
             if (exc != null) {
                 if (exc instanceof Parameter p) {
                     paramsEscaped.add(p.getOrdinal());
-                    paramsReturned.add(p.getOrdinal());
+                    paramsEscapedToReturn.add(p.getOrdinal());
                     addAliases(p.getOrdinal(), paramAliases, paramsEscaped);
-                    addAliases(p.getOrdinal(), paramAliases, paramsReturned);
+                    addAliases(p.getOrdinal(), paramAliases, paramsEscapedToReturn);
                 } else {
-                    Value origin = valueOrigin.get(exc);
-                    if (origin instanceof Parameter p) {
-                        paramsEscaped.add(p.getOrdinal());
-                        paramsReturned.add(p.getOrdinal());
-                        addAliases(p.getOrdinal(), paramAliases, paramsEscaped);
-                        addAliases(p.getOrdinal(), paramAliases, paramsReturned);
+                    Set<Integer> contained = localToParams.get(exc);
+                    if (contained != null && !contained.isEmpty()) {
+                        for (int prd : contained) {
+                            paramsEscaped.add(prd);
+                            paramsEscapedToReturn.add(prd);
+                        }
                     }
                 }
             }
