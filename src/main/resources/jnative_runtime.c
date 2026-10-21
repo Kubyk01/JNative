@@ -2799,3 +2799,249 @@ void __jnative_run_parallel(void** fns, int32_t count) {
     free(threads);
     free(chunks);
 }
+
+/* ============================================================================
+ * Virtual destructor dispatch.
+ * ============================================================================
+ *
+ * Keyed by the receiver's first word, which is either:
+ *   - a %JNativeVTable*   (ordinary object), or
+ *   - a %ReflectionClass* (array whose header mirror is registered in
+ *                          reflect_all_classes).
+ *
+ * The cache maps that pointer to the resolved destructor function, or to
+ * NULL when no destructor exists for the type. Negative caching is
+ * deliberate: a type either has a destructor symbol in the executable or
+ * it does not — the answer is stable for the process lifetime because
+ * every destructor is emitted at build time and statically linked.
+ * ========================================================================== */
+
+typedef void (*jnative_destructor_fn)(void*);
+
+typedef struct JNativeDestructCacheEntry {
+    void*                       key;    /* vtable or class mirror pointer */
+    jnative_destructor_fn       fn;     /* NULL = "no destructor"        */
+    struct JNativeDestructCacheEntry* next;
+} JNativeDestructCacheEntry;
+
+#define JNATIVE_DESTRUCT_BUCKETS 1024u
+#define JNATIVE_DESTRUCT_MASK    (JNATIVE_DESTRUCT_BUCKETS - 1u)
+
+static JNativeDestructCacheEntry*
+    jnative_destruct_cache[JNATIVE_DESTRUCT_BUCKETS];
+
+static pthread_mutex_t jnative_destruct_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static uintptr_t jnative_destruct_hash(const void* p) {
+    uintptr_t h = (uintptr_t)p;
+    h ^= h >> 33;
+    h *= 0xff51afd7ed558ccdULL;
+    h ^= h >> 33;
+    h *= 0xc4ceb9fe1a85ec53ULL;
+    h ^= h >> 33;
+    return h;
+}
+
+/**
+ * Build the destructor symbol name for an array descriptor.
+ *
+ * <p>This is the C-side counterpart of the Java-side name
+ * construction in DestructorInserter.destructorName(Type):</p>
+ *
+ * <pre>
+ *   "__destruct_array_" + Type.array(desc).toString().replaceAll("[^a-zA-Z0-9_.]", "_")
+ * </pre>
+ *
+ * <p>Type.toString() for an array renders as {@code array[element]},
+ * where {@code element} is the element type's own toString() form. For
+ * a primitive element type this is the primitive name ({@code int},
+ * {@code long}, ...). For a reference element type it is
+ * {@code ref(className)}, with slash separators preserved. For a nested
+ * array it recurses, producing {@code array[array[...]]}.</p>
+ *
+ * <p>The reconstruction below produces exactly that raw string, then
+ * applies the same {@code [^a-zA-Z0-9_.] -> '_'} sanitisation. The
+ * result is byte-identical to what the Java side produced for the same
+ * descriptor, so dlsym finds the emitted symbol.</p>
+ *
+ * @param desc     the JVM array descriptor, e.g. "[I" or
+ *                 "[[Ljava/lang/String;"
+ * @param out      output buffer
+ * @param out_size output buffer size including the NUL terminator
+ * @return 1 on success, 0 on malformed input or buffer overflow
+ */
+static int jnative_build_array_destructor_symbol(const char* desc,
+                                                 char* out, size_t out_size)
+{
+    if (desc == NULL || desc[0] != '[' || out_size == 0) return 0;
+
+    size_t pos = 0;
+
+    /* Prefix "__destruct_array_" */
+    static const char PREFIX[] = "__destruct_array_";
+    for (size_t i = 0; PREFIX[i] != '\0'; i++) {
+        if (pos + 1 >= out_size) return 0;
+        out[pos++] = PREFIX[i];
+    }
+
+    /* Count leading '[' (array depth). */
+    int depth = 0;
+    const char* p = desc;
+    while (*p == '[') { depth++; p++; }
+    if (depth == 0 || *p == '\0') return 0;
+
+    /* Build the raw Type.toString() form into a local buffer. */
+    char raw[1024];
+    size_t rl = 0;
+
+    /* "array[" depth times */
+    for (int i = 0; i < depth; i++) {
+        if (rl + 6 >= sizeof(raw)) return 0;
+        memcpy(raw + rl, "array[", 6);
+        rl += 6;
+    }
+
+    /* Base element type */
+    if (*p == 'L') {
+        const char* semi = strchr(p, ';');
+        if (semi == NULL) return 0;
+        size_t inner_len = (size_t)(semi - p - 1);
+        if (inner_len + 6 + rl >= sizeof(raw)) return 0;
+        memcpy(raw + rl, "ref(", 4); rl += 4;
+        memcpy(raw + rl, p + 1, inner_len); rl += inner_len;
+        raw[rl++] = ')';
+    } else {
+        const char* pname = NULL;
+        switch (*p) {
+            case 'Z': pname = "boolean"; break;
+            case 'B': pname = "byte";    break;
+            case 'S': pname = "short";   break;
+            case 'C': pname = "char";    break;
+            case 'I': pname = "int";     break;
+            case 'J': pname = "long";    break;
+            case 'F': pname = "float";   break;
+            case 'D': pname = "double";  break;
+            case 'V': pname = "void";    break;
+            default: return 0;
+        }
+        size_t n = strlen(pname);
+        if (rl + n + 1 >= sizeof(raw)) return 0;
+        memcpy(raw + rl, pname, n); rl += n;
+    }
+
+    /* "]" depth times */
+    for (int i = 0; i < depth; i++) {
+        if (rl + 1 >= sizeof(raw)) return 0;
+        raw[rl++] = ']';
+    }
+    raw[rl] = '\0';
+
+    /* Sanitise: keep [a-zA-Z0-9_.], replace the rest with '_'. */
+    for (size_t i = 0; i < rl; i++) {
+        unsigned char c = (unsigned char)raw[i];
+        char r;
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+            || (c >= '0' && c <= '9') || c == '_' || c == '.') {
+            r = (char)c;
+        } else {
+            r = '_';
+        }
+        if (pos + 1 >= out_size) return 0;
+        out[pos++] = r;
+    }
+    out[pos] = '\0';
+    return 1;
+}
+
+/**
+ * Resolve the destructor symbol for one runtime type.
+ *
+ * <p>For an array (first word is a registered class mirror) the symbol
+ * is `__destruct_array_<sanitized-descriptor>`. For an ordinary object
+ * (first word is a %JNativeVTable) the symbol is
+ * `__destruct_<sanitized-class-name>` where the sanitisation matches
+ * DestructorInserter exactly: `/` and `.` become `_`, everything else
+ * is preserved (including `$` for nested classes).</p>
+ */
+static jnative_destructor_fn jnative_resolve_destructor(void* key) {
+    char symbol[1024];
+
+    if (__jnative_is_class_mirror(key)) {
+        ReflectionClass* mirror = (ReflectionClass*)key;
+        if (mirror->cname == NULL) return NULL;
+        if (!jnative_build_array_destructor_symbol(mirror->cname,
+                                                   symbol, sizeof(symbol))) {
+            return NULL;
+        }
+    } else {
+        JNativeVTable* vt = (JNativeVTable*)key;
+        if (vt->name == NULL) return NULL;
+
+        static const char PREFIX[] = "__destruct_";
+        size_t pos = 0;
+        for (size_t i = 0; PREFIX[i] != '\0'; i++) {
+            if (pos + 1 >= sizeof(symbol)) return NULL;
+            symbol[pos++] = PREFIX[i];
+        }
+        for (const char* p = vt->name; *p != '\0'; p++) {
+            if (pos + 1 >= sizeof(symbol)) return NULL;
+            char c = *p;
+            symbol[pos++] = (c == '/' || c == '.') ? '_' : c;
+        }
+        symbol[pos] = '\0';
+    }
+
+    return (jnative_destructor_fn)dlsym(RTLD_DEFAULT, symbol);
+}
+
+static jnative_destructor_fn jnative_destructor_for(void* key) {
+    if (key == NULL) return NULL;
+
+    size_t bucket = (size_t)(jnative_destruct_hash(key) & JNATIVE_DESTRUCT_MASK);
+
+    /* Fast path: cache hit. */
+    pthread_mutex_lock(&jnative_destruct_lock);
+    for (JNativeDestructCacheEntry* e = jnative_destruct_cache[bucket];
+         e != NULL; e = e->next) {
+        if (e->key == key) {
+            jnative_destructor_fn fn = e->fn;
+            pthread_mutex_unlock(&jnative_destruct_lock);
+            return fn;
+        }
+    }
+    pthread_mutex_unlock(&jnative_destruct_lock);
+
+    /* Slow path: resolve outside the lock. */
+    jnative_destructor_fn fn = jnative_resolve_destructor(key);
+
+    /* Publish, re-checking under the lock to handle the race. */
+    pthread_mutex_lock(&jnative_destruct_lock);
+    for (JNativeDestructCacheEntry* e = jnative_destruct_cache[bucket];
+         e != NULL; e = e->next) {
+        if (e->key == key) {
+            fn = e->fn;
+            pthread_mutex_unlock(&jnative_destruct_lock);
+            return fn;
+        }
+    }
+    JNativeDestructCacheEntry* ne =
+        (JNativeDestructCacheEntry*)malloc(sizeof(*ne));
+    if (ne != NULL) {
+        ne->key  = key;
+        ne->fn   = fn;
+        ne->next = jnative_destruct_cache[bucket];
+        jnative_destruct_cache[bucket] = ne;
+    }
+    pthread_mutex_unlock(&jnative_destruct_lock);
+
+    return fn;
+}
+
+void __jnative_destruct_dispatch(void* obj) {
+    if (obj == NULL) return;
+    void* first_word = *(void**)obj;
+    if (first_word == NULL) return;
+
+    jnative_destructor_fn fn = jnative_destructor_for(first_word);
+    if (fn != NULL) fn(obj);
+}

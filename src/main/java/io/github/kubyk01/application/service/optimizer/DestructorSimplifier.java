@@ -59,6 +59,36 @@ public class DestructorSimplifier {
     }
 
     private void eliminateDeadDestructors() {
+        // Virtual destructor dispatch is used whenever at least one class
+        // destructor has a reference-typed field. In that case EVERY
+        // destructor is reachable (via dlsym from __jnative_destruct_dispatch),
+        // regardless of whether any direct STATIC_CALL targets it. The
+        // pointer-based check below detects the presence of dispatch and
+        // disables elimination — the destructors are all live.
+        boolean dispatchUsed = false;
+        outer:
+        for (Function func : module.getFunctions()) {
+            if (func.getEntryBlock() == null) continue;
+            for (BasicBlock block : func.getBlocks()) {
+                for (Instruction inst : block.getInstructions()) {
+                    if (inst.getOpcode() != Opcode.STATIC_CALL) continue;
+                    if (inst.getOperands().isEmpty()) continue;
+                    Value callee = inst.getOperands().getFirst();
+                    if (!(callee instanceof Constant c)) continue;
+                    Object v = c.getValue();
+                    if (v instanceof String s && s.equals("__jnative_destruct_dispatch")) {
+                        dispatchUsed = true;
+                        break outer;
+                    }
+                }
+            }
+        }
+        if (dispatchUsed) {
+            log.debug("DestructorSimplifier: dispatch in use — "
+                    + "dead destructor elimination skipped");
+            return;
+        }
+
         // Sound over-approximation of "everything that might be needed at
         // runtime": walk every function in the module and collect the set of
         // destructors that appear as a STATIC_CALL callee anywhere. This

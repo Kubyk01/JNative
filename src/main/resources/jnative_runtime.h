@@ -739,6 +739,31 @@ extern void __jnative_monitor_exit(void* obj);
 extern void __jnative_free(void* p);
 
 /* ============================================================================
+ *  Virtual destructor dispatch.
+ * ============================================================================
+ *
+ * Field-typed static dispatch cannot work for a field whose declared
+ * type is abstract. A field declared `Number` may at runtime hold an
+ * `Integer`, and the destructor of the enclosing object must free that
+ * Integer via `__destruct_java_lang_Integer`. Calling
+ * `__destruct_java_lang_Number` there is wrong (abstract Number has no
+ * NEW site, so no destructor exists for it) and calling free() on the
+ * field value is unsafe (it may be a static literal).
+ *
+ * __jnative_destruct_dispatch reads the receiver's vtable (or, for an
+ * array, the class mirror stored in the first word of the array header),
+ * resolves the destructor symbol for that exact runtime type, and calls
+ * it. The lookup is cached per vtable/mirror, so repeated destruction
+ * through the same type is O(1) after the first call.
+ *
+ * If the runtime type has no destructor (no NEW site anywhere in the
+ * module, or the object is a static literal), the dispatch is a no-op.
+ * That is safe: an object whose type never has a NEW site cannot exist
+ * at runtime, and a static literal must not be freed.
+ */
+extern void __jnative_destruct_dispatch(void* obj);
+
+/* ============================================================================
  *  Cycle-safe destruction during shutdown.
  * ============================================================================
  *
