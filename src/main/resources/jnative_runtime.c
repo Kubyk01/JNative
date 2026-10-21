@@ -3074,3 +3074,9 @@ void __jnative_destruct_dispatch(void* obj) {
     jnative_destructor_fn fn = jnative_destructor_for(first_word);
     if (fn != NULL) fn(obj);
 }
+
+void __jnative_destruct_dispatch_if_not_same(void* old_val, void* new_val) {
+    if (old_val == NULL) return;
+    if (old_val == new_val) return;
+    __jnative_destruct_dispatch(old_val);
+}

@@ -763,6 +763,32 @@ extern void __jnative_free(void* p);
  */
 extern void __jnative_destruct_dispatch(void* obj);
 
+/**
+ * Field-overwrite destructor helper.
+ *
+ * Called before every PUT_FIELD that stores a reference-typed value into
+ * a reference-typed field. The previously stored value becomes unreachable
+ * at that exact moment (assuming the field was its last owner — the
+ * assumption escape analysis encodes when it classifies the allocation as
+ * HEAP), so it must be released before the new value replaces it.
+ *
+ * `old_val == new_val` is a no-op: re-storing the same reference does not
+ * transfer ownership, and freeing it would leave the field dangling.
+ *
+ * `old_val == NULL` is a no-op: a field that was never written (freshly
+ * calloc'ed object) has nothing to release.
+ *
+ * For any other `old_val`, the dispatch goes through the same runtime-type
+ * resolution as __jnative_destruct_dispatch: if the receiver's vtable maps
+ * to an emitted `__destruct_<type>` symbol, that destructor runs; if not
+ * (String literal, Integer cache entry, runtime object with no NEW site),
+ * it is a silent no-op. This means the helper is safe to call
+ * unconditionally at every reference-typed PUT_FIELD — no static
+ * classification of "which values need freeing" is required.
+ */
+extern void __jnative_destruct_dispatch_if_not_same(void* old_val,
+                                                    void* new_val);
+
 /* ============================================================================
  *  Cycle-safe destruction during shutdown.
  * ============================================================================

@@ -4,30 +4,15 @@ import io.github.kubyk01.application.service.analyzer.dependencyresolver.Depende
 import io.github.kubyk01.application.service.analyzer.ssa.DominatorTree;
 import io.github.kubyk01.domain.analyzer.aliasanalysis.AliasAnalysisResult;
 import io.github.kubyk01.domain.analyzer.aliasanalysis.AllocationSite;
+import io.github.kubyk01.domain.analyzer.aliasanalysis.PointsToSet;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.ClassNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.FieldNode;
 import io.github.kubyk01.domain.analyzer.escapeanalysis.EscapeAnalysisResult;
 import io.github.kubyk01.domain.analyzer.escapeanalysis.EscapeStatus;
 import io.github.kubyk01.domain.analyzer.lifetime.DestructionPoint;
 import io.github.kubyk01.domain.analyzer.lifetime.LifetimeAnalysisResult;
-import io.github.kubyk01.domain.ir.BasicBlock;
-import io.github.kubyk01.domain.ir.BranchTerminator;
-import io.github.kubyk01.domain.ir.CondBranchTerminator;
-import io.github.kubyk01.domain.ir.Constant;
-import io.github.kubyk01.domain.ir.Function;
-import io.github.kubyk01.domain.ir.IndirectBranchTerminator;
-import io.github.kubyk01.domain.ir.Instruction;
-import io.github.kubyk01.domain.ir.LookupSwitchTerminator;
 import io.github.kubyk01.domain.ir.Module;
-import io.github.kubyk01.domain.ir.Opcode;
-import io.github.kubyk01.domain.ir.Parameter;
-import io.github.kubyk01.domain.ir.ReturnTerminator;
-import io.github.kubyk01.domain.ir.TableSwitchTerminator;
-import io.github.kubyk01.domain.ir.Temporary;
-import io.github.kubyk01.domain.ir.Terminator;
-import io.github.kubyk01.domain.ir.ThrowTerminator;
-import io.github.kubyk01.domain.ir.Type;
-import io.github.kubyk01.domain.ir.Value;
+import io.github.kubyk01.domain.ir.*;
 import lombok.Getter;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -75,16 +60,52 @@ public class DestructorInserter {
         log.debug("DestructorInserter: {} distinct allocated type(s)",
                 allocatedTypes.size());
 
+        // ------------------------------------------------------------------
         // Emit one destructor per allocated type. Non-array reference
         // types get a destructor only when they have their own NEW site;
         // arrays always get one, with the array-of-array closure ensuring
         // that the inner-array destructors exist as well.
+        // ------------------------------------------------------------------
         int generated = 0;
         for (Type type : allocatedTypes) {
             Function dtor = findDestructor(type);
             if (dtor != null) generated++;
         }
 
+        // ------------------------------------------------------------------
+        // Field-overwrite instrumentation.
+        //
+        // Every reference-typed PUT_FIELD is preceded by a release of the
+        // previous field value, PROVIDED the whole-program points-to graph
+        // and the block-level liveness analysis prove that no live value
+        // in this function (or in any successor block) can observe that
+        // previous value after the store.
+        //
+        // Without this pass, HEAP-escape sites have no destruction point
+        // at all (LifetimeAnalyzer.computeSite short-circuits on HEAP),
+        // and every intermediate value stored into an overwritten field is
+        // orphaned with no GC to reclaim it. The TestHeap benchmark's
+        // `h.payload = new Payload(...)` in a loop is the canonical case.
+        //
+        // The liveness gate is what makes the pass safe against
+        // HashMap.resize's `table = newTab`, where the old table is still
+        // referenced by a local variable in the subsequent loop. Without
+        // the gate, that store would free the array that the loop is
+        // about to walk, and the loop would read from freed memory.
+        //
+        // The pass runs after the destructor bodies for every allocated
+        // type have been emitted, so the runtime dispatch inside
+        // emitFieldOverwriteRelease is guaranteed to find a matching
+        // __destruct_* symbol for every type that has a NEW/NEW_ARRAY in
+        // the module.
+        // ------------------------------------------------------------------
+        int instrumented = instrumentFieldOverwrites(lifetimeResult.getLiveOut());
+        if (instrumented > 0) {
+            log.info("DestructorInserter: instrumented {} field-overwrite release(s)",
+                    instrumented);
+        }
+
+        // ------------------------------------------------------------------
         // Insert a destructor call at every destruction point. The call
         // is a direct STATIC_CALL to the site type's destructor — the
         // site type is always a concrete class (abstract classes cannot
@@ -92,6 +113,7 @@ public class DestructorInserter {
         // typed. Fields INSIDE the destructor use virtual dispatch (see
         // createClassDestructor); only the top-level site call is
         // static.
+        // ------------------------------------------------------------------
         int inserted = 0;
         for (Map.Entry<AllocationSite, Set<DestructionPoint>> entry
                 : lifetimeResult.getDestructionPoints().entrySet()) {
@@ -117,6 +139,376 @@ public class DestructorInserter {
         }
         log.info("Destructor insertion: {} destructor(s) generated, {} call(s) inserted",
                 generated, inserted);
+    }
+
+    // =====================================================================
+    //  Field-overwrite instrumentation
+    // =====================================================================
+
+    /**
+     * Walks every function of the module and instruments each PUT_FIELD
+     * that stores a reference-typed value into a reference-typed field
+     * with a pre-store release of the field's previous value, subject to
+     * the provable-death gate in {@link #oldValueIsDead}.
+     *
+     * <p>Returns the number of blocks that received at least one new
+     * instruction pair. The caller logs the count; the exact number of
+     * emitted GET_FIELD/STATIC_CALL pairs is typically 1–3 times this
+     * value because a block can contain more than one PUT_FIELD.</p>
+     */
+    private int instrumentFieldOverwrites(
+            Map<BasicBlock, Set<AllocationSite>> liveOut) {
+        if (liveOut == null || liveOut.isEmpty()) {
+            // No liveness information was published. Emitting a release
+            // without it is exactly the HashMap.resize use-after-free
+            // this pass exists to prevent; bail out of the whole pass
+            // rather than producing unsound IR.
+            log.warn("DestructorInserter: no live-out map was published by "
+                    + "the lifetime analyzer; field-overwrite releases will "
+                    + "not be emitted. HEAP-escape allocations will leak "
+                    + "until their container's destructor runs.");
+            return 0;
+        }
+
+        int touchedBlocks = 0;
+        for (Function func : new ArrayList<>(module.getFunctions())) {
+            if (func.getEntryBlock() == null) continue;
+            for (BasicBlock block : func.getBlocks()) {
+                if (instrumentBlockFieldOverwrites(block, liveOut)) {
+                    touchedBlocks++;
+                }
+            }
+        }
+        return touchedBlocks;
+    }
+
+    private boolean instrumentBlockFieldOverwrites(
+            BasicBlock block,
+            Map<BasicBlock, Set<AllocationSite>> liveOut) {
+        List<Instruction> insts = block.getInstructions();
+        if (insts.isEmpty()) return false;
+
+        List<Instruction> rewritten = new ArrayList<>(insts.size() + 8);
+        boolean changed = false;
+
+        for (Instruction inst : insts) {
+            if (inst.getOpcode() == Opcode.PUT_FIELD
+                    && shouldInstrumentPutField(inst)
+                    && oldValueIsDead(inst, block, liveOut)) {
+                emitFieldOverwriteRelease(inst, block, rewritten);
+                changed = true;
+            }
+            rewritten.add(inst);
+        }
+
+        if (!changed) return false;
+
+        insts.clear();
+        insts.addAll(rewritten);
+        return true;
+    }
+
+    /**
+     * A PUT_FIELD needs the release-before-store sequence iff the value it
+     * stores can carry a managed reference. Primitive writes (an int
+     * stored into an int field, a long into a long field, …) never need
+     * it: the value they carry is a machine scalar, with no vtable and no
+     * destructor.
+     */
+    private boolean shouldInstrumentPutField(Instruction putField) {
+        if (putField.getOperands().size() < 3) return false;
+        Value rhs = putField.getOperands().get(2);
+        if (rhs == null) return false;
+        Type type = rhs.getType();
+        if (type == null) return false;
+        return !type.isPrimitive() && !type.isVoid();
+    }
+
+    /**
+     * Returns true iff the field's previous value is provably dead at the
+     * PUT_FIELD — i.e. no allocation site that could currently be stored
+     * in the field is live on exit from the block, and no such site is
+     * read by any instruction following the PUT_FIELD within the same
+     * block.
+     *
+     * <p>If this returns false, the previous value might be held by a
+     * live local variable, a parameter, or an array element (the
+     * HashMap.resize case), and the release must not be emitted: freeing
+     * it would break the subsequent use.</p>
+     *
+     * <p><b>Direction of error.</b> The check errs on the side of
+     * <em>not</em> releasing. Every path that could conceivably be a
+     * legitimate case of "the field's previous value is still observable
+     * somewhere" returns false, so the pass can only under-release. That
+     * is a leak, which the containing object's own destructor chain (or
+     * the shutdown pass) will eventually reclaim. Over-release — which
+     * the pass must never do — would be a use-after-free, and the entire
+     * reason this pass has a liveness gate at all is that the obvious
+     * "any field overwrite means the old value is dead" rule produces
+     * exactly that use-after-free in HashMap.resize.</p>
+     */
+    private boolean oldValueIsDead(
+            Instruction putField,
+            BasicBlock block,
+            Map<BasicBlock, Set<AllocationSite>> liveOut) {
+
+        if (putField.getOperands().size() < 2) return false;
+
+        Value base       = putField.getOperands().get(0);
+        Value fieldConst = putField.getOperands().get(1);
+
+        // Only a field-name constant (the canonical "owner.Class.name"
+        // key emitted by InstructionHandlers.getField / putField) has a
+        // resolvable points-to identity. An integer-offset constant
+        // (from an Unsafe-style manual field access) has no such
+        // identity, and the analysis carries no information about what
+        // the integer-offset store overwrote; conservatively skip it.
+        if (!(fieldConst instanceof Constant c) || !c.getType().isReference()) {
+            return false;
+        }
+        String fieldKey = c.getValue().toString();
+
+        PointsToSet baseSites = aliasResult.getPointsTo(base);
+        PointsToSet fieldSites =
+                aliasResult.getFieldPointsToForSites(baseSites, fieldKey);
+
+        // ------------------------------------------------------------------
+        // The analysis has no record of anything having been stored into
+        // this field on any base reachable from `base`. Two situations
+        // produce that:
+        //
+        //   1. The field is genuinely fresh (never written since the
+        //      object was allocated). Its runtime value is null, and
+        //      dispatching on null is a no-op. Emitting the release is
+        //      harmless — and unnecessary. Not emitting it is also
+        //      harmless. We choose "not emitting" because that keeps
+        //      the emitted IR smaller.
+        //
+        //   2. The analysis under-approximated the field's contents. In
+        //      that case we cannot reason about liveness at all, and
+        //      emitting a release risks freeing a still-live value.
+        //
+        // Both cases are handled by the same conservative answer: skip.
+        // The cost of the skip is a leak that the container's own
+        // destructor will reclaim; the cost of the alternative would be
+        // a use-after-free.
+        // ------------------------------------------------------------------
+        if (fieldSites.isEmpty() || fieldSites.containsUnknown()) {
+            return false;
+        }
+
+        // ------------------------------------------------------------------
+        // Block-level liveness gate.
+        //
+        // If the map has no entry for this block, liveness information is
+        // unavailable for it (the analyzer never ran, or the block was
+        // created after the analysis). Conservatively do not emit.
+        //
+        // Otherwise: if ANY site that could currently be in the field is
+        // live on exit from the block, the loaded old value might be that
+        // site's object. Freeing it would break the live reference. The
+        // check runs over the field's whole points-to set, not over a
+        // single site, because the whole set is what the runtime can
+        // observe in the field.
+        // ------------------------------------------------------------------
+        Set<AllocationSite> liveOutSet = liveOut.get(block);
+        if (liveOutSet == null) {
+            return false;
+        }
+        for (AllocationSite site : fieldSites.getSites()) {
+            if (liveOutSet.contains(site)) {
+                return false;
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // Same-block, later-instruction gate.
+        //
+        // Block-level live-out only covers values used in successor
+        // blocks. A value used by an instruction that appears later in
+        // the *same* block is invisible to liveOut. Scan forward from the
+        // PUT_FIELD and check whether any subsequent instruction's
+        // operand — or the block's terminator's operand — can reach one
+        // of the field's sites.
+        //
+        // The terminator is scanned explicitly because a value can be
+        // consumed by the terminator alone (a RETURN of a value loaded
+        // from the field, a COND_BRANCH on a boolean read from the field,
+        // etc.).
+        // ------------------------------------------------------------------
+        List<Instruction> insts = block.getInstructions();
+        int idx = insts.indexOf(putField);
+        if (idx >= 0) {
+            for (int i = idx + 1; i < insts.size(); i++) {
+                for (Value op : insts.get(i).getOperands()) {
+                    if (op == null) continue;
+                    if (operandReachesAnySite(op, fieldSites)) {
+                        return false;
+                    }
+                }
+            }
+        }
+        Terminator term = block.getTerminator();
+        if (term != null) {
+            for (Value op : terminatorOperands(term)) {
+                if (op == null) continue;
+                if (operandReachesAnySite(op, fieldSites)) {
+                    return false;
+                }
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * Returns true iff any allocation site reachable from {@code op}'s
+     * points-to set is a member of {@code fieldSites}. This is the
+     * "does this use touch the same object the field might hold?" test
+     * — the same test the block-level liveness check performs, but
+     * applied to a specific operand.
+     */
+    private boolean operandReachesAnySite(Value op, PointsToSet fieldSites) {
+        PointsToSet opSites = aliasResult.getPointsTo(op);
+        if (opSites.isEmpty()) return false;
+        for (AllocationSite site : opSites.getSites()) {
+            if (site == AllocationSite.UNKNOWN) continue;
+            if (fieldSites.contains(site)) return true;
+        }
+        return false;
+    }
+
+    /**
+     * Emits the release sequence:
+     *
+     * <pre>
+     *     GET_FIELD base.field     -> oldValue
+     *     STATIC_CALL __jnative_destruct_dispatch_if_not_same(oldValue, rhs)
+     * </pre>
+     *
+     * The original PUT_FIELD is emitted by the caller after these two
+     * instructions, in the same list.
+     *
+     * <p>Both GET_FIELD and PUT_FIELD carry the same canonical
+     * `owner.Class.name` key (or the same integer offset), so the load
+     * reads exactly the bytes the store is about to overwrite. The
+     * declared type of the freshly-created temporary is the field's
+     * declared type, resolved from the resolver's FieldNode; when the
+     * field cannot be resolved (a synthetic field the resolver does not
+     * know about), the rhs's own IR type is used, which keeps the
+     * emitted instruction structurally valid.</p>
+     *
+     * <p>The runtime helper {@code __jnative_destruct_dispatch_if_not_same}
+     * performs the same two guards that the analysis-side pass cannot
+     * perform exactly:</p>
+     * <ul>
+     *   <li>{@code old == NULL} — the field's initial (zero) value, or
+     *       a value already released by an earlier overwrite on a
+     *       different path. No-op.</li>
+     *   <li>{@code old == rhs} — re-storing the same reference. Freeing
+     *       it here would leave the field dangling. No-op.</li>
+     * </ul>
+     *
+     * <p>Any other {@code old} is dispatched through the runtime-type
+     * resolution used by every other reference release: the receiver's
+     * vtable (or class mirror, for arrays) is looked up in the cache, the
+     * matching {@code __destruct_*} symbol is found, and it is invoked.
+     * Values whose runtime type has no emitted destructor — String
+     * literals, boxed {@code Integer} cache entries, objects that only
+     * a native helper ever creates — silently fall through, which is
+     * the correct behaviour because they are not managed by this
+     * runtime's allocator.</p>
+     */
+    private void emitFieldOverwriteRelease(
+            Instruction putField,
+            BasicBlock block,
+            List<Instruction> out) {
+
+        Value base       = putField.getOperands().get(0);
+        Value fieldConst = putField.getOperands().get(1);
+        Value rhs        = putField.getOperands().get(2);
+
+        Type fieldType = resolveFieldType(putField, rhs);
+
+        Instruction getField = new Instruction(Opcode.GET_FIELD);
+        getField.addOperand(base);
+        getField.addOperand(fieldConst);
+        Temporary oldValue = new Temporary(fieldType);
+        getField.setResult(oldValue);
+        oldValue.setDefiningInstruction(getField);
+        getField.setParent(block);
+
+        Instruction release = new Instruction(Opcode.STATIC_CALL);
+        release.addOperand(new Constant(
+                Type.reference("__jnative_destruct_dispatch_if_not_same"),
+                "__jnative_destruct_dispatch_if_not_same"));
+        release.addOperand(oldValue);
+        release.addOperand(rhs);
+        release.setParent(block);
+
+        out.add(getField);
+        out.add(release);
+    }
+
+    /**
+     * Resolves the declared type of the field a PUT_FIELD writes to.
+     *
+     * <p>The instruction carries the field's canonical name as a
+     * {@code Constant(reference, "owner/Class.name")} operand; the
+     * declared type lives on the corresponding FieldNode in the
+     * resolver. That is the authoritative answer — it is the same type
+     * the emitter will use when it lowers the GET_FIELD instruction.</p>
+     *
+     * <p>The rhs's own IR type is used as a fallback when the resolver
+     * cannot find the field. That only happens for synthetic fields the
+     * resolver does not know about (e.g. a field written by an
+     * instrumenter pass that bypassed the normal method-translation
+     * path); using the value's type keeps the emitted GET_FIELD
+     * structurally valid even in that case. The runtime dispatch is
+     * unaffected by the declared type — it works on the receiver's
+     * vtable, not on the field's declared IR type — so the fallback
+     * cannot change runtime behaviour; it only avoids producing a
+     * GET_FIELD with an inconsistent declared type.</p>
+     */
+    private Type resolveFieldType(Instruction putField, Value rhs) {
+        Value fieldOperand = putField.getOperands().get(1);
+        if (fieldOperand instanceof Constant c && c.getType().isReference()) {
+            String fullName = c.getValue().toString();
+            int lastDot = fullName.lastIndexOf('.');
+            if (lastDot > 0) {
+                String owner = fullName.substring(0, lastDot);
+                String name  = fullName.substring(lastDot + 1);
+                FieldNode node = resolver.getField(owner, name);
+                if (node != null && node.getType() != null) {
+                    return node.getType();
+                }
+            }
+        }
+        return rhs.getType();
+    }
+
+    /**
+     * The operands a terminator consumes, in the same shape as
+     * {@link Instruction#getOperands()}. Needed by the same-block
+     * forward scan, which cannot see a terminator's operands through
+     * {@link Instruction#getOperands()}.
+     */
+    private List<Value> terminatorOperands(Terminator term) {
+        List<Value> result = new ArrayList<>();
+        if (term instanceof ReturnTerminator rt) {
+            if (rt.getValue() != null) result.add(rt.getValue());
+        } else if (term instanceof ThrowTerminator tt) {
+            if (tt.getException() != null) result.add(tt.getException());
+        } else if (term instanceof CondBranchTerminator cbt) {
+            if (cbt.getCondition() != null) result.add(cbt.getCondition());
+        } else if (term instanceof LookupSwitchTerminator lst) {
+            if (lst.getKey() != null) result.add(lst.getKey());
+        } else if (term instanceof TableSwitchTerminator tst) {
+            if (tst.getKey() != null) result.add(tst.getKey());
+        } else if (term instanceof IndirectBranchTerminator ibt) {
+            if (ibt.getTargetBlock() != null) result.add(ibt.getTargetBlock());
+        }
+        return result;
     }
 
     // =====================================================================
