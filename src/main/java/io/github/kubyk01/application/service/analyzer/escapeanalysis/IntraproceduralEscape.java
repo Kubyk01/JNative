@@ -28,17 +28,40 @@ public class IntraproceduralEscape {
     private final Map<String, EscapeSummary> summaries;
     private final DependencyResolver resolver;
 
+    /** Per-allocation-site escape status. */
     private final Map<AllocationSite, EscapeStatus> siteStatus = new HashMap<>();
-    private final Map<AllocationSite, Map<String, EscapeStatus>> fieldStatus = new HashMap<>();
+
+    /**
+     * Per-(site, field) escape level of the value(s) currently stored
+     * in that field. Used by GET_FIELD to propagate the escape level of
+     * the read result.
+     */
+    private final Map<AllocationSite, Map<String, EscapeStatus>> fieldStatus =
+            new HashMap<>();
+
     private final NativeBodyEscapeAnalyzer nativeAnalyzer;
 
     /**
-     * Local parameter-to-parameter escape edges: {@code from -> {to}} means
-     * "the object referenced by {@code from} is reachable from {@code to}".
-     * Used by the fixed point to propagate {@code to}'s status to {@code from}.
+     * Local parameter-to-parameter escape edges, populated from callee
+     * summaries during {@link #processCall}. Each entry `from -> {to}`
+     * means "the object referenced by `from` is reachable from the object
+     * referenced by `to`". The fixed-point loop in {@link #analyze}
+     * propagates `to`'s escape status to `from`, so that when `to`
+     * becomes {@code RETURN} the `from` site is promoted to {@code RETURN}
+     * as well.
+     *
+     * <p>The concrete case this closes is {@code ConcurrentHashMap} created
+     * in {@code newKeySet()} and stored into a {@code KeySetView} that is
+     * returned: the map is reachable from the returned view, so its escape
+     * status must be at least {@code RETURN}, and no per-use destructor
+     * may be inserted for it. Without this mechanism the map is classified
+     * as {@code HEAP}, a destruction point is created for it, and the
+     * destructor frees the map before the caller can use the returned
+     * view.</p>
      */
     private final Map<Value, Set<Value>> localEscapeEdges = new HashMap<>();
 
+    /** Reset at the start of every fixed-point iteration. */
     private boolean changed;
 
     public IntraproceduralEscape(Function function,
@@ -64,8 +87,6 @@ public class IntraproceduralEscape {
             }
         }
 
-        seedFromOwnSummary();
-
         final int MAX_ITERATIONS = 64;
         for (int i = 0; i < MAX_ITERATIONS; i++) {
             changed = false;
@@ -77,6 +98,13 @@ public class IntraproceduralEscape {
                 if (term != null) processTerminator(term);
             }
 
+            // Propagate local escape edges. If `from` escapes into `to`
+            // (i.e. `from` is reachable from `to`), then `from`'s status is
+            // at least `to`'s -- an object reachable from a returned value
+            // is itself returned, an object reachable from a global is
+            // itself global, and so on. Running this after the instruction
+            // walk means the status of `to` reflects every update that
+            // occurred in this iteration.
             for (Map.Entry<Value, Set<Value>> e : localEscapeEdges.entrySet()) {
                 Value from = e.getKey();
                 EscapeStatus fromEsc = getMaxStatus(from);
@@ -95,64 +123,6 @@ public class IntraproceduralEscape {
         return siteStatus;
     }
 
-    /**
-     * Seeds parameter escape statuses from the current function's own
-     * summary. The summary was computed by {@link EscapeSummaryBuilder} and
-     * encodes exactly the facts the intraprocedural fixed point needs to
-     * resolve local allocations reachable from those parameters.
-     *
-     * <p>Without this seeding, {@code p}'s status inside the function would
-     * default to {@link EscapeStatus#STACK} even when the summary says the
-     * parameter escapes to heap or global in its caller's context. A local
-     * allocation {@code c} stored in {@code p.field} would then wrongly
-     * be classified STACK.</p>
-     */
-    private void seedFromOwnSummary() {
-        EscapeSummary self = summaries.get(function.getName());
-        if (self == null) return;
-
-        for (Parameter p : function.getParameters()) {
-            int ord = p.getOrdinal();
-            EscapeStatus seed = EscapeStatus.STACK;
-            if (self.getParamsEscapedToThread().contains(ord)) {
-                seed = maxEscape(seed, EscapeStatus.THREAD);
-            }
-            if (self.getParamsEscapedToStatic().contains(ord)) {
-                seed = maxEscape(seed, EscapeStatus.GLOBAL);
-            }
-            if (self.getParamsEscapedToHeap().contains(ord)) {
-                seed = maxEscape(seed, EscapeStatus.HEAP);
-            }
-            if (self.getParamsReturned().contains(ord)) {
-                // A returned parameter is aliased with the return value.
-                // The callee's local allocations reachable from it must be
-                // at least RETURN-escaped, because the caller's subsequent
-                // use of the return value decides their fate.
-                seed = maxEscape(seed, EscapeStatus.RETURN);
-            }
-            if (seed != EscapeStatus.STACK) {
-                markEscaped(p, seed);
-            }
-        }
-
-        for (Map.Entry<Integer, Set<Integer>> e : self.getParamEscapeEdges().entrySet()) {
-            Parameter from = findParameterByOrdinal(function, e.getKey());
-            if (from == null) continue;
-            for (int toOrd : e.getValue()) {
-                Parameter to = findParameterByOrdinal(function, toOrd);
-                if (to == null) continue;
-                localEscapeEdges.computeIfAbsent(from, k -> new HashSet<>()).add(to);
-            }
-        }
-    }
-
-    private static Parameter findParameterByOrdinal(Function f, int ordinal) {
-        for (Parameter p : f.getParameters()) {
-            if (p.getOrdinal() == ordinal) return p;
-        }
-        return null;
-    }
-
     private void processInstruction(Instruction inst) {
         Opcode op = inst.getOpcode();
         switch (op) {
@@ -160,11 +130,11 @@ public class IntraproceduralEscape {
             case GET_FIELD    -> processGetField(inst);
             case ALOAD        -> processALoad(inst);
             case ASTORE       -> processAStore(inst);
-            case MONITOR_ENTER, MONITOR_EXIT -> { /* monitor does not escape */ }
+            case MONITOR_ENTER, MONITOR_EXIT -> processMonitor(inst);
             case PUT_STATIC   -> processPutStatic(inst);
             case GET_STATIC   -> processGetStatic(inst);
             case CALL, VIRTUAL_CALL, INTERFACE_CALL, STATIC_CALL, SPECIAL_CALL ->
-                processCall(inst);
+                    processCall(inst);
             default -> { }
         }
     }
@@ -179,6 +149,10 @@ public class IntraproceduralEscape {
         String owner = ownerAndField[0];
         String fieldName = ownerAndField[1];
 
+        // A field write mutates the base in place; it does not make the
+        // base escape. Only the stored value becomes reachable from the
+        // base, so its escape level is the maximum of the base's own
+        // level and whatever the field already held.
         EscapeStatus baseEsc = valueEscapeStatus(base);
         markEscaped(rhs, baseEsc);
 
@@ -188,7 +162,7 @@ public class IntraproceduralEscape {
         PointsToSet basePts = aliasResult.getPointsTo(base);
         if (basePts.isEmpty() && base instanceof Parameter) {
             updateFieldStatus(AllocationSite.UNKNOWN, field,
-                maxEscape(fieldEsc, EscapeStatus.HEAP));
+                    maxEscape(fieldEsc, EscapeStatus.HEAP));
         } else {
             for (AllocationSite site : basePts.getSites()) {
                 updateFieldStatus(site, field, fieldEsc);
@@ -202,6 +176,7 @@ public class IntraproceduralEscape {
 
     private void processGetField(Instruction inst) {
         if (inst.getOperands().size() < 2) return;
+
         Value base = inst.getOperands().getFirst();
         Value result = inst.getResult();
         if (result == null) return;
@@ -217,14 +192,14 @@ public class IntraproceduralEscape {
             Map<String, EscapeStatus> map = fieldStatus.get(site);
             if (map != null) {
                 resultEsc = maxEscape(resultEsc,
-                    map.getOrDefault(field, EscapeStatus.STACK));
+                        map.getOrDefault(field, EscapeStatus.STACK));
             }
         }
         if (basePts.isEmpty() && base instanceof Parameter) {
             Map<String, EscapeStatus> map = fieldStatus.get(AllocationSite.UNKNOWN);
             if (map != null) {
                 resultEsc = maxEscape(resultEsc,
-                    map.getOrDefault(field, EscapeStatus.STACK));
+                        map.getOrDefault(field, EscapeStatus.STACK));
             }
             resultEsc = maxEscape(resultEsc, EscapeStatus.HEAP);
         }
@@ -263,6 +238,9 @@ public class IntraproceduralEscape {
         Value value = inst.getOperands().get(2);
         if (value == null) return;
 
+        // Same reasoning as PUT_FIELD: writing into an array modifies it
+        // in place. The array reference does not escape; only the stored
+        // value does, and only when the array is externally observable.
         EscapeStatus arrayEsc = valueEscapeStatus(array);
         markEscaped(value, arrayEsc);
 
@@ -272,12 +250,19 @@ public class IntraproceduralEscape {
         PointsToSet arrayPts = aliasResult.getPointsTo(array);
         if (arrayPts.isEmpty() && array instanceof Parameter) {
             updateFieldStatus(AllocationSite.UNKNOWN, "[]",
-                maxEscape(fieldEsc, EscapeStatus.HEAP));
+                    maxEscape(fieldEsc, EscapeStatus.HEAP));
         } else {
             for (AllocationSite site : arrayPts.getSites()) {
                 updateFieldStatus(site, "[]", fieldEsc);
             }
         }
+    }
+
+    private void processMonitor(Instruction inst) {
+        if (inst.getOperands().isEmpty()) return;
+        // Synchronising on an object exposes it to any other thread that
+        // synchronises on the same object.
+        markEscaped(inst.getOperands().getFirst(), EscapeStatus.GLOBAL);
     }
 
     private void processPutStatic(Instruction inst) {
@@ -289,6 +274,8 @@ public class IntraproceduralEscape {
     private void processGetStatic(Instruction inst) {
         Value result = inst.getResult();
         if (result == null) return;
+        // Any value read from a static field is by definition reachable
+        // from every thread that can load the containing class.
         markEscaped(result, EscapeStatus.GLOBAL);
     }
 
@@ -297,9 +284,9 @@ public class IntraproceduralEscape {
         if (calleeName == null) return;
 
         if (calleeName.startsWith("java/util/concurrent/ExecutorService.submit")
-            || calleeName.startsWith("java/util/concurrent/ForkJoinPool.submit")
-            || calleeName.startsWith("java/util/concurrent/CompletableFuture.supplyAsync")
-            || calleeName.startsWith("java/lang/Thread.start()V")) {
+                || calleeName.startsWith("java/util/concurrent/ForkJoinPool.submit")
+                || calleeName.startsWith("java/util/concurrent/CompletableFuture.supplyAsync")
+                || calleeName.startsWith("java/lang/Thread.start()V")) {
             for (Value arg : getCallArguments(callInst)) {
                 markEscaped(arg, EscapeStatus.THREAD);
             }
@@ -311,10 +298,13 @@ public class IntraproceduralEscape {
         String calleeKey = canonicalCalleeKey(calleeName);
         EscapeSummary summary = summaries.get(calleeKey);
         if (summary == null) {
+            // Native (body-less) callee: consult the C-body analyser.
             EscapeSummary computed = nativeAnalyzer.summaryFor(calleeName);
-            if (computed != null && !computed.isUnresolved()) {
+            if (computed != null && !computed.isEscapesGlobally()) {
                 summary = computed;
             } else {
+                // Unknown callee: conservatively assume every reference
+                // argument may be stored anywhere the callee has access to.
                 for (Value arg : getCallArguments(callInst)) {
                     markEscaped(arg, EscapeStatus.HEAP);
                 }
@@ -329,38 +319,109 @@ public class IntraproceduralEscape {
         List<Value> args = getCallArguments(callInst);
         Value returnValue = callInst.getResult();
 
+        // ------------------------------------------------------------------
+        // Argument escape propagation.
+        //
+        // The callee's summary tells us WHICH of its parameters escape
+        // (indices in getParamsEscaped) and WHICH are returned (indices
+        // in getParamsReturned). It does NOT record, for a parameter
+        // that escapes, whether the escape was to a heap object or to
+        // a static field. The escapesGlobally flag says "somewhere in
+        // this callee's transitive body, a value was stored into global
+        // state", but it does not say WHICH value.
+        //
+        // Because of that, the caller's policy is:
+        //
+        //   * An argument the callee does NOT escape (its index is not
+        //     in paramsEscaped) is left alone, regardless of
+        //     escapesGlobally. The callee's global escapes must have
+        //     come from values it created itself — fresh allocations,
+        //     values read from static state, values read out of objects
+        //     reachable from static state. Nothing the caller passed in
+        //     is at risk through this particular call.
+        //
+        //   * An argument the callee DOES escape is promoted to GLOBAL
+        //     if the callee escapes globally, and to HEAP otherwise:
+        //     the summary cannot distinguish the two cases, so the
+        //     coarser (higher) status wins.
+        //
+        //   * An argument the callee RETURNS (its index is in
+        //     paramsReturned) is NOT promoted at the call site. The
+        //     callee returning a value tells us that the return value
+        //     is an alias of that argument; it does NOT tell us that
+        //     the argument escapes the caller's frame. The caller's
+        //     own analysis of what it does with the return value —
+        //     its return terminator, a field store, another call —
+        //     determines whether the aliased argument actually
+        //     escapes. The alias relationship itself is already
+        //     recorded by InterproceduralPointsTo.processCall, which
+        //     merges the return value's points-to set with every
+        //     argument named in paramsReturned.
+        //
+        //   * The return value itself is NOT promoted to RETURN
+        //     merely because the callee has isReturnsObject == true.
+        //     isReturnsObject is a coarse boolean: it is true for a
+        //     fresh allocation (where the callee already marked the
+        //     site RETURN via its own return terminator) and for an
+        //     aliased argument (where the caller's subsequent use
+        //     decides). Unconditionally promoting the return value to
+        //     RETURN conflates the two cases and, through the shared
+        //     points-to site, promotes the aliased argument as well.
+        //
+        // The concrete failure the old promotions produced:
+        //
+        //     Object.toString() {
+        //         return getClass().getName() + "@"
+        //              + Integer.toHexString(hashCode());
+        //     }
+        //
+        // compiles to a chain of StringBuilder.append calls on a
+        // fresh `new StringBuilder()`. The receiver is never returned
+        // by toString, never stored in a field, and never passed to
+        // an escaping call: it is a local builder whose only role is
+        // to be consumed by StringBuilder.toString() at the end of
+        // the expression. With the old promotion, the receiver's
+        // site was marked RETURN on the first append call. The
+        // generated IR then had (a) a calloc for the StringBuilder,
+        // (b) no __destruct_java_lang_StringBuilder anywhere, and
+        // (c) no free for the returned byte[] — one StringBuilder
+        // plus its internal buffer leaked on every toString() call.
+        //
+        // The fix is semantic, not a heuristic and not a special case
+        // for any particular class or method name. It applies to every
+        // callee uniformly: a call never changes the escape status of
+        // its arguments on the basis of what the callee returns; only
+        // the caller's subsequent use of the return value does.
+        // ------------------------------------------------------------------
+        EscapeStatus escapedArgStatus = summary.isEscapesGlobally()
+                ? EscapeStatus.GLOBAL
+                : EscapeStatus.HEAP;
+
         for (int i = 0; i < args.size(); i++) {
-            Value arg = args.get(i);
-            EscapeStatus status = EscapeStatus.STACK;
-            if (summary.getParamsEscapedToThread().contains(i)) {
-                status = maxEscape(status, EscapeStatus.THREAD);
+            if (summary.getParamsEscaped().contains(i)) {
+                markEscaped(args.get(i), escapedArgStatus);
             }
-            if (summary.getParamsEscapedToStatic().contains(i)) {
-                status = maxEscape(status, EscapeStatus.GLOBAL);
-            }
-            if (summary.getParamsEscapedToHeap().contains(i)) {
-                status = maxEscape(status, EscapeStatus.HEAP);
-            }
-            if (status != EscapeStatus.STACK) {
-                markEscaped(arg, status);
-            }
-            // paramsReturned is deliberately NOT propagated as RETURN here:
-            // the callee returning the argument tells us only that the return
-            // value aliases the argument, not that the argument escapes. The
-            // caller's subsequent use of the return value determines whether
-            // the argument actually escapes.
+            // paramsReturned is deliberately NOT propagated as RETURN
+            // here. See the block comment above for the full rationale.
         }
 
-        if (summary.isReturnsObject() && returnValue != null) {
-            // The callee's own analysis has already classified every
-            // returned allocation site. Nothing to promote here.
+        if (summary.isEscapesGlobally() && returnValue != null) {
+            markEscaped(returnValue, EscapeStatus.GLOBAL);
         }
+        // isReturnsObject is deliberately NOT propagated as RETURN
+        // here. See the block comment above for the full rationale.
 
-        for (Map.Entry<Integer, Set<Integer>> e : summary.getParamEscapeEdges().entrySet()) {
+        // Map the callee's parameter-to-parameter edges to the caller's
+        // argument values. The escape propagation step inside analyze()
+        // turns these into monotone status updates across iterations of
+        // the fixed point.
+        for (Map.Entry<Integer, Set<Integer>> e
+                : summary.getParamEscapeEdges().entrySet()) {
             int fromIdx = e.getKey();
             if (fromIdx >= args.size()) continue;
             Value fromArg = args.get(fromIdx);
             if (fromArg == null) continue;
+
             for (int toIdx : e.getValue()) {
                 if (toIdx >= args.size()) continue;
                 Value toArg = args.get(toIdx);
@@ -385,6 +446,10 @@ public class IntraproceduralEscape {
             }
         }
     }
+
+    // -----------------------------------------------------------------
+    //  Helpers
+    // -----------------------------------------------------------------
 
     private EscapeStatus valueEscapeStatus(Value v) {
         if (v == null) return EscapeStatus.STACK;
@@ -423,7 +488,7 @@ public class IntraproceduralEscape {
     private void updateFieldStatus(AllocationSite site, String field,
                                    EscapeStatus status) {
         Map<String, EscapeStatus> map =
-            fieldStatus.computeIfAbsent(site, k -> new HashMap<>());
+                fieldStatus.computeIfAbsent(site, k -> new HashMap<>());
         EscapeStatus existing = map.getOrDefault(field, EscapeStatus.STACK);
         if (status.ordinal() > existing.ordinal()) {
             map.put(field, status);
