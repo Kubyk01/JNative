@@ -4,9 +4,12 @@ import io.github.kubyk01.application.service.analyzer.dependencyresolver.Depende
 import io.github.kubyk01.domain.analyzer.dependencyresolver.ClassNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.FieldNode;
 import io.github.kubyk01.domain.ir.Constant;
+import io.github.kubyk01.domain.ir.Function;
 import io.github.kubyk01.domain.ir.Instruction;
 import io.github.kubyk01.domain.ir.IrBuilder;
+import io.github.kubyk01.domain.ir.Module;
 import io.github.kubyk01.domain.ir.Opcode;
+import io.github.kubyk01.domain.ir.Parameter;
 import io.github.kubyk01.domain.ir.Temporary;
 import io.github.kubyk01.domain.ir.Type;
 import io.github.kubyk01.domain.ir.Value;
@@ -14,8 +17,25 @@ import org.objectweb.asm.Opcodes;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 
 public class InstructionHandlers {
+    /**
+     * Typed variants of {@code System.arraycopy}, keyed by the element type
+     * of the two arrays.
+     *
+     * <p>The generic native implementation has to read the element size out
+     * of both array headers at run time and compare the two before it can
+     * compute how many bytes to move. When the static type of both operands
+     * is known the size is a compile-time constant and the whole copy
+     * collapses to a single {@code memmove}.</p>
+     */
+    private static final Map<Type, String> TYPED_ARRAYCOPY = Map.of(
+        Type.BYTE, "__jnative_fn_java_lang_System_arraycopy__byte_bytes",
+        Type.CHAR, "__jnative_fn_java_lang_System_arraycopy__char_chars",
+        Type.INT,  "__jnative_fn_java_lang_System_arraycopy__int_ints"
+    );
+
     private final IrBuilder builder;
     private final StackFrame frame;
     private final DependencyResolver resolver;
@@ -387,10 +407,24 @@ public class InstructionHandlers {
             default -> Opcode.CALL;
         };
 
+        String callee = owner + "." + name + desc;
+
+        // A System.arraycopy call whose two operands are statically known
+        // to be arrays of the same primitive element type is routed to the
+        // typed variant of the native method: the element size becomes a
+        // compile-time constant, so the run-time size comparison and the
+        // two header reads the generic implementation performs for it
+        // disappear. Everything else keeps the generic path.
+        String typedArraycopy = typedArraycopySymbol(opcode, owner, name, desc, args);
+        if (typedArraycopy != null) {
+            callee = typedArraycopy;
+            declareTypedArraycopy(typedArraycopy);
+        }
+
         Instruction callInst = new Instruction(irOpcode);
         callInst.setPolymorphicSignature(polymorphic);
         if (receiver != null) callInst.addOperand(receiver);
-        callInst.addOperand(new Constant(Type.reference(owner + "." + name + desc), owner + "." + name + desc));
+        callInst.addOperand(new Constant(Type.reference(callee), callee));
         for (Value arg : args) {
             callInst.addOperand(arg);
         }
@@ -404,6 +438,69 @@ public class InstructionHandlers {
         } else {
             builder.currentBlock().addInstruction(callInst);
         }
+    }
+
+    /**
+     * Returns the symbol of the typed {@code System.arraycopy} variant that
+     * matches the static types of the two array operands, or {@code null}
+     * when the call has to go through the generic implementation.
+     *
+     * <p>Only the case where <em>both</em> operands are statically arrays
+     * of the same primitive element type is specialised. The JVM verifier
+     * guarantees that such a value really is an array of that element type
+     * at run time, and the native implementation re-checks the element size
+     * against its array header before it copies anything.</p>
+     */
+    private String typedArraycopySymbol(int opcode, String owner, String name,
+                                        String desc, List<Value> args) {
+        if (opcode != Opcodes.INVOKESTATIC) return null;
+        if (!"java/lang/System".equals(owner) || !"arraycopy".equals(name)) return null;
+        if (!"(Ljava/lang/Object;ILjava/lang/Object;II)V".equals(desc)) return null;
+        if (args == null || args.size() != 5) return null;
+
+        Type srcElement = arrayElementType(args.get(0));
+        if (srcElement == null) return null;
+        Type destElement = arrayElementType(args.get(2));
+        if (destElement == null) return null;
+        if (!srcElement.equals(destElement)) return null;
+
+        return TYPED_ARRAYCOPY.get(srcElement);
+    }
+
+    /**
+     * The element type of an array-typed value, or {@code null} when the
+     * value is not an array of a primitive element type.
+     */
+    private static Type arrayElementType(Value value) {
+        if (value == null) return null;
+        Type type = value.getType();
+        if (type == null || !type.isArray()) return null;
+        Type element = type.getElementType();
+        return (element != null && element.isPrimitive()) ? element : null;
+    }
+
+    /**
+     * Registers the declaration of a typed {@code System.arraycopy} variant
+     * in the module.
+     *
+     * <p>The body lives in {@code jnative/lang/System.c}; the declaration is
+     * what tells the emitter which parameter types the call site has to
+     * convert its arguments to. Registering the function in the module (as
+     * opposed to listing the symbol in the runtime prelude) keeps the
+     * signature in one place: the prelude would emit a second, independent
+     * declaration of the same symbol into the same file.</p>
+     */
+    private void declareTypedArraycopy(String symbol) {
+        Module module = builder.getModule();
+        if (module == null || module.getFunction(symbol) != null) return;
+
+        Function func = new Function(symbol, Type.VOID);
+        func.addParameter(new Parameter(Type.reference("java/lang/Object"), 0, 0));
+        func.addParameter(new Parameter(Type.INT, 1, 1));
+        func.addParameter(new Parameter(Type.reference("java/lang/Object"), 2, 2));
+        func.addParameter(new Parameter(Type.INT, 3, 3));
+        func.addParameter(new Parameter(Type.INT, 4, 4));
+        module.addFunction(func);
     }
 
     private Type arrayTypeToIr(int atype) {

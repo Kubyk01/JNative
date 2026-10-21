@@ -104,6 +104,86 @@ void __jnative_fn_java_lang_System_arraycopy__Ljava_lang_Object_ILjava_lang_Obje
     memmove(dstPtr, srcPtr, bytes);
 }
 
+/*
+ * Typed specialisations of System.arraycopy.
+ *
+ * The generic implementation above has to read the element size out of
+ * both arrays and compare them before it can compute how many bytes to
+ * move. When the code generator knows the static type of both operands —
+ * which the SSA-level dispatch establishes for byte[], char[] and int[] —
+ * the element size is a compile-time constant and the comparison is
+ * unnecessary.
+ *
+ * The observable behaviour is the one of the generic implementation: the
+ * same checks in the same order, so the same exception is raised for the
+ * same input. The element-size check is kept as a safety net: the static
+ * type says what the array must hold, but the runtime's array header is
+ * what the copy actually strides over, and the two must agree.
+ */
+static void jnative_arraycopy_typed(void* src, int32_t srcPos,
+                                    void* dest, int32_t destPos,
+                                    int32_t length, int32_t elem_size)
+{
+    if (src == NULL || dest == NULL) {
+        __jnative_throw_null_pointer_exception();
+        return;
+    }
+
+    if (length < 0) {
+        __jnative_throw_array_index_out_of_bounds();
+        return;
+    }
+
+    if (srcPos < 0 || destPos < 0) {
+        __jnative_throw_array_index_out_of_bounds();
+        return;
+    }
+
+    int32_t srcLen = jnative_array_length(src);
+    int32_t dstLen = jnative_array_length(dest);
+    if (srcLen < 0 || dstLen < 0) {
+        __jnative_throw_array_index_out_of_bounds();
+        return;
+    }
+
+    if (srcPos + length > srcLen || destPos + length > dstLen) {
+        __jnative_throw_array_index_out_of_bounds();
+        return;
+    }
+
+    if (jnative_array_elem_size(src) != elem_size
+        || jnative_array_elem_size(dest) != elem_size) {
+        __jnative_throw_exception(NULL);
+        return;
+    }
+
+    char* srcPtr = (char*)jnative_array_data(src) + (size_t)srcPos * (size_t)elem_size;
+    char* dstPtr = (char*)jnative_array_data(dest) + (size_t)destPos * (size_t)elem_size;
+
+    memmove(dstPtr, srcPtr, (size_t)length * (size_t)elem_size);
+}
+
+void __jnative_fn_java_lang_System_arraycopy__byte_bytes(
+    void* src, int32_t srcPos, void* dest, int32_t destPos, int32_t length)
+{
+    jnative_arraycopy_typed(src, srcPos, dest, destPos, length,
+                            JNATIVE_ELEM_SIZE_BYTE);
+}
+
+void __jnative_fn_java_lang_System_arraycopy__char_chars(
+    void* src, int32_t srcPos, void* dest, int32_t destPos, int32_t length)
+{
+    jnative_arraycopy_typed(src, srcPos, dest, destPos, length,
+                            JNATIVE_ELEM_SIZE_SHORT);
+}
+
+void __jnative_fn_java_lang_System_arraycopy__int_ints(
+    void* src, int32_t srcPos, void* dest, int32_t destPos, int32_t length)
+{
+    jnative_arraycopy_typed(src, srcPos, dest, destPos, length,
+                            JNATIVE_ELEM_SIZE_INT);
+}
+
 int32_t __jnative_fn_java_lang_System_identityHashCode__Ljava_lang_Object__I(void* obj) {
     if (obj == NULL) return 0;
     return (int32_t)((uintptr_t)obj);

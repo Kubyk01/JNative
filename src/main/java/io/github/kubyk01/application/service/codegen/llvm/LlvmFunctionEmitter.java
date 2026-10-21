@@ -1270,6 +1270,19 @@ public class LlvmFunctionEmitter {
                     owner = "";
                     bareField = fieldName;
                 }
+
+                if (LlvmTypeMapper.LAZY_CLINIT_FLAG_FIELD.equals(bareField)) {
+                    // The lazy-<clinit> completion flag is read with an
+                    // acquire load. It pairs with the release store of the
+                    // thread that ran the initializer, so a thread that
+                    // observes the flag also observes the state the
+                    // initializer published.
+                    sb.append("  ").append(resultName)
+                        .append(" = load atomic i32, i32* @").append(globalName)
+                        .append(" acquire, align 4\n");
+                    break;
+                }
+
                 Type fieldType = globalEmitter.getFieldType(owner, bareField);
                 if (fieldType == null) {
                     fieldType = inst.getResult().getType();
@@ -1297,6 +1310,21 @@ public class LlvmFunctionEmitter {
                         owner = "";
                         bareField = fieldName;
                     }
+
+                    if (LlvmTypeMapper.LAZY_CLINIT_FLAG_FIELD.equals(bareField)) {
+                        // The lazy-<clinit> completion flag is written with
+                        // a release store: everything the initializer
+                        // published before this store is visible to every
+                        // thread that later reads the flag with an acquire
+                        // load.
+                        String rhsRef = getLlvmValue(sb, rhs);
+                        String rhsConverted = castValueToType(sb, rhsRef, rhs.getType(), Type.INT);
+                        sb.append("  store atomic i32 ").append(rhsConverted)
+                            .append(", i32* @").append(globalName)
+                            .append(" release, align 4\n");
+                        break;
+                    }
+
                     Type fieldType = globalEmitter.getFieldType(owner, bareField);
                     if (fieldType == null) {
                         fieldType = rhs.getType();

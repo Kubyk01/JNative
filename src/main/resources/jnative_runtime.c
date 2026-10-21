@@ -1802,6 +1802,43 @@ int __jnative_catch_matches(void* exc, void* type_info) {
     return 0;
 }
 
+/*
+ * Cached vtables of the universal supertypes.
+ *
+ * An array's first word is a class mirror, not a vtable, so the vtable
+ * comparison above can never match for an array receiver. Arrays are
+ * instances of Cloneable and Serializable and inherit Object's methods,
+ * so the type test degenerates to "is the tested type one of the three
+ * universal types?".
+ *
+ * The vtables are resolved with dlsym, so they are looked up once and
+ * cached; the old code called __jnative_own_class_vtable() on every
+ * instanceof against an array.
+ */
+static void* jnative_universal_vtables[3];
+static pthread_once_t jnative_universal_vtables_once = PTHREAD_ONCE_INIT;
+
+static void jnative_init_universal_vtables(void) {
+    jnative_universal_vtables[0] = __jnative_own_class_vtable("java/lang/Object");
+    jnative_universal_vtables[1] = __jnative_own_class_vtable("java/lang/Cloneable");
+    jnative_universal_vtables[2] = __jnative_own_class_vtable("java/io/Serializable");
+}
+
+/*
+ * instanceof.
+ *
+ * The vtable of the receiver's class and the vtables of the tested type's
+ * superclasses share the same representation, so the test is a pointer
+ * comparison against the type_info chain. The chain is short (a class and
+ * its superclasses) and the test is on the hot path of every CHECKCAST,
+ * so it stays O(#supers).
+ *
+ * The only case the chain cannot answer is an array receiver: its first
+ * word is a class mirror rather than a vtable. That case is detected in
+ * O(1) with the mirror hash set and answered against the three universal
+ * types. The previous implementation scanned reflect_all_classes linearly
+ * (4607 entries on a full JDK closure) for every such test.
+ */
 int __jnative_instanceof(void* obj, void** type_info) {
     if (obj == NULL) return 0;
     if (type_info == NULL) return 0;
@@ -1814,28 +1851,20 @@ int __jnative_instanceof(void* obj, void** type_info) {
         ti++;
     }
 
-    if (reflect_all_classes == NULL) return 0;
-    ReflectionClass** cp = reflect_all_classes;
-    while (*cp != NULL) {
-        if ((void*)(*cp) == first_word) {
-            static const char* universal_supers[] = {
-                "java/lang/Object",
-                "java/lang/Cloneable",
-                "java/io/Serializable",
-                NULL
-            };
-            for (int i = 0; universal_supers[i] != NULL; i++) {
-                void* v = __jnative_own_class_vtable(universal_supers[i]);
-                if (v == NULL) continue;
-                ti = type_info;
-                while (*ti) {
-                    if (*ti == v) return 1;
-                    ti++;
-                }
-            }
-            return 0;
+    /* Not a vtable match: only an array receiver (class mirror) can still
+     * be an instance of the tested type, and only through the universal
+     * supertypes. */
+    if (!__jnative_is_class_mirror(first_word)) return 0;
+
+    pthread_once(&jnative_universal_vtables_once, jnative_init_universal_vtables);
+    for (int i = 0; i < 3; i++) {
+        void* v = jnative_universal_vtables[i];
+        if (v == NULL) continue;
+        ti = type_info;
+        while (*ti) {
+            if (*ti == v) return 1;
+            ti++;
         }
-        cp++;
     }
     return 0;
 }

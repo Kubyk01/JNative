@@ -1209,15 +1209,30 @@ public class LlvmGenerator {
                       .append("(").append(args).append(")\n");
                 }
             } else {
-                // Ordinary <clinit>; eagerTarget substitutes the lazy wrapper
-                // when the class was marked cyclic.
+                // Ordinary <clinit>.
+                //
+                // A negative parallel group marks a class that participates
+                // in a non-trivial cycle in the class dependency graph. Such
+                // a class cannot be initialised eagerly: no flat order of
+                // its <clinit> can be correct, because the cycle would
+                // require one of the members to run before the other.
+                //
+                // The cyclic <clinit> is therefore SKIPPED here entirely
+                // and runs on first use through its lazy wrapper
+                // (fn___lazy_clinit_run_*), which the Analyzer installed at
+                // every active-use site of the class. Calling the wrapper
+                // eagerly from this schedule would defeat the purpose of
+                // the lazy mechanism: the wrapper would run the <clinit>
+                // body at the very point where the cycle is still open,
+                // which is exactly the situation the deferral exists to
+                // avoid.
+                //
+                // The batch is NOT flushed here. A skipped clinit imposes no
+                // ordering constraint on the remaining batch, so the batch
+                // keeps accumulating and the parallel groups stay intact.
                 int pg = entry.parallelGroup();
                 if (pg == -1) {
-                    if (!currentBatch.isEmpty()) {
-                        emitParallelBatch(sb, globals, currentBatch, batchIdCounter++);
-                        currentBatch.clear();
-                    }
-                    sb.append("  call void @").append(eagerTarget(name)).append("()\n");
+
                 } else {
                     if (!currentBatch.isEmpty()
                         && currentBatch.getFirst().parallelGroup() != pg) {

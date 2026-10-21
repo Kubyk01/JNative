@@ -223,7 +223,6 @@ public class Compiler implements CompilerPort {
             // 3b. LLVM IR files (one per class + _module.ll). Object names are
             //     sanitized ($, ':', whitespace) and made unique with an index.
             // ------------------------------------------------------------------
-            List<Path> llObjPaths = new ArrayList<>(llPaths.size());
             int irIndex = 0;
             for (Path ll : llPaths) {
                 String base = sanitizeForObjName(ll.getFileName().toString());
@@ -232,7 +231,6 @@ public class Compiler implements CompilerPort {
                 Path obj = tempDir.resolve("ir")
                     .resolve(String.format("%05d_%s.o", irIndex++, base));
                 tasks.add(new CompileTask(ll, obj, true));
-                llObjPaths.add(obj);
             }
 
             int toCompile = tasks.size();

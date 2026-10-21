@@ -27,6 +27,7 @@ import io.github.kubyk01.domain.ir.Terminator;
 import io.github.kubyk01.domain.ir.ThrowTerminator;
 import io.github.kubyk01.domain.ir.Type;
 import io.github.kubyk01.domain.ir.Value;
+import io.github.kubyk01.util.LlvmUtil;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.objectweb.asm.Opcodes;
@@ -873,7 +874,11 @@ public class LlvmGlobalEmitter {
             // Runs last so that emittedRefClassNames (filled by
             // generateReflectionData) is complete: every row of the map points
             // at an @refclass_* constant that already exists.
-            emitLazyClinitMap(lazyClinitWrappers);
+            emitLazyClinitMap(lazyClinitWrappers) +
+            // The completion flags are referenced by the guard wrappers'
+            // bodies, which are emitted as ordinary functions; the globals
+            // themselves are plain i32 and do not depend on anything else.
+            emitLazyClinitFlags();
     }
 
     public String generateLayoutConstants() {
@@ -2073,6 +2078,15 @@ public class LlvmGlobalEmitter {
             int dot = fullName.lastIndexOf('.');
             String owner = fullName.substring(0, dot);
             String fieldName = fullName.substring(dot + 1);
+            if (LlvmTypeMapper.LAZY_CLINIT_FLAG_FIELD.equals(fieldName)) {
+                // The lazy-<clinit> completion flag is not a class field: it
+                // exists only in the IR of the guard wrapper. Its global is
+                // defined by emitLazyClinitFlags(), which owns its type
+                // (i32) and its alignment, so it must not be defined here
+                // as well — two definitions of the same global is a link
+                // error.
+                continue;
+            }
             Type fieldType = getFieldType(owner, fieldName);
             if (fieldType == null) fieldType = Type.UNKNOWN;
             String llvmType = LlvmTypeMapper.toLlvmType(fieldType);
@@ -2894,6 +2908,12 @@ public class LlvmGlobalEmitter {
     }
 
     public Type getFieldType(String className, String fieldName) {
+        // The lazy-<clinit> completion flag is a synthetic field: it exists
+        // only in the IR of the guard wrapper and in no class file, so the
+        // resolver has no entry for it. It is always an i32.
+        if (LlvmTypeMapper.LAZY_CLINIT_FLAG_FIELD.equals(fieldName)) {
+            return Type.INT;
+        }
         // The fields generated java.lang.Class code can legitimately read
         // must be typed by what the runtime struct holds, not by the class
         // file: `name` is an i8* Java String (or null, in which case getName()
@@ -3856,6 +3876,49 @@ public class LlvmGlobalEmitter {
         sb.append("\n]\n");
         sb.append("@jnative_lazy_clinit_map_size = constant i64 ")
           .append(rows.size()).append("\n");
+        return sb.toString();
+    }
+
+    /**
+     * Emits the lazy-{@code <clinit>} completion flag of every class that
+     * owns a guard wrapper.
+     *
+     * <p>Each flag is a single {@code i32} global that the wrapper reads
+     * before it enters the runtime's {@code <clinit>} state machine and
+     * writes once the initializer has completed. It is the fast path: a
+     * class whose initializer has already run is recognised by one atomic
+     * load instead of a call to {@code __jnative_clinit_enter}, which
+     * takes a global mutex and walks the runtime's clinit table with
+     * {@code strcmp}.</p>
+     *
+     * <p>The flag is read with an acquire load and written with a release
+     * store, so a thread that observes the flag also observes the state
+     * the initializer published.</p>
+     *
+     * <p>The global is defined here and only here. The generic static
+     * field pass ({@link #generateStaticFields()}) sees the wrapper's
+     * {@code GET_STATIC}/{@code PUT_STATIC} on the synthetic field and
+     * skips it, so the two passes cannot define the same global twice.
+     * The per-class files reference these globals through the same
+     * external declaration mechanism as every other global.</p>
+     */
+    public String emitLazyClinitFlags() {
+        StringBuilder sb = new StringBuilder();
+        sb.append("\n; ----- Lazy <clinit> completion flags -----\n");
+
+        Set<String> classes = new TreeSet<>();
+        for (Function fn : module.getFunctions()) {
+            if (!LlvmUtil.isLazyClinitWrapper(fn.getName())) continue;
+            String owner = fn.getOwnerClass();
+            if (owner == null || owner.isEmpty()) continue;
+            classes.add(owner);
+        }
+
+        for (String cls : classes) {
+            sb.append("@").append(LlvmTypeMapper.lazyClinitFlagGlobal(cls))
+              .append(" = global i32 0, align 4\n");
+        }
+        sb.append("\n");
         return sb.toString();
     }
 

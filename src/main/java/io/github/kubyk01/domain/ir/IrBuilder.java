@@ -3,16 +3,14 @@ package io.github.kubyk01.domain.ir;
 import lombok.Getter;
 import lombok.Setter;
 
-import java.util.ArrayList;
 import java.util.List;
 
 public class IrBuilder {
     @Getter
-    private Module module;
+    private final Module module;
     private Function currentFunction;
     @Setter
     private BasicBlock currentBlock;
-    private final List<Temporary> temporaries = new ArrayList<>();
 
     public BasicBlock currentBlock() { return currentBlock; }
 
@@ -32,16 +30,6 @@ public class IrBuilder {
         }
         module.addFunction(func);
         currentFunction = func;
-        /*
-         * The IrBuilder instance is shared across the whole module (see
-         * BytecodeToIr.builder). Without this reset the `temporaries` list
-         * grows monotonically with the number of newTemporary() calls of
-         * every function in the module, which on a full JDK closure reaches
-         * several million entries. The list is only ever inspected as a
-         * per-function artifact; nothing outside this class reads across
-         * function boundaries.
-         */
-        temporaries.clear();
         return func;
     }
 
@@ -59,7 +47,6 @@ public class IrBuilder {
         }
         module.addFunction(func);
         currentFunction = func;
-        temporaries.clear();   // same reasoning as above
         return func;
     }
 
@@ -76,9 +63,7 @@ public class IrBuilder {
     }
 
     public Temporary newTemporary(Type type) {
-        Temporary tmp = new Temporary(type);
-        temporaries.add(tmp);
-        return tmp;
+        return new Temporary(type);
     }
 
     public Instruction addInstruction(Opcode opcode, Value... operands) {
