@@ -1,5 +1,6 @@
 package io.github.kubyk01.domain.analyzer.escapeanalysis;
 
+import io.github.kubyk01.domain.analyzer.aliasanalysis.AllocationSite;
 import lombok.Builder;
 import lombok.Data;
 import java.util.HashMap;
@@ -96,6 +97,34 @@ public class EscapeSummary {
     private Set<Integer> paramsEscapedToReturn = new HashSet<>();
 
     /**
+     * For every formal parameter {@code i} — the set of allocation sites
+     * that are reachable from the value passed as parameter {@code i} when
+     * the function exits.
+     *
+     * <p>Semantics: if the argument {@code args[i]} has escape status
+     * {@code S} in the caller, then every site in
+     * {@code sitesReachableFromParams.get(i)} must have a status of at
+     * least {@code max(HEAP, S)}.</p>
+     *
+     * <p>This is the missing link. The intraprocedural escape analysis
+     * sees that {@code this.lock = new ReentrantLock()} puts a fresh site
+     * into a field of the parameter {@code this}, but it does not know what
+     * the caller does with {@code this}. If the caller returns {@code this},
+     * the {@code ReentrantLock} has to be {@code RETURN} and not
+     * {@code HEAP}; otherwise the lifetime analysis places a destructor at
+     * the {@code PUT_FIELD} point, frees the lock and nulls out the field,
+     * leaving a live object with a null field.</p>
+     *
+     * <p>The field is filled in by
+     * {@link io.github.kubyk01.application.service.analyzer.escapeanalysis.EscapeSummaryBuilder}
+     * and read in
+     * {@link io.github.kubyk01.application.service.analyzer.escapeanalysis.IntraproceduralEscape#processCall}
+     * of the calling function.</p>
+     */
+    @Builder.Default
+    private Map<Integer, Set<AllocationSite>> sitesReachableFromParams = new HashMap<>();
+
+    /**
      * Monotone join. ⊥ is the empty summary (all sets empty, all flags
      * false) and ⊤ is "every parameter escapes, every field escapes, all
      * flags true". Merging only ever grows the stored value, which is what
@@ -117,6 +146,13 @@ public class EscapeSummary {
         for (Map.Entry<Integer, Set<Integer>> e
                 : other.paramEscapeEdges.entrySet()) {
             paramEscapeEdges
+                .computeIfAbsent(e.getKey(), k -> new HashSet<>())
+                .addAll(e.getValue());
+        }
+
+        for (Map.Entry<Integer, Set<AllocationSite>> e
+                : other.sitesReachableFromParams.entrySet()) {
+            sitesReachableFromParams
                 .computeIfAbsent(e.getKey(), k -> new HashSet<>())
                 .addAll(e.getValue());
         }

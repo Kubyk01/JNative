@@ -2,6 +2,7 @@ package io.github.kubyk01.application.service.analyzer.escapeanalysis;
 
 import io.github.kubyk01.application.service.analyzer.dependencyresolver.DependencyResolver;
 import io.github.kubyk01.domain.analyzer.aliasanalysis.AliasAnalysisResult;
+import io.github.kubyk01.domain.analyzer.aliasanalysis.AllocationSite;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.FieldNode;
 import io.github.kubyk01.domain.analyzer.escapeanalysis.EscapeSummary;
 import io.github.kubyk01.domain.ir.*;
@@ -651,6 +652,151 @@ public class EscapeSummaryBuilder {
     }
 
     // =====================================================================
+    //  Which values ARE a formal parameter
+    // =====================================================================
+
+    /**
+     * Computes, for every value of the function, the set of parameter
+     * ordinals the value is an <b>alias of</b> — i.e. the value may be the
+     * very object that was passed as that parameter.
+     *
+     * <p>This is deliberately NOT the same as
+     * {@link #computeLocalToParams}: that map answers "which parameters are
+     * reachable <em>from</em> this value" (a field of {@code this} may hold
+     * another parameter), while this map answers "this value <em>is</em>
+     * this parameter". Only the second question is meaningful when
+     * deciding whether an allocation stored into a field becomes reachable
+     * <em>from</em> that parameter.</p>
+     *
+     * <p>The alias relation is propagated through the obvious data flow:
+     * a {@code LOAD} of a parameter's slot, a {@code STORE} into a
+     * parameter's slot, {@code PHI} nodes and {@code CAST}/{@code CHECKCAST}
+     * copies. The propagation is a monotone fixed point — the sets only
+     * grow — so the iteration terminates after at most
+     * {@code 2 * |params| + 64} rounds; in practice after one.</p>
+     */
+    private Map<Value, Set<Integer>> computeValueToParams(Function func) {
+        Map<Value, Set<Integer>> valueToParams = new HashMap<>();
+        Map<Integer, Set<Integer>> slotToParams = new HashMap<>();
+
+        for (Parameter p : func.getParameters()) {
+            valueToParams.computeIfAbsent(p, k -> new HashSet<>())
+                    .add(p.getOrdinal());
+            slotToParams.computeIfAbsent(p.getIndex(), k -> new HashSet<>())
+                    .add(p.getOrdinal());
+        }
+
+        int maxIterations = 2 * func.getParameters().size() + 64;
+
+        for (int iter = 0; iter < maxIterations; iter++) {
+            boolean changed = false;
+
+            for (BasicBlock block : func.getBlocks()) {
+                for (Instruction inst : block.getInstructions()) {
+                    Opcode op = inst.getOpcode();
+
+                    if (op == Opcode.LOAD) {
+                        Value result = inst.getResult();
+                        int idx = inst.getLocalIndex();
+                        if (result == null || idx < 0) continue;
+                        Set<Integer> sp = slotToParams.get(idx);
+                        if (sp == null || sp.isEmpty()) continue;
+                        changed |= mergeParams(valueToParams, result, sp);
+                    } else if (op == Opcode.STORE) {
+                        if (inst.getOperands().isEmpty()) continue;
+                        Value stored = inst.getOperands().getFirst();
+                        int idx = inst.getLocalIndex();
+                        if (idx < 0) continue;
+                        Set<Integer> sp = valueToParams.get(stored);
+                        if (sp == null || sp.isEmpty()) continue;
+                        changed |= mergeParams(slotToParams, idx, sp);
+                    } else if (op == Opcode.PHI) {
+                        Value result = inst.getResult();
+                        if (result == null) continue;
+                        for (Value operand : inst.getOperands()) {
+                            if (operand == null) continue;
+                            Set<Integer> sp = valueToParams.get(operand);
+                            if (sp != null && !sp.isEmpty()) {
+                                changed |= mergeParams(valueToParams, result, sp);
+                            }
+                        }
+                    } else if (op == Opcode.CAST || op == Opcode.CHECKCAST) {
+                        if (inst.getOperands().isEmpty()) continue;
+                        Value src = inst.getOperands().getFirst();
+                        Value result = inst.getResult();
+                        if (result == null) continue;
+                        Set<Integer> sp = valueToParams.get(src);
+                        if (sp == null || sp.isEmpty()) continue;
+                        changed |= mergeParams(valueToParams, result, sp);
+                    }
+                }
+            }
+
+            if (!changed) break;
+        }
+
+        return valueToParams;
+    }
+
+    private static <K> boolean mergeParams(Map<K, Set<Integer>> map, K key,
+                                           Set<Integer> params) {
+        Set<Integer> cur = map.computeIfAbsent(key, k -> new HashSet<>());
+        int before = cur.size();
+        cur.addAll(params);
+        return cur.size() > before;
+    }
+
+    /**
+     * The allocation sites of {@code v} that were allocated by the function
+     * currently under analysis.
+     *
+     * <p>The points-to graph is whole-program, so the points-to set of a
+     * value may contain sites that belong to other functions — for instance
+     * the object the caller passed in as an argument. Those are not
+     * "allocations made here" and must not be reported as reachable from a
+     * parameter of this function.</p>
+     */
+    private Set<AllocationSite> localAllocationSites(Value v, String funcName) {
+        Set<AllocationSite> out = new HashSet<>();
+        if (v == null) return out;
+        for (AllocationSite site : aliasResult.getPointsTo(v).getSites()) {
+            if (funcName.equals(site.getMethodName())) out.add(site);
+        }
+        return out;
+    }
+
+    /**
+     * Collects the allocation sites that become reachable from each formal
+     * parameter of the function under analysis.
+     *
+     * <p>Keyed by parameter <b>ordinal</b> — the same indexing the rest of
+     * the summary uses.</p>
+     */
+    private static final class ReachableSiteCollector {
+
+        private final String funcName;
+        private final Map<Integer, Set<AllocationSite>> byParam = new HashMap<>();
+
+        ReachableSiteCollector(String funcName) {
+            this.funcName = funcName;
+        }
+
+        String funcName() {
+            return funcName;
+        }
+
+        void record(int paramOrdinal, Set<AllocationSite> sites) {
+            if (sites == null || sites.isEmpty()) return;
+            byParam.computeIfAbsent(paramOrdinal, k -> new HashSet<>())
+                    .addAll(sites);
+        }
+
+        Map<Integer, Set<AllocationSite>> result() {
+            return byParam;
+        }
+    }
+
+    // =====================================================================
     //  Per-function summary analysis (semantics unchanged)
     // =====================================================================
 
@@ -661,6 +807,17 @@ public class EscapeSummaryBuilder {
         // into fields through local aliases (requireNonNull-style chains),
         // and (b) populate paramsEscapedToReturn in return terminators.
         Map<Value, Set<Integer>> localToParams = computeLocalToParams(func, snapshot);
+
+        // NEW: the values that ARE a formal parameter (possibly through a
+        // local copy of it). Used to decide whether the base of a field or
+        // array store is "the parameter itself" and therefore whether the
+        // stored allocation becomes reachable from that parameter.
+        Map<Value, Set<Integer>> valueToParams = computeValueToParams(func);
+
+        // NEW: the allocation sites that become reachable from each formal
+        // parameter before the function exits.
+        ReachableSiteCollector reachableSites =
+                new ReachableSiteCollector(func.getName());
 
         Set<Integer> paramsEscaped         = new HashSet<>();
         Set<Integer> paramsReturned        = new HashSet<>();
@@ -677,7 +834,8 @@ public class EscapeSummaryBuilder {
             for (Instruction inst : block.getInstructions()) {
                 processInstruction(inst, paramAliases, paramsEscaped,
                         paramsReturned, paramsEscapedToStatic, fieldsEscaped, flags,
-                        snapshot, valueOrigin, paramEscapeEdges, localToParams);
+                        snapshot, valueOrigin, paramEscapeEdges, localToParams,
+                        valueToParams, reachableSites);
             }
             Terminator term = block.getTerminator();
             if (term != null) {
@@ -697,6 +855,7 @@ public class EscapeSummaryBuilder {
                 .escapesGlobally(flags[1])
                 .createsThread(flags[2])
                 .paramEscapeEdges(paramEscapeEdges)
+                .sitesReachableFromParams(reachableSites.result())
                 .build();
 
         validateSummaryIndices(func, result);
@@ -716,6 +875,10 @@ public class EscapeSummaryBuilder {
         checkIndices(func, "paramsReturned",        s.getParamsReturned(),        n);
         checkIndices(func, "paramsEscapedToStatic", s.getParamsEscapedToStatic(), n);
         checkIndices(func, "paramsEscapedToReturn", s.getParamsEscapedToReturn(), n);
+        for (Integer idx : s.getSitesReachableFromParams().keySet()) {
+            checkIndices(func, "sitesReachableFromParams",
+                    Collections.singleton(idx), n);
+        }
     }
 
     private static void checkIndices(Function func, String name,
@@ -757,17 +920,20 @@ public class EscapeSummaryBuilder {
                                     Map<String, EscapeSummary> snapshot,
                                     Map<Value, Value> valueOrigin,
                                     Map<Integer, Set<Integer>> paramEscapeEdges,
-                                    Map<Value, Set<Integer>> localToParams) {
+                                    Map<Value, Set<Integer>> localToParams,
+                                    Map<Value, Set<Integer>> valueToParams,
+                                    ReachableSiteCollector reachableSites) {
         Opcode op = inst.getOpcode();
         switch (op) {
             case PUT_FIELD -> processPutField(inst, paramAliases, paramsEscaped, fieldsEscaped, flags,
-                    paramEscapeEdges, localToParams);
+                    paramEscapeEdges, localToParams, valueToParams, reachableSites);
             case GET_FIELD -> processGetField(inst, flags);
             case MONITOR_ENTER, MONITOR_EXIT -> processMonitor(inst, paramAliases, paramsEscaped, flags);
             case PUT_STATIC -> processPutStatic(inst, paramAliases, paramsEscaped,
                     paramsEscapedToStatic, flags);
             case ALOAD -> processALoad(inst, valueOrigin);
-            case ASTORE -> processAStore(inst, paramAliases, paramsEscaped, fieldsEscaped);
+            case ASTORE -> processAStore(inst, paramAliases, paramsEscaped, fieldsEscaped,
+                    valueToParams, reachableSites);
             case CALL, VIRTUAL_CALL, INTERFACE_CALL, STATIC_CALL, SPECIAL_CALL ->
                     processCall(inst, paramAliases, paramsEscaped, paramsReturned,
                             paramsEscapedToStatic, flags, snapshot, paramEscapeEdges);
@@ -781,7 +947,9 @@ public class EscapeSummaryBuilder {
                                  Set<String>  fieldsEscaped,
                                  boolean[]    flags,
                                  Map<Integer, Set<Integer>> paramEscapeEdges,
-                                 Map<Value, Set<Integer>> localToParams) {
+                                 Map<Value, Set<Integer>> localToParams,
+                                 Map<Value, Set<Integer>> valueToParams,
+                                 ReachableSiteCollector reachableSites) {
         if (inst.getOperands().size() < 3) return;
 
         Value base = inst.getOperands().get(0);
@@ -841,6 +1009,36 @@ public class EscapeSummaryBuilder {
                 for (int prd : rp) {
                     paramsEscaped.add(prd);
                     addAliases(prd, paramAliases, paramsEscaped);
+                }
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // NEW: the allocation sites that become reachable from a parameter.
+        //
+        // `this.lock = new ReentrantLock()` puts a FRESH allocation into a
+        // field of the receiver. The receiver is formal parameter 0, so
+        // from the exit of this function the ReentrantLock is reachable
+        // from the value that was passed as parameter 0.
+        //
+        // The caller has to learn that: if the caller returns the receiver,
+        // the lock must be RETURN as well and not HEAP. Otherwise the
+        // lifetime analysis places a destructor at the PUT_FIELD point,
+        // frees the lock and nulls out the field, leaving a live object
+        // with a null field (the "receiver of ReentrantLock.lock()V is
+        // null" crash).
+        //
+        // Only allocations made by THIS function are recorded: the value
+        // stored into the field may also be an object that came from the
+        // caller, and that object is not allocated here.
+        // ------------------------------------------------------------------
+        Set<Integer> baseParams = valueToParams.get(base);
+        if (baseParams != null && !baseParams.isEmpty()) {
+            Set<AllocationSite> storedSites =
+                    localAllocationSites(rhs, reachableSites.funcName());
+            if (!storedSites.isEmpty()) {
+                for (int prd : baseParams) {
+                    reachableSites.record(prd, storedSites);
                 }
             }
         }
@@ -927,9 +1125,12 @@ public class EscapeSummaryBuilder {
     private void processAStore(Instruction inst,
                                Map<Integer, Set<Integer>> paramAliases,
                                Set<Integer> paramsEscaped,
-                               Set<String>  fieldsEscaped) {
+                               Set<String>  fieldsEscaped,
+                               Map<Value, Set<Integer>> valueToParams,
+                               ReachableSiteCollector reachableSites) {
         if (inst.getOperands().size() < 3) return;
         Value value = inst.getOperands().get(2);
+        Value array = inst.getOperands().get(0);
 
         Type vt = (value != null) ? value.getType() : null;
         boolean valueIsReference = (vt == null)
@@ -945,6 +1146,20 @@ public class EscapeSummaryBuilder {
             addAliases(p.getOrdinal(), paramAliases, paramsEscaped);
         }
         fieldsEscaped.add("[]");
+
+        // NEW: the allocation sites stored into an array that IS a formal
+        // parameter become reachable from that parameter at the exit of
+        // the function. Same reasoning as the PUT_FIELD case above.
+        Set<Integer> arrayParams = valueToParams.get(array);
+        if (arrayParams != null && !arrayParams.isEmpty()) {
+            Set<AllocationSite> storedSites =
+                    localAllocationSites(value, reachableSites.funcName());
+            if (!storedSites.isEmpty()) {
+                for (int prd : arrayParams) {
+                    reachableSites.record(prd, storedSites);
+                }
+            }
+        }
     }
 
     private void processCall(Instruction inst,

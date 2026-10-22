@@ -154,7 +154,24 @@ public class IntraproceduralEscape {
         // base, so its escape level is the maximum of the base's own
         // level and whatever the field already held.
         EscapeStatus baseEsc = valueEscapeStatus(base);
-        markEscaped(rhs, baseEsc);
+
+        // FIX: a value stored into a field is always at least HEAP.
+        //
+        // Rationale: even when the base is a fresh STACK allocation, the
+        // fields of the owner do not go through destructors when the
+        // owner's frame goes away (a STACK object is released together
+        // with its frame). The value in the field is therefore orphaned
+        // and has to be freed either through the destructors of the owner
+        // (when the owner is not STACK) or at its last use (when the owner
+        // is STACK). In both cases the status must be at least HEAP — it is
+        // the only correct answer.
+        //
+        // Previously this was `markEscaped(rhs, baseEsc)`, and for a STACK
+        // owner the stored value got STACK. That made the DestructorInserter
+        // skip the site (STACK sites are filtered out) and the object
+        // leaked.
+        EscapeStatus rhsPromoted = maxEscape(baseEsc, EscapeStatus.HEAP);
+        markEscaped(rhs, rhsPromoted);
 
         EscapeStatus rhsEsc   = valueEscapeStatus(rhs);
         EscapeStatus fieldEsc = maxEscape(baseEsc, rhsEsc);
@@ -241,8 +258,12 @@ public class IntraproceduralEscape {
         // Same reasoning as PUT_FIELD: writing into an array modifies it
         // in place. The array reference does not escape; only the stored
         // value does, and only when the array is externally observable.
+        // A value stored into an array is at least HEAP for the same
+        // reason as a value stored into a field: the array's elements do
+        // not go through destructors when a STACK owner dies.
         EscapeStatus arrayEsc = valueEscapeStatus(array);
-        markEscaped(value, arrayEsc);
+        EscapeStatus valuePromoted = maxEscape(arrayEsc, EscapeStatus.HEAP);
+        markEscaped(value, valuePromoted);
 
         EscapeStatus valueEsc = valueEscapeStatus(value);
         EscapeStatus fieldEsc = maxEscape(arrayEsc, valueEsc);
@@ -398,6 +419,58 @@ public class IntraproceduralEscape {
 
         // The return value is deliberately NOT promoted here. See the block
         // comment above for the full rationale.
+
+        // ------------------------------------------------------------------
+        // Propagation of the argument's status onto the allocation sites
+        // that are reachable from the corresponding formal parameter.
+        //
+        // If the callee stores fresh allocations into the fields of its
+        // parameter i (see EscapeSummary.sitesReachableFromParams), those
+        // sites are reachable from the argument that was passed at the exit
+        // of the callee. Their status is therefore not below the status of
+        // the argument — with one refinement: a STACK argument still gives
+        // HEAP, because the fields of a STACK owner do not go through
+        // destructors and the object stored in them is orphaned without an
+        // explicit free.
+        //
+        // The case this is needed for:
+        //
+        //     InternalLock()              // <init>
+        //         this.lock = new ReentrantLock();
+        //
+        //     InternalLock.newLockOrNull()
+        //         return new InternalLock();     // this — RETURN
+        //
+        //     PrintStream.<init>
+        //         this.lock = InternalLock.newLockOrNull();
+        //
+        // Without this block the ReentrantLock is classified as HEAP, the
+        // lifetime analysis places a destructor at the PUT_FIELD point and
+        // nulls out the field. Calling PrintStream.println then yields the
+        // NPE "Cannot invoke jdk.internal.misc.InternalLock.lock(V) because
+        // receiver of ReentrantLock.lock()V is null".
+        //
+        // With this block the ReentrantLock gets RETURN from newLockOrNull
+        // (because `this` is returned there) and, on top of that, GLOBAL
+        // from PrintStream (because PrintStream leaks into System.out). No
+        // destructor is placed at the PUT_FIELD point, the field stays
+        // alive, and the object is freed by the ordinary destructor chain
+        // at shutdown.
+        // ------------------------------------------------------------------
+        for (int i = 0; i < args.size(); i++) {
+            Set<AllocationSite> sitesInParam =
+                summary.getSitesReachableFromParams().get(i);
+            if (sitesInParam == null || sitesInParam.isEmpty()) continue;
+
+            EscapeStatus argEsc = valueEscapeStatus(args.get(i));
+            // max(HEAP, argEsc): a STACK argument gives HEAP (the site is
+            // orphaned in the field), RETURN gives RETURN, GLOBAL gives
+            // GLOBAL, THREAD gives THREAD.
+            EscapeStatus promoted = maxEscape(EscapeStatus.HEAP, argEsc);
+            for (AllocationSite site : sitesInParam) {
+                markEscaped(site, promoted);
+            }
+        }
 
         // ------------------------------------------------------------------
         // Args-in-return edges.
