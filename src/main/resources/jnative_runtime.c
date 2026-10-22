@@ -423,6 +423,7 @@ static void jnative_claim_remove(uintptr_t p) {
 
 int __jnative_dtor_enter(void* this_obj) {
     if (this_obj == NULL) return 0;
+    if (!jnative_in_shutdown) return 1;
 
     uintptr_t p = (uintptr_t)this_obj;
 
@@ -442,6 +443,7 @@ int __jnative_dtor_enter(void* this_obj) {
 
 void __jnative_dtor_unclaim(void* this_obj) {
     if (this_obj == NULL) return;
+    if (!jnative_in_shutdown) return;
     jnative_claim_remove((uintptr_t)this_obj);
 }
 
@@ -2992,9 +2994,6 @@ static int jnative_build_array_destructor_symbol(const char* desc,
  */
 static jnative_destructor_fn jnative_resolve_destructor(void* key) {
     char symbol[1024];
-
-    if (key == NULL) return NULL;
-    if (((uintptr_t)key & 7) != 0) return NULL;
 
     if (__jnative_is_class_mirror(key)) {
         ReflectionClass* mirror = (ReflectionClass*)key;
