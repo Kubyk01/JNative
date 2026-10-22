@@ -286,11 +286,15 @@ public final class OutOfSsaPass {
                                 + "' of function '" + func.getName()
                                 + "' has an UndefinedValue at operand index " + i
                                 + ". This is a placeholder emitted by "
-                                + "SSATransformer.renameBlock when it could not "
-                                + "resolve a version - see the throw-site in "
-                                + "SSATransformer for the underlying cause. "
-                                + "Substituting null here would silently corrupt "
-                                + "every use of the phi result.");
+                                + "SSATransformer.renameBlock when the slot had no "
+                                + "version on the corresponding incoming edge. "
+                                + "The phi is alive (its result is used somewhere), "
+                                + "which means the missing version is a genuine bug, "
+                                + "not a dead-phi artifact. Investigate dominance "
+                                + "of '" + block.getLabel() + "', stale predecessor "
+                                + "edges in the CFG, or a phi/predecessor-count "
+                                + "mismatch. Substituting null here would silently "
+                                + "corrupt every use of the phi result.");
                     }
                     if (op instanceof Constant c
                             && c.getValue() == null

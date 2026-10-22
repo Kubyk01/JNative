@@ -661,18 +661,54 @@ public class SSATransformer {
 
                 Value curVer = currentVersion(key);
                 if (curVer == null) {
-                    throw new IllegalStateException(
-                        "SSATransformer: phi operand for slot " + idx
-                            + " (bucket " + bucket + ") in successor block '"
-                            + succ.getLabel()
-                            + "' from predecessor '" + block.getLabel()
-                            + "' has no version on the version stack (function '"
-                            + currentFunction.getName() + "'). "
-                            + "The verifier guarantees a version exists on every "
-                            + "edge; its absence indicates broken dominance, a "
-                            + "stale predecessor edge, or a phi/operand count "
-                            + "mismatch. Investigate predecessors of '"
-                            + succ.getLabel() + "' and the phi's operand list.");
+                    /*
+                     * The slot is not defined along the path through this
+                     * predecessor. This can be one of two fundamentally
+                     * different situations:
+                     *
+                     *   1. A live phi with a broken dominance tree
+                     *      (ProtectionDomain.<init>): the slot really is
+                     *      live here (a use is reachable from this phi),
+                     *      the missing version is a real bug, the value
+                     *      would reach PUT_FIELD and turn into null.
+                     *      A hard failure is required here.
+                     *
+                     *   2. A dead phi (SdpProvider.loadRulesFromFile):
+                     *      the slot is assigned only inside the loop body
+                     *      and is never read outside of it. The
+                     *      loop-carried phi gets an undefined operand on
+                     *      the incoming edge, but its result is never
+                     *      used - on any path, including this one.
+                     *
+                     * These two cases are indistinguishable from the
+                     * version stack: in both of them the stack for the
+                     * given (slot, bucket) is empty. Only the liveness
+                     * of the phi tells them apart - whether its results
+                     * are used. While the predecessor's terminator is
+                     * being processed the phi result uses have not been
+                     * renamed yet, so that signal is not available.
+                     *
+                     * The decision is to defer. The operand is filled in
+                     * with the UndefinedValue marker, processing
+                     * continues, and:
+                     *
+                     *   - cleanupPhis() removes a phi whose result was
+                     *     never used (case 2 - the dead phi simply
+                     *     disappears);
+                     *
+                     *   - OutOfSsaPass, after the full renaming,
+                     *     verifies that no surviving phi (i.e. a live one)
+                     *     contains an UndefinedValue operand. A live phi
+                     *     with an UndefinedValue is case 1, and it fails
+                     *     with a diagnostic naming the block, the function
+                     *     and the operand index.
+                     *
+                     * This keeps the hard diagnostic failure for real bugs
+                     * and lets SSA construction finish on dead phis, which
+                     * occur in bulk in JDK code (a fresh local assigned
+                     * only inside a loop).
+                     */
+                    curVer = new UndefinedValue(phiType);
                 }
 
                 if (!typesCompatible(curVer.getType(), phiType)) {
