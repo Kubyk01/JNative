@@ -994,7 +994,19 @@ public class Analyzer {
         MethodTranslator translator = new MethodTranslator(ref, true, builder, resolver);
 
         try {
-            ClassReader reader = new ClassReader(bytes);
+            // Override readBytecodeInstructionOffset so the translator can
+            // record the bytecode offset of every basic block. This is what
+            // enables the bytecode-interval formulation of try-range bodies
+            // (F4 from the JNI-22 debug report) inside resurrected <clinit>
+            // functions. Without this override, F4 falls back to
+            // GraphUtils.getBlocksBetween, which over-approximates try-range
+            // bodies and manufactures false exceptional edges.
+            ClassReader reader = new ClassReader(bytes) {
+                @Override
+                protected void readBytecodeInstructionOffset(int bytecodeOffset) {
+                    translator.setCurrentBytecodeOffset(bytecodeOffset);
+                }
+            };
             reader.accept(new ClassVisitor(Opcodes.ASM9) {
                 @Override
                 public MethodVisitor visitMethod(int access, String name, String desc,

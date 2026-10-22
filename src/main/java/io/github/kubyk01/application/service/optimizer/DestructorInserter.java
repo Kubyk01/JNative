@@ -512,9 +512,33 @@ public class DestructorInserter {
         Terminator oldTerm = block.getTerminator();
 
         // ---- 1. Split: move [instIdx, end) to a new tail block ----
+        //
+        // The tail is inserted IMMEDIATELY AFTER `block`, not appended to
+        // the end of the function.
+        //
+        // This preserves definition-before-use order in the block list. The
+        // tail contains the STORE instructions that were previously in `block`
+        // (because they came after the PUT_FIELD) plus the PUT_FIELD itself.
+        // Those STOREs define the values that every successor of `block` --
+        // including merge points that come earlier in the original block list
+        // than the end of the function -- will read.
+        //
+        // Appending the tail at the end (the previous behaviour) broke that
+        // invariant: successor blocks were emitted first, the single-pass
+        // value mapper in LlvmFunctionEmitter could not resolve the STOREs'
+        // results, and getDefaultValue silently substituted `null` for every
+        // reference type. This is exactly the ProtectionDomain.principals
+        // NPE reported in the bug: the `this` receiver of the PUT_FIELD was
+        // recovered from a slot whose defining STORE had not been emitted yet.
         BasicBlock tail = new BasicBlock(
                 block.getLabel() + "_rel_tail_" + (++splitId));
-        func.addBlock(tail);
+        func.insertBlockAfter(block, tail);
+
+        // Tracks the last block inserted into the function's block list. Every
+        // subsequent new block is inserted right after it, keeping the diamond
+        // in the natural block-list order (head, tail, dispatch, free_0, next_0,
+        // free_1, next_1, ... free_n).
+        BasicBlock insertAfter = tail;
 
         List<Instruction> moved = new ArrayList<>(insts.subList(instIdx, insts.size()));
         for (Instruction m : moved) {
@@ -650,7 +674,8 @@ public class DestructorInserter {
         // ---- 6. Dispatch block ----
         BasicBlock dispatch = new BasicBlock(
                 block.getLabel() + "_rel_dispatch_" + (++splitId));
-        func.addBlock(dispatch);
+        func.insertBlockAfter(insertAfter, dispatch);
+        insertAfter = dispatch;
         block.setTerminator(new CondBranchTerminator(skipResult, tail, dispatch));
 
         // Load vtable: GET_FIELD with integer offset 0 emits
@@ -690,7 +715,8 @@ public class DestructorInserter {
 
             BasicBlock freeBlock = new BasicBlock(
                     current.getLabel() + "_rel_free_" + (++splitId));
-            func.addBlock(freeBlock);
+            func.insertBlockAfter(insertAfter, freeBlock);
+            insertAfter = freeBlock;
 
             BasicBlock next;
             if (last) {
@@ -698,7 +724,8 @@ public class DestructorInserter {
             } else {
                 next = new BasicBlock(
                         current.getLabel() + "_rel_next_" + (++splitId));
-                func.addBlock(next);
+                func.insertBlockAfter(insertAfter, next);
+                insertAfter = next;
             }
 
             current.setTerminator(
