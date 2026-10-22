@@ -1551,6 +1551,34 @@ public class DestructorInserter {
             }
         }
 
+        // ------------------------------------------------------------------
+        // The owner of the field (the base) is checked across all of its
+        // possible sites. If at least one of them is already
+        // GLOBAL/RETURN/THREAD, the field belongs to a long-lived object,
+        // which means the site stored in that field should have been
+        // promoted to the same status and must not be released per-use.
+        // If the escape analysis missed that, the object still cannot be
+        // freed, and the field cannot be nulled out either — otherwise the
+        // live owner would get null instead of its own field. Skip the
+        // whole insertion.
+        // ------------------------------------------------------------------
+        boolean ownerIsLongLived = false;
+        if (lastStore != null) {
+            Value base = lastStore.getOperands().getFirst();
+            for (AllocationSite baseSite : aliasResult.getPointsTo(base).getSites()) {
+                EscapeStatus ownerStatus = escapeResult.getSiteStatus(baseSite);
+                if (ownerStatus == EscapeStatus.GLOBAL
+                    || ownerStatus == EscapeStatus.RETURN
+                    || ownerStatus == EscapeStatus.THREAD) {
+                    ownerIsLongLived = true;
+                    break;
+                }
+            }
+        }
+        if (ownerIsLongLived) {
+            return;
+        }
+
         // The call is a direct STATIC_CALL to the concrete destructor of
         // the site's type — never a runtime dispatch. The site's type is
         // always a concrete class (an abstract class cannot have a NEW)

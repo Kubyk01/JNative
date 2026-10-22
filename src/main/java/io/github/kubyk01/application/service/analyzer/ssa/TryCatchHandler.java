@@ -22,12 +22,6 @@ public class TryCatchHandler {
         final int n = tryCatchBlocks.size();
         if (n == 0) return;
 
-        // -----------------------------------------------------------------
-        // Pass 1: resolve every range's body against the CURRENT CFG, which
-        // at this point contains no handler edges at all. Bodies are stored
-        // in a parallel list so no mutation of the CFG can influence a
-        // later range's body.
-        // -----------------------------------------------------------------
         List<List<BasicBlock>> bodies = new ArrayList<>(n);
         for (TryCatchInfo info : tryCatchBlocks) {
             BasicBlock startBlock   = labelToBlock.get(info.start);
@@ -41,12 +35,6 @@ public class TryCatchHandler {
                     startBlock, endBlock, handlerBlock));
         }
 
-        // -----------------------------------------------------------------
-        // Pass 2: now that every body is fixed, install the normal
-        // body -> handler edge for each range. Installing them all in a
-        // second pass is what prevents range N's freshly-added handler
-        // edge from contaminating range N+1's body.
-        // -----------------------------------------------------------------
         for (int i = 0; i < n; i++) {
             List<BasicBlock> tryBlocks = bodies.get(i);
             if (tryBlocks == null) continue;
@@ -58,7 +46,7 @@ public class TryCatchHandler {
             for (BasicBlock b : tryBlocks) {
                 if (b == handlerBlock) continue;
                 if (!b.getSuccessors().contains(handlerBlock)) {
-                    b.addSuccessor(handlerBlock);
+                    b.addExceptionalSuccessor(handlerBlock);
                 }
             }
         }

@@ -128,9 +128,9 @@ public class MethodTranslator extends MethodVisitor {
         }
 
         if (current != null
-            && current != target
-            && current.getTerminator() == null
-            && !handlerLabels.contains(label)) {
+                && current != target
+                && current.getTerminator() == null
+                && !handlerLabels.contains(label)) {
             emitStackStoresForTarget(label);
             current.setTerminator(new BranchTerminator(target));
         }

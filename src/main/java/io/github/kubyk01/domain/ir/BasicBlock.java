@@ -22,6 +22,13 @@ public class BasicBlock {
     }
 
     public void setTerminator(Terminator terminator) {
+        if (this.terminator != null) {
+            for (BasicBlock oldTarget : this.terminator.getTargets()) {
+                if (oldTarget != null) {
+                    removeSuccessor(oldTarget);
+                }
+            }
+        }
         this.terminator = terminator;
         if (terminator == null) return;
         terminator.setBlock(this);
@@ -60,14 +67,6 @@ public class BasicBlock {
             // separate relation; if it still contains `block`, the predecessor
             // link must stay.
             if (!exceptionalSuccessors.contains(block)) {
-                block.predecessors.remove(this);
-            }
-        }
-    }
-
-    public void removeExceptionalSuccessor(BasicBlock block) {
-        if (exceptionalSuccessors.remove(block)) {
-            if (!successors.contains(block)) {
                 block.predecessors.remove(this);
             }
         }
