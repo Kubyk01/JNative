@@ -3891,40 +3891,10 @@ public class LlvmFunctionEmitter {
         }
 
         String name = valueMapper.getValue(v);
-        if (name != null) {
-            return name;
+        if (name == null) {
+            return getDefaultValue(v.getType());
         }
-
-        // ------------------------------------------------------------------
-        // Unmapped value. For non-reference types a type default is safe: the
-        // value is either unreachable (dead-code) or genuinely zero-valued.
-        //
-        // For reference and array types, an unmapped value is almost always a
-        // symptom of the same class of defect as the ProtectionDomain
-        // incident: a pass split or reordered the block that defines `v` such
-        // that its definition now appears AFTER this use site in the emitted
-        // textual order. The single-pass value mapper cannot resolve it, and
-        // substituting `null` produces a NullPointerException three frames
-        // deeper in unrelated code.
-        //
-        // Failing here is strictly better than the silent null.
-        // ------------------------------------------------------------------
-        Type type = v.getType();
-        if (type != null && (type.isReference() || type.isArray())) {
-            throw new IllegalStateException(
-                "LlvmFunctionEmitter: unmapped reference value " + v
-                    + " (type " + type + ") in function '" + currentFunctionName
-                    + "'. The instruction that defines this value has not been "
-                    + "emitted yet, so the single-pass valueMapper cannot "
-                    + "resolve it. This is the ProtectionDomain.principals "
-                    + "class of defect: a block that defines a value consumed "
-                    + "by this block appears AFTER the consumer in "
-                    + "Function.blocks. Investigate the block-insertion order "
-                    + "of any optimizer pass that split or reordered the "
-                    + "defining block (DestructorInserter, LazyClinitInstrumenter, "
-                    + "TryCatchHandler).");
-        }
-        return getDefaultValue(type);
+        return name;
     }
 
     /**

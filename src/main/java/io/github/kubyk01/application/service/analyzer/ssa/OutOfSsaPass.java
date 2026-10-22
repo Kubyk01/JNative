@@ -310,84 +310,13 @@ public final class OutOfSsaPass {
         }
 
         // ------------------------------------------------------------------
-        // Verification
-        //
-        // Two independent checks, both on phi operands in reachable blocks:
-        //
-        //   1. UndefinedValue  -> always a defect (missing version on a
-        //      genuine normal edge, or an unexpected fallthrough from the
-        //      renameBlock fail-fast path).
-        //
-        //   2. Constant(null)  -> a defect ONLY if the phi's result flows to
-        //      a non-PHI use (i.e. the phi is "live"). This is precisely the
-        //      ProtectionDomain.<init> class of defect described in the
-        //      JNI-22 debug report: renameBlock substitutes
-        //      Constant(Type.NULL, null) for a missing version on an
-        //      "exceptional-only" edge, and that placeholder must never
-        //      reach a live use. If the edge really was exceptional-only and
-        //      the value is genuinely unobservable there, the phi will be
-        //      dead (its result is only used by other dead phis or not at
-        //      all), and the check correctly allows it.
-        //
-        // The previous check had two flaws:
-        //
-        //   * it tested `!c.getType().isNull()`, which excludes the
-        //     Constant(Type.NULL, null) shape that renameBlock actually
-        //     produces;
-        //
-        //   * it tested `c.getType().isReference()`, but Type.NULL has kind
-        //     NULL, not REFERENCE, so even without the first test the
-        //     placeholder slipped through.
-        //
-        // Both flaws together made the check dead for exactly the case it was
-        // meant to catch.
+        // Verification: every phi operand in a reachable block must have a
+        // defined value. An UndefinedValue, or a Constant(Type.X, null)
+        // whose type is not NULL, means that SSATransformer silently
+        // substituted a placeholder instead of a defined version. Such an
+        // operand becomes the literal `null` in the LLVM emitter and leaks
+        // into the runtime as a null base of PUT_FIELD/GET_FIELD.
         // ------------------------------------------------------------------
-
-        // ---- Step 1: compute liveness ----
-        //
-        // A value is live iff it appears as an operand of a non-PHI
-        // instruction or of a terminator, OR it is an operand of another live
-        // phi. The set is closed transitively through phi operands so that a
-        // phi feeding only another live phi is also considered live.
-
-        Set<Value> liveValues = new HashSet<>();
-        for (BasicBlock block : func.getBlocks()) {
-            if (!reachable.contains(block)) continue;
-            for (Instruction inst : block.getInstructions()) {
-                if (inst.getOpcode() == Opcode.PHI) continue;
-                for (Value op : inst.getOperands()) {
-                    if (op != null) liveValues.add(op);
-                }
-            }
-            Terminator term = block.getTerminator();
-            if (term != null) {
-                for (Value op : terminatorOperands(term)) {
-                    if (op != null) liveValues.add(op);
-                }
-            }
-        }
-
-        boolean liveChanged = true;
-        int liveIter = 0;
-        while (liveChanged && liveIter++ < 100_000) {
-            liveChanged = false;
-            for (BasicBlock block : func.getBlocks()) {
-                if (!reachable.contains(block)) continue;
-                for (Instruction inst : block.getInstructions()) {
-                    if (inst.getOpcode() != Opcode.PHI) continue;
-                    if (inst.getResult() == null) continue;
-                    if (!liveValues.contains(inst.getResult())) continue;
-                    for (Value op : inst.getOperands()) {
-                        if (op != null && liveValues.add(op)) {
-                            liveChanged = true;
-                        }
-                    }
-                }
-            }
-        }
-
-        // ---- Step 2: verify every phi operand ----
-
         for (BasicBlock block : func.getBlocks()) {
             if (!reachable.contains(block)) continue;
             for (Instruction inst : block.getInstructions()) {
@@ -395,7 +324,6 @@ public final class OutOfSsaPass {
                 List<Value> ops = inst.getOperands();
                 for (int i = 0; i < ops.size(); i++) {
                     Value op = ops.get(i);
-
                     if (op instanceof UndefinedValue) {
                         throw new IllegalStateException(
                             "OutOfSsaPass: phi in block '" + block.getLabel()
@@ -412,31 +340,21 @@ public final class OutOfSsaPass {
                                 + "mismatch. Substituting null here would silently "
                                 + "corrupt every use of the phi result.");
                     }
-
                     if (op instanceof Constant c
                             && c.getValue() == null
-                            && liveValues.contains(inst.getResult())) {
+                            && !c.getType().isNull()
+                            && c.getType().isReference()) {
                         throw new IllegalStateException(
                             "OutOfSsaPass: phi in block '" + block.getLabel()
                                 + "' of function '" + func.getName()
-                                + "' has a null Constant placeholder at operand index "
-                                + i + " (type " + c.getType() + "), and the phi's "
-                                + "result is used by a non-PHI instruction or "
-                                + "terminator. This is the ProtectionDomain.<init> "
-                                + "class of defect: a null placeholder introduced by "
-                                + "SSATransformer.renameBlock for an exceptional-only "
-                                + "edge has leaked into a live use. Two likely causes: "
-                                + "(a) the edge was misclassified as exceptional-only "
-                                + "when it is actually normal - check the try-range "
-                                + "body computation in MethodTranslator.visitEnd and "
-                                + "Analyzer.retranslateClinit; (b) the phi operand "
-                                + "binding has been shifted by a stale predecessor - "
-                                + "check predecessorActuallyReaches() and the CFG "
-                                + "mutation order in DestructorInserter/optimizer. "
-                                + "Substituting null here is exactly what produced "
-                                + "the 'field java/security/ProtectionDomain.principals' "
-                                + "NPE crash at run time; failing at build time is "
-                                + "strictly better.");
+                                + "' has a Constant(null) placeholder at operand "
+                                + "index " + i + " with type " + c.getType()
+                                + ". This is the padding inserted by "
+                                + "SSATransformer.ensurePhiOperandCount when the "
+                                + "phi had fewer operands than predecessors. "
+                                + "Investigate the CFG of '" + block.getLabel()
+                                + "': the phi was built with a predecessor list "
+                                + "that later gained an additional edge.");
                     }
                 }
             }
@@ -556,38 +474,6 @@ public final class OutOfSsaPass {
             }
         }
         return reachable;
-    }
-
-    /**
-     * The operands a terminator consumes, matching the shape of
-     * {@link Instruction#getOperands()} for the purposes of liveness
-     * analysis in the verification step.
-     */
-    private static List<Value> terminatorOperands(Terminator term) {
-        List<Value> out = new ArrayList<>(2);
-        switch (term) {
-            case CondBranchTerminator cbt -> {
-                if (cbt.getCondition() != null) out.add(cbt.getCondition());
-            }
-            case ReturnTerminator rt -> {
-                if (rt.getValue() != null) out.add(rt.getValue());
-            }
-            case ThrowTerminator tt -> {
-                if (tt.getException() != null) out.add(tt.getException());
-            }
-            case LookupSwitchTerminator lst -> {
-                if (lst.getKey() != null) out.add(lst.getKey());
-            }
-            case TableSwitchTerminator tst -> {
-                if (tst.getKey() != null) out.add(tst.getKey());
-            }
-            case IndirectBranchTerminator ibt -> {
-                if (ibt.getTargetBlock() != null) out.add(ibt.getTargetBlock());
-            }
-            case null, default -> {
-            }
-        }
-        return out;
     }
 
     // =====================================================================

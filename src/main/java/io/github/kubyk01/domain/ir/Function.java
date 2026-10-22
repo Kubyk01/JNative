@@ -56,40 +56,8 @@ public class Function {
         parameters.add(p);
     }
 
-    /**
-     * Appends {@code block} to the end of the block list.
-     *
-     * <p>This is correct when the block is genuinely the last one to be
-     * emitted, but WRONG when it is a tail split off an existing block:
-     * the block list determines emission order in
-     * {@link io.github.kubyk01.application.service.codegen.llvm.LlvmFunctionEmitter},
-     * and a tail whose STORE results are consumed by earlier siblings must
-     * be emitted before those siblings. Use
-     * {@link #insertBlockAfter(BasicBlock, BasicBlock)} in that case.</p>
-     */
     public void addBlock(BasicBlock block) {
         blocks.add(block);
-        block.setFunction(this);
-    }
-
-    /**
-     * Inserts {@code block} immediately after {@code existing} in the block
-     * list. If {@code existing} is not in the list, falls back to appending.
-     *
-     * <p>Preserves definition-before-use order in the emitted LLVM text:
-     * any value defined by an instruction in {@code block} is emitted
-     * before any successor block that appears later in the list consumes
-     * it. This is required by the single-pass
-     * {@link io.github.kubyk01.application.service.codegen.llvm.LlvmValueMapper}.</p>
-     */
-    public void insertBlockAfter(BasicBlock existing, BasicBlock block) {
-        if (block == null) return;
-        int idx = blocks.indexOf(existing);
-        if (idx < 0) {
-            blocks.add(block);
-        } else {
-            blocks.add(idx + 1, block);
-        }
         block.setFunction(this);
     }
 
