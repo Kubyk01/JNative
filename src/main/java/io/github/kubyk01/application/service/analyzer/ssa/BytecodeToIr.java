@@ -38,7 +38,6 @@ public class BytecodeToIr {
     private final DependencyResolver resolver;
     private final ReachabilityAnalysis reachability;
     private final IrBuilder builder = new IrBuilder();
-    private final Map<MethodReference, Function> functionMap = new HashMap<>();
 
     /** Mangling of a Java method -> the C override that replaces it. */
     private final Map<String, NativeOverride> overrides = new HashMap<>();
@@ -307,7 +306,6 @@ public class BytecodeToIr {
 
             if (classNode.isExternal()) {
                 Function func = createExternalFunction(methodRef, isStatic);
-                functionMap.put(methodRef, func);
                 return;
             }
 
@@ -369,7 +367,6 @@ public class BytecodeToIr {
                     slot += (t == Type.LONG || t == Type.DOUBLE) ? 2 : 1;
                 }
                 builder.getModule().addFunction(func);
-                functionMap.put(methodRef, func);
 
                 // The emitter looks up call targets by the mangled JNative
                 // name and by the "__jnative_"-prefixed form. Register both
@@ -466,8 +463,30 @@ public class BytecodeToIr {
                 return;
             }
 
-            ClassReader reader = new ClassReader(bytes);
-            MethodTranslator translator = new MethodTranslator(methodRef, methodNode.isStatic(), builder, resolver);
+            MethodTranslator translator = new MethodTranslator(
+                    methodRef, methodNode.isStatic(), builder, resolver);
+
+            // Override readBytecodeInstructionOffset so the translator can
+            // record, for every basic block, the bytecode offset of its
+            // first instruction. MethodTranslator.visitEnd() uses those
+            // offsets to compute each try-range's protected body from the
+            // bytecode interval [start, end) rather than from CFG
+            // reachability. See setCurrentBytecodeOffset / visitEnd() in
+            // MethodTranslator for the full rationale.
+            //
+            // The override is unconditional. On every ASM 9.x release this
+            // runtime targets, ClassReader calls readBytecodeInstructionOffset
+            // for every instruction it dispatches; if a future ASM release
+            // stops calling it, blockOffsets stays empty and MethodTranslator
+            // falls back to the previous reachability-based body, so the
+            // translator remains functional.
+            ClassReader reader = new ClassReader(bytes) {
+                @Override
+                protected void readBytecodeInstructionOffset(int bytecodeOffset) {
+                    translator.setCurrentBytecodeOffset(bytecodeOffset);
+                }
+            };
+
             reader.accept(new ClassVisitor(Opcodes.ASM9) {
                 @Override
                 public MethodVisitor visitMethod(int access, String mName, String mDesc,
@@ -481,17 +500,14 @@ public class BytecodeToIr {
 
             Function func = translator.getCurrentFunction();
             if (func != null) {
-                functionMap.put(methodRef, func);
             } else {
-                Function external = createExternalFunction(methodRef, isStatic);
-                functionMap.put(methodRef, external);
+                createExternalFunction(methodRef, isStatic);
             }
         } catch (Exception e) {
             log.warn("Failed to translate method {}; falling back to external declaration: {}",
                 methodRef, e.getMessage());
             boolean isStatic = methodNode != null && methodNode.isStatic();
-            Function func = createExternalFunction(methodRef, isStatic);
-            functionMap.put(methodRef, func);
+            createExternalFunction(methodRef, isStatic);
         }
     }
 

@@ -266,6 +266,50 @@ public final class OutOfSsaPass {
         }
 
         // ------------------------------------------------------------------
+        // Resolve UndefinedValue operands that arrive on exceptional-only
+        // edges.
+        //
+        // renameBlock substitutes Constant(Type.NULL, null) for the incoming
+        // operand of a phi edge that is exceptional-only (see the javadoc
+        // there). This block is the safety net: it re-applies the same
+        // substitution for any phi that still carries an UndefinedValue on an
+        // exceptional-only edge - for example a phi that was built before the
+        // renameBlock fix, or a phi that received an UndefinedValue through an
+        // intermediate phi chain.
+        //
+        // The substitution is sound for exactly the same reason it is sound in
+        // renameBlock: the JVM verifier guarantees the phi's result is not
+        // observed on the exception path. A normal (or mixed) edge with a
+        // missing version is left as UndefinedValue so the verification loop
+        // below still fails on it as a genuine bug (the ProtectionDomain case).
+        // ------------------------------------------------------------------
+        for (BasicBlock block : func.getBlocks()) {
+            if (!reachable.contains(block)) continue;
+            List<BasicBlock> preds = block.getPredecessors();
+            for (Instruction inst : block.getInstructions()) {
+                if (inst.getOpcode() != Opcode.PHI) continue;
+                List<Value> ops = inst.getOperands();
+                for (int i = 0; i < ops.size() && i < preds.size(); i++) {
+                    if (!(ops.get(i) instanceof UndefinedValue)) continue;
+
+                    BasicBlock pred = preds.get(i);
+                    boolean isNormalTarget = false;
+                    Terminator term = pred.getTerminator();
+                    if (term != null) {
+                        for (BasicBlock t : term.getTargets()) {
+                            if (t == block) { isNormalTarget = true; break; }
+                        }
+                    }
+                    boolean isExceptional = pred.getExceptionalSuccessors().contains(block);
+
+                    if (!isNormalTarget && isExceptional) {
+                        ops.set(i, new Constant(Type.NULL, null));
+                    }
+                }
+            }
+        }
+
+        // ------------------------------------------------------------------
         // Verification: every phi operand in a reachable block must have a
         // defined value. An UndefinedValue, or a Constant(Type.X, null)
         // whose type is not NULL, means that SSATransformer silently

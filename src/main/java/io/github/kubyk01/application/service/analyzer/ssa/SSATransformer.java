@@ -663,52 +663,85 @@ public class SSATransformer {
                 if (curVer == null) {
                     /*
                      * The slot is not defined along the path through this
-                     * predecessor. This can be one of two fundamentally
-                     * different situations:
+                     * predecessor. Two fundamentally different situations
+                     * collapse to the same "version stack is empty" signal,
+                     * and the edge kind tells them apart:
                      *
-                     *   1. A live phi with a broken dominance tree
-                     *      (ProtectionDomain.<init>): the slot really is
-                     *      live here (a use is reachable from this phi),
-                     *      the missing version is a real bug, the value
-                     *      would reach PUT_FIELD and turn into null.
-                     *      A hard failure is required here.
+                     *   1. EXCEPTIONAL-ONLY EDGE.
                      *
-                     *   2. A dead phi (SdpProvider.loadRulesFromFile):
-                     *      the slot is assigned only inside the loop body
-                     *      and is never read outside of it. The
-                     *      loop-carried phi gets an undefined operand on
-                     *      the incoming edge, but its result is never
-                     *      used - on any path, including this one.
+                     *      `pred` does not list `succ` among its
+                     *      terminator's targets, but `succ` is in
+                     *      `pred.getExceptionalSuccessors()`. This means
+                     *      the edge carries control on a thrown exception.
+                     *      The exception transfers control mid-block, so a
+                     *      slot that is assigned after the throwing
+                     *      instruction - or that is simply not assigned
+                     *      at all on the block's normal path - has no
+                     *      value here. The JVM verifier permits this
+                     *      precisely because the phi's result is never
+                     *      observed on this path (any observable use of
+                     *      the slot after the catch would require the
+                     *      slot to be definitely assigned on every path
+                     *      to the use, including this one, which it is
+                     *      not).
                      *
-                     * These two cases are indistinguishable from the
-                     * version stack: in both of them the stack for the
-                     * given (slot, bucket) is empty. Only the liveness
-                     * of the phi tells them apart - whether its results
-                     * are used. While the predecessor's terminator is
-                     * being processed the phi result uses have not been
-                     * renamed yet, so that signal is not available.
+                     *      Substituting `Constant(Type.NULL, null)` for
+                     *      the incoming operand makes the emitted IR
+                     *      contain `null` on the exception edge - exactly
+                     *      the runtime value of a slot that was not
+                     *      assigned before the throw. Because the JVM
+                     *      verifier guarantees the value is not consumed
+                     *      on this path, `null` cannot reach any use
+                     *      that would dereference it.
                      *
-                     * The decision is to defer. The operand is filled in
-                     * with the UndefinedValue marker, processing
-                     * continues, and:
+                     *   2. NORMAL (OR MIXED) EDGE.
                      *
-                     *   - cleanupPhis() removes a phi whose result was
-                     *     never used (case 2 - the dead phi simply
-                     *     disappears);
+                     *      `pred` lists `succ` among its terminator's
+                     *      targets. Then the missing version is a genuine
+                     *      bug: either the dominator tree used by
+                     *      SSATransformer failed to propagate the STORE's
+                     *      version across a real edge (the
+                     *      ProtectionDomain.<init> class of defect), or
+                     *      the IR violates the JVM verifier's
+                     *      definite-assignment rule. Fail-fast is required
+                     *      so that the bug surfaces at build time rather
+                     *      than as a null base of a PUT_FIELD at run
+                     *      time.
                      *
-                     *   - OutOfSsaPass, after the full renaming,
-                     *     verifies that no surviving phi (i.e. a live one)
-                     *     contains an UndefinedValue operand. A live phi
-                     *     with an UndefinedValue is case 1, and it fails
-                     *     with a diagnostic naming the block, the function
-                     *     and the operand index.
-                     *
-                     * This keeps the hard diagnostic failure for real bugs
-                     * and lets SSA construction finish on dead phis, which
-                     * occur in bulk in JDK code (a fresh local assigned
-                     * only inside a loop).
+                     * The two cases are distinguished here, per edge,
+                     * rather than globally, because the same phi routinely
+                     * has a normal incoming edge (valid version) and one
+                     * or more exceptional incoming edges (undefined
+                     * version). The phi is alive if its result is used on
+                     * any of its normal paths; the exceptional operands
+                     * are dead by construction.
                      */
-                    curVer = new UndefinedValue(phiType);
+                    boolean predIsNormalTarget = false;
+                    Terminator predTerm = block.getTerminator();
+                    if (predTerm != null) {
+                        for (BasicBlock t : predTerm.getTargets()) {
+                            if (t == succ) { predIsNormalTarget = true; break; }
+                        }
+                    }
+                    boolean predIsExceptional =
+                        block.getExceptionalSuccessors().contains(succ);
+
+                    if (!predIsNormalTarget && predIsExceptional) {
+                        // Exceptional-only edge: the slot has no value
+                        // here, and the JVM verifier guarantees it is not
+                        // observed. `Type.NULL` is the null literal type
+                        // that every other null constant in the IR uses,
+                        // so the emitter renders it as the LLVM literal
+                        // `null` (of any pointer type it must be coerced
+                        // to).
+                        curVer = new Constant(Type.NULL, null);
+                    } else {
+                        // Normal edge with a missing version - genuine
+                        // bug. Let OutOfSsaPass fail on it with a
+                        // diagnostic naming the block and the operand
+                        // index.
+                        curVer = new UndefinedValue(phiType);
+                    }
                 }
 
                 if (!typesCompatible(curVer.getType(), phiType)) {
@@ -890,9 +923,47 @@ public class SSATransformer {
     }
 
     private void cleanupPhis(Function function) {
+        /*
+         * Liveness analysis of the phi instructions, iterated to a fixed
+         * point.
+         *
+         * The result of a phi instruction is considered ALIVE if it is used:
+         *
+         *   1. as an operand of any NON-phi instruction, or
+         *   2. as an operand of any terminator, or
+         *   3. as an operand of another phi instruction whose own result is
+         *      alive (transitively).
+         *
+         * A single-pass check of "appears in the operands of something"
+         * wrongly keeps a phi whose only consumer is another dead phi.
+         * The classic scenario: a slot is assigned only inside a loop
+         * body; the loop-carried phi on the incoming edge gets an
+         * UndefinedValue (SSATransformer.renameBlock, see the change
+         * there), while the phi in the downstream block is used ONLY by
+         * that loop-carried phi. After one pass the loop-carried phi is
+         * removed (its result really is never read), but the downstream
+         * phi survives the pass - its result was in usedValues, because
+         * the loop-carried phi used it while the set was being computed.
+         * Result: the downstream phi has no live consumers at all, yet it
+         * stayed in the graph and OutOfSsaPass correctly fails on its
+         * UndefinedValue operand - even though the phi is dead.
+         *
+         * The iterative variant below eliminates this class of errors,
+         * while keeping the hard diagnostic failure for a phi that is
+         * REALLY used (its operands - including an UndefinedValue - would
+         * reach the run time if it were not stopped).
+         */
+
+        // ---- Phase 1: seed - the operands of the non-phi consumers. ----
+        //
+        // Phi operands deliberately do NOT end up here: if they did, we
+        // would be back to the single-pass logic. The liveness of a phi
+        // must follow from the liveness of its only consumer, and not
+        // declare itself alive through the operands of another phi.
         Set<Value> usedValues = new HashSet<>();
         for (BasicBlock block : function.getBlocks()) {
             for (Instruction inst : block.getInstructions()) {
+                if (inst.getOpcode() == Opcode.PHI) continue;
                 usedValues.addAll(inst.getOperands());
             }
             Terminator term = block.getTerminator();
@@ -912,9 +983,44 @@ public class SSATransformer {
                 }
             }
         }
+
+        // ---- Phase 2: transitive propagation through the live phis. ----
+        //
+        // On every iteration: for each phi whose result is already in
+        // usedValues (i.e. it has a live consumer), add its operands.
+        // Repeat while the set grows. Guaranteed to terminate: usedValues
+        // grows monotonically, and the number of values in a function is
+        // finite.
+        boolean changed = true;
+        while (changed) {
+            changed = false;
+            for (BasicBlock block : function.getBlocks()) {
+                for (Instruction inst : block.getInstructions()) {
+                    if (inst.getOpcode() != Opcode.PHI) continue;
+                    if (inst.getResult() == null) continue;
+                    if (!usedValues.contains(inst.getResult())) continue;
+                    for (Value op : inst.getOperands()) {
+                        if (op != null && usedValues.add(op)) {
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        // ---- Phase 3: remove every phi whose result is not alive. ----
+        //
+        // At this point usedValues is exactly the closure of "the operands
+        // of the non-phi consumers union the operands of the live phis".
+        // Any phi whose result is not in that closure has no consumer on
+        // any path - it can be removed. In particular, the whole chain of
+        // dead phis (A -> B -> C -> dead leaf) is removed, even when the
+        // intermediate members of the chain referenced each other.
         for (BasicBlock block : function.getBlocks()) {
             block.getInstructions().removeIf(inst ->
-                inst.getOpcode() == Opcode.PHI && !usedValues.contains(inst.getResult())
+                inst.getOpcode() == Opcode.PHI
+                    && (inst.getResult() == null
+                        || !usedValues.contains(inst.getResult()))
             );
         }
     }
