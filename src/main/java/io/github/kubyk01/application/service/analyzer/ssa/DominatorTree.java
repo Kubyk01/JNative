@@ -2,6 +2,7 @@ package io.github.kubyk01.application.service.analyzer.ssa;
 
 import io.github.kubyk01.domain.ir.BasicBlock;
 import io.github.kubyk01.domain.ir.Function;
+import io.github.kubyk01.domain.ir.Terminator;
 
 import java.util.*;
 
@@ -17,6 +18,62 @@ public class DominatorTree {
     private void compute(Function function) {
         BasicBlock entry = function.getEntryBlock();
         if (entry == null) return;
+
+        // ------------------------------------------------------------------
+        // Predecessor sanitisation.
+        //
+        // For every block we drop the predecessors that do not actually
+        // reach it: neither through the predecessor's terminator, nor
+        // through an exceptional edge.
+        //
+        // Such stale edges appear because BasicBlock.setTerminator only
+        // clears the edges of the previous terminator, but not the edges
+        // that other passes added directly through addSuccessor /
+        // addExceptionalSuccessor (TryCatchHandler,
+        // MethodTranslator.addExceptionalEdges, DestructorInserter during
+        // block splits, re-registration of a target label in visitLabel).
+        // A leftover stale edge breaks the dominator tree: the block stops
+        // being dominated by the block that is in fact its only
+        // predecessor. The SSA then cannot see the version of the slot
+        // stored in the dominating block and silently substitutes an
+        // UndefinedValue - which surfaces as a null at run time.
+        //
+        // Removing stale predecessors does not change the semantics of the
+        // IR: no edge carried by a terminator is lost (we only remove
+        // those predecessors whose terminator does NOT lead to the block
+        // and who were NOT added via addExceptionalSuccessor). Real
+        // predecessors (including handlers added via
+        // addExceptionalSuccessor) are kept.
+        // ------------------------------------------------------------------
+        for (BasicBlock block : function.getBlocks()) {
+            List<BasicBlock> preds = block.getPredecessors();
+            if (preds.isEmpty()) continue;
+
+            List<BasicBlock> stale = null;
+            for (BasicBlock pred : preds) {
+                boolean reaches = false;
+
+                Terminator t = pred.getTerminator();
+                if (t != null) {
+                    for (BasicBlock tt : t.getTargets()) {
+                        if (tt == block) { reaches = true; break; }
+                    }
+                }
+                if (!reaches) {
+                    for (BasicBlock e : pred.getExceptionalSuccessors()) {
+                        if (e == block) { reaches = true; break; }
+                    }
+                }
+
+                if (!reaches) {
+                    if (stale == null) stale = new ArrayList<>();
+                    stale.add(pred);
+                }
+            }
+            if (stale != null) {
+                preds.removeAll(stale);
+            }
+        }
 
         List<BasicBlock> vertex = new ArrayList<>();
         Map<BasicBlock, Integer> dfsNum = new HashMap<>();

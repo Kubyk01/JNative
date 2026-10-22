@@ -210,6 +210,34 @@ public class SSATransformer {
     private void insertPhiFunctions(Function function) {
         Map<SlotKey, Set<BasicBlock>> defs = collectDefBlocks(function);
 
+        // ------------------------------------------------------------------
+        // Liveness per (slot, bucket) — see computeLiveInForPhiInsertion.
+        //
+        // Standard SSA construction ("pruned SSA", Cytron et al.) inserts a
+        // PHI only where the variable is live at the block entry. Without
+        // this check a PHI is created for every definition that reaches the
+        // iterated dominance frontier, regardless of whether the value is
+        // read further down the flow. The classic case is a "fresh local
+        // assigned only inside the loop and read neither before nor after
+        // the assignment": the loop's def block puts the loop header into
+        // the DF, a PHI is created, but its incoming operand on the entry
+        // edge is undefined (the slot has never been assigned). The JVM
+        // verifier allows this precisely because the value is never read —
+        // the PHI is dead by construction.
+        //
+        // The fail-fast in renameBlock (see the previous step) throws an
+        // IllegalStateException naming the slot and the block on such a
+        // PHI. That is a correct reaction to a real bug (broken
+        // dominance), but for dead PHIs it is a false positive — they
+        // simply should not have been created.
+        //
+        // The order of the def blocks and the bucketing must match
+        // collectDefBlocks: it defines the SlotKey, and we gate it by
+        // liveness. Both use the same typeBucket(...) predicate, see the
+        // invariant in the javadoc of collectDefBlocks.
+        // ------------------------------------------------------------------
+        Map<BasicBlock, Set<SlotKey>> liveIn = computeLiveInForPhiInsertion(function);
+
         for (Map.Entry<SlotKey, Set<BasicBlock>> entry : defs.entrySet()) {
             SlotKey key = entry.getKey();
             Set<BasicBlock> defBlocks = entry.getValue();
@@ -223,6 +251,11 @@ public class SSATransformer {
                 BasicBlock block = worklist.poll();
                 for (BasicBlock frontier : domTree.getDominanceFrontier(block)) {
                     if (hasPhi.contains(frontier)) continue;
+
+                    Set<SlotKey> frontierLiveIn = liveIn.get(frontier);
+                    if (frontierLiveIn == null || !frontierLiveIn.contains(key)) {
+                        continue;
+                    }
 
                     Instruction phi = new Instruction(Opcode.PHI);
                     phi.setLocalIndex(key.index);
@@ -238,6 +271,134 @@ public class SSATransformer {
                 }
             }
         }
+    }
+
+    /**
+     * Liveness per {@link SlotKey} (slot, bucket) for the blocks of a
+     * function.
+     *
+     * <p>Semantics: {@code liveIn[B]} contains the key {@code (slot,
+     * bucket)} if and only if there exists a path from the entry of
+     * {@code B} to a use of that key (a LOAD with the matching bucket)
+     * on which there is no STORE into the same key. Parameters count as
+     * defined in the entry, so they sit in {@code def[entry]} and do
+     * not "leak" into {@code liveIn[entry]} through the use part.</p>
+     *
+     * <p>Used only to gate PHI insertion in
+     * {@link #insertPhiFunctions}: a key needs a PHI in a block if the
+     * key is live-in in that block. This is "pruned SSA" — the standard
+     * SSA construction optimization that eliminates dead PHI nodes with
+     * undefined incoming operands (see the javadoc of
+     * {@link #insertPhiFunctions}).</p>
+     *
+     * <p><b>Bucketing invariant.</b> {@code use[]} and {@code def[]} are
+     * built with the same {@code typeBucket(result.getType())} predicate
+     * as {@link #collectDefBlocks}. Any divergence in bucketing between
+     * this method, {@code collectDefBlocks} and {@code renameBlock}
+     * would break key consistency and produce either the liveness of the
+     * wrong key or an empty version stack for a "live" key. All three
+     * use the same private {@link #typeBucket}; when the bucketing logic
+     * changes, all three must be changed together.</p>
+     *
+     * <p><b>Exceptional edges.</b> {@code block.getSuccessors()} merges
+     * the ordinary and the exceptional edges (see {@code BasicBlock}),
+     * so liveness propagates along the exception front as well. This is
+     * conservative in the right direction (it may slightly overestimate
+     * live-in, but never underestimate it), and it does not lift the
+     * known limitation of SSA construction for mid-block exceptions (the
+     * value of a slot on an exceptional edge is the state at the moment
+     * of the throw, not the state at the end of the block). That
+     * limitation is a separate class of defects, unrelated to dead
+     * loop-carried PHIs; here we merely do not stand in its way.</p>
+     */
+    private Map<BasicBlock, Set<SlotKey>> computeLiveInForPhiInsertion(Function function) {
+        Map<BasicBlock, Set<SlotKey>> use = new HashMap<>();
+        Map<BasicBlock, Set<SlotKey>> def = new HashMap<>();
+
+        for (BasicBlock block : function.getBlocks()) {
+            Set<SlotKey> blockUse = new HashSet<>();
+            Set<SlotKey> blockDef = new HashSet<>();
+
+            for (Instruction inst : block.getInstructions()) {
+                Opcode op = inst.getOpcode();
+                if (op == Opcode.LOAD) {
+                    int idx = inst.getLocalIndex();
+                    if (idx < 0) continue;
+                    if (unsafeLocals.contains(idx)) continue;
+                    Type lt = (inst.getResult() != null)
+                        ? inst.getResult().getType()
+                        : Type.UNKNOWN;
+                    SlotKey key = new SlotKey(idx, typeBucket(lt));
+                    if (!blockDef.contains(key)) {
+                        blockUse.add(key);
+                    }
+                } else if (op == Opcode.STORE) {
+                    int idx = inst.getLocalIndex();
+                    if (idx < 0) continue;
+                    if (unsafeLocals.contains(idx)) continue;
+                    Type dt = (inst.getResult() != null)
+                        ? inst.getResult().getType()
+                        : Type.UNKNOWN;
+                    SlotKey key = new SlotKey(idx, typeBucket(dt));
+                    blockDef.add(key);
+                }
+            }
+            use.put(block, blockUse);
+            def.put(block, blockDef);
+        }
+
+        // Parameters are defined in the entry. This is part of the JVM
+        // contract: a parameter slot has a well-defined value on function
+        // entry, and it does not need to be "carried over" from the
+        // predecessors (the entry has none).
+        BasicBlock entry = function.getEntryBlock();
+        if (entry != null) {
+            Set<SlotKey> entryDef = def.computeIfAbsent(entry, k -> new HashSet<>());
+            for (Parameter p : function.getParameters()) {
+                if (unsafeLocals.contains(p.getIndex())) continue;
+                entryDef.add(new SlotKey(p.getIndex(), typeBucket(p.getType())));
+            }
+        }
+
+        // Backward dataflow until a fixed point is reached.
+        Map<BasicBlock, Set<SlotKey>> liveIn = new HashMap<>();
+        Map<BasicBlock, Set<SlotKey>> liveOut = new HashMap<>();
+        for (BasicBlock block : function.getBlocks()) {
+            liveIn.put(block, new HashSet<>());
+            liveOut.put(block, new HashSet<>());
+        }
+
+        boolean changed = true;
+        while (changed) {
+            changed = false;
+            for (BasicBlock block : function.getBlocks()) {
+                Set<SlotKey> newLiveOut = new HashSet<>();
+                for (BasicBlock succ : block.getSuccessors()) {
+                    Set<SlotKey> succLiveIn = liveIn.get(succ);
+                    if (succLiveIn != null) {
+                        newLiveOut.addAll(succLiveIn);
+                    }
+                }
+                if (!newLiveOut.equals(liveOut.get(block))) {
+                    liveOut.put(block, newLiveOut);
+                    changed = true;
+                }
+
+                Set<SlotKey> newLiveIn = new HashSet<>(
+                    use.getOrDefault(block, Collections.emptySet()));
+                Set<SlotKey> liveOutMinusDef = new HashSet<>(newLiveOut);
+                liveOutMinusDef.removeAll(
+                    def.getOrDefault(block, Collections.emptySet()));
+                newLiveIn.addAll(liveOutMinusDef);
+
+                if (!newLiveIn.equals(liveIn.get(block))) {
+                    liveIn.put(block, newLiveIn);
+                    changed = true;
+                }
+            }
+        }
+
+        return liveIn;
     }
 
     /**
@@ -396,14 +557,27 @@ public class SSATransformer {
 
                 Value curVer = currentVersion(key);
                 if (curVer == null) {
-                    savedSizes.putIfAbsent(key, stackSize(key));
-
-                    Type undefType = inferSlotTypeForBucket(
-                        currentFunction, idx, bucket);
-                    curVer = new UndefinedValue(undefType);
-                    versionStacks.computeIfAbsent(key, k -> new ArrayDeque<>())
-                        .push(curVer);
-                    versionCounters.putIfAbsent(key, 0);
+                    throw new IllegalStateException(
+                        "SSATransformer: LOAD from slot " + idx
+                            + " (bucket " + bucket + ") in block '"
+                            + block.getLabel() + "' of function '"
+                            + currentFunction.getName()
+                            + "' has no version on the version stack. "
+                            + "The JVM verifier guarantees that a STORE precedes "
+                            + "every reachable LOAD on every path; the absence "
+                            + "of a version here means the dominator tree used "
+                            + "by SSATransformer could not propagate the STORE's "
+                            + "version to this point. Investigate: "
+                            + "(a) stale predecessors of '" + block.getLabel()
+                            + "' that are not in any terminator's targets and not "
+                            + "in any predecessor's exceptionalSuccessors "
+                            + "(DominatorTree.compute sanitises these, but a bug "
+                            + "there could still slip through); "
+                            + "(b) the phi operand binding at '"
+                            + block.getLabel()
+                            + "', which is positional against block.getPredecessors(); "
+                            + "(c) a missing STORE from the translator for a "
+                            + "synthetic stack slot (slot index >= 10000).");
                 }
 
                 // Within a bucket the types are compatible by
@@ -487,9 +661,18 @@ public class SSATransformer {
 
                 Value curVer = currentVersion(key);
                 if (curVer == null) {
-                    Type undefType = inferSlotTypeForBucket(
-                        currentFunction, idx, bucket);
-                    curVer = new UndefinedValue(undefType);
+                    throw new IllegalStateException(
+                        "SSATransformer: phi operand for slot " + idx
+                            + " (bucket " + bucket + ") in successor block '"
+                            + succ.getLabel()
+                            + "' from predecessor '" + block.getLabel()
+                            + "' has no version on the version stack (function '"
+                            + currentFunction.getName() + "'). "
+                            + "The verifier guarantees a version exists on every "
+                            + "edge; its absence indicates broken dominance, a "
+                            + "stale predecessor edge, or a phi/operand count "
+                            + "mismatch. Investigate predecessors of '"
+                            + succ.getLabel() + "' and the phi's operand list.");
                 }
 
                 if (!typesCompatible(curVer.getType(), phiType)) {
@@ -609,14 +792,12 @@ public class SSATransformer {
     // ------------------------------------------------------------------
 
     private void optimizePhis(Function function) {
-        List<Instruction> toRemove = new ArrayList<>();
         Map<Instruction, Value> replacementMap = new HashMap<>();
 
         for (BasicBlock block : function.getBlocks()) {
             for (Instruction inst : block.getInstructions()) {
                 if (inst.getOpcode() != Opcode.PHI) continue;
                 if (inst.getOperands().isEmpty()) {
-                    toRemove.add(inst);
                     continue;
                 }
                 Value first = inst.getOperands().getFirst();
@@ -629,7 +810,6 @@ public class SSATransformer {
                 }
                 if (allSame) {
                     replacementMap.put(inst, first);
-                    toRemove.add(inst);
                 }
             }
         }

@@ -2,6 +2,7 @@ package io.github.kubyk01.application.service.analyzer.ssa;
 
 import io.github.kubyk01.domain.ir.BasicBlock;
 import io.github.kubyk01.domain.ir.CondBranchTerminator;
+import io.github.kubyk01.domain.ir.Constant;
 import io.github.kubyk01.domain.ir.Function;
 import io.github.kubyk01.domain.ir.IndirectBranchTerminator;
 import io.github.kubyk01.domain.ir.Instruction;
@@ -14,12 +15,17 @@ import io.github.kubyk01.domain.ir.Temporary;
 import io.github.kubyk01.domain.ir.Terminator;
 import io.github.kubyk01.domain.ir.ThrowTerminator;
 import io.github.kubyk01.domain.ir.Type;
+import io.github.kubyk01.domain.ir.UndefinedValue;
 import io.github.kubyk01.domain.ir.Value;
 
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Deque;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Lowers every {@code PHI} instruction to an explicit store into a
@@ -184,6 +190,130 @@ public final class OutOfSsaPass {
     // =====================================================================
 
     private static void transformFunction(Function func) {
+        // ------------------------------------------------------------------
+        // Predecessor sanitisation before the phi processing.
+        //
+        // The phi operands are positional: the i-th operand corresponds to
+        // the i-th predecessor of the block at the moment the phi was
+        // built in SSATransformer. After SSA, DestructorInserter and
+        // Optimizer mutate the CFG (block splits, instruction
+        // insertion/removal), so the positional binding may become
+        // incorrect. Here we filter out the predecessors whose terminators
+        // do not lead to the block and that were not added through
+        // addExceptionalSuccessor, and rebuild the phi operands by
+        // predecessor identity.
+        // ------------------------------------------------------------------
+        Set<BasicBlock> reachable = computeReachable(func);
+
+        for (BasicBlock block : func.getBlocks()) {
+            if (!reachable.contains(block)) continue;
+
+            List<BasicBlock> preds = block.getPredecessors();
+            if (preds.isEmpty()) continue;
+
+            // 1. Identify the stale predecessors.
+            List<BasicBlock> stale = new ArrayList<>();
+            for (BasicBlock pred : preds) {
+                if (!predecessorActuallyReaches(pred, block)) {
+                    stale.add(pred);
+                }
+            }
+            if (stale.isEmpty()) continue;
+
+            // 2. Capture the current binding (predecessor -> operand)
+            //    before mutating the predecessor list.
+            Map<Instruction, Map<BasicBlock, Value>> bindings = new HashMap<>();
+            for (Instruction inst : block.getInstructions()) {
+                if (inst.getOpcode() != Opcode.PHI) continue;
+                Map<BasicBlock, Value> binding = new HashMap<>();
+                List<Value> ops = inst.getOperands();
+                for (int i = 0; i < preds.size() && i < ops.size(); i++) {
+                    binding.put(preds.get(i), ops.get(i));
+                }
+                bindings.put(inst, binding);
+            }
+
+            // 3. Drop the stale predecessors.
+            preds.removeAll(stale);
+
+            // 4. Rebuild the phi operands: only the surviving
+            //    predecessors, in their new order.
+            for (Map.Entry<Instruction, Map<BasicBlock, Value>> e : bindings.entrySet()) {
+                Instruction phi = e.getKey();
+                Map<BasicBlock, Value> binding = e.getValue();
+                List<Value> ops = phi.getOperands();
+                ops.clear();
+                for (BasicBlock pred : preds) {
+                    Value v = binding.get(pred);
+                    if (v == null) {
+                        throw new IllegalStateException(
+                            "OutOfSsaPass: phi in block '" + block.getLabel()
+                                + "' of function '" + func.getName()
+                                + "' has no operand binding for surviving "
+                                + "predecessor '" + pred.getLabel()
+                                + "' after CFG sanitisation. This indicates a "
+                                + "structurally inconsistent CFG: the predecessor "
+                                + "reaches the block, but was not present in the "
+                                + "phi's operand list at the time this pass ran. "
+                                + "The phi was built positionally by "
+                                + "SSATransformer.renameBlock; a later pass must "
+                                + "have added a new edge to this block without "
+                                + "rebuilding the phi.");
+                    }
+                    ops.add(v);
+                }
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // Verification: every phi operand in a reachable block must have a
+        // defined value. An UndefinedValue, or a Constant(Type.X, null)
+        // whose type is not NULL, means that SSATransformer silently
+        // substituted a placeholder instead of a defined version. Such an
+        // operand becomes the literal `null` in the LLVM emitter and leaks
+        // into the runtime as a null base of PUT_FIELD/GET_FIELD.
+        // ------------------------------------------------------------------
+        for (BasicBlock block : func.getBlocks()) {
+            if (!reachable.contains(block)) continue;
+            for (Instruction inst : block.getInstructions()) {
+                if (inst.getOpcode() != Opcode.PHI) continue;
+                List<Value> ops = inst.getOperands();
+                for (int i = 0; i < ops.size(); i++) {
+                    Value op = ops.get(i);
+                    if (op instanceof UndefinedValue) {
+                        throw new IllegalStateException(
+                            "OutOfSsaPass: phi in block '" + block.getLabel()
+                                + "' of function '" + func.getName()
+                                + "' has an UndefinedValue at operand index " + i
+                                + ". This is a placeholder emitted by "
+                                + "SSATransformer.renameBlock when it could not "
+                                + "resolve a version - see the throw-site in "
+                                + "SSATransformer for the underlying cause. "
+                                + "Substituting null here would silently corrupt "
+                                + "every use of the phi result.");
+                    }
+                    if (op instanceof Constant c
+                            && c.getValue() == null
+                            && !c.getType().isNull()
+                            && c.getType().isReference()) {
+                        throw new IllegalStateException(
+                            "OutOfSsaPass: phi in block '" + block.getLabel()
+                                + "' of function '" + func.getName()
+                                + "' has a Constant(null) placeholder at operand "
+                                + "index " + i + " with type " + c.getType()
+                                + ". This is the padding inserted by "
+                                + "SSATransformer.ensurePhiOperandCount when the "
+                                + "phi had fewer operands than predecessors. "
+                                + "Investigate the CFG of '" + block.getLabel()
+                                + "': the phi was built with a predecessor list "
+                                + "that later gained an additional edge.");
+                    }
+                }
+            }
+        }
+
+        // ---- Existing out-of-SSA lowering ----
+
         int maxLocal = -1;
         for (BasicBlock block : func.getBlocks()) {
             for (Instruction inst : block.getInstructions()) {
@@ -205,50 +335,9 @@ public final class OutOfSsaPass {
                 }
             }
         }
+
         if (phiSlot.isEmpty()) return;
 
-        // ------------------------------------------------------------------
-        // Валидация инварианта φ без мутации CFG.
-        //
-        // Операнды φ позиционные: i-й операнд соответствует i-му
-        // предшественнику блока на момент построения φ в
-        // SSATransformer.renameBlock. Любая пост-SSA мутация списка
-        // предшественников (setTerminator без снятия старых рёбер,
-        // addSuccessor после SSA, ручное удаление из predecessors без
-        // соответствующего удаления операнда) способна сломать это
-        // соответствие. Здесь — только диагностика, чтобы такой
-        // дефект не маскировался подстановкой Constant(Type.NULL, null):
-        // φ-узел, чей операнд молча заменён null'ом, заражает null'ом
-        // все свои использования.
-        // ------------------------------------------------------------------
-        for (Instruction phi : phiSlot.keySet()) {
-            BasicBlock parent = phi.getParent();
-            if (parent == null) {
-                throw new IllegalStateException(
-                        "OutOfSsaPass: PHI instruction has no parent block: " + phi
-                                + " (SSATransformer.insertPhiFunctions must set parent "
-                                + "on every phi it inserts)");
-            }
-
-            int preds = parent.getPredecessors().size();
-            int operands = phi.getOperands().size();
-            if (preds != operands) {
-                throw new IllegalStateException(
-                        "OutOfSsaPass: phi invariant violated in block '"
-                                + parent.getLabel() + "': " + operands
-                                + " operand(s) but " + preds + " predecessor(s). "
-                                + "Operand position is defined by the predecessor list "
-                                + "used by SSATransformer.renameBlock; any post-SSA CFG "
-                                + "mutation must preserve predecessor indices (see "
-                                + "BasicBlock.setTerminator's stale-edge cleanup, "
-                                + "TryCatchHandler.handle's addExceptionalSuccessor, "
-                                + "and DestructorInserter's block-splitting logic). "
-                                + "Substituting null here would silently corrupt every "
-                                + "use of the phi result. Phi: " + phi);
-            }
-        }
-
-        // ---- Вставка STORE в конец каждого predecessor-блока -------------
         for (Map.Entry<Instruction, Integer> entry : phiSlot.entrySet()) {
             Instruction phi = entry.getKey();
             int slot = entry.getValue();
@@ -258,9 +347,17 @@ public final class OutOfSsaPass {
             List<BasicBlock> preds = parent.getPredecessors();
             List<Value> operands = phi.getOperands();
 
+            if (preds.size() != operands.size()) {
+                throw new IllegalStateException(
+                    "OutOfSsaPass: phi operand count (" + operands.size()
+                        + ") does not match predecessor count (" + preds.size()
+                        + ") in block " + parent.getLabel()
+                        + "; phi = " + phi);
+            }
+
             Type slotType = (phi.getResult() != null)
-                    ? phi.getResult().getType()
-                    : Type.UNKNOWN;
+                ? phi.getResult().getType()
+                : Type.UNKNOWN;
 
             for (int i = 0; i < preds.size(); i++) {
                 BasicBlock pred = preds.get(i);
@@ -277,7 +374,7 @@ public final class OutOfSsaPass {
             }
         }
 
-        // ---- Замена каждого PHI на LOAD из того же слота -----------------
+        // ---- Replace every PHI with a LOAD from the same slot ----------
         for (BasicBlock block : func.getBlocks()) {
             List<Instruction> instrs = block.getInstructions();
             for (int i = 0; i < instrs.size(); i++) {
@@ -287,8 +384,8 @@ public final class OutOfSsaPass {
                 if (slot == null) continue;
 
                 Type phiType = phi.getResult() != null
-                        ? phi.getResult().getType()
-                        : Type.UNKNOWN;
+                    ? phi.getResult().getType()
+                    : Type.UNKNOWN;
 
                 Instruction load = new Instruction(Opcode.LOAD);
                 load.setLocalIndex(slot);
@@ -304,6 +401,31 @@ public final class OutOfSsaPass {
                 }
             }
         }
+    }
+
+    /**
+     * Returns the set of blocks reachable from the entry through
+     * terminators and exceptional edges. Unreachable blocks (dead code)
+     * are neither sanitised nor verified: their phi operands were never
+     * filled in by SSATransformer.renameBlock (it only walks the
+     * dom-tree children of the entry), so a null-operand check on them
+     * would produce a false positive for every dead-code block.
+     */
+    private static Set<BasicBlock> computeReachable(Function func) {
+        Set<BasicBlock> reachable = new HashSet<>();
+        BasicBlock entry = func.getEntryBlock();
+        if (entry == null) return reachable;
+
+        Deque<BasicBlock> work = new ArrayDeque<>();
+        work.push(entry);
+        reachable.add(entry);
+        while (!work.isEmpty()) {
+            BasicBlock b = work.pop();
+            for (BasicBlock s : b.getSuccessors()) {
+                if (reachable.add(s)) work.push(s);
+            }
+        }
+        return reachable;
     }
 
     // =====================================================================
