@@ -13,6 +13,7 @@ import io.github.kubyk01.domain.analyzer.lifetime.DestructionPoint;
 import io.github.kubyk01.domain.analyzer.lifetime.LifetimeAnalysisResult;
 import io.github.kubyk01.domain.ir.Module;
 import io.github.kubyk01.domain.ir.*;
+import io.github.kubyk01.util.LlvmUtil;
 import lombok.Getter;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -39,32 +40,29 @@ public class DestructorInserter {
      * {@code MULTI_NEW_ARRAY} in the module, closed under the
      * "array-of-array" relation.
      *
-     * <p>The closure is needed because {@code MULTI_NEW_ARRAY} allocates
-     * the inner arrays at C level ({@code __jnative_new_multi_array}),
-     * not through separate {@code NEW_ARRAY} instructions. The inner
-     * array types therefore may not appear as independent allocation
-     * sites, but they still need destructors because the outer
-     * destructor will dispatch on each element.</p>
-     *
-     * <p>Reference types (non-arrays) are <b>not</b> added by closure:
-     * an abstract superclass that has no {@code NEW} of its own must not
-     * receive a destructor. The virtual destructor dispatch added by
-     * this inserter is what allows fields of such types to be freed
-     * correctly: the field is dispatched on at runtime, and the concrete
-     * type's destructor is found through the vtable.</p>
+     * <p>System-class reference types (String, Integer, Object, …) are
+     * excluded: the runtime never generates destructors for them and
+     * therefore never needs them as entry points here. Arrays are kept
+     * (their own destructors are still emitted), but {@code [LString;}
+     * style arrays are downgraded to a trivial "free the array only"
+     * destructor — see {@link #createArrayDestructor(Type)}.</p>
      */
     private Set<Type> allocatedTypes = Collections.emptySet();
 
     public void insert() {
         this.allocatedTypes = collectAllocatedTypes();
         log.debug("DestructorInserter: {} distinct allocated type(s)",
-                allocatedTypes.size());
+            allocatedTypes.size());
 
         // ------------------------------------------------------------------
         // Emit one destructor per allocated type. Non-array reference
         // types get a destructor only when they have their own NEW site;
         // arrays always get one, with the array-of-array closure ensuring
         // that the inner-array destructors exist as well.
+        //
+        // System-class reference types are never in allocatedTypes (see
+        // collectAllocatedTypes), so findDestructor returns null for them
+        // and no destructor is emitted.
         // ------------------------------------------------------------------
         int generated = 0;
         for (Type type : allocatedTypes) {
@@ -102,7 +100,7 @@ public class DestructorInserter {
         int instrumented = instrumentFieldOverwrites(lifetimeResult.getLiveOut());
         if (instrumented > 0) {
             log.info("DestructorInserter: instrumented {} field-overwrite release(s)",
-                    instrumented);
+                instrumented);
         }
 
         // ------------------------------------------------------------------
@@ -113,9 +111,14 @@ public class DestructorInserter {
         // typed. Fields INSIDE the destructor use virtual dispatch (see
         // createClassDestructor); only the top-level site call is
         // static.
+        //
+        // HEAP sites whose containing field cannot be located are
+        // deliberately skipped — see insertDestructorCall() for the full
+        // rationale and for the concrete TestHeap crash that motivated
+        // the guard.
         // ------------------------------------------------------------------
         for (Map.Entry<AllocationSite, Set<DestructionPoint>> entry
-                : lifetimeResult.getDestructionPoints().entrySet()) {
+            : lifetimeResult.getDestructionPoints().entrySet()) {
 
             AllocationSite site = entry.getKey();
 
@@ -127,10 +130,30 @@ public class DestructorInserter {
             Type type = site.getType();
             if (type.isUnknown() || type.isNull()) continue;
 
+            // ------------------------------------------------------------------
+            // System-class reference sites are deliberately skipped here.
+            //
+            // findDestructor(SystemClass) would return null (isManagedType
+            // filters them), and the fallback warning below would flood
+            // the log with one warning per allocation site for every
+            // String, Integer, etc. allocated by the JDK's own bootstrap.
+            // The absence of a destructor is not a defect — it is the
+            // policy — so the site is silently left for the process-wide
+            // lifetime. Arrays are handled by findDestructor via
+            // createArrayDestructor and are not covered by this check.
+            // ------------------------------------------------------------------
+            if (type.isReference()) {
+                String cls = type.getClassName();
+                if (cls != null && !cls.isEmpty() && cls.charAt(0) != '['
+                    && LlvmUtil.isSystemClassName(cls)) {
+                    continue;
+                }
+            }
+
             Function dtor = findDestructor(type);
             if (dtor == null) {
                 log.warn("DestructorInserter: no destructor for allocation "
-                        + "site {} — the site will not be freed", site);
+                    + "site {} — the site will not be freed", site);
                 continue;
             }
             for (DestructionPoint dp : entry.getValue()) {
@@ -140,7 +163,7 @@ public class DestructorInserter {
             }
         }
         log.info("Destructor insertion: {} destructor(s) generated",
-                generated);
+            generated);
     }
 
     // =====================================================================
@@ -162,27 +185,36 @@ public class DestructorInserter {
      * <p>Two code shapes are used:</p>
      *
      * <ul>
-     *   <li><b>Monomorphic</b> (one concrete destructor for all sites):
+     *   <li><b>Monomorphic</b> (one concrete destructor for all sites, and
+     *       no system-class sites were filtered out):
      *       inline {@code GET_FIELD / icmp / or / select / call} inserted
      *       directly before the PUT_FIELD. No CFG restructuring, no runtime
      *       dispatch, one direct call to {@code __destruct_<Type>}.</li>
      *
-     *   <li><b>Polymorphic</b> (two or more distinct destructors): the
-     *       block is split at the PUT_FIELD, and a static vtable-dispatch
-     *       chain is emitted — one {@code icmp} per distinct vtable,
-     *       branching to a block that calls the corresponding concrete
-     *       destructor. All function pointers are resolved at compile
-     *       time; the {@code dlsym}-based {@code __jnative_destruct_dispatch}
-     *       helper is no longer used.</li>
+     *   <li><b>Polymorphic</b> (two or more distinct destructors, OR one
+     *       destructor plus at least one filtered system-class site):
+     *       the block is split at the PUT_FIELD, and a static
+     *       vtable-dispatch chain is emitted — one {@code icmp} per
+     *       distinct vtable, branching to a block that calls the
+     *       corresponding concrete destructor. All function pointers are
+     *       resolved at compile time.
+     *
+     *       <p>The polymorphic path is chosen whenever the field's
+     *       points-to set contains a system-class reference site, even
+     *       when only one user-class destructor exists. Without this, the
+     *       monomorphic path would emit a direct call to the sole user
+     *       class's destructor and would invoke it on any system-class
+     *       value the field actually holds at runtime — a vtable mismatch
+     *       that corrupts the heap.</p></li>
      * </ul>
      *
      * @return the number of blocks that were processed
      */
     private int instrumentFieldOverwrites(
-            Map<BasicBlock, Set<AllocationSite>> liveOut) {
+        Map<BasicBlock, Set<AllocationSite>> liveOut) {
         if (liveOut == null || liveOut.isEmpty()) {
             log.warn("DestructorInserter: no live-out map was published; "
-                    + "field-overwrite releases will not be emitted.");
+                + "field-overwrite releases will not be emitted.");
             return 0;
         }
 
@@ -212,77 +244,127 @@ public class DestructorInserter {
      *         must enqueue the returned tail for further processing.
      */
     private BasicBlock instrumentOneBlock(
-            BasicBlock block,
-            Map<BasicBlock, Set<AllocationSite>> liveOut) {
+        BasicBlock block,
+        Map<BasicBlock, Set<AllocationSite>> liveOut) {
         List<Instruction> insts = block.getInstructions();
         int i = 0;
         while (i < insts.size()) {
             Instruction inst = insts.get(i);
             if (inst.getOpcode() != Opcode.PUT_FIELD
-                    || !shouldInstrumentPutField(inst)
-                    || !oldValueIsDead(inst, block, liveOut)) {
+                || !shouldInstrumentPutField(inst)
+                || !oldValueIsDead(inst, block, liveOut)) {
                 i++;
                 continue;
             }
 
-            List<Type> dtorTypes = collectDestructorTypes(inst);
+            DtorCollection dc = collectDestructorTypes(inst);
 
-            if (dtorTypes.isEmpty()) {
+            if (dc.types().isEmpty()) {
                 // No destructor exists for any possible site type.
                 i++;
                 continue;
             }
 
-            if (dtorTypes.size() == 1) {
+            // Monomorphic release is only safe when the field is provably
+            // populated exclusively by sites that resolve to the single
+            // destructor we have. If any system-class site was filtered
+            // out, the field could hold a value whose vtable does not
+            // match, so the polymorphic vtable-checked chain must be used.
+            if (dc.types().size() == 1 && !dc.hasFilteredSystemTypes()) {
                 // Monomorphic: inline select + direct call.
                 List<Instruction> release =
-                    emitMonomorphicRelease(inst, block, dtorTypes.getFirst());
+                    emitMonomorphicRelease(inst, block, dc.types().getFirst());
                 insts.addAll(i, release);
                 i += release.size() + 1;  // release + PUT_FIELD
             } else {
                 // Polymorphic: split the block, emit vtable-dispatch chain.
-                return emitPolymorphicRelease(inst, block, i, dtorTypes);
+                // Even a single-type chain goes through this path when a
+                // system-class site was filtered — the chain then consists
+                // of exactly one vtable check, and values of any other type
+                // fall through to the tail without a release.
+                return emitPolymorphicRelease(inst, block, i, dc.types());
             }
         }
         return null;
     }
 
     /**
+     * Result of {@link #collectDestructorTypes(Instruction)}.
+     *
+     * @param types                   distinct destructor targets, one entry
+     *                                per unique {@code __destruct_*} symbol,
+     *                                in deterministic insertion order
+     * @param hasFilteredSystemTypes  true when at least one site in the
+     *                                field's points-to set was a system-class
+     *                                reference (which has no destructor and
+     *                                was therefore dropped from {@code types});
+     *                                forces the polymorphic path so that
+     *                                runtime vtable checks prevent a
+     *                                user-class destructor from being called
+     *                                on a system-class instance
+     */
+    private record DtorCollection(List<Type> types,
+                                  boolean hasFilteredSystemTypes) {}
+
+    /**
      * Collects the set of distinct destructor target types for the sites
-     * that may currently live in the field.
+     * that may currently live in the field, and reports whether any
+     * system-class site was filtered out along the way.
+     *
+     * <p>System-class sites (String, Integer, Object, …) are dropped from
+     * the returned {@code types} list — no destructor exists for them,
+     * and none should be emitted. The {@code hasFilteredSystemTypes} flag
+     * records their presence so the caller can force polymorphic dispatch
+     * and preserve soundness for the mixed case.</p>
      *
      * <p>If two sites share the same destructor (either because they are
-     * of the same type, or because {@code findDestructor} resolved them to
-     * the same symbol), the result contains only one entry — this is the
-     * monomorphic path.</p>
+     * of the same type, or because {@link #findDestructor} resolved them
+     * to the same symbol), the result contains only one entry — this is
+     * the monomorphic path.</p>
      */
-    private List<Type> collectDestructorTypes(Instruction putField) {
-        if (putField.getOperands().size() < 2) return List.of();
+    private DtorCollection collectDestructorTypes(Instruction putField) {
+        if (putField.getOperands().size() < 2) {
+            return new DtorCollection(List.of(), false);
+        }
 
         Value base       = putField.getOperands().get(0);
         Value fieldConst = putField.getOperands().get(1);
         if (!(fieldConst instanceof Constant c) || !c.getType().isReference()) {
-            return List.of();
+            return new DtorCollection(List.of(), false);
         }
         String fieldKey = c.getValue().toString();
 
         PointsToSet baseSites  = aliasResult.getPointsTo(base);
         PointsToSet fieldSites = aliasResult.getFieldPointsToForSites(
-                baseSites, fieldKey);
+            baseSites, fieldKey);
 
         // name → representative Type (deterministic insertion order).
         Map<String, Type> byDtorName = new LinkedHashMap<>();
+        boolean hasFilteredSystemTypes = false;
 
         for (AllocationSite site : fieldSites.getSites()) {
             if (site == AllocationSite.UNKNOWN) continue;
 
             Type siteType = site.getType();
             if (siteType == null
-                    || siteType.isUnknown()
-                    || siteType.isNull()
-                    || siteType.isBlock()
-                    || siteType.isPrimitive()) {
+                || siteType.isUnknown()
+                || siteType.isNull()
+                || siteType.isBlock()
+                || siteType.isPrimitive()) {
                 continue;
+            }
+
+            // Record — but do not include — system-class reference sites.
+            // Their presence forces the polymorphic dispatch path; the
+            // runtime vtable check then prevents the user destructor from
+            // firing on a system-class instance.
+            if (siteType.isReference()) {
+                String cls = siteType.getClassName();
+                if (cls != null && !cls.isEmpty() && cls.charAt(0) != '['
+                    && LlvmUtil.isSystemClassName(cls)) {
+                    hasFilteredSystemTypes = true;
+                    continue;
+                }
             }
 
             Function dtor = findDestructor(siteType);
@@ -292,7 +374,9 @@ public class DestructorInserter {
             byDtorName.putIfAbsent(dtor.getName(), siteType);
         }
 
-        return new ArrayList<>(byDtorName.values());
+        return new DtorCollection(
+            new ArrayList<>(byDtorName.values()),
+            hasFilteredSystemTypes);
     }
 
     /**
@@ -321,9 +405,6 @@ public class DestructorInserter {
     /**
      * Reconstructs the JVM array descriptor of an array type
      * ({@code "[I"}, {@code "[Ljava/lang/String;"}, {@code "[[I"}, …).
-     *
-     * <p>The descriptor is what names the array's class mirror, and it is what
-     * the runtime uses to derive the array destructor's symbol.</p>
      */
     private String arrayDescriptorOf(Type arrayType) {
         Type elem = arrayType.getElementType();
@@ -374,9 +455,9 @@ public class DestructorInserter {
      * identical to the null check that would otherwise be required.</p>
      */
     private List<Instruction> emitMonomorphicRelease(
-            Instruction putField,
-            BasicBlock block,
-            Type dtorType) {
+        Instruction putField,
+        BasicBlock block,
+        Type dtorType) {
 
         List<Instruction> out = new ArrayList<>();
 
@@ -444,7 +525,7 @@ public class DestructorInserter {
         // call void @__destruct_<T>(%to_free)
         Instruction call = new Instruction(Opcode.STATIC_CALL);
         call.addOperand(new Constant(
-                Type.reference(dtor.getName()), dtor.getName()));
+            Type.reference(dtor.getName()), dtor.getName()));
         call.addOperand(toFree);
         call.setParent(block);
         out.add(call);
@@ -459,7 +540,8 @@ public class DestructorInserter {
     /**
      * Splits {@code block} at instruction index {@code instIdx} and emits a
      * static vtable-dispatch chain for a field whose sites resolve to more
-     * than one concrete destructor.
+     * than one concrete destructor, or whose site set included system-class
+     * values that were filtered out.
      *
      * <p>Generated CFG (one type shown for brevity; the real chain has one
      * {@code check} / {@code free} pair per distinct destructor):</p>
@@ -493,19 +575,20 @@ public class DestructorInserter {
      * </pre>
      *
      * <p>If {@code %old} does not match any expected vtable, control falls
-     * straight through to {@code tail}. This cannot happen given a sound
-     * points-to analysis ({@code fieldSites} enumerates every site that can
-     * be in the field, and every site carries one of the expected types);
-     * the fall-through is defensive.</p>
+     * straight through to {@code tail}. This happens on the system-class
+     * sites that were filtered out of {@code destructorTypes}: those values
+     * still exist at runtime, but the correct behaviour for them is not to
+     * call a user-class destructor (which is what the fall-through
+     * provides).</p>
      *
      * @return the new tail block. The caller must re-enqueue it for
      *         further PUT_FIELD processing.
      */
     private BasicBlock emitPolymorphicRelease(
-            Instruction putField,
-            BasicBlock block,
-            int instIdx,
-            List<Type> destructorTypes) {
+        Instruction putField,
+        BasicBlock block,
+        int instIdx,
+        List<Type> destructorTypes) {
 
         Function func = block.getFunction();
         List<Instruction> insts = block.getInstructions();
@@ -513,7 +596,7 @@ public class DestructorInserter {
 
         // ---- 1. Split: move [instIdx, end) to a new tail block ----
         BasicBlock tail = new BasicBlock(
-                block.getLabel() + "_rel_tail_" + (++splitId));
+            block.getLabel() + "_rel_tail_" + (++splitId));
         func.addBlock(tail);
 
         List<Instruction> moved = new ArrayList<>(insts.subList(instIdx, insts.size()));
@@ -581,17 +664,19 @@ public class DestructorInserter {
         if (ranges != null) {
             for (TryCatchRange range : ranges) {
                 if (range.body != null
-                        && range.body.contains(block)
-                        && !range.body.contains(tail)) {
+                    && range.body.contains(block)
+                    && !range.body.contains(tail)) {
                     range.body.add(tail);
                 }
             }
         }
 
-        // ---- 4. Only the types whose destructor could actually be resolved
-        //          take part in the dispatch chain. The chain must not end on
-        //          a block without a terminator, so the "last" flag is
-        //          computed over that filtered set.
+        // ---- 4. Build the effective dispatch chain.
+        //
+        // Every type passed in has a destructor (collectDestructorTypes
+        // filtered the rest). The chain therefore contains exactly one
+        // entry per distinct destructor, ordered by first occurrence in
+        // the field's points-to set.
         List<Type> chainTypes = new ArrayList<>();
         for (Type t : destructorTypes) {
             if (findDestructor(t) != null && dispatchKeyName(t) != null) {
@@ -649,7 +734,7 @@ public class DestructorInserter {
 
         // ---- 6. Dispatch block ----
         BasicBlock dispatch = new BasicBlock(
-                block.getLabel() + "_rel_dispatch_" + (++splitId));
+            block.getLabel() + "_rel_dispatch_" + (++splitId));
         func.addBlock(dispatch);
         block.setTerminator(new CondBranchTerminator(skipResult, tail, dispatch));
 
@@ -662,7 +747,7 @@ public class DestructorInserter {
         loadVt.addOperand(oldValue);
         loadVt.addOperand(new Constant(Type.INT, 0));
         Temporary vtableValue = new Temporary(
-                Type.reference("java/lang/Object"));
+            Type.reference("java/lang/Object"));
         loadVt.setResult(vtableValue);
         vtableValue.setDefiningInstruction(loadVt);
         loadVt.setParent(dispatch);
@@ -680,8 +765,8 @@ public class DestructorInserter {
             Instruction isT = new Instruction(Opcode.EQ);
             isT.addOperand(vtableValue);
             isT.addOperand(new Constant(
-                    Type.reference("__llvm_vtable_ptr__"),
-                    dispatchKeyName(t)));
+                Type.reference("__llvm_vtable_ptr__"),
+                dispatchKeyName(t)));
             Temporary isTResult = new Temporary(Type.BOOLEAN);
             isT.setResult(isTResult);
             isTResult.setDefiningInstruction(isT);
@@ -689,7 +774,7 @@ public class DestructorInserter {
             current.addInstruction(isT);
 
             BasicBlock freeBlock = new BasicBlock(
-                    current.getLabel() + "_rel_free_" + (++splitId));
+                current.getLabel() + "_rel_free_" + (++splitId));
             func.addBlock(freeBlock);
 
             BasicBlock next;
@@ -697,16 +782,16 @@ public class DestructorInserter {
                 next = tail;
             } else {
                 next = new BasicBlock(
-                        current.getLabel() + "_rel_next_" + (++splitId));
+                    current.getLabel() + "_rel_next_" + (++splitId));
                 func.addBlock(next);
             }
 
             current.setTerminator(
-                    new CondBranchTerminator(isTResult, freeBlock, next));
+                new CondBranchTerminator(isTResult, freeBlock, next));
 
             Instruction call = new Instruction(Opcode.STATIC_CALL);
             call.addOperand(new Constant(
-                    Type.reference(dtor.getName()), dtor.getName()));
+                Type.reference(dtor.getName()), dtor.getName()));
             call.addOperand(oldValue);
             call.setParent(freeBlock);
             freeBlock.addInstruction(call);
@@ -797,9 +882,9 @@ public class DestructorInserter {
      * exactly that use-after-free in HashMap.resize.</p>
      */
     private boolean oldValueIsDead(
-            Instruction putField,
-            BasicBlock block,
-            Map<BasicBlock, Set<AllocationSite>> liveOut) {
+        Instruction putField,
+        BasicBlock block,
+        Map<BasicBlock, Set<AllocationSite>> liveOut) {
 
         if (putField.getOperands().size() < 2) return false;
 
@@ -819,7 +904,7 @@ public class DestructorInserter {
 
         PointsToSet baseSites = aliasResult.getPointsTo(base);
         PointsToSet fieldSites =
-                aliasResult.getFieldPointsToForSites(baseSites, fieldKey);
+            aliasResult.getFieldPointsToForSites(baseSites, fieldKey);
 
         // ------------------------------------------------------------------
         // The analysis has no record of anything having been stored into
@@ -1000,11 +1085,26 @@ public class DestructorInserter {
                 for (Instruction inst : block.getInstructions()) {
                     Opcode op = inst.getOpcode();
                     if (op != Opcode.NEW
-                            && op != Opcode.NEW_ARRAY
-                            && op != Opcode.MULTI_NEW_ARRAY) continue;
+                        && op != Opcode.NEW_ARRAY
+                        && op != Opcode.MULTI_NEW_ARRAY) continue;
                     if (inst.getResult() == null) continue;
                     Type t = inst.getResult().getType();
                     if (t == null || t.isUnknown() || t.isNull() || t.isBlock()) continue;
+
+                    // System-class reference allocations do not get their
+                    // own destructor: their lifetime is owned by the JDK's
+                    // own caches (String interning, Integer.valueOf,
+                    // static singletons, etc.) which this runtime cannot
+                    // reason about. Including them here would only cause
+                    // findDestructor to reject them one by one.
+                    if (t.isReference()) {
+                        String cls = t.getClassName();
+                        if (cls != null && !cls.isEmpty() && cls.charAt(0) != '['
+                            && LlvmUtil.isSystemClassName(cls)) {
+                            continue;
+                        }
+                    }
+
                     types.add(t);
                 }
             }
@@ -1039,13 +1139,38 @@ public class DestructorInserter {
         return createDestructor(type);
     }
 
+    /**
+     * Returns true iff a destructor should be generated for {@code type}.
+     *
+     * <p>System-class reference types (String, Integer, Object, Number,
+     * Exception, …) are deliberately excluded. Their lifetime is owned by
+     * the JDK's own caches, singletons and static tables, which this
+     * runtime's interprocedural analysis does not model. Generating a
+     * per-use destructor for such a value risks freeing an object that is
+     * still referenced from a static cache (String.intern, Integer's
+     * small-value cache, ClassValue maps, …) and turning the next read of
+     * that object into a use-after-free.</p>
+     *
+     * <p>Arrays are always considered managed: the array's storage is a
+     * plain heap allocation that the runtime owns, regardless of what its
+     * elements point to. The element destruction policy is decided inside
+     * {@link #createArrayDestructor(Type)} and may itself be downgraded to
+     * a trivial "free the array only" — for example when the element type
+     * is a final system class such as {@code String}.</p>
+     */
     private boolean isManagedType(Type type) {
         if (type == null) return false;
         if (type.isUnknown() || type.isNull() || type.isBlock()) return false;
         if (type.isPrimitive()) return false;
         if (type.isArray()) return true;
         if (type.isReference()) {
-            ClassNode cn = resolver.getClassNode(type.getClassName());
+            String className = type.getClassName();
+            if (className == null || className.isEmpty()) return false;
+
+            // System-class reference — not managed by this pass.
+            if (LlvmUtil.isSystemClassName(className)) return false;
+
+            ClassNode cn = resolver.getClassNode(className);
             return !(cn != null && cn.isExternal());
         }
         return false;
@@ -1054,19 +1179,19 @@ public class DestructorInserter {
     private Function createDestructor(Type type) {
         if (!isManagedType(type)) return null;
         return type.isArray()
-                ? createArrayDestructor(type)
-                : createClassDestructor(type.getClassName());
+            ? createArrayDestructor(type)
+            : createClassDestructor(type.getClassName());
     }
 
     private String destructorName(Type type) {
         if (type == null) return "__destruct_unknown";
         if (type.isArray()) {
             return "__destruct_array_"
-                    + type.toString().replaceAll("[^a-zA-Z0-9_.]", "_");
+                + type.toString().replaceAll("[^a-zA-Z0-9_.]", "_");
         }
         if (type.isReference()) {
             return "__destruct_"
-                    + type.getClassName().replace('/', '_').replace('.', '_');
+                + type.getClassName().replace('/', '_').replace('.', '_');
         }
         return "__destruct_unknown";
     }
@@ -1074,7 +1199,7 @@ public class DestructorInserter {
     private Temporary emitDestructionGuard(BasicBlock entry, Parameter thisParam) {
         Instruction enterCall = new Instruction(Opcode.STATIC_CALL);
         enterCall.addOperand(new Constant(
-                Type.reference("__jnative_dtor_enter"), "__jnative_dtor_enter"));
+            Type.reference("__jnative_dtor_enter"), "__jnative_dtor_enter"));
         enterCall.addOperand(thisParam);
         Temporary enterResult = new Temporary(Type.INT);
         enterCall.setResult(enterResult);
@@ -1094,7 +1219,7 @@ public class DestructorInserter {
     private void emitUnclaim(BasicBlock block, Parameter thisParam) {
         Instruction unclaim = new Instruction(Opcode.STATIC_CALL);
         unclaim.addOperand(new Constant(
-                Type.reference("__jnative_dtor_unclaim"), "__jnative_dtor_unclaim"));
+            Type.reference("__jnative_dtor_unclaim"), "__jnative_dtor_unclaim"));
         unclaim.addOperand(thisParam);
         block.addInstruction(unclaim);
     }
@@ -1111,8 +1236,8 @@ public class DestructorInserter {
     private void emitDispatchCall(BasicBlock block, Value fieldValue) {
         Instruction call = new Instruction(Opcode.STATIC_CALL);
         call.addOperand(new Constant(
-                Type.reference("__jnative_destruct_dispatch"),
-                "__jnative_destruct_dispatch"));
+            Type.reference("__jnative_destruct_dispatch"),
+            "__jnative_destruct_dispatch"));
         call.addOperand(fieldValue);
         block.addInstruction(call);
     }
@@ -1143,7 +1268,11 @@ public class DestructorInserter {
      * </ul>
      *
      * <p>Every other case falls back to the runtime dispatch, which is
-     * always correct.</p>
+     * always correct. In particular, for a field whose declared type is a
+     * system class, the runtime dispatch call is emitted; at run time
+     * {@code __jnative_destruct_dispatch} finds no {@code __destruct_*}
+     * symbol for that system class (this pass never generates one) and
+     * becomes a strict no-op, preserving the system-owned lifetime.</p>
      */
     private void emitFieldDestruction(BasicBlock block,
                                       Value fieldValue,
@@ -1166,13 +1295,13 @@ public class DestructorInserter {
         if (fieldType.isReference() && !fieldType.isUnknown() && !fieldType.isNull()) {
             String className = fieldType.getClassName();
             if (className != null && !className.isEmpty()
-                    && className.charAt(0) != '[') {
+                && className.charAt(0) != '[') {
                 ClassNode cn = resolver.getClassNode(className);
                 if (cn != null && !cn.isExternal() && !cn.isInterface()
-                        && (cn.getAccess() & Opcodes.ACC_ABSTRACT) == 0) {
+                    && (cn.getAccess() & Opcodes.ACC_ABSTRACT) == 0) {
                     boolean isFinal = (cn.getAccess() & Opcodes.ACC_FINAL) != 0;
                     boolean hasNoSubclasses =
-                            resolver.getSubclasses(className).isEmpty();
+                        resolver.getSubclasses(className).isEmpty();
                     if (isFinal || hasNoSubclasses) {
                         Function dtor = findDestructor(fieldType);
                         if (dtor != null) {
@@ -1184,8 +1313,10 @@ public class DestructorInserter {
             }
         }
 
-        // Polymorphic fields / abstract types: only the runtime dispatch
-        // can pick the destructor of the actual runtime type.
+        // Polymorphic fields / abstract types / system-class fields:
+        // only the runtime dispatch can pick the destructor of the actual
+        // runtime type. For system classes the dispatch is a no-op at run
+        // time because no __destruct_* symbol exists for them.
         emitDispatchCall(block, fieldValue);
     }
 
@@ -1197,7 +1328,7 @@ public class DestructorInserter {
                                     Value value) {
         Instruction call = new Instruction(Opcode.STATIC_CALL);
         call.addOperand(new Constant(
-                Type.reference(dtor.getName()), dtor.getName()));
+            Type.reference(dtor.getName()), dtor.getName()));
         call.addOperand(value);
         call.setParent(block);
         block.addInstruction(call);
@@ -1214,11 +1345,12 @@ public class DestructorInserter {
      * no destructor of its own (and, by {@link #findDestructor(Type)},
      * does not get one).</p>
      *
-     * <p>The destruction call is a direct call to the concrete destructor
-     * of the field's static type whenever that type leaves no room for a
-     * different runtime type (a final class, a class without known
-     * subclasses, or an array type); every other field keeps the runtime
-     * dispatch. See {@link #emitFieldDestruction}.</p>
+     * <p>Fields whose declared type is a system class are NOT touched:
+     * the system object's lifetime is owned elsewhere (static caches,
+     * singletons, interned values) and freeing it here would be unsafe.
+     * {@link #emitFieldDestruction} implements the same policy for the
+     * remaining (non-system) field types, choosing between direct
+     * destructor calls and runtime dispatch based on the static type.</p>
      *
      * <p>The body is a <b>single</b> BasicBlock from the IR builder's
      * point of view. The {@code GET_FIELD} instruction still expands into
@@ -1271,7 +1403,7 @@ public class DestructorInserter {
             Instruction getField = new Instruction(Opcode.GET_FIELD);
             getField.addOperand(thisParam);
             getField.addOperand(new Constant(
-                    Type.reference(fullFieldName), fullFieldName));
+                Type.reference(fullFieldName), fullFieldName));
             Temporary fieldValue = new Temporary(fieldType);
             getField.setResult(fieldValue);
             fieldValue.setDefiningInstruction(getField);
@@ -1293,8 +1425,8 @@ public class DestructorInserter {
         List<FieldNode> result = new ArrayList<>();
         String superName = classNode.getSuperName();
         if (superName != null
-                && !superName.equals("java/lang/Object")
-                && !superName.equals(classNode.getName())) {
+            && !superName.equals("java/lang/Object")
+            && !superName.equals(classNode.getName())) {
             ClassNode superNode = resolver.getClassNode(superName);
             if (superNode != null && !superNode.isExternal()) {
                 result.addAll(collectAllReferenceFields(superNode));
@@ -1315,18 +1447,34 @@ public class DestructorInserter {
      * <p>Primitive element types: the elements hold no references; the
      * destructor is {@code unclaim(arr); free(arr); ret}.</p>
      *
-     * <p>Reference or array element types: the destructor loops over the
-     * array and destroys each element, then frees the array. No
-     * per-element null check is needed: every destructor starts with a
-     * guard that turns a {@code null} argument into an immediate return.
-     * The element's destructor is called directly when the declared
-     * element type leaves no room for a different runtime type (a final
-     * class, a class without known subclasses, or an array type);
-     * otherwise the runtime type of each element is resolved via the
-     * element's vtable/mirror, which is what makes {@code Object[]},
-     * {@code Number[]} and {@code Throwable[]} free their elements
-     * correctly regardless of the declared element type. See
-     * {@link #emitFieldDestruction}.</p>
+     * <p>Reference or array element types: the destructor normally loops
+     * over the array and destroys each element, then frees the array.
+     * Two exceptions downgrade this to a trivial destructor that only
+     * frees the array itself (without touching the elements):</p>
+     *
+     * <ul>
+     *   <li><b>System-class element type that is final</b> — a final
+     *       class has no subclasses by construction, so every element is
+     *       provably of that exact final system class. Strings and
+     *       boxed primitives fall into this category. Their instances
+     *       are never owned by the array (String literals are baked
+     *       into the module, small Integer/Long cache entries live for
+     *       the process lifetime), and iterating them would attempt a
+     *       release of shared values that this runtime does not own.</li>
+     *
+     *   <li><b>Nested array whose element is such an array</b> — covered
+     *       by the same rule, because the closure applied in
+     *       {@link #collectAllocatedTypes()} ensures the inner array's
+     *       destructor exists, and the outer loop's direct call to that
+     *       destructor will in turn only free the inner array's storage
+     *       without touching its elements.</li>
+     * </ul>
+     *
+     * <p>Non-final system-class element types (Object, Number, Throwable,
+     * …) keep the normal loop: a user class may legitimately subclass
+     * them, and the runtime dispatch call resolves the correct
+     * concrete destructor for every element (including elements whose
+     * concrete type has no destructor — that resolves to a no-op).</p>
      *
      * <p>The element-destructor symbol for an inner-array element type is
      * guaranteed to exist because {@link #collectAllocatedTypes()}
@@ -1343,6 +1491,37 @@ public class DestructorInserter {
 
         if (!elementsAreRefs) {
             return createTrivialArrayDestructor(arrayType);
+        }
+
+        // ------------------------------------------------------------------
+        // System-class element handling.
+        //
+        // A FINAL system class cannot be subclassed, so every element of
+        // the array is provably of that exact class. For system-owned
+        // values (String, Integer's small-value cache, …) freeing them
+        // from the array destructor would orphan shared state; the array
+        // therefore only frees its own storage and leaves the elements
+        // untouched.
+        //
+        // A NON-FINAL system class (Object, Number, Throwable, …) may
+        // have user-defined subclasses, and those subclasses' instances
+        // genuinely belong to the array. The normal loop is kept for them;
+        // per-element runtime dispatch (via emitFieldDestruction) then
+        // frees the user subclass values and no-ops on system-class
+        // values (there is no __destruct_* symbol for them).
+        // ------------------------------------------------------------------
+        if (elementType.isReference()) {
+            String elemClass = elementType.getClassName();
+            if (elemClass != null && !elemClass.isEmpty()
+                && elemClass.charAt(0) != '['
+                && LlvmUtil.isSystemClassName(elemClass)) {
+                ClassNode elemNode = resolver.getClassNode(elemClass);
+                boolean elemIsFinal = elemNode != null
+                    && (elemNode.getAccess() & Opcodes.ACC_FINAL) != 0;
+                if (elemIsFinal) {
+                    return createTrivialArrayDestructor(arrayType);
+                }
+            }
         }
 
         Function func = new Function(funcName, Type.VOID);
@@ -1494,7 +1673,7 @@ public class DestructorInserter {
     }
 
     // =====================================================================
-    //  Call insertion (unchanged)
+    //  Call insertion
     // =====================================================================
 
     /**
@@ -1502,13 +1681,61 @@ public class DestructorInserter {
      * of {@code site} after the last use of the object, and — for HEAP
      * sites — nulls out the field the object was stored in.
      *
-     * <p>Why the null-out: once the HEAP object has been freed here, the
-     * field-overwrite instrumentation of the next loop iteration would
-     * load the already freed pointer and try to free it again (double
-     * free). Nulling the field guarantees that the overwrite
-     * instrumentation sees NULL and skips the release. It also means that
-     * a destructor of the container — if it is ever called — sees NULL
-     * instead of a dangling pointer and does not free the storage twice.
+     * <h2>Why HEAP sites whose containing field cannot be identified are
+     * skipped</h2>
+     *
+     * <p>A HEAP allocation is by construction reachable from a field of
+     * another object. Freeing it without nulling out that field leaves a
+     * dangling pointer that the container's own destructor, or a later
+     * read of the field through a LOAD, will observe. The concrete
+     * failure that motivated this guard, taken from the compiled
+     * {@code TestHeap$Payload} constructor:</p>
+     *
+     * <pre>
+     *   this.padding = new byte[Math.max(0, size)];
+     *   this.padding[0] = (byte) value;
+     *   this.padding[this.padding.length - 1] = (byte) (value &gt;&gt; 8);
+     * </pre>
+     *
+     * <p>{@code LifetimeAnalyzer.computeSite} produces a
+     * {@link DestructionPoint} for every value that may point at the
+     * site, via {@code collectAliases}. For the {@code padding} array
+     * those are the {@code NEW_ARRAY} result <em>and</em> each
+     * {@code GET_FIELD this.padding} result that later code uses. For
+     * each LOAD-result root, the search below looks for a
+     * {@code PUT_FIELD … root} that stored that <em>specific</em> value
+     * into a field. That store does not exist: the field was written
+     * with {@code %tmp_10572} (the {@code NEW_ARRAY} result), not with
+     * any of the LOAD results. {@code lastStore} stays {@code null},
+     * the null-out branch is skipped, and the destructor is inserted
+     * anyway — so the array is freed inside its own allocator, and the
+     * subsequent {@code padding[length-1] = byte} writes into freed
+     * storage. The observed failure is the SIGSEGV at the second array
+     * store, with the exception object still on the propagation stack.
+     *
+     * <p>When {@code lastStore == null} the analysis has no proof that
+     * the field is about to be cleared, so the only sound action is to
+     * not act. The object stays reachable from the field, and whatever
+     * eventually clears that field — the container's destructor chain,
+     * {@link #instrumentFieldOverwrites} on the next overwrite, or the
+     * shutdown pass — will free the object through the normal path.
+     * Leaking until then is strictly safer than corrupting the field.</p>
+     *
+     * <p>This mirrors the conservative direction already taken by
+     * {@link #oldValueIsDead}, which explicitly refuses to emit a
+     * field-overwrite release when liveness information is unavailable.
+     * The invariant being protected is the same in both places: a
+     * reference that could still be observed at run time must never be
+     * released.</p>
+     *
+     * <p>Why the null-out itself: once the HEAP object has been freed
+     * here, the field-overwrite instrumentation of the next loop
+     * iteration would load the already-freed pointer and try to free it
+     * again (double free). Nulling the field guarantees that the
+     * overwrite instrumentation sees NULL and skips the release. It also
+     * means that a destructor of the container — if it is ever called —
+     * sees NULL instead of a dangling pointer and does not free the
+     * storage twice.</p>
      */
     private void insertDestructorCall(AllocationSite site,
                                       DestructionPoint dp,
@@ -1544,11 +1771,27 @@ public class DestructorInserter {
         for (int i = insertIndex - 1; i >= 0; i--) {
             Instruction candidate = insts.get(i);
             if (candidate.getOpcode() == Opcode.PUT_FIELD
-                    && candidate.getOperands().size() >= 3
-                    && candidate.getOperands().get(2) == objRef) {
+                && candidate.getOperands().size() >= 3
+                && candidate.getOperands().get(2) == objRef) {
                 lastStore = candidate;
                 break;
             }
+        }
+
+        boolean isHeap = escapeResult.getSiteStatus(site) == EscapeStatus.HEAP;
+
+        // ------------------------------------------------------------------
+        // HEAP sites must have their containing field nulled out before
+        // the destructor runs.
+        //
+        // If no store of objRef into a field was located, the analysis has
+        // no way to prove that the field will not observe the freed
+        // pointer. Skip the insertion entirely; see the method javadoc
+        // for the concrete TestHeap$Payload crash that this guard
+        // prevents.
+        // ------------------------------------------------------------------
+        if (isHeap && lastStore == null) {
+            return;
         }
 
         // ------------------------------------------------------------------
@@ -1585,7 +1828,7 @@ public class DestructorInserter {
         // or an array type, so the call is well-typed.
         Instruction call = new Instruction(Opcode.STATIC_CALL);
         call.addOperand(new Constant(
-                Type.reference(dtor.getName()), dtor.getName()));
+            Type.reference(dtor.getName()), dtor.getName()));
         call.addOperand(objRef);
         call.setParent(block);
         insts.add(insertIndex, call);
@@ -1593,9 +1836,9 @@ public class DestructorInserter {
         // For HEAP sites the field the object was stored in is nulled out,
         // so that neither the container's destructor nor the field-
         // overwrite instrumentation can observe (and free) the object a
-        // second time.
-        boolean isHeap = escapeResult.getSiteStatus(site) == EscapeStatus.HEAP;
-        if (isHeap && lastStore != null) {
+        // second time. The guard above guarantees that lastStore != null
+        // whenever isHeap is true at this point.
+        if (isHeap) {
             Instruction nullOut = new Instruction(Opcode.PUT_FIELD);
             nullOut.addOperand(lastStore.getOperands().get(0));  // base
             nullOut.addOperand(lastStore.getOperands().get(1));  // field name
