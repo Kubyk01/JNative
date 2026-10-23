@@ -737,6 +737,7 @@ extern void __jnative_monitor_exit(void* obj);
  * range check is exact for the actual failure mode.
  */
 extern void __jnative_free(void* p);
+extern void __jnative_free_fast(void* p);
 
 /* ============================================================================
  *  Virtual destructor dispatch.
@@ -846,10 +847,14 @@ extern void __jnative_destruct_dispatch_if_not_same(void* old_val,
  * invokes a destructor during shutdown (defensive, not needed today).
  * ========================================================================== */
 
+extern volatile int gv_jnative_in_shutdown;
+extern int __jnative_is_shutdown(void);
+
 extern void __jnative_begin_shutdown(void);
 extern int  __jnative_dtor_enter(void* this_obj);
 extern void __jnative_dtor_unclaim(void* this_obj);
 extern void __jnative_free(void* p);
+extern void __jnative_free_fast(void* p);
 
 /* ---- Exception construction and throwers --------------------------- */
 

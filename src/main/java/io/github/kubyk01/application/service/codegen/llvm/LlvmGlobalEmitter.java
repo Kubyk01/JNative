@@ -2056,7 +2056,8 @@ public class LlvmGlobalEmitter {
     // =========================================================================
 
     private String generateStaticFields() {
-        Set<String> allFields = new TreeSet<>(aliasResult.getGraph().getStaticFieldPointsToMap().keySet());
+        Set<String> allFields = new TreeSet<>(aliasResult.getGraph()
+                .getStaticFieldPointsToMap().keySet());
 
         for (Function function : module.getFunctions()) {
             for (BasicBlock block : function.getBlocks()) {
@@ -2074,19 +2075,67 @@ public class LlvmGlobalEmitter {
         }
 
         StringBuilder sb = new StringBuilder();
+
+        // ------------------------------------------------------------------
+        // Runtime-owned globals referenced through GET_STATIC/PUT_STATIC that
+        // are NOT class fields. Emit them as `external global` exactly once
+        // here, in _module.ll's globalDefs block, which sits before every
+        // function body that reads them.
+        //
+        // Why this is emitted unconditionally (not gated on `allFields`):
+        //   - if a destructor body in the current module already references
+        //     gv_jnative_in_shutdown, the declaration must precede the load;
+        //   - if no function yet references it, the declaration is inert
+        //     (zero bytes in .o, discarded by the linker);
+        //   - by emitting it here, parseGlobalDecls() picks it up so that
+        //     per-class .ll files can emit their own `external global` for
+        //     the same symbol through LlvmGenerator.buildExterns().
+        //
+        // The `align 4` matches the C-side declaration
+        // `volatile int gv_jnative_in_shutdown`; a mismatch would change the
+        // alignment of the emitted symbol's slot in _module.o's data segment,
+        // which is not what the C side allocates.
+        // ------------------------------------------------------------------
+        sb.append("@gv_jnative_in_shutdown = external global i32, align 4\n");
+
         for (String fullName : allFields) {
-            int dot = fullName.lastIndexOf('.');
-            String owner = fullName.substring(0, dot);
-            String fieldName = fullName.substring(dot + 1);
-            if (LlvmTypeMapper.LAZY_CLINIT_FLAG_FIELD.equals(fieldName)) {
-                // The lazy-<clinit> completion flag is not a class field: it
-                // exists only in the IR of the guard wrapper. Its global is
-                // defined by emitLazyClinitFlags(), which owns its type
-                // (i32) and its alignment, so it must not be defined here
-                // as well — two definitions of the same global is a link
-                // error.
+            // --------------------------------------------------------------
+            // Runtime-owned globals that are NOT class fields.
+            //
+            // This check runs BEFORE any `.`-based parsing: `fullName` has no
+            // separator, and `lastIndexOf('.') == -1` would make
+            // `substring(0, -1)` throw StringIndexOutOfBoundsException. That
+            // is exactly the crash that motivated this reordering — the
+            // length-22 name in the traceback is "jnative_in_shutdown".
+            //
+            // The symbol is declared above and defined in jnative_runtime.c;
+            // emitting it here as a class field would be a duplicate global
+            // and a link-time error.
+            // --------------------------------------------------------------
+            if ("jnative_in_shutdown".equals(fullName)) {
                 continue;
             }
+
+            int dot = fullName.lastIndexOf('.');
+            if (dot <= 0) {
+                // Defensive: any other owner-less key is a producer bug.
+                // Such a field cannot be addressed through getFieldOffset()
+                // by any class, so a global emitted for it would be dead
+                // storage. Skip rather than crash on a negative substring
+                // end index.
+                continue;
+            }
+
+            String owner     = fullName.substring(0, dot);
+            String fieldName = fullName.substring(dot + 1);
+
+            if (LlvmTypeMapper.LAZY_CLINIT_FLAG_FIELD.equals(fieldName)) {
+                // The lazy-<clinit> completion flag: owned by
+                // emitLazyClinitFlags(), not here. A second definition would
+                // be a link error.
+                continue;
+            }
+
             Type fieldType = getFieldType(owner, fieldName);
             if (fieldType == null) fieldType = Type.UNKNOWN;
             String llvmType = LlvmTypeMapper.toLlvmType(fieldType);
@@ -2103,7 +2152,7 @@ public class LlvmGlobalEmitter {
 
             String globalName = "gv_" + LlvmTypeMapper.sanitizeIdentifier(fullName);
             sb.append("@").append(globalName).append(" = global ").append(llvmType)
-                .append(" ").append(init).append(", align 8\n");
+              .append(" ").append(init).append(", align 8\n");
         }
         sb.append("\n");
         return sb.toString();

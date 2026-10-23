@@ -4,6 +4,8 @@ import io.github.kubyk01.application.service.analyzer.dependencyresolver.Depende
 import io.github.kubyk01.application.service.analyzer.ssa.GraphUtils;
 import io.github.kubyk01.application.service.analyzer.ssa.TypeResolver;
 import io.github.kubyk01.application.service.codegen.llvm.nativepolymorphicfunctionresolver.PolymorphicResolver;
+import io.github.kubyk01.domain.analyzer.dependencyresolver.ClassNode;
+import io.github.kubyk01.domain.analyzer.dependencyresolver.FieldNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.MethodNode;
 import io.github.kubyk01.domain.ir.BasicBlock;
 import io.github.kubyk01.domain.ir.BranchTerminator;
@@ -252,6 +254,22 @@ public class LlvmFunctionEmitter {
      */
     private final List<String> pendingSlotDeclarations = new ArrayList<>();
 
+    /**
+     * Values defined in try-body blocks and used in catch-handler blocks.
+     * For each such value a stack slot is allocated in the entry block,
+     * a store is emitted at the definition site, and every use reads
+     * from the slot via {@link #getLlvmValue}.
+     * <p>
+     * Reason: the setjmp/longjmp-based try-guard lowering produces a
+     * LLVM CFG where the try-body block and the catch-dispatch block are
+     * siblings under the arm block. The try-body therefore does not
+     * dominate the handler in the emitted CFG, even though the IR CFG has
+     * an exceptional edge making it dominate. Any SSA value crossing this
+     * boundary without materialization is rejected by the LLVM verifier
+     * with "Instruction does not dominate all uses!".
+     */
+    private final Set<Value> tryCrossingValues = new HashSet<>();
+
     private int tmpCounter = 0;
     private int labelCounter = 0;
     private BasicBlock currentEntryBlock;
@@ -266,6 +284,53 @@ public class LlvmFunctionEmitter {
     private final Map<BasicBlock, List<TryCatchRange>> blockToTryRanges = new HashMap<>();
     private final Map<TryCatchRange, BasicBlock> handlerBlockByRange = new HashMap<>();
     private final Map<TryCatchRange, Integer> rangeOrdinals = new HashMap<>();
+
+    /** Per-block: is this block a try-region entry (has a predecessor outside its region). */
+    private final Map<BasicBlock, Boolean> tryRegionEntry = new HashMap<>();
+
+    /** Per-block: does control leave a try-region at this block (via terminator or no-succ). */
+    private final Map<BasicBlock, Boolean> tryRegionExit = new HashMap<>();
+
+    /** Shared catch-dispatch block per try-range set (emitted once at function end). */
+    private final Map<RangeKey, String> catchLabelByRangeSet = new LinkedHashMap<>();
+    private final Map<RangeKey, StringBuilder> catchBodyByRangeSet = new LinkedHashMap<>();
+
+    /** Structural key for a try-range set. Compared by reference identity of ranges. */
+    private static final class RangeKey {
+        final List<TryCatchRange> ranges;
+        RangeKey(List<TryCatchRange> ranges) { this.ranges = ranges; }
+        @Override public boolean equals(Object o) {
+            if (!(o instanceof RangeKey k)) return false;
+            if (ranges.size() != k.ranges.size()) return false;
+            for (int i = 0; i < ranges.size(); i++) {
+                if (ranges.get(i) != k.ranges.get(i)) return false;
+            }
+            return true;
+        }
+        @Override public int hashCode() {
+            int h = 1;
+            for (TryCatchRange r : ranges) h = 31 * h + System.identityHashCode(r);
+            return h;
+        }
+    }
+
+    /**
+     * For each trampoline block: the ordered list of try-ranges whose
+     * frames must be popped at the trampoline's entry.
+     */
+    private final Map<BasicBlock, List<TryCatchRange>> trampolinePops = new HashMap<>();
+
+    /**
+     * For each block that is a mixed-exit of a try region: mapping from
+     * the block's original successor (outside the region) to the
+     * trampoline block that pops the region frames and then branches to
+     * that successor.
+     * <p>
+     * Populated in {@link #computeTryRegions(Function)}; consumed in
+     * {@link #emitBlock} to build the {@code targetRedirects} map handed
+     * to {@link #emitTerminator}.
+     */
+    private final Map<BasicBlock, Map<BasicBlock, BasicBlock>> blockExitRedirects = new HashMap<>();
 
     public String emitFunction(Function func) {
         String funcName = func.getName();
@@ -321,6 +386,13 @@ public class LlvmFunctionEmitter {
         valuePointers.clear();
         phiPreloads.clear();
         pendingSlotDeclarations.clear();
+        tryCrossingValues.clear();
+        tryRegionEntry.clear();
+        tryRegionExit.clear();
+        catchLabelByRangeSet.clear();
+        catchBodyByRangeSet.clear();
+        trampolinePops.clear();
+        blockExitRedirects.clear();
 
         StringBuilder signature = new StringBuilder();
         signature.append("define ")
@@ -392,6 +464,8 @@ public class LlvmFunctionEmitter {
 
         currentEntryBlock = func.getEntryBlock();
         buildTryCatchInfo(func);
+        computeTryRegions(func);
+        tryCrossingValues.addAll(computeTryCrossingValues(func));
 
         List<String> bodies = new ArrayList<>();
         int entryIdx = 0;
@@ -461,6 +535,11 @@ public class LlvmFunctionEmitter {
             if (i != entryIdx) {
                 sb.append(bodies.get(i));
             }
+        }
+
+        // Emit the shared catch dispatch blocks once per try-range set.
+        for (StringBuilder cb : catchBodyByRangeSet.values()) {
+            sb.append(cb);
         }
 
         sb.append("}\n\n");
@@ -562,6 +641,244 @@ public class LlvmFunctionEmitter {
         return filtered;
     }
 
+    private static boolean sameRanges(List<TryCatchRange> a, List<TryCatchRange> b) {
+        if (a.size() != b.size()) return false;
+        for (int i = 0; i < a.size(); i++) {
+            if (a.get(i) != b.get(i)) return false;
+        }
+        return true;
+    }
+
+    /**
+     * Computes the entry/exit sets used by region-level try hoisting.
+     *
+     * <p>A block is a region <b>entry</b> iff at least one of its predecessors
+     * carries a different try-range set (or, for the function entry block,
+     * always). A block is a region <b>exit</b> iff at least one of its
+     * successors carries a different try-range set, or the block ends with
+     * {@code return} (which unwinds the entire frame and therefore every
+     * active catch context within it).</p>
+     *
+     * <p>Both properties are consumed by {@link #emitBlock} to place the
+     * {@code setjmp + push_catch} arm and the {@code pop_catch} exit code
+     * exactly at the region boundaries — once per region activation, not once
+     * per guarded instruction.</p>
+     */
+    private void computeTryRegions(Function func) {
+        // ---- Phase 1: entry/exit flags (unchanged logic). ----
+        for (BasicBlock block : func.getBlocks()) {
+            List<TryCatchRange> myRanges = effectiveRangesFor(block);
+            if (myRanges.isEmpty()) {
+                tryRegionEntry.put(block, false);
+                tryRegionExit.put(block, false);
+                continue;
+            }
+            boolean isEntry = false;
+            for (BasicBlock pred : block.getPredecessors()) {
+                if (!sameRanges(effectiveRangesFor(pred), myRanges)) {
+                    isEntry = true;
+                    break;
+                }
+            }
+            boolean isExit = block.getTerminator() instanceof ReturnTerminator;
+            if (!isExit) {
+                for (BasicBlock succ : block.getSuccessors()) {
+                    if (!sameRanges(effectiveRangesFor(succ), myRanges)) {
+                        isExit = true;
+                        break;
+                    }
+                }
+            }
+            tryRegionEntry.put(block, isEntry);
+            tryRegionExit.put(block, isExit);
+        }
+
+        // ---- Phase 2: create trampolines for mixed-exit blocks. ----
+        //
+        // A "mixed exit" is a block whose terminator has some normal
+        // targets inside the block's own try region and some outside.
+        // All-inside and all-outside exits do not need a trampoline: the
+        // former needs nothing, the latter runs the pop_catch sequence
+        // unconditionally before the terminator.
+        List<BasicBlock> snapshot = new ArrayList<>(func.getBlocks());
+        for (BasicBlock block : snapshot) {
+            List<TryCatchRange> myRanges = effectiveRangesFor(block);
+            if (myRanges.isEmpty()) continue;
+            if (!tryRegionExit.getOrDefault(block, false)) continue;
+
+            Terminator term = block.getTerminator();
+            if (term == null || term instanceof ReturnTerminator) continue;
+
+            boolean hasInsideNormalSucc  = false;
+            boolean hasOutsideNormalSucc = false;
+            for (BasicBlock succ : term.getTargets()) {
+                if (sameRanges(effectiveRangesFor(succ), myRanges)) hasInsideNormalSucc  = true;
+                else                                                hasOutsideNormalSucc = true;
+            }
+            if (!hasInsideNormalSucc || !hasOutsideNormalSucc) continue;
+
+            Map<BasicBlock, BasicBlock> redirects = new HashMap<>();
+            for (BasicBlock succ : term.getTargets()) {
+                if (sameRanges(effectiveRangesFor(succ), myRanges)) continue;
+
+                BasicBlock tramp = new BasicBlock(
+                    block.getLabel() + "_exit_tramp_" + (trampolinePops.size()
+                        + blockExitRedirects.size() + 1));
+                // Route this trampoline's own emission through the
+                // trampoline path in emitBlock.
+                trampolinePops.put(tramp, myRanges);
+                func.addBlock(tramp);
+
+                // ------------------------------------------------------------------
+                // ORDER IS LOAD-BEARING.
+                //
+                // `tramp.setTerminator(BranchTerminator(succ))` internally calls
+                // `tramp.addSuccessor(succ)`, which appends `tramp` to
+                // `succ.predecessors`. If we set the terminator FIRST and then
+                // do `preds.set(blockIdx, tramp)`, the successor ends up with
+                // `tramp` listed TWICE: once at `blockIdx` (from the replace),
+                // once at the end (from addSuccessor). PHI emission is
+                // positional against `succ.predecessors`, so the duplication
+                // corrupts the PHI operand list and LLVM rejects the module
+                // with "does not dominate all uses".
+                //
+                // By rewiring the predecessor slot FIRST, addSuccessor's
+                // duplicate check (`if (!block.predecessors.contains(this))`)
+                // sees `tramp` already present and skips the second add.
+                // After both calls, `succ.predecessors` contains exactly one
+                // entry per real predecessor, with `tramp` in the position
+                // where `block` used to sit.
+                // ------------------------------------------------------------------
+                List<BasicBlock> preds = succ.getPredecessors();
+                int blockIdx = preds.indexOf(block);
+                if (blockIdx >= 0) {
+                    preds.set(blockIdx, tramp);
+                }
+
+                tramp.setTerminator(new BranchTerminator(succ));
+
+                redirects.put(succ, tramp);
+            }
+            if (!redirects.isEmpty()) {
+                blockExitRedirects.put(block, redirects);
+            }
+        }
+    }
+
+    /**
+     * Значения, которые пересекают границу try-body → catch-region.
+     *
+     * <p>Setjmp-машинерия try-guard'ов порождает CFG, в котором
+     * {@code bodyLabel} и {@code catchLabel} — сиблинги под общим {@code arm}-блоком.
+     * В IR-CFG exceptional edge делает def-блок из try-body доминирующим над
+     * handler'ом, но в эмитированном LLVM CFG такого доминирования нет. Любое
+     * SSA-значение, определённое в try-body и использованное в блоке, достижимом
+     * из соответствующего handler'а, должно быть материализовано через слот в
+     * entry-блоке.</p>
+     *
+     * <p>Материализация выполняется для тела <em>каждого</em> диапазона
+     * независимо: значение, определённое в теле r1, используется в catch-region
+     * r2 (вложенного в r1), материализуется по правилу r2, а не r1 — это
+     * минимизирует число материализаций и корректно для вложенных try.</p>
+     */
+    private Set<Value> computeTryCrossingValues(Function func) {
+        Set<Value> result = new HashSet<>();
+        List<TryCatchRange> ranges = func.getTryCatchRanges();
+        if (ranges == null || ranges.isEmpty()) return result;
+
+        Map<String, BasicBlock> byLabel = new HashMap<>();
+        for (BasicBlock b : func.getBlocks()) {
+            byLabel.put(b.getLabel(), b);
+        }
+
+        BasicBlock entry = func.getEntryBlock();
+
+        for (TryCatchRange range : ranges) {
+            BasicBlock handler = byLabel.get("L" + range.handler);
+            if (handler == null) continue;
+
+            // Множество блоков, составляющих тело данного диапазона. Строится
+            // из blockToTryRanges — то есть ровно то же множество, что
+            // использует buildTryCatchInfo (включая fallback через
+            // GraphUtils.getBlocksBetween, если range.body не был заполнен
+            // при трансляции).
+            Set<BasicBlock> bodySet = new HashSet<>();
+            for (Map.Entry<BasicBlock, List<TryCatchRange>> e : blockToTryRanges.entrySet()) {
+                if (e.getValue().contains(range)) bodySet.add(e.getKey());
+            }
+            if (bodySet.isEmpty()) continue;
+
+            // Транзитивное замыкание handler'а по обычному CFG. Включает
+            // сам handler, catch-логику и всё, что от неё достижимо (в том
+            // числе блоки после finally, петли обратно в try-body и т.д.).
+            Set<BasicBlock> catchReachable = new HashSet<>();
+            Deque<BasicBlock> worklist = new ArrayDeque<>();
+            worklist.add(handler);
+            while (!worklist.isEmpty()) {
+                BasicBlock cur = worklist.poll();
+                if (!catchReachable.add(cur)) continue;
+                for (BasicBlock succ : cur.getSuccessors()) {
+                    if (!catchReachable.contains(succ)) worklist.add(succ);
+                }
+            }
+
+            for (BasicBlock B : catchReachable) {
+                for (Instruction inst : B.getInstructions()) {
+                    for (Value op : inst.getOperands()) {
+                        addIfCrossing(result, op, B, bodySet, entry);
+                    }
+                }
+                Terminator term = B.getTerminator();
+                if (term != null) {
+                    for (Value op : terminatorOperands(term)) {
+                        addIfCrossing(result, op, B, bodySet, entry);
+                    }
+                }
+            }
+        }
+        return result;
+    }
+
+    /**
+     * Добавляет {@code op} в результирующее множество, если это Temporary,
+     * определённый в {@code bodyBlocks} (не в {@code useBlock} и не в
+     * entry-блоке). Параметры пропускаются автоматически — они не Temporary.
+     */
+    private static void addIfCrossing(Set<Value> result,
+                                      Value op,
+                                      BasicBlock useBlock,
+                                      Set<BasicBlock> bodyBlocks,
+                                      BasicBlock entry) {
+        if (!(op instanceof Temporary t)) return;
+        Instruction def = t.getDefiningInstruction();
+        if (def == null) return;
+        BasicBlock defBlock = def.getParent();
+        if (defBlock == null) return;
+        if (defBlock == useBlock) return;
+        if (defBlock == entry) return;
+        if (!bodyBlocks.contains(defBlock)) return;
+        result.add(op);
+    }
+
+    /** Собирает операнды терминатора, включая key/target/exception/condition. */
+    private static List<Value> terminatorOperands(Terminator term) {
+        List<Value> out = new ArrayList<>();
+        if (term instanceof ReturnTerminator rt) {
+            if (rt.getValue() != null) out.add(rt.getValue());
+        } else if (term instanceof ThrowTerminator tt) {
+            if (tt.getException() != null) out.add(tt.getException());
+        } else if (term instanceof CondBranchTerminator cbt) {
+            if (cbt.getCondition() != null) out.add(cbt.getCondition());
+        } else if (term instanceof LookupSwitchTerminator lst) {
+            if (lst.getKey() != null) out.add(lst.getKey());
+        } else if (term instanceof TableSwitchTerminator tst) {
+            if (tst.getKey() != null) out.add(tst.getKey());
+        } else if (term instanceof IndirectBranchTerminator ibt) {
+            if (ibt.getTargetBlock() != null) out.add(ibt.getTargetBlock());
+        }
+        return out;
+    }
+
     private Set<Integer> collectUsedLocals(Function func) {
         Set<Integer> locals = new HashSet<>();
         for (BasicBlock block : func.getBlocks()) {
@@ -580,22 +897,49 @@ public class LlvmFunctionEmitter {
             sb.append(llvmLabel(block)).append(":\n");
         }
 
-        // Ranges that must be guarded in this block, filtered so that a
-        // block is never wrapped in the guard of a range whose handler is
-        // the block itself. See effectiveRangesFor() for the reasoning.
-        List<TryCatchRange> ranges = effectiveRangesFor(block);
-
-        for (Instruction inst : block.getInstructions()) {
-            sb.append(emitInstruction(inst, ranges));
+        // ---------- Trampoline blocks: emit pops + branch, then stop. ----------
+        //
+        // These blocks were materialised in computeTryRegions and are always
+        // emitted AFTER the block that owns the exit trampoline. They contain
+        // exactly one sequence of pops (one per active catch frame in the
+        // region being exited) followed by the block's single terminator.
+        List<TryCatchRange> trampolineRanges = trampolinePops.get(block);
+        if (trampolineRanges != null) {
+            sb.repeat("  call void @__jnative_pop_catch()\n", trampolineRanges.size());
+            Terminator trampTerm = block.getTerminator();
+            if (trampTerm != null) {
+                sb.append(emitTerminator(trampTerm, List.of(), Collections.emptyMap()));
+            } else {
+                sb.append("  unreachable\n");
+            }
+            return sb.toString();
         }
 
+        // ---------- Normal block: entry / body / exit / terminator ----------
+        List<TryCatchRange> ranges = effectiveRangesFor(block);
+        boolean isEntry = tryRegionEntry.getOrDefault(block, false);
+        boolean isExit  = tryRegionExit.getOrDefault(block, false);
         Terminator term = block.getTerminator();
+
+        // --- entry: arm the cascaded setjmp + push_catch ---
+        String bodyLabel;
+        if (isEntry && !ranges.isEmpty()) {
+            bodyLabel = newLabel("body");
+            RangeKey key = new RangeKey(ranges);
+            String catchLabel = catchLabelByRangeSet.get(key);
+            if (catchLabel == null) {
+                catchLabel = newLabel("catch_dispatch");
+                catchLabelByRangeSet.put(key, catchLabel);
+                StringBuilder cb = new StringBuilder();
+                emitCatchDispatchBody(cb, catchLabel, ranges);
+                catchBodyByRangeSet.put(key, cb);
+            }
+            emitRegionArm(sb, ranges, catchLabel, bodyLabel);
+            sb.append(bodyLabel).append(":\n");
+        }
+
+        // --- PHI preloads (for successor PHIs) — unchanged from previous revision ---
         if (term != null) {
-            // A successor's phi may use a value that lives in a try-guard slot.
-            // We cannot reload it inside the phi itself — phi operands must be
-            // bare values — so we materialise the load here, in the predecessor
-            // block, where the resulting SSA register dominates the edge to the
-            // successor.
             for (BasicBlock succ : term.getTargets()) {
                 int predIdx = succ.getPredecessors().indexOf(block);
                 if (predIdx < 0) continue;
@@ -605,49 +949,80 @@ public class LlvmFunctionEmitter {
                     Value phiOp = succInst.getOperands().get(predIdx);
                     if (phiOp == null) continue;
 
-                    // Slot-based preload (existing behaviour).
                     String slot = valueSlots.get(phiOp);
                     if (slot != null) {
                         String ty = LlvmTypeMapper.toLlvmType(phiOp.getType());
                         String tmp = newAux("phi_preload");
                         sb.append("  ").append(tmp).append(" = load ")
-                            .append(ty).append(", ").append(ty)
-                            .append("* ").append(slot).append("\n");
-                        phiPreloads
-                            .computeIfAbsent(succInst, k -> new HashMap<>())
-                            .put(predIdx, tmp);
+                          .append(ty).append(", ").append(ty).append("* ")
+                          .append(slot).append("\n");
+                        phiPreloads.computeIfAbsent(succInst, k -> new HashMap<>())
+                                   .put(predIdx, tmp);
                         continue;
                     }
 
-                    // ------------------------------------------------------------------
-                    // Stack-allocated object preload.
-                    //
-                    // A PHI operand is conceptually evaluated on the incoming edge,
-                    // so its SSA value must dominate the predecessor's terminator,
-                    // not the PHI's own block. The alloca in the entry block
-                    // dominates the predecessor terminator unconditionally, so
-                    // emitting a fresh bitcast here (right before the terminator,
-                    // in the predecessor block) is always well-formed.
-                    //
-                    // Doing this via the phiPreloads map keeps the same structure
-                    // as the valueSlots case above, so the PHI emission itself
-                    // needs no special-casing beyond checking phiPreloads first.
-                    // ------------------------------------------------------------------
                     StackAlloc ptrSlot = valuePointers.get(phiOp);
                     if (ptrSlot != null) {
                         String destTy = LlvmTypeMapper.toLlvmType(phiOp.getType());
                         String tmp = newAux("phi_preload");
                         sb.append("  ").append(tmp).append(" = bitcast ")
-                            .append(ptrSlot.structType()).append("* ")
-                            .append(ptrSlot.allocaName())
-                            .append(" to ").append(destTy).append("\n");
-                        phiPreloads
-                            .computeIfAbsent(succInst, k -> new HashMap<>())
-                            .put(predIdx, tmp);
+                          .append(ptrSlot.structType()).append("* ")
+                          .append(ptrSlot.allocaName())
+                          .append(" to ").append(destTy).append("\n");
+                        phiPreloads.computeIfAbsent(succInst, k -> new HashMap<>())
+                                   .put(predIdx, tmp);
                     }
                 }
             }
-            sb.append(emitTerminator(term, ranges));
+        }
+
+        // --- body instructions (no per-instruction guards; region is armed) ---
+        for (Instruction inst : block.getInstructions()) {
+            sb.append(emitInstruction(inst, List.of()));
+        }
+
+        // --- exit: emit pops for the all-outside case, or prepare redirects ---
+        Map<BasicBlock, String> targetRedirects = Collections.emptyMap();
+        if (isExit && !ranges.isEmpty()) {
+            boolean isReturn = (term == null) || (term instanceof ReturnTerminator);
+
+            boolean hasInsideNormalSucc  = false;
+            boolean hasOutsideNormalSucc = false;
+            if (!isReturn) {
+                for (BasicBlock succ : term.getTargets()) {
+                    if (sameRanges(effectiveRangesFor(succ), ranges)) hasInsideNormalSucc  = true;
+                    else                                                hasOutsideNormalSucc = true;
+                }
+            }
+
+            if (isReturn || (hasOutsideNormalSucc && !hasInsideNormalSucc)) {
+                // All normal exits are outside (or the block returns):
+                // pop inline, before the terminator. The exception path also
+                // pops, via the shared catch-dispatch block; the two paths
+                // are mutually exclusive.
+                sb.repeat("  call void @__jnative_pop_catch()\n", ranges.size());
+            } else if (hasOutsideNormalSucc && hasInsideNormalSucc) {
+                // Mixed exit: the trampolines created by computeTryRegions
+                // carry the per-edge pops.
+                Map<BasicBlock, BasicBlock> redirects = blockExitRedirects.get(block);
+                if (redirects != null && !redirects.isEmpty()) {
+                    targetRedirects = new HashMap<>();
+                    for (Map.Entry<BasicBlock, BasicBlock> e : redirects.entrySet()) {
+                        targetRedirects.put(e.getKey(), llvmLabel(e.getValue()));
+                    }
+                }
+                // If redirects is unexpectedly empty, we fall through to the
+                // terminator without redirects — but that cannot happen in a
+                // well-formed run, because computeTryRegions creates the
+                // trampolines exactly when both flags above are true.
+            }
+            // If only inside normal successors exist: nothing to do on the
+            // normal path; exception edges pop via catch-dispatch.
+        }
+
+        // --- terminator ---
+        if (term != null) {
+            sb.append(emitTerminator(term, List.of(), targetRedirects));
         } else {
             Type retType = block.getFunction().getReturnType();
             if (retType.isVoid()) {
@@ -655,7 +1030,7 @@ public class LlvmFunctionEmitter {
             } else {
                 String zero = getZeroValue(retType);
                 sb.append("  ret ").append(LlvmTypeMapper.toLlvmType(retType))
-                    .append(" ").append(zero).append("\n");
+                  .append(" ").append(zero).append("\n");
             }
         }
         return sb.toString();
@@ -1283,14 +1658,35 @@ public class LlvmFunctionEmitter {
                     break;
                 }
 
+                // ------------------------------------------------------------------
+                // Runtime-owned shutdown flag: defined in jnative_runtime.c as
+                // `volatile int gv_jnative_in_shutdown`, written exactly once via
+                // __jnative_begin_shutdown's __ATOMIC_RELEASE store. The reader side
+                // pairs with acquire so that any state the initializer published
+                // before the release is visible here.
+                //
+                // Routing through getFieldType() would call
+                // resolver.getField("", "jnative_in_shutdown"), install an empty-
+                // class stub in classMap, log a spurious "class not found"
+                // diagnostic, and fall back to the temp's declared type anyway. The
+                // explicit case avoids all three and emits the correct memory
+                // ordering in one step.
+                // ------------------------------------------------------------------
+                if ("jnative_in_shutdown".equals(bareField)) {
+                    sb.append("  ").append(resultName)
+                      .append(" = load atomic i32, i32* @").append(globalName)
+                      .append(" acquire, align 4\n");
+                    break;
+                }
+
                 Type fieldType = globalEmitter.getFieldType(owner, bareField);
                 if (fieldType == null) {
                     fieldType = inst.getResult().getType();
                 }
                 String llvmType = LlvmTypeMapper.toLlvmType(fieldType);
                 sb.append("  ").append(resultName).append(" = load ")
-                    .append(llvmType).append(", ")
-                    .append(llvmType).append("* @").append(globalName).append("\n");
+                  .append(llvmType).append(", ")
+                  .append(llvmType).append("* @").append(globalName).append("\n");
                 break;
             }
 
@@ -2449,8 +2845,13 @@ public class LlvmFunctionEmitter {
                     .append("* ").append(gepReg).append(" to i64\n");
 
                 String allocReg = newAux("alloc");
-                sb.append("  ").append(allocReg)
-                    .append(" = call i8* @calloc(i64 1, i64 ").append(sizeReg).append(")\n");
+                if (areAllInstanceFieldsFinal(className)) {
+                    sb.append("  ").append(allocReg)
+                        .append(" = call i8* @malloc(i64 ").append(sizeReg).append(")\n");
+                } else {
+                    sb.append("  ").append(allocReg)
+                        .append(" = call i8* @calloc(i64 1, i64 ").append(sizeReg).append(")\n");
+                }
 
                 sb.append("  ").append(resultName).append(" = bitcast i8* ").append(allocReg)
                     .append(" to ").append(structType).append("*\n");
@@ -2985,6 +3386,43 @@ public class LlvmFunctionEmitter {
             default:
                 sb.append("  ; unsupported opcode: ").append(op).append("\n");
         }
+
+        // Материализация значений, пересекающих try-границу.
+        //
+        // Значения, определённые в try-body и использованные в catch-region,
+        // обязаны жить в стек-слоте из entry-блока: их SSA-регистр определён в
+        // блоке, который в эмитированном LLVM CFG не доминирует точку
+        // использования (bodyLabel и catchLabel — сиблинги).
+        //
+        // Слот выделяется в entry-блоке (через pendingSlotDeclarations), запись
+        // выполняется сразу после определения, чтение — в точке каждого
+        // использования (см. getLlvmValue, ветка valueSlots).
+        if (inst.getResult() != null
+                && tryCrossingValues.contains(inst.getResult())
+                && !valueSlots.containsKey(inst.getResult())) {
+
+            // Инструкции, которые не материализуют свой результат (NOP, ветки
+            // dead code и т.п.), не должны получать store в слот — иначе в IR
+            // попадёт store из несуществующего SSA-регистра. Проверка через
+            // точный паттерн `  %tmp_N = ` (с ведущими двумя пробелами), которой
+            // пользуется весь эмиттер при определении значений.
+            resultName = valueMapper.getValue(inst.getResult());
+            String needle = "  " + resultName + " = ";
+            boolean resultActuallyDefined = resultName != null
+                && sb.toString().contains(needle);
+
+            if (resultActuallyDefined) {
+                Type resType = inst.getResult().getType();
+                String resLlvm = LlvmTypeMapper.toLlvmType(resType);
+                String slot = newAux("try_slot");
+                pendingSlotDeclarations.add(
+                    "  " + slot + " = alloca " + resLlvm + ", align 8\n");
+                sb.append("  store ").append(resLlvm).append(" ").append(resultName)
+                  .append(", ").append(resLlvm).append("* ").append(slot).append("\n");
+                valueSlots.put(inst.getResult(), slot);
+            }
+        }
+
         return sb.toString();
     }
 
@@ -3453,50 +3891,41 @@ public class LlvmFunctionEmitter {
      */
     private void emitCall(StringBuilder sb, Type retType, Value resultValue, String resultName,
                           List<TryCatchRange> ranges, CallEmitter emitter) {
-        String retLlvm = LlvmTypeMapper.toLlvmType(retType);
-
+        // Region-level hoisting means call sites never need their own guard:
+        // the enclosing region was armed at block entry.  `ranges` is
+        // therefore always empty here for guarded code; the non-empty branch
+        // is retained only for the legacy fallback that the analyzer might
+        // still construct for an unusual shape (it emits the same
+        // per-instruction guard it always did).
         if (ranges.isEmpty()) {
             emitter.emit(sb, retType.isVoid() ? null : resultName);
             return;
         }
-
         String slot = null;
         if (!retType.isVoid() && resultValue != null) {
             slot = newAux("call_slot");
-
-            // The alloca is deferred to the entry block (see emitFunction).
-            // Emitting it here, in the block that performs the call, would
-            // only make the slot's address available on paths that actually
-            // pass through this block. Any later load of the slot from a
-            // block reachable without crossing this one — for example a
-            // sibling guarded region that shares the enclosing continuation
-            // block — would then fail LLVM's dominance check with
-            // "Instruction does not dominate all uses!".
-            pendingSlotDeclarations.add(
-                "  " + slot + " = alloca " + retLlvm + ", align 8\n");
+            pendingSlotDeclarations.add("  " + slot + " = alloca "
+                + LlvmTypeMapper.toLlvmType(retType) + ", align 8\n");
         }
-
         final String slotRef = slot;
+        // Reuse the legacy per-instruction guard path — only reachable for
+        // fallback call sites outside any try region.
         emitTryGuard(sb, ranges, inner -> {
             if (!retType.isVoid()) {
                 String bodyResult = newAux("body_result");
-                // The emitter must use `inner` for every getLlvmValue it performs,
-                // so that arg slot_loads land in the guarded body, not in the
-                // pre-guard block.
                 emitter.emit(inner, bodyResult);
                 if (slotRef != null) {
-                    inner.append("  store ").append(retLlvm).append(" ")
-                        .append(bodyResult).append(", ").append(retLlvm)
-                        .append("* ").append(slotRef).append("\n");
+                    inner.append("  store ")
+                         .append(LlvmTypeMapper.toLlvmType(retType)).append(" ")
+                         .append(bodyResult).append(", ")
+                         .append(LlvmTypeMapper.toLlvmType(retType)).append("* ")
+                         .append(slotRef).append("\n");
                 }
             } else {
                 emitter.emit(inner, null);
             }
         }, false);
-
-        if (slotRef != null) {
-            valueSlots.put(resultValue, slotRef);
-        }
+        if (slotRef != null) valueSlots.put(resultValue, slotRef);
     }
 
     private void emitDivByZeroCheck(StringBuilder sb, Value divisor, List<TryCatchRange> ranges) {
@@ -3620,8 +4049,110 @@ public class LlvmFunctionEmitter {
         return r.type != null ? globalEmitter.getTypeInfoName(r.type) : null;
     }
 
-    private String emitTerminator(Terminator term, List<TryCatchRange> ranges) {
+    /**
+     * Emits the cascaded arm: for each try range in {@code ranges} (outermost
+     * first), a block that does {@code setjmp(buf); if (!ok) goto catch;
+     * push_catch(buf, type_info);} and branches to the next arm block or to
+     * {@code bodyLabel}.
+     *
+     * <p>The last setjmp emitted is the one for the innermost range (index 0
+     * in the list), so a longjmp from the body always lands on the innermost
+     * range's setjmp and dispatch checks it first — matching the reference
+     * semantics of the previous per-instruction guards.</p>
+     */
+    private void emitRegionArm(StringBuilder sb,
+                               List<TryCatchRange> ranges,
+                               String catchLabel,
+                               String bodyLabel) {
+        int k = ranges.size();
+        String[] armLabels = new String[k];
+        for (int i = 0; i < k; i++) armLabels[i] = newLabel("arm");
+
+        // Entry goes straight to the outermost arm (index k-1).
+        sb.append("  br label %").append(armLabels[k - 1]).append("\n");
+
+        for (int i = k - 1; i >= 0; i--) {
+            TryCatchRange r = ranges.get(i);
+            int ord = rangeOrdinals.get(r);
+            String arm  = armLabels[i];
+            String cont = newLabel("arm_cont");
+
+            sb.append(arm).append(":\n");
+            String bufPtr = newAux("sj_jb");
+            sb.append("  ").append(bufPtr).append(" = bitcast [")
+              .append(JMP_BUF_SIZE).append(" x i8]* %jmp_buf_").append(ord)
+              .append(" to i8*\n");
+            String sjRet = newAux("sj_ret");
+            sb.append("  ").append(sjRet).append(" = call i32 @_setjmp(i8* ")
+              .append(bufPtr).append(")\n");
+            String isZero = newAux("sj_zero");
+            sb.append("  ").append(isZero).append(" = icmp eq i32 ").append(sjRet)
+              .append(", 0\n");
+            sb.append("  br i1 ").append(isZero)
+              .append(", label %").append(cont)
+              .append(", label %").append(catchLabel).append("\n");
+
+            sb.append(cont).append(":\n");
+            sb.append("  call void @__jnative_push_catch(i8* ").append(bufPtr)
+              .append(", i8** ").append(catchTypeInfoOperand(r)).append(")\n");
+            if (i > 0) sb.append("  br label %").append(armLabels[i - 1]).append("\n");
+            else       sb.append("  br label %").append(bodyLabel).append("\n");
+        }
+    }
+
+    /**
+     * Emits a single shared catch-dispatch block per try-range set.  Matches
+     * the previous per-guard dispatch exactly: on a hit at range {@code i},
+     * pops {@code k - i} frames and jumps to the handler; on miss, pops one
+     * frame and rethrows to the next outer context.
+     */
+    private void emitCatchDispatchBody(StringBuilder sb,
+                                       String catchLabel,
+                                       List<TryCatchRange> ranges) {
+        sb.append(catchLabel).append(":\n");
+        String exc = newAux("caught_exc");
+        sb.append("  ").append(exc)
+          .append(" = call i8* @__jnative_get_exception_object()\n");
+
+        int k = ranges.size();
+        String[] missLabels = new String[k];
+        for (int i = 0; i < k; i++) missLabels[i] = newLabel("cmiss");
+
+        for (int i = 0; i < k; i++) {
+            TryCatchRange r = ranges.get(i);
+            if (i > 0) {
+                sb.append(missLabels[i - 1]).append(":\n");
+                sb.append("  call void @__jnative_pop_catch()\n");
+            }
+            String hitBlk = newLabel("chit");
+            String ti = r.type != null ? globalEmitter.getTypeInfoName(r.type) : null;
+            if (ti != null) {
+                String matches = newAux("cm");
+                sb.append("  ").append(matches)
+                  .append(" = call i1 @__jnative_catch_matches(i8* ").append(exc)
+                  .append(", i8** ").append(ti).append(")\n");
+                sb.append("  br i1 ").append(matches)
+                  .append(", label %").append(hitBlk)
+                  .append(", label %").append(missLabels[i]).append("\n");
+            } else {
+                sb.append("  br label %").append(hitBlk).append("\n");
+            }
+            sb.append(hitBlk).append(":\n");
+            sb.repeat("  call void @__jnative_pop_catch()\n", k - i);
+            BasicBlock handler = handlerBlockByRange.get(r);
+            sb.append("  br label %").append(llvmLabel(handler)).append("\n");
+        }
+        sb.append(missLabels[k - 1]).append(":\n");
+        sb.append("  call void @__jnative_pop_catch()\n");
+        sb.append("  call void @__jnative_throw_exception(i8* ").append(exc).append(")\n");
+        sb.append("  unreachable\n");
+    }
+
+    private String emitTerminator(Terminator term, List<TryCatchRange> ranges,
+                              Map<BasicBlock, String> targetRedirects) {
         StringBuilder sb = new StringBuilder();
+        java.util.function.Function<BasicBlock, String> targetLabel =
+            t -> targetRedirects != null ? targetRedirects.getOrDefault(t, llvmLabel(t)) : llvmLabel(t);
 
         if (term instanceof ReturnTerminator rt) {
             Value retVal = rt.getValue();
@@ -3641,12 +4172,13 @@ public class LlvmFunctionEmitter {
                 }
             }
         } else if (term instanceof BranchTerminator bt) {
-            sb.append("  br label %").append(llvmLabel(bt.getTarget())).append("\n");
+            sb.append("  br label %").append(targetLabel.apply(bt.getTarget())).append("\n");
         } else if (term instanceof CondBranchTerminator cbt) {
             String cond = getLlvmValue(sb, cbt.getCondition());
-            sb.append("  br i1 ").append(cond).append(", label %")
-                .append(llvmLabel(cbt.getTrueTarget())).append(", label %")
-                .append(llvmLabel(cbt.getFalseTarget())).append("\n");
+            sb.append("  br i1 ").append(cond)
+              .append(", label %").append(targetLabel.apply(cbt.getTrueTarget()))
+              .append(", label %").append(targetLabel.apply(cbt.getFalseTarget()))
+              .append("\n");
         } else if (term instanceof ThrowTerminator tt) {
             Value exc = tt.getException();
             String excRef = exc == null ? null : getPointerOperand(sb, exc);
@@ -3685,17 +4217,17 @@ public class LlvmFunctionEmitter {
             String keyRef = getLlvmValue(sb, key);
             String keyI32 = castValueToType(sb, keyRef, key.getType(), Type.INT);
             sb.append("  switch i32 ").append(keyI32).append(", label %")
-                .append(llvmLabel(defaultTarget)).append(" [\n");
+                .append(targetLabel.apply(defaultTarget)).append(" [\n");
             if (term instanceof LookupSwitchTerminator lst) {
                 for (int i = 0; i < lst.getKeys().length; i++) {
                     sb.append("    i32 ").append(lst.getKeys()[i]).append(", label %")
-                        .append(llvmLabel(lst.getTargetsArray()[i])).append("\n");
+                        .append(targetLabel.apply(lst.getTargetsArray()[i])).append("\n");
                 }
             } else {
                 TableSwitchTerminator tst = (TableSwitchTerminator) term;
                 for (int i = 0; i < tst.getTargetsArray().length; i++) {
                     sb.append("    i32 ").append(tst.getMin() + i).append(", label %")
-                        .append(llvmLabel(tst.getTargetsArray()[i])).append("\n");
+                        .append(targetLabel.apply(tst.getTargetsArray()[i])).append("\n");
                 }
             }
             sb.append("  ]\n");
@@ -3708,7 +4240,7 @@ public class LlvmFunctionEmitter {
                 sb.append("  indirectbr i8* ").append(blockAddr).append(", [");
                 for (int i = 0; i < targets.size(); i++) {
                     if (i > 0) sb.append(", ");
-                    sb.append("label %").append(llvmLabel(targets.get(i)));
+                    sb.append("label %").append(targetLabel.apply(targets.get(i)));
                 }
                 sb.append("]\n");
             }
@@ -4350,6 +4882,24 @@ public class LlvmFunctionEmitter {
             }
         }
         return Math.max(n, 1);
+    }
+
+    private boolean areAllInstanceFieldsFinal(String className) {
+        ClassNode cls = resolver.getClassNode(className);
+        if (cls == null || cls.isExternal()) return false;
+
+        ClassNode cur = cls;
+        java.util.Set<String> seen = new java.util.HashSet<>();
+        while (cur != null && !cur.isExternal() && seen.add(cur.getName())) {
+            for (FieldNode f : cur.getFields()) {
+                if ((f.getAccess() & org.objectweb.asm.Opcodes.ACC_STATIC) != 0) continue;
+                if ((f.getAccess() & org.objectweb.asm.Opcodes.ACC_FINAL) == 0) return false;
+            }
+            String sup = cur.getSuperName();
+            if (sup == null || sup.equals(cur.getName()) || "java/lang/Object".equals(sup)) break;
+            cur = resolver.getClassNode(sup);
+        }
+        return true;
     }
 
     private String emitBaseToI8Pointer(StringBuilder sb, Value base) {

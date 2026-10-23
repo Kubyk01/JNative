@@ -1196,7 +1196,113 @@ public class DestructorInserter {
         return "__destruct_unknown";
     }
 
-    private Temporary emitDestructionGuard(BasicBlock entry, Parameter thisParam) {
+    /**
+     * Wires the destructor entry block into the shared prologue that checks
+     * the shutdown flag, then either runs {@code __jnative_dtor_enter} (slow
+     * path) or jumps straight to {@code bodyFast} (fast path).
+     *
+     * <p>Fast path (every call outside shutdown):</p>
+     * <pre>
+     *   %shutdown = load atomic i32, i32* @gv_jnative_in_shutdown acquire
+     *   %in_shutdown = icmp ne i32 %shutdown, 0
+     *   br i1 %in_shutdown, label %slow, label %bodyFast
+     * </pre>
+     *
+     * <p>The load is atomic acquire (matching the release store in
+     * {@code __jnative_begin_shutdown}).  ThinLTO at -O2 inlines this into
+     * every call site, so the fast path becomes a single load, a compare and
+     * a branch — three instructions, no frame, no call.</p>
+     *
+     * <p>Slow path (only during {@code __jnative_shutdown}):</p>
+     * <pre>
+     * slow:
+     *   %r = call i32 @__jnative_dtor_enter(i8* %this)
+     *   %skip = icmp eq i32 %r, 0
+     *   br i1 %skip, label %return, label %bodySlow
+     * </pre>
+     *
+     * <p>{@code bodyFast} and {@code bodySlow} acquire a second predecessor
+     * ({@code slow}) in addition to the original {@code entry}.  No PHI node
+     * exists in a generated destructor, so nothing needs to be renumbered.</p>
+     */
+private void emitDestructionGuard(BasicBlock entry,
+                                       Parameter thisParam,
+                                       BasicBlock returnBlock,
+                                       BasicBlock bodyFast,
+                                       BasicBlock bodySlow) {
+        Function func = entry.getFunction();
+        if (func == null) {
+            throw new IllegalStateException(
+                "emitDestructionGuard: entry block '" + entry.getLabel()
+                    + "' is not attached to any Function");
+        }
+
+        // ---------------------------------------------------------------
+        // Null guard: деструктор вызывается с null как no-op.
+        //
+        // Контракт (см. emitMonomorphicRelease / emitPolymorphicRelease):
+        // когда освобождать нечего, инструментация перезаписи поля
+        // передаёт в деструктор null через select. Деструктор ОБЯЗАН
+        // вернуться немедленно, не трогая поля.
+        //
+        // Исторически этот контракт выполнялся только в slow-path через
+        // __jnative_dtor_enter(null) == 0. Но fast-path (body_fast) —
+        // это путь при gv_jnative_in_shutdown == 0, и он начинается
+        // сразу с GET_FIELD / GET_STATIC, первая же null-проверка базы
+        // которого бросает NPE. Наблюдаемое поведение (TestHeap):
+        //
+        //   NullPointerException: Cannot invoke destruct_TestHeap$Payload
+        //     because field 'TestHeap$Payload.padding' is null
+        //
+        // Фикс: явный null-guard в entry — до любой другой работы.
+        // ---------------------------------------------------------------
+        Instruction isNull = new Instruction(Opcode.EQ);
+        isNull.addOperand(thisParam);
+        isNull.addOperand(new Constant(Type.NULL, null));
+        Temporary isNullResult = new Temporary(Type.BOOLEAN);
+        isNull.setResult(isNullResult);
+        isNullResult.setDefiningInstruction(isNull);
+        entry.addInstruction(isNull);
+
+        BasicBlock entryAfterNull =
+            new BasicBlock(entry.getLabel() + "_after_null");
+        func.addBlock(entryAfterNull);
+
+        entry.setTerminator(
+            new CondBranchTerminator(isNullResult, returnBlock, entryAfterNull));
+        entry.addSuccessor(returnBlock);
+        entry.addSuccessor(entryAfterNull);
+
+        // ---------------------------------------------------------------
+        // Shutdown-guard — исходная логика, перенесённая в entryAfterNull.
+        // ---------------------------------------------------------------
+        BasicBlock slowCheck = new BasicBlock(entry.getLabel() + "_dtor_slow");
+        func.addBlock(slowCheck);
+
+        Instruction shutdownLoad = new Instruction(Opcode.GET_STATIC);
+        shutdownLoad.addOperand(new Constant(
+            Type.reference("jnative_in_shutdown"), "jnative_in_shutdown"));
+        Temporary shutdownVal = new Temporary(Type.INT);
+        shutdownLoad.setResult(shutdownVal);
+        shutdownVal.setDefiningInstruction(shutdownLoad);
+        entryAfterNull.addInstruction(shutdownLoad);
+
+        Instruction inShutdown = new Instruction(Opcode.NE);
+        inShutdown.addOperand(shutdownVal);
+        inShutdown.addOperand(new Constant(Type.INT, 0));
+        Temporary inShutdownBool = new Temporary(Type.BOOLEAN);
+        inShutdown.setResult(inShutdownBool);
+        inShutdownBool.setDefiningInstruction(inShutdown);
+        entryAfterNull.addInstruction(inShutdown);
+
+        entryAfterNull.setTerminator(
+            new CondBranchTerminator(inShutdownBool, slowCheck, bodyFast));
+        entryAfterNull.addSuccessor(slowCheck);
+        entryAfterNull.addSuccessor(bodyFast);
+
+        // ---------------------------------------------------------------
+        // Slow-path: __jnative_dtor_enter + claim-check (без изменений).
+        // ---------------------------------------------------------------
         Instruction enterCall = new Instruction(Opcode.STATIC_CALL);
         enterCall.addOperand(new Constant(
             Type.reference("__jnative_dtor_enter"), "__jnative_dtor_enter"));
@@ -1204,16 +1310,20 @@ public class DestructorInserter {
         Temporary enterResult = new Temporary(Type.INT);
         enterCall.setResult(enterResult);
         enterResult.setDefiningInstruction(enterCall);
-        entry.addInstruction(enterCall);
+        slowCheck.addInstruction(enterCall);
 
-        Instruction skip = new Instruction(Opcode.EQ);
-        skip.addOperand(enterResult);
-        skip.addOperand(new Constant(Type.INT, 0));
-        Temporary skipResult = new Temporary(Type.BOOLEAN);
-        skip.setResult(skipResult);
-        skipResult.setDefiningInstruction(skip);
-        entry.addInstruction(skip);
-        return skipResult;
+        Instruction skipInst = new Instruction(Opcode.EQ);
+        skipInst.addOperand(enterResult);
+        skipInst.addOperand(new Constant(Type.INT, 0));
+        Temporary skipBool = new Temporary(Type.BOOLEAN);
+        skipInst.setResult(skipBool);
+        skipBool.setDefiningInstruction(skipInst);
+        slowCheck.addInstruction(skipInst);
+
+        slowCheck.setTerminator(
+            new CondBranchTerminator(skipBool, returnBlock, bodySlow));
+        slowCheck.addSuccessor(returnBlock);
+        slowCheck.addSuccessor(bodySlow);
     }
 
     private void emitUnclaim(BasicBlock block, Parameter thisParam) {
@@ -1375,22 +1485,20 @@ public class DestructorInserter {
         Parameter thisParam = new Parameter(Type.reference(className), 0);
         func.addParameter(thisParam);
 
-        BasicBlock entry = new BasicBlock(funcName + "_entry");
-        func.addBlock(entry);
-        func.setEntryBlock(entry);
-
+        BasicBlock entry       = new BasicBlock(funcName + "_entry");
         BasicBlock returnBlock = new BasicBlock(funcName + "_return");
+        BasicBlock bodyFast    = new BasicBlock(funcName + "_body_fast");
+        BasicBlock bodySlow    = new BasicBlock(funcName + "_body_slow");
+        func.addBlock(entry);
         func.addBlock(returnBlock);
+        func.addBlock(bodyFast);
+        func.addBlock(bodySlow);
+        func.setEntryBlock(entry);
         returnBlock.setTerminator(new ReturnTerminator(null));
 
-        BasicBlock bodyBlock = new BasicBlock(funcName + "_body");
-        func.addBlock(bodyBlock);
+        emitDestructionGuard(entry, thisParam, returnBlock, bodyFast, bodySlow);
 
-        Temporary skipResult = emitDestructionGuard(entry, thisParam);
-        entry.setTerminator(new CondBranchTerminator(skipResult, returnBlock, bodyBlock));
-        entry.addSuccessor(returnBlock);
-        entry.addSuccessor(bodyBlock);
-
+        // ---- Fast path: destroy children, then __jnative_free_fast ----
         for (FieldNode field : collectAllReferenceFields(classNode)) {
             if ((field.getAccess() & Opcodes.ACC_STATIC) != 0) continue;
             Type fieldType = field.getType();
@@ -1407,16 +1515,45 @@ public class DestructorInserter {
             Temporary fieldValue = new Temporary(fieldType);
             getField.setResult(fieldValue);
             fieldValue.setDefiningInstruction(getField);
-            bodyBlock.addInstruction(getField);
+            bodyFast.addInstruction(getField);
 
-            emitFieldDestruction(bodyBlock, fieldValue, fieldType);
+            emitFieldDestruction(bodyFast, fieldValue, fieldType);
         }
 
-        emitUnclaim(bodyBlock, thisParam);
+        Instruction freeFast = new Instruction(Opcode.STATIC_CALL);
+        freeFast.addOperand(new Constant(
+            Type.reference("__jnative_free_fast"), "__jnative_free_fast"));
+        freeFast.addOperand(thisParam);
+        bodyFast.addInstruction(freeFast);
+        bodyFast.setTerminator(new ReturnTerminator(null));
+
+        // ---- Slow path: destroy children, unclaim, __jnative_free ----
+        for (FieldNode field : collectAllReferenceFields(classNode)) {
+            if ((field.getAccess() & Opcodes.ACC_STATIC) != 0) continue;
+            Type fieldType = field.getType();
+            if (!isManagedType(fieldType)) continue;
+
+            String fieldOwner = field.getOwner();
+            if (fieldOwner == null || fieldOwner.isEmpty()) fieldOwner = className;
+            String fullFieldName = fieldOwner + "." + field.getName();
+
+            Instruction getField = new Instruction(Opcode.GET_FIELD);
+            getField.addOperand(thisParam);
+            getField.addOperand(new Constant(
+                Type.reference(fullFieldName), fullFieldName));
+            Temporary fieldValue = new Temporary(fieldType);
+            getField.setResult(fieldValue);
+            fieldValue.setDefiningInstruction(getField);
+            bodySlow.addInstruction(getField);
+
+            emitFieldDestruction(bodySlow, fieldValue, fieldType);
+        }
+
+        emitUnclaim(bodySlow, thisParam);
         Instruction freeInst = new Instruction(Opcode.FREE);
         freeInst.addOperand(thisParam);
-        bodyBlock.addInstruction(freeInst);
-        bodyBlock.setTerminator(new ReturnTerminator(null));
+        bodySlow.addInstruction(freeInst);
+        bodySlow.setTerminator(new ReturnTerminator(null));
 
         return func;
     }
@@ -1535,103 +1672,185 @@ public class DestructorInserter {
         // prologue). The loop counter lives in slot 1.
         final int COUNTER_SLOT = 1;
 
-        BasicBlock entry = new BasicBlock(funcName + "_entry");
-        func.addBlock(entry);
-        func.setEntryBlock(entry);
-
+        BasicBlock entry       = new BasicBlock(funcName + "_entry");
         BasicBlock returnBlock = new BasicBlock(funcName + "_return");
+        BasicBlock bodyFast    = new BasicBlock(funcName + "_body_fast");
+        BasicBlock bodySlow    = new BasicBlock(funcName + "_body_slow");
+        func.addBlock(entry);
         func.addBlock(returnBlock);
+        func.addBlock(bodyFast);
+        func.addBlock(bodySlow);
+        func.setEntryBlock(entry);
         returnBlock.setTerminator(new ReturnTerminator(null));
 
-        BasicBlock bodyBlock = new BasicBlock(funcName + "_body");
-        func.addBlock(bodyBlock);
+        emitDestructionGuard(entry, arrParam, returnBlock, bodyFast, bodySlow);
 
-        Temporary skipResult = emitDestructionGuard(entry, arrParam);
-        entry.setTerminator(new CondBranchTerminator(skipResult, returnBlock, bodyBlock));
-        entry.addSuccessor(returnBlock);
-        entry.addSuccessor(bodyBlock);
-
+        // ---- Fast path: loop over elements, destroy each, then __jnative_free_fast ----
         // body: len = arraylength(arr); store local[1] = 0; br loop_header
-        Instruction lenInst = new Instruction(Opcode.ARRAYLENGTH);
-        lenInst.addOperand(arrParam);
-        Temporary lenVal = new Temporary(Type.INT);
-        lenInst.setResult(lenVal);
-        lenVal.setDefiningInstruction(lenInst);
-        bodyBlock.addInstruction(lenInst);
+        Instruction lenInstFast = new Instruction(Opcode.ARRAYLENGTH);
+        lenInstFast.addOperand(arrParam);
+        Temporary lenValFast = new Temporary(Type.INT);
+        lenInstFast.setResult(lenValFast);
+        lenValFast.setDefiningInstruction(lenInstFast);
+        bodyFast.addInstruction(lenInstFast);
 
-        Instruction counterInit = new Instruction(Opcode.STORE);
-        counterInit.addOperand(new Constant(Type.INT, 0));
-        counterInit.setLocalIndex(COUNTER_SLOT);
-        Temporary counterInitResult = new Temporary(Type.INT);
-        counterInit.setResult(counterInitResult);
-        counterInitResult.setDefiningInstruction(counterInit);
-        bodyBlock.addInstruction(counterInit);
+        Instruction counterInitFast = new Instruction(Opcode.STORE);
+        counterInitFast.addOperand(new Constant(Type.INT, 0));
+        counterInitFast.setLocalIndex(COUNTER_SLOT);
+        Temporary counterInitResultFast = new Temporary(Type.INT);
+        counterInitFast.setResult(counterInitResultFast);
+        counterInitResultFast.setDefiningInstruction(counterInitFast);
+        bodyFast.addInstruction(counterInitFast);
 
-        BasicBlock loopHeader = new BasicBlock(funcName + "_loop_header");
-        BasicBlock loopBody = new BasicBlock(funcName + "_loop_body");
-        BasicBlock loopAfter = new BasicBlock(funcName + "_loop_after");
-        func.addBlock(loopHeader);
-        func.addBlock(loopBody);
-        func.addBlock(loopAfter);
+        BasicBlock loopHeaderFast = new BasicBlock(funcName + "_loop_header_fast");
+        BasicBlock loopBodyFast = new BasicBlock(funcName + "_loop_body_fast");
+        BasicBlock loopAfterFast = new BasicBlock(funcName + "_loop_after_fast");
+        func.addBlock(loopHeaderFast);
+        func.addBlock(loopBodyFast);
+        func.addBlock(loopAfterFast);
 
-        bodyBlock.setTerminator(new BranchTerminator(loopHeader));
-        bodyBlock.addSuccessor(loopHeader);
+        bodyFast.setTerminator(new BranchTerminator(loopHeaderFast));
+        bodyFast.addSuccessor(loopHeaderFast);
 
         // loop_header: counter = load local[1]; if counter < len → loop_body else loop_after
-        Instruction counterLoad = new Instruction(Opcode.LOAD);
-        counterLoad.setLocalIndex(COUNTER_SLOT);
-        Temporary counter = new Temporary(Type.INT);
-        counterLoad.setResult(counter);
-        counter.setDefiningInstruction(counterLoad);
-        loopHeader.addInstruction(counterLoad);
+        Instruction counterLoadFast = new Instruction(Opcode.LOAD);
+        counterLoadFast.setLocalIndex(COUNTER_SLOT);
+        Temporary counterFast = new Temporary(Type.INT);
+        counterLoadFast.setResult(counterFast);
+        counterFast.setDefiningInstruction(counterLoadFast);
+        loopHeaderFast.addInstruction(counterLoadFast);
 
-        Instruction cmpLoop = new Instruction(Opcode.LT);
-        cmpLoop.addOperand(counter);
-        cmpLoop.addOperand(lenVal);
-        Temporary cmpLoopResult = new Temporary(Type.BOOLEAN);
-        cmpLoop.setResult(cmpLoopResult);
-        cmpLoopResult.setDefiningInstruction(cmpLoop);
-        loopHeader.addInstruction(cmpLoop);
-        loopHeader.setTerminator(new CondBranchTerminator(cmpLoopResult, loopBody, loopAfter));
-        loopHeader.addSuccessor(loopBody);
-        loopHeader.addSuccessor(loopAfter);
+        Instruction cmpLoopFast = new Instruction(Opcode.LT);
+        cmpLoopFast.addOperand(counterFast);
+        cmpLoopFast.addOperand(lenValFast);
+        Temporary cmpLoopResultFast = new Temporary(Type.BOOLEAN);
+        cmpLoopFast.setResult(cmpLoopResultFast);
+        cmpLoopResultFast.setDefiningInstruction(cmpLoopFast);
+        loopHeaderFast.addInstruction(cmpLoopFast);
+        loopHeaderFast.setTerminator(new CondBranchTerminator(cmpLoopResultFast, loopBodyFast, loopAfterFast));
+        loopHeaderFast.addSuccessor(loopBodyFast);
+        loopHeaderFast.addSuccessor(loopAfterFast);
 
         // loop_body: elem = arr[counter]; destroy(elem); counter++; store; br header
-        Instruction loadElem = new Instruction(Opcode.ALOAD);
-        loadElem.addOperand(arrParam);
-        loadElem.addOperand(counter);
-        Temporary elemVal = new Temporary(elementType);
-        loadElem.setResult(elemVal);
-        elemVal.setDefiningInstruction(loadElem);
-        loopBody.addInstruction(loadElem);
+        Instruction loadElemFast = new Instruction(Opcode.ALOAD);
+        loadElemFast.addOperand(arrParam);
+        loadElemFast.addOperand(counterFast);
+        Temporary elemValFast = new Temporary(elementType);
+        loadElemFast.setResult(elemValFast);
+        elemValFast.setDefiningInstruction(loadElemFast);
+        loopBodyFast.addInstruction(loadElemFast);
 
-        emitFieldDestruction(loopBody, elemVal, elementType);
+        emitFieldDestruction(loopBodyFast, elemValFast, elementType);
 
-        Instruction inc = new Instruction(Opcode.ADD);
-        inc.addOperand(counter);
-        inc.addOperand(new Constant(Type.INT, 1));
-        Temporary newCounter = new Temporary(Type.INT);
-        inc.setResult(newCounter);
-        newCounter.setDefiningInstruction(inc);
-        loopBody.addInstruction(inc);
+        Instruction incFast = new Instruction(Opcode.ADD);
+        incFast.addOperand(counterFast);
+        incFast.addOperand(new Constant(Type.INT, 1));
+        Temporary newCounterFast = new Temporary(Type.INT);
+        incFast.setResult(newCounterFast);
+        newCounterFast.setDefiningInstruction(incFast);
+        loopBodyFast.addInstruction(incFast);
 
-        Instruction storeCounter = new Instruction(Opcode.STORE);
-        storeCounter.addOperand(newCounter);
-        storeCounter.setLocalIndex(COUNTER_SLOT);
-        Temporary storedCounter = new Temporary(Type.INT);
-        storeCounter.setResult(storedCounter);
-        storedCounter.setDefiningInstruction(storeCounter);
-        loopBody.addInstruction(storeCounter);
+        Instruction storeCounterFast = new Instruction(Opcode.STORE);
+        storeCounterFast.addOperand(newCounterFast);
+        storeCounterFast.setLocalIndex(COUNTER_SLOT);
+        Temporary storedCounterFast = new Temporary(Type.INT);
+        storeCounterFast.setResult(storedCounterFast);
+        storedCounterFast.setDefiningInstruction(storeCounterFast);
+        loopBodyFast.addInstruction(storeCounterFast);
 
-        loopBody.setTerminator(new BranchTerminator(loopHeader));
-        loopBody.addSuccessor(loopHeader);
+        loopBodyFast.setTerminator(new BranchTerminator(loopHeaderFast));
+        loopBodyFast.addSuccessor(loopHeaderFast);
+
+        // loop_after: __jnative_free_fast(arr); ret
+        Instruction freeFast = new Instruction(Opcode.STATIC_CALL);
+        freeFast.addOperand(new Constant(
+            Type.reference("__jnative_free_fast"), "__jnative_free_fast"));
+        freeFast.addOperand(arrParam);
+        loopAfterFast.addInstruction(freeFast);
+        loopAfterFast.setTerminator(new ReturnTerminator(null));
+
+        // ---- Slow path: full shutdown semantics with unclaim ----
+        // body: len = arraylength(arr); store local[1] = 0; br loop_header
+        Instruction lenInstSlow = new Instruction(Opcode.ARRAYLENGTH);
+        lenInstSlow.addOperand(arrParam);
+        Temporary lenValSlow = new Temporary(Type.INT);
+        lenInstSlow.setResult(lenValSlow);
+        lenValSlow.setDefiningInstruction(lenInstSlow);
+        bodySlow.addInstruction(lenInstSlow);
+
+        Instruction counterInitSlow = new Instruction(Opcode.STORE);
+        counterInitSlow.addOperand(new Constant(Type.INT, 0));
+        counterInitSlow.setLocalIndex(COUNTER_SLOT);
+        Temporary counterInitResultSlow = new Temporary(Type.INT);
+        counterInitSlow.setResult(counterInitResultSlow);
+        counterInitResultSlow.setDefiningInstruction(counterInitSlow);
+        bodySlow.addInstruction(counterInitSlow);
+
+        BasicBlock loopHeaderSlow = new BasicBlock(funcName + "_loop_header_slow");
+        BasicBlock loopBodySlow = new BasicBlock(funcName + "_loop_body_slow");
+        BasicBlock loopAfterSlow = new BasicBlock(funcName + "_loop_after_slow");
+        func.addBlock(loopHeaderSlow);
+        func.addBlock(loopBodySlow);
+        func.addBlock(loopAfterSlow);
+
+        bodySlow.setTerminator(new BranchTerminator(loopHeaderSlow));
+        bodySlow.addSuccessor(loopHeaderSlow);
+
+        // loop_header: counter = load local[1]; if counter < len → loop_body else loop_after
+        Instruction counterLoadSlow = new Instruction(Opcode.LOAD);
+        counterLoadSlow.setLocalIndex(COUNTER_SLOT);
+        Temporary counterSlow = new Temporary(Type.INT);
+        counterLoadSlow.setResult(counterSlow);
+        counterSlow.setDefiningInstruction(counterLoadSlow);
+        loopHeaderSlow.addInstruction(counterLoadSlow);
+
+        Instruction cmpLoopSlow = new Instruction(Opcode.LT);
+        cmpLoopSlow.addOperand(counterSlow);
+        cmpLoopSlow.addOperand(lenValSlow);
+        Temporary cmpLoopResultSlow = new Temporary(Type.BOOLEAN);
+        cmpLoopSlow.setResult(cmpLoopResultSlow);
+        cmpLoopResultSlow.setDefiningInstruction(cmpLoopSlow);
+        loopHeaderSlow.addInstruction(cmpLoopSlow);
+        loopHeaderSlow.setTerminator(new CondBranchTerminator(cmpLoopResultSlow, loopBodySlow, loopAfterSlow));
+        loopHeaderSlow.addSuccessor(loopBodySlow);
+        loopHeaderSlow.addSuccessor(loopAfterSlow);
+
+        // loop_body: elem = arr[counter]; destroy(elem); counter++; store; br header
+        Instruction loadElemSlow = new Instruction(Opcode.ALOAD);
+        loadElemSlow.addOperand(arrParam);
+        loadElemSlow.addOperand(counterSlow);
+        Temporary elemValSlow = new Temporary(elementType);
+        loadElemSlow.setResult(elemValSlow);
+        elemValSlow.setDefiningInstruction(loadElemSlow);
+        loopBodySlow.addInstruction(loadElemSlow);
+
+        emitFieldDestruction(loopBodySlow, elemValSlow, elementType);
+
+        Instruction incSlow = new Instruction(Opcode.ADD);
+        incSlow.addOperand(counterSlow);
+        incSlow.addOperand(new Constant(Type.INT, 1));
+        Temporary newCounterSlow = new Temporary(Type.INT);
+        incSlow.setResult(newCounterSlow);
+        newCounterSlow.setDefiningInstruction(incSlow);
+        loopBodySlow.addInstruction(incSlow);
+
+        Instruction storeCounterSlow = new Instruction(Opcode.STORE);
+        storeCounterSlow.addOperand(newCounterSlow);
+        storeCounterSlow.setLocalIndex(COUNTER_SLOT);
+        Temporary storedCounterSlow = new Temporary(Type.INT);
+        storeCounterSlow.setResult(storedCounterSlow);
+        storedCounterSlow.setDefiningInstruction(storeCounterSlow);
+        loopBodySlow.addInstruction(storeCounterSlow);
+
+        loopBodySlow.setTerminator(new BranchTerminator(loopHeaderSlow));
+        loopBodySlow.addSuccessor(loopHeaderSlow);
 
         // loop_after: unclaim(arr); free(arr); ret
-        emitUnclaim(loopAfter, arrParam);
+        emitUnclaim(loopAfterSlow, arrParam);
         Instruction freeArr = new Instruction(Opcode.FREE);
         freeArr.addOperand(arrParam);
-        loopAfter.addInstruction(freeArr);
-        loopAfter.setTerminator(new ReturnTerminator(null));
+        loopAfterSlow.addInstruction(freeArr);
+        loopAfterSlow.setTerminator(new ReturnTerminator(null));
 
         return func;
     }
@@ -1647,27 +1866,33 @@ public class DestructorInserter {
         Parameter arrParam = new Parameter(arrayType, 0);
         func.addParameter(arrParam);
 
-        BasicBlock entry = new BasicBlock(funcName + "_entry");
-        func.addBlock(entry);
-        func.setEntryBlock(entry);
-
+        BasicBlock entry       = new BasicBlock(funcName + "_entry");
         BasicBlock returnBlock = new BasicBlock(funcName + "_return");
+        BasicBlock bodyFast    = new BasicBlock(funcName + "_body_fast");
+        BasicBlock bodySlow    = new BasicBlock(funcName + "_body_slow");
+        func.addBlock(entry);
         func.addBlock(returnBlock);
+        func.addBlock(bodyFast);
+        func.addBlock(bodySlow);
+        func.setEntryBlock(entry);
         returnBlock.setTerminator(new ReturnTerminator(null));
 
-        BasicBlock bodyBlock = new BasicBlock(funcName + "_body");
-        func.addBlock(bodyBlock);
+        emitDestructionGuard(entry, arrParam, returnBlock, bodyFast, bodySlow);
 
-        Temporary skipResult = emitDestructionGuard(entry, arrParam);
-        entry.setTerminator(new CondBranchTerminator(skipResult, returnBlock, bodyBlock));
-        entry.addSuccessor(returnBlock);
-        entry.addSuccessor(bodyBlock);
+        // Fast path — no shutdown checks, no claim bookkeeping.
+        Instruction freeFast = new Instruction(Opcode.STATIC_CALL);
+        freeFast.addOperand(new Constant(
+            Type.reference("__jnative_free_fast"), "__jnative_free_fast"));
+        freeFast.addOperand(arrParam);
+        bodyFast.addInstruction(freeFast);
+        bodyFast.setTerminator(new ReturnTerminator(null));
 
-        emitUnclaim(bodyBlock, arrParam);
+        // Slow path — full semantics during shutdown.
+        emitUnclaim(bodySlow, arrParam);
         Instruction freeInst = new Instruction(Opcode.FREE);
         freeInst.addOperand(arrParam);
-        bodyBlock.addInstruction(freeInst);
-        bodyBlock.setTerminator(new ReturnTerminator(null));
+        bodySlow.addInstruction(freeInst);
+        bodySlow.setTerminator(new ReturnTerminator(null));
 
         return func;
     }
@@ -1756,6 +1981,37 @@ public class DestructorInserter {
         }
 
         if (!noLaterUse(objRef, block, insertIndex)) return;
+
+        // ------------------------------------------------------------------
+        // Dominance check at the *insertion position*.
+        //
+        // objectRefAvailableAt consults the dominator tree of the block.
+        // The tree itself is computed lazily and cached per function;
+        // insertDestructorCall runs before any block split done by
+        // emitPolymorphicRelease of the SAME function — but not before
+        // splits done in *other* functions of the same module. Since the
+        // dominator tree is stored per Function, a fresh computation is
+        // required when insts have been reshuffled (the previous call may
+        // have called emitPolymorphicRelease on a different Function).
+        //
+        // The domTrees field is populated from DominatorTree(func), which
+        // is O(V+E) per function. To avoid recomputing it per insertion,
+        // invalidate the cached tree whenever the block or its predecessors
+        // change. Today emitPolymorphicRelease adds a new predecessor to
+        // `tail` and to the handler; the safest thing to do is to drop the
+        // cache entry for the function containing `block` right here if the
+        // tree was created before the current call.
+        //
+        // The simplest correct fix: compute the tree freshly at this point
+        // (objectRefAvailableAt does not cache), and let domTrees be
+        // memoised only by callers that know the CFG has been rebuilt.
+        // ------------------------------------------------------------------
+        Function func = block.getFunction();
+        if (func == null) return;
+        DominatorTree dom = new DominatorTree(func);
+        if (!valueAvailableAt(objRef, block, dom)) {
+            return;
+        }
 
         // ------------------------------------------------------------------
         // Find the last PUT_FIELD that stored objRef into a field.
@@ -1879,6 +2135,36 @@ public class DestructorInserter {
         Function func = block.getFunction();
         if (func == null) return false;
         DominatorTree dom = domTrees.computeIfAbsent(func, DominatorTree::new);
+        return dom.dominates(defBlock, block);
+    }
+
+    /**
+     * Checks whether a value is available at the given block using the
+     * provided dominator tree. Used when the cached dominator tree may be
+     * stale due to CFG modifications by earlier passes.
+     */
+    private boolean valueAvailableAt(Value objRef, BasicBlock block, DominatorTree dom) {
+        switch (objRef) {
+            case null -> {
+                return false;
+            }
+            case Constant ignored1 -> {
+                return true;
+            }
+            case Parameter ignored -> {
+                return true;
+            }
+            default -> {
+            }
+        }
+        if (!(objRef instanceof Temporary t)) return false;
+        Instruction def = t.getDefiningInstruction();
+        if (def == null) return false;
+        BasicBlock defBlock = def.getParent();
+        if (defBlock == null) return false;
+        if (defBlock == block) return true;
+        Function func = block.getFunction();
+        if (func == null) return false;
         return dom.dominates(defBlock, block);
     }
 
