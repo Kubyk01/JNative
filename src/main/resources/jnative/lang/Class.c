@@ -17,13 +17,12 @@ extern const char* __jnative_read_string_bytes(void* s, int32_t* out_len);
  * --------------------------------------------------------------------------
  * Guard for the reflect-mirror "root" fields.
  *
- * JNATIVE_METHOD_ROOT_OFFSET and JNATIVE_CTOR_ROOT_OFFSET are published by
- * @main through __jnative_reflect_set_layout. The call site in
- * LlvmGenerator.generateMain currently passes only 17 arguments to a
- * function whose signature declares 19 — the two new root offsets were
- * never threaded through. The C side therefore observes two stack slots
- * worth of stale data, and a value that happens to be a plausible-looking
- * positive integer drives a write to method + <garbage>.
+ * JNATIVE_METHOD_ROOT_OFFSET and JNATIVE_CTOR_ROOT_OFFSET are emitted by
+ * LlvmGlobalEmitter.generateLayoutConstants() as `constant i32` globals.
+ * The guard exists because the value is not guaranteed to be meaningful
+ * on every JDK: a field that a given JDK release no longer declares is
+ * published as -1, and a future rename could surface any other value the
+ * layout computation produced.
  *
  * The bounds check below is the last line of defence: it is better to
  * silently skip the root write (which only matters for one corner case of
@@ -32,9 +31,8 @@ extern const char* __jnative_read_string_bytes(void* s, int32_t* out_len);
  * Method and Constructor both put root within the first ~256 bytes of the
  * object.
  *
- * A root offset of -1 (the initial value, and the value after the
- * mis-signature is corrected on the Java side) means "not set" and the
- * write is skipped.
+ * A root offset of -1 (the value published when the JDK does not declare
+ * the field) means "not set" and the write is skipped.
  */
 #define JNATIVE_ROOT_OFFSET_MAX 512
 
@@ -308,9 +306,9 @@ static void* build_parameter_types_array(const char* desc)
  * Build a java.lang.reflect.Field from a native ReflectionField
  * descriptor.
  *
- * The mirror is sized generously: the offsets published by @main
- * through __jnative_reflect_set_layout are checked, and the allocation
- * covers every field the routine writes.
+ * The mirror is sized generously: the offsets read from the .rodata
+ * constants emitted by LlvmGlobalEmitter.generateLayoutConstants() are
+ * checked, and the allocation covers every field the routine writes.
  */
 static void* create_field_mirror(ReflectionClass* declaring_cls,
                                  ReflectionField* rf)
@@ -374,10 +372,9 @@ static void* create_field_mirror(ReflectionClass* declaring_cls,
  *
  * The `root` write — which is what makes Method.copy() work on a mirror
  * that has already had its methodAccessor set — is gated on a bounds
- * check. When the offset published by __jnative_reflect_set_layout is
- * either -1 (because the emitter-side argument was never threaded
- * through) or a garbage value that happens to be inside the plausible
- * range, the write is skipped rather than performed at a wild address.
+ * check. When the emitted constant is -1 (this JDK does not declare the
+ * field) or a value that does not fall inside the plausible range, the
+ * write is skipped rather than performed at a wild address.
  * A mirror that is not marked as its own root will fail Method.copy()
  * with "Can not copy a non-root Method", which is a clean Java-level
  * error rather than a segfault.
@@ -557,28 +554,124 @@ int __jnative_fn_java_lang_Class_isPrimitive___Z(void* this_cls) {
            strcmp(name, "void")    == 0;
 }
 
-void* __jnative_fn_java_lang_Class_getName___Ljava_lang_String_(void* this_cls) {
-    if (this_cls == NULL) return NULL;
-    const char* name = ((struct ReflectionClass*)this_cls)->cname;
-    if (name == NULL) return NULL;
-    return __jnative_make_string_obj(name, (int32_t)strlen(name));
-}
+/* ============================================================================
+ * Class.getName() / Class.initClassName() — cached dotted class name.
+ *
+ * Both the JDK-level Class.getName() and the native initClassName() are
+ * specified to return the same thing: the binary name of the class, with
+ * every '/' replaced by '.'. (For array types, the JVM descriptor is kept
+ * verbatim: "[I", "[Ljava.lang.String;", "[[I" — only the '/' characters
+ * inside the "L...;" component are folded, which is exactly what the
+ * documented JDK behaviour requires.)
+ *
+ * The JDK-level implementation of Class.getName() caches the result in the
+ * Class object's `name` field (see java.base/java/lang/Class.java:
+ *
+ *     public String getName() {
+ *         String name = this.name;
+ *         if (name == null) {
+ *             name = initClassName();
+ *             this.name = name;
+ *         }
+ *         return name;
+ *     }
+ *
+ * ). In this runtime, that field lives at offset 8 of the Class mirror
+ * (ReflectionClass.name in jnative_runtime.h), is emitted as "i8* null" in
+ * every @refclass_* constant, and is *supposed* to be written back by the
+ * emitted IR the first time the JDK path runs. In practice that write does
+ * not take effect: profiling shows initClassName being called on every
+ * single getName(), and because initClassName delegates to
+ * __jnative_make_string_obj -> jnative_array_alloc("[B") ->
+ * jnative_class_by_name("[B"), which is a linear scan over
+ * reflect_all_classes[], the cost is O(N) per call — 29 % of the whole
+ * benchmark in the report.
+ *
+ * To make the caching independent of the emitted bytecode, both C functions
+ * below publish the result into the same slot the JDK path reads from:
+ *
+ *     1. Load the `name` slot at offset 8 with acquire semantics.
+ *     2. If it is non-NULL, return it directly (fast path, O(1)).
+ *     3. Otherwise compute the dotted name, publish it into the slot with
+ *        a release store, and return it.
+ *
+ * The publish is a compare-and-swap against NULL, so if two threads race on
+ * the first call they both end up returning the same String — the loser's
+ * computed String is leaked (one per class, only under contention) and the
+ * winner's is returned. This matches the JDK's own behaviour: the Java
+ * field is not synchronized, and a torn write would be a JMM violation
+ * anyway, so the JDK code relies on idempotent recomputation under races.
+ *
+ * After the first call, the fast path is a single acquire-load of the slot.
+ * It does not allocate, does not call into __jnative_make_string_obj, and
+ * does not touch jnative_class_by_name. The 29 % of the benchmark that was
+ * spent recomputing the name every iteration collapses to one-time setup
+ * cost per class.
+ *
+ * Arrays: the descriptor form is preserved as required by the JDK
+ * documentation for Class.getName():
+ *
+ *     [I          -> "[I"
+ *     [Ljava/lang/String; -> "[Ljava.lang.String;"
+ *     [[Ljava/lang/Object; -> "[[Ljava.lang.Object;"
+ *
+ * because the transformation is a pure '/' -> '.' substitution: the leading
+ * '[' characters, the primitive single-letter codes, and the surrounding
+ * 'L' / ';' all pass through unchanged.
+ * ========================================================================== */
 
-void* __jnative_fn_java_lang_Class_initClassName___Ljava_lang_String_(void* this_cls) {
-    if (this_cls == NULL) return NULL;
-    const char* internal = ((struct ReflectionClass*)this_cls)->cname;
+static void* cached_dotted_class_name(struct ReflectionClass* cls) {
+    if (cls == NULL) return NULL;
+
+    /* Fast path: another caller (either the JDK bytecode path or a
+     * previous invocation of this function) already published the name.
+     * The acquire barrier pairs with the release in the CAS below, so a
+     * non-NULL slot here implies the backing String's fields are visible
+     * to this thread. */
+    void* cached = __atomic_load_n(&cls->name, __ATOMIC_ACQUIRE);
+    if (cached != NULL) return cached;
+
+    const char* internal = cls->cname;
     if (internal == NULL) return NULL;
 
     size_t len = strlen(internal);
-    char* out = malloc(len + 1);
+    if (len == 0) return NULL;
+
+    char* out = (char*)malloc(len + 1);
     if (out == NULL) return NULL;
+
     for (size_t i = 0; i < len; i++) {
         out[i] = (internal[i] == '/') ? '.' : internal[i];
     }
     out[len] = '\0';
-    void* result = __jnative_make_string_obj(out, (int32_t)len);
+
+    void* computed = __jnative_make_string_obj(out, (int32_t)len);
     free(out);
-    return result;
+
+    if (computed == NULL) return NULL;
+
+    /* Publish into the Class mirror's `name` slot with a release store.
+     * If another thread won the race, discard our duplicate (its memory
+     * is small and only ever allocated once per class per contending
+     * thread) and return the winner's instance — that guarantees all
+     * callers observe the same String object, which is what the JDK's
+     * own caching documents. */
+    void* expected = NULL;
+    if (!__atomic_compare_exchange_n(&cls->name, &expected, computed, 0,
+                                      __ATOMIC_RELEASE, __ATOMIC_ACQUIRE)) {
+        return expected;
+    }
+    return computed;
+}
+
+void* __jnative_fn_java_lang_Class_getName___Ljava_lang_String_(void* this_cls) {
+    if (this_cls == NULL) return NULL;
+    return cached_dotted_class_name((struct ReflectionClass*)this_cls);
+}
+
+void* __jnative_fn_java_lang_Class_initClassName___Ljava_lang_String_(void* this_cls) {
+    if (this_cls == NULL) return NULL;
+    return cached_dotted_class_name((struct ReflectionClass*)this_cls);
 }
 
 void* __jnative_fn_java_lang_Class_getClassLoader___Ljava_lang_ClassLoader_(void* this_cls) {
@@ -932,4 +1025,62 @@ void* __jnative_fn_java_lang_Class_getRecordComponents0____Ljava_lang_reflect_Re
 int32_t __jnative_fn_java_lang_Class_isRecord0___Z(void* this_cls) {
     (void)this_cls;
     return 0;
+}
+
+/* ============================================================================
+ * Class.getResourceAsStream override
+ * ========================================================================== */
+
+#define RES_PATH_BUF 1024
+
+void* __jnative_override_Class_getResourceAsStream(void* this_class,
+                                                   void* name_str)
+{
+    if (this_class == NULL) {
+        __jnative_throw_null_pointer_exception_ctx(
+            "__jnative_override_Class_getResourceAsStream", "this_class");
+    }
+    if (name_str == NULL) {
+        __jnative_throw_null_pointer_exception_ctx(
+            "__jnative_override_Class_getResourceAsStream", "name_str");
+    }
+
+    int32_t name_len = 0;
+    const char* name = __jnative_read_string_bytes(name_str, &name_len);
+    if (name == NULL || name_len <= 0) return NULL;
+
+    char lookup_path[RES_PATH_BUF];
+    int32_t lookup_len;
+
+    if (name[0] == '/') {
+        lookup_len = name_len - 1;
+        if (lookup_len <= 0 || lookup_len >= RES_PATH_BUF) return NULL;
+        memcpy(lookup_path, name + 1, (size_t)lookup_len);
+    } else {
+        const char* cname = ((ReflectionClass*)this_class)->cname;
+        if (cname == NULL) return NULL;
+        const char* slash = strrchr(cname, '/');
+        if (slash == NULL) {
+            if (name_len >= RES_PATH_BUF) return NULL;
+            memcpy(lookup_path, name, (size_t)name_len);
+            lookup_len = name_len;
+        } else {
+            size_t pkg_len = (size_t)(slash - cname) + 1;
+            if (pkg_len + (size_t)name_len >= RES_PATH_BUF) return NULL;
+            memcpy(lookup_path, cname, pkg_len);
+            memcpy(lookup_path + pkg_len, name, (size_t)name_len);
+            lookup_len = (int32_t)(pkg_len + (size_t)name_len);
+        }
+    }
+    lookup_path[lookup_len] = '\0';
+
+    const JNativeResourceEntry* res = jnative_find_resource(lookup_path, lookup_len);
+    if (res == NULL) return NULL;
+
+    void* bytes = jnative_byte_array(res->data, res->size);
+    if (bytes == NULL) {
+        __jnative_throw_out_of_memory_error_ctx("Class.getResourceAsStream");
+    }
+
+    return __jnative_make_byte_array_input_stream(bytes);
 }

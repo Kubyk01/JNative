@@ -28,6 +28,80 @@ import java.util.regex.Pattern;
  *
  * A trailing {@code __<mangledDesc>} on the method name encodes the JVM
  * descriptor, e.g. {@code getDefaultPRNG__ZBV_V} = {@code (Z[B)V}.
+ *
+ * <h2>Sentinel method names</h2>
+ *
+ * Two method names are special, because the JVM's canonical spelling of
+ * their method names contains angle brackets that are not legal in a C
+ * identifier:
+ *
+ * <ul>
+ *   <li>{@code clinit} → {@code <clinit>} with descriptor {@code ()V}.
+ *       The class-file format requires every class initializer to have
+ *       exactly that descriptor, so there is nothing to disambiguate.</li>
+ *
+ *   <li>{@code init} → {@code <init>} with descriptor {@code null}.
+ *       A class may declare more than one constructor, so the sentinel
+ *       cannot pin a specific descriptor. The override applies to every
+ *       reachable overload of {@code <init>} whose call site is emitted
+ *       in the module.</li>
+ * </ul>
+ *
+ * <h2>Why the {@code init} sentinel matches every overload</h2>
+ *
+ * <p>The mangling performed by
+ * {@code LlvmRuntime.sanitizeToAsciiIdentifier} replaces every character
+ * outside {@code [a-zA-Z0-9_]} — including both {@code '/'} (in class
+ * names) and {@code ';'} (at the end of {@code L...;} descriptors) —
+ * with a single {@code '_'}. The substitution is therefore
+ * <b>not injective</b> on the descriptor alphabet: {@code Ljava/lang/String;}
+ * and the already-sanitised {@code Ljava_lang_String_} produce the same
+ * mangled form, and there is no way to recover the original descriptor
+ * from a mangled string in general. For that reason the scanner cannot
+ * accept a {@code __<mangled-desc>} suffix on {@code init} and translate
+ * it back to the real descriptor.</p>
+ *
+ * <p>The consequence is a documented limitation of the {@code init}
+ * sentinel:</p>
+ *
+ * <ul>
+ *   <li>The C override's parameter list must be compatible with the
+ *       widest overload of {@code <init>} that is <b>reachable in the
+ *       compiled image</b>. If only one overload of a given class is
+ *       reachable, its own signature is sufficient. The
+ *       {@code java.security.ProtectionDomain} case uses the 4-argument
+ *       constructor, and the C override is declared with five
+ *       parameters (receiver + four).</li>
+ *
+ *   <li>If two or more overloads of {@code <init>} with different
+ *       arities are reachable in the same image, the emitter will
+ *       generate calls of both arities against the single declaration
+ *       emitted from the C override. LLVM rejects that mismatch at
+ *       code-generation time, so the failure mode is a visible build
+ *       error, not silent undefined behaviour.</li>
+ *
+ *   <li>When two overloads genuinely need different C implementations,
+ *       the override must be split across two C files with distinct
+ *       symbol names, and the scanner must be extended with a naming
+ *       convention that disambiguates the descriptor. The current
+ *       scanner deliberately does not attempt that, because the
+ *       reverse-mangler is lossy.</li>
+ * </ul>
+ *
+ * <h2>Reverse-mangling of the descriptor</h2>
+ *
+ * <p>When a method name carries a {@code __<mangled-desc>} suffix (as in
+ * {@code createLong__Ljava_lang_String_IIJ_Ljava_nio_ByteBuffer_}), the
+ * scanner calls {@link #unMangleDescriptor(String)}. Because the mangler
+ * is not injective, that method does not attempt a full reconstruction;
+ * it produces a string that is only meaningful as an identity key. The
+ * consequence is that overrides which need a specific descriptor to
+ * match (i.e. do <b>not</b> carry the {@code init} or {@code clinit}
+ * sentinel) must list their descriptor unambiguously in the C symbol
+ * name, and callers should not rely on the resulting {@code descriptor}
+ * field to be a syntactically valid JVM descriptor — it is used only
+ * for equality comparison against {@code MethodReference.getDescriptor()}
+ * in {@code BytecodeToIr.findOverride}.</p>
  */
 @Slf4j
 public final class NativeOverrideScanner {
@@ -106,6 +180,31 @@ public final class NativeOverrideScanner {
             if ("clinit".equals(methodName)) {
                 methodName = "<clinit>";
                 descriptor = "()V";
+            }
+
+            // ----------------------------------------------------------------
+            // <init> sentinel.
+            //
+            // Same angle-bracket problem as <clinit>, but with a twist: a
+            // class may declare multiple <init> overloads. The sentinel
+            // therefore matches every reachable overload, and the C
+            // function must be declared with a parameter list that covers
+            // the widest overload actually reached in the image.
+            //
+            // See the class javadoc for the full discussion of the
+            // trade-offs and the visible-failure mode that results from a
+            // mismatch.
+            //
+            // If a caller supplies a __<mangled-desc> suffix on "init",
+            // it is discarded: unMangleDescriptor cannot reconstruct the
+            // original descriptor from the mangled form, so accepting the
+            // suffix would produce a descriptor that never matches
+            // anything and silently disable the override. Discarding it
+            // makes the sentinel's behaviour explicit.
+            // ----------------------------------------------------------------
+            if ("init".equals(methodName)) {
+                methodName = "<init>";
+                descriptor = null;
             }
 
             List<String> cTypes = splitParams(cParams);

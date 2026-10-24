@@ -95,15 +95,19 @@ public class LlvmRuntime {
     public static String getDeclarations() {
         return """
             declare void @__jnative_debug_clinit(i8*)
-            declare void @__jnative_init_string_pool(i8**, i32)
+            declare void @__jnative_run_parallel(i8**, i32)
             declare i8* @malloc(i64)
             declare i8* @calloc(i64, i64)
             declare void @free(i8*)
             declare void @__jnative_free(i8*)
+            declare void @__jnative_free_fast(i8*)
+            declare void @__jnative_destruct_dispatch(i8*)
+            declare void @__jnative_destruct_dispatch_if_not_same(i8*, i8*)
 
             declare void @__jnative_begin_shutdown()
             declare i32  @__jnative_dtor_enter(i8*)
             declare void @__jnative_dtor_unclaim(i8*)
+            declare i32  @__jnative_is_shutdown()
 
             declare i32 @printf(i8*, ...)
             declare void @abort() noreturn
@@ -176,6 +180,11 @@ public class LlvmRuntime {
 
             declare i8* @__jnative_invoke_method(i8*, i8*, i8**)
             declare i8* @__jnative_new_instance(i8*, i8**)
+
+            declare i8* @__jnative_get_jnienv()
+            declare i8* @__jnative_get_thread_jnienv()
+
+            declare i8* @jnative_static_field_address(i8*, i8*)
             """;
     }
 
@@ -421,17 +430,67 @@ public class LlvmRuntime {
     }
 
     /**
-     * Mangles a class and method name into the {@code fn_<class>_<name>}
-     * prefix used by the emitter for helper functions that are not tied to a
-     * specific descriptor — for example the reflection adaptors, or the
-     * per-class lazy-{@code <clinit>} guard wrappers.
+     * Builds the JNI-compatible symbol name for a Java {@code native}
+     * method, following the "Resolving Native Method Names" rules of the
+     * JNI specification:
      *
-     * <p>The result does not include a descriptor suffix, so callers that
-     * need a fully qualified symbol should use {@link #mangleMethod}
-     * instead.</p>
+     * <pre>
+     *   Java_&lt;mangled-owner&gt;_&lt;mangled-name&gt;
+     * </pre>
+     *
+     * <p>Mangling maps {@code '_' -> "_1"}, {@code ';' -> "_2"},
+     * {@code '[' -> "_3"}, {@code '/'} and {@code '.'} to a single
+     * underscore, and every other non-alphanumeric character to
+     * {@code "_0XXXX"} (four lowercase hex digits). When the class
+     * declares more than one method with the same name (an overload set),
+     * the descriptor is appended as {@code "__<mangled-desc>"}, which is
+     * the JNI convention for disambiguating overloads.</p>
+     *
+     * @param owner              internal class name, e.g. {@code "java/io/File"}
+     * @param name               the Java method name
+     * @param descriptor         the JVM method descriptor
+     * @param ownerOverloadCount number of methods with {@code name} declared
+     *                           by {@code owner}; values greater than 1 add
+     *                           the {@code __<descriptor>} suffix
      */
-    public static String mangleBase(String className, String methodName) {
-        return "fn_" + sanitizeToAsciiIdentifier(className)
-            + "_" + sanitizeToAsciiIdentifier(methodName);
+    public static String toJniSymbolName(String owner, String name,
+                                         String descriptor, int ownerOverloadCount) {
+        StringBuilder sb = new StringBuilder("Java_");
+        appendJniMangled(sb, owner);
+        sb.append('_');
+        appendJniMangled(sb, name);
+        if (ownerOverloadCount > 1) {
+            sb.append("__");
+            appendJniMangled(sb, descriptor);
+        }
+        return sb.toString();
+    }
+
+    /**
+     * Appends the JNI mangling of {@code s} to {@code sb}. See
+     * {@link #toJniSymbolName(String, String, String, int)} for the
+     * character mapping.
+     */
+    public static void appendJniMangled(StringBuilder sb, String s) {
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+                || (c >= '0' && c <= '9')) {
+                sb.append(c);
+            } else if (c == '/' || c == '.') {
+                sb.append('_');
+            } else if (c == '_') {
+                sb.append("_1");
+            } else if (c == ';') {
+                sb.append("_2");
+            } else if (c == '[') {
+                sb.append("_3");
+            } else {
+                sb.append("_0");
+                String hex = Integer.toHexString(c);
+                sb.repeat("0", 4 - hex.length());
+                sb.append(hex);
+            }
+        }
     }
 }

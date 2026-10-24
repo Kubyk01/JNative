@@ -23,6 +23,7 @@ import io.github.kubyk01.domain.ir.Type;
 import io.github.kubyk01.domain.ir.UndefinedValue;
 import io.github.kubyk01.domain.ir.Value;
 import lombok.Getter;
+import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
 import org.objectweb.asm.Handle;
 import org.objectweb.asm.Label;
@@ -70,6 +71,64 @@ public class MethodTranslator extends MethodVisitor {
     private final Map<Label, List<Type>> labelStackTypes = new HashMap<>();
     private int nextSyntheticLocal = 10000;
 
+    /**
+     * Bytecode offset of the instruction currently being visited, or -1
+     * if no offset has been observed yet. Fed by {@link
+     * BytecodeToIr}'s {@code ClassReader} wrapper through
+     * {@link #setCurrentBytecodeOffset(int)}.
+     * -- SETTER --
+     *  Called by
+     * 's
+     *  wrapper for every bytecode instruction. Stores the instruction's
+     *  bytecode offset so that try-range bodies can be computed from the
+     *  bytecode interval
+     *  rather than from CFG
+     *  reachability.
+     *  <p>Rationale.
+     *  computes the body
+     *  of a try-range as the set of blocks reachable from
+     *  without going through
+     * . For a try-range inside a loop
+     *  that is not the whole-method approximation: the only path from
+     *
+     *  to
+     *  in the CFG runs around the entire
+     *  loop, so the BFS pulls in the loop header, the loop tail and every
+     *  block that feeds back into the header. For a try-range with an
+     *  exception handler that jumps back to the loop header — the exact
+     *  pattern in
+     *  —
+     *  that produces false exceptional edges such as
+     *
+     * , which in turn make the handler's
+     *  reads appear live in the loop header and create PHI nodes whose
+     *  preheader operand has never been assigned. The PHI's incoming
+     *  value on the preheader edge does not exist in the JVM verifier's
+     *  model (the slot is not definitely assigned on that path), and
+     *
+     *  correctly refuses to invent
+     *  one: it emits
+     * , which
+     *
+     *  then rejects.</p>
+     *  <p>The bytecode-interval formulation is the semantics the JVM
+     *  specification uses: the protected range of a try-catch entry is a
+     *  half-open interval over the bytecode offsets of the method body.
+     *  A block belongs to the body iff its first bytecode instruction has
+     *  an offset in
+     * .</p>
+
+     */
+    @Setter
+    private int currentBytecodeOffset = -1;
+
+    /**
+     * Bytecode offset of the first instruction of each basic block.
+     * Used to compute try-range bodies from the bytecode interval
+     * {@code [start, end)}. See {@link #setCurrentBytecodeOffset(int)}.
+     */
+    private final Map<BasicBlock, Integer> blockOffsets = new HashMap<>();
+
     @Getter
     private Function currentFunction;
     private BasicBlock currentBlock;
@@ -84,6 +143,26 @@ public class MethodTranslator extends MethodVisitor {
         this.frame = new StackFrame(builder);
         this.tryCatchHandler = new TryCatchHandler(labelToBlock);
         this.handlers = new InstructionHandlers(builder, frame, resolver);
+    }
+
+    /**
+     * Records {@code currentBytecodeOffset} against the current basic
+     * block if that block does not yet have an offset. Called at the
+     * start of every {@code visitXxxInsn} so that a block created by
+     * {@link #createNextBlock()} (a synthetic fallthrough of a
+     * conditional branch) picks up the offset of the first instruction
+     * that lands in it.
+     *
+     * <p>Never overwrites: the offset of a block is the offset of its
+     * first bytecode instruction, which is the only one that matters for
+     * the try-range membership test.</p>
+     */
+    private void recordBlockOffset() {
+        BasicBlock current = builder.currentBlock();
+        if (current == null) return;
+        if (blockOffsets.containsKey(current)) return;
+        if (currentBytecodeOffset < 0) return;
+        blockOffsets.put(current, currentBytecodeOffset);
     }
 
     @Override
@@ -128,15 +207,32 @@ public class MethodTranslator extends MethodVisitor {
         }
 
         if (current != null
-            && current != target
-            && current.getTerminator() == null
-            && !handlerLabels.contains(label)) {
+                && current != target
+                && current.getTerminator() == null
+                && !handlerLabels.contains(label)) {
             emitStackStoresForTarget(label);
             current.setTerminator(new BranchTerminator(target));
         }
 
         currentBlock = target;
         builder.setCurrentBlock(target);
+
+        // The label itself carries the bytecode offset of the instruction
+        // that follows it. Record that offset for the target block.
+        if (currentBytecodeOffset >= 0 && !blockOffsets.containsKey(target)) {
+            blockOffsets.put(target, currentBytecodeOffset);
+        }
+        // If the previous block is now a pure pass-through (it has no
+        // instructions of its own and was just terminated with a branch
+        // to the label), give it the same offset. This is the common case
+        // for the method entry block, which becomes
+        // `entry: br label %L0` before any instruction is emitted.
+        if (current != null && current != target
+                && current.getInstructions().isEmpty()
+                && !blockOffsets.containsKey(current)
+                && currentBytecodeOffset >= 0) {
+            blockOffsets.put(current, currentBytecodeOffset);
+        }
 
         if (handlerLabels.contains(label)) {
             frame.clear();
@@ -152,6 +248,7 @@ public class MethodTranslator extends MethodVisitor {
 
     @Override
     public void visitInsn(int opcode) {
+        recordBlockOffset();
         switch (opcode) {
             case Opcodes.ACONST_NULL:
                 handlers.pushNull();
@@ -408,6 +505,7 @@ public class MethodTranslator extends MethodVisitor {
 
     @Override
     public void visitIntInsn(int opcode, int operand) {
+        recordBlockOffset();
         switch (opcode) {
             case Opcodes.BIPUSH:
             case Opcodes.SIPUSH:
@@ -423,6 +521,7 @@ public class MethodTranslator extends MethodVisitor {
 
     @Override
     public void visitVarInsn(int opcode, int var) {
+        recordBlockOffset();
         switch (opcode) {
             case Opcodes.ILOAD:
             case Opcodes.LLOAD:
@@ -468,6 +567,7 @@ public class MethodTranslator extends MethodVisitor {
 
     @Override
     public void visitIincInsn(int var, int increment) {
+        recordBlockOffset();
         Instruction load = builder.createLoad(var, Type.INT);
         Value loaded = load.getResult();
 
@@ -481,6 +581,7 @@ public class MethodTranslator extends MethodVisitor {
 
     @Override
     public void visitTypeInsn(int opcode, String type) {
+        recordBlockOffset();
         switch (opcode) {
             case Opcodes.NEW:
                 handlers.newObject(type);
@@ -501,6 +602,7 @@ public class MethodTranslator extends MethodVisitor {
 
     @Override
     public void visitFieldInsn(int opcode, String owner, String name, String desc) {
+        recordBlockOffset();
         switch (opcode) {
             case Opcodes.GETFIELD:
                 handlers.getField(owner, name);
@@ -521,6 +623,7 @@ public class MethodTranslator extends MethodVisitor {
 
     @Override
     public void visitMethodInsn(int opcode, String owner, String name, String desc, boolean isInterface) {
+        recordBlockOffset();
         if (owner.equals("java/lang/Class")
             && name.equals("desiredAssertionStatus")
             && desc.equals("()Z")) {
@@ -551,6 +654,7 @@ public class MethodTranslator extends MethodVisitor {
 
     @Override
     public void visitJumpInsn(int opcode, Label label) {
+        recordBlockOffset();
         switch (opcode) {
             case Opcodes.GOTO: {
                 BasicBlock target = getOrCreateBlock(label, frame.size());
@@ -656,6 +760,7 @@ public class MethodTranslator extends MethodVisitor {
 
     @Override
     public void visitLookupSwitchInsn(Label dflt, int[] keys, Label[] labels) {
+        recordBlockOffset();
         Value key = frame.pop();
 
         BasicBlock defaultBlock = getOrCreateBlock(dflt, frame.size());
@@ -672,6 +777,7 @@ public class MethodTranslator extends MethodVisitor {
 
     @Override
     public void visitTableSwitchInsn(int min, int max, Label dflt, Label... labels) {
+        recordBlockOffset();
         Value key = frame.pop();
 
         BasicBlock defaultBlock = getOrCreateBlock(dflt, frame.size());
@@ -688,6 +794,7 @@ public class MethodTranslator extends MethodVisitor {
 
     @Override
     public void visitLdcInsn(Object value) {
+        recordBlockOffset();
         switch (value) {
             case Integer i -> handlers.pushInt(i);
             case Long l -> handlers.pushLong(l);
@@ -712,6 +819,7 @@ public class MethodTranslator extends MethodVisitor {
 
     @Override
     public void visitMultiANewArrayInsn(String desc, int dims) {
+        recordBlockOffset();
         handlers.multiNewArray(desc, dims);
     }
 
@@ -724,6 +832,7 @@ public class MethodTranslator extends MethodVisitor {
 
     @Override
     public void visitInvokeDynamicInsn(String name, String desc, Handle bsm, Object... bsmArgs) {
+        recordBlockOffset();
         List<Type> paramTypes = TypeResolver.descToParamTypes(desc);
         List<Value> captured = new ArrayList<>();
         for (int i = 0; i < paramTypes.size(); i++) {
@@ -830,6 +939,35 @@ public class MethodTranslator extends MethodVisitor {
             }
         }
 
+        // ------------------------------------------------------------------
+        // Compute each try-range's protected body from its BYTECODE
+        // interval [start, end).
+        //
+        // The previous implementation used GraphUtils.getBlocksBetween — a
+        // BFS over CFG reachability. For a try-range inside a loop that
+        // over-approximates the body: the only CFG path from `start` to
+        // `end` goes around the whole loop, so the BFS pulls in the loop
+        // header, the loop tail and every feedback block. The result is
+        // false exceptional edges (loop_header → handler), which propagate
+        // liveness of a slot backwards past its definition, create PHIs
+        // whose preheader operand has never been assigned, and produce an
+        // UndefinedValue that OutOfSsaPass correctly rejects.
+        //
+        // The bytecode-interval formulation is the JVMS semantics: the
+        // protected range of a try-catch entry is the half-open interval
+        // [start, end) over the bytecode offsets of the method body. A
+        // block belongs to the body iff its first bytecode instruction has
+        // an offset in [start, end).
+        //
+        // If the offset tracking produced no data for the boundaries (an
+        // ASM build whose ClassReader does not call
+        // readBytecodeInstructionOffset, or a degenerate / malformed
+        // range), fall back to the previous reachability-based
+        // approximation. This preserves the previous (buggy but
+        // functionally-over-approximating) behaviour on any environment
+        // where the offset hook did not fire, so the fix never makes
+        // things worse.
+        // ------------------------------------------------------------------
         for (TryCatchRange range : tryCatchRanges) {
             BasicBlock rangeStart   = labelToBlock.get(range.start);
             BasicBlock rangeEnd     = labelToBlock.get(range.end);
@@ -837,11 +975,42 @@ public class MethodTranslator extends MethodVisitor {
             if (rangeStart == null || rangeEnd == null || rangeHandler == null) {
                 continue;
             }
-            range.body = GraphUtils.getBlocksBetween(
-                    rangeStart, rangeEnd, rangeHandler);
+
+            Integer startOff = blockOffsets.get(rangeStart);
+            Integer endOff   = blockOffsets.get(rangeEnd);
+            if (startOff == null || endOff == null || startOff >= endOff) {
+                // Offset tracking did not produce a usable interval.
+                // Fall back to the pre-fix reachability-based body. See the
+                // block comment above.
+                range.body = GraphUtils.getBlocksBetween(
+                        rangeStart, rangeEnd, rangeHandler);
+                continue;
+            }
+
+            List<BasicBlock> body = new ArrayList<>();
+            for (Map.Entry<BasicBlock, Integer> e : blockOffsets.entrySet()) {
+                BasicBlock b = e.getKey();
+                if (b == rangeHandler) continue;
+                int off = e.getValue();
+                if (off >= startOff && off < endOff) {
+                    body.add(b);
+                }
+            }
+            range.body = body;
         }
 
-        tryCatchHandler.handle();
+        // NOTE: TryCatchHandler.handle() is deliberately NOT called.
+        //
+        // The same false-edge defect as in the body computation above lived
+        // inside TryCatchHandler.handle(): it recomputed the body via
+        // GraphUtils.getBlocksBetween and added an exceptional successor
+        // from EVERY block in that (over-approximated) body — including
+        // blocks with no throwing instructions. addExceptionalEdges() below
+        // already adds the edges precisely (only from blocks that actually
+        // contain a throwing instruction or throwing terminator), and it
+        // uses the corrected range.body. Calling TryCatchHandler.handle()
+        // in addition would re-introduce the over-approximation it was
+        // meant to avoid.
         currentFunction.setTryCatchRanges(tryCatchRanges);
         addExceptionalEdges();
     }

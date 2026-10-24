@@ -21,5 +21,6 @@ public enum Opcode {
     JSR, INDIRECT_BRANCH,
     NOP,
     PHI,
+    SELECT,          // branchless conditional selection
     INVOKEDYNAMIC
 }

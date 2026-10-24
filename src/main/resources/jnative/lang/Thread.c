@@ -11,7 +11,7 @@
 #include "jnative_runtime.h"
 
 /* ============================================================================
- * Thread object layout handoff
+ * Thread object layout constants
  * ============================================================================
  *
  * The C runtime synthesises the "main" java.lang.Thread object lazily, the
@@ -20,35 +20,18 @@
  * constructor has run -- inside jdk.internal.misc.CarrierThread.<clinit> --
  * so the object has to be fully valid from C.
  *
- * The offsets below are NOT hard-coded. They are pushed in from @main by
- * LlvmGenerator.generateMain() through __jnative_thread_set_layout(). The
- * values come from LlvmGlobalEmitter.getFieldOffset() and
- * computeObjectSize(), which are the same functions that produced the
- * %struct.java_lang_Thread* LLVM types in the compiled module. Any JDK
- * field reordering changes both sides in lockstep.
+ * The offsets below are NOT hard-coded. They are declared extern const in
+ * jnative_runtime.h and defined as LLVM `constant i32` globals in
+ * _module.ll by LlvmGlobalEmitter.generateLayoutConstants(). The values
+ * come from LlvmGlobalEmitter.getFieldOffset() and computeObjectSize(),
+ * which are the same functions that produced the %struct.java_lang_Thread*
+ * LLVM types in the compiled module. Any JDK field reordering changes
+ * both sides in lockstep.
  *
- * Until __jnative_thread_set_layout() runs, every offset is -1 and the
- * synthesiser refuses to build an object rather than building one with
- * guessed offsets. This is a hard fail-safe: the alternative is producing
- * an object whose layout silently disagrees with the emitted bytecode.
+ * A value of -1 means "this JDK does not declare that field"; every
+ * consumer below tests for it and skips the write rather than building an
+ * object whose layout silently disagrees with the emitted bytecode.
  * ========================================================================== */
-
-static int32_t THREAD_OBJECT_SIZE         = -1;
-static int32_t THREAD_HOLDER_OFFSET       = -1;
-static int32_t THREAD_TID_OFFSET          = -1;
-static int32_t THREAD_NAME_OFFSET         = -1;
-static int32_t THREAD_INTERRUPTLOCK_OFFSET = -1;
-
-static int32_t FH_OBJECT_SIZE        = -1;
-static int32_t FH_GROUP_OFFSET       = -1;
-static int32_t FH_PRIORITY_OFFSET    = -1;
-static int32_t FH_DAEMON_OFFSET      = -1;
-static int32_t FH_STATUS_OFFSET      = -1;
-
-static int32_t TG_OBJECT_SIZE        = -1;
-static int32_t TG_NAME_OFFSET        = -1;
-static int32_t TG_MAXPRIORITY_OFFSET = -1;
-static int32_t TG_VMALLOW_OFFSET     = -1;
 
 /*
  * JVMTI thread-status bits, as consumed by jdk.internal.misc.VM.toThreadState.
@@ -63,65 +46,7 @@ static int32_t TG_VMALLOW_OFFSET     = -1;
 #define JNATIVE_THREAD_NORM_PRIORITY  5
 #define JNATIVE_THREAD_MAX_PRIORITY   10
 
-/**
- * Hand-off from LlvmGenerator.generateMain. Idempotent: a second call with
- * the same values is a no-op, a second call with different values is a
- * programming error and is reported to stderr.
- */
-void __jnative_thread_set_layout(
-    int32_t thread_object_size,
-    int32_t thread_holder_offset,
-    int32_t thread_tid_offset,
-    int32_t thread_name_offset,
-    int32_t thread_interruptlock_offset,
-    int32_t fh_object_size,
-    int32_t fh_group_offset,
-    int32_t fh_priority_offset,
-    int32_t fh_daemon_offset,
-    int32_t fh_status_offset,
-    int32_t tg_object_size,
-    int32_t tg_name_offset,
-    int32_t tg_maxpriority_offset,
-    int32_t tg_vmallow_offset)
-{
-    if (THREAD_OBJECT_SIZE > 0) {
-        if (THREAD_OBJECT_SIZE          != thread_object_size
-            || THREAD_HOLDER_OFFSET     != thread_holder_offset
-            || THREAD_TID_OFFSET        != thread_tid_offset
-            || THREAD_NAME_OFFSET       != thread_name_offset
-            || THREAD_INTERRUPTLOCK_OFFSET != thread_interruptlock_offset
-            || FH_OBJECT_SIZE           != fh_object_size
-            || FH_GROUP_OFFSET          != fh_group_offset
-            || FH_PRIORITY_OFFSET       != fh_priority_offset
-            || FH_DAEMON_OFFSET         != fh_daemon_offset
-            || FH_STATUS_OFFSET         != fh_status_offset
-            || TG_OBJECT_SIZE           != tg_object_size
-            || TG_NAME_OFFSET           != tg_name_offset
-            || TG_MAXPRIORITY_OFFSET    != tg_maxpriority_offset
-            || TG_VMALLOW_OFFSET        != tg_vmallow_offset) {
-            fprintf(stderr,
-                "jnative: warning: __jnative_thread_set_layout called twice "
-                "with different values; ignoring the second call\n");
-            return;
-        }
-        return;
-    }
 
-    THREAD_OBJECT_SIZE          = thread_object_size;
-    THREAD_HOLDER_OFFSET        = thread_holder_offset;
-    THREAD_TID_OFFSET           = thread_tid_offset;
-    THREAD_NAME_OFFSET          = thread_name_offset;
-    THREAD_INTERRUPTLOCK_OFFSET = thread_interruptlock_offset;
-    FH_OBJECT_SIZE              = fh_object_size;
-    FH_GROUP_OFFSET             = fh_group_offset;
-    FH_PRIORITY_OFFSET          = fh_priority_offset;
-    FH_DAEMON_OFFSET            = fh_daemon_offset;
-    FH_STATUS_OFFSET            = fh_status_offset;
-    TG_OBJECT_SIZE              = tg_object_size;
-    TG_NAME_OFFSET              = tg_name_offset;
-    TG_MAXPRIORITY_OFFSET       = tg_maxpriority_offset;
-    TG_VMALLOW_OFFSET           = tg_vmallow_offset;
-}
 
 extern const void* vtable_java_lang_Thread[];
 
@@ -926,7 +851,8 @@ void __jnative_fn_java_lang_Thread_setScopedValueCache___Ljava_lang_Object__V(vo
  * Why the previous THREAD_TID_OFFSET >= 0 gate has been removed
  * ---------------------------------------------------------------------------
  *
- * The previous revision returned -1 when the layout handoff had not run, on
+ * The previous revision returned -1 while the thread-layout constants were
+ * still uninitialised, on
  * the theory that ThreadIdentifiers.<clinit> would "fall back to a
  * conservative path". That theory is false. The actual bytecode of
  * ThreadIdentifiers.next() reads:
@@ -940,10 +866,10 @@ void __jnative_fn_java_lang_Thread_setScopedValueCache___Ljava_lang_Object__V(vo
  *
  * The gate is not just unhelpful — it is wrong in principle, because the
  * value this method returns is a link-time constant. The address of
- * jnative_next_tid is valid before __jnative_thread_set_layout has ever been
- * called, during it, and after it. There is no state the layout handoff can
- * be in that would make the answer different, and therefore no reason to
- * gate on it.
+ * jnative_next_tid is valid before _module.ll's layout constants are ever
+ * read, during any particular read, and after them. There is no state the
+ * layout can be in that would make the answer different, and therefore no
+ * reason to gate on it.
  *
  * ---------------------------------------------------------------------------
  * Why the previous `(int64_t)THREAD_TID_OFFSET` was wrong

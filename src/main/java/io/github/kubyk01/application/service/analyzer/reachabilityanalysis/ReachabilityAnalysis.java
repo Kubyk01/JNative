@@ -23,6 +23,7 @@ import io.github.kubyk01.domain.ir.Terminator;
 import io.github.kubyk01.domain.ir.ThrowTerminator;
 import io.github.kubyk01.domain.ir.Type;
 import io.github.kubyk01.domain.ir.Value;
+import io.github.kubyk01.util.LlvmUtil;
 import lombok.Getter;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -30,14 +31,32 @@ import org.objectweb.asm.ClassReader;
 import org.objectweb.asm.ClassVisitor;
 import org.objectweb.asm.MethodVisitor;
 import org.objectweb.asm.Opcodes;
+import reactor.core.publisher.Flux;
+import reactor.core.scheduler.Scheduler;
+import reactor.core.scheduler.Schedulers;
 
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 
 @Slf4j
 @RequiredArgsConstructor
 public class ReachabilityAnalysis {
 
     private final DependencyResolver resolver;
+
+    /**
+     * Scheduler for the parallel phases of this class. Set by the
+     * orchestrator right after construction. Defaults to
+     * {@link Schedulers#single()} so the class stays usable from unit
+     * tests that never touch the reactor runtime.
+     */
+    private Scheduler scheduler = Schedulers.single();
+
+    public void setScheduler(Scheduler scheduler) {
+        if (scheduler != null) {
+            this.scheduler = scheduler;
+        }
+    }
 
     @Getter
     private final Set<String> reachableClasses = new HashSet<>();
@@ -161,82 +180,106 @@ public class ReachabilityAnalysis {
         return result;
     }
 
+    /**
+     * Applies the reachability metadata collected from
+     * {@code META-INF/native-image/…/reflect-config.json} (as well as the
+     * proxy/jni variants) found in the input archive and its nested jars.
+     *
+     * <h2>Conditional entries</h2>
+     *
+     * <p>An entry whose source JSON carried a
+     * {@code condition.typeReachable} clause is applied only if the named
+     * trigger type is reachable in the image. Entries with an unreachable
+     * trigger are dropped silently — this is exactly native-image's
+     * semantics: if the trigger class is absent, the entry was written for
+     * an optional dependency that this particular image does not have, and
+     * keeping it would drag a non-existent class into the analysis and
+     * produce a spurious "System class … not found even via reflection,
+     * stub created" warning.</p>
+     *
+     * <h2>Iteration</h2>
+     *
+     * <p>The condition is evaluated to a fixed point. First all
+     * unconditional entries are applied — they populate
+     * {@link #reachableClasses} with their classes. Then the conditional
+     * entries are walked: those whose trigger is already reachable are
+     * applied, the rest are dropped. If a pass applied anything, the
+     * worklist is drained ({@link #drainWorklist()}) and the virtual
+     * dispatch fixed point is recomputed
+     * ({@link #resolveVirtualDispatchFixedPoint()}); then the next pass
+     * runs. This is necessary because the reachability of a trigger class
+     * may be established not by the metadata itself but transitively —
+     * through calls that were only just discovered in the newly added
+     * classes.</p>
+     *
+     * <p>The process terminates: the set of applied entries grows
+     * monotonically, the {@code pending} set shrinks monotonically, and
+     * every iteration either applies at least one entry or ends the loop.
+     * The order of entries within the source array does not affect the
+     * result.</p>
+     *
+     * <p>Proxy interfaces and JNI classes are applied unconditionally: at
+     * the time of writing the metadata schema defines no condition for
+     * them.</p>
+     */
     public void applyMetadata(ReachabilityMetadata metadata) {
         if (metadata == null) return;
 
+        List<ReachabilityMetadata.ReflectClass> pending = new ArrayList<>();
+        int applied = 0;
+
+        // First pass — unconditional entries.
         for (ReachabilityMetadata.ReflectClass rc : metadata.getReflectClasses()) {
-            String className = rc.getName().replace('.', '/');
-            addClassWithInit(className, true);
-            ReflectClassInfo info = reflectInfo.getOrCreateClassInfo(className);
-            ClassNode classNode = resolver.getClassNode(className);
-            if (classNode != null) {
-                info.setSuperName(classNode.getSuperName());
-                info.getInterfaces().addAll(classNode.getInterfaces());
-            }
-            if (classNode != null && !classNode.isExternal()) {
-                if (rc.isAllDeclaredMethods() || rc.isAllPublicMethods()) {
-                    for (MethodNode m : classNode.getMethods()) {
-                        if (!m.getName().equals("<init>") && !m.getName().equals("<clinit>")) {
-                            MethodReference ref = new MethodReference(className, m.getName(), m.getDescriptor());
-                            info.addMethod(ref);
-                            addMethod(ref, true);
-                        }
-                    }
-                } else {
-                    for (String methodSig : rc.getMethods()) {
-                        int parenIdx = methodSig.indexOf('(');
-                        String methodName = parenIdx > 0 ? methodSig.substring(0, parenIdx) : methodSig;
-                        for (MethodNode m : classNode.getMethods()) {
-                            if (m.getName().equals(methodName) && !m.getName().equals("<init>")) {
-                                MethodReference ref = new MethodReference(className, m.getName(), m.getDescriptor());
-                                info.addMethod(ref);
-                                addMethod(ref, true);
-                            }
-                        }
-                    }
-                }
-                if (rc.isAllDeclaredFields() || rc.isAllPublicFields()) {
-                    for (io.github.kubyk01.domain.analyzer.dependencyresolver.FieldNode f : classNode.getFields()) {
-                        FieldReference ref = new FieldReference(className, f.getName(), f.getDescriptor());
-                        info.addField(ref);
-                    }
-                } else {
-                    for (String fieldName : rc.getFields()) {
-                        FieldReference ref = new FieldReference(className, fieldName, null);
-                        info.addField(ref);
-                    }
-                }
-                if (rc.isAllDeclaredConstructors() || rc.isAllPublicConstructors()) {
-                    for (MethodNode m : classNode.getMethods()) {
-                        if (m.getName().equals("<init>")) {
-                            MethodReference ref = new MethodReference(className, "<init>", m.getDescriptor());
-                            info.addConstructor(ref);
-                            addMethod(ref, true);
-                        }
-                    }
-                } else {
-                    for (String ctorSig : rc.getConstructors()) {
-                        for (MethodNode m : classNode.getMethods()) {
-                            if (m.getName().equals("<init>") && m.getDescriptor().equals(ctorSig)) {
-                                MethodReference ref = new MethodReference(className, "<init>", m.getDescriptor());
-                                info.addConstructor(ref);
-                                addMethod(ref, true);
-                            }
-                        }
-                    }
-                }
-                // Metadata that lists constructors or reflects a class as
-                // constructible is a genuine signal that the class is
-                // instantiated: it is what native-image reachability
-                // metadata is for. Record it so the virtual-dispatch
-                // candidate filter sees the class as a possible runtime
-                // type.
-                if (rc.isAllDeclaredConstructors() || rc.isAllPublicConstructors()
-                    || !rc.getConstructors().isEmpty()) {
-                    instantiatedClasses.add(className);
-                }
+            String trigger = rc.getTypeReachable();
+            if (trigger == null || trigger.isEmpty()) {
+                applyReflectEntry(rc);
+                applied++;
+            } else {
+                pending.add(rc);
             }
         }
+
+        // Drain the worklist so that the classes added by the
+        // unconditional entries, and everything transitively reachable
+        // from them, become visible to the trigger check below. Without
+        // this step the first iteration of the next loop would start with
+        // a stale reachable set.
+        if (!pending.isEmpty()) {
+            drainWorklist();
+            resolveVirtualDispatchFixedPoint();
+        }
+
+        // Iterative application of conditional entries.
+        boolean changed = true;
+        while (changed && !pending.isEmpty()) {
+            changed = false;
+            List<ReachabilityMetadata.ReflectClass> stillPending =
+                new ArrayList<>(pending.size());
+
+            for (ReachabilityMetadata.ReflectClass rc : pending) {
+                if (isTriggerReachable(rc.getTypeReachable())) {
+                    applyReflectEntry(rc);
+                    applied++;
+                    changed = true;
+                } else {
+                    stillPending.add(rc);
+                }
+            }
+            pending = stillPending;
+
+            if (changed) {
+                drainWorklist();
+                resolveVirtualDispatchFixedPoint();
+            }
+        }
+
+        if (!pending.isEmpty()) {
+            log.debug("Dropped {} conditional reflect entr{} whose trigger "
+                    + "type is not reachable in this image",
+                pending.size(), pending.size() == 1 ? "y" : "ies");
+        }
+
+        // Proxy interfaces — unconditional.
         for (ReachabilityMetadata.ProxyInterface pi : metadata.getProxyInterfaces()) {
             for (String iface : pi.getInterfaces()) {
                 String className = iface.replace('.', '/');
@@ -244,21 +287,221 @@ public class ReachabilityAnalysis {
                 ClassNode classNode = resolver.getClassNode(className);
                 if (classNode != null && !classNode.isExternal()) {
                     for (MethodNode m : classNode.getMethods()) {
-                        addMethod(new MethodReference(className, m.getName(), m.getDescriptor()), true);
+                        addMethod(new MethodReference(className,
+                            m.getName(), m.getDescriptor()), true);
                     }
                 }
             }
         }
+
+        // JNI classes — unconditional.
         for (ReachabilityMetadata.JniClass jc : metadata.getJniClasses()) {
             String className = jc.getName().replace('.', '/');
             addClassWithInit(className, true);
-            // A class handed to JNI is instantiated from native code.
             instantiatedClasses.add(className);
         }
-        log.info("Applied reachability metadata: {} reflect classes, {} proxy interfaces, {} jni classes",
-            metadata.getReflectClasses().size(),
+
+        log.info("Applied reachability metadata: {} reflect classes applied, "
+                + "{} dropped (unreachable trigger), {} proxy interfaces, "
+                + "{} jni classes",
+            applied,
+            pending.size(),
             metadata.getProxyInterfaces().size(),
             metadata.getJniClasses().size());
+    }
+
+    /**
+     * Applies a single {@code reflect-config.json} entry: materialises the
+     * class, registers it in {@link #reflectInfo} and expands the
+     * {@code allDeclaredMethods}/{@code allPublicConstructors}/{@code …}
+     * flags into concrete methods, fields and constructors.
+     *
+     * <p>The method is split out of
+     * {@link #applyMetadata(ReachabilityMetadata)} so that the iterative
+     * loop over conditional entries can apply them one at a time rather
+     * than duplicating the expansion logic inside the loop. The body is
+     * identical to the former single-entry branch — extracted unchanged.</p>
+     */
+    private void applyReflectEntry(ReachabilityMetadata.ReflectClass rc) {
+        String className = rc.getName().replace('.', '/');
+        addClassWithInit(className, true);
+        ReflectClassInfo info = reflectInfo.getOrCreateClassInfo(className);
+        ClassNode classNode = resolver.getClassNode(className);
+        if (classNode != null) {
+            info.setSuperName(classNode.getSuperName());
+            info.getInterfaces().addAll(classNode.getInterfaces());
+        }
+        if (classNode != null && !classNode.isExternal()) {
+            if (rc.isAllDeclaredMethods() || rc.isAllPublicMethods()) {
+                for (MethodNode m : classNode.getMethods()) {
+                    if (!m.getName().equals("<init>")
+                        && !m.getName().equals("<clinit>")) {
+                        MethodReference ref = new MethodReference(
+                            className, m.getName(), m.getDescriptor());
+                        info.addMethod(ref);
+                        addMethod(ref, true);
+                    }
+                }
+            } else {
+                for (String methodSig : rc.getMethods()) {
+                    int parenIdx = methodSig.indexOf('(');
+                    String methodName = parenIdx > 0
+                        ? methodSig.substring(0, parenIdx)
+                        : methodSig;
+                    for (MethodNode m : classNode.getMethods()) {
+                        if (m.getName().equals(methodName)
+                            && !m.getName().equals("<init>")) {
+                            MethodReference ref = new MethodReference(
+                                className, m.getName(), m.getDescriptor());
+                            info.addMethod(ref);
+                            addMethod(ref, true);
+                        }
+                    }
+                }
+            }
+            if (rc.isAllDeclaredFields() || rc.isAllPublicFields()) {
+                for (io.github.kubyk01.domain.analyzer.dependencyresolver.FieldNode f
+                        : classNode.getFields()) {
+                    FieldReference ref = new FieldReference(
+                        className, f.getName(), f.getDescriptor());
+                    info.addField(ref);
+                }
+            } else {
+                for (String fieldName : rc.getFields()) {
+                    FieldReference ref = new FieldReference(
+                        className, fieldName, null);
+                    info.addField(ref);
+                }
+            }
+            if (rc.isAllDeclaredConstructors() || rc.isAllPublicConstructors()) {
+                for (MethodNode m : classNode.getMethods()) {
+                    if (m.getName().equals("<init>")) {
+                        MethodReference ref = new MethodReference(
+                            className, "<init>", m.getDescriptor());
+                        info.addConstructor(ref);
+                        addMethod(ref, true);
+                    }
+                }
+            } else {
+                for (String ctorSig : rc.getConstructors()) {
+                    for (MethodNode m : classNode.getMethods()) {
+                        if (m.getName().equals("<init>")
+                            && m.getDescriptor().equals(ctorSig)) {
+                            MethodReference ref = new MethodReference(
+                                className, "<init>", m.getDescriptor());
+                            info.addConstructor(ref);
+                            addMethod(ref, true);
+                        }
+                    }
+                }
+            }
+            if (rc.isAllDeclaredConstructors() || rc.isAllPublicConstructors()
+                || !rc.getConstructors().isEmpty()) {
+                instantiatedClasses.add(className);
+            }
+        }
+    }
+
+    /**
+     * Checks whether the {@code condition.typeReachable} condition is
+     * satisfied.
+     *
+     * <h2>What "reachable" means</h2>
+     *
+     * <p>Native-image semantics: the trigger class is reachable if it made
+     * it into the final image. An exact check of that property would
+     * require a full reachability analysis, which has not run yet at the
+     * time {@link #applyMetadata(ReachabilityMetadata)} is called — it is
+     * applied immediately before
+     * {@link #analyzeFromEntry(String, String, String)}. The check below
+     * is a conservative approximation: it returns {@code true} only if the
+     * class is already guaranteed to be available in the image or can be
+     * loaded by a JDK class loader, and {@code false} in all other cases.
+     * Dropping an entry is the safe direction of error: if the class does
+     * turn out to be reachable later, the metadata can be applied again
+     * (the iterative loop in
+     * {@link #applyMetadata(ReachabilityMetadata)} provides for this),
+     * whereas a false application cannot be undone without dragging a
+     * non-existent class into the image and producing a spurious
+     * warning.</p>
+     *
+     * <h2>Order of checks</h2>
+     *
+     * <ol>
+     *   <li><b>Already reachable.</b> The class entered
+     *       {@link #reachableClasses} — either through a previously
+     *       applied metadata entry, through bytecode parsing, through
+     *       superclass closure or through other passes.</li>
+     *
+     *   <li><b>Present in the class map with real bytecode.</b> This
+     *       covers every class physically present in the input archive:
+     *       {@code DependencyResolver.scan()} parses all
+     *       {@code .class}-files up front, so any input class is already
+     *       in the map. Classes that entered it as external stubs
+     *       ({@code isExternal() == true}) are rejected: a stub is a sign
+     *       that the class is absent.</li>
+     *
+     *   <li><b>Loadable by the standard JDK loader.</b> This covers the
+     *       JDK classes that the reachability analysis will drag in
+     *       later but has not touched yet: at call time the class map
+     *       contains only classes from the input archive, and triggers
+     *       such as {@code java.lang.String} or
+     *       {@code java.lang.invoke.MethodHandle} have not yet entered
+     *       it. {@code Class.forName} with {@code initialize == false}
+     *       does not run static initializers, so this check has no side
+     *       effects.</li>
+     * </ol>
+     *
+     * <p>If none of the three checks fires, the trigger class genuinely
+     * cannot become reachable: it is neither in the input, nor in the JDK
+     * loader, nor among the previously added classes. The entry is
+     * dropped.</p>
+     *
+     * @param typeReachable the value of {@code condition.typeReachable}
+     *                      in binary form (with dots), or {@code null} /
+     *                      empty string for an unconditional entry
+     * @return {@code true} if the condition is satisfied
+     */
+    private boolean isTriggerReachable(String typeReachable) {
+        if (typeReachable == null || typeReachable.isEmpty()) {
+            return true;
+        }
+
+        String internalName = typeReachable.replace('.', '/');
+
+        // 1. Already in the reachable set.
+        if (reachableClasses.contains(internalName)) {
+            return true;
+        }
+
+        // 2. In the class map with real bytecode.
+        ClassNode existing = resolver.getClassMap().get(internalName);
+        if (existing != null && !existing.isExternal()) {
+            return true;
+        }
+
+        // 3. Loadable by a JDK loader. Try both the context and the
+        //    system loader: the former may be replaced (tests, Spring Boot
+        //    LaunchedURLClassLoader), the latter is always available in
+        //    this runtime and delegates to the bootstrap loader for JDK
+        //    classes.
+        ClassLoader cl = Thread.currentThread().getContextClassLoader();
+        if (cl == null) cl = ClassLoader.getSystemClassLoader();
+        if (cl != null) {
+            try {
+                Class.forName(typeReachable, false, cl);
+                return true;
+            } catch (ClassNotFoundException ignored) {
+                // expected for absent optional dependencies
+            } catch (LinkageError ignored) {
+                // class present but cannot be linked in this environment
+                // (e.g. a native dependency is missing)
+            } catch (SecurityException ignored) {
+                // forbidden by the loader policy — treat as unreachable
+            }
+        }
+
+        return false;
     }
 
     public void analyzeFromEntry(String entryClass, String entryMethod, String entryDescriptor) {
@@ -751,71 +994,90 @@ public class ReachabilityAnalysis {
         while (changed && pass++ < MAX_IMPLEMENTATION_PASSES) {
             changed = false;
 
-            // Snapshot the class-map keys. The map grows during the loop
-            // as DependencyResolver loads classes that were previously only
-            // referenced by name, and iterating a live map while it grows is
-            // exactly the kind of race that produced the bug this method
-            // exists to close.
+            // Snapshot the class map. It may grow during the parallel
+            // phase as new classes are force-loaded through
+            // resolver.getClassNode() -> loadSystemClass(); the snapshot
+            // is taken once so every worker sees the same starting set.
             List<String> classNames =
                 new ArrayList<>(resolver.getClassMap().keySet());
 
-            for (String cls : classNames) {
-                if (cls == null || cls.isEmpty()) continue;
-                // Array pseudo-classes have no interfaces of their own and
-                // no vtable of their own (they inherit java/lang/Object's).
-                if (cls.charAt(0) == '[') continue;
+            // Parallel collection phase. Every worker walks its slice of
+            // the class map and collects concrete implementations of
+            // interface methods that are not yet in the reachable set.
+            //
+            // The scan only READS reachableMethods (a plain HashSet) —
+            // nothing writes to it during the parallel phase, so a
+            // concurrent read is safe. Every mutation of reachableMethods,
+            // worklist and userReachableMethods happens in the sequential
+            // commit below.
+            Set<MethodReference> discovered = ConcurrentHashMap.newKeySet();
 
-                ClassNode cn = resolver.getClassNode(cls);
-                if (cn == null) continue;
-                if (cn.isInterface()) continue;
-                if (cn.isExternal()) continue;
+            LlvmUtil.awaitMono(
+                Flux.fromIterable(classNames)
+                    .parallel()
+                    .runOn(scheduler)
+                    .doOnNext(cls -> {
+                        if (cls == null || cls.isEmpty()) return;
+                        if (cls.charAt(0) == '[') return;
 
-                Set<String> ifaces = new LinkedHashSet<>();
-                collectAllInterfacesRec(cn, ifaces);
-                if (ifaces.isEmpty()) continue;
+                        ClassNode cn = resolver.getClassNode(cls);
+                        if (cn == null) return;
+                        if (cn.isInterface()) return;
+                        if (cn.isExternal()) return;
 
-                for (String iface : ifaces) {
-                    ClassNode ifaceNode = resolver.getClassNode(iface);
-                    if (ifaceNode == null) continue;
-                    if (!ifaceNode.isInterface()) continue;
-                    if (ifaceNode.isExternal()) continue;
+                        Set<String> ifaces = new LinkedHashSet<>();
+                        collectAllInterfacesRec(cn, ifaces);
+                        if (ifaces.isEmpty()) return;
 
-                    for (MethodNode im : ifaceNode.getMethods()) {
-                        if (im.isStatic()) continue;
-                        String mName = im.getName();
-                        if (mName == null || mName.isEmpty()) continue;
-                        // Constructors and class initializers are never
-                        // interface members; the JDK class-file format does
-                        // not allow them in an interface.
-                        if (mName.equals("<init>") || mName.equals("<clinit>")) continue;
-                        String mDesc = im.getDescriptor();
-                        if (mDesc == null || mDesc.isEmpty()) continue;
+                        for (String iface : ifaces) {
+                            ClassNode ifaceNode = resolver.getClassNode(iface);
+                            if (ifaceNode == null) continue;
+                            if (!ifaceNode.isInterface()) continue;
+                            if (ifaceNode.isExternal()) continue;
 
-                        String[] foundOwner = new String[1];
-                        MethodNode concrete = resolver.findMethodInHierarchy(
-                            cls, mName, mDesc, foundOwner);
-                        if (concrete == null) continue;
-                        if (concrete.isAbstract()) continue;
-                        // Native methods have their implementation in C,
-                        // which is emitted separately; adding them here
-                        // would just produce an external declaration with
-                        // no body.
-                        if (concrete.isNative()) continue;
+                            for (MethodNode im : ifaceNode.getMethods()) {
+                                if (im.isStatic()) continue;
+                                String mName = im.getName();
+                                if (mName == null || mName.isEmpty()) continue;
+                                if (mName.equals("<init>") || mName.equals("<clinit>")) continue;
+                                String mDesc = im.getDescriptor();
+                                if (mDesc == null || mDesc.isEmpty()) continue;
 
-                        String decl = foundOwner[0];
-                        if (decl == null || decl.isEmpty()) continue;
+                                String[] foundOwner = new String[1];
+                                MethodNode concrete = resolver.findMethodInHierarchy(
+                                    cls, mName, mDesc, foundOwner);
+                                if (concrete == null) continue;
+                                if (concrete.isAbstract()) continue;
+                                if (concrete.isNative()) continue;
 
-                        ClassNode declNode = resolver.getClassNode(decl);
-                        if (declNode == null) continue;
-                        if (declNode.isExternal()) continue;
+                                String decl = foundOwner[0];
+                                if (decl == null || decl.isEmpty()) continue;
 
-                        MethodReference ref =
-                            new MethodReference(decl, mName, mDesc);
-                        if (!reachableMethods.contains(ref)) {
-                            addMethod(ref, true);
-                            changed = true;
+                                ClassNode declNode = resolver.getClassNode(decl);
+                                if (declNode == null) continue;
+                                if (declNode.isExternal()) continue;
+
+                                MethodReference ref =
+                                    new MethodReference(decl, mName, mDesc);
+                                if (!reachableMethods.contains(ref)) {
+                                    discovered.add(ref);
+                                }
+                            }
                         }
-                    }
+                    })
+                    .sequential()
+                    .then()
+            );
+
+            // Sequential commit: the only place in this method that
+            // mutates reachableMethods / userReachableMethods / worklist.
+            // Because discovery is deduplicated by the ConcurrentHashMap
+            // key set, the same method cannot be added twice even if
+            // several classes expose the same implementation.
+            for (MethodReference ref : discovered) {
+                if (!reachableMethods.contains(ref)) {
+                    addMethod(ref, true);
+                    changed = true;
                 }
             }
 
@@ -1074,7 +1336,7 @@ public class ReachabilityAnalysis {
         MethodNode method = findMethodInHierarchy(classNode, name, desc, actualOwnerHolder);
 
         if (method == null) {
-            log.warn("Method not found in class {}: {}{}", owner, name, desc);
+            //log.warn("Method not found in class {}: {}{}", owner, name, desc);
             return;
         }
 

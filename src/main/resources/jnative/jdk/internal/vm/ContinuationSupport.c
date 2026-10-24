@@ -35,3 +35,9 @@ int32_t __jnative_fn_jdk_internal_vm_Continuation_doYield___I(int32_t mode) {
 
     return 0;
 }
+
+int32_t Java_jdk_internal_vm_Continuation_doYield(void* jni_env, void* jclass) {
+    (void)jni_env;
+    (void)jclass;
+    return __jnative_fn_jdk_internal_vm_Continuation_doYield___I(0);
+}

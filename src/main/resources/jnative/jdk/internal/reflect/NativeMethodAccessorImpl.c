@@ -4,30 +4,9 @@
 #include <string.h>
 #include "jnative_runtime.h"
 
-#define METHOD_LAYOUT_OLD_CLAZZ            56
-#define METHOD_LAYOUT_OLD_NAME             72
-#define METHOD_LAYOUT_OLD_RETURN_TYPE      80
-#define METHOD_LAYOUT_OLD_PARAMETER_TYPES  88
-
-#define METHOD_LAYOUT_NEW_CLAZZ            16
-#define METHOD_LAYOUT_NEW_NAME             32
-#define METHOD_LAYOUT_NEW_RETURN_TYPE      40
-#define METHOD_LAYOUT_NEW_PARAMETER_TYPES  48
-
 /* =========================================================================
  *  Registry helpers
  * ========================================================================= */
-
-static int is_registered_reflection_class(void* candidate) {
-    if (candidate == NULL) return 0;
-    if (reflect_all_classes == NULL) return 0;
-    ReflectionClass** pp = reflect_all_classes;
-    while (*pp != NULL) {
-        if ((void*)(*pp) == candidate) return 1;
-        pp++;
-    }
-    return 0;
-}
 
 static int append_class_descriptor(ReflectionClass* cls,
                                    char* buf, size_t buf_size)
@@ -175,43 +154,7 @@ static ReflectionConstructor* lookup_reflection_constructor(
     return NULL;
 }
 
-struct reflect_layout {
-    int clazz_offset;
-    int name_offset;
-    int return_type_offset;
-    int parameter_types_offset;
-};
 
-static int detect_reflect_layout(void* obj, struct reflect_layout* out) {
-    void* old_clazz = *(void**)((char*)obj + METHOD_LAYOUT_OLD_CLAZZ);
-    void* new_clazz = *(void**)((char*)obj + METHOD_LAYOUT_NEW_CLAZZ);
-
-    int old_ok = is_registered_reflection_class(old_clazz);
-    int new_ok = is_registered_reflection_class(new_clazz);
-
-    if (old_ok && !new_ok) {
-        out->clazz_offset           = METHOD_LAYOUT_OLD_CLAZZ;
-        out->name_offset            = METHOD_LAYOUT_OLD_NAME;
-        out->return_type_offset     = METHOD_LAYOUT_OLD_RETURN_TYPE;
-        out->parameter_types_offset = METHOD_LAYOUT_OLD_PARAMETER_TYPES;
-        return 1;
-    }
-    if (new_ok && !old_ok) {
-        out->clazz_offset           = METHOD_LAYOUT_NEW_CLAZZ;
-        out->name_offset            = METHOD_LAYOUT_NEW_NAME;
-        out->return_type_offset     = METHOD_LAYOUT_NEW_RETURN_TYPE;
-        out->parameter_types_offset = METHOD_LAYOUT_NEW_PARAMETER_TYPES;
-        return 1;
-    }
-    if (old_ok && new_ok) {
-        out->clazz_offset           = METHOD_LAYOUT_NEW_CLAZZ;
-        out->name_offset            = METHOD_LAYOUT_NEW_NAME;
-        out->return_type_offset     = METHOD_LAYOUT_NEW_RETURN_TYPE;
-        out->parameter_types_offset = METHOD_LAYOUT_NEW_PARAMETER_TYPES;
-        return 1;
-    }
-    return 0;
-}
 
 void* __jnative_fn_jdk_internal_reflect_NativeMethodAccessorImpl_invoke0__Ljava_lang_reflect_Method_Ljava_lang_Object__Ljava_lang_Object__Ljava_lang_Object_(
         void* method_obj, void* obj, void* args_array)
@@ -220,22 +163,12 @@ void* __jnative_fn_jdk_internal_reflect_NativeMethodAccessorImpl_invoke0__Ljava_
         __jnative_throw_null_pointer_exception();
     }
 
-    struct reflect_layout layout;
-    if (!detect_reflect_layout(method_obj, &layout)) {
-        /*
-         * The Method object does not present a recognised field layout:
-         * either it has not been initialised, or it was built by a JDK
-         * whose hierarchy this file does not model. Refuse to guess.
-         */
-        __jnative_throw_null_pointer_exception();
-    }
-
-    void* clazz = *(void**)((char*)method_obj + layout.clazz_offset);
-    void* name_str = *(void**)((char*)method_obj + layout.name_offset);
+    void* clazz = *(void**)((char*)method_obj + JNATIVE_METHOD_CLAZZ_OFFSET);
+    void* name_str = *(void**)((char*)method_obj + JNATIVE_METHOD_NAME_OFFSET);
     void* return_class =
-        *(void**)((char*)method_obj + layout.return_type_offset);
+        *(void**)((char*)method_obj + JNATIVE_METHOD_RETURN_TYPE_OFFSET);
     void* parameter_types_array =
-        *(void**)((char*)method_obj + layout.parameter_types_offset);
+        *(void**)((char*)method_obj + JNATIVE_METHOD_PARAM_TYPES_OFFSET);
 
     if (clazz == NULL || name_str == NULL) {
         __jnative_throw_null_pointer_exception();
@@ -273,21 +206,69 @@ void* __jnative_fn_jdk_internal_reflect_NativeMethodAccessorImpl_invoke0__Ljava_
     return fn(obj, args_payload);
 }
 
-void* __jnative_fn_jdk_internal_reflect_NativeConstructorAccessorImpl_newInstance0__Ljava_lang_reflect_Constructor__Ljava_lang_Object__Ljava_lang_Object_(
+/* --------------------------------------------------------------------------
+ * NativeConstructorAccessorImpl.newInstance0 — implementation.
+ * --------------------------------------------------------------------------
+ *
+ * The public mangled symbol
+ *
+ *     __jnative_fn_jdk_internal_reflect_NativeConstructorAccessorImpl_newInstance0__…
+ *
+ * is defined by the forwarding shim in NativeConstructorAccessorImpl.c.
+ * That shim has three responsibilities:
+ *
+ *   1. It satisfies BytecodeToIr.findJNativeFileOwner and
+ *      Compiler.hasNativeSupport, both of which decide "does class C
+ *      have a JNative implementation?" by probing for a C file whose
+ *      name matches <package>/<SimpleClassName>.c.
+ *
+ *   2. It keeps the single definition of that symbol unambiguous —
+ *      there is exactly one function whose name is the mangled form.
+ *
+ *   3. It keeps the actual logic in this file, where it can share the
+ *      descriptor/lookup helpers (build_constructor_descriptor,
+ *      lookup_reflection_constructor, append_class_descriptor,
+ *      build_parameter_list) with invoke0. Splitting the helpers across
+ *      two files would mean duplicating ~150 lines of layout code, which
+ *      is worse than the one-function shim.
+ *
+ * The implementation itself is unchanged; only the function's external
+ * symbol name has changed, from the mangled form to a plain
+ * __jnative_impl_* identifier that no tool treats specially. The
+ * forwarding shim in NativeConstructorAccessorImpl.c is the only
+ * caller, and DirectConstructorHandleAccessor.c forwards through the
+ * same shim, so the whole delegation chain (NativeConstructorAccessorImpl
+ * -> DirectConstructorHandleAccessor -> this implementation) remains
+ * intact.
+ *
+ * The consequences of the previous arrangement — where the mangled
+ * symbol was defined here, in a file named after a sibling class — were:
+ *
+ *   - both the reachability probe and the JNI fallback thought
+ *     NativeConstructorAccessorImpl had no JNative implementation;
+ *
+ *   - BytecodeToIr produced a JNI symbol
+ *     Java_jdk_internal_reflect_NativeConstructorAccessorImpl_newInstance0;
+ *
+ *   - the compiler's JNI-native discovery found no C file to satisfy
+ *     it, so the link step failed with:
+ *
+ *         ld.lld: error: undefined symbol:
+ *             Java_jdk_internal_reflect_NativeConstructorAccessorImpl_newInstance0
+ *
+ * Renaming the implementation and providing the shim in the correct
+ * file keeps everything together without that mismatch.
+ * ------------------------------------------------------------------------ */
+void* __jnative_impl_reflect_NativeConstructorAccessorImpl_newInstance0__(
         void* constructor_obj, void* args_array)
 {
     if (constructor_obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
 
-    struct reflect_layout layout;
-    if (!detect_reflect_layout(constructor_obj, &layout)) {
-        __jnative_throw_null_pointer_exception();
-    }
-
-    void* clazz = *(void**)((char*)constructor_obj + layout.clazz_offset);
+    void* clazz = *(void**)((char*)constructor_obj + JNATIVE_CTOR_CLAZZ_OFFSET);
     void* parameter_types_array =
-        *(void**)((char*)constructor_obj + layout.parameter_types_offset);
+        *(void**)((char*)constructor_obj + JNATIVE_CTOR_PARAM_TYPES_OFFSET);
 
     if (clazz == NULL) {
         __jnative_throw_null_pointer_exception();

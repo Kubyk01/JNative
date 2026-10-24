@@ -3,16 +3,14 @@ package io.github.kubyk01.domain.ir;
 import lombok.Getter;
 import lombok.Setter;
 
-import java.util.ArrayList;
 import java.util.List;
 
 public class IrBuilder {
     @Getter
-    private Module module;
+    private final Module module;
     private Function currentFunction;
     @Setter
     private BasicBlock currentBlock;
-    private final List<Temporary> temporaries = new ArrayList<>();
 
     public BasicBlock currentBlock() { return currentBlock; }
 
@@ -65,9 +63,7 @@ public class IrBuilder {
     }
 
     public Temporary newTemporary(Type type) {
-        Temporary tmp = new Temporary(type);
-        temporaries.add(tmp);
-        return tmp;
+        return new Temporary(type);
     }
 
     public Instruction addInstruction(Opcode opcode, Value... operands) {
@@ -174,7 +170,8 @@ public class IrBuilder {
                  NEW, NEW_ARRAY, MULTI_NEW_ARRAY,
                  INSTANCEOF, CHECKCAST,
                  ARRAYLENGTH,
-                 ALOAD
+                 ALOAD,
+                 SELECT
                 -> true;
             default -> false;
         };
@@ -258,6 +255,13 @@ public class IrBuilder {
                 yield operands.length > 0 ? operands[0].getType() : Type.UNKNOWN;
             }
             case ARRAYLENGTH -> Type.INT;
+            case SELECT -> {
+                // operands: [cond, trueVal, falseVal]
+                if (operands.length >= 2 && operands[1] != null) {
+                    yield operands[1].getType();
+                }
+                yield Type.UNKNOWN;
+            }
             case ALOAD -> {
                 if (operands.length > 0 && operands[0].getType().isArray()) {
                     yield operands[0].getType().getElementType();

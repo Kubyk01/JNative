@@ -7,10 +7,58 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
+/**
+ * Interprocedural, field-sensitive points-to graph.
+ *
+ * <h2>Thread-safety</h2>
+ *
+ * <p>The graph is written by every thread that evaluates a function in
+ * the parallel points-to worklist. Since the class now propagates
+ * caller points-to into callee {@code Parameter}-s (precise
+ * interprocedural field sensitivity), a value's {@code PointsToSet}
+ * may be written by <em>several</em> threads concurrently:</p>
+ *
+ * <ul>
+ *   <li>a {@code Parameter}'s set is written by its own function's
+ *       seeding pass and by every caller's argument propagation;</li>
+ *   <li>a {@code Temporary}'s set is written only by its owning
+ *       function, but may be <em>iterated</em> by that same thread
+ *       while another thread is writing into a {@code Parameter}
+ *       that the temporary aliases;</li>
+ *   <li>field and static-field sets are written by every function
+ *       that stores into the corresponding field.</li>
+ * </ul>
+ *
+ * <p>Every {@code PointsToSet} stored in this graph therefore uses
+ * {@link PointsToSet#shared()} — a {@code ConcurrentHashMap} key set —
+ * rather than {@link PointsToSet#local()}. Iteration over such a set
+ * is weakly consistent and never throws {@code ConcurrentModificationException};
+ * {@code add}, {@code contains}, {@code size} are all atomic.</p>
+ *
+ * <p>The only sets that remain {@code local()} are thread-local
+ * temporaries (the result of {@link #getFieldPointsToForSites} and of
+ * {@link #getFieldPointsToMap}), which are produced and consumed by a
+ * single thread and never reach any caller from another thread.</p>
+ */
 public class PointsToGraph {
+
+    /**
+     * Value-level points-to map.
+     *
+     * <p>Backed by {@link ConcurrentHashMap}. Values are partitioned
+     * by owner function — one thread per function during evaluation —
+     * but cross-function propagation now writes into callee
+     * {@code Parameter}-s from arbitrary caller threads, so concurrent
+     * insertion of new keys and concurrent updates of existing keys
+     * are both expected.</p>
+     */
     private final Map<Value, PointsToSet> nodeToPointsTo = new ConcurrentHashMap<>();
-    private final Map<AllocationSite, Map<String, PointsToSet>> fieldPointsTo = new ConcurrentHashMap<>();
-    private final Map<String, PointsToSet> staticFieldPointsTo = new ConcurrentHashMap<>();
+
+    private final Map<AllocationSite, Map<String, PointsToSet>> fieldPointsTo
+        = new ConcurrentHashMap<>();
+    private final Map<String, PointsToSet> staticFieldPointsTo
+        = new ConcurrentHashMap<>();
+
     @Getter
     private final Map<AllocationSite, Value> allocationSiteToValue = new HashMap<>();
 
@@ -19,140 +67,109 @@ public class PointsToGraph {
     }
 
     public PointsToSet get(Value v) {
-        return nodeToPointsTo.computeIfAbsent(v, k -> new PointsToSet());
+        PointsToSet s = nodeToPointsTo.get(v);
+        return s != null ? s : PointsToSet.EMPTY;
     }
 
-    /**
-     * Non-creating counterpart of {@link #get(Value)}: returns {@code null}
-     * when the value has no points-to information yet, instead of installing
-     * an empty {@code PointsToSet} for it.
-     *
-     * <p>Callers that only read (for example the return-value handling and the
-     * parameter-write widening loop in
-     * {@code InterproceduralPointsTo.processCall}) must use this overload: an
-     * empty entry created by {@link #get(Value)} is not equivalent to no
-     * entry, because other consumers treat the mere presence of the key as
-     * "this value has points-to information".</p>
-     */
     public PointsToSet getIfPresent(Value v) {
         return nodeToPointsTo.get(v);
     }
 
+    /**
+     * Directly installs a set. Only safe when the set is itself
+     * thread-safe — i.e. obtained from {@link PointsToSet#shared()} or
+     * from {@link #get(Value)}. Prefer {@link #merge} or
+     * {@link #addSite} which perform the correct atomic install.
+     */
     public void set(Value v, PointsToSet pts) {
+        if (pts == null || pts.isEmpty()) {
+            nodeToPointsTo.remove(v);
+            return;
+        }
         nodeToPointsTo.put(v, pts);
     }
 
+    /**
+     * Atomic merge-all. Creates the entry on first use with
+     * {@code shared()} semantics.
+     */
     public void addAll(Value v, PointsToSet pts) {
-        get(v).addAll(pts);
+        if (pts == null || pts.isEmpty()) return;
+        PointsToSet existing = nodeToPointsTo.computeIfAbsent(v, k -> PointsToSet.shared());
+        existing.addAll(pts);
     }
 
     public void add(Value v, AllocationSite site) {
-        get(v).add(site);
+        addSite(v, site);
     }
 
     /**
-     * Adds a single allocation site to a value's points-to set and
-     * returns {@code true} iff the set actually changed.
+     * Atomic add-site with change detection.
      *
-     * <p>The change flag comes from the underlying
-     * {@link java.util.concurrent.ConcurrentHashMap.KeySetView#add(Object)},
-     * which is itself atomic — two concurrent calls with the same
-     * argument cannot both observe a change. This is what lets the
-     * return-value handling in
-     * {@code InterproceduralPointsTo.processCall} skip the temporary
-     * {@code PointsToSet} it used to build.</p>
+     * <p>Creation uses {@code computeIfAbsent} so that two concurrent
+     * callers cannot both observe a null entry, each install a fresh
+     * {@code PointsToSet}, and lose one of the sites (last write wins).
+     * The installed set is {@code shared()}, so the {@code add} itself
+     * is thread-safe.</p>
      */
     public boolean addSite(Value v, AllocationSite site) {
-        PointsToSet existing = nodeToPointsTo.get(v);
-        if (existing == null) {
-            existing = nodeToPointsTo.computeIfAbsent(v, k -> new PointsToSet());
-        }
+        PointsToSet existing = nodeToPointsTo.computeIfAbsent(v, k -> PointsToSet.shared());
         return existing.addSite(site);
     }
 
     /**
-     * Same change-flag contract as {@link #mergeFieldPointsTo}.
+     * Atomic merge with change detection.
      *
-     * <p>The size comparison is exact: the destination set is this
-     * value's own concurrent key set, and {@code addAll} on it either
-     * leaves the size unchanged (all elements already present) or
-     * strictly increases it. Under concurrent evaluation of different
-     * functions, a value's set is only ever written by the thread that
-     * is evaluating the function that contains the value — see the
-     * "evaluation owner" invariant in
-     * {@code InterproceduralPointsTo.analyze} — so the comparison is
-     * exact for the caller's perspective.</p>
+     * <p>Change is detected via a size comparison against the shared
+     * set. Under concurrent evaluation the {@code before} observation
+     * may be stale; because sets grow monotonically, any growth
+     * (from us or from another thread) makes the result {@code true}.
+     * A false positive re-enqueues a caller that did not need to be
+     * re-enqueued — harmless. A false negative is impossible, because
+     * our own {@code addAll} either added at least one new site
+     * (size grows) or added none (no growth, correct answer).</p>
      */
     public boolean merge(Value v, PointsToSet pts) {
-        PointsToSet existing = nodeToPointsTo.get(v);
-        if (existing == null) {
-            existing = nodeToPointsTo.computeIfAbsent(v, k -> new PointsToSet());
-        }
-        int oldSize = existing.getSites().size();
+        if (pts == null || pts.isEmpty()) return false;
+        PointsToSet existing = nodeToPointsTo.computeIfAbsent(v, k -> PointsToSet.shared());
+        int before = existing.getSites().size();
         existing.addAll(pts);
-        return existing.getSites().size() > oldSize;
+        return existing.getSites().size() > before;
     }
 
     public Map<Value, PointsToSet> getAll() {
         return nodeToPointsTo;
     }
 
+    // =================================================================
+    //  Field-level points-to
+    // =================================================================
+
     public PointsToSet getFieldPointsTo(AllocationSite site, String field) {
-        return fieldPointsTo
-                .computeIfAbsent(site, k -> new ConcurrentHashMap<>())
-                .computeIfAbsent(field, k -> new PointsToSet());
+        Map<String, PointsToSet> perSite = fieldPointsTo.get(site);
+        if (perSite == null) return PointsToSet.EMPTY;
+        PointsToSet s = perSite.get(field);
+        return s != null ? s : PointsToSet.EMPTY;
     }
 
     /**
-     * Returns {@code true} iff the field's points-to set grew as a
-     * result of the merge, {@code false} otherwise.
-     *
-     * <p>Returning the change flag is load-bearing for the caller: the
-     * interprocedural worklist uses this to decide whether the enclosing
-     * function actually produced new information and must therefore be
-     * propagated to its callers. Returning {@code void} — as earlier
-     * revisions did — forced every caller to assume a change had
-     * occurred, which either silently dropped the re-enqueue (the
-     * pre-fix behaviour) or over-enqueued. Neither is acceptable now that
-     * the widening loops run hundreds of thousands of times on a full
-     * JDK image.</p>
-     *
-     * <p>Under parallel evaluation, the destination set may be modified
-     * concurrently by another worker merging into the same (site, field)
-     * pair. Because writes are monotone — we only ever add, never remove
-     * — the size comparison cannot produce a false negative. It can
-     * produce a false positive (return true when the only growth came
-     * from the other worker's insert), which is harmless: the caller
-     * re-enqueues a caller that might not have needed it, and the
-     * fast-path skip in {@code processCall} makes that re-enqueue
-     * essentially free.</p>
+     * Thread-safe merge into a field's points-to set. Every per-site
+     * map and every per-field set is concurrent; creation is atomic
+     * through {@code computeIfAbsent} at both levels.
      */
     public boolean mergeFieldPointsTo(AllocationSite site, String field, PointsToSet pts) {
-        Map<String, PointsToSet> perSite = fieldPointsTo.get(site);
-        PointsToSet existing = perSite == null ? null : perSite.get(field);
-        if (existing == null) {
-            existing = getFieldPointsTo(site, field);
-        }
-        int oldSize = existing.getSites().size();
+        if (pts == null || pts.isEmpty()) return false;
+
+        Map<String, PointsToSet> perSite =
+            fieldPointsTo.computeIfAbsent(site, k -> new ConcurrentHashMap<>());
+        PointsToSet existing =
+            perSite.computeIfAbsent(field, k -> PointsToSet.shared());
+
+        int before = existing.getSites().size();
         existing.addAll(pts);
-        return existing.getSites().size() > oldSize;
+        return existing.getSites().size() > before;
     }
 
-    /**
-     * Fast-path predicate used by the coarsened widening loops in
-     * {@code InterproceduralPointsTo.processCall}.
-     *
-     * <p>Both levels of the lookup use the plain, non-creating
-     * {@link Map#get(Object)} path. That is deliberate: the predicate
-     * must not have the side effect of allocating an empty
-     * {@code PointsToSet} for a field that has never been written.
-     * Creating such an entry would make every later read of
-     * {@link #getFieldPointsToMap(AllocationSite)} observe a non-null
-     * map, which the cyclic-reference detector and the escape analysis
-     * both interpret as "this site has fields with points-to
-     * information". An empty entry is not equivalent to no entry for
-     * either of those consumers.</p>
-     */
     public boolean fieldContainsUnknown(AllocationSite site, String field) {
         Map<String, PointsToSet> perSite = fieldPointsTo.get(site);
         if (perSite == null) return false;
@@ -164,12 +181,32 @@ public class PointsToGraph {
         return fieldPointsTo.get(site);
     }
 
+    /**
+     * Union of the field's points-to set over every base site in
+     * {@code sites}.
+     *
+     * <p>The result is a fresh, thread-local {@code PointsToSet}
+     * (a {@code HashSet}-backed {@code local()} set). It is produced
+     * and consumed by a single thread — {@code processInstruction}
+     * builds it and immediately passes it to {@code merge}, both on
+     * the same thread — so no concurrent modification is possible.
+     * The iteration over {@code sites.getSites()} is safe because
+     * {@code sites} is a value-level set stored in the graph, i.e.
+     * {@code shared()} and therefore weakly consistent.</p>
+     */
     public PointsToSet getFieldPointsToForSites(PointsToSet sites, String field) {
-        PointsToSet result = new PointsToSet();
+        if (sites == null || sites.isEmpty()) return PointsToSet.EMPTY;
+
+        PointsToSet result = null;
         for (AllocationSite site : sites.getSites()) {
-            result.addAll(getFieldPointsTo(site, field));
+            Map<String, PointsToSet> perSite = fieldPointsTo.get(site);
+            if (perSite == null) continue;
+            PointsToSet ftp = perSite.get(field);
+            if (ftp == null || ftp.isEmpty()) continue;
+            if (result == null) result = PointsToSet.local();
+            result.addAll(ftp);
         }
-        return result;
+        return (result != null) ? result : PointsToSet.EMPTY;
     }
 
     public PointsToSet getArrayElementPointsTo(AllocationSite site) {
@@ -180,24 +217,24 @@ public class PointsToGraph {
         return mergeFieldPointsTo(site, "[]", pts);
     }
 
+    // =================================================================
+    //  Static-field points-to
+    // =================================================================
+
     public PointsToSet getStaticFieldPointsTo(String field) {
-        return staticFieldPointsTo.computeIfAbsent(field, k -> new PointsToSet());
+        PointsToSet s = staticFieldPointsTo.get(field);
+        return s != null ? s : PointsToSet.EMPTY;
     }
 
     public boolean mergeStaticFieldPointsTo(String field, PointsToSet pts) {
-        PointsToSet existing = staticFieldPointsTo.get(field);
-        if (existing == null) {
-            existing = staticFieldPointsTo.computeIfAbsent(field, k -> new PointsToSet());
-        }
-        int oldSize = existing.getSites().size();
+        if (pts == null || pts.isEmpty()) return false;
+        PointsToSet existing =
+            staticFieldPointsTo.computeIfAbsent(field, k -> PointsToSet.shared());
+        int before = existing.getSites().size();
         existing.addAll(pts);
-        return existing.getSites().size() > oldSize;
+        return existing.getSites().size() > before;
     }
 
-    /**
-     * Static-field counterpart of {@link #fieldContainsUnknown}. Uses
-     * the non-creating {@code get} path for the same reason.
-     */
     public boolean staticFieldContainsUnknown(String field) {
         PointsToSet pts = staticFieldPointsTo.get(field);
         return pts != null && pts.containsUnknown();
@@ -210,5 +247,4 @@ public class PointsToGraph {
     public boolean mayAlias(Value a, Value b) {
         return get(a).intersects(get(b));
     }
-
 }

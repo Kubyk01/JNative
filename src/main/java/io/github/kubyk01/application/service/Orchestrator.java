@@ -22,10 +22,12 @@ import io.github.kubyk01.domain.analyzer.escapeanalysis.EscapeAnalysisResult;
 import io.github.kubyk01.domain.analyzer.lifetime.LifetimeAnalysisResult;
 import io.github.kubyk01.domain.ir.Function;
 import io.github.kubyk01.domain.ir.Module;
+import io.github.kubyk01.domain.ir.TargetPlatform;
 import io.github.kubyk01.port.primary.OrchestratorPort;
 import io.github.kubyk01.port.secondary.CompilerPort;
 import io.github.kubyk01.util.LlvmUtil;
 import lombok.extern.slf4j.Slf4j;
+import reactor.core.publisher.Flux;
 import reactor.core.scheduler.Scheduler;
 import reactor.core.scheduler.Schedulers;
 
@@ -40,6 +42,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
 
@@ -68,7 +71,8 @@ public class Orchestrator implements OrchestratorPort {
                         String debugName,
                         boolean showClassesGraph,
                         int cores,
-                        int optimizationLevel) {
+                        int optimizationLevel,
+                        TargetPlatform targetPlatform) {
 
         final int effectiveCores = (cores <= 0)
                 ? Runtime.getRuntime().availableProcessors()
@@ -89,7 +93,7 @@ public class Orchestrator implements OrchestratorPort {
             runAnalysis(path, entryClass, entryMethod, entryDescriptor,
                     showClasses, showAlias, showEscape, showLifetime, showDestructor,
                     outputFile, noCompile, includeSystem, debugName, showClassesGraph,
-                    effectiveCores, optimizationLevel, scheduler);
+                    effectiveCores, optimizationLevel, scheduler, targetPlatform);
         } finally {
             scheduler.dispose();
         }
@@ -111,7 +115,8 @@ public class Orchestrator implements OrchestratorPort {
                              boolean showClassesGraph,
                              int effectiveCores,
                              int optimizationLevel,
-                             Scheduler scheduler) {
+                             Scheduler scheduler,
+                             TargetPlatform targetPlatform) {
 
         // --- 1. Dependency resolution -------------------------------------
         DependencyResolver resolver = new DependencyResolver();
@@ -126,6 +131,7 @@ public class Orchestrator implements OrchestratorPort {
 
         // --- 2. Reachability analysis -------------------------------------
         ReachabilityAnalysis analysis = new ReachabilityAnalysis(resolver);
+        analysis.setScheduler(scheduler);
         analysis.applyMetadata(resolver.getMetadata());
         analysis.analyzeFromEntry(entryClass, entryMethod, entryDescriptor);
 
@@ -209,26 +215,58 @@ public class Orchestrator implements OrchestratorPort {
         Set<String> allClasses = analysis.getReachableClasses();
         Set<MethodReference> allMethods = analysis.getReachableMethods();
 
-        Set<String> usedSystemClasses = new HashSet<>();
-        for (String cls : allClasses) {
-            if (LlvmUtil.isSystemClassName(cls) && compiler.hasNativeSupport(cls)) {
-                usedSystemClasses.add(cls);
-            }
-        }
+        Set<String> usedSystemClasses = ConcurrentHashMap.newKeySet();
+        Set<String> polymorphicClasses = ConcurrentHashMap.newKeySet();
 
-        // --- 3. Polymorphic-resolver warm-up ------------------------------
-        Set<String> polymorphicClasses = new HashSet<>();
-        for (String cls : allClasses) {
-            ClassNode node = resolver.getClassNode(cls);
-            if (node != null && node.getPolymorphicMethodNames() != null
-                    && !node.getPolymorphicMethodNames().isEmpty()) {
-                polymorphicClasses.add(cls);
-            }
-        }
+        // ---- Parallel collection of system classes with native support ----
+        //
+        // hasNativeSupport() opens one classpath resource per call; on a
+        // shaded jar with a few thousand system classes, doing this
+        // serially is measurable. The check is stateless and thread-safe
+        // (it only reads the current thread's context class loader and
+        // the classpath), so it parallelises cleanly.
+        LlvmUtil.awaitMono(
+            Flux.fromIterable(allClasses)
+                .parallel()
+                .runOn(scheduler)
+                .doOnNext(cls -> {
+                    if (LlvmUtil.isSystemClassName(cls)
+                        && compiler.hasNativeSupport(cls)) {
+                        usedSystemClasses.add(cls);
+                    }
+                })
+                .sequential()
+                .then()
+        );
+
+        // ---- Parallel collection of polymorphic-method-bearing classes ----
+        LlvmUtil.awaitMono(
+            Flux.fromIterable(allClasses)
+                .parallel()
+                .runOn(scheduler)
+                .doOnNext(cls -> {
+                    ClassNode node = resolver.getClassNode(cls);
+                    if (node != null && node.getPolymorphicMethodNames() != null
+                            && !node.getPolymorphicMethodNames().isEmpty()) {
+                        polymorphicClasses.add(cls);
+                    }
+                })
+                .sequential()
+                .then()
+        );
+
         Set<String> toLoad = new HashSet<>(polymorphicClasses);
         toLoad.retainAll(usedSystemClasses);
         PolymorphicResolver polymorphicResolver = new PolymorphicResolver();
-        polymorphicResolver.loadAll(toLoad);
+
+        // ---- Parallel C-source parsing ----
+        //
+        // ParserC.parse reads one resource per class and compiles a
+        // regex over a potentially large C file. Both operations are
+        // stateless and thread-safe (the compiled Pattern is shared
+        // read-only, Matcher instances are per-call), so the parse of
+        // distinct files runs concurrently on the analysis scheduler.
+        polymorphicResolver.loadAll(toLoad, scheduler);
 
         // --- 4. Filtering for user-visible listings -----------------------
         Set<String> classesToShow;
@@ -284,8 +322,8 @@ public class Orchestrator implements OrchestratorPort {
         // bytecode is not translated into IR at all, and every call site
         // — direct, virtual, or reflective — is aliased onto the C symbol.
         //
-        // The C resource path is derived with exactly the same rule
-        // Compiler.getNativeResourcePath uses: strip a leading "java/"
+        // The C resource path is derived with the same base rule
+        // Compiler.findNativeResourcePath uses: strip a leading "java/"
         // from the class name and prepend "jnative/". So for
         // java.security.SecureRandom the path is
         // "jnative/security/SecureRandom.c".
@@ -382,6 +420,7 @@ public class Orchestrator implements OrchestratorPort {
         llvmGen.setClinitSchedule(analysisResult.clinitSchedule());
         llvmGen.setClinitWrappers(analysisResult.clinitWrappers());
         llvmGen.setEmbeddedResources(embedded);
+        llvmGen.setTargetPlatform(targetPlatform);
 
         Path genDir = Paths.get("target", "generated-jnative");
         try {
@@ -415,12 +454,16 @@ public class Orchestrator implements OrchestratorPort {
 
         // --- 11. Native compilation ---------------------------------------
         if (!noCompile) {
-            Path exePath = outputFile != null ? Paths.get(outputFile) : Paths.get("a.out");
+            Path exePath = outputFile != null
+                ? Paths.get(outputFile)
+                : defaultOutputPath(path, targetPlatform);
             try {
                 compiler.compileAndLink(llPaths, exePath, usedSystemClasses, module,
-                        resolver, effectiveCores, optimizationLevel);
+                        resolver, effectiveCores, optimizationLevel, targetPlatform);
                 System.out.println("Native executable built successfully: "
                         + exePath.toAbsolutePath());
+                System.out.println("  target triple: " + targetPlatform.triple());
+                System.out.println("  target datalayout: " + targetPlatform.dataLayout());
             } catch (IOException | InterruptedException e) {
                 log.error("Failed to build native executable", e);
                 System.err.println("Build failed: " + e.getMessage());
@@ -497,10 +540,11 @@ public class Orchestrator implements OrchestratorPort {
      * Maps an internal class name to the classpath-relative path of its
      * C runtime source.
      *
-     * <p>This is byte-for-byte the same mapping
-     * {@link io.github.kubyk01.application.service.compiler.Compiler#getNativeResourcePath}
-     * performs, and it must stay that way: the override scanner and the
-     * native compiler must find the same files.</p>
+     * <p>This is the same base mapping
+     * {@code Compiler.findNativeResourcePath} performs before it probes
+     * {@code <Class>.c} and then {@code <Class>Support.c}. The scanner
+     * only looks at {@code <Class>.c}: override bodies live in the
+     * class's own file.</p>
      */
     private static String cResourcePathForClass(String internalName) {
         if (internalName.startsWith("java/")) {
@@ -686,5 +730,92 @@ public class Orchestrator implements OrchestratorPort {
     private static boolean matchesDebug(String debugName, String name) {
         if (debugName == null) return true;
         return name != null && name.contains(debugName);
+    }
+
+    // =====================================================================
+    //  Default output-file naming
+    // =====================================================================
+
+    /**
+     * Derives the default executable path from the input path when the user
+     * does not supply an explicit {@code --output}.
+     *
+     * <p>The naming rule is the one every AOT compiler follows: the
+     * executable is named after its input, with the language-specific
+     * extension dropped, and the platform's own executable suffix appended
+     * when the target is Windows.</p>
+     *
+     * <ul>
+     *   <li>{@code Test.jar} &rarr; {@code Test} (Unix) /
+     *       {@code Test.exe} (Windows target).</li>
+     *   <li>{@code Foo.class} &rarr; {@code Foo} / {@code Foo.exe}.</li>
+     *   <li>A directory {@code build/} &rarr; the file {@code build} placed
+     *       next to that directory, or {@code build.exe} on Windows. The
+     *       directory itself is untouched.</li>
+     *   <li>An input with no parent (a bare relative name such as
+     *       {@code Test.jar}) yields a result relative to the current
+     *       working directory, matching the resolution the previous
+     *       hard-coded {@code "a.out"} used.</li>
+     * </ul>
+     *
+     * <p>The output is always placed <b>next to the input</b>, never inside
+     * the current directory unless the input is itself relative. This is
+     * the natural layout for build artefacts: {@code jnative analyze
+     * jars/Test.jar} produces {@code jars/Test}, which sits next to its
+     * source and can be shipped as one directory. It also means that two
+     * invocations on different jars in different directories cannot
+     * silently collide on a shared name.</p>
+     *
+     * <p>The Windows suffix is chosen from the <em>target</em> triple, not
+     * from the build host's {@code os.name}. A Linux build with
+     * {@code --target x86_64-pc-windows-msvc} produces a PE binary that
+     * the user will want to name {@code .exe} in order for the receiving
+     * Windows system to run it as an executable; keying the suffix off
+     * the host would produce {@code Test} on that build and the file would
+     * not be double-clickable.</p>
+     *
+     * @param input          the JAR, directory or single {@code .class}
+     *                       file the analysis was run on
+     * @param targetPlatform the resolved target platform for this build;
+     *                       may be {@code null} only if the caller did not
+     *                       resolve one, in which case the host {@code os.name}
+     *                       is used as a fallback
+     * @return the default executable path
+     */
+    private static Path defaultOutputPath(Path input, TargetPlatform targetPlatform) {
+        Path fileNamePath = input.getFileName();
+        String fileName = (fileNamePath != null) ? fileNamePath.toString() : "";
+
+        // Root path ("/", "C:\") or empty input: no sensible stem exists.
+        // Fall back to a stable, explicit name rather than producing a path
+        // that resolves to the filesystem root.
+        if (fileName.isEmpty() || fileName.equals(".") || fileName.equals("..")) {
+            fileName = "output";
+        }
+
+        // Strip a trailing .jar or .class so that the executable is named
+        // after its input rather than after its input's format. Any other
+        // extension is left in place: "Test.foo" is not a known JNative
+        // input and stripping ".foo" would surprise the user.
+        String baseName = fileName;
+        int dotIdx = fileName.lastIndexOf('.');
+        if (dotIdx > 0) {
+            String ext = fileName.substring(dotIdx).toLowerCase(java.util.Locale.ROOT);
+            if (ext.equals(".jar") || ext.equals(".class")) {
+                baseName = fileName.substring(0, dotIdx);
+            }
+        }
+
+        boolean targetIsWindows = targetPlatform != null
+            ? targetPlatform.triple().toLowerCase(java.util.Locale.ROOT).contains("windows")
+            : System.getProperty("os.name", "")
+                  .toLowerCase(java.util.Locale.ROOT).contains("win");
+
+        if (targetIsWindows) {
+            baseName = baseName + ".exe";
+        }
+
+        Path parent = input.getParent();
+        return (parent != null) ? parent.resolve(baseName) : Paths.get(baseName);
     }
 }

@@ -21,6 +21,8 @@ import org.objectweb.asm.ClassVisitor;
 import org.objectweb.asm.MethodVisitor;
 import org.objectweb.asm.Opcodes;
 
+import java.io.IOException;
+import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -36,7 +38,6 @@ public class BytecodeToIr {
     private final DependencyResolver resolver;
     private final ReachabilityAnalysis reachability;
     private final IrBuilder builder = new IrBuilder();
-    private final Map<MethodReference, Function> functionMap = new HashMap<>();
 
     /** Mangling of a Java method -> the C override that replaces it. */
     private final Map<String, NativeOverride> overrides = new HashMap<>();
@@ -305,20 +306,59 @@ public class BytecodeToIr {
 
             if (classNode.isExternal()) {
                 Function func = createExternalFunction(methodRef, isStatic);
-                functionMap.put(methodRef, func);
                 return;
             }
 
             if (methodNode != null && methodNode.isNative()) {
-                String nativeName = "__jnative_" + LlvmRuntime.mangleMethod(owner, name, desc);
-                Function func = new Function(nativeName, methodNode.getReturnType());
-                func.setOwnerClass(owner);
+                // Find the class that actually declares this native method.
+                // The owner string passed in may be an interface, an
+                // abstract superclass, or an inner class; the native
+                // implementation always lives with the declaring class.
+                String[] declaringHolder = new String[1];
+                MethodNode declaring = resolver.findMethodInHierarchy(owner, name, desc, declaringHolder);
+                String declaringOwner = (declaringHolder[0] != null && !declaringHolder[0].isEmpty())
+                        ? declaringHolder[0]
+                        : owner;
+                if (declaring == null) {
+                    declaring = methodNode;
+                    declaringOwner = owner;
+                }
+
+                // A JNative C file is looked up on the declaring class AND
+                // on every enclosing class of the declaring class. This
+                // covers the case where a native method is declared on an
+                // inner class but implemented in a C file named after the
+                // enclosing class.
+                String nativeFileOwner = findJNativeFileOwner(declaringOwner);
+
+                String symbolName;
+                boolean jni;
+                if (nativeFileOwner != null) {
+                    // JNative implementation exists — keep the historic
+                    // symbol.
+                    symbolName = "__jnative_"
+                        + LlvmRuntime.mangleMethod(declaringOwner, name, desc);
+                    jni = false;
+                } else {
+                    // No JNative implementation. The linker will resolve
+                    // the symbol from a platform .so. JNI naming rules
+                    // apply; overloads of the same name get the
+                    // "__<mangled-descriptor>" suffix.
+                    int overloads = countOverloads(declaringOwner, name);
+                    symbolName = LlvmRuntime.toJniSymbolName(declaringOwner, name, desc, overloads);
+                    jni = true;
+                }
+
+                Function func = new Function(symbolName, declaring.getReturnType());
+                func.setOwnerClass(declaringOwner);
+                func.setJniNative(jni);
+                func.setStaticJniNative(jni && declaring.isStatic());
 
                 List<Type> allParams = new ArrayList<>();
-                if (!methodNode.isStatic()) {
-                    allParams.add(Type.reference(owner));
+                if (!declaring.isStatic()) {
+                    allParams.add(Type.reference(declaringOwner));
                 }
-                allParams.addAll(methodNode.getParameterTypes());
+                allParams.addAll(declaring.getParameterTypes());
 
                 int slot = 0;
                 for (int i = 0; i < allParams.size(); i++) {
@@ -327,7 +367,22 @@ public class BytecodeToIr {
                     slot += (t == Type.LONG || t == Type.DOUBLE) ? 2 : 1;
                 }
                 builder.getModule().addFunction(func);
-                functionMap.put(methodRef, func);
+
+                // The emitter looks up call targets by the mangled JNative
+                // name and by the "__jnative_"-prefixed form. Register both
+                // as aliases so the call site resolves to the JNI function
+                // without a second lookup.
+                String jnativeMangled = LlvmRuntime.mangleMethod(declaringOwner, name, desc);
+                builder.getModule().registerAlias(jnativeMangled, func);
+                builder.getModule().registerAlias("__jnative_" + jnativeMangled, func);
+
+                // Also alias under the original owner, in case the emitter
+                // walks through the un-resolved method reference.
+                if (!declaringOwner.equals(owner)) {
+                    String originalMangled = LlvmRuntime.mangleMethod(owner, name, desc);
+                    builder.getModule().registerAlias(originalMangled, func);
+                    builder.getModule().registerAlias("__jnative_" + originalMangled, func);
+                }
                 return;
             }
 
@@ -342,9 +397,6 @@ public class BytecodeToIr {
                 // itable entry that references it then fails to resolve
                 // at link time with:
                 //
-                //     ld.lld: error: undefined symbol: fn_java_io_FileSystem_getSeparator___C
-                //     >>> referenced by output.ll
-                //     >>>   ...(.data.rel.ro..Lvtable_methods_java_io_FileSystem+0x58)
                 //
                 // The concrete failures this avoids:
                 //
@@ -411,8 +463,30 @@ public class BytecodeToIr {
                 return;
             }
 
-            ClassReader reader = new ClassReader(bytes);
-            MethodTranslator translator = new MethodTranslator(methodRef, methodNode.isStatic(), builder, resolver);
+            MethodTranslator translator = new MethodTranslator(
+                    methodRef, methodNode.isStatic(), builder, resolver);
+
+            // Override readBytecodeInstructionOffset so the translator can
+            // record, for every basic block, the bytecode offset of its
+            // first instruction. MethodTranslator.visitEnd() uses those
+            // offsets to compute each try-range's protected body from the
+            // bytecode interval [start, end) rather than from CFG
+            // reachability. See setCurrentBytecodeOffset / visitEnd() in
+            // MethodTranslator for the full rationale.
+            //
+            // The override is unconditional. On every ASM 9.x release this
+            // runtime targets, ClassReader calls readBytecodeInstructionOffset
+            // for every instruction it dispatches; if a future ASM release
+            // stops calling it, blockOffsets stays empty and MethodTranslator
+            // falls back to the previous reachability-based body, so the
+            // translator remains functional.
+            ClassReader reader = new ClassReader(bytes) {
+                @Override
+                protected void readBytecodeInstructionOffset(int bytecodeOffset) {
+                    translator.setCurrentBytecodeOffset(bytecodeOffset);
+                }
+            };
+
             reader.accept(new ClassVisitor(Opcodes.ASM9) {
                 @Override
                 public MethodVisitor visitMethod(int access, String mName, String mDesc,
@@ -426,18 +500,71 @@ public class BytecodeToIr {
 
             Function func = translator.getCurrentFunction();
             if (func != null) {
-                functionMap.put(methodRef, func);
             } else {
-                Function external = createExternalFunction(methodRef, isStatic);
-                functionMap.put(methodRef, external);
+                createExternalFunction(methodRef, isStatic);
             }
         } catch (Exception e) {
             log.warn("Failed to translate method {}; falling back to external declaration: {}",
                 methodRef, e.getMessage());
             boolean isStatic = methodNode != null && methodNode.isStatic();
-            Function func = createExternalFunction(methodRef, isStatic);
-            functionMap.put(methodRef, func);
+            createExternalFunction(methodRef, isStatic);
         }
+    }
+
+    /**
+     * Walks the declaring class and every enclosing class of an inner class,
+     * returning the first internal name whose JNative C file exists on the
+     * classpath. Returns null when no C file is found.
+     */
+    private String findJNativeFileOwner(String declaringOwner) {
+        String candidate = declaringOwner;
+        while (candidate != null && !candidate.isEmpty()) {
+            String base = candidate.startsWith("java/")
+                ? "jnative/" + candidate.substring("java/".length())
+                : "jnative/" + candidate;
+
+            // 1. Exact match: Foo.c
+            if (resourceExists(base + ".c")) return candidate;
+
+            // 2. JDK convention: FooSupport.c (Continuation +
+            //    ContinuationSupport, IntegerPolynomial +
+            //    IntegerPolynomial1305, ...)
+            if (resourceExists(base + "Support.c")) return candidate;
+
+            int dollar = candidate.lastIndexOf('$');
+            if (dollar < 0) break;
+            candidate = candidate.substring(0, dollar);
+        }
+        return null;
+    }
+
+    private static boolean resourceExists(String resourcePath) {
+        try (InputStream is = Thread.currentThread().getContextClassLoader()
+                .getResourceAsStream(resourcePath)) {
+            return is != null;
+        } catch (IOException ignored) {
+            return false;
+        }
+    }
+
+    /**
+     * Number of methods named {@code name} declared by {@code owner}.
+     * Used to decide whether the JNI symbol needs the {@code __<desc>}
+     * overload suffix. Returns 1 when the class is unknown, which keeps
+     * the unsuffixed JNI form — the common case.
+     */
+    private int countOverloads(String owner, String name) {
+        ClassNode cn = resolver.getClassNode(owner);
+        if (cn == null) {
+            return 1;
+        }
+        int n = 0;
+        for (MethodNode mn : cn.getMethods()) {
+            if (mn.getName().equals(name)) {
+                n++;
+            }
+        }
+        return Math.max(n, 1);
     }
 
     private MethodNode findMethod(ClassNode classNode, String name, String desc) {

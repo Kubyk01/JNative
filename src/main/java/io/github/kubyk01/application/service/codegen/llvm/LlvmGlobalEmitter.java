@@ -3,7 +3,6 @@ package io.github.kubyk01.application.service.codegen.llvm;
 import io.github.kubyk01.application.service.analyzer.dependencyresolver.DependencyResolver;
 import io.github.kubyk01.application.service.analyzer.ssa.TypeResolver;
 import io.github.kubyk01.domain.analyzer.aliasanalysis.AliasAnalysisResult;
-import io.github.kubyk01.domain.analyzer.aliasanalysis.PointsToSet;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.ClassNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.FieldNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.FieldReference;
@@ -28,6 +27,7 @@ import io.github.kubyk01.domain.ir.Terminator;
 import io.github.kubyk01.domain.ir.ThrowTerminator;
 import io.github.kubyk01.domain.ir.Type;
 import io.github.kubyk01.domain.ir.Value;
+import io.github.kubyk01.util.LlvmUtil;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.objectweb.asm.Opcodes;
@@ -37,6 +37,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.concurrent.ConcurrentHashMap;
 
 import static io.github.kubyk01.util.LlvmUtil.getElementSizeOfType;
+import static io.github.kubyk01.util.LlvmUtil.extractFieldName;
 
 /**
  * Emits the global data section of a generated LLVM module: struct type
@@ -275,6 +276,28 @@ public class LlvmGlobalEmitter {
      */
     private final Set<String> emittedRefClassNames = ConcurrentHashMap.newKeySet();
 
+    /**
+     * Lazy-{@code <clinit>} guard wrappers: mangled {@code <clinit>} symbol
+     * to wrapper symbol, as produced by
+     * {@link io.github.kubyk01.application.service.optimizer.LazyClinitInstrumenter}
+     * and handed over by {@link LlvmGenerator#setClinitWrappers(Map)}.
+     *
+     * <p>Consumed by {@link #emitLazyClinitMap()}, which runs (after
+     * {@link #generateReflectionData()} has populated
+     * {@link #emittedRefClassNames}) inside
+     * {@link #generateGlobalDefinitions()}.
+     */
+    private Map<String, String> lazyClinitWrappers = new HashMap<>();
+
+    /**
+     * Supplies the lazy-{@code <clinit>} wrapper map to the emitter. Called
+     * from {@link LlvmGenerator#setClinitWrappers(Map)}; null-tolerant in the
+     * same way as that setter.
+     */
+    public void setLazyClinitWrappers(Map<String, String> wrappers) {
+        this.lazyClinitWrappers = (wrappers != null) ? wrappers : new HashMap<>();
+    }
+
     public int getLiteralPoolSize() {
         return stringLiteralPool.size();
     }
@@ -291,12 +314,10 @@ public class LlvmGlobalEmitter {
 
     private final Map<String, Integer> interfaceIds = new ConcurrentHashMap<>();
     private int nextInterfaceId = 0;
-    private int totalInterfaces = 0;
     private volatile boolean layoutsBuilt = false;
 
     private final Map<String, String> vtableNames = new ConcurrentHashMap<>();
     private final Map<String, Integer> vtableLengths = new ConcurrentHashMap<>();
-    private final Map<String, Integer> lambdaVtableLengths = new ConcurrentHashMap<>();
 
     private final Map<String, String> typeInfoNames = new ConcurrentHashMap<>();
 
@@ -307,7 +328,6 @@ public class LlvmGlobalEmitter {
     private String cachedTypeDefinitions;
 
     private final Map<String, String> extraStructs = new ConcurrentHashMap<>();
-    private final Map<String, String> extraVtables = new ConcurrentHashMap<>();
 
     // =========================================================================
     //  Native overrides and embedded resources
@@ -424,7 +444,6 @@ public class LlvmGlobalEmitter {
         String samInterface;
         String samSig;
         String adaptorName;
-        List<Type> capturedTypes;
 
         /**
          * All interfaces this lambda is an instance of: the SAM interface
@@ -474,22 +493,8 @@ public class LlvmGlobalEmitter {
     //  Extra struct / vtable registry
     // =========================================================================
 
-    public void addExtraStruct(String name, String definition) {
-        extraStructs.put(name, definition);
-    }
-
-    public void addExtraVtable(String name, String content) {
-        extraVtables.put(name, content);
-    }
-
     public void emitExtraStructs(StringBuilder sb) {
         for (String def : extraStructs.values()) {
-            sb.append(def).append("\n");
-        }
-    }
-
-    public void emitExtraVtables(StringBuilder sb) {
-        for (String def : extraVtables.values()) {
             sb.append(def).append("\n");
         }
     }
@@ -573,13 +578,8 @@ public class LlvmGlobalEmitter {
                 interfaceIds.put(name, nextInterfaceId++);
                 getOrBuildInterfaceLayout(name);
             }
-            totalInterfaces = nextInterfaceId;
             layoutsBuilt = true;
         }
-    }
-
-    public void prepareMethodIndex() {
-        prepareLayouts();
     }
 
     private VtableLayout getOrBuildClassLayout(String className) {
@@ -742,21 +742,8 @@ public class LlvmGlobalEmitter {
         return id != null ? id : -1;
     }
 
-    public int getTotalInterfaces() {
-        prepareLayouts();
-        return totalInterfaces;
-    }
-
     public String getVtableName(String className) {
         return vtableNames.get(className);
-    }
-
-    public int getVtableLength(String className) {
-        return vtableLengths.getOrDefault(className, -1);
-    }
-
-    public int getLambdaVtableLength(String lambdaId) {
-        return lambdaVtableLengths.getOrDefault(lambdaId, -1);
     }
 
     public String getStructName(String className) {
@@ -830,6 +817,11 @@ public class LlvmGlobalEmitter {
             + "i8*, i8*, i8*, i8*, i8*, i8*, i8*, i8*, i8*, i8*, "
             + "i8*, i8*, i8*, i8*, i8*, i8*, i8*, i8* }\n" +
             "%JNativeSymbolClassEntry = type { i8*, %ReflectionClass* }\n" +
+            // One entry of @jnative_lazy_clinit_map; see emitLazyClinitMap()
+            // and JNativeLazyClinitEntry in jnative_runtime.h. The two fields
+            // are the class whose <clinit> is lazy and the guard wrapper that
+            // runs it on first use.
+            "%JNativeLazyClinitEntry = type { %ReflectionClass*, i8* }\n" +
             // One entry of @jnative_function_index; see
             // generateFunctionIndex() and JNativeFunctionEntry in
             // jnative_runtime.h. The three fields are the function pointer,
@@ -864,7 +856,8 @@ public class LlvmGlobalEmitter {
      */
     public String generateGlobalDefinitions() {
         prepareLayouts();
-        return generateStaticFields() +
+        return generateLayoutConstants() +
+            generateStaticFields() +
             // generateStringLiterals() depends on vtableNames, which only exists
             // after generateVtables(); the reflection data depends on the string
             // literal pool; the unnamed module and the embedded-resource table
@@ -877,21 +870,112 @@ public class LlvmGlobalEmitter {
             generateUnnamedModule() +
             generateEmbeddedResources() +
             generateReflectionData() +
-            generateFunctionIndex();
+            generateFunctionIndex() +
+            // Runs last so that emittedRefClassNames (filled by
+            // generateReflectionData) is complete: every row of the map points
+            // at an @refclass_* constant that already exists.
+            emitLazyClinitMap(lazyClinitWrappers) +
+            // The completion flags are referenced by the guard wrappers'
+            // bodies, which are emitted as ordinary functions; the globals
+            // themselves are plain i32 and do not depend on anything else.
+            emitLazyClinitFlags();
     }
 
-    /** Existing entry point, preserved for backwards compatibility. */
-    public String generateGlobals() {
-        prepareLayouts();
-        return generateTypeDefinitions()
-            + generateStructDefinitions()
-            + generateGlobalDefinitions();
+    public String generateLayoutConstants() {
+        StringBuilder sb = new StringBuilder();
+        sb.append("\n; ----- Layout constants (compile-time) -----\n");
+
+        // Thread
+        int threadSize = computeObjectSize("java/lang/Thread");
+        int threadHolder = safeGlobalFieldOffset("java/lang/Thread", "holder");
+        int threadTid = safeGlobalFieldOffset("java/lang/Thread", "tid");
+        int threadName = safeGlobalFieldOffset("java/lang/Thread", "name");
+        int threadInterruptLock = safeGlobalFieldOffsetAllowMissing("java/lang/Thread", "interruptLock");
+
+        int fhSize = computeObjectSize("java/lang/Thread$FieldHolder");
+        int fhGroup = safeGlobalFieldOffset("java/lang/Thread$FieldHolder", "group");
+        int fhPriority = safeGlobalFieldOffset("java/lang/Thread$FieldHolder", "priority");
+        int fhDaemon = safeGlobalFieldOffset("java/lang/Thread$FieldHolder", "daemon");
+        int fhStatus = safeGlobalFieldOffset("java/lang/Thread$FieldHolder", "threadStatus");
+
+        int tgSize = computeObjectSize("java/lang/ThreadGroup");
+        int tgName = safeGlobalFieldOffset("java/lang/ThreadGroup", "name");
+        int tgMaxPrio = safeGlobalFieldOffset("java/lang/ThreadGroup", "maxPriority");
+        int tgVmAllow = safeGlobalFieldOffsetAllowMissing("java/lang/ThreadGroup", "vmAllowSuspension");
+
+        sb.append("@THREAD_OBJECT_SIZE          = constant i32 ").append(threadSize).append("\n");
+        sb.append("@THREAD_HOLDER_OFFSET        = constant i32 ").append(threadHolder).append("\n");
+        sb.append("@THREAD_TID_OFFSET           = constant i32 ").append(threadTid).append("\n");
+        sb.append("@THREAD_NAME_OFFSET          = constant i32 ").append(threadName).append("\n");
+        sb.append("@THREAD_INTERRUPTLOCK_OFFSET = constant i32 ").append(threadInterruptLock).append("\n");
+        sb.append("@FH_OBJECT_SIZE              = constant i32 ").append(fhSize).append("\n");
+        sb.append("@FH_GROUP_OFFSET             = constant i32 ").append(fhGroup).append("\n");
+        sb.append("@FH_PRIORITY_OFFSET          = constant i32 ").append(fhPriority).append("\n");
+        sb.append("@FH_DAEMON_OFFSET            = constant i32 ").append(fhDaemon).append("\n");
+        sb.append("@FH_STATUS_OFFSET            = constant i32 ").append(fhStatus).append("\n");
+        sb.append("@TG_OBJECT_SIZE              = constant i32 ").append(tgSize).append("\n");
+        sb.append("@TG_NAME_OFFSET              = constant i32 ").append(tgName).append("\n");
+        sb.append("@TG_MAXPRIORITY_OFFSET       = constant i32 ").append(tgMaxPrio).append("\n");
+        sb.append("@TG_VMALLOW_OFFSET           = constant i32 ").append(tgVmAllow).append("\n\n");
+
+        // reflect
+        int fieldClazz = safeGlobalFieldOffsetAllowMissing("java/lang/reflect/Field", "clazz");
+        int fieldSlot = safeGlobalFieldOffsetAllowMissing("java/lang/reflect/Field", "slot");
+        int fieldName = safeGlobalFieldOffsetAllowMissing("java/lang/reflect/Field", "name");
+        int fieldType = safeGlobalFieldOffsetAllowMissing("java/lang/reflect/Field", "type");
+        int fieldModifiers = safeGlobalFieldOffsetAllowMissing("java/lang/reflect/Field", "modifiers");
+        int methodClazz = safeGlobalFieldOffsetAllowMissing("java/lang/reflect/Method", "clazz");
+        int methodSlot = safeGlobalFieldOffsetAllowMissing("java/lang/reflect/Method", "slot");
+        int methodName = safeGlobalFieldOffsetAllowMissing("java/lang/reflect/Method", "name");
+        int methodReturn = safeGlobalFieldOffsetAllowMissing("java/lang/reflect/Method", "returnType");
+        int methodParams = safeGlobalFieldOffsetAllowMissing("java/lang/reflect/Method", "parameterTypes");
+        int methodExc = safeGlobalFieldOffsetAllowMissing("java/lang/reflect/Method", "exceptionTypes");
+        int methodMods = safeGlobalFieldOffsetAllowMissing("java/lang/reflect/Method", "modifiers");
+        int ctorClazz = safeGlobalFieldOffsetAllowMissing("java/lang/reflect/Constructor", "clazz");
+        int ctorSlot = safeGlobalFieldOffsetAllowMissing("java/lang/reflect/Constructor", "slot");
+        int ctorParams = safeGlobalFieldOffsetAllowMissing("java/lang/reflect/Constructor", "parameterTypes");
+        int ctorExc = safeGlobalFieldOffsetAllowMissing("java/lang/reflect/Constructor", "exceptionTypes");
+        int ctorMods = safeGlobalFieldOffsetAllowMissing("java/lang/reflect/Constructor", "modifiers");
+        int ctorRoot = safeGlobalFieldOffsetAllowMissing("java/lang/reflect/Constructor", "root");
+        int methodRoot = safeGlobalFieldOffsetAllowMissing("java/lang/reflect/Method", "root");
+
+        sb.append("@JNATIVE_FIELD_CLAZZ_OFFSET      = constant i32 ").append(fieldClazz).append("\n");
+        sb.append("@JNATIVE_FIELD_SLOT_OFFSET       = constant i32 ").append(fieldSlot).append("\n");
+        sb.append("@JNATIVE_FIELD_NAME_OFFSET       = constant i32 ").append(fieldName).append("\n");
+        sb.append("@JNATIVE_FIELD_TYPE_OFFSET       = constant i32 ").append(fieldType).append("\n");
+        sb.append("@JNATIVE_FIELD_MODIFIERS_OFFSET  = constant i32 ").append(fieldModifiers).append("\n");
+        sb.append("@JNATIVE_METHOD_CLAZZ_OFFSET          = constant i32 ").append(methodClazz).append("\n");
+        sb.append("@JNATIVE_METHOD_SLOT_OFFSET           = constant i32 ").append(methodSlot).append("\n");
+        sb.append("@JNATIVE_METHOD_NAME_OFFSET           = constant i32 ").append(methodName).append("\n");
+        sb.append("@JNATIVE_METHOD_RETURN_TYPE_OFFSET    = constant i32 ").append(methodReturn).append("\n");
+        sb.append("@JNATIVE_METHOD_PARAM_TYPES_OFFSET    = constant i32 ").append(methodParams).append("\n");
+        sb.append("@JNATIVE_METHOD_EXC_TYPES_OFFSET      = constant i32 ").append(methodExc).append("\n");
+        sb.append("@JNATIVE_METHOD_MODIFIERS_OFFSET      = constant i32 ").append(methodMods).append("\n");
+        sb.append("@JNATIVE_METHOD_ROOT_OFFSET           = constant i32 ").append(methodRoot).append("\n");
+        sb.append("@JNATIVE_CTOR_CLAZZ_OFFSET            = constant i32 ").append(ctorClazz).append("\n");
+        sb.append("@JNATIVE_CTOR_SLOT_OFFSET             = constant i32 ").append(ctorSlot).append("\n");
+        sb.append("@JNATIVE_CTOR_PARAM_TYPES_OFFSET      = constant i32 ").append(ctorParams).append("\n");
+        sb.append("@JNATIVE_CTOR_EXC_TYPES_OFFSET        = constant i32 ").append(ctorExc).append("\n");
+        sb.append("@JNATIVE_CTOR_MODIFIERS_OFFSET        = constant i32 ").append(ctorMods).append("\n");
+        sb.append("@JNATIVE_CTOR_ROOT_OFFSET             = constant i32 ").append(ctorRoot).append("\n\n");
+        return sb.toString();
     }
 
-    // =========================================================================
-    //  Unnamed-module singleton
-    // =========================================================================
+    private int safeGlobalFieldOffset(String owner, String field) {
+        try {
+            return getFieldOffset(owner, field);
+        } catch (Exception e) {
+            return 0;
+        }
+    }
 
+    private int safeGlobalFieldOffsetAllowMissing(String owner, String field) {
+        try {
+            return getFieldOffset(owner, field);
+        } catch (Exception e) {
+            return -1;
+        }
+    }
     /**
      * Emits the one shared {@code java.lang.Module} object that stands for the
      * bootstrap loader's module.
@@ -1614,7 +1698,6 @@ public class LlvmGlobalEmitter {
         synchronized (this) {
             if (!interfaceIds.containsKey(samInterface)) {
                 interfaceIds.put(samInterface, nextInterfaceId++);
-                totalInterfaces = nextInterfaceId;
             }
             getOrBuildInterfaceLayout(samInterface);
 
@@ -1640,7 +1723,6 @@ public class LlvmGlobalEmitter {
             for (String iface : superIfacesList) {
                 if (!interfaceIds.containsKey(iface)) {
                     interfaceIds.put(iface, nextInterfaceId++);
-                    totalInterfaces = nextInterfaceId;
                 }
                 getOrBuildInterfaceLayout(iface);
             }
@@ -1653,7 +1735,6 @@ public class LlvmGlobalEmitter {
             info.samInterface = samInterface;
             info.samSig = samSig;
             info.adaptorName = adaptorName;
-            info.capturedTypes = new ArrayList<>(capturedTypes);
             info.superInterfaces = superIfacesList;
             lambdaRegistry.put(lambdaId, info);
 
@@ -1894,7 +1975,6 @@ public class LlvmGlobalEmitter {
                     .append("}\n");
 
             vtableLengths.put(lambdaClassName, methodLen);
-            lambdaVtableLengths.put(info.lambdaId, methodLen);
         }
         return sb.toString();
     }
@@ -1976,14 +2056,86 @@ public class LlvmGlobalEmitter {
     // =========================================================================
 
     private String generateStaticFields() {
+        Set<String> allFields = new TreeSet<>(aliasResult.getGraph()
+                .getStaticFieldPointsToMap().keySet());
+
+        for (Function function : module.getFunctions()) {
+            for (BasicBlock block : function.getBlocks()) {
+                for (Instruction inst : block.getInstructions()) {
+                    Opcode op = inst.getOpcode();
+                    if (op != Opcode.GET_STATIC && op != Opcode.PUT_STATIC) continue;
+                    String fullName = extractFieldName(inst);
+                    if (fullName == null || fullName.isEmpty()
+                        || "unknown".equals(fullName)) {
+                        continue;
+                    }
+                    allFields.add(fullName);
+                }
+            }
+        }
+
         StringBuilder sb = new StringBuilder();
-        Map<String, PointsToSet> staticFields = aliasResult.getGraph().getStaticFieldPointsToMap();
-        List<String> sorted = new ArrayList<>(staticFields.keySet());
-        Collections.sort(sorted);
-        for (String fullName : sorted) {
+
+        // ------------------------------------------------------------------
+        // Runtime-owned globals referenced through GET_STATIC/PUT_STATIC that
+        // are NOT class fields. Emit them as `external global` exactly once
+        // here, in _module.ll's globalDefs block, which sits before every
+        // function body that reads them.
+        //
+        // Why this is emitted unconditionally (not gated on `allFields`):
+        //   - if a destructor body in the current module already references
+        //     gv_jnative_in_shutdown, the declaration must precede the load;
+        //   - if no function yet references it, the declaration is inert
+        //     (zero bytes in .o, discarded by the linker);
+        //   - by emitting it here, parseGlobalDecls() picks it up so that
+        //     per-class .ll files can emit their own `external global` for
+        //     the same symbol through LlvmGenerator.buildExterns().
+        //
+        // The `align 4` matches the C-side declaration
+        // `volatile int gv_jnative_in_shutdown`; a mismatch would change the
+        // alignment of the emitted symbol's slot in _module.o's data segment,
+        // which is not what the C side allocates.
+        // ------------------------------------------------------------------
+        sb.append("@gv_jnative_in_shutdown = external global i32, align 4\n");
+
+        for (String fullName : allFields) {
+            // --------------------------------------------------------------
+            // Runtime-owned globals that are NOT class fields.
+            //
+            // This check runs BEFORE any `.`-based parsing: `fullName` has no
+            // separator, and `lastIndexOf('.') == -1` would make
+            // `substring(0, -1)` throw StringIndexOutOfBoundsException. That
+            // is exactly the crash that motivated this reordering — the
+            // length-22 name in the traceback is "jnative_in_shutdown".
+            //
+            // The symbol is declared above and defined in jnative_runtime.c;
+            // emitting it here as a class field would be a duplicate global
+            // and a link-time error.
+            // --------------------------------------------------------------
+            if ("jnative_in_shutdown".equals(fullName)) {
+                continue;
+            }
+
             int dot = fullName.lastIndexOf('.');
-            String owner = fullName.substring(0, dot);
+            if (dot <= 0) {
+                // Defensive: any other owner-less key is a producer bug.
+                // Such a field cannot be addressed through getFieldOffset()
+                // by any class, so a global emitted for it would be dead
+                // storage. Skip rather than crash on a negative substring
+                // end index.
+                continue;
+            }
+
+            String owner     = fullName.substring(0, dot);
             String fieldName = fullName.substring(dot + 1);
+
+            if (LlvmTypeMapper.LAZY_CLINIT_FLAG_FIELD.equals(fieldName)) {
+                // The lazy-<clinit> completion flag: owned by
+                // emitLazyClinitFlags(), not here. A second definition would
+                // be a link error.
+                continue;
+            }
+
             Type fieldType = getFieldType(owner, fieldName);
             if (fieldType == null) fieldType = Type.UNKNOWN;
             String llvmType = LlvmTypeMapper.toLlvmType(fieldType);
@@ -2000,7 +2152,7 @@ public class LlvmGlobalEmitter {
 
             String globalName = "gv_" + LlvmTypeMapper.sanitizeIdentifier(fullName);
             sb.append("@").append(globalName).append(" = global ").append(llvmType)
-                .append(" ").append(init).append(", align 8\n");
+              .append(" ").append(init).append(", align 8\n");
         }
         sb.append("\n");
         return sb.toString();
@@ -2805,6 +2957,12 @@ public class LlvmGlobalEmitter {
     }
 
     public Type getFieldType(String className, String fieldName) {
+        // The lazy-<clinit> completion flag is a synthetic field: it exists
+        // only in the IR of the guard wrapper and in no class file, so the
+        // resolver has no entry for it. It is always an i32.
+        if (LlvmTypeMapper.LAZY_CLINIT_FLAG_FIELD.equals(fieldName)) {
+            return Type.INT;
+        }
         // The fields generated java.lang.Class code can legitimately read
         // must be typed by what the runtime struct holds, not by the class
         // file: `name` is an i8* Java String (or null, in which case getName()
@@ -3695,6 +3853,125 @@ public class LlvmGlobalEmitter {
     }
 
     /**
+     * Emits {@code @jnative_lazy_clinit_map} and
+     * {@code @jnative_lazy_clinit_map_size}: one row per class whose
+     * {@code <clinit>} was given a lazy guard wrapper, pairing the class
+     * mirror with the wrapper that runs the initializer on first use.
+     *
+     * <p>The consumer is the hand-written native file
+     * {@code jdk/internal/reflect/MethodHandleObjectFieldAccessorImpl.c},
+     * which must run the class initializer before performing a
+     * MemberName-targeted field access (see that file's header comment for
+     * the access-order invariant). The C side reads the table through the
+     * weak declarations in {@code jnative_runtime.h}, so an image with no
+     * lazy classes simply resolves the symbols to null and short-circuits.
+     *
+     * <p>The wrapper column is stored as an {@code i8*} (bitcast of
+     * {@code void ()*}), matching {@code JNativeLazyClinitEntry.wrapper}.
+     *
+     * <p>Must run after {@link #generateReflectionData()} — it needs
+     * {@link #emittedRefClassNames} to decide which {@code @refclass_*}
+     * constants actually exist.
+     *
+     * @param clinitWrappers mangled {@code <clinit>} symbol to wrapper
+     *                       symbol, as filled by LazyClinitInstrumenter
+     */
+    public String emitLazyClinitMap(Map<String, String> clinitWrappers) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("\n; ----- Lazy <clinit> map -----\n");
+
+        // Resolve each clinitName back to its owning internal class name
+        // through the IR function itself (ownerClass is set by
+        // BytecodeToIr / MethodTranslator when the <clinit> body is built).
+        List<String[]> rows = new ArrayList<>();   // {className, wrapperName}
+        if (clinitWrappers != null) {
+            for (Map.Entry<String, String> e : clinitWrappers.entrySet()) {
+                String clinitName = e.getKey();     // e.g. fn_java_lang_Foo__clinit____V
+                String wrapperName = e.getValue();
+                if (wrapperName == null || wrapperName.isEmpty()) continue;
+
+                Function clinitFn = module.getFunction(clinitName);
+                if (clinitFn == null || clinitFn.getEntryBlock() == null) continue;
+                String className = clinitFn.getOwnerClass();
+                if (className == null || className.isEmpty()) continue;
+
+                Function wrapperFn = module.getFunction(wrapperName);
+                if (wrapperFn == null || wrapperFn.getEntryBlock() == null) continue;
+
+                if (!emittedRefClassNames.contains(className)) continue;
+                rows.add(new String[]{className, wrapperName});
+            }
+        }
+        rows.sort(Comparator.comparing(r -> r[0]));
+
+        if (rows.isEmpty()) {
+            sb.append("@jnative_lazy_clinit_map = constant [1 x %JNativeLazyClinitEntry] ")
+              .append("[%JNativeLazyClinitEntry { %ReflectionClass* null, i8* null }]\n");
+            sb.append("@jnative_lazy_clinit_map_size = constant i64 0\n");
+            return sb.toString();
+        }
+
+        sb.append("@jnative_lazy_clinit_map = constant [")
+          .append(rows.size())
+          .append(" x %JNativeLazyClinitEntry] [\n");
+        for (int i = 0; i < rows.size(); i++) {
+            String cls = rows.get(i)[0];
+            String wrapper = rows.get(i)[1];
+            if (i > 0) sb.append(",\n");
+            sb.append("  %JNativeLazyClinitEntry { %ReflectionClass* @refclass_")
+              .append(LlvmTypeMapper.sanitizeIdentifier(cls))
+              .append(", i8* bitcast (void ()* @").append(wrapper).append(" to i8*) }");
+        }
+        sb.append("\n]\n");
+        sb.append("@jnative_lazy_clinit_map_size = constant i64 ")
+          .append(rows.size()).append("\n");
+        return sb.toString();
+    }
+
+    /**
+     * Emits the lazy-{@code <clinit>} completion flag of every class that
+     * owns a guard wrapper.
+     *
+     * <p>Each flag is a single {@code i32} global that the wrapper reads
+     * before it enters the runtime's {@code <clinit>} state machine and
+     * writes once the initializer has completed. It is the fast path: a
+     * class whose initializer has already run is recognised by one atomic
+     * load instead of a call to {@code __jnative_clinit_enter}, which
+     * takes a global mutex and walks the runtime's clinit table with
+     * {@code strcmp}.</p>
+     *
+     * <p>The flag is read with an acquire load and written with a release
+     * store, so a thread that observes the flag also observes the state
+     * the initializer published.</p>
+     *
+     * <p>The global is defined here and only here. The generic static
+     * field pass ({@link #generateStaticFields()}) sees the wrapper's
+     * {@code GET_STATIC}/{@code PUT_STATIC} on the synthetic field and
+     * skips it, so the two passes cannot define the same global twice.
+     * The per-class files reference these globals through the same
+     * external declaration mechanism as every other global.</p>
+     */
+    public String emitLazyClinitFlags() {
+        StringBuilder sb = new StringBuilder();
+        sb.append("\n; ----- Lazy <clinit> completion flags -----\n");
+
+        Set<String> classes = new TreeSet<>();
+        for (Function fn : module.getFunctions()) {
+            if (!LlvmUtil.isLazyClinitWrapper(fn.getName())) continue;
+            String owner = fn.getOwnerClass();
+            if (owner == null || owner.isEmpty()) continue;
+            classes.add(owner);
+        }
+
+        for (String cls : classes) {
+            sb.append("@").append(LlvmTypeMapper.lazyClinitFlagGlobal(cls))
+              .append(" = global i32 0, align 4\n");
+        }
+        sb.append("\n");
+        return sb.toString();
+    }
+
+    /**
      * True when the function's emitted definition has the same LLVM type as
      * its IR signature, so that the {@code bitcast (... to i8*)} in the
      * function index is well-typed.
@@ -4083,7 +4360,6 @@ public class LlvmGlobalEmitter {
         synchronized (this) {
             if (!interfaceIds.containsKey(ifaceName)) {
                 interfaceIds.put(ifaceName, nextInterfaceId++);
-                totalInterfaces = nextInterfaceId;
             }
             getOrBuildInterfaceLayout(ifaceName);
         }

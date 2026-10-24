@@ -47,20 +47,93 @@ public class LifetimeAnalyzer {
 
         // -------- 1. Collect sites (parallel over functions) -----
         AllocationSiteCollector collector =
-            new AllocationSiteCollector(module, aliasResult, scheduler);
+                new AllocationSiteCollector(module, aliasResult, scheduler);
         List<AllocationSite> allSites = collector.collect();
 
         // -------- 2. Cyclic reference detection --------
         CyclicReferenceDetector cyclicDetector =
-            new CyclicReferenceDetector(aliasResult.getGraph(), allSites);
+                new CyclicReferenceDetector(aliasResult.getGraph(), allSites);
         Set<AllocationSite> cyclicSites = cyclicDetector.detect();
         result.getUnresolved().addAll(cyclicSites);
 
         // -------- 3. Liveness (now internally parallel) --------
         LivenessAnalyzer livenessAnalyzer =
-            new LivenessAnalyzer(module, aliasResult, summaries);
+                new LivenessAnalyzer(module, aliasResult, summaries);
         livenessAnalyzer.setScheduler(scheduler);
         livenessAnalyzer.computeLiveSets(allSites);
+
+        // -------- 3b. Publish live-out per block -------------------------
+        //
+        // DestructorInserter.instrumentFieldOverwrites() consumes this map
+        // to decide whether the previous value of a reference-typed field
+        // is provably dead at a PUT_FIELD. The gate is:
+        //
+        //   emit the release iff no allocation site that could currently
+        //   be in the field is live on exit from the block AND no
+        //   subsequent instruction in the same block (or its terminator)
+        //   reads such a site.
+        //
+        // The block-level part of that gate is exactly what live-out
+        // provides. Getting it wrong in either direction is fatal:
+        //
+        //   - Emitting without live-out information frees objects that
+        //     are still reachable through locals, parameters, other
+        //     fields, or array elements. The concrete counterexample is
+        //     java.util.HashMap.resize():
+        //
+        //         Node<K,V>[] oldTab = table;
+        //         ...
+        //         table = newTab;
+        //         if (oldTab != null) {
+        //             for (int j = 0; j < oldCap; ++j) {
+        //                 e = oldTab[j];          // reads freed memory
+        //                 ...
+        //             }
+        //         }
+        //
+        //     `oldTab` is still live in the local variable across the
+        //     `table = newTab` store, so releasing the old table at the
+        //     store corrupts the loop that follows. The observed
+        //     AIOOBE — "Array index out of bounds in
+        //     java.util.HashMap.resize" — was the emitter's bounds
+        //     check firing on a garbage length word read from a
+        //     recycled chunk.
+        //
+        //   - Not emitting at all leaves HEAP-escape sites with no
+        //     destruction point (LifetimeAnalyzer.computeSite
+        //     short-circuits on EscapeStatus.HEAP) and therefore leaks
+        //     every intermediate value stored into an overwritten field.
+        //     TestHeap's `h.payload = new Payload(...)` in a loop is
+        //     the canonical case: without the pass, 9 999 999 Payloads
+        //     are orphaned with no GC to reclaim them.
+        //
+        // The snapshot below includes one entry per block of every live
+        // function — including terminal blocks, whose live-out is an
+        // empty set. That "present but empty" state is what
+        // DestructorInserter's gate distinguishes from "absent":
+        //
+        //     entry is empty set  -> nothing is live after this block,
+        //                             so releasing the field's previous
+        //                             value is safe.
+        //     entry is absent     -> no liveness information for this
+        //                             block (should not happen on a
+        //                             well-formed module, but a future
+        //                             pass that adds blocks after the
+        //                             analysis could produce it).
+        //                             Conservative: do not emit.
+        //
+        // The copy is shallow: the sets are read-only after
+        // computeLiveSets() returns, so putting them into a plain
+        // HashMap is both cheap and correct.
+        // ------------------------------------------------------------------
+        Map<BasicBlock, Set<AllocationSite>> liveOutSnapshot = new HashMap<>();
+        for (Function f : module.getFunctions()) {
+            if (f.getEntryBlock() == null) continue;
+            for (BasicBlock b : f.getBlocks()) {
+                liveOutSnapshot.put(b, livenessAnalyzer.getLiveOut(b));
+            }
+        }
+        result.setLiveOut(liveOutSnapshot);
 
         // -------- 4. Dominator trees + natural loops, in parallel --------
         List<Function> live = new ArrayList<>();
@@ -70,18 +143,18 @@ public class LifetimeAnalyzer {
 
         Map<Function, DominatorTree> domTrees = new ConcurrentHashMap<>();
         Map<Function, Map<BasicBlock, Set<BasicBlock>>> loopHeaders =
-            new ConcurrentHashMap<>();
+                new ConcurrentHashMap<>();
 
         LlvmUtil.awaitMono(Flux.fromIterable(live)
-            .parallel()
-            .runOn(scheduler)
-            .doOnNext(func -> {
-                DominatorTree domTree = new DominatorTree(func);
-                domTrees.put(func, domTree);
-                loopHeaders.put(func, detectNaturalLoops(func, domTree));
-            })
-            .sequential()
-            .then()
+                .parallel()
+                .runOn(scheduler)
+                .doOnNext(func -> {
+                    DominatorTree domTree = new DominatorTree(func);
+                    domTrees.put(func, domTree);
+                    loopHeaders.put(func, detectNaturalLoops(func, domTree));
+                })
+                .sequential()
+                .then()
         );
 
         // -------- 5. Per-site analysis, in parallel --------
@@ -103,12 +176,12 @@ public class LifetimeAnalyzer {
         // maps as plain HashMaps (no concurrency concerns) while still
         // running the analysis itself in parallel.
         List<SiteResult> siteResults = LlvmUtil.awaitFlux(
-            Flux.fromIterable(candidates)
-                .parallel()
-                .runOn(scheduler)
-                .map(site -> computeSite(site, domTrees, loopHeaders,
-                                         livenessAnalyzer, siteToValue))
-                .sequential()
+                Flux.fromIterable(candidates)
+                        .parallel()
+                        .runOn(scheduler)
+                        .map(site -> computeSite(site, domTrees, loopHeaders,
+                                livenessAnalyzer, siteToValue))
+                        .sequential()
         );
 
         if (siteResults != null) {
@@ -118,8 +191,8 @@ public class LifetimeAnalyzer {
                 } else {
                     for (DestructionPoint point : sr.points()) {
                         result.getDestructionPoints()
-                              .computeIfAbsent(sr.site(), k -> new HashSet<>())
-                              .add(point);
+                                .computeIfAbsent(sr.site(), k -> new HashSet<>())
+                                .add(point);
                     }
                 }
             }
@@ -136,55 +209,55 @@ public class LifetimeAnalyzer {
         EscapeStatus status = escapeResult.getSiteStatus(site);
 
         // ------------------------------------------------------------------
-        // Ownership rule for HEAP sites.
+        // Ownership rule for GLOBAL / THREAD / RETURN.
         //
-        // A HEAP allocation is one whose only remaining reference is inside
-        // a field of another object. That owner is the sole entity entitled
-        // to release the storage: DestructorInserter.createClassDestructor
-        // already emits a destructor that walks every reference-typed field
-        // of the owner and calls the field's destructor recursively, and
-        // the single-free rule (delegatedToSuper) guarantees that the
-        // object is freed exactly once along that chain.
+        // An object that reaches a static field, another thread, or the
+        // caller outlives the frame that allocated it. Its lifetime is
+        // bounded by an entity outside the destruction-point machinery, so
+        // there is no point inside the defining function at which a
+        // destructor could legally run: any such call would free storage
+        // that the new owner still observes.
+        // ------------------------------------------------------------------
+        if (status == EscapeStatus.GLOBAL
+                || status == EscapeStatus.THREAD
+                || status == EscapeStatus.RETURN) {
+            return new SiteResult(site, List.of(), false);
+        }
+
+        // ------------------------------------------------------------------
+        // HEAP sites DO get a per-use destruction point.
         //
-        // Emitting a per-use destruction point for a HEAP site would create
-        // a second, competing owner of the same allocation -- the store
-        // site. Its destructor runs while the real owner still holds a
-        // reference to the object, and the results are exactly the two
-        // failures observed in the previous two runs:
+        // A HEAP allocation is one whose only remaining reference is a
+        // field of another object. The usual reclaim path for such an
+        // object is the owner's destructor chain: DestructorInserter's
+        // createClassDestructor walks every reference-typed field of the
+        // owner and releases it recursively.
         //
-        //   1. Use-after-free: the owner's field points at freed memory,
-        //      and the first read through the field observes whatever the
-        //      allocator wrote into the recycled chunk. On the run that
-        //      produced this report the recycled chunk happened to contain
-        //      the string "/usr/lib", which was then interpreted as a vtable
-        //      by AccessController.executePrivileged.
+        // That chain, however, only exists when the owner itself has a
+        // destructor. The owner may be a STACK object -- an object that
+        // does not escape its defining function. A STACK object's storage
+        // is released by the frame teardown; no destructor ever runs for
+        // it, so the chain stops at the container and the HEAP object it
+        // holds is never released. The only way to reclaim such an object
+        // is to free it at its last use, BEFORE the container becomes
+        // unreachable.
         //
-        //   2. Double free: the owner's destructor walks the field and
-        //      frees the same storage again, which glibc's tcache detects
-        //      and turns into a "free(): double free detected in tcache 2"
-        //      abort.
+        // The per-use destructor emitted for a HEAP site is therefore
+        // paired with a null-out of the field that held the object (see
+        // DestructorInserter.insertDestructorCall). The null-out is what
+        // keeps the two reclaim paths from colliding:
         //
-        // The reproduced crash was the deep form of the same defect:
+        //   - when the container's own destructor does run, it observes
+        //     NULL instead of a dangling pointer and does not free the
+        //     storage a second time;
+        //   - the field-overwrite instrumentation of the next loop
+        //     iteration loads NULL and skips the release, so no double
+        //     free can happen there either.
         //
-        //     ReferenceQueue.<init>:
-        //         new ReentrantLock()               -> stored into this.lock
-        //             ReentrantLock.<init>:
-        //                 new NonfairSync()         -> stored into this.sync
-        //                 per-use destructor for the Sync       (wrong)
-        //         per-use destructor for the Lock           (wrong)
-        //     ... later, an owner's destructor walks the field ...
-        //     __destruct_ReentrantLock -> __destruct_Sync -> __destruct_AQS
-        //         -> __destruct_AOS loads the (already freed) field
-        //         -> loads a garbage exclusiveOwnerThread
-        //         -> calls __destruct_java_lang_Thread(garbage)
-        //         -> SIGSEGV
-        //
-        // The correct treatment of a HEAP site is therefore the same as for
-        // GLOBAL / THREAD / RETURN: its lifetime is bounded by an entity
-        // outside the destruction-point machinery, and no per-use destructor
-        // is emitted for it. Storage is reclaimed through the owner's
-        // destructor chain, which is the only correct owner of a HEAP
-        // object.
+        // The runtime's single-free rule (__jnative_dtor_enter /
+        // __jnative_dtor_unclaim) stays the last line of defence: the
+        // first destructor call claims the object, every later call on
+        // the same pointer is a no-op.
         //
         // STACK is intentionally not listed here. A STACK object that is
         // used as an object is materialised via alloca (see
@@ -197,16 +270,8 @@ public class LifetimeAnalyzer {
         // by EscapeAnalysisResult.getSiteStatus for a site that the
         // analysis did not classify at all; treating such a site as
         // potentially free-able at its last use preserves the previous
-        // conservative behaviour and cannot introduce the HEAP double-free,
-        // because an UNKNOWN site was never observed being stored into
-        // another object's field.
+        // conservative behaviour.
         // ------------------------------------------------------------------
-        if (status == EscapeStatus.GLOBAL
-            || status == EscapeStatus.THREAD
-            || status == EscapeStatus.RETURN
-            || status == EscapeStatus.HEAP) {
-            return new SiteResult(site, List.of(), false);
-        }
 
         Function func = module.getFunction(site.getMethodName());
         if (func == null || func.getEntryBlock() == null) {
@@ -226,7 +291,7 @@ public class LifetimeAnalyzer {
         Set<Value> roots = collectAliases(site, func, allocVal);
 
         Map<Value, List<LivenessAnalyzer.ValueLastUse>> valueLastUses =
-            livenessAnalyzer.computeValueLastUses(func);
+                livenessAnalyzer.computeValueLastUses(func);
 
         List<DestructionPoint> points = new ArrayList<>();
         for (Value root : roots) {
@@ -313,7 +378,7 @@ public class LifetimeAnalyzer {
         }
 
         List<DestructionPoint> filtered =
-            filterPointsInLoops(points, site, loops, livenessAnalyzer);
+                filterPointsInLoops(points, site, loops, livenessAnalyzer);
 
         if (filtered.isEmpty()) {
             // No provably-dead last use. Fall back to the common
@@ -369,7 +434,7 @@ public class LifetimeAnalyzer {
             }
 
             return new SiteResult(site,
-                List.of(new DestructionPoint(lca, null, allocVal)), false);
+                    List.of(new DestructionPoint(lca, null, allocVal)), false);
         }
 
         return new SiteResult(site, dedupPoints(filtered, dom), false);
@@ -516,7 +581,7 @@ public class LifetimeAnalyzer {
             boolean inLiveLoop = false;
             for (Map.Entry<BasicBlock, Set<BasicBlock>> e : loops.entrySet()) {
                 if (e.getValue().contains(p.getBlock())
-                    && livenessAnalyzer.getLiveIn(e.getKey()).contains(site)) {
+                        && livenessAnalyzer.getLiveIn(e.getKey()).contains(site)) {
                     inLiveLoop = true;
                     break;
                 }
@@ -540,7 +605,7 @@ public class LifetimeAnalyzer {
             boolean dominated = false;
             for (DestructionPoint q : points) {
                 if (q.getBlock() != p.getBlock()
-                    && dom.dominates(q.getBlock(), p.getBlock())) {
+                        && dom.dominates(q.getBlock(), p.getBlock())) {
                     dominated = true;
                     break;
                 }
@@ -551,7 +616,7 @@ public class LifetimeAnalyzer {
     }
 
     private Map<BasicBlock, Set<BasicBlock>> detectNaturalLoops(Function func,
-                                                               DominatorTree domTree) {
+                                                                DominatorTree domTree) {
         Map<BasicBlock, Set<BasicBlock>> loops = new HashMap<>();
         for (BasicBlock block : func.getBlocks()) {
             for (BasicBlock pred : block.getPredecessors()) {

@@ -2,6 +2,7 @@ package io.github.kubyk01.application.service.optimizer;
 
 import io.github.kubyk01.application.service.analyzer.dependencyresolver.DependencyResolver;
 import io.github.kubyk01.application.service.codegen.llvm.LlvmRuntime;
+import io.github.kubyk01.application.service.codegen.llvm.LlvmTypeMapper;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.ClassNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.MethodNode;
 import io.github.kubyk01.domain.ir.BasicBlock;
@@ -307,6 +308,11 @@ public class LazyClinitInstrumenter {
      * <pre>
      *   entry:
      *     [ call superclass wrapper ]        ; JVMS 5.5 step 5
+     *     %flag = load atomic i32 @&lt;flag&gt; acquire
+     *     %done = (flag != 0)
+     *     br i1 %done, label %exit, label %slow
+     *
+     *   slow:
      *     %r = call i32 @__jnative_clinit_enter(i8* &lt;name&gt;)
      *     %c = icmp eq i32 %r, 0
      *     br i1 %c, label %do_init, label %exit
@@ -314,11 +320,38 @@ public class LazyClinitInstrumenter {
      *   do_init:
      *     call void @&lt;real_clinit&gt;()        ; the actual body
      *     call void @__jnative_clinit_exit(i8* &lt;name&gt;)
+     *     br label %publish
+     *
+     *   publish:
+     *     store atomic i32 1, i32* @&lt;flag&gt; release
      *     br label %exit
      *
      *   exit:
      *     ret void
      * </pre>
+     *
+     * <p>The completion flag is the fast path. A class whose initializer
+     * has already run is recognised by a single atomic load, so the
+     * wrapper never enters the runtime's state machine again — and never
+     * takes the mutex and walks the clinit table that
+     * {@code __jnative_clinit_enter} does. The load is an acquire load
+     * and the store is a release store, so a thread that observes the
+     * flag also observes the state the initializer published.</p>
+     *
+     * <p>The flag is published only by the thread that actually ran the
+     * body. The {@code __jnative_clinit_enter} result of "1" covers two
+     * cases — the class is already done, or the class is being
+     * initialized by this very thread (JVMS 5.5 step 3, the recursive
+     * request) — and in the second case the initializer has not
+     * completed yet, so publishing the flag there would let another
+     * thread observe a half-initialized class.</p>
+     *
+     * <p>The flag is not published when the initializer fails: the
+     * exception leaves through the body, the publish block is never
+     * reached, and the flag stays 0. The next access therefore takes the
+     * slow path again and the runtime's state machine raises
+     * {@code NoClassDefFoundError}, exactly as HotSpot does for the
+     * second reference to a class whose initializer threw.</p>
      *
      * <p>The wrapper's mangled name begins with
      * {@link #WRAPPER_NAME_PREFIX}, and {@code LlvmFunctionEmitter} is
@@ -333,11 +366,15 @@ public class LazyClinitInstrumenter {
                                   String superWrapperName) {
         String wrapperName = wrapper.getName();
 
-        BasicBlock entry  = new BasicBlock(wrapperName + "_entry");
-        BasicBlock doInit = new BasicBlock(wrapperName + "_do_init");
-        BasicBlock exit   = new BasicBlock(wrapperName + "_exit");
+        BasicBlock entry   = new BasicBlock(wrapperName + "_entry");
+        BasicBlock slow    = new BasicBlock(wrapperName + "_slow");
+        BasicBlock doInit  = new BasicBlock(wrapperName + "_do_init");
+        BasicBlock publish = new BasicBlock(wrapperName + "_publish");
+        BasicBlock exit    = new BasicBlock(wrapperName + "_exit");
         wrapper.addBlock(entry);
+        wrapper.addBlock(slow);
         wrapper.addBlock(doInit);
+        wrapper.addBlock(publish);
         wrapper.addBlock(exit);
         wrapper.setEntryBlock(entry);
 
@@ -352,7 +389,31 @@ public class LazyClinitInstrumenter {
         /* Shared String constant carrying the internal class name. */
         Constant nameConst = new Constant(Type.reference("java/lang/String"), className);
 
-        /* %r = __jnative_clinit_enter(name) */
+        /* The synthetic static field that carries the completion flag. It
+         * is not a field of the class: it exists only in this wrapper and
+         * in the global that holds it. */
+        String flagField = className + "." + LlvmTypeMapper.LAZY_CLINIT_FLAG_FIELD;
+
+        /* %flag = GETSTATIC <flag>  (emitted as an atomic acquire load) */
+        Instruction flagLoad = new Instruction(Opcode.GET_STATIC);
+        flagLoad.addOperand(new Constant(Type.reference(flagField), flagField));
+        Temporary flagTmp = new Temporary(Type.INT);
+        flagLoad.setResult(flagTmp);
+        flagTmp.setDefiningInstruction(flagLoad);
+        entry.addInstruction(flagLoad);
+
+        /* %done = (flag != 0) — the initializer has already completed. */
+        Instruction flagCmp = new Instruction(Opcode.NE);
+        flagCmp.addOperand(flagTmp);
+        flagCmp.addOperand(new Constant(Type.INT, 0));
+        Temporary flagCond = new Temporary(Type.BOOLEAN);
+        flagCmp.setResult(flagCond);
+        flagCond.setDefiningInstruction(flagCmp);
+        entry.addInstruction(flagCmp);
+
+        entry.setTerminator(new CondBranchTerminator(flagCond, exit, slow));
+
+        /* slow: %r = __jnative_clinit_enter(name) */
         Instruction enterCall = new Instruction(Opcode.STATIC_CALL);
         enterCall.addOperand(new Constant(
             Type.reference("__jnative_clinit_enter"), "__jnative_clinit_enter"));
@@ -360,7 +421,7 @@ public class LazyClinitInstrumenter {
         Temporary rTmp = new Temporary(Type.INT);
         enterCall.setResult(rTmp);
         rTmp.setDefiningInstruction(enterCall);
-        entry.addInstruction(enterCall);
+        slow.addInstruction(enterCall);
 
         /* %c = (r == 0) — "this thread must run the body". */
         Instruction cmp = new Instruction(Opcode.EQ);
@@ -369,9 +430,9 @@ public class LazyClinitInstrumenter {
         Temporary condTmp = new Temporary(Type.BOOLEAN);
         cmp.setResult(condTmp);
         condTmp.setDefiningInstruction(cmp);
-        entry.addInstruction(cmp);
+        slow.addInstruction(cmp);
 
-        entry.setTerminator(new CondBranchTerminator(condTmp, doInit, exit));
+        slow.setTerminator(new CondBranchTerminator(condTmp, doInit, exit));
 
         /* do_init: real body, then publish completion. */
         Instruction realCall = new Instruction(Opcode.STATIC_CALL);
@@ -385,7 +446,16 @@ public class LazyClinitInstrumenter {
         exitCall.addOperand(nameConst);
         doInit.addInstruction(exitCall);
 
-        doInit.setTerminator(new BranchTerminator(exit));
+        doInit.setTerminator(new BranchTerminator(publish));
+
+        /* publish: the flag is released only after the body has completed
+         * normally. A failed initializer never reaches this block. */
+        Instruction flagStore = new Instruction(Opcode.PUT_STATIC);
+        flagStore.addOperand(new Constant(Type.reference(flagField), flagField));
+        flagStore.addOperand(new Constant(Type.INT, 1));
+        publish.addInstruction(flagStore);
+
+        publish.setTerminator(new BranchTerminator(exit));
 
         /* exit: return. */
         exit.setTerminator(new ReturnTerminator(null));
@@ -408,14 +478,23 @@ public class LazyClinitInstrumenter {
         List<Instruction> insts = block.getInstructions();
         if (insts.isEmpty()) return 0;
 
-        List<Instruction> rewritten = new ArrayList<>(insts.size() + 4);
+        // Lazy allocation: rewritten == null means no active trigger
+        // point has been found yet and the list has not been started.
+        // In the vast majority of blocks rewritten stays null and no
+        // ArrayList is allocated at all.
+        List<Instruction> rewritten = null;
         int added = 0;
 
-        for (Instruction inst : insts) {
+        for (int i = 0; i < insts.size(); i++) {
+            Instruction inst = insts.get(i);
             String triggered = triggeredClassFor(inst);
             if (triggered != null && !triggered.equals(ownerClass)) {
                 String wrapper = classToWrapper.get(triggered);
                 if (wrapper != null) {
+                    if (rewritten == null) {
+                        rewritten = new ArrayList<>(insts.size() + 4);
+                        for (int j = 0; j < i; j++) rewritten.add(insts.get(j));
+                    }
                     Instruction call = new Instruction(Opcode.STATIC_CALL);
                     call.addOperand(new Constant(Type.reference(wrapper), wrapper));
                     call.setParent(block);
@@ -423,10 +502,10 @@ public class LazyClinitInstrumenter {
                     added++;
                 }
             }
-            rewritten.add(inst);
+            if (rewritten != null) rewritten.add(inst);
         }
 
-        if (added > 0) {
+        if (rewritten != null) {
             insts.clear();
             insts.addAll(rewritten);
         }

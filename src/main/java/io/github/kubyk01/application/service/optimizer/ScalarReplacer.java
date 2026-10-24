@@ -1,5 +1,6 @@
 package io.github.kubyk01.application.service.optimizer;
 
+import io.github.kubyk01.application.service.analyzer.ssa.DominatorTree;
 import io.github.kubyk01.domain.analyzer.aliasanalysis.AliasAnalysisResult;
 import io.github.kubyk01.domain.analyzer.aliasanalysis.AllocationSite;
 import io.github.kubyk01.domain.analyzer.aliasanalysis.PointsToSet;
@@ -21,7 +22,9 @@ import lombok.Getter;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -35,6 +38,31 @@ import static io.github.kubyk01.util.LlvmUtil.extractFieldName;
  * Replaces objects that do not escape and have no observable side effects
  * with a set of local variables (scalar replacement).
  * Removes NEW, GET_FIELD, PUT_FIELD instructions, replacing them with operations on temporary variables.
+ *
+ * <h2>Stack-allocation safety rule</h2>
+ *
+ * <p>When a NEW is marked stack-allocated, {@code LlvmFunctionEmitter} emits
+ * the corresponding {@code alloca} into the function's <b>entry block</b>,
+ * so that the alloca's address dominates every use of the value.
+ * That placement is only sound when the NEW is executed at most once per
+ * function invocation. If the NEW lies inside a loop body, the entry-block
+ * alloca is shared by every iteration, and every iteration writes into the
+ * same object — the classic "N distinct objects collapse into one" bug.</p>
+ *
+ * <p>The concrete failure this rule prevents:
+ * {@code java.lang.module.Configuration.<init>} allocates one
+ * {@code ResolvedModule} per module in a {@code for} loop, stores them into
+ * a {@code ResolvedModule[]}, and passes that array to
+ * {@code Set.of(...)}. With the entry-block alloca, all 65 boot-layer
+ * modules ended up pointing at the same object, and
+ * {@code ImmutableCollections.SetN} detected a duplicate element with
+ * {@code IllegalArgumentException: duplicate element: <id>/jdk.jlink}.</p>
+ *
+ * <p>The rule is deliberately the <b>only</b> additional restriction on
+ * stack allocation: escaping objects are already excluded by the
+ * escape-status check below, and scalar-replaceable objects never get
+ * emitted as real objects at all. Non-loop NEW allocations therefore keep
+ * their existing stack-allocation optimisation unchanged.</p>
  */
 @Slf4j
 @RequiredArgsConstructor
@@ -53,20 +81,18 @@ public class ScalarReplacer {
         for (Function func : module.getFunctions()) {
             if (func.getEntryBlock() == null) continue;
 
+            // Loop blocks are computed once per function, not per NEW.
+            // See the class javadoc for why this set is load-bearing.
+            Set<BasicBlock> loopBlocks = computeLoopBlocks(func);
+
             // ------------------------------------------------------------------
             // First pass: every NEW whose result is a STACK-status object
             // but which is used as a real object — i.e. as a receiver of a
             // call — cannot be scalar-replaced (there is no way to give the
             // callee a real object pointer without an allocation). Mark
-            // such a NEW as stack-allocated. The codegen will emit an
-            // alloca in the function's entry block instead of a calloc,
-            // and no destructor will be inserted, because the alloca's
-            // memory is released automatically when the function returns.
-            //
-            // The condition `isUsedAsObject(inst)` is deliberate and is the
-            // same predicate that gates scalar replacement below. An object
-            // that passes this check has at least one call use that is not
-            // a destructor call, so scalar replacement is not applicable.
+            // such a NEW as stack-allocated, UNLESS the NEW lies inside a
+            // loop body: the entry-block alloca would then be shared by
+            // every iteration.
             // ------------------------------------------------------------------
             for (BasicBlock block : func.getBlocks()) {
                 for (Instruction inst : block.getInstructions()) {
@@ -85,6 +111,14 @@ public class ScalarReplacer {
                         }
                     }
                     if (!allStack) continue;
+
+                    if (loopBlocks.contains(block)) {
+                        // The alloca would be hoisted to the entry block
+                        // and shared by every iteration. Every iteration
+                        // would write into the same object, collapsing N
+                        // distinct allocations into one.
+                        continue;
+                    }
 
                     if (isUsedAsObject(inst)) {
                         inst.setStackAllocated(true);
@@ -117,6 +151,62 @@ public class ScalarReplacer {
 
             cleanup(func);
         }
+    }
+
+    /**
+     * Returns the set of basic blocks that belong to at least one natural
+     * loop in {@code func}.
+     *
+     * <p>Uses the standard "back edge + natural loop" construction:</p>
+     * <ol>
+     *   <li>An edge {@code pred -> header} is a back edge iff
+     *       {@code header} dominates {@code pred}. The dominance relation
+     *       comes from the same {@link DominatorTree} that the lifetime
+     *       analyser already uses.</li>
+     *   <li>The natural loop of that back edge is
+     *       {@code {header} ∪ {b : b can reach pred without going through header}}.
+     *       That set is computed by a backward BFS from {@code pred},
+     *       stopping at {@code header}.</li>
+     *   <li>The result is the union of the natural loops of every back
+     *       edge.</li>
+     * </ol>
+     *
+     * <p>Reducible and irreducible CFGs are both handled correctly: the
+     * natural-loop construction is defined for any CFG in which the
+     * dominator relation is well-defined, which is every CFG the JVM
+     * verifier accepts.</p>
+     */
+    private static Set<BasicBlock> computeLoopBlocks(Function func) {
+        BasicBlock entry = func.getEntryBlock();
+        if (entry == null) return Set.of();
+
+        DominatorTree dom = new DominatorTree(func);
+        Set<BasicBlock> loopBlocks = new HashSet<>();
+
+        for (BasicBlock header : func.getBlocks()) {
+            for (BasicBlock pred : header.getPredecessors()) {
+                if (!dom.dominates(header, pred)) continue;
+
+                // Back edge pred -> header. Natural loop = header plus
+                // every block that can reach pred without going through
+                // header.
+                Deque<BasicBlock> worklist = new ArrayDeque<>();
+                loopBlocks.add(header);
+                if (!loopBlocks.contains(pred)) {
+                    worklist.add(pred);
+                }
+                while (!worklist.isEmpty()) {
+                    BasicBlock cur = worklist.poll();
+                    if (!loopBlocks.add(cur)) continue;
+                    for (BasicBlock p : cur.getPredecessors()) {
+                        if (p != header && !loopBlocks.contains(p)) {
+                            worklist.add(p);
+                        }
+                    }
+                }
+            }
+        }
+        return loopBlocks;
     }
 
     private boolean isUsedAsObject(Instruction newInst) {

@@ -96,6 +96,22 @@ public class SSATransformer {
     public void transform(Function function) {
         if (function.getEntryBlock() == null || function.getBlocks().isEmpty()) return;
 
+        /*
+         * Reset per-function state.
+         *
+         * The SSATransformer instance is reused across every function in
+         * the module (see BytecodeToIr.translate and Orchestrator's SSA
+         * loop). Without this reset the three maps below grow monotonically
+         * with the total number of LOAD results, PHI nodes and slot accesses
+         * of the whole module — on a full JDK closure that is several
+         * million entries and several hundred MB of retained heap. The maps
+         * are only meaningful within a single function, so clearing them at
+         * entry is not only safe, it is the only correct behaviour.
+         */
+        versionStacks.clear();
+        versionCounters.clear();
+        replacements.clear();
+
         this.currentFunction = function;
         this.unsafeLocals = identifyUnsafeLocals(function);
         domTree = new DominatorTree(function);
@@ -194,6 +210,34 @@ public class SSATransformer {
     private void insertPhiFunctions(Function function) {
         Map<SlotKey, Set<BasicBlock>> defs = collectDefBlocks(function);
 
+        // ------------------------------------------------------------------
+        // Liveness per (slot, bucket) — see computeLiveInForPhiInsertion.
+        //
+        // Standard SSA construction ("pruned SSA", Cytron et al.) inserts a
+        // PHI only where the variable is live at the block entry. Without
+        // this check a PHI is created for every definition that reaches the
+        // iterated dominance frontier, regardless of whether the value is
+        // read further down the flow. The classic case is a "fresh local
+        // assigned only inside the loop and read neither before nor after
+        // the assignment": the loop's def block puts the loop header into
+        // the DF, a PHI is created, but its incoming operand on the entry
+        // edge is undefined (the slot has never been assigned). The JVM
+        // verifier allows this precisely because the value is never read —
+        // the PHI is dead by construction.
+        //
+        // The fail-fast in renameBlock (see the previous step) throws an
+        // IllegalStateException naming the slot and the block on such a
+        // PHI. That is a correct reaction to a real bug (broken
+        // dominance), but for dead PHIs it is a false positive — they
+        // simply should not have been created.
+        //
+        // The order of the def blocks and the bucketing must match
+        // collectDefBlocks: it defines the SlotKey, and we gate it by
+        // liveness. Both use the same typeBucket(...) predicate, see the
+        // invariant in the javadoc of collectDefBlocks.
+        // ------------------------------------------------------------------
+        Map<BasicBlock, Set<SlotKey>> liveIn = computeLiveInForPhiInsertion(function);
+
         for (Map.Entry<SlotKey, Set<BasicBlock>> entry : defs.entrySet()) {
             SlotKey key = entry.getKey();
             Set<BasicBlock> defBlocks = entry.getValue();
@@ -207,6 +251,11 @@ public class SSATransformer {
                 BasicBlock block = worklist.poll();
                 for (BasicBlock frontier : domTree.getDominanceFrontier(block)) {
                     if (hasPhi.contains(frontier)) continue;
+
+                    Set<SlotKey> frontierLiveIn = liveIn.get(frontier);
+                    if (frontierLiveIn == null || !frontierLiveIn.contains(key)) {
+                        continue;
+                    }
 
                     Instruction phi = new Instruction(Opcode.PHI);
                     phi.setLocalIndex(key.index);
@@ -222,6 +271,134 @@ public class SSATransformer {
                 }
             }
         }
+    }
+
+    /**
+     * Liveness per {@link SlotKey} (slot, bucket) for the blocks of a
+     * function.
+     *
+     * <p>Semantics: {@code liveIn[B]} contains the key {@code (slot,
+     * bucket)} if and only if there exists a path from the entry of
+     * {@code B} to a use of that key (a LOAD with the matching bucket)
+     * on which there is no STORE into the same key. Parameters count as
+     * defined in the entry, so they sit in {@code def[entry]} and do
+     * not "leak" into {@code liveIn[entry]} through the use part.</p>
+     *
+     * <p>Used only to gate PHI insertion in
+     * {@link #insertPhiFunctions}: a key needs a PHI in a block if the
+     * key is live-in in that block. This is "pruned SSA" — the standard
+     * SSA construction optimization that eliminates dead PHI nodes with
+     * undefined incoming operands (see the javadoc of
+     * {@link #insertPhiFunctions}).</p>
+     *
+     * <p><b>Bucketing invariant.</b> {@code use[]} and {@code def[]} are
+     * built with the same {@code typeBucket(result.getType())} predicate
+     * as {@link #collectDefBlocks}. Any divergence in bucketing between
+     * this method, {@code collectDefBlocks} and {@code renameBlock}
+     * would break key consistency and produce either the liveness of the
+     * wrong key or an empty version stack for a "live" key. All three
+     * use the same private {@link #typeBucket}; when the bucketing logic
+     * changes, all three must be changed together.</p>
+     *
+     * <p><b>Exceptional edges.</b> {@code block.getSuccessors()} merges
+     * the ordinary and the exceptional edges (see {@code BasicBlock}),
+     * so liveness propagates along the exception front as well. This is
+     * conservative in the right direction (it may slightly overestimate
+     * live-in, but never underestimate it), and it does not lift the
+     * known limitation of SSA construction for mid-block exceptions (the
+     * value of a slot on an exceptional edge is the state at the moment
+     * of the throw, not the state at the end of the block). That
+     * limitation is a separate class of defects, unrelated to dead
+     * loop-carried PHIs; here we merely do not stand in its way.</p>
+     */
+    private Map<BasicBlock, Set<SlotKey>> computeLiveInForPhiInsertion(Function function) {
+        Map<BasicBlock, Set<SlotKey>> use = new HashMap<>();
+        Map<BasicBlock, Set<SlotKey>> def = new HashMap<>();
+
+        for (BasicBlock block : function.getBlocks()) {
+            Set<SlotKey> blockUse = new HashSet<>();
+            Set<SlotKey> blockDef = new HashSet<>();
+
+            for (Instruction inst : block.getInstructions()) {
+                Opcode op = inst.getOpcode();
+                if (op == Opcode.LOAD) {
+                    int idx = inst.getLocalIndex();
+                    if (idx < 0) continue;
+                    if (unsafeLocals.contains(idx)) continue;
+                    Type lt = (inst.getResult() != null)
+                        ? inst.getResult().getType()
+                        : Type.UNKNOWN;
+                    SlotKey key = new SlotKey(idx, typeBucket(lt));
+                    if (!blockDef.contains(key)) {
+                        blockUse.add(key);
+                    }
+                } else if (op == Opcode.STORE) {
+                    int idx = inst.getLocalIndex();
+                    if (idx < 0) continue;
+                    if (unsafeLocals.contains(idx)) continue;
+                    Type dt = (inst.getResult() != null)
+                        ? inst.getResult().getType()
+                        : Type.UNKNOWN;
+                    SlotKey key = new SlotKey(idx, typeBucket(dt));
+                    blockDef.add(key);
+                }
+            }
+            use.put(block, blockUse);
+            def.put(block, blockDef);
+        }
+
+        // Parameters are defined in the entry. This is part of the JVM
+        // contract: a parameter slot has a well-defined value on function
+        // entry, and it does not need to be "carried over" from the
+        // predecessors (the entry has none).
+        BasicBlock entry = function.getEntryBlock();
+        if (entry != null) {
+            Set<SlotKey> entryDef = def.computeIfAbsent(entry, k -> new HashSet<>());
+            for (Parameter p : function.getParameters()) {
+                if (unsafeLocals.contains(p.getIndex())) continue;
+                entryDef.add(new SlotKey(p.getIndex(), typeBucket(p.getType())));
+            }
+        }
+
+        // Backward dataflow until a fixed point is reached.
+        Map<BasicBlock, Set<SlotKey>> liveIn = new HashMap<>();
+        Map<BasicBlock, Set<SlotKey>> liveOut = new HashMap<>();
+        for (BasicBlock block : function.getBlocks()) {
+            liveIn.put(block, new HashSet<>());
+            liveOut.put(block, new HashSet<>());
+        }
+
+        boolean changed = true;
+        while (changed) {
+            changed = false;
+            for (BasicBlock block : function.getBlocks()) {
+                Set<SlotKey> newLiveOut = new HashSet<>();
+                for (BasicBlock succ : block.getSuccessors()) {
+                    Set<SlotKey> succLiveIn = liveIn.get(succ);
+                    if (succLiveIn != null) {
+                        newLiveOut.addAll(succLiveIn);
+                    }
+                }
+                if (!newLiveOut.equals(liveOut.get(block))) {
+                    liveOut.put(block, newLiveOut);
+                    changed = true;
+                }
+
+                Set<SlotKey> newLiveIn = new HashSet<>(
+                    use.getOrDefault(block, Collections.emptySet()));
+                Set<SlotKey> liveOutMinusDef = new HashSet<>(newLiveOut);
+                liveOutMinusDef.removeAll(
+                    def.getOrDefault(block, Collections.emptySet()));
+                newLiveIn.addAll(liveOutMinusDef);
+
+                if (!newLiveIn.equals(liveIn.get(block))) {
+                    liveIn.put(block, newLiveIn);
+                    changed = true;
+                }
+            }
+        }
+
+        return liveIn;
     }
 
     /**
@@ -380,14 +557,27 @@ public class SSATransformer {
 
                 Value curVer = currentVersion(key);
                 if (curVer == null) {
-                    savedSizes.putIfAbsent(key, stackSize(key));
-
-                    Type undefType = inferSlotTypeForBucket(
-                        currentFunction, idx, bucket);
-                    curVer = new UndefinedValue(undefType);
-                    versionStacks.computeIfAbsent(key, k -> new ArrayDeque<>())
-                        .push(curVer);
-                    versionCounters.putIfAbsent(key, 0);
+                    throw new IllegalStateException(
+                        "SSATransformer: LOAD from slot " + idx
+                            + " (bucket " + bucket + ") in block '"
+                            + block.getLabel() + "' of function '"
+                            + currentFunction.getName()
+                            + "' has no version on the version stack. "
+                            + "The JVM verifier guarantees that a STORE precedes "
+                            + "every reachable LOAD on every path; the absence "
+                            + "of a version here means the dominator tree used "
+                            + "by SSATransformer could not propagate the STORE's "
+                            + "version to this point. Investigate: "
+                            + "(a) stale predecessors of '" + block.getLabel()
+                            + "' that are not in any terminator's targets and not "
+                            + "in any predecessor's exceptionalSuccessors "
+                            + "(DominatorTree.compute sanitises these, but a bug "
+                            + "there could still slip through); "
+                            + "(b) the phi operand binding at '"
+                            + block.getLabel()
+                            + "', which is positional against block.getPredecessors(); "
+                            + "(c) a missing STORE from the translator for a "
+                            + "synthetic stack slot (slot index >= 10000).");
                 }
 
                 // Within a bucket the types are compatible by
@@ -471,9 +661,87 @@ public class SSATransformer {
 
                 Value curVer = currentVersion(key);
                 if (curVer == null) {
-                    Type undefType = inferSlotTypeForBucket(
-                        currentFunction, idx, bucket);
-                    curVer = new UndefinedValue(undefType);
+                    /*
+                     * The slot is not defined along the path through this
+                     * predecessor. Two fundamentally different situations
+                     * collapse to the same "version stack is empty" signal,
+                     * and the edge kind tells them apart:
+                     *
+                     *   1. EXCEPTIONAL-ONLY EDGE.
+                     *
+                     *      `pred` does not list `succ` among its
+                     *      terminator's targets, but `succ` is in
+                     *      `pred.getExceptionalSuccessors()`. This means
+                     *      the edge carries control on a thrown exception.
+                     *      The exception transfers control mid-block, so a
+                     *      slot that is assigned after the throwing
+                     *      instruction - or that is simply not assigned
+                     *      at all on the block's normal path - has no
+                     *      value here. The JVM verifier permits this
+                     *      precisely because the phi's result is never
+                     *      observed on this path (any observable use of
+                     *      the slot after the catch would require the
+                     *      slot to be definitely assigned on every path
+                     *      to the use, including this one, which it is
+                     *      not).
+                     *
+                     *      Substituting `Constant(Type.NULL, null)` for
+                     *      the incoming operand makes the emitted IR
+                     *      contain `null` on the exception edge - exactly
+                     *      the runtime value of a slot that was not
+                     *      assigned before the throw. Because the JVM
+                     *      verifier guarantees the value is not consumed
+                     *      on this path, `null` cannot reach any use
+                     *      that would dereference it.
+                     *
+                     *   2. NORMAL (OR MIXED) EDGE.
+                     *
+                     *      `pred` lists `succ` among its terminator's
+                     *      targets. Then the missing version is a genuine
+                     *      bug: either the dominator tree used by
+                     *      SSATransformer failed to propagate the STORE's
+                     *      version across a real edge (the
+                     *      ProtectionDomain.<init> class of defect), or
+                     *      the IR violates the JVM verifier's
+                     *      definite-assignment rule. Fail-fast is required
+                     *      so that the bug surfaces at build time rather
+                     *      than as a null base of a PUT_FIELD at run
+                     *      time.
+                     *
+                     * The two cases are distinguished here, per edge,
+                     * rather than globally, because the same phi routinely
+                     * has a normal incoming edge (valid version) and one
+                     * or more exceptional incoming edges (undefined
+                     * version). The phi is alive if its result is used on
+                     * any of its normal paths; the exceptional operands
+                     * are dead by construction.
+                     */
+                    boolean predIsNormalTarget = false;
+                    Terminator predTerm = block.getTerminator();
+                    if (predTerm != null) {
+                        for (BasicBlock t : predTerm.getTargets()) {
+                            if (t == succ) { predIsNormalTarget = true; break; }
+                        }
+                    }
+                    boolean predIsExceptional =
+                        block.getExceptionalSuccessors().contains(succ);
+
+                    if (!predIsNormalTarget && predIsExceptional) {
+                        // Exceptional-only edge: the slot has no value
+                        // here, and the JVM verifier guarantees it is not
+                        // observed. `Type.NULL` is the null literal type
+                        // that every other null constant in the IR uses,
+                        // so the emitter renders it as the LLVM literal
+                        // `null` (of any pointer type it must be coerced
+                        // to).
+                        curVer = new Constant(Type.NULL, null);
+                    } else {
+                        // Normal edge with a missing version - genuine
+                        // bug. Let OutOfSsaPass fail on it with a
+                        // diagnostic naming the block and the operand
+                        // index.
+                        curVer = new UndefinedValue(phiType);
+                    }
                 }
 
                 if (!typesCompatible(curVer.getType(), phiType)) {
@@ -593,14 +861,12 @@ public class SSATransformer {
     // ------------------------------------------------------------------
 
     private void optimizePhis(Function function) {
-        List<Instruction> toRemove = new ArrayList<>();
         Map<Instruction, Value> replacementMap = new HashMap<>();
 
         for (BasicBlock block : function.getBlocks()) {
             for (Instruction inst : block.getInstructions()) {
                 if (inst.getOpcode() != Opcode.PHI) continue;
                 if (inst.getOperands().isEmpty()) {
-                    toRemove.add(inst);
                     continue;
                 }
                 Value first = inst.getOperands().getFirst();
@@ -613,7 +879,6 @@ public class SSATransformer {
                 }
                 if (allSame) {
                     replacementMap.put(inst, first);
-                    toRemove.add(inst);
                 }
             }
         }
@@ -658,9 +923,47 @@ public class SSATransformer {
     }
 
     private void cleanupPhis(Function function) {
+        /*
+         * Liveness analysis of the phi instructions, iterated to a fixed
+         * point.
+         *
+         * The result of a phi instruction is considered ALIVE if it is used:
+         *
+         *   1. as an operand of any NON-phi instruction, or
+         *   2. as an operand of any terminator, or
+         *   3. as an operand of another phi instruction whose own result is
+         *      alive (transitively).
+         *
+         * A single-pass check of "appears in the operands of something"
+         * wrongly keeps a phi whose only consumer is another dead phi.
+         * The classic scenario: a slot is assigned only inside a loop
+         * body; the loop-carried phi on the incoming edge gets an
+         * UndefinedValue (SSATransformer.renameBlock, see the change
+         * there), while the phi in the downstream block is used ONLY by
+         * that loop-carried phi. After one pass the loop-carried phi is
+         * removed (its result really is never read), but the downstream
+         * phi survives the pass - its result was in usedValues, because
+         * the loop-carried phi used it while the set was being computed.
+         * Result: the downstream phi has no live consumers at all, yet it
+         * stayed in the graph and OutOfSsaPass correctly fails on its
+         * UndefinedValue operand - even though the phi is dead.
+         *
+         * The iterative variant below eliminates this class of errors,
+         * while keeping the hard diagnostic failure for a phi that is
+         * REALLY used (its operands - including an UndefinedValue - would
+         * reach the run time if it were not stopped).
+         */
+
+        // ---- Phase 1: seed - the operands of the non-phi consumers. ----
+        //
+        // Phi operands deliberately do NOT end up here: if they did, we
+        // would be back to the single-pass logic. The liveness of a phi
+        // must follow from the liveness of its only consumer, and not
+        // declare itself alive through the operands of another phi.
         Set<Value> usedValues = new HashSet<>();
         for (BasicBlock block : function.getBlocks()) {
             for (Instruction inst : block.getInstructions()) {
+                if (inst.getOpcode() == Opcode.PHI) continue;
                 usedValues.addAll(inst.getOperands());
             }
             Terminator term = block.getTerminator();
@@ -680,9 +983,44 @@ public class SSATransformer {
                 }
             }
         }
+
+        // ---- Phase 2: transitive propagation through the live phis. ----
+        //
+        // On every iteration: for each phi whose result is already in
+        // usedValues (i.e. it has a live consumer), add its operands.
+        // Repeat while the set grows. Guaranteed to terminate: usedValues
+        // grows monotonically, and the number of values in a function is
+        // finite.
+        boolean changed = true;
+        while (changed) {
+            changed = false;
+            for (BasicBlock block : function.getBlocks()) {
+                for (Instruction inst : block.getInstructions()) {
+                    if (inst.getOpcode() != Opcode.PHI) continue;
+                    if (inst.getResult() == null) continue;
+                    if (!usedValues.contains(inst.getResult())) continue;
+                    for (Value op : inst.getOperands()) {
+                        if (op != null && usedValues.add(op)) {
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        // ---- Phase 3: remove every phi whose result is not alive. ----
+        //
+        // At this point usedValues is exactly the closure of "the operands
+        // of the non-phi consumers union the operands of the live phis".
+        // Any phi whose result is not in that closure has no consumer on
+        // any path - it can be removed. In particular, the whole chain of
+        // dead phis (A -> B -> C -> dead leaf) is removed, even when the
+        // intermediate members of the chain referenced each other.
         for (BasicBlock block : function.getBlocks()) {
             block.getInstructions().removeIf(inst ->
-                inst.getOpcode() == Opcode.PHI && !usedValues.contains(inst.getResult())
+                inst.getOpcode() == Opcode.PHI
+                    && (inst.getResult() == null
+                        || !usedValues.contains(inst.getResult()))
             );
         }
     }
