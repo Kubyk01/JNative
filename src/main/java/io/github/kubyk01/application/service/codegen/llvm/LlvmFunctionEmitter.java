@@ -2762,9 +2762,9 @@ public class LlvmFunctionEmitter {
                     // Stack-allocated object.
                     //
                     // The alloca is queued into pendingSlotDeclarations rather than
-                    // emitted in the current block, so that it lands in the
-                    // function's entry block. Its address therefore dominates every
-                    // use, including uses that follow a try-guard region.
+                    // emitted in the current block, so that it lands in the function's
+                    // entry block. Its address therefore dominates every use,
+                    // including uses that follow a try-guard region.
                     //
                     // The bitcast into the object's reference type is NOT emitted here.
                     // Doing so would define an SSA value in this block, and a use of
@@ -2778,6 +2778,12 @@ public class LlvmFunctionEmitter {
                     // Instead, the alloca name is registered in valuePointers and
                     // getLlvmValue re-emits the bitcast at each use site, in the block
                     // that actually performs the use.
+                    //
+                    // The alloca is explicitly zeroed with llvm.memset for exactly the
+                    // same reason the heap path below uses calloc: the field-overwrite
+                    // instrumentation of DestructorInserter reads the field's
+                    // "previous" value BEFORE any constructor body has written it, and
+                    // that read must observe NULL, not uninitialised stack memory.
                     // ------------------------------------------------------------------
                     String allocName = newAux("stack_alloc");
                     pendingSlotDeclarations.add(
@@ -2833,7 +2839,6 @@ public class LlvmFunctionEmitter {
                     break;
                 }
 
-                // ---- Heap allocation (existing code path, unchanged) ----
                 String gepReg = newAux("alloc_gep");
                 sb.append("  ").append(gepReg)
                     .append(" = getelementptr ").append(structType)
@@ -2845,13 +2850,8 @@ public class LlvmFunctionEmitter {
                     .append("* ").append(gepReg).append(" to i64\n");
 
                 String allocReg = newAux("alloc");
-                if (areAllInstanceFieldsFinal(className)) {
-                    sb.append("  ").append(allocReg)
-                        .append(" = call i8* @malloc(i64 ").append(sizeReg).append(")\n");
-                } else {
-                    sb.append("  ").append(allocReg)
-                        .append(" = call i8* @calloc(i64 1, i64 ").append(sizeReg).append(")\n");
-                }
+                sb.append("  ").append(allocReg)
+                    .append(" = call i8* @calloc(i64 1, i64 ").append(sizeReg).append(")\n");
 
                 sb.append("  ").append(resultName).append(" = bitcast i8* ").append(allocReg)
                     .append(" to ").append(structType).append("*\n");
