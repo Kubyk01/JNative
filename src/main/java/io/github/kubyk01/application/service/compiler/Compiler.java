@@ -540,7 +540,7 @@ public class Compiler implements CompilerPort {
         command.add("-x");
         command.add(task.isIr ? "ir" : "c");
         command.add("-O" + optimizationLevel);
-        command.add("-flto=thin");
+        command.add(optimizationLevel == 0 ? "-fno-lto" : "-flto=thin");
         command.add("-g");
         command.add("-fno-omit-frame-pointer");
 
