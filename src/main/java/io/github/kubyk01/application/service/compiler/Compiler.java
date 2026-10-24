@@ -540,10 +540,7 @@ public class Compiler implements CompilerPort {
         command.add("-x");
         command.add(task.isIr ? "ir" : "c");
         command.add("-O" + optimizationLevel);
-        // Emit LLVM bitcode for ThinLTO. Every translation unit (including
-        // the runtime itself) participates in the same link-time
-        // optimization pipeline.
-        command.add("-flto=thin");
+        command.add("-fno-lto");
         command.add("-g");
         command.add("-fno-omit-frame-pointer");
 
