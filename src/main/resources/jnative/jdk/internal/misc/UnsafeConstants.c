@@ -1,3 +1,4 @@
+#include "jnative_platform.h"
 /*
  * Runtime companion for jdk.internal.misc.UnsafeConstants.
  *
@@ -43,7 +44,6 @@
  */
 
 #include <stdint.h>
-#include <unistd.h>
 
 #include "jnative_runtime.h"
 

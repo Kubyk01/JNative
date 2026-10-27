@@ -87,6 +87,18 @@
 #  endif
 #endif
 
+/*
+ * jnative_runtime.c includes jnative_platform.h first (for sockets and
+ * the native ABI types) and this header second (for diagnostics and
+ * time). In that combination jnative_platform.h already owns
+ * jn_thread_t / jn_mutex_t / jn_cond_t, so only the portability
+ * extensions are declared below. Standalone users (the two
+ * jnative_portability_*.c translation units) get the full definitions.
+ */
+#if defined(JNATIVE_PLATFORM_H)
+#  define JNATIVE_PORTABILITY_OVER_PLATFORM 1
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -107,6 +119,8 @@ extern "C" {
 /* ==================================================================
  *  1. THREADS, LOCKS, CONDITION VARIABLES, TLS, ONCE
  * ================================================================== */
+
+#if !defined(JNATIVE_PORTABILITY_OVER_PLATFORM)
 
 #if defined(JNATIVE_PLATFORM_WINDOWS)
 
@@ -216,6 +230,66 @@ static inline void* jn_tls_get(jn_tls_key_t k)            { return pthread_getsp
 static inline int   jn_tls_set(jn_tls_key_t k, void* v)   { return pthread_setspecific(k, v); }
 
 #endif /* platform */
+
+#else  /* JNATIVE_PORTABILITY_OVER_PLATFORM */
+
+/*
+ * The platform header is already in scope. It provides jn_thread_t,
+ * jn_mutex_t, jn_cond_t and the jn_thread_* / jn_mutex_* / jn_cond_*
+ * macros; add the portability-only names and one-shot/TLS wrappers.
+ */
+typedef jn_mutex_t jn_lock_t;
+typedef jn_mutex_t jn_recmutex_t;
+
+#if defined(JNATIVE_PLATFORM_WINDOWS)
+   typedef INIT_ONCE jn_once_t;
+#  define JN_ONCE_INIT INIT_ONCE_STATIC_INIT
+   typedef DWORD     jn_tls_key_t;
+
+   int   jn_once(jn_once_t*, void (*fn)(void));
+   int   jn_tls_key_create(jn_tls_key_t* k, void (*destructor)(void*));
+   void* jn_tls_get(jn_tls_key_t k);
+   int   jn_tls_set(jn_tls_key_t k, void* v);
+#else
+   typedef pthread_once_t jn_once_t;
+#  define JN_ONCE_INIT PTHREAD_ONCE_INIT
+   typedef pthread_key_t  jn_tls_key_t;
+
+   static inline int jn_once(jn_once_t* o, void (*fn)(void)) {
+       return pthread_once(o, fn);
+   }
+   static inline int jn_tls_key_create(jn_tls_key_t* k, void (*d)(void*)) {
+       return pthread_key_create(k, d);
+   }
+   static inline void* jn_tls_get(jn_tls_key_t k) {
+       return pthread_getspecific(k);
+   }
+   static inline int jn_tls_set(jn_tls_key_t k, void* v) {
+       return pthread_setspecific(k, v);
+   }
+#endif
+
+#  define jn_thread_self()      pthread_self()
+#  define jn_thread_equal(a, b) pthread_equal((a), (b))
+
+/* The platform header already defines these macros on Windows. The
+ * guards keep this header usable in both include orders. */
+#if defined(JNATIVE_PLATFORM_WINDOWS)
+#  ifndef jn_now_realtime
+#    define jn_now_realtime(ts)      jn_now_realtime_win(ts)
+#  endif
+#  ifndef jn_now_monotonic
+#    define jn_now_monotonic(ts)     jn_now_monotonic_win(ts)
+#  endif
+#  ifndef jn_sleep_ns_ns
+#    define jn_sleep_ns_ns(req, rem) jn_sleep_ns_ns_win((req), (rem))
+#  endif
+#endif
+#  ifndef jn_dlsym_default
+#    define jn_dlsym_default(name)   dlsym(jn_dlsym_default, name)
+#  endif
+
+#endif /* JNATIVE_PORTABILITY_OVER_PLATFORM */
 
 /* ==================================================================
  *  2. DYNAMIC SYMBOL RESOLUTION
@@ -372,6 +446,20 @@ int jn_get_text_range  (uintptr_t* low, uintptr_t* high);
 #    define AF_UNIX 1
 #  endif
 
+/* Windows-time compatibility aliases for POSIX-named calls. */
+#  ifndef jn_now_realtime
+#    define jn_now_realtime(ts)      jn_now_realtime_win(ts)
+#  endif
+#  ifndef jn_now_monotonic
+#    define jn_now_monotonic(ts)     jn_now_monotonic_win(ts)
+#  endif
+#  ifndef jn_sleep_ns_ns
+#    define jn_sleep_ns_ns(req, rem) jn_sleep_ns_ns_win((req), (rem))
+#  endif
+#  ifndef jn_dlsym_default
+#    define jn_dlsym_default(name)   dlsym(jn_dlsym_default, (name))
+#  endif
+
 /* Signal numbers used by the fatal-handler path; not the same values as
  * POSIX, but they are only used to build the exit code. */
 #  ifndef SIGSEGV
@@ -389,10 +477,12 @@ int jn_get_text_range  (uintptr_t* low, uintptr_t* high);
 
 /* readlink / symlink — Windows has no direct equivalent, so the shims
  * return -1 (the caller's error path). */
+#if !defined(JNATIVE_PORTABILITY_OVER_PLATFORM)
 static inline long jn_readlink(const char* path, char* buf, size_t len) {
     (void)path; (void)buf; (void)len;
     return -1;
 }
+#endif
 
 /* getifaddrs — implemented via GetAdaptersAddresses in
  * jnative_portability_windows.c. The struct is deliberately opaque:

@@ -1,7 +1,7 @@
+#include "jnative_platform.h"
 #include <stdint.h>
 #include <stddef.h>
 #include <time.h>
-#include <unistd.h>
 
 #include "jnative_runtime.h"
 /*

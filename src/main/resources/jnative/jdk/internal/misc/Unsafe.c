@@ -1,16 +1,21 @@
+#include "jnative_platform.h"
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
 #include <stdlib.h>
-#include <pthread.h>
 #include <errno.h>
 #include <stdatomic.h>
 #include <time.h>
-#include <unistd.h>
 #include <ctype.h>
-#include <dlfcn.h>
 #include <inttypes.h>
 #include "jnative_runtime.h"
+
+#if defined(_WIN32)
+static int getloadavg(double* loadavg, int nelems) {
+    (void)loadavg; (void)nelems;
+    return -1;   /* Windows does not provide load average */
+}
+#endif
 
 /*
  * ABI convention for every instance native in this file:
@@ -541,22 +546,22 @@ void __jnative_fn_jdk_internal_misc_Unsafe_fullFence___V(void* this_unsafe) { (v
 
 /* ---- Park / Unpark (per-thread) ---- */
 typedef struct ParkEntry {
-    pthread_t thread;
-    pthread_mutex_t mutex;
-    pthread_cond_t cond;
+    jn_thread_t thread;
+    jn_mutex_t mutex;
+    jn_cond_t cond;
     int permit;
     int parked;
     struct ParkEntry* next;
 } ParkEntry;
 
-static pthread_mutex_t park_table_lock = PTHREAD_MUTEX_INITIALIZER;
+static jn_mutex_t park_table_lock = JN_MUTEX_INITIALIZER;
 static ParkEntry* park_table = NULL;
 
-static ParkEntry* get_park_entry(pthread_t t) {
-    pthread_mutex_lock(&park_table_lock);
+static ParkEntry* get_park_entry(jn_thread_t t) {
+    jn_mutex_lock(&park_table_lock);
     for (ParkEntry* e = park_table; e; e = e->next) {
         if (pthread_equal(e->thread, t)) {
-            pthread_mutex_unlock(&park_table_lock);
+            jn_mutex_unlock(&park_table_lock);
             return e;
         }
     }
@@ -568,7 +573,7 @@ static ParkEntry* get_park_entry(pthread_t t) {
         e->next = park_table;
         park_table = e;
     }
-    pthread_mutex_unlock(&park_table_lock);
+    jn_mutex_unlock(&park_table_lock);
     return e;
 }
 
@@ -577,18 +582,18 @@ void __jnative_fn_jdk_internal_misc_Unsafe_park__ZJ_V(void* this_unsafe, int32_t
     int abs = isAbsolute ? 1 : 0;
     ParkEntry* e = get_park_entry(pthread_self());
     if (!e) return;
-    pthread_mutex_lock(&e->mutex);
+    jn_mutex_lock(&e->mutex);
     if (e->permit) {
         e->permit = 0;
-        pthread_mutex_unlock(&e->mutex);
+        jn_mutex_unlock(&e->mutex);
         return;
     }
     e->parked = 1;
     if (time == 0) {
-        while (e->parked) pthread_cond_wait(&e->cond, &e->mutex);
+        while (e->parked) jn_cond_wait(&e->cond, &e->mutex);
     } else {
         struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
+        jn_now_realtime(&ts);
         if (abs) {
             ts.tv_sec = time / 1000;
             ts.tv_nsec = (time % 1000) * 1000000L;
@@ -598,28 +603,28 @@ void __jnative_fn_jdk_internal_misc_Unsafe_park__ZJ_V(void* this_unsafe, int32_t
             if (ts.tv_nsec >= 1000000000) { ts.tv_sec++; ts.tv_nsec -= 1000000000; }
         }
         while (e->parked) {
-            if (pthread_cond_timedwait(&e->cond, &e->mutex, &ts) == ETIMEDOUT) break;
+            if (jn_cond_timedwait(&e->cond, &e->mutex, &ts) == ETIMEDOUT) break;
         }
     }
     e->parked = 0;
-    pthread_mutex_unlock(&e->mutex);
+    jn_mutex_unlock(&e->mutex);
 }
 
 void __jnative_fn_jdk_internal_misc_Unsafe_unpark__Ljava_lang_Object__V(
         void* this_unsafe, void* thread) {
     (void)this_unsafe;
     if (!thread) return;
-    pthread_t t = pthread_self();
+    jn_thread_t t = pthread_self();
     ParkEntry* e = get_park_entry(t);
     if (!e) return;
-    pthread_mutex_lock(&e->mutex);
+    jn_mutex_lock(&e->mutex);
     if (e->parked) {
         e->parked = 0;
-        pthread_cond_signal(&e->cond);
+        jn_cond_signal(&e->cond);
     } else {
         e->permit = 1;
     }
-    pthread_mutex_unlock(&e->mutex);
+    jn_mutex_unlock(&e->mutex);
 }
 
 struct ReflectionFieldLayout {
@@ -672,7 +677,7 @@ int64_t __jnative_fn_jdk_internal_misc_Unsafe_staticFieldOffset__Ljava_lang_refl
     const char* name = __jnative_read_string_bytes(name_str, &name_len);
     if (name == NULL || name_len <= 0) return 0;
 
-    void* handle = dlopen(NULL, RTLD_LAZY);
+    void* handle = jn_dlsym_default;
     if (handle == NULL) return 0;
 
     /*
@@ -691,7 +696,7 @@ int64_t __jnative_fn_jdk_internal_misc_Unsafe_staticFieldOffset__Ljava_lang_refl
         if (cls_name != NULL
             && jnative_build_static_field_symbol(cls_name, name, name_len,
                                                  symbol, sizeof(symbol))) {
-            void* addr = dlsym(handle, symbol);
+            void* addr = jn_dlsym_default( symbol);
             if (addr != NULL) {
                 result = (int64_t)(intptr_t)addr;
                 break;

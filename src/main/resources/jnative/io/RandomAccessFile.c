@@ -1,9 +1,9 @@
 #define _GNU_SOURCE
+#include "jnative_platform.h"
 #include <stdint.h>
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
 #include <limits.h>
@@ -11,6 +11,13 @@
 #include <sys/stat.h>
 
 #include "jnative_runtime.h"
+
+#ifndef O_SYNC
+#define O_SYNC 0
+#endif
+#ifndef O_DSYNC
+#define O_DSYNC 0
+#endif
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096

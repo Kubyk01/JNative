@@ -1,3 +1,4 @@
+#include "jnative_platform.h"
 #include "jnative_runtime.h"
 /*
  * java.util.List does not declare getClass() — it is a final method of

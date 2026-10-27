@@ -1,3 +1,4 @@
+#include "jnative_platform.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>

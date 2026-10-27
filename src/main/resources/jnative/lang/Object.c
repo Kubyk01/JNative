@@ -1,10 +1,9 @@
 #define _GNU_SOURCE
+#include "jnative_platform.h"
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-#include <pthread.h>
 #include <time.h>
-#include <dlfcn.h>
 #include <stdio.h>
 #include "jnative_runtime.h"
 
@@ -327,19 +326,19 @@ void *__jnative_fn_java_lang_Object_clone___Ljava_lang_Object_(void *obj) {
     return clone;
 }
 
-/* ---- Monitor wait/notify support using pthread_cond_t ---- */
+/* ---- Monitor wait/notify support using jn_cond_t ---- */
 
 typedef struct MonitorEx {
     void *obj;
-    pthread_mutex_t mutex;
-    pthread_cond_t cond;
+    jn_mutex_t mutex;
+    jn_cond_t cond;
     int wait_count;
     struct MonitorEx *next;
 } MonitorEx;
 
 #define MONITOR_HASH_SIZE 1024
 static MonitorEx *monitor_ex_table[MONITOR_HASH_SIZE] = {0};
-static pthread_mutex_t monitor_table_lock = PTHREAD_MUTEX_INITIALIZER;
+static jn_mutex_t monitor_table_lock = JN_MUTEX_INITIALIZER;
 
 static uint32_t hash_ptr(void *p) {
     return (uint32_t)((uintptr_t)p) % MONITOR_HASH_SIZE;
@@ -348,18 +347,18 @@ static uint32_t hash_ptr(void *p) {
 static MonitorEx *get_monitor_ex(void *obj) {
     if (!obj) return NULL;
     uint32_t idx = hash_ptr(obj);
-    pthread_mutex_lock(&monitor_table_lock);
+    jn_mutex_lock(&monitor_table_lock);
     MonitorEx *m = monitor_ex_table[idx];
     while (m) {
         if (m->obj == obj) {
-            pthread_mutex_unlock(&monitor_table_lock);
+            jn_mutex_unlock(&monitor_table_lock);
             return m;
         }
         m = m->next;
     }
     MonitorEx *newm = calloc(1, sizeof(MonitorEx));
     if (!newm) {
-        pthread_mutex_unlock(&monitor_table_lock);
+        jn_mutex_unlock(&monitor_table_lock);
         return NULL;
     }
     newm->obj = obj;
@@ -368,23 +367,23 @@ static MonitorEx *get_monitor_ex(void *obj) {
     newm->wait_count = 0;
     newm->next = monitor_ex_table[idx];
     monitor_ex_table[idx] = newm;
-    pthread_mutex_unlock(&monitor_table_lock);
+    jn_mutex_unlock(&monitor_table_lock);
     return newm;
 }
 
 static MonitorEx *find_monitor_ex(void *obj) {
     if (!obj) return NULL;
     uint32_t idx = hash_ptr(obj);
-    pthread_mutex_lock(&monitor_table_lock);
+    jn_mutex_lock(&monitor_table_lock);
     MonitorEx *m = monitor_ex_table[idx];
     while (m) {
         if (m->obj == obj) {
-            pthread_mutex_unlock(&monitor_table_lock);
+            jn_mutex_unlock(&monitor_table_lock);
             return m;
         }
         m = m->next;
     }
-    pthread_mutex_unlock(&monitor_table_lock);
+    jn_mutex_unlock(&monitor_table_lock);
     return NULL;
 }
 
@@ -395,11 +394,11 @@ void __jnative_fn_java_lang_Object_notify___V(void *obj) {
     }
     MonitorEx *m = find_monitor_ex(obj);
     if (!m) return;
-    pthread_mutex_lock(&m->mutex);
+    jn_mutex_lock(&m->mutex);
     if (m->wait_count > 0) {
-        pthread_cond_signal(&m->cond);
+        jn_cond_signal(&m->cond);
     }
-    pthread_mutex_unlock(&m->mutex);
+    jn_mutex_unlock(&m->mutex);
 }
 
 void __jnative_fn_java_lang_Object_notifyAll___V(void *obj) {
@@ -409,11 +408,11 @@ void __jnative_fn_java_lang_Object_notifyAll___V(void *obj) {
     }
     MonitorEx *m = find_monitor_ex(obj);
     if (!m) return;
-    pthread_mutex_lock(&m->mutex);
+    jn_mutex_lock(&m->mutex);
     if (m->wait_count > 0) {
-        pthread_cond_broadcast(&m->cond);
+        jn_cond_broadcast(&m->cond);
     }
-    pthread_mutex_unlock(&m->mutex);
+    jn_mutex_unlock(&m->mutex);
 }
 
 void __jnative_fn_java_lang_Object_wait0__J_V(void *obj, int64_t timeoutMillis) {
@@ -427,31 +426,31 @@ void __jnative_fn_java_lang_Object_wait0__J_V(void *obj, int64_t timeoutMillis) 
         return;
     }
 
-    pthread_mutex_lock(&m->mutex);
+    jn_mutex_lock(&m->mutex);
     m->wait_count++;
 
     struct timespec ts;
     if (timeoutMillis == 0) {
-        pthread_cond_wait(&m->cond, &m->mutex);
+        jn_cond_wait(&m->cond, &m->mutex);
     } else {
-        clock_gettime(CLOCK_REALTIME, &ts);
+        jn_now_realtime(&ts);
         ts.tv_sec += timeoutMillis / 1000;
         ts.tv_nsec += (timeoutMillis % 1000) * 1000000L;
         if (ts.tv_nsec >= 1000000000) {
             ts.tv_sec++;
             ts.tv_nsec -= 1000000000;
         }
-        pthread_cond_timedwait(&m->cond, &m->mutex, &ts);
+        jn_cond_timedwait(&m->cond, &m->mutex, &ts);
     }
 
     m->wait_count--;
-    pthread_mutex_unlock(&m->mutex);
+    jn_mutex_unlock(&m->mutex);
 }
 
 /* ---- System.nanoTime() ---- */
 
 int64_t __jnative_fn_java_lang_System_nanoTime___J(void) {
     struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
+    jn_now_monotonic(&ts);
     return (int64_t)ts.tv_sec * 1000000000L + ts.tv_nsec;
 }

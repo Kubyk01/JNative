@@ -119,11 +119,11 @@
  */
 
 #define _GNU_SOURCE
+#include "jnative_platform.h"
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
 #include <stdlib.h>
-#include <dlfcn.h>
 
 #include "jnative_runtime.h"
 
@@ -382,7 +382,7 @@ static void* method_get_type(void* method_obj) {
     }
 
     typedef void* (*get_type_fn)(void*);
-    get_type_fn fn = (get_type_fn)dlsym(RTLD_DEFAULT,
+    get_type_fn fn = (get_type_fn)jn_dlsym_default(
         "fn_java_lang_reflect_Method_getType__Ljava_lang_invoke_MethodType_");
     if (fn != NULL) {
         return fn(method_obj);
@@ -404,7 +404,7 @@ static const char* method_type_descriptor(void* method_type) {
     if (method_type == NULL) return NULL;
 
     typedef void* (*to_desc_fn)(void*);
-    to_desc_fn fn = (to_desc_fn)dlsym(RTLD_DEFAULT,
+    to_desc_fn fn = (to_desc_fn)jn_dlsym_default(
         "fn_java_lang_invoke_MethodType_toMethodDescriptorString___Ljava_lang_String_");
     if (fn == NULL) return NULL;
 
@@ -1125,12 +1125,12 @@ int64_t __jnative_fn_java_lang_invoke_MethodHandleNatives_staticFieldOffset__Lja
 
     /*
      * Open the process image once and reuse the handle across every
-     * candidate in the superclass walk. dlopen(NULL, RTLD_LAZY) returns
+     * candidate in the superclass walk. jn_dlsym_default returns
      * a handle to the running executable and its already-loaded
      * dependencies, which is where every @gv_* global emitted by the
      * LLVM backend lives.
      */
-    void* handle = dlopen(NULL, RTLD_LAZY);
+    void* handle = jn_dlsym_default;
     if (handle == NULL) {
         return 0;
     }
@@ -1144,7 +1144,7 @@ int64_t __jnative_fn_java_lang_invoke_MethodHandleNatives_staticFieldOffset__Lja
         if (cls_name != NULL
             && jnative_build_static_field_symbol(cls_name, name, name_len,
                                                  symbol, sizeof(symbol))) {
-            void* addr = dlsym(handle, symbol);
+            void* addr = jn_dlsym_default( symbol);
             if (addr != NULL) {
                 result = (int64_t)(intptr_t)addr;
                 break;

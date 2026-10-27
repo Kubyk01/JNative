@@ -1,8 +1,7 @@
 #define _GNU_SOURCE
+#include "jnative_platform.h"
 #include <stdint.h>
-#include <pthread.h>
 #include <signal.h>
-#include <unistd.h>
 #include <errno.h>
 
 #include "jnative_runtime.h"
@@ -51,12 +50,12 @@ void __jnative_fn_sun_nio_ch_NativeThread_init___V(void) {
  * Returns the opaque identifier of the calling thread. Used by the
  * Java layer as the handle it stores in NativeThreadSet.
  *
- * The value is the pthread_t of the calling thread, reinterpreted as
- * a 64-bit integer. pthread_t is already an unsigned long on every
+ * The value is the jn_thread_t of the calling thread, reinterpreted as
+ * a 64-bit integer. jn_thread_t is already an unsigned long on every
  * platform this runtime targets, so the reinterpretation is exact.
  */
 int64_t __jnative_fn_sun_nio_ch_NativeThread_current0___J(void) {
-    pthread_t self = pthread_self();
+    jn_thread_t self = pthread_self();
     return (int64_t)(uintptr_t)self;
 }
 

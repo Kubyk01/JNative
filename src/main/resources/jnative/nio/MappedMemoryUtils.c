@@ -18,10 +18,10 @@
  */
 
 #define _GNU_SOURCE
+#include "jnative_platform.h"
 #include <stdint.h>
 #include <stddef.h>
 #include <stdlib.h>
-#include <sys/mman.h>
 
 #include "jnative_runtime.h"
 

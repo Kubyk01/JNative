@@ -1,14 +1,11 @@
 #define _GNU_SOURCE
+#include "jnative_platform.h"
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
-#include <unistd.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/types.h>
-#include <sys/socket.h>
-#include <sys/ioctl.h>
-#include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
 
@@ -148,7 +145,7 @@ int32_t __jnative_fn_sun_nio_ch_Net_isReusePortAvailable0___Z(void) {
         } else {
 #ifdef SO_REUSEPORT
             int one = 1;
-            if (setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one)) == 0) {
+            if (setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, (const char*)&one, sizeof(one)) == 0) {
                 cached = 1;
             } else {
                 cached = 0;

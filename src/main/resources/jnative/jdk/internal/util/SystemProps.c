@@ -1,12 +1,11 @@
 #define _GNU_SOURCE
+#include "jnative_platform.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
-#include <unistd.h>
 #include <limits.h>
-#include <dlfcn.h>
 #include "jnative_runtime.h"
 
 /*
@@ -66,9 +65,9 @@ static void* lookup_class_vtable(struct ReflectionClass* cls) {
     for (char* p = buf; *p; p++) {
         if (*p == '/' || *p == '.') *p = '_';
     }
-    void* handle = dlopen(NULL, RTLD_LAZY);
+    void* handle = jn_dlsym_default;
     if (!handle) return NULL;
-    void** type_info = (void**)dlsym(handle, buf);
+    void** type_info = (void**)jn_dlsym_default( buf);
     dlclose(handle);
     return type_info ? type_info[0] : NULL;
 }
@@ -102,7 +101,7 @@ static const char* resolve_java_home(char* buf, size_t bufsz) {
     }
 
 #if defined(__linux__)
-    ssize_t n = readlink("/proc/self/exe", buf, bufsz - 1);
+    ssize_t n = jn_readlink("/proc/self/exe", buf, bufsz - 1);
     if (n > 0) {
         buf[n] = '\0';
         char* slash = strrchr(buf, '/');
@@ -404,12 +403,12 @@ void* __jnative_fn_jdk_internal_util_SystemProps_Raw_cmdProperties___Ljava_util_
         abort();
     }
 
-    void* handle = dlopen(NULL, RTLD_LAZY);
+    void* handle = jn_dlsym_default;
     if (!handle) {
         fprintf(stderr, "jnative: fatal: dlopen(NULL) failed\n");
         abort();
     }
-    void** node_type_info = (void**)dlsym(handle, "__type_info_java_util_HashMap_Node");
+    void** node_type_info = (void**)jn_dlsym_default( "__type_info_java_util_HashMap_Node");
     void* node_vtable = (node_type_info && node_type_info[0])
         ? node_type_info[0]
         : lookup_class_vtable(find_class("java/lang/Object"));
@@ -601,13 +600,13 @@ void* __jnative_make_bootstrap_props(
     if (chm_basecount_off    <= 0) chm_basecount_off    = CHM_BASECOUNT_OFFSET;
     if (chm_sizectl_off      <= 0) chm_sizectl_off      = CHM_SIZECTL_OFFSET;
 
-    void* handle = dlopen(NULL, RTLD_LAZY);
+    void* handle = jn_dlsym_default;
     if (!handle) {
         fprintf(stderr, "jnative: fatal: dlopen(NULL) failed\n");
         abort();
     }
 
-    void** node_type_info = (void**)dlsym(handle,
+    void** node_type_info = (void**)jn_dlsym_default(
         "__type_info_java_util_concurrent_ConcurrentHashMap_Node");
     void* node_vtable = (node_type_info && node_type_info[0])
         ? node_type_info[0]

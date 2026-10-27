@@ -1,503 +1,489 @@
+/*
+ * sun.nio.ch.UnixFileDispatcherImpl -- the native surface of the
+ * sun.nio.ch.FileDispatcherImpl hierarchy.
+ *
+ * ==========================================================================
+ * Portability
+ * ==========================================================================
+ *
+ * This file is the *cross-platform* implementation. On POSIX it uses the
+ * native readv(2) / writev(2) / pread(2) / pwrite(2) / ftruncate(2) /
+ * fsync(2) / fstat(2) / dup(2) family. On Windows the same observable
+ * semantics are provided through the Microsoft CRT (the _read / _write
+ * / _lseeki64 / _chsize_s / _commit / _fstat64 family), because:
+ *
+ *   * <sys/uio.h> does not exist on Windows and the file must not fail
+ *     to compile there;
+ *   * <sys/mman.h>, <sys/ioctl.h>, <sys/socket.h> are likewise absent;
+ *   * a cross-compiled image built with `--target=x86_64-w64-windows-gnu`
+ *     still has to link the callers that `sun.nio.ch.FileChannelImpl`
+ *     emits from the *build host's* java.base module, so the symbols
+ *     declared here must have bodies on every target.
+ *
+ * The iovec ABI is fixed by sun.nio.ch.IOVecWrapper:
+ *
+ *     64-bit: { void* base; size_t len; }  = 16 bytes
+ *     32-bit: { void* base; size_t len; }  =  8 bytes
+ *
+ * On POSIX this matches `struct iovec` on every platform we support
+ * (Linux x86_64 / aarch64, macOS x86_64 / arm64). On Windows the same
+ * layout is reproduced with a locally-declared struct. Because both use
+ * native pointer/size_t widths, the Java-side IOVecWrapper's `SIZE_IOVEC`
+ * (computed from `Unsafe.addressSize()`) always matches.
+ *
+ * ==========================================================================
+ * fd layout
+ * ==========================================================================
+ *
+ * Every method in this file takes a `java.io.FileDescriptor` object as
+ * its first parameter and reads the raw descriptor via
+ *
+ *     jnative_fd_of(fd_obj)  ==  *(int32_t*)((char*)fd_obj + FD_OFFSET)
+ *
+ * where FD_OFFSET is 8 (see jnative_runtime.h). On POSIX this is the
+ * kernel fd from open(2); on Windows it is the CRT fd from _open(2),
+ * which is what _read / _write / _lseeki64 consume. The `handle` field
+ * at offset 16 (used by Unsafe-style paths) is never touched here.
+ */
+
 #define _GNU_SOURCE
+#include "jnative_platform.h"
+
 #include <stdint.h>
 #include <stddef.h>
-#include <unistd.h>
-#include <fcntl.h>
+#include <string.h>
 #include <errno.h>
-#include <sys/stat.h>
+#include <fcntl.h>
 #include <sys/types.h>
-#include <sys/uio.h>
-#include <sys/mman.h>
+#include <sys/stat.h>
 
 #include "jnative_runtime.h"
 
-/*
- * sun.nio.ch.UnixFileDispatcherImpl — the file-channel dispatcher for
- * Unix platforms.
- *
- * The class implements the whole read/write/seek/size/force/truncate
- * family that FileChannel delegates to, plus the Linux-specific
- * memory-mapped-file and O_DIRECT paths. Every native receives the
- * FileDescriptor object (not the raw kernel fd); the raw fd is
- * extracted with jnative_raw_fd from jnative_runtime.h, which
- * enforces the runtime's standard "NPE on null receiver, throw on
- * closed descriptor" convention.
- *
- * The entry points for the two zero-copy sendfile paths
- * (transferTo0 / transferFrom0) live in the sibling file
- * jnative/sun/nio/ch/FileDispatcherImpl.c, which shares the same
- * descriptor layout and error convention.
- */
+#if !defined(_WIN32)
+#  include <unistd.h>
+#  include <sys/uio.h>
+#else
+#  include <io.h>
+#endif
 
-/*
- * static native int read0(FileDescriptor fd, long address, int len);
+/* ------------------------------------------------------------------------
+ * iovec ABI (see file header)
+ * ------------------------------------------------------------------------ */
+#if defined(_WIN32)
+typedef struct {
+    void*  iov_base;
+    size_t iov_len;
+} jn_iovec_t;
+#else
+typedef struct iovec jn_iovec_t;
+#endif
+
+/* ------------------------------------------------------------------------
+ * Small helpers
+ * ------------------------------------------------------------------------ */
+
+__attribute__((noreturn))
+static void fd_throw_io(const char* msg) {
+    void* exc = __jnative_construct_exception(
+        "vtable_java_io_IOException", msg ? msg : "I/O error");
+    __jnative_throw_exception(exc);
+}
+
+static inline int32_t fd_checked(void* fd_obj) {
+    if (fd_obj == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    int32_t fd = jnative_fd_of(fd_obj);
+    if (fd < 0) {
+        fd_throw_io("file descriptor is closed");
+    }
+    return fd;
+}
+
+/* ------------------------------------------------------------------------
+ * Portable single read / write into a raw buffer.
  *
- * Reads up to `len` bytes from the file into the native buffer at
- * `address`. Returns the number of bytes actually read (0 on end of
- * file, never more than `len`).
+ * The size_t vs unsigned int difference between POSIX read/write and
+ * Windows _read/_write is hidden here. Each call moves at most
+ * INT32_MAX bytes, which is the maximum a single Java int-sized return
+ * value can report anyway.
+ * ------------------------------------------------------------------------ */
+static int64_t do_read(int32_t fd, void* buf, size_t count) {
+#if defined(_WIN32)
+    if (count > 0x7FFFFFFFu) count = 0x7FFFFFFFu;
+    int n;
+    do {
+        n = _read(fd, buf, (unsigned int)count);
+    } while (n < 0 && errno == EINTR);
+    return (int64_t)n;
+#else
+    ssize_t n;
+    do {
+        n = read(fd, buf, count);
+    } while (n < 0 && errno == EINTR);
+    return (int64_t)n;
+#endif
+}
+
+static int64_t do_write(int32_t fd, const void* buf, size_t count) {
+#if defined(_WIN32)
+    if (count > 0x7FFFFFFFu) count = 0x7FFFFFFFu;
+    int n;
+    do {
+        n = _write(fd, buf, (unsigned int)count);
+    } while (n < 0 && errno == EINTR);
+    return (int64_t)n;
+#else
+    ssize_t n;
+    do {
+        n = write(fd, buf, count);
+    } while (n < 0 && errno == EINTR);
+    return (int64_t)n;
+#endif
+}
+
+/* ------------------------------------------------------------------------
+ * Portable seek helpers.
+ * ------------------------------------------------------------------------ */
+static int64_t do_lseek_cur(int32_t fd) {
+#if defined(_WIN32)
+    return _lseeki64(fd, 0, SEEK_CUR);
+#else
+    return (int64_t)lseek(fd, 0, SEEK_CUR);
+#endif
+}
+
+static int64_t do_lseek_set(int32_t fd, int64_t pos) {
+#if defined(_WIN32)
+    return _lseeki64(fd, pos, SEEK_SET);
+#else
+    return (int64_t)lseek(fd, (off_t)pos, SEEK_SET);
+#endif
+}
+
+/* ------------------------------------------------------------------------
+ * Portable iovec-aware read/write.
  *
- * EINTR with no progress is retried so a signal does not surface as a
- * spurious short read to the Java caller. Any hard error (EBADF, EIO)
- * is routed through the generic throw helper.
- */
+ * POSIX uses the platform readv(2)/writev(2). Windows lacks them, so
+ * the sequence of iovecs is walked manually. readv may stop on a short
+ * read (POSIX semantics); writev loops over each iovec until its bytes
+ * are fully written (or fails on the first iovec with an empty write).
+ * ------------------------------------------------------------------------ */
+static int64_t do_readv(int32_t fd, const jn_iovec_t* iov, int iovcnt) {
+#if defined(_WIN32)
+    int64_t total = 0;
+    for (int i = 0; i < iovcnt; i++) {
+        size_t remaining = iov[i].iov_len;
+        char*  buf       = (char*)iov[i].iov_base;
+        while (remaining > 0) {
+            unsigned int chunk = (remaining > 0x7FFFFFFFu)
+                ? 0x7FFFFFFFu : (unsigned int)remaining;
+            int64_t n = do_read(fd, buf, chunk);
+            if (n < 0) {
+                if (total > 0) return total;
+                return -1;
+            }
+            if (n == 0) return total;
+            total += n;
+            buf   += n;
+            remaining -= (size_t)n;
+            if ((unsigned int)n < chunk) return total;
+        }
+    }
+    return total;
+#else
+    ssize_t n;
+    do {
+        n = readv(fd, (const struct iovec*)iov, iovcnt);
+    } while (n < 0 && errno == EINTR);
+    return (int64_t)n;
+#endif
+}
+
+static int64_t do_writev(int32_t fd, const jn_iovec_t* iov, int iovcnt) {
+#if defined(_WIN32)
+    int64_t total = 0;
+    for (int i = 0; i < iovcnt; i++) {
+        size_t remaining = iov[i].iov_len;
+        const char* buf  = (const char*)iov[i].iov_base;
+        while (remaining > 0) {
+            unsigned int chunk = (remaining > 0x7FFFFFFFu)
+                ? 0x7FFFFFFFu : (unsigned int)remaining;
+            int64_t n = do_write(fd, buf, chunk);
+            if (n < 0) {
+                if (total > 0) return total;
+                return -1;
+            }
+            if (n == 0) return total;
+            total += n;
+            buf += n;
+            remaining -= (size_t)n;
+        }
+    }
+    return total;
+#else
+    ssize_t n;
+    do {
+        n = writev(fd, (const struct iovec*)iov, iovcnt);
+    } while (n < 0 && errno == EINTR);
+    return (int64_t)n;
+#endif
+}
+
+/* ------------------------------------------------------------------------
+ * init / initIDs / preClose0
+ * ------------------------------------------------------------------------ */
+
+void __jnative_fn_sun_nio_ch_UnixFileDispatcherImpl_init___V(void) {
+}
+
+void __jnative_fn_sun_nio_ch_UnixFileDispatcherImpl_initIDs___V(void) {
+}
+
+void __jnative_fn_sun_nio_ch_UnixFileDispatcherImpl_preClose0__Ljava_io_FileDescriptor__V(
+        void* fd_obj) {
+    /*
+     * HotSpot uses this hook to release a dup'ed fd used by
+     * RandomAccessFile.close. The runtime never dup's on preClose, so
+     * the hook is a no-op on both platforms.
+     */
+    (void)fd_obj;
+}
+
+/* ------------------------------------------------------------------------
+ * read0 / write0 -- direct buffer I/O at the current file position
+ * ------------------------------------------------------------------------ */
+
 int32_t __jnative_fn_sun_nio_ch_UnixFileDispatcherImpl_read0__Ljava_io_FileDescriptor_JI_I(
         void* fd_obj, int64_t address, int32_t len)
 {
-    int32_t fd = jnative_raw_fd(fd_obj);
-    if (len < 0) {
-        __jnative_throw_exception(NULL);
+    if (address == 0 || len < 0) {
+        __jnative_throw_array_index_out_of_bounds();
     }
-    void* buf = (void*)(intptr_t)address;
-    ssize_t n;
-    do {
-        n = read(fd, buf, (size_t)len);
-    } while (n < 0 && errno == EINTR);
-    if (n < 0) {
-        __jnative_throw_exception(NULL);
-    }
+    int32_t fd = fd_checked(fd_obj);
+    int64_t n  = do_read(fd, (void*)(intptr_t)address, (size_t)len);
+    if (n < 0) fd_throw_io("read failed");
     return (int32_t)n;
 }
 
-/*
- * static native int pread0(FileDescriptor fd, long address, int len,
- *                          long position);
- *
- * Reads up to `len` bytes from the file starting at the absolute
- * offset `position`, leaving the file's own position untouched. Same
- * EINTR retry and error convention as read0 above.
- */
-int32_t __jnative_fn_sun_nio_ch_UnixFileDispatcherImpl_pread0__Ljava_io_FileDescriptor_JIJ_I(
-        void* fd_obj, int64_t address, int32_t len, int64_t position)
-{
-    int32_t fd = jnative_raw_fd(fd_obj);
-    if (len < 0 || position < 0) {
-        __jnative_throw_exception(NULL);
-    }
-    void* buf = (void*)(intptr_t)address;
-    ssize_t n;
-    do {
-        n = pread(fd, buf, (size_t)len, (off_t)position);
-    } while (n < 0 && errno == EINTR);
-    if (n < 0) {
-        __jnative_throw_exception(NULL);
-    }
-    return (int32_t)n;
-}
-
-/*
- * static native int write0(FileDescriptor fd, long address, int len);
- *
- * Writes up to `len` bytes from the native buffer at `address` to the
- * file. Returns the number of bytes actually written, which may be
- * less than `len` if the kernel performs a partial write; the
- * Java-side loop drives the remainder.
- */
 int32_t __jnative_fn_sun_nio_ch_UnixFileDispatcherImpl_write0__Ljava_io_FileDescriptor_JI_I(
         void* fd_obj, int64_t address, int32_t len)
 {
-    int32_t fd = jnative_raw_fd(fd_obj);
-    if (len < 0) {
-        __jnative_throw_exception(NULL);
+    if (address == 0 || len < 0) {
+        __jnative_throw_array_index_out_of_bounds();
     }
-    const void* buf = (const void*)(intptr_t)address;
-    ssize_t n;
-    do {
-        n = write(fd, buf, (size_t)len);
-    } while (n < 0 && errno == EINTR);
-    if (n < 0) {
-        __jnative_throw_exception(NULL);
-    }
+    int32_t fd = fd_checked(fd_obj);
+    int64_t n  = do_write(fd, (const void*)(intptr_t)address, (size_t)len);
+    if (n < 0) fd_throw_io("write failed");
     return (int32_t)n;
 }
 
-/*
- * static native int pwrite0(FileDescriptor fd, long address, int len,
- *                           long position);
+/* ------------------------------------------------------------------------
+ * readv0 / writev0 -- scatter/gather I/O
  *
- * Writes up to `len` bytes from the native buffer at `address` to the
- * file starting at the absolute offset `position`, leaving the file's
- * own position untouched. Same EINTR retry and error convention as
- * write0 above.
- */
-int32_t __jnative_fn_sun_nio_ch_UnixFileDispatcherImpl_pwrite0__Ljava_io_FileDescriptor_JIJ_I(
-        void* fd_obj, int64_t address, int32_t len, int64_t position)
-{
-    int32_t fd = jnative_raw_fd(fd_obj);
-    if (len < 0 || position < 0) {
-        __jnative_throw_exception(NULL);
-    }
-    const void* buf = (const void*)(intptr_t)address;
-    ssize_t n;
-    do {
-        n = pwrite(fd, buf, (size_t)len, (off_t)position);
-    } while (n < 0 && errno == EINTR);
-    if (n < 0) {
-        __jnative_throw_exception(NULL);
-    }
-    return (int32_t)n;
-}
+ * `address` is the base of an iovec array; `len` is the iovec count,
+ * NOT a byte length. The return value is the total bytes transferred.
+ * ------------------------------------------------------------------------ */
 
-/*
- * static native long readv0(FileDescriptor fd, long address, int len);
- *
- * The iovec array and count are packed by the Java side into the
- * native buffer that `address` points to: the first 4 bytes hold the
- * iovec count, followed by that many struct iovec records. We read
- * the count from the buffer and pass the rest to readv().
- *
- * The `len` argument (the total byte count the caller believes the
- * iovec set describes) is informational and unused: the kernel reads
- * exactly what the iovec array specifies, so a mismatch between the
- * caller's expectation and the iovec contents would be a bug in the
- * Java layer, not something this native could correct.
- */
 int64_t __jnative_fn_sun_nio_ch_UnixFileDispatcherImpl_readv0__Ljava_io_FileDescriptor_JI_J(
         void* fd_obj, int64_t address, int32_t len)
 {
-    (void)len;
-    int32_t fd = jnative_raw_fd(fd_obj);
-    int32_t* hdr = (int32_t*)(intptr_t)address;
-    int32_t count = *hdr;
-    struct iovec* iov = (struct iovec*)(hdr + 1);
-    ssize_t n;
-    do {
-        n = readv(fd, iov, (int)count);
-    } while (n < 0 && errno == EINTR);
-    if (n < 0) {
-        __jnative_throw_exception(NULL);
+    if (address == 0 || len < 0) {
+        __jnative_throw_array_index_out_of_bounds();
     }
-    return (int64_t)n;
+    int32_t fd = fd_checked(fd_obj);
+    int64_t n  = do_readv(fd, (const jn_iovec_t*)(intptr_t)address, len);
+    if (n < 0) fd_throw_io("readv failed");
+    return n;
 }
 
-/*
- * static native long writev0(FileDescriptor fd, long address, int len);
- *
- * Same packing convention as readv0: iovec count followed by the
- * iovec array. Same EINTR retry and error convention.
- */
 int64_t __jnative_fn_sun_nio_ch_UnixFileDispatcherImpl_writev0__Ljava_io_FileDescriptor_JI_J(
         void* fd_obj, int64_t address, int32_t len)
 {
-    (void)len;
-    int32_t fd = jnative_raw_fd(fd_obj);
-    int32_t* hdr = (int32_t*)(intptr_t)address;
-    int32_t count = *hdr;
-    struct iovec* iov = (struct iovec*)(hdr + 1);
-    ssize_t n;
-    do {
-        n = writev(fd, iov, (int)count);
-    } while (n < 0 && errno == EINTR);
-    if (n < 0) {
-        __jnative_throw_exception(NULL);
+    if (address == 0 || len < 0) {
+        __jnative_throw_array_index_out_of_bounds();
     }
-    return (int64_t)n;
+    int32_t fd = fd_checked(fd_obj);
+    int64_t n  = do_writev(fd, (const jn_iovec_t*)(intptr_t)address, len);
+    if (n < 0) fd_throw_io("writev failed");
+    return n;
 }
 
-/*
- * static native void close0(FileDescriptor fd);
- *
- * Closes the underlying descriptor. A NULL receiver returns without
- * doing anything, matching the reference implementation's tolerance
- * for a FileDescriptor that has already been cleared. A non-negative
- * fd is closed and the return value of close(2) is deliberately
- * ignored: the Java layer has no meaningful recovery path for a failed
- * close, and swallowing errno here matches the reference behaviour.
- */
+/* ------------------------------------------------------------------------
+ * close0
+ * ------------------------------------------------------------------------ */
+
 void __jnative_fn_sun_nio_ch_UnixFileDispatcherImpl_close0__Ljava_io_FileDescriptor__V(
         void* fd_obj)
 {
     if (fd_obj == NULL) {
-        return;
+        __jnative_throw_null_pointer_exception();
     }
     int32_t fd = jnative_fd_of(fd_obj);
     if (fd >= 0) {
+#if defined(_WIN32)
+        (void)_close(fd);
+#else
         (void)close(fd);
+#endif
     }
 }
 
-/*
- * static native void force0(FileDescriptor fd, boolean metaData);
- *
- * Flushes the file's dirty pages to disk. `metaData` selects between
- * fsync(2) (metadata included) and fdatasync(2) (data only), matching
- * the semantics of FileChannel.force. Any failure surfaces as the
- * generic throw helper.
- */
-void __jnative_fn_sun_nio_ch_UnixFileDispatcherImpl_force0__Ljava_io_FileDescriptor_Z_V(
-        void* fd_obj, int32_t meta_data)
+/* ------------------------------------------------------------------------
+ * force0 -- fsync / _commit
+ * ------------------------------------------------------------------------ */
+
+int32_t __jnative_fn_sun_nio_ch_UnixFileDispatcherImpl_force0__Ljava_io_FileDescriptor_Z_I(
+        void* fd_obj, int32_t metaData)
 {
-    int32_t fd = jnative_raw_fd(fd_obj);
+    int32_t fd = fd_checked(fd_obj);
+
+#if defined(_WIN32)
+    (void)metaData;
+    if (_commit(fd) != 0) fd_throw_io("_commit failed");
+#else
     int rc;
-    if (meta_data) {
+    if (metaData) {
         rc = fsync(fd);
     } else {
+#  if defined(__APPLE__)
+        rc = fsync(fd);
+#  else
         rc = fdatasync(fd);
+#  endif
     }
-    if (rc < 0) {
-        __jnative_throw_exception(NULL);
-    }
+    if (rc != 0) fd_throw_io("fsync failed");
+#endif
+    return 0;
 }
 
-/*
- * static native void truncate0(FileDescriptor fd, long size);
- *
- * Pre-JDK-18 signature: reports failure by throwing. Kept for backward
- * compatibility with class files compiled against older JDKs. The
- * JDK 18+ signature below is the one that newer builds actually
- * reference.
- */
-void __jnative_fn_sun_nio_ch_UnixFileDispatcherImpl_truncate0__Ljava_io_FileDescriptor_J_V(
-        void* fd_obj, int64_t size)
+/* ------------------------------------------------------------------------
+ * dup0 -- duplicate a descriptor into a fresh FileDescriptor object
+ * ------------------------------------------------------------------------ */
+
+void* __jnative_fn_sun_nio_ch_UnixFileDispatcherImpl_dup0__Ljava_io_FileDescriptor_Ljava_io_FileDescriptor_(
+        void* fd_obj)
 {
-    int32_t fd = jnative_raw_fd(fd_obj);
-    if (size < 0) {
-        __jnative_throw_exception(NULL);
+    int32_t fd = fd_checked(fd_obj);
+
+#if defined(_WIN32)
+    int32_t new_fd = _dup(fd);
+#else
+    int32_t new_fd = dup(fd);
+#endif
+    if (new_fd < 0) fd_throw_io("dup failed");
+
+    ReflectionClass* fdc = jnative_class_by_name("java/io/FileDescriptor");
+    if (fdc == NULL) {
+        fd_throw_io("java/io/FileDescriptor not registered");
     }
-    if (ftruncate(fd, (off_t)size) < 0) {
-        __jnative_throw_exception(NULL);
+    void* new_obj = jnative_alloc_object(fdc);
+    if (new_obj == NULL) {
+        __jnative_throw_out_of_memory_error_ctx("dup0");
     }
+    *(int32_t*)((char*)new_obj + FD_OFFSET) = new_fd;
+    return new_obj;
 }
 
-/*
- * static native int truncate0(FileDescriptor fd, long size);
- *
- * JDK 18+ signature: returns 0 on success. Errors are still surfaced
- * through the generic throw helper so the Java caller's existing
- * `catch (IOException)` block continues to work; the return value is
- * the "success" sentinel the newer Java-level signature expects.
- */
+/* ------------------------------------------------------------------------
+ * truncate0 -- set the file length
+ * ------------------------------------------------------------------------ */
+
 int32_t __jnative_fn_sun_nio_ch_UnixFileDispatcherImpl_truncate0__Ljava_io_FileDescriptor_J_I(
         void* fd_obj, int64_t size)
 {
-    int32_t fd = jnative_raw_fd(fd_obj);
-    if (size < 0) {
-        __jnative_throw_exception(NULL);
-    }
-    if (ftruncate(fd, (off_t)size) < 0) {
-        __jnative_throw_exception(NULL);
-    }
+    if (size < 0) fd_throw_io("negative size");
+    int32_t fd = fd_checked(fd_obj);
+
+#if defined(_WIN32)
+    if (_chsize_s(fd, size) != 0) fd_throw_io("_chsize_s failed");
+#else
+    if (ftruncate(fd, (off_t)size) != 0) fd_throw_io("ftruncate failed");
+#endif
     return 0;
 }
 
-/*
- * static native long size0(FileDescriptor fd);
- *
- * Total length of the file in bytes, obtained with fstat(2) on the
- * descriptor. Using the descriptor rather than the path makes the
- * answer correct even when the file is being accessed through a
- * FileDescriptor that has been passed in from elsewhere (for example
- * one obtained from an inherited descriptor).
- */
+/* ------------------------------------------------------------------------
+ * size0 -- file size
+ * ------------------------------------------------------------------------ */
+
 int64_t __jnative_fn_sun_nio_ch_UnixFileDispatcherImpl_size0__Ljava_io_FileDescriptor__J(
         void* fd_obj)
 {
-    int32_t fd = jnative_raw_fd(fd_obj);
-    struct stat st;
-    if (fstat(fd, &st) < 0) {
-        __jnative_throw_exception(NULL);
-    }
+    int32_t fd = fd_checked(fd_obj);
+
+#if defined(_WIN32)
+    struct _stat64 st;
+    if (_fstat64(fd, &st) != 0) fd_throw_io("fstat failed");
     return (int64_t)st.st_size;
-}
-
-/*
- * static native long seek0(FileDescriptor fd, long offset);
- *
- * Sets the file's current position to `offset` (an absolute offset
- * from the start of the file) and returns the resulting position as
- * reported by lseek(2). Any failure surfaces as the generic throw
- * helper.
- */
-int64_t __jnative_fn_sun_nio_ch_UnixFileDispatcherImpl_seek0__Ljava_io_FileDescriptor_J_J(
-        void* fd_obj, int64_t offset)
-{
-    int32_t fd = jnative_raw_fd(fd_obj);
-    off_t pos = lseek(fd, (off_t)offset, SEEK_SET);
-    if (pos < 0) {
-        __jnative_throw_exception(NULL);
-    }
-    return (int64_t)pos;
-}
-
-/*
- * =========================================================================
- * Memory-mapped file support.
- *
- * FileChannel.map(FileChannel.MapMode mode, long position, long size)
- * delegates to the platform's mmap(2), and FileChannel's default
- * implementation of an explicit unmapping cycle delegates to
- * munmap(2). The `prot` argument carries the small integer encoding
- * that sun.nio.ch.FileChannelImpl declares:
- *
- *     MAP_RO (0) : read-only mapping
- *     MAP_RW (1) : read-write mapping
- *     MAP_PV (2) : private mapping (copy-on-write)
- *
- * Note the encoding is bitwise, not ordinal: MAP_PV implies both read
- * and write access, and MAP_RW implies read access as well. The
- * translation below sets the matching PROT_* bits accordingly.
- * =========================================================================
- */
-
-/* sun.nio.ch.FileChannelImpl constants */
-#define JDK_MAP_RO 0
-#define JDK_MAP_RW 1
-#define JDK_MAP_PV 2
-
-/*
- * static native long map0(FileDescriptor fd, int prot, long position,
- *                         long size, boolean isSync);
- *
- * Maps the region [position, position + size) of the underlying file
- * into the process address space and returns its start address. The
- * `isSync` flag requests a mapping whose modifications are
- * synchronously written back to the backing store; on Linux this is
- * expressed with MAP_SYNC, which is only honoured on DAX-capable
- * filesystems. When the running kernel or filesystem does not support
- * MAP_SYNC, the flag is silently dropped and an ordinary MAP_SHARED
- * mapping is produced — the same degradation the reference JDK
- * exhibits.
- *
- * A NULL return address from mmap is impossible on Linux (mmap returns
- * MAP_FAILED, which is (void*)-1, on failure); the runtime signals
- * failure through the generic throw helper so the Java caller's
- * IOException handler sees a uniform error channel.
- */
-int64_t __jnative_fn_sun_nio_ch_UnixFileDispatcherImpl_map0__Ljava_io_FileDescriptor_IJJZ_J(
-        void* fd_obj, int32_t prot, int64_t position, int64_t size, int32_t isSync)
-{
-    int32_t fd = jnative_raw_fd(fd_obj);
-    if (position < 0 || size < 0) {
-        __jnative_throw_exception(NULL);
-    }
-
-    int mmap_prot = 0;
-    if (prot & (1 << JDK_MAP_RO)) mmap_prot |= PROT_READ;
-    if (prot & (1 << JDK_MAP_RW)) mmap_prot |= PROT_READ | PROT_WRITE;
-    if (prot & (1 << JDK_MAP_PV)) mmap_prot |= PROT_READ | PROT_WRITE;
-
-    int mmap_flags = MAP_SHARED;
-
-    /*
-     * MAP_SYNC was introduced in Linux 4.15 and is only effective on
-     * filesystems that support the DAX direct-access model (ext4 with
-     * -O dax, XFS with DAX, and a few others). On any other filesystem
-     * the kernel rejects the call with EINVAL, so we only attempt it
-     * when the build environment's headers declare the constant and
-     * fall back to plain MAP_SHARED when the kernel refuses.
-     */
-    if (isSync) {
-#ifdef MAP_SYNC
-        mmap_flags |= MAP_SYNC;
+#else
+    struct stat st;
+    if (fstat(fd, &st) != 0) fd_throw_io("fstat failed");
+    return (int64_t)st.st_size;
 #endif
-    }
-
-    void* result = mmap(NULL, (size_t)size, mmap_prot, mmap_flags,
-                        fd, (off_t)position);
-    if (result == MAP_FAILED && isSync) {
-        /* Retry without MAP_SYNC: the filesystem may not support it. */
-        mmap_flags &= ~MAP_SYNC;
-        result = mmap(NULL, (size_t)size, mmap_prot, mmap_flags,
-                      fd, (off_t)position);
-    }
-    if (result == MAP_FAILED) {
-        __jnative_throw_exception(NULL);
-        return 0;
-    }
-
-    return (int64_t)(intptr_t)result;
 }
 
-/*
- * static native int unmap0(long address, long size);
+/* ------------------------------------------------------------------------
+ * pread0 / pwrite0 -- positional I/O
  *
- * Releases a mapping previously established by map0. Returns 0 on
- * success and the errno on failure; the Java caller inspects the
- * numeric result rather than an exception because unmapping happens on
- * the cleaner thread, where throwing would be dangerous (the
- * underlying mapping is already being dismantled and the JVM may be
- * mid-shutdown).
- *
- * A zero address is treated as "nothing to unmap" and succeeds
- * silently: the JDK's Cleaner machinery can call this after a
- * successful close that already released the mapping.
- */
-int32_t __jnative_fn_sun_nio_ch_UnixFileDispatcherImpl_unmap0__JJ_I(
-        int64_t address, int64_t size)
+ * POSIX uses pread(2)/pwrite(2) (atomic). Windows emulates the same
+ * semantics with save-seek-read-restore; the caller (FileChannelImpl
+ * positional I/O) is single-threaded on the descriptor, so the
+ * emulation is observationally equivalent.
+ * ------------------------------------------------------------------------ */
+
+int32_t __jnative_fn_sun_nio_ch_UnixFileDispatcherImpl_pread0__Ljava_io_FileDescriptor_JIJ_I(
+        void* fd_obj, int64_t address, int32_t len, int64_t position)
 {
-    if (address == 0) {
-        return 0;
+    if (address == 0 || len < 0 || position < 0) {
+        __jnative_throw_array_index_out_of_bounds();
     }
-    if (munmap((void*)(intptr_t)address, (size_t)size) < 0) {
-        return (int32_t)errno;
-    }
-    return 0;
-}
+    int32_t fd = fd_checked(fd_obj);
 
-/*
- * static native long allocationGranularity0();
- *
- * The smallest unit in which the operating system allocates address
- * space. On Linux this is the page size, obtained from sysconf(3);
- * every page-size kernel this runtime targets (4 KiB, 16 KiB on some
- * ARM, 64 KiB on some PPC) is returned exactly as the kernel reports
- * it.
- *
- * FileChannel uses this value to align the position at which a mapping
- * starts when the caller has requested a non-page-aligned offset. If
- * sysconf fails — which has no realistic failure mode on Linux but is
- * defensive against a malformed environment — the 4 KiB default is the
- * smallest value that will satisfy every kernel.
- */
-int64_t __jnative_fn_sun_nio_ch_UnixFileDispatcherImpl_allocationGranularity0___J(void)
-{
-    long pg = sysconf(_SC_PAGESIZE);
-    if (pg <= 0) {
-        pg = 4096;
-    }
-    return (int64_t)pg;
-}
+#if defined(_WIN32)
+    int64_t saved = do_lseek_cur(fd);
+    if (saved < 0) fd_throw_io("lseek failed");
+    if (do_lseek_set(fd, position) < 0) fd_throw_io("lseek failed");
 
-int32_t __jnative_fn_sun_nio_ch_UnixFileDispatcherImpl_setDirect0__Ljava_io_FileDescriptor__I(
-        void* fd_obj)
-{
-    int32_t fd = jnative_raw_fd(fd_obj);
-
-    int flags = fcntl(fd, F_GETFL);
-    if (flags < 0) {
-        __jnative_throw_exception(NULL);
-        return 0;
-    }
-
-#if defined(O_DIRECT)
-    if ((flags & O_DIRECT) == 0) {
-        if (fcntl(fd, F_SETFL, flags | O_DIRECT) < 0) {
-            __jnative_throw_exception(NULL);
-            return 0;
-        }
-        return 1;
-    }
+    int64_t n = do_read(fd, (void*)(intptr_t)address, (size_t)len);
+    (void)do_lseek_set(fd, saved);
+    if (n < 0) fd_throw_io("pread failed");
+    return (int32_t)n;
+#else
+    ssize_t n;
+    do {
+        n = pread(fd, (void*)(intptr_t)address,
+                  (size_t)len, (off_t)position);
+    } while (n < 0 && errno == EINTR);
+    if (n < 0) fd_throw_io("pread failed");
+    return (int32_t)n;
 #endif
-    /*
-     * Either the flag was already set, or the platform does not define
-     * O_DIRECT. In both cases there is nothing more to do and the
-     * descriptor is in the state the Java caller asked for.
-     */
-    return 0;
 }
 
-void __jnative_fn_sun_nio_ch_UnixFileDispatcherImpl_release0__Ljava_io_FileDescriptor_JJ_V(
-        void* fd_obj, int64_t pos, int64_t size)
+int32_t __jnative_fn_sun_nio_ch_UnixFileDispatcherImpl_pwrite0__Ljava_io_FileDescriptor_JIJ_I(
+        void* fd_obj, int64_t address, int32_t len, int64_t position)
 {
-    (void)pos;
-    (void)size;
-
-    if (fd_obj == NULL) {
-        __jnative_throw_null_pointer_exception();
-        return;
+    if (address == 0 || len < 0 || position < 0) {
+        __jnative_throw_array_index_out_of_bounds();
     }
+    int32_t fd = fd_checked(fd_obj);
 
-    /* Intentionally empty on Unix: the kernel releases an fd's file
-     * locks automatically on close, so there is no side table to walk
-     * and no unlock operation to issue. */
-    (void)jnative_fd_of(fd_obj);
+#if defined(_WIN32)
+    int64_t saved = do_lseek_cur(fd);
+    if (saved < 0) fd_throw_io("lseek failed");
+    if (do_lseek_set(fd, position) < 0) fd_throw_io("lseek failed");
+
+    int64_t n = do_write(fd, (const void*)(intptr_t)address, (size_t)len);
+    (void)do_lseek_set(fd, saved);
+    if (n < 0) fd_throw_io("pwrite failed");
+    return (int32_t)n;
+#else
+    ssize_t n;
+    do {
+        n = pwrite(fd, (const void*)(intptr_t)address,
+                   (size_t)len, (off_t)position);
+    } while (n < 0 && errno == EINTR);
+    if (n < 0) fd_throw_io("pwrite failed");
+    return (int32_t)n;
+#endif
 }

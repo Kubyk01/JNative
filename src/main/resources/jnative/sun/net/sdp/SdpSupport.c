@@ -1,3 +1,4 @@
+#include "jnative_platform.h"
 /*
  * sun.net.sdp.SdpSupport
  *

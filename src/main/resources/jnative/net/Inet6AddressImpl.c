@@ -1,15 +1,11 @@
 #define _GNU_SOURCE
+#include "jnative_platform.h"
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
-#include <unistd.h>
 #include <errno.h>
-#include <netdb.h>
-#include <sys/socket.h>
 #include <sys/time.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
 
 #include "jnative_runtime.h"
 
@@ -275,7 +271,7 @@ int32_t __jnative_fn_java_net_Inet6AddressImpl_isReachable0___BII_BII_Z(
         struct timeval tv;
         tv.tv_sec  = timeout / 1000;
         tv.tv_usec = (timeout % 1000) * 1000;
-        (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, (const char*)&tv, sizeof(tv));
     }
 
     int rc;

@@ -1,10 +1,9 @@
 #define _GNU_SOURCE
+#include "jnative_platform.h"
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <limits.h>
-#include <unistd.h>
-#include <dlfcn.h>
 
 #include "jnative_runtime.h"
 
@@ -99,7 +98,7 @@ void* __jnative_fn_jdk_internal_loader_NativeLibraries_findBuiltinLib__Ljava_lan
     if (!known) return NULL;
 
     char exe[PATH_MAX];
-    ssize_t len = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    ssize_t len = jn_readlink("/proc/self/exe", exe, sizeof(exe) - 1);
     if (len <= 0) return NULL;
     exe[len] = '\0';
 
@@ -128,7 +127,7 @@ void* __jnative_fn_jdk_internal_loader_NativeLibraries_findBuiltinLib__Ljava_lan
  * that still matters is the lib's `handle` field, because any
  * subsequent JNI-style `findEntry0(handle, symbol)` call would use it
  * as the first argument to dlsym. We therefore store a handle to the
- * running process image (dlopen(NULL, RTLD_LAZY)) in that field, which
+ * running process image (jn_dlsym_default) in that field, which
  * is exactly what the reference implementation uses for the builtin
  * (non-isJNI) case.
  *
@@ -155,7 +154,7 @@ int32_t __jnative_fn_jdk_internal_loader_NativeLibraries_load__Ljdk_internal_loa
     (void)is_jni;
 
     if (lib != NULL) {
-        void* handle = dlopen(NULL, RTLD_LAZY);
+        void* handle = jn_dlsym_default;
         if (handle == NULL) {
             /* The process image handle is the only handle this runtime
              * ever needs; failure here means the process is already in

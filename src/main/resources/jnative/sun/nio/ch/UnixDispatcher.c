@@ -1,9 +1,8 @@
 #define _GNU_SOURCE
+#include "jnative_platform.h"
 #include <stdint.h>
 #include <stddef.h>
-#include <unistd.h>
 #include <errno.h>
-#include <sys/socket.h>
 
 #include "jnative_runtime.h"
 

@@ -1,5 +1,5 @@
 #define _GNU_SOURCE
-#include <unistd.h>
+#include "jnative_platform.h"
 
 #include "jnative_runtime.h"
 

@@ -74,6 +74,7 @@
  */
 
 #define _GNU_SOURCE
+#include "jnative_platform.h"
 #include <stdint.h>
 
 #include "jnative_runtime.h"

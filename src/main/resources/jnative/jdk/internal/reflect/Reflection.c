@@ -1,4 +1,5 @@
 #define _GNU_SOURCE
+#include "jnative_platform.h"
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,7 +12,6 @@
 #include <dbghelp.h>
 #pragma comment(lib, "dbghelp.lib")
 #else
-#include <execinfo.h>
 #endif
 
 /* =========================================================================

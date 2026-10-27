@@ -1,14 +1,28 @@
 #define _GNU_SOURCE
+#include "jnative_platform.h"
 #include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
 #include <errno.h>
-#include <unistd.h>
 #include <limits.h>
 #include <dirent.h>
 #include <sys/stat.h>
 
 #include "jnative_runtime.h"
+
+#if defined(_WIN32)
+#include <direct.h>
+#ifndef realpath
+#define realpath(N,R) _fullpath((R),(N),_MAX_PATH)
+#endif
+#endif
+
+#ifndef O_SYNC
+#define O_SYNC 0
+#endif
+#ifndef O_DSYNC
+#define O_DSYNC 0
+#endif
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096

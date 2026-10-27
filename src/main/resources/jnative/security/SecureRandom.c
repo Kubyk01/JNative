@@ -1,8 +1,8 @@
 #define _GNU_SOURCE
+#include "jnative_platform.h"
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
-#include <dlfcn.h>
 
 #include "jnative_runtime.h"
 
@@ -19,9 +19,9 @@
     "fn_sun_security_provider_SecureRandom_engineSetSeed___B_V"
 
 static void* lookup_symbol(const char* name) {
-    void* handle = dlopen(NULL, RTLD_LAZY);
+    void* handle = jn_dlsym_default;
     if (handle == NULL) return NULL;
-    void* sym = dlsym(handle, name);
+    void* sym = jn_dlsym_default( name);
     dlclose(handle);
     return sym;
 }

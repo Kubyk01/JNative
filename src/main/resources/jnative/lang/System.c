@@ -1,3 +1,4 @@
+#include "jnative_platform.h"
 #include <string.h>
 #include <stdint.h>
 #include <time.h>
@@ -191,7 +192,7 @@ int32_t __jnative_fn_java_lang_System_identityHashCode__Ljava_lang_Object__I(voi
 
 int64_t __jnative_fn_java_lang_System_currentTimeMillis___J(void) {
     struct timespec ts;
-    if (clock_gettime(CLOCK_REALTIME, &ts) != 0) {
+    if (jn_now_realtime, &ts) != 0) {
         return (int64_t)0;
     }
     int64_t millis = (int64_t)ts.tv_sec * 1000LL + (int64_t)(ts.tv_nsec / 1000000LL);

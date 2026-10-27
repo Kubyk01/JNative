@@ -106,7 +106,6 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <setjmp.h>
-#include <dlfcn.h>
 #include <pthread.h>
 
 #include "jnative_runtime.h"
