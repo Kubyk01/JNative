@@ -27,12 +27,13 @@
 #include "jnative_runtime.h"
 
 /* ============================================================================
- *  Externs for the FileDispatcherImpl versions of each inherited native.
- *  These symbols are defined in FileDispatcherImpl.c and are already linked
- *  into the image (they were the focus of the previous fix). The wrappers
- *  below duplicate them under the UnixFileDispatcherImpl mangled name so
- *  that a .ll produced by a Linux analysis still links against a Windows
- *  target.
+ *  Externs for the FileDispatcherImpl functions we forward to.
+ *
+ *  size0 and truncate0 are NOT in this list: their JDK 21 signatures differ
+ *  between the two classes (return int on both, but FileDispatcherImpl's
+ *  current C implementation returns long). Rather than depend on a cast
+ *  through a possibly-mismatched extern, the two functions are implemented
+ *  standalone in this file below.
  * ========================================================================== */
 
 extern int32_t __jnative_fn_sun_nio_ch_FileDispatcherImpl_read0__Ljava_io_FileDescriptor_JI_I(
@@ -49,12 +50,8 @@ extern int64_t __jnative_fn_sun_nio_ch_FileDispatcherImpl_writev0__Ljava_io_File
         void*, int64_t, int32_t);
 extern int64_t __jnative_fn_sun_nio_ch_FileDispatcherImpl_seek0__Ljava_io_FileDescriptor_J_J(
         void*, int64_t);
-extern int64_t __jnative_fn_sun_nio_ch_FileDispatcherImpl_size0__Ljava_io_FileDescriptor_J(
-        void*);
 extern void    __jnative_fn_sun_nio_ch_FileDispatcherImpl_force0__Ljava_io_FileDescriptor_Z_V(
         void*, int32_t);
-extern int64_t __jnative_fn_sun_nio_ch_FileDispatcherImpl_truncate0__Ljava_io_FileDescriptor_J_J(
-        void*, int64_t);
 extern void    __jnative_fn_sun_nio_ch_FileDispatcherImpl_close0__Ljava_io_FileDescriptor_V(
         void*);
 extern int32_t __jnative_fn_sun_nio_ch_FileDispatcherImpl_dup0__Ljava_io_FileDescriptor_I(
@@ -66,7 +63,7 @@ extern int64_t __jnative_fn_sun_nio_ch_FileDispatcherImpl_transferFrom0__Ljava_i
 extern void    __jnative_fn_sun_nio_ch_FileDispatcherImpl_init0___V(void);
 
 /* ============================================================================
- *  Forwarding wrappers for the inherited natives.
+ *  Forwarding wrappers.
  * ========================================================================== */
 
 int32_t __jnative_fn_sun_nio_ch_UnixFileDispatcherImpl_read0__Ljava_io_FileDescriptor_JI_I(
@@ -111,20 +108,9 @@ int64_t __jnative_fn_sun_nio_ch_UnixFileDispatcherImpl_seek0__Ljava_io_FileDescr
             fdo, offset);
 }
 
-int64_t __jnative_fn_sun_nio_ch_UnixFileDispatcherImpl_size0__Ljava_io_FileDescriptor_J(
-        void* fdo) {
-    return __jnative_fn_sun_nio_ch_FileDispatcherImpl_size0__Ljava_io_FileDescriptor_J(fdo);
-}
-
 void __jnative_fn_sun_nio_ch_UnixFileDispatcherImpl_force0__Ljava_io_FileDescriptor_Z_V(
         void* fdo, int32_t meta) {
     __jnative_fn_sun_nio_ch_FileDispatcherImpl_force0__Ljava_io_FileDescriptor_Z_V(fdo, meta);
-}
-
-int64_t __jnative_fn_sun_nio_ch_UnixFileDispatcherImpl_truncate0__Ljava_io_FileDescriptor_J_J(
-        void* fdo, int64_t size) {
-    return __jnative_fn_sun_nio_ch_FileDispatcherImpl_truncate0__Ljava_io_FileDescriptor_J_J(
-            fdo, size);
 }
 
 void __jnative_fn_sun_nio_ch_UnixFileDispatcherImpl_close0__Ljava_io_FileDescriptor_V(
@@ -156,7 +142,7 @@ void __jnative_fn_sun_nio_ch_UnixFileDispatcherImpl_init0___V(void) {
 }
 
 /* ============================================================================
- *  Local helpers for the Unix-specific natives.
+ *  Local helpers.
  * ========================================================================== */
 
 __attribute__((noreturn))
@@ -185,29 +171,104 @@ static inline int32_t ufdi_fdval(void* fdo) {
 }
 
 /* ============================================================================
- *  Unix-specific natives
+ *  Standalone implementations for the two natives whose JDK 21 signatures
+ *  differ between the two classes.
  * ========================================================================== */
+
+/*
+ * long size0(FileDescriptor fd) throws IOException;
+ *
+ * Mangled name carries TWO underscores before the return `J`: `;)J` yields
+ * `__J` (semicolon and closing parenthesis each mangle to one underscore).
+ * The previous version of this file used `_J` (one underscore), which was
+ * a typo — the linker never matched the symbol the .ll requested.
+ */
+int64_t __jnative_fn_sun_nio_ch_UnixFileDispatcherImpl_size0__Ljava_io_FileDescriptor__J(
+        void* fdo)
+{
+    int32_t fd = ufdi_fdval(fdo);
+#if defined(_WIN32)
+    intptr_t h = _get_osfhandle(fd);
+    if (h == -1) ufdi_throw_io("_get_osfhandle failed");
+    LARGE_INTEGER sz;
+    if (!GetFileSizeEx((HANDLE)h, &sz))
+        ufdi_throw_io("GetFileSizeEx failed");
+    return (int64_t)sz.QuadPart;
+#else
+    struct stat st;
+    if (fstat(fd, &st) < 0) ufdi_throw_io("fstat failed");
+    return (int64_t)st.st_size;
+#endif
+}
+
+/*
+ * int truncate0(FileDescriptor fd, long size) throws IOException;
+ *
+ * JDK 21 returns int (older JDKs returned long). The mangled name ends
+ * `_J_I` — `J` is the size argument, `I` is the return type.
+ */
+int32_t __jnative_fn_sun_nio_ch_UnixFileDispatcherImpl_truncate0__Ljava_io_FileDescriptor_J_I(
+        void* fdo, int64_t size)
+{
+    int32_t fd = ufdi_fdval(fdo);
+#if defined(_WIN32)
+    intptr_t h = _get_osfhandle(fd);
+    if (h == -1) ufdi_throw_io("_get_osfhandle failed");
+    LARGE_INTEGER li;
+    li.QuadPart = size;
+    if (SetFilePointerEx((HANDLE)h, li, NULL, FILE_BEGIN) == 0)
+        ufdi_throw_io("SetFilePointerEx failed");
+    if (!SetEndOfFile((HANDLE)h))
+        ufdi_throw_io("SetEndOfFile failed");
+    return 0;
+#else
+    if (ftruncate(fd, (off_t)size) < 0) ufdi_throw_io("ftruncate failed");
+    return 0;
+#endif
+}
+
+/* ============================================================================
+ *  Unix-specific natives (not in FileDispatcherImpl).
+ * ========================================================================== */
+
+/*
+ * long allocationGranularity0() throws IOException;
+ *
+ * Returns the smallest alignment unit a memory mapping can use.
+ * POSIX: the page size from sysconf(_SC_PAGE_SIZE).
+ * Windows: SYSTEM_INFO.dwAllocationGranularity — the value is 64 KiB on
+ * every x86/x64 Windows build and is what FileChannel.map must round
+ * to.
+ */
+int64_t __jnative_fn_sun_nio_ch_UnixFileDispatcherImpl_allocationGranularity0___J(void)
+{
+#if defined(_WIN32)
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    return (int64_t)si.dwAllocationGranularity;
+#else
+    long ps = sysconf(_SC_PAGE_SIZE);
+    return (ps > 0) ? (int64_t)ps : 4096;
+#endif
+}
+
+/*
+ * int setDirect0(FileDescriptor fd) throws IOException;
+ *
+ * Marks the fd as a direct (native-memory) mapping so subsequent
+ * release0 / unmap0 calls can issue without consulting the channel's
+ * bookkeeping. JDK 21 returns int (older JDKs returned void).
+ */
+int32_t __jnative_fn_sun_nio_ch_UnixFileDispatcherImpl_setDirect0__Ljava_io_FileDescriptor__I(
+        void* fdo)
+{
+    (void)fdo;
+    return 0;
+}
 
 /*
  * long map0(FileDescriptor fd, int prot, long position, long length,
  *           boolean isSync) throws IOException;
- *
- * Maps `length` bytes starting at `position` of the file behind `fd`
- * into the caller's address space and returns the mapped address.
- * `prot` is a bitwise OR of PROT_READ / PROT_WRITE / PROT_EXEC as
- * defined by the caller, and `isSync` selects MAP_SYNC when the
- * platform supports it.
- *
- * Linux / BSD / macOS: implement with mmap. The MAP_SYNC flag is only
- * defined on Linux with a recent enough kernel header, so the
- * fallback below treats "isSync && !MAP_SYNC" as the non-sync case —
- * the caller's sync intent is still honoured as far as the kernel
- * allows.
- *
- * Windows: this native is only reached when the class was compiled
- * against a Unix java.base. On a Windows target the analysis-side
- * UnixFileDispatcherImpl is never loaded at runtime, so throwing here
- * is a defensive measure — the code path is unreachable in practice.
  */
 int64_t __jnative_fn_sun_nio_ch_UnixFileDispatcherImpl_map0__Ljava_io_FileDescriptor_IJJZ_J(
         void* fdo, int32_t prot, int64_t position, int64_t length,
@@ -231,17 +292,13 @@ int64_t __jnative_fn_sun_nio_ch_UnixFileDispatcherImpl_map0__Ljava_io_FileDescri
 }
 
 /*
- * int unmap0(long address, long length);
- *
- * Unmaps the region returned by a previous map0. Returns 0 on success,
- * throws IOException on failure.
+ * int unmap0(long address, long length) throws IOException;
  */
 int32_t __jnative_fn_sun_nio_ch_UnixFileDispatcherImpl_unmap0__JJ_I(
         int64_t address, int64_t length)
 {
 #if defined(_WIN32)
     (void)address; (void)length;
-    /* Nothing was mapped by map0 on Windows; treat as already unmapped. */
     return 0;
 #else
     if (munmap((void*)(uintptr_t)address, (size_t)length) < 0) {
@@ -254,36 +311,16 @@ int32_t __jnative_fn_sun_nio_ch_UnixFileDispatcherImpl_unmap0__JJ_I(
 /*
  * void release0(FileDescriptor fd, long address, long length)
  *     throws IOException;
- *
- * Unmaps the region as part of the channel's cleanup path. On Windows
- * it is a silent no-op because nothing was mapped; on Unix it mirrors
- * unmap0 but is only called from cleanup, where throwing is the
- * documented contract on mmap failure.
  */
 void __jnative_fn_sun_nio_ch_UnixFileDispatcherImpl_release0__Ljava_io_FileDescriptor_JJ_V(
         void* fdo, int64_t address, int64_t length)
 {
 #if defined(_WIN32)
     (void)fdo; (void)address; (void)length;
-    /* no-op — see the comment above */
 #else
     (void)fdo;
     if (munmap((void*)(uintptr_t)address, (size_t)length) < 0) {
         ufdi_throw_io("munmap (release) failed");
     }
 #endif
-}
-
-/*
- * void setDirect0(FileDescriptor fd) throws IOException;
- *
- * Marks the fd as a direct (native-memory) mapping so that subsequent
- * release0 / unmap0 calls can be issued without consulting the
- * channel's own bookkeeping. The JDK's own Unix implementation is a
- * strict no-op; this one is too.
- */
-void __jnative_fn_sun_nio_ch_UnixFileDispatcherImpl_setDirect0__Ljava_io_FileDescriptor__V(
-        void* fdo)
-{
-    (void)fdo;
 }

@@ -8,9 +8,11 @@
 #  include <windows.h>
 #  include <io.h>
 #  include <limits.h>
+#  include <errno.h>
 #else
 #  include <unistd.h>
 #  include <errno.h>
+#  include <fcntl.h>
 #  include <string.h>
 #  include <limits.h>
 #  include <sys/uio.h>
@@ -67,13 +69,6 @@ static inline int32_t io_fdval(void* fdo) {
 
 /*
  * static native int fdVal(FileDescriptor fd);
- *
- * Returns the raw integer file descriptor stored in the FileDescriptor
- * object. Unlike the private helper io_fdval above, this is the JDK-level
- * native that FileChannelImpl.transferToDirectly calls to obtain the
- * target channel's fd. It does NOT throw on an unopened fd — the JDK
- * contract returns whatever value the fd field currently holds, and the
- * caller checks.
  */
 int32_t __jnative_fn_sun_nio_ch_IOUtil_fdVal__Ljava_io_FileDescriptor__I(void* fdo) {
     if (fdo == NULL) __jnative_throw_null_pointer_exception();
@@ -81,11 +76,49 @@ int32_t __jnative_fn_sun_nio_ch_IOUtil_fdVal__Ljava_io_FileDescriptor__I(void* f
 }
 
 /* ============================================================================
- *  iovMax — maximum iovec count for readv / writev.
+ *  configureBlocking — put the fd into or out of non-blocking mode.
  *
- *  POSIX: IOV_MAX from <limits.h> (fallback to sysconf(_SC_IOV_MAX)).
- *  Windows: no scatter-gather primitives exist; 1024 is the value the
- *  JDK's own Windows code uses to size its per-thread array.
+ *  POSIX: flip O_NONBLOCK via fcntl(F_GETFL) / fcntl(F_SETFL).
+ *  Windows: ioctlsocket(FIONBIO) on a socket; non-sockets (pipes,
+ *  console handles, real files) are inherently blocking on Windows and
+ *  cannot be made non-blocking, so the syscall returns WSAENOTSOCK and
+ *  we treat the operation as a silent no-op — matching what HotSpot's
+ *  own IOUtil.c does for the non-socket case.
+ * ========================================================================== */
+
+void __jnative_fn_sun_nio_ch_IOUtil_configureBlocking__Ljava_io_FileDescriptor_Z_V(
+        void* fdo, int32_t blocking)
+{
+    int32_t fd = io_fdval(fdo);
+
+#if defined(_WIN32)
+    u_long mode = blocking ? 0u : 1u;
+    if (ioctlsocket((SOCKET)(uintptr_t)(intptr_t)fd, FIONBIO, &mode)
+            == SOCKET_ERROR) {
+        int32_t e = WSAGetLastError();
+        if (e == WSAENOTSOCK) {
+            /* Non-socket fd (pipe, file, console). Windows cannot toggle
+             * its blocking mode; the caller's request is meaningless. */
+            return;
+        }
+        jn_throw_io_ctx("configureBlocking failed", e);
+    }
+#else
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0) {
+        jn_throw_io_ctx("configureBlocking: fcntl(F_GETFL) failed", errno);
+    }
+    int new_flags = blocking
+        ? (flags & ~O_NONBLOCK)
+        : (flags |  O_NONBLOCK);
+    if (fcntl(fd, F_SETFL, new_flags) < 0) {
+        jn_throw_io_ctx("configureBlocking: fcntl(F_SETFL) failed", errno);
+    }
+#endif
+}
+
+/* ============================================================================
+ *  iovMax — maximum iovec count for readv / writev.
  * ========================================================================== */
 
 int32_t __jnative_fn_sun_nio_ch_IOUtil_iovMax___I(void) {
@@ -103,11 +136,6 @@ int32_t __jnative_fn_sun_nio_ch_IOUtil_iovMax___I(void) {
 
 /* ============================================================================
  *  writevMax — maximum single writev() byte count.
- *
- *  POSIX: SSIZE_MAX.
- *  Windows: INT32_MAX (the value only bounds how much the caller may
- *  request in one call; the sequential loop in writev below returns a
- *  short count if the kernel asks for less).
  * ========================================================================== */
 
 int64_t __jnative_fn_sun_nio_ch_IOUtil_writevMax___J(void) {
@@ -122,10 +150,6 @@ int64_t __jnative_fn_sun_nio_ch_IOUtil_writevMax___J(void) {
 
 /* ============================================================================
  *  Buffer address extraction.
- *
- *  Each element of `bufs[]` is either a byte[] (first word = class
- *  mirror, payload at JAVA_ARR_HDR) or a DirectByteBuffer (first word =
- *  vtable, base = address()J resolved by walking the class hierarchy).
  * ========================================================================== */
 
 static int64_t direct_buffer_address(void* buf) {

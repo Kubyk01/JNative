@@ -256,6 +256,33 @@ int32_t __jnative_fn_sun_nio_ch_Net_isIPv6Available0___Z(void) {
     return cached;
 }
 
+/*
+ * isReusePortAvailable0() boolean
+ *
+ * Whether the platform exposes a SO_REUSEPORT-style socket option that
+ * lets multiple sockets bind to the same address and port with the
+ * kernel load-balancing incoming connections.
+ *
+ * POSIX: true iff the build's <sys/socket.h> defines SO_REUSEPORT
+ *        (Linux, macOS, and the BSDs all do). The old Linux kernel
+ *        requirement was 3.9; any modern distribution satisfies it.
+ * Windows: false. The Windows 10+ SO_REUSE_UNICASTPORT option is not
+ *          equivalent to SO_REUSEPORT — it is single-socket exclusive
+ *          and does not load-balance — and the JDK's own Windows
+ *          implementation of this native returns false unconditionally.
+ */
+int32_t __jnative_fn_sun_nio_ch_Net_isReusePortAvailable0___Z(void) {
+#if defined(_WIN32)
+    return 0;
+#else
+#  if defined(SO_REUSEPORT)
+    return 1;
+#  else
+    return 0;
+#  endif
+#endif
+}
+
 int32_t __jnative_fn_sun_nio_ch_Net_isExclusiveBindAvailable___I(void) {
 #if defined(_WIN32)
     return 1;
@@ -707,12 +734,6 @@ int32_t __jnative_fn_sun_nio_ch_Net_localPort__Ljava_io_FileDescriptor__I(
 /*
  * setIntOption0(FileDescriptor fd, boolean mayNeedConversion,
  *               int level, int opt, int arg, boolean isIPv6) throws IOException;
- *
- * Linux: mayNeedConversion and isIPv6 are ignored (Linux uses the same
- *        IPPROTO_IPV6 constant for both v4 and v6 sockets).
- * Windows: JDK converts a few options between the v4 and v6 levels. This
- *        build ignores those conversions; if a future target needs them,
- *        add the mapping here before the setsockopt call.
  */
 void __jnative_fn_sun_nio_ch_Net_setIntOption0__Ljava_io_FileDescriptor_ZIIIZ_V(
         void* fdo, int32_t may_need_conversion,
