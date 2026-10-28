@@ -243,13 +243,27 @@ public class Compiler implements CompilerPort {
                                     + "`sudo pacman -S lld` on Arch) and try again.");
                 }
 
-                List<Path> gccRuntimeDirs = findGccRuntimeLibDirs(target);
-                for (Path dir : gccRuntimeDirs) {
-                    linkCmd.add("-L" + dir);
-                }
-                Path ehFallbackDir = ensureLibgccEh(target, gccRuntimeDirs, tempDir);
-                if (ehFallbackDir != null) {
-                    linkCmd.add("-L" + ehFallbackDir);
+                // The MinGW-w64 GCC runtime library discovery and the
+                // libgcc_eh.a fallback symlink are ONLY relevant when
+                // cross-compiling to a Windows GNU target. On a native
+                // Linux/macOS build, the host toolchain already resolves
+                // -lgcc and -lgcc_eh through its own search paths; running
+                // findGccRuntimeLibDirs() unconditionally here makes it pick
+                // up the mingw-w64 cross-compiler's libgcc.a (if the
+                // cross-toolchain happens to be installed), add its directory
+                // as -L, and the native ld.lld then tries to link MinGW PE
+                // .o members as if they were ELF relocatables — the "archive
+                // member 'X.o' is neither ET_REL nor LLVM bitcode" warning
+                // storm.
+                if (target.isWindows()) {
+                    List<Path> gccRuntimeDirs = findGccRuntimeLibDirs(target);
+                    for (Path dir : gccRuntimeDirs) {
+                        linkCmd.add("-L" + dir);
+                    }
+                    Path ehFallbackDir = ensureLibgccEh(target, gccRuntimeDirs, tempDir);
+                    if (ehFallbackDir != null) {
+                        linkCmd.add("-L" + ehFallbackDir);
+                    }
                 }
 
                 linkCmd.add("-fuse-ld=lld");
@@ -316,6 +330,10 @@ public class Compiler implements CompilerPort {
     // =====================================================================
 
     private static List<Path> findGccRuntimeLibDirs(TargetPlatform target) {
+        if (!target.isWindows()) {
+            return List.of();
+        }
+
         LinkedHashSet<Path> dirs = new LinkedHashSet<>();
 
         String arch = target.triple().split("-")[0];
@@ -756,34 +774,18 @@ public class Compiler implements CompilerPort {
             linkCmd.add("-Wl,--gc-sections");
             linkCmd.add("-lm");
 
-            // ---- Threading -------------------------------------------------
-            //
-            // Every pthread_* and sched_yield symbol that the runtime and its
-            // per-class native files reference lives in libwinpthread:
-            //
-            //   jnative_runtime.c   : pthread_mutex_lock/unlock/destroy,
-            //                         pthread_mutexattr_*,
-            //                         pthread_cond_wait/init/broadcast/signal,
-            //                         pthread_create/join, pthread_self/equal
-            //   java/lang/Thread.c  : pthread_create/join, pthread_self/equal,
-            //                         pthread_cond_*, jn_recmutex_init
-            //   java/lang/Object.c  : pthread_cond_timedwait64
-            //   Unsafe.c            : pthread_mutex_lock, pthread_cond_timedwait64
-            //
-            // MinGW-w64 ships libwinpthread under both names; -lpthread is the
-            // conventional alias and resolves libpthread.a / libpthread.dll.a.
-            // Without this flag every one of those symbols remains undefined.
-            linkCmd.add("-lpthread");
+            // Link winpthread STATICALLY. -lpthread resolves to the DLL
+            // import library (libpthread.dll.a) by default, which makes the
+            // produced .exe depend on libwinpthread-1.dll being present on
+            // the target. The MinGW-w64 distribution ships the static form
+            // (libwinpthread.a) alongside it; -Bstatic/-Bdynamic forces the
+            // linker to pick the former while leaving the .dll.a forms of
+            // every subsequent system library untouched.
+            linkCmd.add("-Wl,-Bstatic");
+            linkCmd.add("-lwinpthread");
+            linkCmd.add("-Wl,-Bdynamic");
 
-            // ---- DbgHelp ---------------------------------------------------
-            //
-            // jnative_portability_windows.c and the Windows branch of
-            // Reflection.c call SymInitialize / SymFromAddr / SymSetOptions
-            // for stack-unwinding diagnostics. The import library that
-            // resolves those __declspec(dllimport) symbols is libdbghelp.
             linkCmd.add("-ldbghelp");
-
-            // ---- Windows SDK ----------------------------------------------
             linkCmd.add("-lws2_32");
             linkCmd.add("-liphlpapi");
             linkCmd.add("-lpsapi");

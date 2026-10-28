@@ -12,6 +12,7 @@
 #include <dbghelp.h>
 #pragma comment(lib, "dbghelp.lib")
 #else
+#include <execinfo.h>
 #endif
 
 /* =========================================================================

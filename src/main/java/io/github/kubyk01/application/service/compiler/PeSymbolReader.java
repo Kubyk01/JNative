@@ -3,10 +3,9 @@ package io.github.kubyk01.application.service.compiler;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
-import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardOpenOption;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.Set;
@@ -61,16 +60,11 @@ public final class PeSymbolReader {
                             SectionHeader[] sections) {}
 
     private static ByteBuffer readFile(Path file) throws IOException {
-        try (FileChannel ch = FileChannel.open(file, StandardOpenOption.READ)) {
-            long size = ch.size();
-            if (size <= 0 || size > Integer.MAX_VALUE) return null;
-            ByteBuffer buf = ByteBuffer.allocate((int) size);
-            buf.order(ByteOrder.LITTLE_ENDIAN);
-            // todo fix that
-            while (buf.hasRemaining() && ch.read(buf) > 0) { /* keep reading */ }
-            buf.flip();
-            return buf;
-        }
+        byte[] bytes = Files.readAllBytes(file);
+        if (bytes.length == 0) return null;
+        ByteBuffer buf = ByteBuffer.wrap(bytes);
+        buf.order(ByteOrder.LITTLE_ENDIAN);
+        return buf;
     }
 
     private static PeHeader parseHeaders(ByteBuffer b) {

@@ -95,6 +95,22 @@
 typedef int jn_socket_t;
 #define JN_INVALID_SOCKET INVALID_SOCKET
 
+/* ------------------------------------------------------------------------
+ * Portable socklen_t.
+ *
+ * POSIX declares getsockopt/setsockopt/accept/getpeername/getsockname/
+ * recvfrom with `socklen_t *` (unsigned int on Linux), while Winsock2
+ * declares the same functions with `int *`. A single `int optlen` will
+ * therefore trigger -Wpointer-sign on POSIX while being correct on
+ * Windows; the opposite holds for `socklen_t`. jn_socklen_t is the
+ * portable spelling that compiles cleanly on both.
+ * ------------------------------------------------------------------------ */
+#if defined(_WIN32)
+   typedef int jn_socklen_t;
+#else
+   typedef socklen_t jn_socklen_t;
+#endif
+
 /* Windows has no readlink(2); report failure so callers take their
  * existing error path. */
 static inline long jn_readlink(const char* path, char* buf, size_t len) {
@@ -264,6 +280,22 @@ extern void* jn_dlsym_default;
 
 typedef int jn_socket_t;
 #define JN_INVALID_SOCKET (-1)
+
+/* ------------------------------------------------------------------------
+ * Portable socklen_t.
+ *
+ * POSIX declares getsockopt/setsockopt/accept/getpeername/getsockname/
+ * recvfrom with `socklen_t *` (unsigned int on Linux), while Winsock2
+ * declares the same functions with `int *`. A single `int optlen` will
+ * therefore trigger -Wpointer-sign on POSIX while being correct on
+ * Windows; the opposite holds for `socklen_t`. jn_socklen_t is the
+ * portable spelling that compiles cleanly on both.
+ * ------------------------------------------------------------------------ */
+#if defined(_WIN32)
+   typedef int jn_socklen_t;
+#else
+   typedef socklen_t jn_socklen_t;
+#endif
 
 typedef pthread_t       jn_thread_t;
 typedef pthread_mutex_t jn_mutex_t;

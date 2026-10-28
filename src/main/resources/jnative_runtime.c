@@ -33,6 +33,11 @@
 #include <stdarg.h>
 #include <ctype.h>
 
+#if defined(__linux__)
+#  include <link.h>     /* dl_iterate_phdr, struct dl_phdr_info,
+                          ElfW(Phdr), PT_LOAD, PF_W */
+#endif
+
 #include "jnative_runtime.h"
 
 /* ========================================================================
