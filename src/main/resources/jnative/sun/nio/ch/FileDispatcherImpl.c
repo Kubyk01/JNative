@@ -1,239 +1,470 @@
 #define _GNU_SOURCE
+
+#if defined(_WIN32)
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <winsock2.h>
+#  include <windows.h>
+#  include <io.h>
+#else
+#  include <unistd.h>
+#  include <fcntl.h>
+#  include <sys/types.h>
+#  include <sys/stat.h>
+#  include <sys/sendfile.h>
+#  include <sys/uio.h>
+#  include <errno.h>
+#  include <string.h>
+#endif
+
 #include "jnative_platform.h"
 #include <stdint.h>
 #include <stddef.h>
-#include <errno.h>
-#include <sys/sendfile.h>
-#include <sys/types.h>
 
 #include "jnative_runtime.h"
 
-/*
- * sun.nio.ch.FileDispatcherImpl — the zero-copy bulk transfer paths
- * that FileChannel delegates to for file-to-file copies.
- *
- * The class exposes a whole family of natives on the file-channel
- * side, but only two of them are implemented here: the transferTo0 /
- * transferFrom0 pair that maps directly onto the Linux sendfile(2)
- * system call. Every other FileDispatcherImpl method — the
- * read/write/pread/pwrite/readv/writev family, close0, force0, the
- * truncate/size/seek accessors — is implemented in the sibling file
- * jnative/sun/nio/ch/UnixFileDispatcherImpl.c, which shares the same
- * underlying descriptor layout and error convention.
- *
- * This file therefore does not re-declare fd_of / raw_fd: those
- * helpers are private to UnixFileDispatcherImpl.c and this file only
- * needs the raw FD_OFFSET constant that jnative_runtime.h already
- * provides.
- */
+#define IOS_UNAVAILABLE (-2)
+#define IOS_INTERRUPTED (-3)
+
+/* =========== portable FD and pread/pwrite/read/write wrappers =========== */
+
+static inline int32_t fdi_fdval(void* fdo) {
+    if (fdo == NULL) __jnative_throw_null_pointer_exception();
+    int32_t fd = jnative_fd_of(fdo);
+    if (fd < 0) {
+        void* exc = __jnative_construct_exception(
+            "vtable_java_io_IOException", "Stream Closed");
+        __jnative_throw_exception(exc);
+    }
+    return fd;
+}
+
+static inline int fdi_is_would_block(int e) {
+    return e == EAGAIN || e == EWOULDBLOCK;
+}
+
+static inline int fdi_is_interrupted(int e) {
+    return e == EINTR;
+}
 
 /*
- * static native void init0();
+ * Unified error thrower.
  *
- * Called from FileDispatcherImpl.<clinit>. On HotSpot this hook caches
- * the JNI field IDs used by the transfer* family of natives. This
- * runtime accesses every field through its LLVM-computed byte offset
- * and never consults JNI field IDs, so there is nothing to cache.
+ * `code` is a platform-native error value:
+ *   - errno        on POSIX
+ *   - errno        on Windows for CRT functions (_read/_write/_open/...)
+ *   - GetLastError on Windows for Win32 APIs (_get_osfhandle/GetFileSizeEx/...)
+ *
+ * The Windows branch passes `code` to FormatMessageA, which expects a
+ * Win32 error code. For the CRT paths, callers use fdi_throw_io, which
+ * forwards errno. For the Win32-API paths, callers use fdi_throw_win32,
+ * which forwards GetLastError.
+ *
+ * The previous revision called the MSVC-only `_dosmaperr` helper, which
+ * does not exist in MinGW-w64 and produced five
+ * -Wimplicit-function-declaration errors on the Windows build.
  */
+__attribute__((noreturn))
+static void fdi_throw_io_code(const char* what, int32_t code) {
+    char buf[512];
+#if defined(_WIN32)
+    char sysbuf[256];
+    DWORD n = FormatMessageA(
+        FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+        NULL, (DWORD)code, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+        sysbuf, (DWORD)sizeof(sysbuf), NULL);
+    if (n > 0) {
+        while (n > 0 && (sysbuf[n-1] == '\r' || sysbuf[n-1] == '\n'
+                      || sysbuf[n-1] == ' '  || sysbuf[n-1] == '\t')) {
+            sysbuf[--n] = '\0';
+        }
+        snprintf(buf, sizeof(buf), "%s: %s (error %d)",
+                 what ? what : "I/O error", sysbuf, (int)code);
+    } else {
+        snprintf(buf, sizeof(buf), "%s (error %d)",
+                 what ? what : "I/O error", (int)code);
+    }
+#else
+    snprintf(buf, sizeof(buf), "%s: %s (errno %d)",
+             what ? what : "I/O error", strerror((int)code), (int)code);
+#endif
+    void* exc = __jnative_construct_exception("vtable_java_io_IOException", buf);
+    __jnative_throw_exception(exc);
+}
+
+static inline int32_t fdi_errno(void) {
+    return (int32_t)errno;
+}
+
+__attribute__((noreturn))
+static void fdi_throw_io(const char* what) {
+    fdi_throw_io_code(what, fdi_errno());
+}
+
+#if defined(_WIN32)
+__attribute__((noreturn))
+static void fdi_throw_win32(const char* what) {
+    fdi_throw_io_code(what, (int32_t)GetLastError());
+}
+#endif
+
+#if defined(_WIN32)
+static int64_t fdi_pread(int fd, void* buf, size_t n, int64_t off) {
+    if (_lseeki64(fd, off, SEEK_SET) < 0) return -1;
+    return _read(fd, buf, (unsigned int)n);
+}
+static int64_t fdi_pwrite(int fd, const void* buf, size_t n, int64_t off) {
+    if (_lseeki64(fd, off, SEEK_SET) < 0) return -1;
+    return _write(fd, buf, (unsigned int)n);
+}
+static int64_t fdi_read(int fd, void* buf, size_t n) {
+    return _read(fd, buf, (unsigned int)n);
+}
+static int64_t fdi_write(int fd, const void* buf, size_t n) {
+    return _write(fd, buf, (unsigned int)n);
+}
+static int64_t fdi_lseek(int fd, int64_t off, int whence) {
+    return _lseeki64(fd, off, whence);
+}
+static int fdi_close(int fd) { return _close(fd); }
+static int fdi_commit(int fd) { return _commit(fd); }
+#else
+static int64_t fdi_pread(int fd, void* buf, size_t n, int64_t off) {
+    return (int64_t)pread(fd, buf, n, (off_t)off);
+}
+static int64_t fdi_pwrite(int fd, const void* buf, size_t n, int64_t off) {
+    return (int64_t)pwrite(fd, buf, n, (off_t)off);
+}
+static int64_t fdi_read(int fd, void* buf, size_t n) {
+    return (int64_t)read(fd, buf, n);
+}
+static int64_t fdi_write(int fd, const void* buf, size_t n) {
+    return (int64_t)write(fd, buf, n);
+}
+static int64_t fdi_lseek(int fd, int64_t off, int whence) {
+    return (int64_t)lseek(fd, (off_t)off, whence);
+}
+static int fdi_close(int fd) { return close(fd); }
+static int fdi_commit(int fd) {
+#  if defined(__APPLE__)
+    return fcntl(fd, F_FULLFSYNC, 0);
+#  else
+    return fsync(fd);
+#  endif
+}
+#endif
+
+/* =========== init0 =========== */
+
 void __jnative_fn_sun_nio_ch_FileDispatcherImpl_init0___V(void) {
 }
 
-/*
- * =========================================================================
- * Zero-copy bulk transfer between two file descriptors.
- *
- * The JDK's FileChannel offers two directions, and the underlying
- * dispatcher declares a native for each:
- *
- *   transferTo0  (FileDescriptor src, long position, long count,
- *                 FileDescriptor dst, boolean isTransferTo)
- *       -> long
- *
- *   transferFrom0(FileDescriptor src, FileDescriptor dst,
- *                 long position, long count, boolean isTransferTo)
- *       -> long
- *
- * Both end up as a single sendfile(2) call on Linux:
- *
- *     ssize_t sendfile(int out_fd, int in_fd, off_t *offset,
- *                      size_t count);
- *
- * `out_fd` is the destination, `in_fd` is the source. The `offset`
- * argument is the byte position in `in_fd` from which the transfer
- * begins. The Java API uses `position < 0` to mean "start at the
- * current file position and advance it as bytes are transferred";
- * passing NULL as the offset argument gives exactly that behaviour. A
- * non-negative `position` is a byte offset within the source that must
- * be honoured without disturbing the source's file pointer — sendfile
- * does that when a valid offset pointer is supplied.
- *
- * `count` is a Java long, but sendfile caps a single call at
- * approximately 0x7ffff000 bytes on Linux (the value is derived from
- * the maximum size of a single read/write transaction the kernel will
- * accept). The caller loops until it has moved every requested byte;
- * we clamp here so an oversized count does not cause sendfile to
- * return EINVAL.
- *
- * EINTR is retried transparently, so a signal delivered during the
- * kernel-side copy does not surface as a spurious IOException to the
- * Java caller.
- *
- * Any hard error (EBADF, EINVAL, ENOMEM, a closed descriptor) is
- * reported through the generic throw helper, which the Java side's
- * `catch (IOException x)` block turns into the appropriate exception.
- * The return value is the number of bytes actually transferred, which
- * the Java layer accumulates across loop iterations.
- * =========================================================================
- */
+/* =========== read0 / write0 =========== */
 
-/*
- * The maximum number of bytes that a single sendfile(2) call will
- * accept on Linux. The exact limit is derived from MAX_RW_COUNT and
- * the size of a single read/write transaction the kernel can service
- * atomically; 0x7ffff000 is the value the reference JDK itself uses
- * and is comfortably below every kernel version's real cap.
- */
-#define TRANSFER_MAX (0x7ffff000L)
-
-/*
- * static native long transferTo0(FileDescriptor src,
- *                                long position,
- *                                long count,
- *                                FileDescriptor dst,
- *                                boolean isTransferTo);
- *
- * Transfer `count` bytes starting at `position` in `src` into `dst`.
- * The argument order matches the JDK's own declaration on every
- * platform; the trailing boolean is informational and unused by the
- * native body — it exists so that a single native signature can serve
- * both FileChannel.transferTo and FileChannel.transferFrom on some
- * JDK versions.
- */
-int64_t __jnative_fn_sun_nio_ch_FileDispatcherImpl_transferTo0__Ljava_io_FileDescriptor_JJLjava_io_FileDescriptor_Z_J(
-        void* src_fd_obj, int64_t position, int64_t count,
-        void* dst_fd_obj, int32_t isTransferTo)
+int32_t __jnative_fn_sun_nio_ch_FileDispatcherImpl_read0__Ljava_io_FileDescriptor_JI_I(
+        void* fdo, int64_t address, int32_t len)
 {
-    (void)isTransferTo;
+    int fd = fdi_fdval(fdo);
+    void* buf = (void*)(intptr_t)address;
 
-    if (src_fd_obj == NULL || dst_fd_obj == NULL) {
-        __jnative_throw_null_pointer_exception();
-        return 0;
-    }
-
-    int32_t src_fd = *(int32_t*)((char*)src_fd_obj + FD_OFFSET);
-    int32_t dst_fd = *(int32_t*)((char*)dst_fd_obj + FD_OFFSET);
-
-    if (src_fd < 0 || dst_fd < 0) {
-        __jnative_throw_exception(NULL);
-        return 0;
-    }
-
-    if (count < 0) {
-        __jnative_throw_exception(NULL);
-        return 0;
-    }
-    if (count == 0) {
-        return 0;
-    }
-
-    /*
-     * Clamp to the maximum single-call size that Linux's sendfile will
-     * accept. The Java layer loops until `count` bytes have been
-     * transferred, so this clamp does not change the total amount the
-     * caller sees.
-     */
-    size_t nbytes = (size_t)count;
-    if (nbytes > (size_t)TRANSFER_MAX) {
-        nbytes = (size_t)TRANSFER_MAX;
-    }
-
-    off_t  off_storage = (off_t)position;
-    off_t* off_ptr = (position < 0) ? NULL : &off_storage;
-
-    ssize_t n;
+    int64_t n;
     do {
-        n = sendfile(dst_fd, src_fd, off_ptr, nbytes);
-    } while (n < 0 && errno == EINTR);
+        n = fdi_read(fd, buf, (size_t)len);
+    } while (n < 0 && fdi_is_interrupted(fdi_errno()));
 
     if (n < 0) {
-        __jnative_throw_exception(NULL);
-        return 0;
+        if (fdi_is_would_block(fdi_errno())) return IOS_UNAVAILABLE;
+        fdi_throw_io("read0 failed");
+    }
+    return (int32_t)n;
+}
+
+int32_t __jnative_fn_sun_nio_ch_FileDispatcherImpl_write0__Ljava_io_FileDescriptor_JI_I(
+        void* fdo, int64_t address, int32_t len)
+{
+    int fd = fdi_fdval(fdo);
+    void* buf = (void*)(intptr_t)address;
+
+    int64_t n;
+    do {
+        n = fdi_write(fd, buf, (size_t)len);
+    } while (n < 0 && fdi_is_interrupted(fdi_errno()));
+
+    if (n < 0) {
+        if (fdi_is_would_block(fdi_errno())) return IOS_UNAVAILABLE;
+        fdi_throw_io("write0 failed");
+    }
+    return (int32_t)n;
+}
+
+/* =========== pread0 / pwrite0 =========== */
+
+int32_t __jnative_fn_sun_nio_ch_FileDispatcherImpl_pread0__Ljava_io_FileDescriptor_JIJ_I(
+        void* fdo, int64_t address, int32_t len, int64_t position)
+{
+    int fd = fdi_fdval(fdo);
+    void* buf = (void*)(intptr_t)address;
+
+    int64_t n;
+    do {
+        n = fdi_pread(fd, buf, (size_t)len, position);
+    } while (n < 0 && fdi_is_interrupted(fdi_errno()));
+
+    if (n < 0) {
+        if (fdi_is_would_block(fdi_errno())) return IOS_UNAVAILABLE;
+        fdi_throw_io("pread0 failed");
+    }
+    return (int32_t)n;
+}
+
+int32_t __jnative_fn_sun_nio_ch_FileDispatcherImpl_pwrite0__Ljava_io_FileDescriptor_JIJ_I(
+        void* fdo, int64_t address, int32_t len, int64_t position)
+{
+    int fd = fdi_fdval(fdo);
+    void* buf = (void*)(intptr_t)address;
+
+    int64_t n;
+    do {
+        n = fdi_pwrite(fd, buf, (size_t)len, position);
+    } while (n < 0 && fdi_is_interrupted(fdi_errno()));
+
+    if (n < 0) {
+        if (fdi_is_would_block(fdi_errno())) return IOS_UNAVAILABLE;
+        fdi_throw_io("pwrite0 failed");
+    }
+    return (int32_t)n;
+}
+
+/* =========== readv0 / writev0 =========== */
+
+#if defined(_WIN32)
+int64_t __jnative_fn_sun_nio_ch_FileDispatcherImpl_readv0__Ljava_io_FileDescriptor_JI_J(
+        void* fdo, int64_t address, int32_t len)
+{
+    (void)fdo; (void)address; (void)len;
+    fdi_throw_io("readv0 not supported on this platform");
+}
+int64_t __jnative_fn_sun_nio_ch_FileDispatcherImpl_writev0__Ljava_io_FileDescriptor_JI_J(
+        void* fdo, int64_t address, int32_t len)
+{
+    (void)fdo; (void)address; (void)len;
+    fdi_throw_io("writev0 not supported on this platform");
+}
+#else
+int64_t __jnative_fn_sun_nio_ch_FileDispatcherImpl_readv0__Ljava_io_FileDescriptor_JI_J(
+        void* fdo, int64_t address, int32_t len)
+{
+    int fd = fdi_fdval(fdo);
+    struct iovec* iov = (struct iovec*)(intptr_t)address;
+    ssize_t n = readv(fd, iov, len);
+    if (n < 0) {
+        if (fdi_is_would_block(errno)) return (int64_t)IOS_UNAVAILABLE;
+        if (fdi_is_interrupted(errno)) return (int64_t)IOS_INTERRUPTED;
+        fdi_throw_io("readv failed");
     }
     return (int64_t)n;
 }
-
-/*
- * static native long transferFrom0(FileDescriptor src,
- *                                  FileDescriptor dst,
- *                                  long position,
- *                                  long count,
- *                                  boolean isTransferTo);
- *
- * FileChannel.transferFrom(src, position, count, dst) calls this with
- * (dst, src, position, count, false) after swapping its own argument
- * order; FileChannel.transferTo uses the transferTo0 entry point
- * above. The first argument is therefore always the *destination* and
- * the second is always the *source*, regardless of which direction
- * the Java caller invoked.
- *
- * The remaining logic is identical to transferTo0 — the same sendfile
- * call, the same clamping, the same EINTR retry, the same throw helper
- * on hard errors. The two entry points are kept separate rather than
- * sharing a single body because their argument orders differ and
- * dispatching between them at runtime would only obscure the mapping
- * between the Java declaration and the C definition.
- */
-int64_t __jnative_fn_sun_nio_ch_FileDispatcherImpl_transferFrom0__Ljava_io_FileDescriptor_Ljava_io_FileDescriptor_JJZ_J(
-        void* src_fd_obj, void* dst_fd_obj,
-        int64_t position, int64_t count,
-        int32_t isTransferTo)
+int64_t __jnative_fn_sun_nio_ch_FileDispatcherImpl_writev0__Ljava_io_FileDescriptor_JI_J(
+        void* fdo, int64_t address, int32_t len)
 {
-    (void)isTransferTo;
-
-    if (src_fd_obj == NULL || dst_fd_obj == NULL) {
-        __jnative_throw_null_pointer_exception();
-        return 0;
-    }
-
-    /*
-     * Note the deliberate reversal: the first parameter is the
-     * destination, the second is the source, matching the argument
-     * order that FileChannel.transferFrom passes through. The local
-     * names below reflect the actual direction of data flow, not the
-     * position of the arguments in the C signature.
-     */
-    int32_t dst_fd = *(int32_t*)((char*)dst_fd_obj + FD_OFFSET);
-    int32_t src_fd = *(int32_t*)((char*)src_fd_obj + FD_OFFSET);
-
-    if (src_fd < 0 || dst_fd < 0) {
-        __jnative_throw_exception(NULL);
-        return 0;
-    }
-
-    if (count < 0) {
-        __jnative_throw_exception(NULL);
-        return 0;
-    }
-    if (count == 0) {
-        return 0;
-    }
-
-    size_t nbytes = (size_t)count;
-    if (nbytes > (size_t)TRANSFER_MAX) {
-        nbytes = (size_t)TRANSFER_MAX;
-    }
-
-    off_t  off_storage = (off_t)position;
-    off_t* off_ptr = (position < 0) ? NULL : &off_storage;
-
-    ssize_t n;
-    do {
-        n = sendfile(dst_fd, src_fd, off_ptr, nbytes);
-    } while (n < 0 && errno == EINTR);
-
+    int fd = fdi_fdval(fdo);
+    struct iovec* iov = (struct iovec*)(intptr_t)address;
+    ssize_t n = writev(fd, iov, len);
     if (n < 0) {
-        __jnative_throw_exception(NULL);
-        return 0;
+        if (fdi_is_would_block(errno)) return (int64_t)IOS_UNAVAILABLE;
+        if (fdi_is_interrupted(errno)) return (int64_t)IOS_INTERRUPTED;
+        fdi_throw_io("writev failed");
     }
     return (int64_t)n;
+}
+#endif
+
+/* =========== seek0 =========== */
+
+int64_t __jnative_fn_sun_nio_ch_FileDispatcherImpl_seek0__Ljava_io_FileDescriptor_J_J(
+        void* fdo, int64_t offset)
+{
+    int fd = fdi_fdval(fdo);
+    int64_t p = fdi_lseek(fd, offset, SEEK_SET);
+    if (p < 0) fdi_throw_io("lseek failed");
+    return p;
+}
+
+/* =========== size0 =========== */
+
+int64_t __jnative_fn_sun_nio_ch_FileDispatcherImpl_size0__Ljava_io_FileDescriptor_J(
+        void* fdo)
+{
+    int fd = fdi_fdval(fdo);
+#if defined(_WIN32)
+    intptr_t h = _get_osfhandle(fd);
+    if (h == -1) fdi_throw_win32("_get_osfhandle failed");
+    LARGE_INTEGER sz;
+    if (!GetFileSizeEx((HANDLE)h, &sz))
+        fdi_throw_win32("GetFileSizeEx failed");
+    return (int64_t)sz.QuadPart;
+#else
+    struct stat st;
+    if (fstat(fd, &st) < 0) fdi_throw_io("fstat failed");
+    return (int64_t)st.st_size;
+#endif
+}
+
+/* =========== force0 =========== */
+
+void __jnative_fn_sun_nio_ch_FileDispatcherImpl_force0__Ljava_io_FileDescriptor_Z_V(
+        void* fdo, int32_t metadata)
+{
+    int fd = fdi_fdval(fdo);
+    (void)metadata;
+    if (fdi_commit(fd) != 0) fdi_throw_io("fsync failed");
+}
+
+/* =========== truncate0 =========== */
+
+int64_t __jnative_fn_sun_nio_ch_FileDispatcherImpl_truncate0__Ljava_io_FileDescriptor_J_J(
+        void* fdo, int64_t size)
+{
+    int fd = fdi_fdval(fdo);
+#if defined(_WIN32)
+    intptr_t h = _get_osfhandle(fd);
+    if (h == -1) fdi_throw_win32("_get_osfhandle failed");
+    LARGE_INTEGER li;
+    li.QuadPart = size;
+    if (SetFilePointerEx((HANDLE)h, li, NULL, FILE_BEGIN) == 0)
+        fdi_throw_win32("SetFilePointerEx failed");
+    if (!SetEndOfFile((HANDLE)h))
+        fdi_throw_win32("SetEndOfFile failed");
+    return size;
+#else
+    if (ftruncate(fd, (off_t)size) < 0) fdi_throw_io("ftruncate failed");
+    return size;
+#endif
+}
+
+/* =========== close0 =========== */
+
+void __jnative_fn_sun_nio_ch_FileDispatcherImpl_close0__Ljava_io_FileDescriptor_V(
+        void* fdo)
+{
+    int fd = fdi_fdval(fdo);
+    fdi_close(fd);
+    *(int32_t*)((char*)fdo + FD_OFFSET) = -1;
+}
+
+/* =========== dup0 =========== */
+
+int32_t __jnative_fn_sun_nio_ch_FileDispatcherImpl_dup0__Ljava_io_FileDescriptor_I(
+        void* fdo)
+{
+    int fd = fdi_fdval(fdo);
+#if defined(_WIN32)
+    int nd = _dup(fd);
+    if (nd < 0) fdi_throw_io("_dup failed");
+    return nd;
+#else
+    int nd = dup(fd);
+    if (nd < 0) fdi_throw_io("dup failed");
+    return nd;
+#endif
+}
+
+/* =========== transferTo0 =========== */
+
+int64_t __jnative_fn_sun_nio_ch_FileDispatcherImpl_transferTo0__Ljava_io_FileDescriptor_JJLjava_io_FileDescriptor_Z_J(
+        void* src_fdo, int64_t position, int64_t count,
+        void* dst_fdo, int32_t append)
+{
+    int src = fdi_fdval(src_fdo);
+    int dst = fdi_fdval(dst_fdo);
+
+    if (append) {
+        if (fdi_lseek(dst, 0, SEEK_END) < 0) {
+            fdi_throw_io("lseek dst to end failed");
+        }
+    }
+
+#if !defined(_WIN32)
+    off_t off = (off_t)position;
+    ssize_t sn = sendfile(dst, src, &off, (size_t)count);
+    if (sn >= 0) return (int64_t)sn;
+    if (errno != EINVAL && errno != ENOSYS && errno != EOPNOTSUPP) {
+        fdi_throw_io("sendfile failed");
+    }
+#endif
+
+    char buf[65536];
+    int64_t total = 0;
+    while (total < count) {
+        size_t chunk = (size_t)((count - total < (int64_t)sizeof(buf))
+                                ? (count - total) : (int64_t)sizeof(buf));
+
+        int64_t nr;
+        do {
+            nr = fdi_pread(src, buf, chunk, position + total);
+        } while (nr < 0 && fdi_is_interrupted(fdi_errno()));
+        if (nr < 0) fdi_throw_io("pread src failed");
+        if (nr == 0) break;
+
+        int64_t written = 0;
+        while (written < nr) {
+            int64_t nw;
+            do {
+                nw = fdi_write(dst, buf + written, (size_t)(nr - written));
+            } while (nw < 0 && fdi_is_interrupted(fdi_errno()));
+            if (nw < 0) fdi_throw_io("write dst failed");
+            if (nw == 0) return total;
+            written += nw;
+        }
+        total += nr;
+    }
+    return total;
+}
+
+/* =========== transferFrom0 =========== */
+
+int64_t __jnative_fn_sun_nio_ch_FileDispatcherImpl_transferFrom0__Ljava_io_FileDescriptor_Ljava_io_FileDescriptor_JJZ_J(
+        void* src_fdo, void* dst_fdo, int64_t position, int64_t count,
+        int32_t append)
+{
+    int src = fdi_fdval(src_fdo);
+    int dst = fdi_fdval(dst_fdo);
+
+    if (append) {
+        if (fdi_lseek(dst, 0, SEEK_END) < 0) {
+            fdi_throw_io("lseek dst to end failed");
+        }
+    } else {
+        if (fdi_lseek(dst, position, SEEK_SET) < 0) {
+            fdi_throw_io("lseek dst failed");
+        }
+    }
+
+    char buf[65536];
+    int64_t total = 0;
+    while (total < count) {
+        size_t chunk = (size_t)((count - total < (int64_t)sizeof(buf))
+                                ? (count - total) : (int64_t)sizeof(buf));
+
+        int64_t nr;
+        do {
+            nr = fdi_read(src, buf, chunk);
+        } while (nr < 0 && fdi_is_interrupted(fdi_errno()));
+        if (nr < 0) fdi_throw_io("read src failed");
+        if (nr == 0) break;
+
+        int64_t written = 0;
+        while (written < nr) {
+            int64_t nw;
+            do {
+                nw = fdi_write(dst, buf + written, (size_t)(nr - written));
+            } while (nw < 0 && fdi_is_interrupted(fdi_errno()));
+            if (nw < 0) fdi_throw_io("write dst failed");
+            if (nw == 0) return total;
+            written += nw;
+        }
+        total += nr;
+    }
+    return total;
 }

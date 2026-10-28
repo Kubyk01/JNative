@@ -1,55 +1,49 @@
 /*
- * sun.nio.ch.EPoll — Linux-only epoll bridge.
+ * sun.nio.ch.EPoll — Linux epoll bridge with non-Linux fallbacks.
  *
- * The class is part of the JDK's Linux NIO selector implementation
- * (EPollSelectorImpl). On Windows the equivalent selector is
- * WindowsSelectorImpl, which uses WSAEventSelect + select(2) and has
- * no native EPoll dependency. Therefore this translation unit is
- * compiled only when the target is Linux.
+ * The real implementation is Linux-only: it calls epoll_create1,
+ * epoll_ctl, epoll_wait and uses struct epoll_event, none of which
+ * exist on Windows. But the Linux analysis that produced the .ll
+ * files in this build pulled sun/nio/ch/EPoll into the reachability
+ * closure, so the emitted IR references the mangled natives
+ * unconditionally. On a Windows target those symbols must therefore
+ * still exist — otherwise the link fails with "undefined symbol:
+ * __jnative_fn_sun_nio_ch_EPoll_*".
  *
- * The guard is the correct fix for the build failure: the symbols
- * epoll_create1, epoll_ctl, epoll_wait and the struct epoll_event are
- * glibc/Linux kernel interfaces that do not exist on Windows. Compiling
- * this file on a Windows target is not a portability problem — the
- * code is simply not part of the Windows image.
+ * The fix keeps the real implementation behind #if defined(__linux__)
+ * and provides stubs in the #else branch. The stubs are never reached
+ * at runtime on Windows because EPollSelectorImpl / EPollPoller are
+ * not loaded there; they exist purely so the linker can resolve the
+ * call sites that came from the Linux-host analysis.
+ *
+ * The eventSize / eventsOffset / dataOffset stubs return the Linux
+ * x86_64 values. Those three natives ARE called at run time, from
+ * EPoll.<clinit>, which is scheduled eagerly by the JNative runtime
+ * regardless of target platform. Returning a valid number there lets
+ * the class initializer complete; the value itself is never consumed
+ * on Windows.
  */
-
-#if defined(__linux__)
 
 #include "jnative_platform.h"
 #include <stdint.h>
 #include <stddef.h>
-#include <unistd.h>
-#include <sys/epoll.h>
-#include <errno.h>
+
+#if defined(__linux__)
+#  include <unistd.h>
+#  include <sys/epoll.h>
+#  include <errno.h>
+#endif
 
 #include "jnative_runtime.h"
 
-/*
- * EPoll.java constants:
- *
- *     EPOLL_CTL_ADD = 1
- *     EPOLL_CTL_DEL = 2
- *     EPOLL_CTL_MOD = 3
- *
- *     EPOLLIN  = 0x001
- *     EPOLLOUT = 0x004
- *     EPOLLERR = 0x008
- *     EPOLLHUP = 0x010
- *
- * EPOLLONESHOT is a JDK-internal flag (1 << 30) that the selector uses
- * for one-shot registrations; it is passed through verbatim to
- * epoll_ctl.
- */
-#define JNATIVE_EPOLLONESHOT (1u << 30)
+#if defined(__linux__)
 
 /* -------------------------------------------------------------------------
- * static native int epollCreate();
+ * static native int create();
  *
  * Creates a new epoll instance with close-on-exec set.
- * Returns the epoll file descriptor, or throws IOException on failure.
  * ----------------------------------------------------------------------- */
-int32_t __jnative_fn_sun_nio_ch_EPoll_epollCreate___I(void)
+int32_t __jnative_fn_sun_nio_ch_EPoll_create___I(void)
 {
     int fd = epoll_create1(EPOLL_CLOEXEC);
     if (fd < 0) {
@@ -59,19 +53,14 @@ int32_t __jnative_fn_sun_nio_ch_EPoll_epollCreate___I(void)
 }
 
 /* -------------------------------------------------------------------------
- * static native int epollCtl(int epfd, int opcode, int fd, int events);
- *
- * Adds, modifies or removes a file descriptor from the epoll set.
- * Returns 0 on success, or throws IOException on failure.
+ * static native int ctl(int epfd, int opcode, int fd, int events);
  * ----------------------------------------------------------------------- */
-int32_t __jnative_fn_sun_nio_ch_EPoll_epollCtl__IIII_I(
+int32_t __jnative_fn_sun_nio_ch_EPoll_ctl__IIII_I(
         int32_t epfd, int32_t opcode, int32_t fd, int32_t events)
 {
     struct epoll_event ev;
-    /* The kernel ignores the event payload on EPOLL_CTL_DEL; the field
-     * is initialised anyway so that the struct is fully defined. */
-    ev.events   = (uint32_t)events;
-    ev.data.fd  = fd;
+    ev.events  = (uint32_t)events;
+    ev.data.fd = fd;
 
     int rc = epoll_ctl(epfd, opcode, fd, &ev);
     if (rc < 0) {
@@ -81,38 +70,28 @@ int32_t __jnative_fn_sun_nio_ch_EPoll_epollCtl__IIII_I(
 }
 
 /* -------------------------------------------------------------------------
- * static native int epollWait(int epfd, long pollArray, int timeout);
+ * static native int wait(int epfd, long pollAddress,
+ *                        int numfds, int timeout) throws IOException;
  *
- * Waits for events on the epoll instance.
- *
- * `pollArray` is the address of a native-allocated array of
- * epoll_event structs (allocated by EPollArrayWrapper in the JDK).
- * Each entry holds a 32-bit `events` field followed by a 32-bit
- * `data.fd` field; that is exactly the layout of struct epoll_event
- * on Linux for the `EPOLL_CTL_ADD`/`EPOLL_CTL_MOD` path.
- *
- * Returns the number of ready descriptors, 0 on timeout, or throws
- * IOException on failure.
+ * `pollAddress` points at a native buffer of `numfds` struct epoll_event
+ * entries. The kernel writes at most `numfds` ready events into it. The
+ * caller (EPollArrayWrapper) allocates that buffer once and passes the
+ * count through unchanged; we do not invent a MAX_EVENTS constant.
  * ----------------------------------------------------------------------- */
-int32_t __jnative_fn_sun_nio_ch_EPoll_epollWait__IJI_I(
-        int32_t epfd, int64_t pollArray, int32_t timeout)
+int32_t __jnative_fn_sun_nio_ch_EPoll_wait__IJII_I(
+        int32_t epfd, int64_t pollAddress, int32_t numfds, int32_t timeout)
 {
-    struct epoll_event* events = (struct epoll_event*)(intptr_t)pollArray;
+    struct epoll_event* events = (struct epoll_event*)(intptr_t)pollAddress;
     if (events == NULL) {
         __jnative_throw_null_pointer_exception();
     }
-
-    /*
-     * The JDK's EPollArrayWrapper allocates a buffer large enough to
-     * hold `NUM_EPOLL_EVENTS` entries (currently 256). The kernel
-     * writes at most that many ready events; the exact constant is
-     * defined in EPollArrayWrapper.java and must match here.
-     */
-    const int MAX_EVENTS = 256;
+    if (numfds <= 0) {
+        return 0;
+    }
 
     int n;
     do {
-        n = epoll_wait(epfd, events, MAX_EVENTS, timeout);
+        n = epoll_wait(epfd, events, numfds, timeout);
     } while (n < 0 && errno == EINTR);
 
     if (n < 0) {
@@ -122,39 +101,83 @@ int32_t __jnative_fn_sun_nio_ch_EPoll_epollWait__IJI_I(
 }
 
 /* -------------------------------------------------------------------------
- * static native int epollSize();
- *
- * Returns sizeof(struct epoll_event), which the JDK uses to size the
- * native poll buffer. The value is platform-specific and is exposed
- * through the class's static final field.
+ * static native int eventSize();
  * ----------------------------------------------------------------------- */
-int32_t __jnative_fn_sun_nio_ch_EPoll_epollSize___I(void)
+int32_t __jnative_fn_sun_nio_ch_EPoll_eventSize___I(void)
 {
     return (int32_t)sizeof(struct epoll_event);
 }
 
 /* -------------------------------------------------------------------------
- * static native int epollDataOffset();
- *
- * Returns the byte offset of the `data` field inside struct
- * epoll_event. The JDK stores the file descriptor in that field and
- * reads it back through Unsafe, so the offset must be the kernel's
- * actual offset, not a compile-time guess.
+ * static native int eventsOffset();
  * ----------------------------------------------------------------------- */
-int32_t __jnative_fn_sun_nio_ch_EPoll_epollDataOffset___I(void)
+int32_t __jnative_fn_sun_nio_ch_EPoll_eventsOffset___I(void)
+{
+    return (int32_t)offsetof(struct epoll_event, events);
+}
+
+/* -------------------------------------------------------------------------
+ * static native int dataOffset();
+ * ----------------------------------------------------------------------- */
+int32_t __jnative_fn_sun_nio_ch_EPoll_dataOffset___I(void)
 {
     return (int32_t)offsetof(struct epoll_event, data);
 }
 
-/* -------------------------------------------------------------------------
- * static native int epollEventsOffset();
+#else /* !__linux__ */
+
+/*
+ * Non-Linux fallbacks.
  *
- * Returns the byte offset of the `events` field inside struct
- * epoll_event. Used by the JDK to read the ready-event mask.
- * ----------------------------------------------------------------------- */
-int32_t __jnative_fn_sun_nio_ch_EPoll_epollEventsOffset___I(void)
+ * These symbols exist only because the Linux analysis that produced the
+ * .ll files in this build emitted references to them unconditionally.
+ * On Windows the JDK uses WindowsSelectorImpl (WSAEventSelect + select)
+ * and EPollSelectorImpl / EPollPoller are never loaded, so create / ctl
+ * / wait are never reached at run time.
+ *
+ * The three offset accessors ARE reached, from EPoll.<clinit>, which
+ * the JNative runtime schedules eagerly on every platform. They return
+ * the Linux x86_64 layout (sizeof = 12, events @ 0, data @ 4). The
+ * values are never consulted on Windows — EPoll itself is unused —
+ * but returning a real number lets the class initializer complete
+ * instead of aborting the whole program with an unhandled exception.
+ */
+
+int32_t __jnative_fn_sun_nio_ch_EPoll_create___I(void)
 {
-    return (int32_t)offsetof(struct epoll_event, events);
+    __jnative_throw_exception(NULL);
+    return -1;
+}
+
+int32_t __jnative_fn_sun_nio_ch_EPoll_ctl__IIII_I(
+        int32_t epfd, int32_t opcode, int32_t fd, int32_t events)
+{
+    (void)epfd; (void)opcode; (void)fd; (void)events;
+    __jnative_throw_exception(NULL);
+    return -1;
+}
+
+int32_t __jnative_fn_sun_nio_ch_EPoll_wait__IJII_I(
+        int32_t epfd, int64_t pollAddress, int32_t numfds, int32_t timeout)
+{
+    (void)epfd; (void)pollAddress; (void)numfds; (void)timeout;
+    __jnative_throw_exception(NULL);
+    return -1;
+}
+
+int32_t __jnative_fn_sun_nio_ch_EPoll_eventSize___I(void)
+{
+    return 12;
+}
+
+int32_t __jnative_fn_sun_nio_ch_EPoll_eventsOffset___I(void)
+{
+    return 0;
+}
+
+int32_t __jnative_fn_sun_nio_ch_EPoll_dataOffset___I(void)
+{
+    return 4;
 }
 
 #endif /* __linux__ */

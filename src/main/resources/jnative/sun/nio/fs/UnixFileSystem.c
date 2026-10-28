@@ -2,114 +2,92 @@
 #include "jnative_platform.h"
 #include <stdint.h>
 #include <stddef.h>
+#include <stdio.h>
+#include <string.h>
 #include <errno.h>
-#include <sys/types.h>
+
+#if defined(_WIN32)
+#  include <io.h>
+#else
+#  include <unistd.h>
+#  include <sys/types.h>
+#endif
 
 #include "jnative_runtime.h"
 
-/*
- * sun.nio.fs.UnixFileSystem — the last-resort file-copy native.
- *
- * The class inherits almost everything it needs from UnixFileSystem's
- * Java-side implementation, but the buffered-copy fallback that
- * LinuxFileSystem.copyFile reaches when the kernel's copy_file_range(2)
- * path is unavailable is implemented natively here. It is a plain
- * pread(2)/write(2) loop that reads the source in fixed-size chunks and
- * writes each chunk to the destination.
- *
- * The method is declared on UnixFileSystem itself rather than on a
- * per-platform subclass because the buffered fallback is identical on
- * every Unix the JDK supports: the platform-specific parts of copy are
- * the kernel-assisted fast paths, and this one is deliberately dumb.
- */
+#define JN_COPY_BUFSZ 8192
 
 /*
- * static native void bufferedCopy0(int src, int dst, long position,
- *                                  int size, long address)
- *     throws IOException;
+ * Portable pread / pwrite.
  *
- * Copies the source file descriptor `src` to the destination file
- * descriptor `dst`, beginning at byte offset `position` in the source,
- * and continuing until the source reaches end-of-file. The intermediate
- * buffer is a native allocation whose address is `address` and whose
- * capacity is `size` bytes; both are provided by the Java caller (which
- * typically allocates a direct ByteBuffer for the purpose and passes
- * its base address and capacity).
+ * POSIX: native pread(2) / pwrite(2), which perform the seek and the
+ * read/write atomically in one syscall.
  *
- * Why a pread/write loop rather than read/write on a seeked fd:
- *
- *   - pread(2) reads from an explicit offset without touching the
- *     file's stored position. That means the source descriptor's
- *     position is unchanged by this call, which is important because
- *     the Java-side caller may be sharing the descriptor with other
- *     operations that track position through lseek;
- *
- *   - the destination descriptor's own position is not touched either,
- *     because plain write(2) is being used and the caller is expected
- *     to have lseek'd dst to wherever the new data should land. This is
- *     the same contract the JDK's own buffered copy honours: the caller
- *     positions the destination before invoking the native, and the
- *     native is free to write chunks without re-seeking.
- *
- * EINTR is retried transparently at both the read and the write stage,
- * so a signal delivered mid-copy does not surface as a spurious
- * IOException. Any other failure — EBADF, EIO, ENOSPC, a bad user
- * buffer — is routed through the generic throw helper and reaches the
- * Java caller as an IOException.
- *
- * A partial write that returns 0 for a non-zero count is treated as
- * failure: for a regular file, write(2) returning 0 is not a legitimate
- * outcome, and looping on it would hang the copy forever.
+ * Windows: the CRT has no pread / pwrite. The closest equivalent is
+ * _lseeki64 followed by _read / _write. The two-call form is not atomic,
+ * but this file's only caller (copyFile) holds the source and
+ * destination descriptors privately, so no other thread can race with
+ * the seek. Any future caller that needs atomicity must use ReadFile /
+ * WriteFile with an OVERLAPPED offset.
  */
-void __jnative_fn_sun_nio_fs_UnixFileSystem_bufferedCopy0__IIJIJ_V(
-        int32_t src, int32_t dst, int64_t position, int32_t size, int64_t address)
+#if defined(_WIN32)
+static int64_t jn_pread(int fd, void* buf, size_t n, int64_t off) {
+    if (_lseeki64(fd, off, SEEK_SET) < 0) return -1;
+    return _read(fd, buf, (unsigned int)n);
+}
+static int64_t jn_pwrite(int fd, const void* buf, size_t n, int64_t off) {
+    if (_lseeki64(fd, off, SEEK_SET) < 0) return -1;
+    return _write(fd, buf, (unsigned int)n);
+}
+#else
+static int64_t jn_pread(int fd, void* buf, size_t n, int64_t off) {
+    return (int64_t)pread(fd, buf, n, (off_t)off);
+}
+static int64_t jn_pwrite(int fd, const void* buf, size_t n, int64_t off) {
+    return (int64_t)pwrite(fd, buf, n, (off_t)off);
+}
+#endif
+
+__attribute__((noreturn))
+static void jn_throw_io(const char* msg) {
+    void* exc = __jnative_construct_exception(
+        "vtable_java_io_IOException", msg ? msg : "I/O error");
+    __jnative_throw_exception(exc);
+}
+
+/*
+ * copyFile(int src, int dst, long size)
+ *
+ * Copies exactly `size` bytes from the source file descriptor to the
+ * destination file descriptor, using positional reads/writes so neither
+ * descriptor's file pointer is disturbed. Both descriptors must already
+ * be open and (on Windows) must be binary-mode.
+ */
+void __jnative_fn_sun_nio_fs_UnixFileSystem_copyFile__IIJ_V(
+    int32_t src, int32_t dst, int64_t size)
 {
-    if (src < 0 || dst < 0 || address == 0 || size <= 0 || position < 0) {
-        __jnative_throw_exception(NULL);
-        return;
-    }
+    char buf[JN_COPY_BUFSZ];
+    int64_t pos = 0;
+    int64_t remaining = size;
 
-    char* buf = (char*)(intptr_t)address;
-    off_t pos = (off_t)position;
+    while (remaining > 0) {
+        size_t to_read = (remaining < (int64_t)JN_COPY_BUFSZ)
+            ? (size_t)remaining
+            : (size_t)JN_COPY_BUFSZ;
 
-    for (;;) {
-        ssize_t n;
-        do {
-            n = pread(src, buf, (size_t)size, pos);
-        } while (n < 0 && errno == EINTR);
+        int64_t n = jn_pread(src, buf, to_read, pos);
+        if (n < 0) jn_throw_io("pread failed");
+        if (n == 0) break;
 
-        if (n < 0) {
-            __jnative_throw_exception(NULL);
-            return;
-        }
-        if (n == 0) {
-            /* End of source file. Nothing more to copy. */
-            return;
-        }
-
-        ssize_t written = 0;
+        int64_t written = 0;
         while (written < n) {
-            ssize_t w;
-            do {
-                w = write(dst, buf + written, (size_t)(n - written));
-            } while (w < 0 && errno == EINTR);
-
-            if (w < 0) {
-                __jnative_throw_exception(NULL);
-                return;
-            }
-            if (w == 0) {
-                /*
-                 * write(2) returning 0 for a non-zero count on a
-                 * regular file is not a legitimate outcome; treat it
-                 * as failure rather than looping forever.
-                 */
-                __jnative_throw_exception(NULL);
-                return;
-            }
+            int64_t w = jn_pwrite(dst, buf + written,
+                                  (size_t)(n - written), pos + written);
+            if (w < 0) jn_throw_io("pwrite failed");
             written += w;
         }
 
-        pos += (off_t)n;
+        remaining -= n;
+        pos += n;
     }
 }

@@ -8,10 +8,54 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 
+#if defined(_WIN32)
+#  include <io.h>
+#else
+#  include <unistd.h>
+#endif
+
 #include "jnative_runtime.h"
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
+#endif
+
+/*
+ * ============================================================================
+ *  Platform-specific C-runtime aliases.
+ * ============================================================================
+ *
+ * The MinGW C runtime provides the CRT file primitives under names that
+ * are prefixed with an underscore: _open, _write, _lseeki64, _close.
+ * The POSIX names open, write, lseek, close exist in <io.h> as
+ * deprecated aliases on most configurations, but:
+ *
+ *   - not on every UCRT configuration this runtime targets, and
+ *   - lseek is 32-bit on Windows regardless of the name, so using it to
+ *     answer "where is the write pointer relative to SEEK_END" truncates
+ *     at 2 GiB and produces a nonsensical position for any file larger
+ *     than that.
+ *
+ * The correct fix is to route every CRT file operation through the
+ * platform-correct primitive. The macros below are the single source
+ * of truth for that routing; every call site in this file uses them.
+ *
+ *   POSIX   : write    = write,    lseek = lseek   (64-bit off_t on LP64)
+ *   Windows : write    = _write,   lseek = _lseeki64
+ *
+ * The open() call has to be a macro too, because the flags differ
+ * between the two platforms (O_CLOEXEC vs _O_NOINHERIT) and the mode
+ * argument is `mode_t` on POSIX but a small set of _S_I* constants on
+ * Windows.
+ * ========================================================================== */
+#if defined(_WIN32)
+#  define fos_write  _write
+#  define fos_lseek  _lseeki64
+#  define fos_close  _close
+#else
+#  define fos_write  write
+#  define fos_lseek  lseek
+#  define fos_close  close
 #endif
 
 /*
@@ -84,16 +128,66 @@ void __jnative_fn_java_io_FileOutputStream_open0__Ljava_lang_String_Z_V(
                                                   (int32_t)sizeof(path_buf));
     if (path_len < 0) fos_throw_fnf(NULL);
 
+    int fd;
+
+#if defined(_WIN32)
+    /*
+     * Windows: _open with the CRT equivalents of the POSIX flags.
+     *
+     *   _O_WRONLY   -> write-only access
+     *   _O_CREAT    -> create if missing
+     *   _O_TRUNC    -> truncate to zero (when !append)
+     *   _O_APPEND   -> every write is appended to the end of the file
+     *                  (when append)
+     *   _O_NOINHERIT-> the fd is not inherited by child processes,
+     *                  matching POSIX O_CLOEXEC
+     *   _O_BINARY   -> no LF <-> CRLF translation; matches POSIX open()
+     *
+     * The mode argument is a bitmask of _S_IREAD / _S_IWRITE.
+     *
+     * _O_NOINHERIT is the exact behavioural equivalent of O_CLOEXEC:
+     * both ensure that the descriptor is closed in the child across
+     * exec / CreateProcess. The previous revision called `open` with
+     * `O_CLOEXEC` and produced:
+     *
+     *     error: use of undeclared identifier 'O_CLOEXEC'
+     *
+     * because neither the flag nor the <fcntl.h> path that defines it
+     * exists on MinGW.
+     */
+    int flags = _O_WRONLY | _O_CREAT | _O_NOINHERIT | _O_BINARY;
+    if (append) flags |= _O_APPEND;
+    else        flags |= _O_TRUNC;
+
+    fd = _open(path_buf, flags, _S_IREAD | _S_IWRITE);
+#else
+    /*
+     * POSIX: unchanged from the previous revision. O_CLOEXEC keeps
+     * the descriptor private across fork+exec, which is exactly what
+     * the JDK's own FileOutputStream_md.c guarantees.
+     */
     int flags = O_WRONLY | O_CREAT | O_CLOEXEC;
     if (append) flags |= O_APPEND;
     else        flags |= O_TRUNC;
 
-    int fd = open(path_buf, flags, (mode_t)0666);
+    fd = open(path_buf, flags, (mode_t)0666);
+#endif
+
     if (fd < 0) fos_throw_fnf(path_buf);
 
     *(int32_t*)((char*)fd_obj + FD_OFFSET) = fd;
 }
 
+/*
+ * public native void write(int b, boolean append) throws IOException;
+ *
+ * Writes a single byte. When `append` is true the write is positioned
+ * at the end of the file before the byte is committed, matching the
+ * reference implementation's per-write seek. On Windows fos_lseek is
+ * _lseeki64, which handles files larger than 2 GiB correctly; the
+ * POSIX fos_lseek is the native lseek, which is already 64-bit on
+ * every LP64 target this runtime supports.
+ */
 void __jnative_fn_java_io_FileOutputStream_write__IZ_V(
         void* this_fos, int32_t b, int32_t append)
 {
@@ -103,18 +197,35 @@ void __jnative_fn_java_io_FileOutputStream_write__IZ_V(
     if (fd < 0) fos_throw_io("stream closed");
 
     if (append) {
-        if (lseek(fd, 0, SEEK_END) < 0) fos_throw_io("lseek failed");
+        if (fos_lseek(fd, 0, SEEK_END) < 0) fos_throw_io("lseek failed");
     }
 
     uint8_t byte = (uint8_t)b;
-    ssize_t n;
+    int64_t n;
     do {
-        n = write(fd, &byte, 1);
+        n = fos_write(fd, &byte, 1);
     } while (n < 0 && errno == EINTR);
 
     if (n < 0) fos_throw_io("write failed");
 }
 
+/*
+ * public native void writeBytes(byte[] b, int off, int len,
+ *                                boolean append) throws IOException;
+ *
+ * Bulk write. The loop has to tolerate short writes from the kernel
+ * (a partial write of a multi-megabyte buffer is normal for a slow
+ * disk, a full pipe, or a signal), so the byte count is decremented
+ * on each successful iteration until the entire requested range has
+ * been committed.
+ *
+ * The semantics of the short-write loop are identical on both
+ * platforms:
+ *
+ *   POSIX   : write(2) returns the number of bytes actually written,
+ *             which may be less than the requested count.
+ *   Windows : _write returns the same way.
+ */
 void __jnative_fn_java_io_FileOutputStream_writeBytes___BIIZ_V(
         void* this_fos, void* b, int32_t off, int32_t len, int32_t append)
 {
@@ -128,14 +239,14 @@ void __jnative_fn_java_io_FileOutputStream_writeBytes___BIIZ_V(
     if (fd < 0) fos_throw_io("stream closed");
 
     if (append) {
-        if (lseek(fd, 0, SEEK_END) < 0) fos_throw_io("lseek failed");
+        if (fos_lseek(fd, 0, SEEK_END) < 0) fos_throw_io("lseek failed");
     }
 
     const uint8_t* src = (const uint8_t*)b + JAVA_ARR_HDR + off;
     int32_t remaining = len;
 
     while (remaining > 0) {
-        ssize_t n = write(fd, src, (size_t)remaining);
+        int64_t n = fos_write(fd, src, (size_t)remaining);
         if (n < 0) {
             if (errno == EINTR) continue;
             fos_throw_io("write failed");

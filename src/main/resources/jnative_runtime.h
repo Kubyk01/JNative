@@ -916,7 +916,10 @@ JNATIVE_NORETURN extern void __jnative_throw_array_index_out_of_bounds_ctx(
 JNATIVE_NORETURN extern void __jnative_throw_class_cast_exception_ctx(
         const char* caller);
 JNATIVE_NORETURN extern void __jnative_throw_arithmetic_exception_ctx(
-        const char* caller);
+    const char* caller);
+
+JNATIVE_NORETURN extern void __jnative_throw_io_ctx(const char* extra,
+                                                    const char* caller);
 
 JNATIVE_NORETURN extern void __jnative_throw_clone_not_supported_exception(void);
 JNATIVE_NORETURN extern void __jnative_throw_clone_not_supported_exception_ctx(

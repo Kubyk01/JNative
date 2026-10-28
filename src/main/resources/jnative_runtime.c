@@ -1755,6 +1755,45 @@ void __jnative_throw_arithmetic_exception_ctx(const char* caller) {
     __jnative_log_unhandled_exception(exc,
         "java.lang.ArithmeticException", caller, NULL);
 }
+__attribute__((noreturn))
+void __jnative_throw_io_ctx(const char* extra, const char* caller) {
+    char buf[512];
+    char demangled[256];
+
+    if (caller != NULL) {
+        __jnative_demangle(caller, demangled, sizeof(demangled));
+        if (extra != NULL) {
+            snprintf(buf, sizeof(buf), "%s (in %s)", extra, demangled);
+        } else {
+            snprintf(buf, sizeof(buf), "I/O error in %s", demangled);
+        }
+    } else {
+        if (extra != NULL) {
+            snprintf(buf, sizeof(buf), "%s", extra);
+        } else {
+            snprintf(buf, sizeof(buf), "I/O error");
+        }
+    }
+
+    void* exc = __jnative_make_exception_object(
+        "vtable_java_io_IOException", buf);
+    if (exc == NULL) {
+        exc = __jnative_make_exception_object("vtable_java_lang_Throwable", buf);
+    }
+    if (exc == NULL) {
+        const char* msg = "jnative: fatal: cannot construct IOException and "
+                          "no Throwable vtable available\n";
+        (void)!write(2, msg, strlen(msg));
+        _exit(1);
+    }
+    current_exception = exc;
+    CatchContext* ctx = current_catch_ctx();
+    if (ctx) {
+        mark_abandoned_clinits(ctx);
+        longjmp(*(jmp_buf*)ctx->jmp_buf_ptr, 1);
+    }
+    __jnative_log_unhandled_exception(exc, "java.io.IOException", caller, extra);
+}
 
 __attribute__((noreturn)) void __jnative_throw_exception(void* exc) {
     __jnative_throw_exception_ctx(exc, NULL);
