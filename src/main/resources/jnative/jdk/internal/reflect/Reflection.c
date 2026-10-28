@@ -9,8 +9,6 @@
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#include <dbghelp.h>
-#pragma comment(lib, "dbghelp.lib")
 #else
 #include <execinfo.h>
 #endif
@@ -459,41 +457,17 @@ static struct ReflectionClass* find_first_java_caller(void) {
 
 __attribute__((noinline))
 static struct ReflectionClass* find_first_java_caller(void) {
-    static int sym_initialized = 0;
-    if (!sym_initialized) {
-        SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES);
-        SymInitialize(GetCurrentProcess(), NULL, TRUE);
-        sym_initialized = 1;
-    }
-
     void* frames[JNATIVE_MAX_FRAMES];
     USHORT n = CaptureStackBackTrace(0, JNATIVE_MAX_FRAMES, frames, NULL);
 
-    /*
-     * Same rule as on Unix: return the first Java frame that is not a
-     * service frame, resolving lazy-<clinit> wrappers through the
-     * thread-local <clinit> identity stack. Classification is done on
-     * the symbol name returned by SymFromAddr, which for the C symbols
-     * emitted by the LLVM backend is the mangled form
-     * ("fn_java_lang_...") used in @jnative_symbol_class_map and
-     * @jnative_caller_sensitive_symbols.
-     *
-     * If a future toolchain change starts demangling those names, the
-     * prefix checks below and the binary searches inside
-     * is_caller_sensitive_symbol / class_for_symbol will need a
-     * corresponding demangling step; the current code assumes the
-     * undecorated name is the symbol as written by the emitter.
-     */
     for (USHORT i = 0; i < n; i++) {
-        DWORD64 addr = (DWORD64)(uintptr_t)frames[i];
-        char buf[sizeof(SYMBOL_INFO) + MAX_SYM_NAME];
-        PSYMBOL_INFO pSym = (PSYMBOL_INFO)buf;
-        pSym->SizeOfStruct = sizeof(SYMBOL_INFO);
-        pSym->MaxNameLen   = MAX_SYM_NAME;
-        DWORD64 displacement = 0;
-        if (!SymFromAddr(GetCurrentProcess(), addr, &displacement, pSym)) continue;
+        const char* sym = NULL;
+        struct ReflectionClass* entry_cls = NULL;
 
-        const char* sym = pSym->Name;
+        if (!__jnative_function_at_address((uintptr_t)frames[i],
+                                            &sym, &entry_cls)) {
+            continue;
+        }
 
         if (!is_java_frame_symbol(sym)) continue;
 
@@ -504,6 +478,8 @@ static struct ReflectionClass* find_first_java_caller(void) {
         }
 
         if (is_service_frame_symbol(sym)) continue;
+
+        if (entry_cls != NULL) return entry_cls;
 
         struct ReflectionClass* cls = class_for_symbol(sym);
         if (cls != NULL) return cls;

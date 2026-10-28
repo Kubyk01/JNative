@@ -4,6 +4,7 @@ import io.github.kubyk01.application.service.analyzer.dependencyresolver.Depende
 import io.github.kubyk01.application.service.codegen.llvm.LlvmRuntime;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.ClassNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.MethodNode;
+import io.github.kubyk01.domain.ir.Function;
 import io.github.kubyk01.domain.ir.Module;
 import io.github.kubyk01.domain.ir.TargetPlatform;
 import io.github.kubyk01.port.secondary.CompilerPort;
@@ -215,6 +216,11 @@ public class Compiler implements CompilerPort {
             // -L<gcc-runtime-dir> explicitly for every directory that
             // contains libgcc.a. See findGccRuntimeLibDirs below.
             // ------------------------------------------------------------------
+            Path defFile = null;
+            if (target.isWindows()) {
+                defFile = generateWindowsExportDef(module, llPaths, tempDir);
+            }
+
             List<String> linkCmd = new ArrayList<>();
             linkCmd.add(compiler);
 
@@ -278,7 +284,7 @@ public class Compiler implements CompilerPort {
             linkCmd.add("-o");
             linkCmd.add(exePath.toString());
 
-            appendLinkerLibraries(linkCmd, target);
+            appendLinkerLibraries(linkCmd, target, defFile);
 
             // ------------------------------------------------------------------
             // 6. Native library discovery and bundling.
@@ -762,29 +768,254 @@ public class Compiler implements CompilerPort {
     }
 
     // =====================================================================
+    //  Windows export table
+    // =====================================================================
+
+    private static Path generateWindowsExportDef(Module module,
+                                                 List<Path> llPaths,
+                                                 Path tempDir) throws IOException {
+        Set<String> exports = new TreeSet<>();
+
+        // ------------------------------------------------------------------
+        // 1. Defined functions in the module. A Function with an entry block
+        //    becomes `define void @fn_...` in _module.ll; one without it is a
+        //    bare `declare` and has no body to export.
+        // ------------------------------------------------------------------
+        Set<String> definedFunctions = new HashSet<>();
+        for (Function f : module.getFunctions()) {
+            if (f.getEntryBlock() == null) continue;
+            definedFunctions.add(f.getName());
+        }
+
+        // ------------------------------------------------------------------
+        // 2. Defined globals from _module.ll.
+        //
+        //    `@name = global ...` and `@name = constant ...` are global
+        //    definitions. Function definitions start with `define`, function
+        //    declarations start with `declare`, and operand-only `@` mentions
+        //    start with an instruction mnemonic — none of those begin with `@`,
+        //    so the `startsWith("@")` filter is exact.
+        // ------------------------------------------------------------------
+        Path moduleLl = null;
+        for (Path ll : llPaths) {
+            if ("_module.ll".equals(ll.getFileName().toString())) {
+                moduleLl = ll;
+                break;
+            }
+        }
+        if (moduleLl == null) {
+            throw new IllegalStateException(
+                "Cannot generate Windows export def: _module.ll not found in "
+                    + llPaths);
+        }
+        Set<String> definedGlobals = new HashSet<>();
+        for (String line : Files.readAllLines(moduleLl)) {
+            if (!line.startsWith("@")) continue;
+            int eq = line.indexOf(" = ");
+            if (eq <= 0) continue;
+            String lhs = line.substring(1, eq).trim();
+            String rhs = line.substring(eq + 3).trim();
+            if (rhs.startsWith("external ") || rhs.startsWith("declare ")) continue;
+            definedGlobals.add(lhs);
+        }
+
+        // ------------------------------------------------------------------
+        // 3. Globals the C runtime dlsyms.
+        //
+        //    jnative_runtime.c and the per-class native support files all
+        //    resolve these through GetProcAddress / dlsym(RTLD_DEFAULT, ...),
+        //    which on Windows can only see the export table. The four prefixes
+        //    below are the only global families the runtime looks up by name.
+        // ------------------------------------------------------------------
+        for (String g : definedGlobals) {
+            if (g.startsWith("gv_")
+                || g.startsWith("vtable_")
+                || g.startsWith("__type_info_")) {
+                exports.add(g);
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // 4. Functions the C runtime dlsyms by pattern.
+        //
+        //    __destruct_<Type> / __destruct_array_<Desc>
+        //        resolved by jnative_resolve_destructor() in jnative_runtime.c.
+        //
+        //    fn_<Class>__clinit____V
+        //        built at runtime by ObjectStreamClass.hasStaticInitializer()
+        //        and looked up through dlsym.
+        // ------------------------------------------------------------------
+        for (String f : definedFunctions) {
+            if (f.startsWith("__destruct_")) {
+                exports.add(f);
+            } else if (f.startsWith("fn_") && f.endsWith("__clinit____V")) {
+                exports.add(f);
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // 5. Functions the C runtime dlsyms by literal.
+        //
+        //    Anywhere a C source writes a `"fn_..."` or `"__jnative_fn_..."`
+        //    string literal, that literal is a dlsym target. The scan is data-
+        //    driven: when a future C file adds a new lookup, it is picked up
+        //    automatically without touching this Java method.
+        //
+        //    The literal is only added to the .def when it is also a defined
+        //    function in the module. That filter is what makes JDK-version
+        //    differences safe: MethodHandleNatives.c still mentions
+        //    "fn_java_lang_reflect_Method_getType__..." in its source, but on
+        //    JDK 21 that method does not exist, so the literal is skipped
+        //    rather than handed to ld.lld as an undefined-symbol requirement.
+        // ------------------------------------------------------------------
+        Set<String> fnLiteralsInCSources = new HashSet<>();
+        try (var stream = Files.walk(tempDir)) {
+            stream.filter(p -> p.toString().endsWith(".c"))
+                  .forEach(p -> scanFnLiterals(p, fnLiteralsInCSources));
+        }
+        for (String literal : fnLiteralsInCSources) {
+            if (definedFunctions.contains(literal)) {
+                exports.add(literal);
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // 6. Write the .def file.
+        // ------------------------------------------------------------------
+        Path defFile = tempDir.resolve("exports.def");
+        StringBuilder sb = new StringBuilder("EXPORTS\n");
+        for (String sym : exports) {
+            sb.append("    ").append(sym).append("\n");
+        }
+        Files.writeString(defFile, sb.toString());
+
+        System.out.println("Windows export table: " + exports.size() + " symbol(s)");
+        return defFile;
+    }
+
+    /**
+     * Scans one C source file for {@code "fn_..."} and
+     * {@code "__jnative_fn_..."} string literals and records every match in
+     * {@code out}.
+     *
+     * <p>The scan runs on the comment-stripped text, so a symbol mentioned
+     * only in a comment is not picked up. String literals themselves are
+     * preserved verbatim, so a symbol referenced from a {@code #define}
+     * (as {@code Perf.c} does) is found even when the {@code #define} and
+     * its {@code dlsym} call site are on separate physical lines.</p>
+     *
+     * <p>False positives — a string that happens to look like a mangled
+     * symbol but is not actually passed to {@code dlsym} — are filtered out
+     * by the {@code definedFunctions.contains(literal)} check at the call
+     * site. So a string that ends up in {@code out} but is not a real
+     * function simply does not make it into the {@code .def} file.</p>
+     */
+    private static void scanFnLiterals(Path cFile, Set<String> out) {
+        String content;
+        try {
+            content = Files.readString(cFile);
+        } catch (IOException e) {
+            return;
+        }
+        content = stripCComments(content);
+
+        final int n = content.length();
+        int i = 0;
+        while ((i = content.indexOf('"', i)) >= 0) {
+            int after = i + 1;
+            String prefix = null;
+            if (content.startsWith("fn_", after)) {
+                prefix = "fn_";
+            } else if (content.startsWith("__jnative_fn_", after)) {
+                prefix = "__jnative_fn_";
+            }
+            if (prefix == null) {
+                i = after;
+                continue;
+            }
+            int j = after;
+            while (j < n) {
+                char c = content.charAt(j);
+                if ((c >= 'a' && c <= 'z')
+                    || (c >= 'A' && c <= 'Z')
+                    || (c >= '0' && c <= '9')
+                    || c == '_') {
+                    j++;
+                } else {
+                    break;
+                }
+            }
+            if (j > after && j < n && content.charAt(j) == '"') {
+                out.add(content.substring(after, j));
+            }
+            i = j > after ? j : after;
+        }
+    }
+
+    /**
+     * Removes C and C++ comments from {@code src} while leaving every string
+     * and character literal intact. A string literal that happens to contain
+     * {@code //} or {@code /*} must not be treated as a comment, which is why
+     * the scan enters string and character literals before it looks at the
+     * first two characters of the current position.
+     */
+    private static String stripCComments(String src) {
+        StringBuilder out = new StringBuilder(src.length());
+        final int n = src.length();
+        int i = 0;
+        while (i < n) {
+            char quote = src.charAt(i);
+            if (quote == '/' && i + 1 < n && src.charAt(i + 1) == '/') {
+                while (i < n && src.charAt(i) != '\n') i++;
+                continue;
+            }
+            if (quote == '/' && i + 1 < n && src.charAt(i + 1) == '*') {
+                i += 2;
+                while (i + 1 < n && !(src.charAt(i) == '*' && src.charAt(i + 1) == '/')) {
+                    i++;
+                }
+                i += 2;
+                continue;
+            }
+            if (quote == '"' || quote == '\'') {
+                out.append(src.charAt(i++));
+                while (i < n) {
+                    char ch = src.charAt(i);
+                    out.append(ch);
+                    i++;
+                    if (ch == '\\' && i < n) {
+                        out.append(src.charAt(i++));
+                    } else if (ch == quote) {
+                        break;
+                    }
+                }
+                continue;
+            }
+            out.append(quote);
+            i++;
+        }
+        return out.toString();
+    }
+
+    // =====================================================================
     //  Linker flags
     // =====================================================================
 
     private static void appendLinkerLibraries(List<String> linkCmd,
-                                              TargetPlatform target) {
+                                              TargetPlatform target,
+                                              Path defFile) {
         if (target.isWindows()) {
             linkCmd.add("-mconsole");
             linkCmd.add("-Wl,--subsystem,console");
             linkCmd.add("-static-libgcc");
+            if (defFile != null) {
+                linkCmd.add(defFile.toString());
+            }
             linkCmd.add("-Wl,--gc-sections");
             linkCmd.add("-lm");
-
-            // Link winpthread STATICALLY. -lpthread resolves to the DLL
-            // import library (libpthread.dll.a) by default, which makes the
-            // produced .exe depend on libwinpthread-1.dll being present on
-            // the target. The MinGW-w64 distribution ships the static form
-            // (libwinpthread.a) alongside it; -Bstatic/-Bdynamic forces the
-            // linker to pick the former while leaving the .dll.a forms of
-            // every subsequent system library untouched.
             linkCmd.add("-Wl,-Bstatic");
             linkCmd.add("-lwinpthread");
             linkCmd.add("-Wl,-Bdynamic");
-
             linkCmd.add("-ldbghelp");
             linkCmd.add("-lws2_32");
             linkCmd.add("-liphlpapi");
