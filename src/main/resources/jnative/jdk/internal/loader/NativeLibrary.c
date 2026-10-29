@@ -1,95 +1,93 @@
 /*
- * jdk.internal.loader.NativeLibrary — the single native entry point of
- * the NativeLibraryImpl symbol-lookup path.
+ * jdk.internal.loader.NativeLibrary -- real symbol lookup.
  *
- * The class declares exactly one native:
+ * ==========================================================================
+ * What the class declares
+ * ==========================================================================
  *
  *     static native long findEntry0(NativeLibraryImpl lib, String name);
  *
- * which resolves the address of a native symbol by name. In HotSpot the
- * body is a dlsym(3) call against the handle stored in lib->handle,
- * and the returned address is stored into the java.lang.reflect.Field
- * or Method that will subsequently be invoked through it.
+ * The `lib.handle` field (offset 16 of the NativeLibraryImpl object) is
+ * set by NativeLibraries.load to the process-image handle
+ * (jn_dlsym_default). findEntry0 resolves `name` against that handle and
+ * returns the raw address, or 0 if the symbol is absent.
  *
- * This runtime never resolves a symbol at run time: every native
- * method has a statically-linked __jnative_fn_* symbol emitted by the
- * LLVM backend, and the linkage between a Java-level method and its C
- * body is made at code-generation time. Nevertheless, the reachability
- * walk pulls in NativeLibrary.find because the JDK's own reflective
- * accessors reference it, and the linker needs a body.
+ * ==========================================================================
+ * Why a real implementation (not `return 0`)
+ * ==========================================================================
  *
- * Returning 0 is the documented "no such symbol" answer: the
- * Java-side caller (NativeLibraryImpl.find / NativeLibraries.find)
- * treats a 0 result as "not found" and raises UnsatisfiedLinkError
- * with the symbol name attached. That is the truthful behaviour for a
- * runtime that has no dynamic symbol table to look up in, and it
- * produces a diagnostic that names the missing symbol rather than
- * silently dereferencing address 0.
+ * Returning 0 unconditionally would report every symbol as missing,
+ * even though the runtime *does* export real symbols for both JNative
+ * natives (__jnative_fn_*) and JNI fallbacks (Java_*). The mapping from
+ * a Java native method to its symbol is established statically at
+ * codegen time, but the JDK's reflective-access machinery still walks
+ * through this entry point when it needs to build a MethodHandle for a
+ * native method. Providing the real address lets those paths continue
+ * instead of failing with a misleading UnsatisfiedLinkError.
  *
- * ---------------------------------------------------------------------
- * Why this file exists separately from NativeLibraries.c
- * ---------------------------------------------------------------------
+ * If the symbol is genuinely absent, the function returns 0 -- the
+ * documented "not found" sentinel -- and the caller raises
+ * UnsatisfiedLinkError with the requested name attached.
  *
- * The implementation used to live in NativeLibraries.c (plural),
- * alongside NativeLibraries.load / .unload / .findBuiltinLib, because
- * all four are conceptually "the native loader machinery" and read
- * more naturally as one file.
+ * ==========================================================================
+ * File name
+ * ==========================================================================
  *
- * That organisation conflicts with BytecodeToIr.findJNativeFileOwner
- * and Compiler.hasNativeSupport, both of which decide whether a native
- * method has a JNative implementation by probing for a C file whose
- * name matches the declaring class:
- *
- *     jnative/<package>/<SimpleClassName>.c
- *
- * For NativeLibrary.findEntry0 the declaring class is NativeLibrary
- * (singular), so the probe looks for NativeLibrary.c. The file
- * NativeLibraries.c (plural) does not match, both helpers conclude
- * "no JNative implementation exists", and BytecodeToIr falls back to
- * the JNI symbol naming rule:
- *
- *     Java_jdk_internal_loader_NativeLibrary_findEntry0
- *
- * which nothing provides. The link fails with:
- *
- *     ld.lld: error: undefined symbol:
- *         Java_jdk_internal_loader_NativeLibrary_findEntry0
- *
- * Keeping the implementation in a file whose name matches the
- * declaring class — as this file does — satisfies the probe without
- * changing the probe itself, and is the smallest change that makes
- * the link succeed.
+ * BytecodeToIr.findJNativeFileOwner and Compiler.hasNativeSupport probe
+ * for `jnative/<package>/<SimpleClassName>.c`. The class is
+ * NativeLibrary (singular); keeping the body in NativeLibrary.c means
+ * both probes succeed and the linker sees the mangled __jnative_fn_*
+ * symbol emitted by the LLVM backend.
  */
 
 #define _GNU_SOURCE
+#include "jnative_platform.h"
 #include <stdint.h>
+#include <stddef.h>
+#include <string.h>
 
 #include "jnative_runtime.h"
 
-/*
- * static native long findEntry0(NativeLibraryImpl lib, String name);
- *
- * Returns the address of the named native symbol, or 0 if the symbol
- * is not available. Because every native method this runtime could
- * ever dispatch to has a statically-linked __jnative_fn_* symbol
- * emitted by the LLVM backend, and no reachable path actually invokes
- * findEntry0 at run time (the reflective-accessor machinery does not
- * reach the JNI entry point), the truthful answer is 0.
- *
- * A 0 result is caught by the Java-side caller
- * (NativeLibraryImpl.find / NativeLibraries.find), which translates it
- * into UnsatisfiedLinkError with the symbol name attached. That is
- * strictly better than attempting dlsym against the process image and
- * returning a JNative C implementation's address: the reflective
- * caller has no way to invoke an arbitrary C function through the
- * address it receives (that would require matching the JNI calling
- * convention of a function that was never designed for it), so a
- * non-zero return would send it into undefined behaviour.
- */
 int64_t __jnative_fn_jdk_internal_loader_NativeLibrary_findEntry0__JLjava_lang_String__J(
         int64_t handle, void* name_str)
 {
-    (void)handle;
-    (void)name_str;
-    return 0;
+    if (name_str == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+
+    /*
+     * Native symbol names are ASCII identifiers; the runtime does not
+     * assume a NUL terminator inside the Java String's payload (it has
+     * none by construction for strings built by Arrays.copyOf etc.).
+     * Copy into a NUL-terminated stack buffer.
+     */
+    int32_t len = 0;
+    const char* name = __jnative_read_string_bytes(name_str, &len);
+    if (name == NULL || len <= 0) return 0;
+    if (len >= 512) return 0;
+
+    char buf[512];
+    memcpy(buf, name, (size_t)len);
+    buf[len] = '\0';
+
+    void* sym = NULL;
+
+    /*
+     * The handle is either the process-image handle stored by
+     * NativeLibraries.load, or (defensively) some other dlopen /
+     * LoadLibrary handle. `dlsym` on both platforms resolves the
+     * symbol against the given handle.
+     */
+    if (handle != 0 && handle != (int64_t)-1) {
+        sym = dlsym((void*)(intptr_t)handle, buf);
+    }
+
+    /* Fall back to the process image if the handle did not yield a
+     * symbol. This covers the (currently unreachable) case where the
+     * handle was invalidated between load and findEntry0. */
+    if (sym == NULL) {
+        sym = jn_dlsym_default(buf);
+    }
+
+    return (int64_t)(intptr_t)sym;
 }

@@ -168,6 +168,7 @@
  */
 
 #define _GNU_SOURCE
+#include "jnative_platform.h"
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>

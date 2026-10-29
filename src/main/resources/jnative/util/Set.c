@@ -1,3 +1,4 @@
+#include "jnative_platform.h"
 /*
  * java.util.Set does not declare getClass() – it inherits the final method
  * from java.lang.Object. The reachability resolver nevertheless emits a

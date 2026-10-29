@@ -1,8 +1,8 @@
 #define _GNU_SOURCE
+#include "jnative_platform.h"
 #include <stdint.h>
 #include <string.h>
 #include <ctype.h>
-#include <dlfcn.h>
 #include "jnative_runtime.h"
 
 void __jnative_fn_java_io_ObjectStreamClass_initNative___V(void) {
@@ -61,10 +61,10 @@ int32_t __jnative_fn_java_io_ObjectStreamClass_hasStaticInitializer__Ljava_lang_
     memcpy(symbol + pos, suffix, suffix_len + 1);
 
     /* Look up the symbol in the running process image. */
-    void* handle = dlopen(NULL, RTLD_LAZY);
+    void* handle = jn_dlsym_default;
     if (handle == NULL) return 0;
 
-    void* sym = dlsym(handle, symbol);
+    void* sym = jn_dlsym_default( symbol);
     dlclose(handle);
 
     return sym != NULL ? 1 : 0;

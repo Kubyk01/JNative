@@ -1,4 +1,4 @@
-#include <unistd.h>
+#include "jnative_platform.h"
 #include <stdint.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -40,48 +40,56 @@ void __jnative_fn_java_io_FileDescriptor_sync___V(void* this_fd) {
         return;
     }
 
+#if defined(_WIN32)
+    if (_commit(fd) < 0) {
+        fd_throw_io("fsync failed");
+    }
+#else
     if (fsync(fd) < 0) {
         fd_throw_io("fsync failed");
     }
+#endif
 }
 
-/* --------------------------------------------------------------------------
+/*
  * private static native long getHandle(int d);
  *
  * Returns an opaque 64-bit identifier for the given raw file descriptor.
  * On Unix this identifier is the descriptor itself: it uniquely names an
  * open file within the process and is stable for the lifetime of the
  * descriptor. An invalid descriptor (-1) yields -1.
- * ------------------------------------------------------------------------ */
+ */
 int64_t __jnative_fn_java_io_FileDescriptor_getHandle__I_J(int32_t fd) {
     return (int64_t)fd;
 }
 
-/* --------------------------------------------------------------------------
+/*
  * private static native boolean getAppend(int d);
- *
- * Returns true iff the file descriptor was opened with O_APPEND. The
- * flag is queried through fcntl(F_GETFL); a failed query or an invalid
- * descriptor yields false.
- * ------------------------------------------------------------------------ */
+ */
 int32_t __jnative_fn_java_io_FileDescriptor_getAppend__I_Z(int32_t fd) {
     if (fd < 0) {
         return 0;
     }
+
+#if defined(_WIN32)
+    /* See the comment above for why this is 0 rather than a query. */
+    return 0;
+#else
     int flags = fcntl(fd, F_GETFL);
     if (flags < 0) {
         return 0;
     }
     return (flags & O_APPEND) ? 1 : 0;
+#endif
 }
 
-/* --------------------------------------------------------------------------
+/*
  * private static native void initIDs();
  *
  * Caches the JNI field IDs of FileDescriptor's instance fields. This
  * runtime accesses instance fields through their LLVM-computed byte
  * offsets and never consults JNI field IDs, so there is nothing to
  * cache. The symbol exists so the class's <clinit> links.
- * ------------------------------------------------------------------------ */
+ */
 void __jnative_fn_java_io_FileDescriptor_initIDs___V(void) {
 }

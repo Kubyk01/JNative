@@ -1,3 +1,4 @@
+#include "jnative_platform.h"
 #include <stdint.h>
 #include <time.h>
 
@@ -23,7 +24,7 @@ int64_t __jnative_fn_jdk_internal_misc_VM_getNanoTimeAdjustment__J_J(int64_t off
     int64_t offset_nanos;
     int64_t diff_nanos;
 
-    if (clock_gettime(CLOCK_REALTIME, &ts) != 0) {
+    if (jn_now_realtime(&ts) != 0) {
         return (int64_t)-1;
     }
 

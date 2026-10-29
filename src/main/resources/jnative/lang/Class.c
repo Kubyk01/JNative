@@ -1,10 +1,10 @@
 #define _GNU_SOURCE
+#include "jnative_platform.h"
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
-#include <dlfcn.h>
 #include "jnative_runtime.h"
 
 extern struct ReflectionClass* reflect_all_classes[];
@@ -167,9 +167,9 @@ static char* build_type_info_symbol(const char* class_name) {
 static void** lookup_type_info(struct ReflectionClass* cls) {
     if (!cls || !cls->cname) return NULL;
     const char* symbol = build_type_info_symbol(cls->cname);
-    void* handle = dlopen(NULL, RTLD_LAZY);
+    void* handle = jn_dlsym_default;
     if (!handle) return NULL;
-    void** type_info = (void**)dlsym(handle, symbol);
+    void** type_info = (void**)jn_dlsym_default( symbol);
     dlclose(handle);
     return type_info;
 }

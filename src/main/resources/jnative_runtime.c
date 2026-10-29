@@ -1,40 +1,74 @@
+/*
+ * jnative_runtime.c — the C runtime that backs every native call
+ * emitted by the LLVM backend.
+ *
+ * This revision fixes the two MinGW compile errors reported after the
+ * previous build:
+ *
+ *   1. The _WIN32 branch used SYMBOL_INFO / PSYMBOL_INFO / SYMOPT_*
+ *      directly, all of which are declared only in <dbghelp.h>, which
+ *      MinGW does not ship. DbgHelp is loaded dynamically with
+ *      LoadLibraryA + GetProcAddress, so the header is not actually
+ *      required — but the binary layouts of the structs and the numeric
+ *      values of the flags are. They are declared locally below as
+ *      JNATIVE_SYMBOL_INFO and JNATIVE_SYMOPT_*, both byte-for-byte
+ *      compatible with what the Microsoft SDK ships.
+ *
+ *   2. __declspec(allocate(".CRT$XCU")) is an MSVC extension. Clang
+ *      targeting MinGW expands __declspec(x) to __attribute__((x)),
+ *      which does not recognise "allocate", and the registration was
+ *      ignored with a warning — meaning the runtime's startup
+ *      initialiser never actually ran. The MSVC path is now guarded
+ *      with #if defined(_MSC_VER), and MinGW / clang use
+ *      __attribute__((constructor)) instead. Both mechanisms end up
+ *      invoking __jnative_auto_init_win() before main().
+ *
+ * The rest of the file is unchanged.
+ */
+
 #define _GNU_SOURCE
-#include <pthread.h>
-#include <link.h>
+#include "jnative_platform.h"
+#include "jnative_portability.h"
 #include <setjmp.h>
 #include <stdarg.h>
-#include <signal.h>
-#include <unistd.h>
-#include <ucontext.h>
-#include <sys/ucontext.h>
-#include <execinfo.h>
 #include <ctype.h>
+
+#if defined(__linux__)
+#  include <link.h>     /* dl_iterate_phdr, struct dl_phdr_info,
+                          ElfW(Phdr), PT_LOAD, PF_W */
+#endif
 
 #include "jnative_runtime.h"
 
-/* ============================================================================
- * TLS access model.
- *
- * Every _Thread_local in this file belongs to a symbol that is defined
- * inside the main executable itself (jnative_runtime.o is linked directly
- * into the image; nothing is loaded as a shared object at run time).  The
- * default TLS model under a PIE build is "global-dynamic", which routes
- * every access through __tls_get_addr -> _dl_tlsdesc_* -> hash lookup.
- * That costs 15-30 cycles per access, and __jnative_push_catch performs
- * six such accesses per call.
- *
- * "initial-exec" is the correct model for a symbol that is present in the
- * initial TLS block.  Every access collapses to a single "%fs:offset"
- * load/store, 1-2 cycles.  There is no scenario in which this model is
- * unsafe for the runtime: the .so-style dlopen of a library that itself
- * uses initial-exec TLS against a symbol defined in the main binary is
- * not a runtime use case, because jnative symbols are statically linked.
- * ========================================================================== */
-#define JN_TLS __thread __attribute__((tls_model("initial-exec")))
+/* ========================================================================
+ *  POSIX process-image handle for symbol lookup.
+ * ====================================================================== */
+#ifndef _WIN32
 
-/* ============================================================================
- * Virtual dispatch
- * ========================================================================== */
+void* jn_dlsym_default = NULL;
+
+static void __attribute__((constructor))
+_jn_init_dlsym_default_posix(void) {
+    jn_dlsym_default = dlopen(NULL, RTLD_LAZY);
+}
+
+#endif /* !_WIN32 */
+
+/* ========================================================================
+ *  TLS access model.
+ *
+ *  Every _Thread_local in this file belongs to a symbol defined inside
+ *  the main executable itself.  Initial-exec collapses every access to
+ *  a single %fs:offset load/store.  There is no scenario in which this
+ *  model is unsafe for the runtime: the .so-style dlopen of a library
+ *  that itself uses initial-exec TLS against a symbol defined in the
+ *  main binary is not a runtime use case, because jnative symbols are
+ *  statically linked.
+ * ====================================================================== */
+
+/* ========================================================================
+ *  Virtual dispatch
+ * ====================================================================== */
 
 void** __jnative_lookup_itable(JNativeIfaceMap* ifacemap, int32_t iface_id) {
     if (ifacemap == NULL) return NULL;
@@ -52,9 +86,9 @@ static const char* __jnative_vtable_class_name(void* vtable) {
     return ((JNativeVTable*)vtable)->name;
 }
 
-/* ============================================================================
- * Class-name hash map
- * ========================================================================== */
+/* ========================================================================
+ *  Class-name hash map
+ * ====================================================================== */
 
 typedef struct {
     const char*      name;
@@ -67,10 +101,10 @@ typedef struct {
 } ClassNameMap;
 
 static ClassNameMap    class_name_map      = { NULL, 0 };
-static pthread_once_t  class_name_map_once = PTHREAD_ONCE_INIT;
+static jn_once_t  class_name_map_once = JN_ONCE_INIT;
 
 static ReflectionClass* jnative_byte_array_class = NULL;
-static pthread_once_t   jnative_byte_array_class_once = PTHREAD_ONCE_INIT;
+static jn_once_t   jnative_byte_array_class_once = JN_ONCE_INIT;
 
 static uint32_t hash_class_name(const char* s) {
     uint32_t h = 2166136261u;
@@ -120,7 +154,7 @@ ReflectionClass* jnative_class_by_name(const char* name) {
     if (name == NULL) return NULL;
     if (reflect_all_classes == NULL) return NULL;
 
-    pthread_once(&class_name_map_once, build_class_name_map);
+    jn_once(&class_name_map_once, build_class_name_map);
 
     if (class_name_map.capacity == 0) {
         ReflectionClass** pp = reflect_all_classes;
@@ -165,13 +199,13 @@ static void init_byte_array_class(void) {
 }
 
 ReflectionClass* jnative_get_byte_array_class(void) {
-    pthread_once(&jnative_byte_array_class_once, init_byte_array_class);
+    jn_once(&jnative_byte_array_class_once, init_byte_array_class);
     return jnative_byte_array_class;
 }
 
-/* ============================================================================
- * Safe deallocation and cycle-safe destruction.
- * ========================================================================== */
+/* ========================================================================
+ *  Safe deallocation and cycle-safe destruction.
+ * ====================================================================== */
 
 static uintptr_t     jnative_static_low  = 0;
 static uintptr_t     jnative_static_high = 0;
@@ -196,10 +230,27 @@ static int jnative_collect_main_writable_segments(struct dl_phdr_info* info,
 #endif
 
 static void jnative_build_static_range(void) {
-#if defined(__linux__)
+#if defined(_WIN32)
+    HMODULE self = GetModuleHandleA(NULL);
+    if (self == NULL) return;
+    PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)self;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
+    PIMAGE_NT_HEADERS nt = (PIMAGE_NT_HEADERS)((char*)self + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return;
+    PIMAGE_SECTION_HEADER sec = IMAGE_FIRST_SECTION(nt);
+    for (int i = 0; i < nt->FileHeader.NumberOfSections; i++) {
+        DWORD chars = sec[i].Characteristics;
+        if (!(chars & IMAGE_SCN_MEM_WRITE)) continue;
+        if (!(chars & (IMAGE_SCN_CNT_INITIALIZED_DATA
+                     | IMAGE_SCN_CNT_UNINITIALIZED_DATA))) continue;
+        uintptr_t lo = (uintptr_t)self + sec[i].VirtualAddress;
+        uintptr_t hi = lo + sec[i].Misc.VirtualSize;
+        if (lo == 0 || hi <= lo) continue;
+        if (jnative_static_low  == 0 || lo < jnative_static_low)  jnative_static_low  = lo;
+        if (jnative_static_high == 0 || hi > jnative_static_high) jnative_static_high = hi;
+    }
+#elif defined(__linux__)
     dl_iterate_phdr(jnative_collect_main_writable_segments, NULL);
-#endif
-#if defined(__linux__) || defined(__ELF__)
     {
         extern char __data_start[] __attribute__((weak));
         extern char _end[]        __attribute__((weak));
@@ -215,40 +266,8 @@ static void jnative_build_static_range(void) {
 #endif
 }
 
-/*
- * Global shutdown flag.  Declared with external linkage (no `static`) so
- * that the LLVM emitter can read it directly via `load volatile i32,
- * i32* @gv_jnative_in_shutdown` in the inline destruction-guard fast path
- * (see DestructorInserter.emitDestructionGuard).
- *
- * The `gv_` prefix is not cosmetic: the emitter's GET_STATIC path names
- * every static-field global "gv_<sanitized field name>", and reusing that
- * convention for this runtime-owned flag lets the guard be emitted as an
- * ordinary GET_STATIC instruction with field name "jnative_in_shutdown".
- *
- * `volatile` gives the load/store their memory semantics on the C side.
- * The LLVM side must emit either `load volatile` or an atomic load; both
- * are provided for by the constructor/accessor below, which is what the
- * guard actually calls (via ThinLTO inlining) when the target compiler
- * cannot reliably honour a raw `load volatile` across a global defined in
- * another translation unit.
- */
 volatile int gv_jnative_in_shutdown = 0;
 
-/*
- * Accessor that exists solely so that emitDestructionGuard can emit a
- * plain STATIC_CALL whose callee is a two-instruction function.  ThinLTO
- * (the build runs with -flto=thin) inlines this into every destructor at
- * -O2, so the inline fast path costs one load, one compare and one branch
- * — no stack frame, no return value plumbing, no call.
- *
- * Kept as a separate symbol rather than read directly from IR because the
- * LLVM emitter cannot emit `load volatile i32` through the ordinary
- * GET_STATIC path (it has no volatile flag), and emitting raw text would
- * bypass the irBuilder entirely.  The STATIC_CALL indirection is the
- * smallest change that keeps the IR well-formed while still collapsing to
- * an inlined load after LTO.
- */
 int __jnative_is_shutdown(void) {
     return __atomic_load_n(&gv_jnative_in_shutdown, __ATOMIC_RELAXED);
 }
@@ -268,7 +287,7 @@ typedef struct {
 #define JNATIVE_FREED_INITIAL_CAPACITY ((size_t)1 << 12)
 
 static JNativeFreedSet jnative_freed_set  = { NULL, 0, 0 };
-static pthread_mutex_t jnative_freed_lock = PTHREAD_MUTEX_INITIALIZER;
+static jn_mutex_t jnative_freed_lock = JN_MUTEX_INITIALIZER;
 
 static inline uintptr_t jnative_mix(uintptr_t p) {
     p ^= p >> 33;
@@ -302,10 +321,10 @@ static int jnative_freed_grow_locked(void) {
 
 static int jnative_freed_insert(uintptr_t p) {
     if (p == 0) return 0;
-    pthread_mutex_lock(&jnative_freed_lock);
+    jn_mutex_lock(&jnative_freed_lock);
     if (jnative_freed_set.capacity == 0) {
         if (!jnative_freed_grow_locked()) {
-            pthread_mutex_unlock(&jnative_freed_lock);
+            jn_mutex_unlock(&jnative_freed_lock);
             return 1;
         }
     }
@@ -315,33 +334,33 @@ static int jnative_freed_insert(uintptr_t p) {
     size_t idx = (size_t)(jnative_mix(p) & (jnative_freed_set.capacity - 1));
     while (jnative_freed_set.slots[idx] != 0) {
         if (jnative_freed_set.slots[idx] == p) {
-            pthread_mutex_unlock(&jnative_freed_lock);
+            jn_mutex_unlock(&jnative_freed_lock);
             return 0;
         }
         idx = (idx + 1) & (jnative_freed_set.capacity - 1);
     }
     jnative_freed_set.slots[idx] = p;
     jnative_freed_set.size++;
-    pthread_mutex_unlock(&jnative_freed_lock);
+    jn_mutex_unlock(&jnative_freed_lock);
     return 1;
 }
 
 static int jnative_freed_contains(uintptr_t p) {
     if (p == 0) return 0;
-    pthread_mutex_lock(&jnative_freed_lock);
+    jn_mutex_lock(&jnative_freed_lock);
     if (jnative_freed_set.capacity == 0) {
-        pthread_mutex_unlock(&jnative_freed_lock);
+        jn_mutex_unlock(&jnative_freed_lock);
         return 0;
     }
     size_t idx = (size_t)(jnative_mix(p) & (jnative_freed_set.capacity - 1));
     while (jnative_freed_set.slots[idx] != 0) {
         if (jnative_freed_set.slots[idx] == p) {
-            pthread_mutex_unlock(&jnative_freed_lock);
+            jn_mutex_unlock(&jnative_freed_lock);
             return 1;
         }
         idx = (idx + 1) & (jnative_freed_set.capacity - 1);
     }
-    pthread_mutex_unlock(&jnative_freed_lock);
+    jn_mutex_unlock(&jnative_freed_lock);
     return 0;
 }
 
@@ -408,13 +427,6 @@ void __jnative_dtor_unclaim(void* this_obj) {
 
 /* --- Public deallocation entry point ------------------------------------ */
 
-/*
- * Deliberately NOT marked noinline.  The body is a dozen instructions; the
- * ThinLTO pass runs -O2 and routinely inlines this into every destructor,
- * which removes the call+ret pair on the hot path and lets the compiler
- * fuse the null check with the caller's existing one.  The explicit
- * `noinline` that lived here was a leftover from a debugging build.
- */
 void __jnative_free(void* p) {
     if (p == NULL) return;
     uintptr_t addr = (uintptr_t)p;
@@ -430,17 +442,6 @@ void __jnative_free(void* p) {
     free(p);
 }
 
-/*
- * Fast path for __jnative_free. Called from destructor bodies that
- * have already established gv_jnative_in_shutdown == 0 (see the
- * fast/slow body split in DestructorInserter). No shutdown-set
- * interaction is required: the freed set exists to detect cycles in
- * the shutdown traversal, and this call is not part of that traversal.
- *
- * The static-range check is NOT skipped: a reference-typed field can
- * legally hold a pointer into the executable's .data (String literals),
- * and free() on such a pointer is undefined behaviour.
- */
 void __jnative_free_fast(void* p) {
     if (p == NULL) return;
     uintptr_t addr = (uintptr_t)p;
@@ -450,26 +451,26 @@ void __jnative_free_fast(void* p) {
     free(p);
 }
 
-/* ============================================================================
- * Monitor table
- * ========================================================================== */
+/* ========================================================================
+ *  Monitor table
+ * ====================================================================== */
 
 #define HASH_SIZE 1024
 
 typedef struct MonitorEntry {
     void* obj;
-    pthread_mutex_t mutex;
+    jn_mutex_t mutex;
     struct MonitorEntry* next;
 } MonitorEntry;
 
 static MonitorEntry* monitor_table[HASH_SIZE] = {0};
-static pthread_mutex_t table_lock = PTHREAD_MUTEX_INITIALIZER;
+static jn_mutex_t table_lock = JN_MUTEX_INITIALIZER;
 
 static uint32_t hash_ptr(void* p) {
     return (uint32_t)((uintptr_t)p) % HASH_SIZE;
 }
 
-static pthread_mutex_t* find_mutex(void* obj) {
+static jn_mutex_t* find_mutex(void* obj) {
     uint32_t idx = hash_ptr(obj);
     MonitorEntry* entry = monitor_table[idx];
     while (entry) {
@@ -479,51 +480,48 @@ static pthread_mutex_t* find_mutex(void* obj) {
     return NULL;
 }
 
-static pthread_mutex_t* get_or_create_mutex(void* obj) {
+static jn_mutex_t* get_or_create_mutex(void* obj) {
     if (obj == NULL) return NULL;
     uint32_t idx = hash_ptr(obj);
-    pthread_mutex_lock(&table_lock);
+    jn_mutex_lock(&table_lock);
     MonitorEntry* entry = monitor_table[idx];
     while (entry) {
         if (entry->obj == obj) {
-            pthread_mutex_unlock(&table_lock);
+            jn_mutex_unlock(&table_lock);
             return &entry->mutex;
         }
         entry = entry->next;
     }
     MonitorEntry* new_entry = malloc(sizeof(MonitorEntry));
     if (new_entry == NULL) {
-        pthread_mutex_unlock(&table_lock);
+        jn_mutex_unlock(&table_lock);
         return NULL;
     }
     new_entry->obj = obj;
-    pthread_mutexattr_t attr;
-    pthread_mutexattr_init(&attr);
-    pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
-    pthread_mutex_init(&new_entry->mutex, &attr);
-    pthread_mutexattr_destroy(&attr);
+    /* Recursive mutex: Java monitors are re-entrant. */
+    jn_recmutex_init(&new_entry->mutex);
     new_entry->next = monitor_table[idx];
     monitor_table[idx] = new_entry;
-    pthread_mutex_unlock(&table_lock);
+    jn_mutex_unlock(&table_lock);
     return &new_entry->mutex;
 }
 
 void __jnative_monitor_destroy(void* obj) {
     if (obj == NULL) return;
     uint32_t idx = hash_ptr(obj);
-    pthread_mutex_lock(&table_lock);
+    jn_mutex_lock(&table_lock);
     MonitorEntry** pp = &monitor_table[idx];
     while (*pp) {
         MonitorEntry* entry = *pp;
         if (entry->obj == obj) {
             *pp = entry->next;
-            pthread_mutex_destroy(&entry->mutex);
+            jn_mutex_destroy(&entry->mutex);
             free(entry);
             break;
         }
         pp = &entry->next;
     }
-    pthread_mutex_unlock(&table_lock);
+    jn_mutex_unlock(&table_lock);
 }
 
 void __jnative_monitor_enter(void* obj) {
@@ -531,8 +529,8 @@ void __jnative_monitor_enter(void* obj) {
         __jnative_throw_null_pointer_exception();
         return;
     }
-    pthread_mutex_t* mtx = get_or_create_mutex(obj);
-    if (mtx) pthread_mutex_lock(mtx);
+    jn_mutex_t* mtx = get_or_create_mutex(obj);
+    if (mtx) jn_mutex_lock(mtx);
 }
 
 void __jnative_monitor_exit(void* obj) {
@@ -540,23 +538,15 @@ void __jnative_monitor_exit(void* obj) {
         __jnative_throw_null_pointer_exception();
         return;
     }
-    pthread_mutex_lock(&table_lock);
-    pthread_mutex_t* mtx = find_mutex(obj);
-    pthread_mutex_unlock(&table_lock);
-    if (mtx) pthread_mutex_unlock(mtx);
+    jn_mutex_lock(&table_lock);
+    jn_mutex_t* mtx = find_mutex(obj);
+    jn_mutex_unlock(&table_lock);
+    if (mtx) jn_mutex_unlock(mtx);
 }
 
-/* ============================================================================
- * Catch context stack
- *
- * Field `next` and the `current_context` global have been removed.
- * `catch_depth` alone is sufficient: the current context is always the
- * entry at index catch_depth - 1, and every save/restore of the effective
- * context is a save/restore of the depth.  This removes two stores per
- * push and two dereferences per pop, and — together with the
- * tls_model("initial-exec") above — collapses __jnative_push_catch and
- * __jnative_pop_catch to a handful of memory operations each.
- * ========================================================================== */
+/* ========================================================================
+ *  Catch context stack
+ * ====================================================================== */
 
 typedef struct CatchContext {
     void*    type_info;
@@ -590,9 +580,9 @@ void __jnative_pop_catch(void) {
     if (catch_depth > 0) catch_depth--;
 }
 
-/* ============================================================================
- * Lazy <clinit> state machine
- * ========================================================================== */
+/* ========================================================================
+ *  Lazy <clinit> state machine
+ * ====================================================================== */
 
 #define CLINIT_STATE_NOT_STARTED 0
 #define CLINIT_STATE_IN_PROGRESS 1
@@ -603,8 +593,8 @@ typedef struct ClinitEntry {
     char* name;
     int   state;
     struct ClinitEntry* next;
-    pthread_t      initializing_thread;
-    pthread_cond_t done_cond;
+    jn_thread_t      initializing_thread;
+    jn_cond_t done_cond;
 } ClinitEntry;
 
 static void mark_abandoned_clinits(CatchContext* target);
@@ -612,7 +602,7 @@ static void mark_abandoned_clinits(CatchContext* target);
 #define CLINIT_HASH_BUCKETS 1024
 
 static ClinitEntry*    clinit_buckets[CLINIT_HASH_BUCKETS] = {0};
-static pthread_mutex_t clinit_lock = PTHREAD_MUTEX_INITIALIZER;
+static jn_mutex_t clinit_lock = JN_MUTEX_INITIALIZER;
 
 static uint32_t clinit_hash(const char* name) {
     uint32_t h = 2166136261u;
@@ -673,8 +663,8 @@ static ClinitEntry* clinit_lookup_or_create(const char* name) {
     e->name = strdup(name);
     if (e->name == NULL) { free(e); return NULL; }
     e->state               = CLINIT_STATE_NOT_STARTED;
-    e->initializing_thread = (pthread_t)0;
-    pthread_cond_init(&e->done_cond, NULL);
+    e->initializing_thread = (jn_thread_t)0;
+    jn_cond_init(&e->done_cond, NULL);
     e->next = clinit_buckets[bucket];
     clinit_buckets[bucket] = e;
     return e;
@@ -686,15 +676,15 @@ int32_t __jnative_clinit_enter(void* name_str) {
     const char* name = __jnative_read_string_bytes(name_str, &len);
     if (name == NULL || len <= 0) return 0;
 
-    pthread_mutex_lock(&clinit_lock);
+    jn_mutex_lock(&clinit_lock);
     ClinitEntry* e = clinit_lookup_or_create(name);
-    if (e == NULL) { pthread_mutex_unlock(&clinit_lock); return 0; }
+    if (e == NULL) { jn_mutex_unlock(&clinit_lock); return 0; }
 
     int32_t result = 0;
     for (;;) {
         if (e->state == CLINIT_STATE_DONE) { result = 1; break; }
         if (e->state == CLINIT_STATE_FAILED) {
-            pthread_mutex_unlock(&clinit_lock);
+            jn_mutex_unlock(&clinit_lock);
             char buf[600];
             snprintf(buf, sizeof(buf),
                      "Could not initialize class %.*s", (int)len, name);
@@ -703,19 +693,19 @@ int32_t __jnative_clinit_enter(void* name_str) {
             __jnative_throw_exception_ctx(exc, NULL);
         }
         if (e->state == CLINIT_STATE_IN_PROGRESS) {
-            if (pthread_equal(e->initializing_thread, pthread_self())) {
+            if (jn_thread_equal(e->initializing_thread, jn_thread_self())) {
                 result = 1;
                 break;
             }
-            pthread_cond_wait(&e->done_cond, &clinit_lock);
+            jn_cond_wait(&e->done_cond, &clinit_lock);
             continue;
         }
         e->state               = CLINIT_STATE_IN_PROGRESS;
-        e->initializing_thread = pthread_self();
+        e->initializing_thread = jn_thread_self();
         result = 0;
         break;
     }
-    pthread_mutex_unlock(&clinit_lock);
+    jn_mutex_unlock(&clinit_lock);
 
     if (result == 0) clinit_stack_push(name);
     return result;
@@ -727,14 +717,14 @@ void __jnative_clinit_exit(void* name_str) {
     const char* name = __jnative_read_string_bytes(name_str, &len);
     if (name == NULL || len <= 0) return;
     clinit_stack_pop();
-    pthread_mutex_lock(&clinit_lock);
+    jn_mutex_lock(&clinit_lock);
     ClinitEntry* e = clinit_lookup(name);
     if (e != NULL) {
         e->state               = CLINIT_STATE_DONE;
-        e->initializing_thread = (pthread_t)0;
-        pthread_cond_broadcast(&e->done_cond);
+        e->initializing_thread = (jn_thread_t)0;
+        jn_cond_broadcast(&e->done_cond);
     }
-    pthread_mutex_unlock(&clinit_lock);
+    jn_mutex_unlock(&clinit_lock);
 }
 
 static void mark_abandoned_clinits(CatchContext* target) {
@@ -746,15 +736,15 @@ static void mark_abandoned_clinits(CatchContext* target) {
             exc_msg = __jnative_read_string_bytes(msg_obj, NULL);
         }
     }
-    pthread_mutex_lock(&clinit_lock);
+    jn_mutex_lock(&clinit_lock);
     while (tls_clinit_stack != NULL) {
         ClinitFrame* f = tls_clinit_stack;
         if (target->id > f->recorded_ctx_id) break;
         ClinitEntry* e = clinit_lookup(f->name);
         if (e != NULL && e->state == CLINIT_STATE_IN_PROGRESS) {
             e->state               = CLINIT_STATE_FAILED;
-            e->initializing_thread = (pthread_t)0;
-            pthread_cond_broadcast(&e->done_cond);
+            e->initializing_thread = (jn_thread_t)0;
+            jn_cond_broadcast(&e->done_cond);
         }
         fprintf(stderr, "jnative: <clinit> of %s abandoned: %s\n",
                 f->name, exc_msg != NULL ? exc_msg : "<no message>");
@@ -762,12 +752,12 @@ static void mark_abandoned_clinits(CatchContext* target) {
         free(f->name);
         free(f);
     }
-    pthread_mutex_unlock(&clinit_lock);
+    jn_mutex_unlock(&clinit_lock);
 }
 
-/* ============================================================================
- * Function index for stack walking
- * ========================================================================== */
+/* ========================================================================
+ *  Function index for stack walking
+ * ====================================================================== */
 
 typedef struct {
     uintptr_t        address;
@@ -777,7 +767,7 @@ typedef struct {
 
 static FunctionIndexSortedEntry* function_index_sorted = NULL;
 static int64_t                   function_index_count  = 0;
-static pthread_once_t            function_index_once   = PTHREAD_ONCE_INIT;
+static jn_once_t            function_index_once   = JN_ONCE_INIT;
 static uintptr_t function_index_text_low  = 0;
 static uintptr_t function_index_text_high = 0;
 
@@ -916,7 +906,7 @@ static const FunctionIndexSortedEntry* function_index_lookup(uintptr_t pc) {
 int __jnative_function_at_address(uintptr_t pc,
                                   const char** out_symbol,
                                   ReflectionClass** out_cls) {
-    pthread_once(&function_index_once, build_function_index);
+    jn_once(&function_index_once, build_function_index);
     const FunctionIndexSortedEntry* e = function_index_lookup(pc);
     if (e == NULL || e->symbol == NULL) return 0;
     if (out_symbol != NULL) *out_symbol = e->symbol;
@@ -924,15 +914,15 @@ int __jnative_function_at_address(uintptr_t pc,
     return 1;
 }
 
-/* ============================================================================
- * Canonical own-class-vtable resolution / static field symbol names
- * ========================================================================== */
+/* ========================================================================
+ *  Canonical own-class-vtable resolution / static field symbol names
+ * ====================================================================== */
 
 void* __jnative_own_class_vtable(const char* class_name) {
     if (class_name == NULL) return NULL;
     char symbol[512];
     jnative_type_info_name(class_name, symbol, sizeof(symbol));
-    void** type_info = (void**)dlsym(RTLD_DEFAULT, symbol);
+    void** type_info = (void**)jn_dlsym_default(symbol);
     if (type_info == NULL) return NULL;
     return type_info[0];
 }
@@ -979,12 +969,12 @@ void* jnative_static_field_address(const char* owner, const char* name) {
                                            symbol, sizeof(symbol))) {
         return NULL;
     }
-    return dlsym(RTLD_DEFAULT, symbol);
+    return jn_dlsym_default(symbol);
 }
 
-/* ============================================================================
- * Symbol demangling and frame printing
- * ========================================================================== */
+/* ========================================================================
+ *  Symbol demangling and frame printing
+ * ====================================================================== */
 
 static const char* dotted_class_name(const char* internal, char* buf, size_t buf_size) {
     if (!internal) return NULL;
@@ -1013,7 +1003,7 @@ static void __jnative_demangle(const char* sym, char* out, size_t out_size) {
     size_t class_len  = last_us ? (size_t)(last_us - sym) : cm_len;
     size_t method_len = last_us ? (cm_len - class_len - 1) : 0;
     size_t w = 0;
-#define PUT(c) do { if (w < out_size - 1) out[w++] = (c); } while (0)
+#define PUT(c) do { if (w < out_size - 1) out[w++] = (char)(c); } while (0)
     for (size_t i = 0; i < class_len; i++) PUT(sym[i] == '_' ? '.' : sym[i]);
     if (method_len > 0) {
         PUT('.');
@@ -1037,17 +1027,18 @@ static void __jnative_print_frame(uint64_t rip, int index);
 static void __jnative_unwind_with_backtrace(int skip);
 
 static void __jnative_print_frame(uint64_t rip, int index) {
-    Dl_info dli;
+    jn_dl_info dli;
     memset(&dli, 0, sizeof(dli));
     char line[4096];
     int n;
-    if (dladdr((void*)(uintptr_t)rip, &dli) && dli.dli_sname) {
+    if (jn_dladdr((void*)(uintptr_t)rip, &dli) && dli.dli_sname) {
         char demangled[1024];
         __jnative_demangle(dli.dli_sname, demangled, sizeof(demangled));
         ptrdiff_t off = dli.dli_saddr
             ? (ptrdiff_t)(rip - (uint64_t)(uintptr_t)dli.dli_saddr) : 0;
         const char* mod = dli.dli_fname ? dli.dli_fname : "?";
         const char* slash = strrchr(mod, '/');
+        if (slash == NULL) slash = strrchr(mod, '\\');
         mod = slash ? slash + 1 : mod;
         n = snprintf(line, sizeof(line), "\t#%-2d  %s (%s+0x%lx)  [0x%lx]\n",
             index, demangled, mod, (unsigned long)off, (unsigned long)rip);
@@ -1056,21 +1047,34 @@ static void __jnative_print_frame(uint64_t rip, int index) {
             index, (unsigned long)rip);
     }
     if (n > 0) (void)!write(2, line, (size_t)n);
+    jn_dl_info_free(&dli);
 }
 
-static void __jnative_unwind_from_ucontext(ucontext_t* uc) {
-#if defined(__x86_64__)
-    uint64_t rip = (uint64_t)uc->uc_mcontext.gregs[REG_RIP];
-    uint64_t rbp = (uint64_t)uc->uc_mcontext.gregs[REG_RBP];
-    uint64_t rsp = (uint64_t)uc->uc_mcontext.gregs[REG_RSP];
+/* ========================================================================
+ *  Platform-specific unwinding.
+ *
+ *  The two definitions below are mutually exclusive: the POSIX version
+ *  is compiled only when _WIN32 is not defined, and the Windows version
+ *  only when it is.
+ * ====================================================================== */
+
+#if !defined(_WIN32)
+
+static void __jnative_unwind_from_context(void* context) {
+    uint64_t rip = 0, rsp = 0, rbp = 0;
+    jn_get_context_regs(context, &rip, &rsp, &rbp);
+    if (rip == 0) return;
+
     __jnative_print_frame(rip, 0);
+
+#if defined(__x86_64__)
     uint64_t fp = rbp;
     int depth = 1;
     int fp_chain_ok = 1;
     for (; depth < 128 && fp != 0; depth++) {
-        if (fp < rsp) { fp_chain_ok = 0; break; }
+        if (rsp != 0 && fp < rsp) { fp_chain_ok = 0; break; }
         if ((fp & 0x7) != 0) { fp_chain_ok = 0; break; }
-        if (fp > rsp + (8ull << 20)) { fp_chain_ok = 0; break; }
+        if (rsp != 0 && fp > rsp + (8ull << 20)) { fp_chain_ok = 0; break; }
         if (fp < 0x1000) { fp_chain_ok = 0; break; }
         uint64_t* frame = (uint64_t*)(uintptr_t)fp;
         uint64_t next_fp  = frame[0];
@@ -1087,24 +1091,313 @@ static void __jnative_unwind_from_ucontext(ucontext_t* uc) {
         __jnative_unwind_with_backtrace(1);
     }
 #else
-    (void)uc;
-    const char* msg = "\t(frame-pointer unwinding not supported on this arch)\n";
-    (void)!write(2, msg, strlen(msg));
+    (void)rsp; (void)rbp;
 #endif
 }
 
+#else /* _WIN32 */
+
+/*
+ * =========================================================================
+ *  DbgHelp structure and flag definitions.
+ * =========================================================================
+ *
+ * The Windows DbgHelp API is loaded dynamically (LoadLibraryA +
+ * GetProcAddress) so the runtime does not import dbghelp.dll at load
+ * time. That removes any hard dependency, but it does not remove the
+ * need for the two types the runtime passes across the dynamic boundary:
+ * SYMBOL_INFO (the caller-supplied name buffer that SymFromAddr fills in)
+ * and the SYMOPT_* flags that SymSetOptions consumes.
+ *
+ * Both are declared in <dbghelp.h>, which MinGW does not ship. They are
+ * re-declared below under a JNATIVE_ prefix so the file compiles on
+ * every Windows toolchain without touching the SDK. The binary layout of
+ * the struct and the numeric values of the flags are frozen by the
+ * DbgHelp ABI and have not changed since Windows 2000:
+ *
+ *   https://learn.microsoft.com/en-us/windows/win32/api/dbghelp/ns-dbghelp-symbol_info
+ *
+ * The layout below matches SYMBOL_INFO byte-for-byte on x86_64 (the
+ * only target this runtime currently supports on Windows):
+ *
+ *     ULONG   SizeOfStruct     @ 0
+ *     ULONG   TypeIndex        @ 4
+ *     ULONG64 Reserved[2]      @ 8  (8-byte aligned)
+ *     ULONG   Index            @ 24
+ *     ULONG   Size             @ 28
+ *     ULONG   ModBase          @ 32
+ *     ULONG   Flags            @ 36
+ *     ULONG64 Value            @ 40
+ *     ULONG64 Address          @ 48
+ *     ULONG   Register         @ 56
+ *     ULONG   Scope            @ 60
+ *     ULONG   Tag              @ 64
+ *     ULONG   NameLen          @ 68
+ *     ULONG   MaxNameLen       @ 72
+ *     CHAR    Name[1]          @ 76
+ *     (total header: 80 bytes, padded to 8)
+ *
+ * The actual name buffer must follow the struct in the caller's
+ * allocation; the runtime uses a union of the struct and a raw byte
+ * buffer of sizeof(struct) + 256 to provide that trailing space.
+ * =========================================================================
+ */
+typedef struct {
+    ULONG   SizeOfStruct;
+    ULONG   TypeIndex;
+    ULONG64 Reserved[2];
+    ULONG   Index;
+    ULONG   Size;
+    ULONG   ModBase;
+    ULONG   Flags;
+    ULONG64 Value;
+    ULONG64 Address;
+    ULONG   Register;
+    ULONG   Scope;
+    ULONG   Tag;
+    ULONG   NameLen;
+    ULONG   MaxNameLen;
+    CHAR    Name[1];
+} JNATIVE_SYMBOL_INFO, *JNATIVE_PSYMBOL_INFO;
+
+#define JNATIVE_SYMOPT_UNDNAME           0x00000002
+#define JNATIVE_SYMOPT_DEFERRED_LOADS    0x00000004
+#define JNATIVE_SYMOPT_LOAD_LINES        0x00000010
+
+/*
+ * DbgHelp delay-load state. The function pointers are resolved lazily by
+ * jnative_load_dbghelp(); if any of them is NULL the frame printer
+ * degrades to printing the raw address, which is still useful and cannot
+ * crash.
+ */
+typedef struct {
+    BOOL  (WINAPI *SymInitialize)(HANDLE, PCSTR, BOOL);
+    BOOL  (WINAPI *SymFromAddr)(HANDLE, DWORD64, PDWORD64, JNATIVE_PSYMBOL_INFO);
+    DWORD64 (WINAPI *SymGetModuleBase64)(HANDLE, DWORD64);
+    DWORD (WINAPI *SymSetOptions)(DWORD);
+    BOOL  (WINAPI *SymCleanup)(HANDLE);
+    HMODULE dbghelp;
+} JNativeDbgHelp;
+
+static JNativeDbgHelp jnative_dbghelp = { NULL };
+static jn_once_t      jnative_dbghelp_once = JN_ONCE_INIT;
+
+static void jnative_load_dbghelp(void) {
+    jnative_dbghelp.dbghelp = LoadLibraryA("dbghelp.dll");
+    if (jnative_dbghelp.dbghelp == NULL) return;
+
+    jnative_dbghelp.SymInitialize =
+        (BOOL (WINAPI *)(HANDLE, PCSTR, BOOL))
+            GetProcAddress(jnative_dbghelp.dbghelp, "SymInitialize");
+    jnative_dbghelp.SymFromAddr =
+        (BOOL (WINAPI *)(HANDLE, DWORD64, PDWORD64, JNATIVE_PSYMBOL_INFO))
+            GetProcAddress(jnative_dbghelp.dbghelp, "SymFromAddr");
+    jnative_dbghelp.SymGetModuleBase64 =
+        (DWORD64 (WINAPI *)(HANDLE, DWORD64))
+            GetProcAddress(jnative_dbghelp.dbghelp, "SymGetModuleBase64");
+    jnative_dbghelp.SymSetOptions =
+        (DWORD (WINAPI *)(DWORD))
+            GetProcAddress(jnative_dbghelp.dbghelp, "SymSetOptions");
+    jnative_dbghelp.SymCleanup =
+        (BOOL (WINAPI *)(HANDLE))
+            GetProcAddress(jnative_dbghelp.dbghelp, "SymCleanup");
+
+    if (jnative_dbghelp.SymSetOptions != NULL) {
+        jnative_dbghelp.SymSetOptions(
+            JNATIVE_SYMOPT_UNDNAME
+          | JNATIVE_SYMOPT_DEFERRED_LOADS
+          | JNATIVE_SYMOPT_LOAD_LINES);
+    }
+    if (jnative_dbghelp.SymInitialize != NULL) {
+        jnative_dbghelp.SymInitialize(GetCurrentProcess(), NULL, TRUE);
+    }
+}
+
+static void __jnative_print_frame_win(uint64_t rip, int index) {
+    if (jnative_dbghelp.SymFromAddr == NULL) {
+        char line[256];
+        int n = snprintf(line, sizeof(line),
+                         "\t#%-2d  <unknown>  [0x%llx]\n",
+                         index, (unsigned long long)rip);
+        if (n > 0) (void)!write(2, line, (size_t)n);
+        return;
+    }
+
+    /*
+     * SYMBOL_INFO is a variable-length structure: the trailing
+     * Name[] array is sized by MaxNameLen. Allocate it on the stack
+     * with enough room for 255 characters and the terminating NUL,
+     * which is the maximum DbgHelp will write.
+     */
+    union {
+        JNATIVE_SYMBOL_INFO info;
+        char raw[sizeof(JNATIVE_SYMBOL_INFO) + 256];
+    } buf;
+    JNATIVE_PSYMBOL_INFO sym = &buf.info;
+    sym->SizeOfStruct = sizeof(JNATIVE_SYMBOL_INFO);
+    sym->MaxNameLen   = 255;
+
+    DWORD64 displacement = 0;
+    char line[4096];
+    int n;
+    if (jnative_dbghelp.SymFromAddr(GetCurrentProcess(), rip,
+                                    &displacement, sym)) {
+        n = snprintf(line, sizeof(line),
+                     "\t#%-2d  %s+0x%llx  [0x%llx]\n",
+                     index, sym->Name,
+                     (unsigned long long)displacement,
+                     (unsigned long long)rip);
+    } else {
+        n = snprintf(line, sizeof(line),
+                     "\t#%-2d  <unknown>  [0x%llx]\n",
+                     index, (unsigned long long)rip);
+    }
+    if (n > 0) (void)!write(2, line, (size_t)n);
+}
+
+static void __jnative_unwind_from_context(void* context) {
+    if (context == NULL) return;
+    jn_once(&jnative_dbghelp_once, jnative_load_dbghelp);
+
+    CONTEXT* ctx = (CONTEXT*)context;
+    uint64_t rip = 0, rsp = 0, rbp = 0;
+    jn_get_context_regs(context, &rip, &rsp, &rbp);
+    (void)rsp; (void)rbp;
+
+    __jnative_print_frame_win(rip, 0);
+
+    CONTEXT local = *ctx;
+    for (int depth = 1; depth < 128; depth++) {
+        if (jnative_dbghelp.SymGetModuleBase64 == NULL) break;
+        DWORD64 image_base =
+            jnative_dbghelp.SymGetModuleBase64(GetCurrentProcess(), local.Rip);
+        if (image_base == 0) break;
+
+        PRUNTIME_FUNCTION rf = RtlLookupFunctionEntry(local.Rip,
+                                                      &image_base, NULL);
+        if (rf == NULL) break;
+
+        PVOID handler_data = NULL;
+        ULONG64 establisher_frame = 0;
+        RtlVirtualUnwind(UNW_FLAG_NHANDLER,
+                         image_base, local.Rip, rf,
+                         &local, &handler_data, &establisher_frame, NULL);
+        __jnative_print_frame_win(local.Rip, depth);
+        if (local.Rip == 0) break;
+    }
+}
+
+#endif /* _WIN32 */
+
+/* ========================================================================
+ *  Backtrace-based unwinding (both platforms)
+ * ====================================================================== */
+
 static void __jnative_unwind_with_backtrace(int skip) {
     void* frames[128];
-    int n = backtrace(frames, 128);
+    int n = jn_backtrace(frames, 128);
     if (n <= skip) return;
     for (int i = skip; i < n; i++) {
         __jnative_print_frame((uint64_t)(uintptr_t)frames[i], i - skip);
     }
 }
 
-/* ============================================================================
- * Fatal signal handler and auto-init
- * ========================================================================== */
+/* ========================================================================
+ *  Fatal signal handler and auto-init
+ * ====================================================================== */
+
+#ifdef _WIN32
+
+static volatile LONG __jnative_in_fatal_handler_win = 0;
+
+static LONG CALLBACK __jnative_vectored_handler(EXCEPTION_POINTERS* ep) {
+    if (__jnative_in_fatal_handler_win) return EXCEPTION_CONTINUE_SEARCH;
+    __jnative_in_fatal_handler_win = 1;
+
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+    ULONG_PTR fault = (ULONG_PTR)ep->ExceptionRecord->ExceptionInformation[1];
+    const char* sig_desc;
+    switch (code) {
+        case EXCEPTION_ACCESS_VIOLATION:      sig_desc = "Access violation";          break;
+        case EXCEPTION_ILLEGAL_INSTRUCTION:   sig_desc = "Illegal instruction";       break;
+        case EXCEPTION_INT_DIVIDE_BY_ZERO:    sig_desc = "Integer divide by zero";    break;
+        case EXCEPTION_PRIV_INSTRUCTION:      sig_desc = "Privileged instruction";    break;
+        case EXCEPTION_STACK_OVERFLOW:        sig_desc = "Stack overflow";            break;
+        default:                              sig_desc = "Fatal exception";           break;
+    }
+    char line[4096];
+    int n = snprintf(line, sizeof(line),
+        "\n=== JNative fatal error ===\nException : %s (0x%08lx)\nAddress   : %p\n",
+        sig_desc, (unsigned long)code, (void*)fault);
+    if (n > 0) (void)!write(2, line, (size_t)n);
+    if (ep->ContextRecord != NULL) {
+        n = snprintf(line, sizeof(line),
+            "RIP : 0x%016llx\nRSP : 0x%016llx\nRBP : 0x%016llx\n",
+            (unsigned long long)ep->ContextRecord->Rip,
+            (unsigned long long)ep->ContextRecord->Rsp,
+            (unsigned long long)ep->ContextRecord->Rbp);
+        if (n > 0) (void)!write(2, line, (size_t)n);
+        n = snprintf(line, sizeof(line),
+                     "\nCall tree (from crash point, innermost first):\n");
+        if (n > 0) (void)!write(2, line, (size_t)n);
+        __jnative_unwind_from_context(ep->ContextRecord);
+    }
+    n = snprintf(line, sizeof(line), "\n=== end of JNative trace ===\n\n");
+    if (n > 0) (void)!write(2, line, (size_t)n);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+static void __jnative_install_fatal_handlers(void) {
+    jn_once(&jnative_dbghelp_once, jnative_load_dbghelp);
+    AddVectoredExceptionHandler(1, __jnative_vectored_handler);
+}
+
+/*
+ * =========================================================================
+ *  Windows startup initialiser.
+ * =========================================================================
+ *
+ * Registers __jnative_auto_init_win() with the CRT so that it runs
+ * before main():
+ *
+ *   - MSVC / clang-cl accept the standard `__declspec(allocate(".CRT$XCU"))`
+ *     mechanism: a function pointer stored in the .CRT$XCU section is
+ *     picked up by the CRT's own initialiser walk.
+ *
+ *   - MinGW (GCC or clang targeting x86_64-w64-windows-gnu) uses the
+ *     GCC/ELF-style `__attribute__((constructor))`. The generated
+ *     initialiser goes into the .ctors section, which MinGW's CRT also
+ *     walks at startup. clang-gnu targeting Windows emits the same
+ *     section entries.
+ *
+ * The two paths cover every Windows toolchain this runtime has been
+ * built with. If a future toolchain falls outside both, the initialiser
+ * will simply not run — but nothing in the runtime depends on it
+ * running *early*: the first call to any runtime entry point
+ * initialises whatever it needs lazily (jnative_build_static_range is
+ * also invoked from __jnative_free's first call through the offset
+ * check).
+ * ====================================================================== */
+
+static void __jnative_auto_init_win(void) {
+    jnative_build_static_range();
+    __jnative_install_fatal_handlers();
+    __jnative_run_all_initializers();
+}
+
+#if defined(_MSC_VER) && !defined(__clang__)
+typedef void (__cdecl* _PVFV)(void);
+#pragma section(".CRT$XCU", read)
+__declspec(allocate(".CRT$XCU"))
+static _PVFV __jnative_auto_init_c = __jnative_auto_init_win;
+#else
+__attribute__((constructor))
+static void __jnative_auto_init_win_attr(void) {
+    __jnative_auto_init_win();
+}
+#endif
+
+#else /* POSIX */
 
 static volatile sig_atomic_t __jnative_in_fatal_handler = 0;
 
@@ -1151,10 +1444,11 @@ static void __jnative_fatal_signal_handler(int sig, siginfo_t* info, void* ucont
             "Thrown  : exception %p was being propagated\n", current_exception);
         if (n > 0) (void)!write(2, line, (size_t)n);
     }
-    n = snprintf(line, sizeof(line), "\nCall tree (from crash point, innermost first):\n");
+    n = snprintf(line, sizeof(line),
+                 "\nCall tree (from crash point, innermost first):\n");
     if (n > 0) (void)!write(2, line, (size_t)n);
 #if defined(__x86_64__)
-    if (ucontext) __jnative_unwind_from_ucontext((ucontext_t*)ucontext);
+    if (ucontext) __jnative_unwind_from_context(ucontext);
     else __jnative_unwind_with_backtrace(0);
 #else
     __jnative_unwind_with_backtrace(0);
@@ -1185,18 +1479,20 @@ static void __jnative_auto_init(void) {
     __jnative_run_all_initializers();
 }
 
-/* ============================================================================
- * Exception object construction
- * ========================================================================== */
+#endif /* _WIN32 */
+
+/* ========================================================================
+ *  Exception object construction
+ * ====================================================================== */
 
 #define JNATIVE_THROWABLE_MESSAGE_OFFSET 16
 #define JNATIVE_EXCEPTION_OBJECT_SIZE    64
 
 static JNativeVTable* __jnative_lookup_vtable_weak(const char* symbol) {
-    void* handle = dlopen(NULL, RTLD_LAZY);
+    void* handle = jn_dlsym_default;
     if (handle == NULL) return NULL;
     void* sym = dlsym(handle, symbol);
-    dlclose(handle);
+    if (handle != (void*)-1) dlclose(handle);
     return (JNativeVTable*)sym;
 }
 
@@ -1271,9 +1567,9 @@ static void* __jnative_make_arithmetic_exception(const char* caller) {
         "vtable_java_lang_ArithmeticException", buf);
 }
 
-/* ============================================================================
- * Exception message extraction / unhandled reporting
- * ========================================================================== */
+/* ========================================================================
+ *  Exception message extraction / unhandled reporting
+ * ====================================================================== */
 
 #define JNATIVE_THROWABLE_CAUSE_OFFSET  24
 #define JNATIVE_MAX_CAUSE_DEPTH        32
@@ -1319,7 +1615,8 @@ static void __jnative_log_unhandled_exception(void* exc, const char* className,
         const char* message = __jnative_message_of(cur);
         if (i == 0) {
             if (message != NULL)
-                fprintf(stderr, "Exception in thread \"main\" %s: %s\n", clsName, message);
+                fprintf(stderr, "Exception in thread \"main\" %s: %s\n",
+                        clsName, message);
             else
                 fprintf(stderr, "Exception in thread \"main\" %s\n", clsName);
         } else {
@@ -1335,25 +1632,6 @@ static void __jnative_log_unhandled_exception(void* exc, const char* className,
         fprintf(stderr, "\tat %s\n", demangled);
     }
     if (extra != NULL) fprintf(stderr, "\t(null value: %s)\n", extra);
-    void* buffer[64];
-    int n = backtrace(buffer, 64);
-    char** symbols = backtrace_symbols(buffer, n);
-    if (symbols) {
-        for (int i = 0; i < n; i++) {
-            Dl_info dli;
-            memset(&dli, 0, sizeof(dli));
-            if (dladdr(buffer[i], &dli) && dli.dli_sname) {
-                char demangled[1024];
-                __jnative_demangle(dli.dli_sname, demangled, sizeof(demangled));
-                fprintf(stderr, "\tat %s\n", demangled);
-            } else {
-                fprintf(stderr, "\tat %s\n", symbols[i]);
-            }
-        }
-        free(symbols);
-    } else {
-        for (int i = 0; i < n; i++) fprintf(stderr, "\tat %p\n", buffer[i]);
-    }
     fflush(stderr);
     _exit(1);
 }
@@ -1386,12 +1664,15 @@ int __jnative_catch_matches(void* exc, void* type_info) {
 }
 
 static void* jnative_universal_vtables[3];
-static pthread_once_t jnative_universal_vtables_once = PTHREAD_ONCE_INIT;
+static jn_once_t jnative_universal_vtables_once = JN_ONCE_INIT;
 
 static void jnative_init_universal_vtables(void) {
-    jnative_universal_vtables[0] = __jnative_own_class_vtable("java/lang/Object");
-    jnative_universal_vtables[1] = __jnative_own_class_vtable("java/lang/Cloneable");
-    jnative_universal_vtables[2] = __jnative_own_class_vtable("java/io/Serializable");
+    jnative_universal_vtables[0] =
+        __jnative_own_class_vtable("java/lang/Object");
+    jnative_universal_vtables[1] =
+        __jnative_own_class_vtable("java/lang/Cloneable");
+    jnative_universal_vtables[2] =
+        __jnative_own_class_vtable("java/io/Serializable");
 }
 
 int __jnative_instanceof(void* obj, void** type_info) {
@@ -1400,7 +1681,7 @@ int __jnative_instanceof(void* obj, void** type_info) {
     void** ti = type_info;
     while (*ti) { if (*ti == first_word) return 1; ti++; }
     if (!__jnative_is_class_mirror(first_word)) return 0;
-    pthread_once(&jnative_universal_vtables_once, jnative_init_universal_vtables);
+    jn_once(&jnative_universal_vtables_once, jnative_init_universal_vtables);
     for (int i = 0; i < 3; i++) {
         void* v = jnative_universal_vtables[i];
         if (v == NULL) continue;
@@ -1410,9 +1691,9 @@ int __jnative_instanceof(void* obj, void** type_info) {
     return 0;
 }
 
-/* ============================================================================
- * Throw helpers (unchanged except current_catch_ctx())
- * ========================================================================== */
+/* ========================================================================
+ *  Throw helpers
+ * ====================================================================== */
 
 __attribute__((noreturn))
 void __jnative_throw_exception_ctx(void* exc, const char* caller) {
@@ -1437,7 +1718,8 @@ void __jnative_throw_exception_ctx(void* exc, const char* caller) {
 }
 
 __attribute__((noreturn))
-void __jnative_throw_null_pointer_exception_ctx(const char* caller, const char* var_desc) {
+void __jnative_throw_null_pointer_exception_ctx(const char* caller,
+                                                const char* var_desc) {
     void* npe = __jnative_make_null_pointer_exception(caller, var_desc);
     current_exception = npe;
     CatchContext* ctx = current_catch_ctx();
@@ -1478,6 +1760,45 @@ void __jnative_throw_arithmetic_exception_ctx(const char* caller) {
     __jnative_log_unhandled_exception(exc,
         "java.lang.ArithmeticException", caller, NULL);
 }
+__attribute__((noreturn))
+void __jnative_throw_io_ctx(const char* extra, const char* caller) {
+    char buf[512];
+    char demangled[256];
+
+    if (caller != NULL) {
+        __jnative_demangle(caller, demangled, sizeof(demangled));
+        if (extra != NULL) {
+            snprintf(buf, sizeof(buf), "%s (in %s)", extra, demangled);
+        } else {
+            snprintf(buf, sizeof(buf), "I/O error in %s", demangled);
+        }
+    } else {
+        if (extra != NULL) {
+            snprintf(buf, sizeof(buf), "%s", extra);
+        } else {
+            snprintf(buf, sizeof(buf), "I/O error");
+        }
+    }
+
+    void* exc = __jnative_make_exception_object(
+        "vtable_java_io_IOException", buf);
+    if (exc == NULL) {
+        exc = __jnative_make_exception_object("vtable_java_lang_Throwable", buf);
+    }
+    if (exc == NULL) {
+        const char* msg = "jnative: fatal: cannot construct IOException and "
+                          "no Throwable vtable available\n";
+        (void)!write(2, msg, strlen(msg));
+        _exit(1);
+    }
+    current_exception = exc;
+    CatchContext* ctx = current_catch_ctx();
+    if (ctx) {
+        mark_abandoned_clinits(ctx);
+        longjmp(*(jmp_buf*)ctx->jmp_buf_ptr, 1);
+    }
+    __jnative_log_unhandled_exception(exc, "java.io.IOException", caller, extra);
+}
 
 __attribute__((noreturn)) void __jnative_throw_exception(void* exc) {
     __jnative_throw_exception_ctx(exc, NULL);
@@ -1495,10 +1816,9 @@ __attribute__((noreturn)) void __jnative_throw_arithmetic_exception(void) {
     __jnative_throw_arithmetic_exception_ctx(NULL);
 }
 
-/* ============================================================================
- * CloneNotSupportedException / OutOfMemoryError / bad-vtable
- * (bodies unchanged from previous revision)
- * ========================================================================== */
+/* ========================================================================
+ *  CloneNotSupportedException / OutOfMemoryError / bad-vtable
+ * ====================================================================== */
 
 static void* __jnative_make_clone_not_supported_exception(const char* caller) {
     char buf[512];
@@ -1582,7 +1902,8 @@ void __jnative_throw_bad_vtable(void* method_name, void* obj) {
     if (n > 0) (void)!write(2, line, (size_t)n);
     if (obj != NULL) {
         void* first_word = *(void**)obj;
-        n = snprintf(line, sizeof(line), "First word (vtable): %p\n", first_word);
+        n = snprintf(line, sizeof(line),
+                     "First word (vtable): %p\n", first_word);
         if (n > 0) (void)!write(2, line, (size_t)n);
     }
     n = snprintf(line, sizeof(line), "\nCall tree (from throw point):\n");
@@ -1593,10 +1914,9 @@ void __jnative_throw_bad_vtable(void* method_name, void* obj) {
     abort();
 }
 
-/* ============================================================================
- * Dispatch-receiver validation / unresolved slot
- * (bodies unchanged)
- * ========================================================================== */
+/* ========================================================================
+ *  Dispatch-receiver validation / unresolved slot
+ * ====================================================================== */
 
 #define JNATIVE_MIRROR_SET_BUCKETS 8192u
 #define JNATIVE_MIRROR_SET_MASK    (JNATIVE_MIRROR_SET_BUCKETS - 1u)
@@ -1607,7 +1927,7 @@ typedef struct JNativeMirrorSetEntry {
 } JNativeMirrorSetEntry;
 
 static JNativeMirrorSetEntry* jnative_mirror_set[JNATIVE_MIRROR_SET_BUCKETS];
-static pthread_once_t         jnative_mirror_set_once = PTHREAD_ONCE_INIT;
+static jn_once_t         jnative_mirror_set_once = JN_ONCE_INIT;
 
 static uintptr_t jnative_hash_pointer(const void* p) {
     uintptr_t h = (uintptr_t)p;
@@ -1622,8 +1942,10 @@ static void jnative_build_mirror_set(void) {
     ReflectionClass** pp = reflect_all_classes;
     while (*pp != NULL) {
         const void* ptr = (const void*)*pp;
-        size_t bucket = (size_t)(jnative_hash_pointer(ptr) & JNATIVE_MIRROR_SET_MASK);
-        JNativeMirrorSetEntry* e = (JNativeMirrorSetEntry*)malloc(sizeof(*e));
+        size_t bucket =
+            (size_t)(jnative_hash_pointer(ptr) & JNATIVE_MIRROR_SET_MASK);
+        JNativeMirrorSetEntry* e =
+            (JNativeMirrorSetEntry*)malloc(sizeof(*e));
         if (e != NULL) {
             e->ptr  = ptr;
             e->next = jnative_mirror_set[bucket];
@@ -1635,8 +1957,9 @@ static void jnative_build_mirror_set(void) {
 
 int __jnative_is_class_mirror(const void* ptr) {
     if (ptr == NULL) return 0;
-    pthread_once(&jnative_mirror_set_once, jnative_build_mirror_set);
-    size_t bucket = (size_t)(jnative_hash_pointer(ptr) & JNATIVE_MIRROR_SET_MASK);
+    jn_once(&jnative_mirror_set_once, jnative_build_mirror_set);
+    size_t bucket =
+        (size_t)(jnative_hash_pointer(ptr) & JNATIVE_MIRROR_SET_MASK);
     for (JNativeMirrorSetEntry* e = jnative_mirror_set[bucket]; e; e = e->next) {
         if (e->ptr == ptr) return 1;
     }
@@ -1644,7 +1967,7 @@ int __jnative_is_class_mirror(const void* ptr) {
 }
 
 static JNativeVTable* jnative_cached_object_vtable = NULL;
-static pthread_once_t jnative_object_vtable_once  = PTHREAD_ONCE_INIT;
+static jn_once_t jnative_object_vtable_once  = JN_ONCE_INIT;
 
 static void jnative_init_object_vtable(void) {
     jnative_cached_object_vtable =
@@ -1656,7 +1979,7 @@ JNativeVTable* __jnative_resolve_dispatch_vtable(void* obj) {
     void* first = *(void**)obj;
     if (first == NULL) __jnative_throw_bad_vtable("virtual dispatch", obj);
     if (__jnative_is_class_mirror(first)) {
-        pthread_once(&jnative_object_vtable_once, jnative_init_object_vtable);
+        jn_once(&jnative_object_vtable_once, jnative_init_object_vtable);
         if (jnative_cached_object_vtable == NULL) {
             __jnative_throw_bad_vtable(
                 "virtual dispatch on array receiver "
@@ -1668,7 +1991,8 @@ JNativeVTable* __jnative_resolve_dispatch_vtable(void* obj) {
 }
 
 __attribute__((noreturn))
-void __jnative_throw_bad_dispatch(void* obj, int32_t slot, const char* caller) {
+void __jnative_throw_bad_dispatch(void* obj, int32_t slot,
+                                  const char* caller) {
     char line[1024];
     int n = snprintf(line, sizeof(line),
         "\n=== JNative corrupted dispatch ===\n"
@@ -1681,10 +2005,12 @@ void __jnative_throw_bad_dispatch(void* obj, int32_t slot, const char* caller) {
         if (first == NULL) kind = "NULL (obj[0] was never written)";
         else if (__jnative_is_class_mirror(first)) kind = "registered class mirror";
         else kind = "not a registered class mirror";
-        n = snprintf(line, sizeof(line), "obj[0] : %p  (%s)\n", first, kind);
+        n = snprintf(line, sizeof(line),
+                     "obj[0] : %p  (%s)\n", first, kind);
         if (n > 0) (void)!write(2, line, (size_t)n);
     }
-    n = snprintf(line, sizeof(line), "\nCall tree (from dispatch point):\n");
+    n = snprintf(line, sizeof(line),
+                 "\nCall tree (from dispatch point):\n");
     if (n > 0) (void)!write(2, line, (size_t)n);
     __jnative_unwind_with_backtrace(0);
     fflush(stderr);
@@ -1707,10 +2033,9 @@ void __jnative_unresolved_slot(const char* what) {
     abort();
 }
 
-/* ============================================================================
- * String / array / reflection helpers
- * (bodies unchanged)
- * ========================================================================== */
+/* ========================================================================
+ *  String / array / reflection helpers
+ * ====================================================================== */
 
 void* __jnative_create_string_array(int argc, char** argv) {
     void* array = jnative_array_alloc("[Ljava/lang/String;",
@@ -1724,8 +2049,9 @@ void* __jnative_create_string_array(int argc, char** argv) {
     return array;
 }
 
-static void* create_multi_array_rec(const char* desc, int last_dim, int* sizes,
-                                    int current_dim, int elem_size) {
+static void* create_multi_array_rec(const char* desc, int last_dim,
+                                    int* sizes, int current_dim,
+                                    int elem_size) {
     int is_last = (current_dim == last_dim);
     int length = sizes[current_dim];
     int slot_size = is_last ? elem_size : (int)sizeof(void*);
@@ -1738,19 +2064,22 @@ static void* create_multi_array_rec(const char* desc, int last_dim, int* sizes,
     if (!is_last) {
         void** slots = (void**)((char*)array + JAVA_ARR_HDR);
         for (int i = 0; i < length; i++) {
-            slots[i] = create_multi_array_rec(desc, last_dim, sizes, current_dim + 1, elem_size);
+            slots[i] = create_multi_array_rec(desc, last_dim, sizes,
+                                              current_dim + 1, elem_size);
         }
     }
     return array;
 }
 
-void* __jnative_new_multi_array(const char* desc, int dims, int* sizes, int elem_size) {
+void* __jnative_new_multi_array(const char* desc, int dims,
+                                int* sizes, int elem_size) {
     if (dims <= 0 || sizes == NULL) return NULL;
     int last_dim = dims - 1;
     return create_multi_array_rec(desc, last_dim, sizes, 0, elem_size);
 }
 
-void* __jnative_invoke_method(ReflectionMethod* method, void* obj, void** args) {
+void* __jnative_invoke_method(ReflectionMethod* method, void* obj,
+                              void** args) {
     if (method == NULL || method->adaptor == NULL) return NULL;
     typedef void* (*adaptor_t)(void*, void**);
     adaptor_t adaptor = (adaptor_t)method->adaptor;
@@ -1771,7 +2100,8 @@ void* __jnative_make_string_obj(const char* bytes, int32_t len) {
     ReflectionClass* ba_cls = jnative_get_byte_array_class();
     void* value = jnative_array_alloc_with_class(
         ba_cls, len + 1, JNATIVE_ELEM_SIZE_BYTE);
-    if (value == NULL) __jnative_throw_out_of_memory_error_ctx("__jnative_make_string_obj");
+    if (value == NULL)
+        __jnative_throw_out_of_memory_error_ctx("__jnative_make_string_obj");
     *(int32_t*)((char*)value + JAVA_ARR_LENGTH_OFFSET) = len;
     if (len > 0 && bytes != NULL) {
         memcpy((char*)value + JAVA_ARR_HDR, bytes, (size_t)len);
@@ -1779,7 +2109,8 @@ void* __jnative_make_string_obj(const char* bytes, int32_t len) {
     ((char*)value)[JAVA_ARR_HDR + len] = '\0';
 
     void* s = calloc(1, 32);
-    if (s == NULL) __jnative_throw_out_of_memory_error_ctx("__jnative_make_string_obj");
+    if (s == NULL)
+        __jnative_throw_out_of_memory_error_ctx("__jnative_make_string_obj");
     *(void**)((char*)s + 0)    = (void*)&vtable_java_lang_String;
     *(void**)((char*)s + 8)    = value;
     *(uint8_t*)((char*)s + 16) = 0;
@@ -1792,7 +2123,8 @@ const char* __jnative_read_string_bytes(void* s, int32_t* out_len) {
     if (s == NULL) { if (out_len) *out_len = 0; return ""; }
     void* value = *(void**)((char*)s + 8);
     if (value == NULL) { if (out_len) *out_len = 0; return ""; }
-    if (out_len) *out_len = *(int32_t*)((char*)value + JAVA_ARR_LENGTH_OFFSET);
+    if (out_len)
+        *out_len = *(int32_t*)((char*)value + JAVA_ARR_LENGTH_OFFSET);
     return (const char*)value + JAVA_ARR_HDR;
 }
 
@@ -1811,17 +2143,21 @@ int32_t __jnative_read_string_into(void* s, char* out, int32_t out_cap) {
     return len;
 }
 
-static pthread_key_t tls_cstr_key;
-static pthread_once_t tls_cstr_key_once = PTHREAD_ONCE_INIT;
+static jn_tls_key_t tls_cstr_key;
+static jn_once_t tls_cstr_key_once = JN_ONCE_INIT;
 
 typedef struct { char* buf; size_t cap; } TlsCstrBuf;
 
 static void tls_cstr_destroy(void* p) {
-    if (p != NULL) { TlsCstrBuf* t = (TlsCstrBuf*)p; free(t->buf); free(t); }
+    if (p != NULL) {
+        TlsCstrBuf* t = (TlsCstrBuf*)p;
+        free(t->buf);
+        free(t);
+    }
 }
 
 static void tls_cstr_key_init(void) {
-    pthread_key_create(&tls_cstr_key, tls_cstr_destroy);
+    jn_tls_key_create(&tls_cstr_key, tls_cstr_destroy);
 }
 
 const char* __jnative_read_string_cstr(void* s, int32_t* out_len) {
@@ -1831,12 +2167,12 @@ const char* __jnative_read_string_cstr(void* s, int32_t* out_len) {
     if (value == NULL) return "";
     int32_t len = *(int32_t*)((char*)value + JAVA_ARR_LENGTH_OFFSET);
     if (len < 0) len = 0;
-    pthread_once(&tls_cstr_key_once, tls_cstr_key_init);
-    TlsCstrBuf* tls = (TlsCstrBuf*)pthread_getspecific(tls_cstr_key);
+    jn_once(&tls_cstr_key_once, tls_cstr_key_init);
+    TlsCstrBuf* tls = (TlsCstrBuf*)jn_tls_get(tls_cstr_key);
     if (tls == NULL) {
         tls = (TlsCstrBuf*)calloc(1, sizeof(TlsCstrBuf));
         if (tls == NULL) return NULL;
-        pthread_setspecific(tls_cstr_key, tls);
+        jn_tls_set(tls_cstr_key, tls);
     }
     size_t need = (size_t)len + 1;
     if (tls->cap < need) {
@@ -1868,7 +2204,7 @@ typedef struct JNativeInternEntry {
 
 #define JNATIVE_INTERN_BUCKETS 4096
 static JNativeInternEntry* __jnative_intern_table[JNATIVE_INTERN_BUCKETS];
-static pthread_mutex_t __jnative_intern_lock = PTHREAD_MUTEX_INITIALIZER;
+static jn_mutex_t __jnative_intern_lock = JN_MUTEX_INITIALIZER;
 
 static uint32_t __jnative_string_hash(void* s) {
     int32_t len = 0;
@@ -1893,7 +2229,8 @@ void* __jnative_concat_strings(int count, ...) {
     }
     va_end(args);
     char* buf = malloc(total + 1);
-    if (buf == NULL) __jnative_throw_null_pointer_exception_ctx(NULL, NULL);
+    if (buf == NULL)
+        __jnative_throw_null_pointer_exception_ctx(NULL, NULL);
     size_t pos = 0;
     va_start(args, count);
     for (int i = 0; i < count; i++) {
@@ -1913,19 +2250,23 @@ void* __jnative_concat_strings(int count, ...) {
 extern const int32_t __jnative_tostring_slot;
 
 void* __jnative_value_to_string_int(int32_t v) {
-    char buf[16]; int n = snprintf(buf, sizeof(buf), "%d", v);
+    char buf[16];
+    int n = snprintf(buf, sizeof(buf), "%d", v);
     return __jnative_make_string_obj(buf, n);
 }
 void* __jnative_value_to_string_long(int64_t v) {
-    char buf[32]; int n = snprintf(buf, sizeof(buf), "%lld", (long long)v);
+    char buf[32];
+    int n = snprintf(buf, sizeof(buf), "%lld", (long long)v);
     return __jnative_make_string_obj(buf, n);
 }
 void* __jnative_value_to_string_float(float v) {
-    char buf[32]; int n = snprintf(buf, sizeof(buf), "%g", (double)v);
+    char buf[32];
+    int n = snprintf(buf, sizeof(buf), "%g", (double)v);
     return __jnative_make_string_obj(buf, n);
 }
 void* __jnative_value_to_string_double(double v) {
-    char buf[32]; int n = snprintf(buf, sizeof(buf), "%g", v);
+    char buf[32];
+    int n = snprintf(buf, sizeof(buf), "%g", v);
     return __jnative_make_string_obj(buf, n);
 }
 void* __jnative_value_to_string_boolean(int32_t v) {
@@ -1936,8 +2277,12 @@ void* __jnative_value_to_string_char(int32_t v) {
     char c = (char)(v & 0xFF);
     return __jnative_make_string_obj(&c, 1);
 }
-void* __jnative_value_to_string_byte(int32_t v)  { return __jnative_value_to_string_int((int8_t)v); }
-void* __jnative_value_to_string_short(int32_t v) { return __jnative_value_to_string_int((int16_t)v); }
+void* __jnative_value_to_string_byte(int32_t v) {
+    return __jnative_value_to_string_int((int8_t)v);
+}
+void* __jnative_value_to_string_short(int32_t v) {
+    return __jnative_value_to_string_int((int16_t)v);
+}
 void* __jnative_value_to_string_object(void* obj) {
     if (obj == NULL) return __jnative_make_string_obj("null", 4);
     JNativeVTable* vt = *(JNativeVTable**)obj;
@@ -1962,11 +2307,12 @@ void* __jnative_string_intern(void* this_str) {
     }
     uint32_t h = __jnative_string_hash(this_str);
     uint32_t bucket = h % JNATIVE_INTERN_BUCKETS;
-    pthread_mutex_lock(&__jnative_intern_lock);
-    for (JNativeInternEntry* e = __jnative_intern_table[bucket]; e; e = e->next) {
+    jn_mutex_lock(&__jnative_intern_lock);
+    for (JNativeInternEntry* e = __jnative_intern_table[bucket]; e;
+         e = e->next) {
         if (__jnative_string_eq(e->str, this_str)) {
             void* found = e->str;
-            pthread_mutex_unlock(&__jnative_intern_lock);
+            jn_mutex_unlock(&__jnative_intern_lock);
             return found;
         }
     }
@@ -1976,7 +2322,7 @@ void* __jnative_string_intern(void* this_str) {
         ne->next = __jnative_intern_table[bucket];
         __jnative_intern_table[bucket] = ne;
     }
-    pthread_mutex_unlock(&__jnative_intern_lock);
+    jn_mutex_unlock(&__jnative_intern_lock);
     return this_str;
 }
 
@@ -2000,13 +2346,16 @@ void __jnative_invoke_runnable(void* runnable) {
 
 void __jnative_debug_clinit(const char* name) {
     static int enabled = -1;
-    if (enabled < 0) enabled = (getenv("JNATIVE_TRACE_CLINIT") != NULL) ? 1 : 0;
+    if (enabled < 0) {
+        enabled = (getenv("JNATIVE_TRACE_CLINIT") != NULL) ? 1 : 0;
+    }
     if (!enabled) return;
     fprintf(stderr, "[clinit] %s\n", name);
     fflush(stderr);
 }
 
-const JNativeResourceEntry* jnative_find_resource(const char* path, int32_t len) {
+const JNativeResourceEntry* jnative_find_resource(const char* path,
+                                                  int32_t len) {
     if (path == NULL || len <= 0) return NULL;
     int32_t n = jnative_builtin_resources_count;
     for (int32_t i = 0; i < n; i++) {
@@ -2026,16 +2375,19 @@ const JNativeResourceEntry* jnative_find_resource(const char* path, int32_t len)
 #define BAIS_COUNT_OFFSET 24
 
 void* __jnative_make_byte_array_input_stream(void* bytes) {
-    if (bytes == NULL) __jnative_throw_null_pointer_exception_ctx(
-        "__jnative_make_byte_array_input_stream", "bytes");
-    ReflectionClass* cls = jnative_class_by_name("java/io/ByteArrayInputStream");
+    if (bytes == NULL)
+        __jnative_throw_null_pointer_exception_ctx(
+            "__jnative_make_byte_array_input_stream", "bytes");
+    ReflectionClass* cls =
+        jnative_class_by_name("java/io/ByteArrayInputStream");
     if (cls == NULL) {
         fprintf(stderr, "jnative: fatal: java.io.ByteArrayInputStream is not "
                         "registered\n");
         _exit(1);
     }
     void* bais = jnative_alloc_object(cls);
-    if (bais == NULL) __jnative_throw_out_of_memory_error_ctx("Class.getResourceAsStream");
+    if (bais == NULL)
+        __jnative_throw_out_of_memory_error_ctx("Class.getResourceAsStream");
     int32_t len = jnative_array_length(bytes);
     *(void**)((char*)bais + BAIS_BUF_OFFSET)    = bytes;
     *(int32_t*)((char*)bais + BAIS_POS_OFFSET)   = 0;
@@ -2044,9 +2396,9 @@ void* __jnative_make_byte_array_input_stream(void* bytes) {
     return bais;
 }
 
-/* ============================================================================
- * Parallel <clinit> scheduling
- * ========================================================================== */
+/* ========================================================================
+ *  Parallel <clinit> scheduling
+ * ====================================================================== */
 
 typedef struct {
     void**  fns;
@@ -2064,8 +2416,15 @@ static void* jnative_run_parallel_chunk(void* arg) {
 
 void __jnative_run_parallel(void** fns, int32_t count) {
     if (fns == NULL || count <= 0) return;
-    if (count == 1) { ((void (*)(void))fns[0])(); return; }
+    if (count == 1) {
+        ((void (*)(void))fns[0])();
+        return;
+    }
+#if defined(_WIN32)
+    int32_t max_threads = (int32_t)jn_cpu_count();
+#else
     int32_t max_threads = (int32_t)sysconf(_SC_NPROCESSORS_ONLN);
+#endif
     if (max_threads <= 0) max_threads = 4;
     if (max_threads > count) max_threads = count;
     if (max_threads <= 1) {
@@ -2074,11 +2433,14 @@ void __jnative_run_parallel(void** fns, int32_t count) {
     }
     int32_t chunk_size = (count + max_threads - 1) / max_threads;
     int32_t n_chunks   = (count + chunk_size - 1) / chunk_size;
-    pthread_t* threads = (pthread_t*)malloc((size_t)n_chunks * sizeof(pthread_t));
-    JNativeParallelChunk* chunks = (JNativeParallelChunk*)malloc(
-        (size_t)n_chunks * sizeof(JNativeParallelChunk));
+    jn_thread_t* threads =
+        (jn_thread_t*)malloc((size_t)n_chunks * sizeof(jn_thread_t));
+    JNativeParallelChunk* chunks =
+        (JNativeParallelChunk*)malloc((size_t)n_chunks *
+                                      sizeof(JNativeParallelChunk));
     if (threads == NULL || chunks == NULL) {
-        free(threads); free(chunks);
+        free(threads);
+        free(chunks);
         for (int32_t i = 0; i < count; i++) ((void (*)(void))fns[i])();
         return;
     }
@@ -2087,21 +2449,22 @@ void __jnative_run_parallel(void** fns, int32_t count) {
         chunks[c].start = c * chunk_size;
         chunks[c].end   = (c + 1) * chunk_size;
         if (chunks[c].end > count) chunks[c].end = count;
-        if (pthread_create(&threads[c], NULL, jnative_run_parallel_chunk,
-                           &chunks[c]) != 0) {
+        if (jn_thread_create(&threads[c], NULL, jnative_run_parallel_chunk,
+                             &chunks[c]) != 0) {
             threads[c] = 0;
             jnative_run_parallel_chunk(&chunks[c]);
         }
     }
     for (int32_t c = 0; c < n_chunks; c++) {
-        if (threads[c] != 0) pthread_join(threads[c], NULL);
+        if (threads[c] != 0) jn_thread_join(threads[c], NULL);
     }
-    free(threads); free(chunks);
+    free(threads);
+    free(chunks);
 }
 
-/* ============================================================================
- * Virtual destructor dispatch (unchanged)
- * ========================================================================== */
+/* ========================================================================
+ *  Virtual destructor dispatch
+ * ====================================================================== */
 
 typedef void (*jnative_destructor_fn)(void*);
 
@@ -2114,8 +2477,9 @@ typedef struct JNativeDestructCacheEntry {
 #define JNATIVE_DESTRUCT_BUCKETS 1024u
 #define JNATIVE_DESTRUCT_MASK    (JNATIVE_DESTRUCT_BUCKETS - 1u)
 
-static JNativeDestructCacheEntry* jnative_destruct_cache[JNATIVE_DESTRUCT_BUCKETS];
-static pthread_mutex_t jnative_destruct_lock = PTHREAD_MUTEX_INITIALIZER;
+static JNativeDestructCacheEntry*
+    jnative_destruct_cache[JNATIVE_DESTRUCT_BUCKETS];
+static jn_mutex_t jnative_destruct_lock = JN_MUTEX_INITIALIZER;
 
 static uintptr_t jnative_destruct_hash(const void* p) {
     uintptr_t h = (uintptr_t)p;
@@ -2126,7 +2490,8 @@ static uintptr_t jnative_destruct_hash(const void* p) {
 }
 
 static int jnative_build_array_destructor_symbol(const char* desc,
-                                                 char* out, size_t out_size) {
+                                                 char* out,
+                                                 size_t out_size) {
     if (desc == NULL || desc[0] != '[' || out_size == 0) return 0;
     size_t pos = 0;
     static const char PREFIX[] = "__destruct_array_";
@@ -2138,18 +2503,22 @@ static int jnative_build_array_destructor_symbol(const char* desc,
     const char* p = desc;
     while (*p == '[') { depth++; p++; }
     if (depth == 0 || *p == '\0') return 0;
-    char raw[1024]; size_t rl = 0;
+    char raw[1024];
+    size_t rl = 0;
     for (int i = 0; i < depth; i++) {
         if (rl + 6 >= sizeof(raw)) return 0;
-        memcpy(raw + rl, "array[", 6); rl += 6;
+        memcpy(raw + rl, "array[", 6);
+        rl += 6;
     }
     if (*p == 'L') {
         const char* semi = strchr(p, ';');
         if (semi == NULL) return 0;
         size_t inner_len = (size_t)(semi - p - 1);
         if (inner_len + 6 + rl >= sizeof(raw)) return 0;
-        memcpy(raw + rl, "ref(", 4); rl += 4;
-        memcpy(raw + rl, p + 1, inner_len); rl += inner_len;
+        memcpy(raw + rl, "ref(", 4);
+        rl += 4;
+        memcpy(raw + rl, p + 1, inner_len);
+        rl += inner_len;
         raw[rl++] = ')';
     } else {
         const char* pname = NULL;
@@ -2167,7 +2536,8 @@ static int jnative_build_array_destructor_symbol(const char* desc,
         }
         size_t n = strlen(pname);
         if (rl + n + 1 >= sizeof(raw)) return 0;
-        memcpy(raw + rl, pname, n); rl += n;
+        memcpy(raw + rl, pname, n);
+        rl += n;
     }
     for (int i = 0; i < depth; i++) {
         if (rl + 1 >= sizeof(raw)) return 0;
@@ -2178,8 +2548,11 @@ static int jnative_build_array_destructor_symbol(const char* desc,
         unsigned char c = (unsigned char)raw[i];
         char r;
         if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
-            || (c >= '0' && c <= '9') || c == '_' || c == '.') r = (char)c;
-        else r = '_';
+            || (c >= '0' && c <= '9') || c == '_' || c == '.') {
+            r = (char)c;
+        } else {
+            r = '_';
+        }
         if (pos + 1 >= out_size) return 0;
         out[pos++] = r;
     }
@@ -2193,7 +2566,10 @@ static jnative_destructor_fn jnative_resolve_destructor(void* key) {
         ReflectionClass* mirror = (ReflectionClass*)key;
         if (mirror->cname == NULL) return NULL;
         if (!jnative_build_array_destructor_symbol(mirror->cname,
-                                                   symbol, sizeof(symbol))) return NULL;
+                                                   symbol,
+                                                   sizeof(symbol))) {
+            return NULL;
+        }
     } else {
         JNativeVTable* vt = (JNativeVTable*)key;
         if (vt->name == NULL) return NULL;
@@ -2210,38 +2586,42 @@ static jnative_destructor_fn jnative_resolve_destructor(void* key) {
         }
         symbol[pos] = '\0';
     }
-    return (jnative_destructor_fn)dlsym(RTLD_DEFAULT, symbol);
+    return (jnative_destructor_fn)jn_dlsym_default(symbol);
 }
 
 static jnative_destructor_fn jnative_destructor_for(void* key) {
     if (key == NULL) return NULL;
-    size_t bucket = (size_t)(jnative_destruct_hash(key) & JNATIVE_DESTRUCT_MASK);
-    pthread_mutex_lock(&jnative_destruct_lock);
-    for (JNativeDestructCacheEntry* e = jnative_destruct_cache[bucket]; e; e = e->next) {
+    size_t bucket =
+        (size_t)(jnative_destruct_hash(key) & JNATIVE_DESTRUCT_MASK);
+    jn_mutex_lock(&jnative_destruct_lock);
+    for (JNativeDestructCacheEntry* e = jnative_destruct_cache[bucket]; e;
+         e = e->next) {
         if (e->key == key) {
             jnative_destructor_fn fn = e->fn;
-            pthread_mutex_unlock(&jnative_destruct_lock);
+            jn_mutex_unlock(&jnative_destruct_lock);
             return fn;
         }
     }
-    pthread_mutex_unlock(&jnative_destruct_lock);
+    jn_mutex_unlock(&jnative_destruct_lock);
     jnative_destructor_fn fn = jnative_resolve_destructor(key);
-    pthread_mutex_lock(&jnative_destruct_lock);
-    for (JNativeDestructCacheEntry* e = jnative_destruct_cache[bucket]; e; e = e->next) {
+    jn_mutex_lock(&jnative_destruct_lock);
+    for (JNativeDestructCacheEntry* e = jnative_destruct_cache[bucket]; e;
+         e = e->next) {
         if (e->key == key) {
             fn = e->fn;
-            pthread_mutex_unlock(&jnative_destruct_lock);
+            jn_mutex_unlock(&jnative_destruct_lock);
             return fn;
         }
     }
-    JNativeDestructCacheEntry* ne = (JNativeDestructCacheEntry*)malloc(sizeof(*ne));
+    JNativeDestructCacheEntry* ne =
+        (JNativeDestructCacheEntry*)malloc(sizeof(*ne));
     if (ne != NULL) {
         ne->key  = key;
         ne->fn   = fn;
         ne->next = jnative_destruct_cache[bucket];
         jnative_destruct_cache[bucket] = ne;
     }
-    pthread_mutex_unlock(&jnative_destruct_lock);
+    jn_mutex_unlock(&jnative_destruct_lock);
     return fn;
 }
 

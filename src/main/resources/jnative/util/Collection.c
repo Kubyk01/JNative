@@ -1,3 +1,4 @@
+#include "jnative_platform.h"
 #include "jnative_runtime.h"
 
 extern void* __jnative_fn_java_lang_Object_getClass___Ljava_lang_Class_(void* obj);

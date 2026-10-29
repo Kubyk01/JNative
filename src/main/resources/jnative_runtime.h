@@ -256,12 +256,18 @@
 #ifndef JNATIVE_RUNTIME_H
 #define JNATIVE_RUNTIME_H
 
+#include "jnative_platform.h"
+
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
-#include <dlfcn.h>
+#if defined(_WIN32)
+#  include "jnative_dlfcn_win32.h"
+#else
+#  include <dlfcn.h>
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -269,16 +275,29 @@ extern "C" {
 
 /* ========================================================================
  *  Portability shims
+ *
+ *  JN_NORETURN / JN_WEAK / JN_UNUSED are the platform-selected
+ *  constructs (declspec on MSVC, __attribute__ on GCC/Clang). They are
+ *  defined once in jnative_platform.h. The three JNATIVE_* aliases
+ *  below are the only place this header introduces those names.
+ *
+ *  An earlier revision aliased JNATIVE_NORETURN / JNATIVE_WEAK /
+ *  JNATIVE_UNUSED twice — once to the JN_* forms, once directly to the
+ *  __attribute__ forms. The second alias shadowed the first and
+ *  produced -Wmacro-redefined on every translation unit that includes
+ *  this header. The #ifndef guards below mean the header is safe to
+ *  include any number of times, in any order relative to
+ *  jnative_platform.h.
  * ======================================================================== */
 
-#if defined(__GNUC__) || defined(__clang__)
-#  define JNATIVE_NORETURN __attribute__((noreturn))
-#  define JNATIVE_WEAK     __attribute__((weak))
-#  define JNATIVE_UNUSED   __attribute__((unused))
-#else
-#  define JNATIVE_NORETURN
-#  define JNATIVE_WEAK
-#  define JNATIVE_UNUSED
+#ifndef JNATIVE_NORETURN
+#  define JNATIVE_NORETURN JN_NORETURN
+#endif
+#ifndef JNATIVE_WEAK
+#  define JNATIVE_WEAK     JN_WEAK
+#endif
+#ifndef JNATIVE_UNUSED
+#  define JNATIVE_UNUSED   JN_UNUSED
 #endif
 
 #ifndef RTLD_DEFAULT
@@ -897,7 +916,10 @@ JNATIVE_NORETURN extern void __jnative_throw_array_index_out_of_bounds_ctx(
 JNATIVE_NORETURN extern void __jnative_throw_class_cast_exception_ctx(
         const char* caller);
 JNATIVE_NORETURN extern void __jnative_throw_arithmetic_exception_ctx(
-        const char* caller);
+    const char* caller);
+
+JNATIVE_NORETURN extern void __jnative_throw_io_ctx(const char* extra,
+                                                    const char* caller);
 
 JNATIVE_NORETURN extern void __jnative_throw_clone_not_supported_exception(void);
 JNATIVE_NORETURN extern void __jnative_throw_clone_not_supported_exception_ctx(

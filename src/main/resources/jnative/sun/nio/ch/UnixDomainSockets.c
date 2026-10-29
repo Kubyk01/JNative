@@ -1,16 +1,45 @@
 #define _GNU_SOURCE
+#include "jnative_platform.h"
 #include <stdint.h>
 #include <stddef.h>
-#include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 #include <errno.h>
-#include <fcntl.h>
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <sys/un.h>
+
+#if defined(_WIN32)
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <winsock2.h>
+#  include <ws2tcpip.h>
+#  include <afunix.h>
+#  include <io.h>
+#  include <stdint.h>
+#  define JNU_CLOSE(fd) closesocket((SOCKET)(uintptr_t)(fd))
+#  define JNU_UNLINK _unlink
+#else
+#  include <sys/types.h>
+#  include <sys/socket.h>
+#  include <sys/un.h>
+#  include <unistd.h>
+#  include <fcntl.h>
+#  define JNU_CLOSE(fd) close(fd)
+#  define JNU_UNLINK unlink
+#endif
 
 #include "jnative_runtime.h"
+
+static int jnu_set_nonblocking(int fd, int enable) {
+#if defined(_WIN32)
+    u_long mode = enable ? 1u : 0u;
+    return ioctlsocket((SOCKET)(uintptr_t)fd, FIONBIO, &mode);
+#else
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0) return -1;
+    if (enable) flags |= O_NONBLOCK;
+    else        flags &= ~O_NONBLOCK;
+    return fcntl(fd, F_SETFL, flags);
+#endif
+}
 
 /*
  * sun.nio.ch.UnixDomainSockets — the Unix-domain-socket backend for
@@ -99,17 +128,9 @@ int32_t __jnative_fn_sun_nio_ch_UnixDomainSockets_socket0__ZZZ_I(
     }
 
     if (!block) {
-        int flags = fcntl(fd, F_GETFL, 0);
-        if (flags < 0) {
+        if (jnu_set_nonblocking(fd, 1) < 0) {
             int saved = errno;
-            close(fd);
-            errno = saved;
-            __jnative_throw_exception(NULL);
-            return -1;
-        }
-        if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
-            int saved = errno;
-            close(fd);
+            JNU_CLOSE(fd);
             errno = saved;
             __jnative_throw_exception(NULL);
             return -1;

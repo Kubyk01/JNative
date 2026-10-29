@@ -1,9 +1,8 @@
-#define _GNU_SOURCE
-#include <dlfcn.h>
+#include "jnative_platform.h"
+#include "jnative_portability.h"
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-#include <execinfo.h>
 #include "jnative_runtime.h"
 
 /*
@@ -52,19 +51,26 @@ static struct ReflectionClass* lookup_class(const char* name) {
 
 void* __jnative_fn_java_lang_SecurityManager_getClassContext____Ljava_lang_Class_(void) {
     void* frames[256];
-    int frame_count = backtrace(frames, 256);
+    int frame_count = jn_backtrace(frames, 256);
 
     struct ReflectionClass* classes[256];
     int class_count = 0;
 
     for (int i = 0; i < frame_count; i++) {
-        Dl_info info;
-        if (dladdr(frames[i], &info) == 0) continue;
-        if (!info.dli_sname) continue;
+        jn_dl_info info;
+        if (!jn_dladdr(frames[i], &info)) continue;
+        if (!info.dli_sname) {
+            jn_dl_info_free(&info);
+            continue;
+        }
 
         char class_name[512];
-        if (!extract_class_name(info.dli_sname, class_name, sizeof(class_name))) continue;
+        if (!extract_class_name(info.dli_sname, class_name, sizeof(class_name))) {
+            jn_dl_info_free(&info);
+            continue;
+        }
         struct ReflectionClass* cls = lookup_class(class_name);
+        jn_dl_info_free(&info);
         if (!cls) continue;
 
         if (class_count > 0 && classes[class_count - 1] == cls) continue;

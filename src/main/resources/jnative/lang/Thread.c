@@ -1,12 +1,11 @@
 #define _GNU_SOURCE
-#include <pthread.h>
+#include "jnative_platform.h"
 #include <time.h>
 #include <sched.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <errno.h>
-#include <unistd.h>
 
 #include "jnative_runtime.h"
 
@@ -112,9 +111,9 @@ static _Alignas(8) int64_t jnative_next_tid = 1;
 typedef struct ThreadState {
     void* java_thread;
     void* carrier_thread;
-    pthread_t pthread;
-    pthread_mutex_t mutex;
-    pthread_cond_t cond;
+    jn_thread_t pthread;
+    jn_mutex_t mutex;
+    jn_cond_t cond;
     int running;
     int started;
     int finished;
@@ -131,7 +130,7 @@ typedef struct ThreadState {
     struct ThreadState* next;
 } ThreadState;
 
-static pthread_mutex_t thread_table_lock = PTHREAD_MUTEX_INITIALIZER;
+static jn_mutex_t thread_table_lock = JN_MUTEX_INITIALIZER;
 static ThreadState* thread_table = NULL;
 static _Thread_local ThreadState* tls_state = NULL;
 static ThreadState* main_thread_state = NULL;
@@ -315,29 +314,29 @@ static void* create_thread_object(void) {
 
 static ThreadState* find_thread_state(void* java_thread) {
     if (!java_thread) return NULL;
-    pthread_mutex_lock(&thread_table_lock);
+    jn_mutex_lock(&thread_table_lock);
     for (ThreadState* s = thread_table; s; s = s->next) {
         if (s->java_thread == java_thread) {
-            pthread_mutex_unlock(&thread_table_lock);
+            jn_mutex_unlock(&thread_table_lock);
             return s;
         }
     }
-    pthread_mutex_unlock(&thread_table_lock);
+    jn_mutex_unlock(&thread_table_lock);
     return NULL;
 }
 
 static ThreadState* get_or_create_thread_state(void* java_thread) {
     if (!java_thread) return NULL;
-    pthread_mutex_lock(&thread_table_lock);
+    jn_mutex_lock(&thread_table_lock);
     for (ThreadState* s = thread_table; s; s = s->next) {
         if (s->java_thread == java_thread) {
-            pthread_mutex_unlock(&thread_table_lock);
+            jn_mutex_unlock(&thread_table_lock);
             return s;
         }
     }
     ThreadState* s = calloc(1, sizeof(ThreadState));
     if (!s) {
-        pthread_mutex_unlock(&thread_table_lock);
+        jn_mutex_unlock(&thread_table_lock);
         return NULL;
     }
     s->java_thread = java_thread;
@@ -348,7 +347,7 @@ static ThreadState* get_or_create_thread_state(void* java_thread) {
      * and the layout is guaranteed to arrive before any user-visible
      * thread operation. */
     if (THREAD_TID_OFFSET < 0) {
-        pthread_mutex_unlock(&thread_table_lock);
+        jn_mutex_unlock(&thread_table_lock);
         return s;
     }
     s->tid = *(int64_t*)((char*)java_thread + THREAD_TID_OFFSET);
@@ -368,7 +367,7 @@ static ThreadState* get_or_create_thread_state(void* java_thread) {
     pthread_cond_init(&s->cond, NULL);
     s->next = thread_table;
     thread_table = s;
-    pthread_mutex_unlock(&thread_table_lock);
+    jn_mutex_unlock(&thread_table_lock);
     return s;
 }
 
@@ -379,14 +378,14 @@ static ThreadState* get_or_create_thread_state(void* java_thread) {
  */
 static ThreadState* ensure_main_thread(void) {
     if (main_thread_state) return main_thread_state;
-    pthread_mutex_lock(&thread_table_lock);
+    jn_mutex_lock(&thread_table_lock);
     if (main_thread_state) {
-        pthread_mutex_unlock(&thread_table_lock);
+        jn_mutex_unlock(&thread_table_lock);
         return main_thread_state;
     }
     ThreadState* s = calloc(1, sizeof(ThreadState));
     if (!s) {
-        pthread_mutex_unlock(&thread_table_lock);
+        jn_mutex_unlock(&thread_table_lock);
         return NULL;
     }
     s->java_thread = create_thread_object();
@@ -404,7 +403,7 @@ static ThreadState* ensure_main_thread(void) {
     thread_table = s;
     main_thread_state = s;
     tls_state = s;
-    pthread_mutex_unlock(&thread_table_lock);
+    jn_mutex_unlock(&thread_table_lock);
     return s;
 }
 
@@ -426,21 +425,21 @@ static void* thread_entry(void* arg) {
 
     tls_state = s;
 
-    pthread_mutex_lock(&s->mutex);
+    jn_mutex_lock(&s->mutex);
     s->running = 1;
-    pthread_cond_broadcast(&s->cond);
-    pthread_mutex_unlock(&s->mutex);
+    jn_cond_broadcast(&s->cond);
+    jn_mutex_unlock(&s->mutex);
 
     if (runnable) {
         extern void __jnative_invoke_runnable(void* runnable);
         __jnative_invoke_runnable(runnable);
     }
 
-    pthread_mutex_lock(&s->mutex);
+    jn_mutex_lock(&s->mutex);
     s->running = 0;
     s->finished = 1;
-    pthread_cond_broadcast(&s->cond);
-    pthread_mutex_unlock(&s->mutex);
+    jn_cond_broadcast(&s->cond);
+    jn_mutex_unlock(&s->mutex);
     return NULL;
 }
 
@@ -482,7 +481,7 @@ void __jnative_fn_java_lang_Thread_sleep__J(long millis) {
     struct timespec req, rem;
     req.tv_sec = millis / 1000;
     req.tv_nsec = (millis % 1000) * 1000000L;
-    while (nanosleep(&req, &rem) == -1 && errno == EINTR) {
+    while (jn_sleep_ns_ns(&req, &rem) == -1 && errno == EINTR) {
         if (tls_state && tls_state->interrupted) {
             tls_state->interrupted = 0;
             __jnative_throw_exception(NULL);
@@ -492,7 +491,7 @@ void __jnative_fn_java_lang_Thread_sleep__J(long millis) {
 }
 
 void __jnative_fn_java_lang_Thread_yield__V(void) {
-    sched_yield();
+    jn_yield();
 }
 
 /*
@@ -522,14 +521,14 @@ void __jnative_fn_java_lang_Thread_start__V(void* this_thread) {
         __jnative_throw_exception(NULL);
         return;
     }
-    pthread_mutex_lock(&s->mutex);
+    jn_mutex_lock(&s->mutex);
     if (s->started) {
-        pthread_mutex_unlock(&s->mutex);
+        jn_mutex_unlock(&s->mutex);
         __jnative_throw_exception(NULL);
         return;
     }
     s->started = 1;
-    pthread_mutex_unlock(&s->mutex);
+    jn_mutex_unlock(&s->mutex);
 
     StartArgs* sa = malloc(sizeof(StartArgs));
     if (!sa) {
@@ -544,7 +543,7 @@ void __jnative_fn_java_lang_Thread_start__V(void* this_thread) {
     if (s->stack_size > 0) {
         pthread_attr_setstacksize(&attr, (size_t)s->stack_size);
     }
-    int rc = pthread_create(&s->pthread, &attr, thread_entry, sa);
+    int rc = jn_thread_create(&s->pthread, &attr, thread_entry, sa);
     pthread_attr_destroy(&attr);
     if (rc != 0) {
         free(sa);
@@ -572,10 +571,10 @@ void __jnative_fn_java_lang_Thread_interrupt0___V(void* this_thread) {
     }
     ThreadState* s = find_thread_state(this_thread);
     if (!s) return;
-    pthread_mutex_lock(&s->mutex);
+    jn_mutex_lock(&s->mutex);
     s->interrupted = 1;
-    pthread_cond_broadcast(&s->cond);
-    pthread_mutex_unlock(&s->mutex);
+    jn_cond_broadcast(&s->cond);
+    jn_mutex_unlock(&s->mutex);
 }
 
 void __jnative_fn_java_lang_Thread_interrupt__V(void* this_thread) {
@@ -595,10 +594,10 @@ int __jnative_fn_java_lang_Thread_isInterrupted__Z(void* this_thread, int clearI
     if (!this_thread) return 0;
     ThreadState* s = find_thread_state(this_thread);
     if (!s) return 0;
-    pthread_mutex_lock(&s->mutex);
+    jn_mutex_lock(&s->mutex);
     int old = s->interrupted;
     if (clearInterrupted) s->interrupted = 0;
-    pthread_mutex_unlock(&s->mutex);
+    jn_mutex_unlock(&s->mutex);
     return old;
 }
 
@@ -606,9 +605,9 @@ void __jnative_fn_java_lang_Thread_clearInterrupt__V(void* this_thread) {
     if (!this_thread) return;
     ThreadState* s = find_thread_state(this_thread);
     if (!s) return;
-    pthread_mutex_lock(&s->mutex);
+    jn_mutex_lock(&s->mutex);
     s->interrupted = 0;
-    pthread_mutex_unlock(&s->mutex);
+    jn_mutex_unlock(&s->mutex);
 }
 
 /*
@@ -744,20 +743,20 @@ void __jnative_fn_java_lang_Thread_join__J_V(void* this_thread, int64_t millis) 
     if (!this_thread) return;
     ThreadState* s = find_thread_state(this_thread);
     if (!s || !s->started) return;
-    pthread_mutex_lock(&s->mutex);
+    jn_mutex_lock(&s->mutex);
     if (millis <= 0) {
-        while (!s->finished) pthread_cond_wait(&s->cond, &s->mutex);
+        while (!s->finished) jn_cond_wait(&s->cond, &s->mutex);
     } else {
         struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
+        jn_now_realtime(&ts);
         ts.tv_sec += millis / 1000;
         ts.tv_nsec += (millis % 1000) * 1000000L;
         if (ts.tv_nsec >= 1000000000) { ts.tv_sec++; ts.tv_nsec -= 1000000000; }
         while (!s->finished) {
-            if (pthread_cond_timedwait(&s->cond, &s->mutex, &ts) == ETIMEDOUT) break;
+            if (jn_cond_timedwait(&s->cond, &s->mutex, &ts) == ETIMEDOUT) break;
         }
     }
-    pthread_mutex_unlock(&s->mutex);
+    jn_mutex_unlock(&s->mutex);
 }
 
 /*
@@ -779,11 +778,11 @@ void __jnative_fn_java_lang_Thread_exit__V(void* this_thread) {
     if (!this_thread) return;
     ThreadState* s = find_thread_state(this_thread);
     if (s) {
-        pthread_mutex_lock(&s->mutex);
+        jn_mutex_lock(&s->mutex);
         s->running = 0;
         s->finished = 1;
-        pthread_cond_broadcast(&s->cond);
-        pthread_mutex_unlock(&s->mutex);
+        jn_cond_broadcast(&s->cond);
+        jn_mutex_unlock(&s->mutex);
     }
 }
 
@@ -934,7 +933,7 @@ void __jnative_fn_java_lang_Thread_registerNatives___V(void* arg) {
  * Thread.getAllStackTraces being defined for every program state.
  */
 void* __jnative_fn_java_lang_Thread_getThreads____Ljava_lang_Thread_(void) {
-    pthread_mutex_lock(&thread_table_lock);
+    jn_mutex_lock(&thread_table_lock);
 
     int32_t count = 0;
     for (ThreadState* s = thread_table; s; s = s->next) {
@@ -954,7 +953,7 @@ void* __jnative_fn_java_lang_Thread_getThreads____Ljava_lang_Thread_(void) {
         }
     }
 
-    pthread_mutex_unlock(&thread_table_lock);
+    jn_mutex_unlock(&thread_table_lock);
 
     if (array == NULL) {
         __jnative_throw_out_of_memory_error_ctx("Thread.getThreads");

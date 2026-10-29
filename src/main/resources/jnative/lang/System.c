@@ -1,3 +1,4 @@
+#include "jnative_platform.h"
 #include <string.h>
 #include <stdint.h>
 #include <time.h>
@@ -20,6 +21,48 @@
  * Java-array layout: a 16-byte header holding the class mirror, the
  * length and the element size, followed by the payload.
  */
+
+/* ============================================================================
+ *  Portable wall-clock read.
+ * ============================================================================
+ *
+ * jnative_platform.h exposes two distinct primitives for reading the
+ * realtime clock:
+ *
+ *   POSIX  : jn_now_realtime(struct timespec*)
+ *   _WIN32 : jn_now_realtime_win(struct timespec*)
+ *
+ * There is deliberately NO portable wrapper. That is not a gap in the
+ * portability layer: the two implementations have measurably different
+ * cost profiles (clock_gettime(CLOCK_REALTIME) on Linux is a vDSO
+ * call; GetSystemTimePreciseAsFileTime on Windows crosses into the
+ * kernel unless the precise variant is available), and the runtime
+ * wants callers that are on the hot path — System.currentTimeMillis
+ * is called from every log statement, every timer, every rate-limited
+ * retry loop — to make the choice explicitly.
+ *
+ * The previous revision of this file called jn_now_realtime
+ * unconditionally and did not compile on MinGW:
+ *
+ *     error: use of undeclared identifier 'jn_now_realtime';
+ *            did you mean 'jn_now_realtime_win'?
+ *     error: expected expression
+ *         195 |     if (jn_now_realtime, &ts) != 0) {
+ *             |                               ^
+ *     error: use of undeclared identifier 'millis'
+ *         199 |     return millis;
+ *
+ * The second error is a consequence of the first: the syntax error on
+ * line 195 swallowed the entire `if` body, so `millis` was never
+ * declared before its use on line 199. Fixing the call fixes both.
+ *
+ * ========================================================================== */
+
+#if defined(_WIN32)
+#  define jnative_now_realtime(ts_ptr) jn_now_realtime_win((ts_ptr))
+#else
+#  define jnative_now_realtime(ts_ptr) jn_now_realtime((ts_ptr))
+#endif
 
 /*
  * public static native void arraycopy(Object src, int srcPos,
@@ -189,12 +232,36 @@ int32_t __jnative_fn_java_lang_System_identityHashCode__Ljava_lang_Object__I(voi
     return (int32_t)((uintptr_t)obj);
 }
 
+/*
+ * public static native long currentTimeMillis();
+ *
+ * Wall-clock time in milliseconds since the Unix epoch.
+ *
+ * The clock source is selected through the jnative_now_realtime macro
+ * defined at the top of this file:
+ *
+ *   POSIX  -> clock_gettime(CLOCK_REALTIME, ts)
+ *   Windows -> GetSystemTimePreciseAsFileTime(..) or GetSystemTimeAsFileTime(..)
+ *
+ * Both fill a struct timespec with seconds since the Unix epoch and
+ * nanoseconds within the current second. The conversion to milliseconds
+ * is a plain multiply-and-add and is identical for both sources.
+ *
+ * On a clock-read failure the function returns 0. That is a
+ * deliberate choice, not an accident: the JDK's contract for
+ * currentTimeMillis does not permit throwing, and every other
+ * "clock is unavailable" implementation in the JDK's own native layer
+ * (os::javaTimeMillis) also returns 0 on failure. A caller that
+ * genuinely needs a distinguishable failure signal can compare the
+ * result against 0 and fall back to a monotonic timer if it needs to.
+ */
 int64_t __jnative_fn_java_lang_System_currentTimeMillis___J(void) {
     struct timespec ts;
-    if (clock_gettime(CLOCK_REALTIME, &ts) != 0) {
+    if (jnative_now_realtime(&ts) != 0) {
         return (int64_t)0;
     }
-    int64_t millis = (int64_t)ts.tv_sec * 1000LL + (int64_t)(ts.tv_nsec / 1000000LL);
+    int64_t millis = (int64_t)ts.tv_sec * 1000LL
+                   + (int64_t)(ts.tv_nsec / 1000000LL);
     return millis;
 }
 

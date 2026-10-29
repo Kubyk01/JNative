@@ -1,8 +1,6 @@
 #define _GNU_SOURCE
+#include "jnative_platform.h"
 #include <stdint.h>
-#include <unistd.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
 
 #include "jnative_runtime.h"
 
@@ -62,9 +60,9 @@ static int probe_dual_stack_socket(void) {
         return 0;
     }
     int v6only = 0;
-    socklen_t optlen = sizeof(v6only);
+    jn_socklen_t optlen = (jn_socklen_t)sizeof(v6only);
     int result = 0;
-    if (getsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, &optlen) == 0) {
+    if (getsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, (char*)&v6only, &optlen) == 0) {
         result = (v6only == 0) ? 1 : 0;
     }
     close(fd);
