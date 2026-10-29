@@ -97,7 +97,7 @@ public class DestructorInserter {
         // __destruct_* symbol for every type that has a NEW/NEW_ARRAY in
         // the module.
         // ------------------------------------------------------------------
-        int instrumented = instrumentFieldOverwrites(lifetimeResult.getLiveOut());
+        int instrumented = instrumentFieldOverwrites(lifetimeResult);
         if (instrumented > 0) {
             log.info("DestructorInserter: instrumented {} field-overwrite release(s)",
                 instrumented);
@@ -210,11 +210,14 @@ public class DestructorInserter {
      *
      * @return the number of blocks that were processed
      */
-    private int instrumentFieldOverwrites(
-        Map<BasicBlock, Set<AllocationSite>> liveOut) {
-        if (liveOut == null || liveOut.isEmpty()) {
-            log.warn("DestructorInserter: no live-out map was published; "
-                + "field-overwrite releases will not be emitted.");
+    private int instrumentFieldOverwrites(LifetimeAnalysisResult livenessResult) {
+        // A `null` liveOutQuery means liveness ran but produced no per-block
+        // data — which after the bitset refactor can only happen when the
+        // module contains no live functions. In that case nothing can be
+        // instrumented.
+        if (livenessResult == null) {
+            log.warn("DestructorInserter: no liveness result; field-overwrite "
+                   + "releases will not be emitted.");
             return 0;
         }
 
@@ -227,10 +230,8 @@ public class DestructorInserter {
         int processed = 0;
         while (!pending.isEmpty()) {
             BasicBlock block = pending.poll();
-            BasicBlock tail = instrumentOneBlock(block, liveOut);
-            if (tail != null) {
-                pending.add(tail);
-            }
+            BasicBlock tail = instrumentOneBlock(block, livenessResult);
+            if (tail != null) pending.add(tail);
             processed++;
         }
         return processed;
@@ -245,14 +246,14 @@ public class DestructorInserter {
      */
     private BasicBlock instrumentOneBlock(
         BasicBlock block,
-        Map<BasicBlock, Set<AllocationSite>> liveOut) {
+        LifetimeAnalysisResult livenessResult) {
         List<Instruction> insts = block.getInstructions();
         int i = 0;
         while (i < insts.size()) {
             Instruction inst = insts.get(i);
             if (inst.getOpcode() != Opcode.PUT_FIELD
                 || !shouldInstrumentPutField(inst)
-                || !oldValueIsDead(inst, block, liveOut)) {
+                || !oldValueIsDead(inst, block, livenessResult)) {
                 i++;
                 continue;
             }
@@ -859,44 +860,36 @@ public class DestructorInserter {
     }
 
     /**
-     * Returns true iff the field's previous value is provably dead at the
-     * PUT_FIELD — i.e. no allocation site that could currently be stored
-     * in the field is live on exit from the block, and no such site is
-     * read by any instruction following the PUT_FIELD within the same
-     * block.
+     * Returns {@code true} iff the field's previous value is provably dead
+     * at the {@code PUT_FIELD}. The liveness half of the decision has been
+     * precomputed by {@link LifetimeAnalyzer} into
+     * {@link LifetimeAnalysisResult#getFieldOverwriteLivenessGates}; the
+     * remaining half (no later read of the field in the same block) is
+     * evaluated here because it does not consult liveness.
      *
-     * <p>If this returns false, the previous value might be held by a
-     * live local variable, a parameter, or an array element (the
-     * HashMap.resize case), and the release must not be emitted: freeing
-     * it would break the subsequent use.</p>
-     *
-     * <p><b>Direction of error.</b> The check errs on the side of
-     * <em>not</em> releasing. Every path that could conceivably be a
-     * legitimate case of "the field's previous value is still observable
-     * somewhere" returns false, so the pass can only under-release. That
-     * is a leak, which the containing object's own destructor chain (or
-     * the shutdown pass) will eventually reclaim. Over-release — which
-     * the pass must never do — would be a use-after-free, and the entire
-     * reason this pass has a liveness gate at all is that the obvious
-     * "any field overwrite means the old value is dead" rule produces
-     * exactly that use-after-free in HashMap.resize.</p>
+     * <p>The semantics are unchanged from previous revisions. The only
+     * difference is where the liveness test runs: instead of querying a
+     * per-block {@code Set<AllocationSite>} through the analyser (whose
+     * backing storage for every block in the module was the source of the
+     * OOM this patch eliminates), the boolean result of that query is read
+     * back from the precomputed gate map.</p>
      */
-    private boolean oldValueIsDead(
-        Instruction putField,
-        BasicBlock block,
-        Map<BasicBlock, Set<AllocationSite>> liveOut) {
+    private boolean oldValueIsDead(Instruction putField,
+                                   BasicBlock block,
+                                   LifetimeAnalysisResult lifetimeResult) {
+        if (!lifetimeResult.isFieldOverwriteLivenessGatePassed(putField)) {
+            return false;
+        }
 
+        // ---- Same-block, later-instruction gate. -----------------------
+        //
+        // Not liveness-related: scanning forward from the PUT_FIELD for any
+        // subsequent operand (instruction or terminator) that could reach a
+        // site the field might currently hold.
         if (putField.getOperands().size() < 2) return false;
 
-        Value base       = putField.getOperands().get(0);
+        Value base = putField.getOperands().get(0);
         Value fieldConst = putField.getOperands().get(1);
-
-        // Only a field-name constant (the canonical "owner.Class.name"
-        // key emitted by InstructionHandlers.getField / putField) has a
-        // resolvable points-to identity. An integer-offset constant
-        // (from an Unsafe-style manual field access) has no such
-        // identity, and the analysis carries no information about what
-        // the integer-offset store overwrote; conservatively skip it.
         if (!(fieldConst instanceof Constant c) || !c.getType().isReference()) {
             return false;
         }
@@ -906,79 +899,13 @@ public class DestructorInserter {
         PointsToSet fieldSites =
             aliasResult.getFieldPointsToForSites(baseSites, fieldKey);
 
-        // ------------------------------------------------------------------
-        // The analysis has no record of anything having been stored into
-        // this field on any base reachable from `base`. Two situations
-        // produce that:
-        //
-        //   1. The field is genuinely fresh (never written since the
-        //      object was allocated). Its runtime value is null, and
-        //      dispatching on null is a no-op. Emitting the release is
-        //      harmless — and unnecessary. Not emitting it is also
-        //      harmless. We choose "not emitting" because that keeps
-        //      the emitted IR smaller.
-        //
-        //   2. The analysis under-approximated the field's contents. In
-        //      that case we cannot reason about liveness at all, and
-        //      emitting a release risks freeing a still-live value.
-        //
-        // Both cases are handled by the same conservative answer: skip.
-        // The cost of the skip is a leak that the container's own
-        // destructor will reclaim; the cost of the alternative would be
-        // a use-after-free.
-        // ------------------------------------------------------------------
-        if (fieldSites.isEmpty() || fieldSites.containsUnknown()) {
-            return false;
-        }
-
-        // ------------------------------------------------------------------
-        // Block-level liveness gate.
-        //
-        // If the map has no entry for this block, liveness information is
-        // unavailable for it (the analyzer never ran, or the block was
-        // created after the analysis). Conservatively do not emit.
-        //
-        // Otherwise: if ANY site that could currently be in the field is
-        // live on exit from the block, the loaded old value might be that
-        // site's object. Freeing it would break the live reference. The
-        // check runs over the field's whole points-to set, not over a
-        // single site, because the whole set is what the runtime can
-        // observe in the field.
-        // ------------------------------------------------------------------
-        Set<AllocationSite> liveOutSet = liveOut.get(block);
-        if (liveOutSet == null) {
-            return false;
-        }
-        for (AllocationSite site : fieldSites.getSites()) {
-            if (liveOutSet.contains(site)) {
-                return false;
-            }
-        }
-
-        // ------------------------------------------------------------------
-        // Same-block, later-instruction gate.
-        //
-        // Block-level live-out only covers values used in successor
-        // blocks. A value used by an instruction that appears later in
-        // the *same* block is invisible to liveOut. Scan forward from the
-        // PUT_FIELD and check whether any subsequent instruction's
-        // operand — or the block's terminator's operand — can reach one
-        // of the field's sites.
-        //
-        // The terminator is scanned explicitly because a value can be
-        // consumed by the terminator alone (a RETURN of a value loaded
-        // from the field, a COND_BRANCH on a boolean read from the field,
-        // etc.).
-        // ------------------------------------------------------------------
         List<Instruction> insts = block.getInstructions();
         int idx = insts.indexOf(putField);
         if (idx >= 0) {
             for (int i = idx + 1; i < insts.size(); i++) {
                 for (Value op : insts.get(i).getOperands()) {
                     if (op == null) continue;
-                    if (operandReachesAnySite(op, fieldSites)) {
-                        return false;
-                    }
+                    if (operandReachesAnySite(op, fieldSites)) return false;
                 }
             }
         }
@@ -986,9 +913,7 @@ public class DestructorInserter {
         if (term != null) {
             for (Value op : terminatorOperands(term)) {
                 if (op == null) continue;
-                if (operandReachesAnySite(op, fieldSites)) {
-                    return false;
-                }
+                if (operandReachesAnySite(op, fieldSites)) return false;
             }
         }
 
