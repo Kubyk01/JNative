@@ -68,38 +68,15 @@ import static io.github.kubyk01.util.LlvmUtil.isAllocation;
 /**
  * Orchestrates the analysis pipeline for a compiled module.
  *
- * <h2>Parallelism</h2>
+ * Parallelism: every parallel phase runs on a scheduler owned by the
+ * Orchestrator (set via setScheduler). No parallelStream() anywhere;
+ * ForkJoinPool.commonPool() is not used. The default single() keeps
+ * the class usable from unit tests.
  *
- * <p>Every parallel phase in this class — the call-graph construction,
- * the scope/nested-clinit construction, the triggered-class collection,
- * the field writer/reader collection, and the lazy-clinit
- * instrumentation — runs on the {@link Scheduler} that
- * {@link io.github.kubyk01.application.service.Orchestrator} creates
- * once and hands in through {@link #setScheduler(Scheduler)}. The class
- * never calls {@code parallelStream()} and therefore never touches
- * {@code ForkJoinPool.commonPool()}; the {@code common.parallelism}
- * system property is irrelevant to it.</p>
- *
- * <p>The scheduler is not owned by this class. The orchestrator disposes
- * it after the analysis pipeline has finished; the default
- * {@link Schedulers#single()} that is used when no scheduler has been
- * provided keeps the class usable from unit tests that never touch the
- * reactor runtime at all.</p>
- *
- * <h2>Removed pre-analysis pass</h2>
- *
- * <p>Earlier revisions of this class ran a separate {@link AliasAnalyzer}
- * pass over a synthetic {@link Module} containing only the {@code <clinit>}
- * bodies, immediately before the real alias analysis. That pre-pass was
- * dead code: its result was thrown away, and the same functions were
- * re-analyzed a few lines later as part of the full module. It doubled
- * the cost of the two fixed-point passes inside {@link AliasAnalyzer}
- * (the summary builder and the points-to propagation) for every class
- * initializer in the image, and on a full JDK reachability closure it
- * was the dominant contributor to wall-clock time. It has been removed;
- * the single remaining pass over the full module already covers every
- * {@code <clinit>} body, because the sort that precedes it only reorders
- * the functions, it does not remove them.</p>
+ * An earlier revision ran a second AliasAnalyzer pass over a synthetic
+ * Module containing only <clinit> bodies; its result was discarded, and
+ * the same bodies were re-analyzed a few lines later as part of the
+ * full module. It doubled the cost of both fixed points. Removed.
  */
 @Slf4j
 public class Analyzer {
@@ -180,41 +157,15 @@ public class Analyzer {
                 + " missing native-method symbol(s).");
         }
 
-        // ------------------------------------------------------------------
-        // Close over the IR callees of every function resurrected above.
-        //
-        // resurrectRemovedClinits and ensureReferencedClinitsPresent add
-        // <clinit> bodies directly to the module via retranslateClinit,
-        // which builds only the one function it is asked for and does not
-        // walk its outgoing call graph. The bodies it produces therefore
-        // reference their class's constructor <init>(...)V and the
-        // synthetic $values() method by mangled name, without either
-        // method having been translated into the module.
-        //
-        // The orchestrator's initial translate() pass would normally have
-        // caught those missing callees through closeOverIrCallees(), but
-        // that pass has already completed by the time this code runs: it
-        // executes inside BytecodeToIr.translate(), long before Analyzer
-        // is constructed. Without a second closure pass here, every call
-        // site inside a resurrected <clinit> reaches the LLVM emitter
-        // with a callee that has no body, and the emitter converts each
-        // one into a call to __jnative_unresolved_slot followed by
-        // unreachable.
-        //
-        // The concrete failure this closes is documented in the fun.txt
-        // report: a resurrected
-        // java/net/Authenticator$RequestorType.<clinit> called both
-        // RequestorType.<init>(Ljava/lang/String;I)V and
-        // RequestorType.$values(), neither of which was in the module,
-        // and the resulting trap fired before main() had produced any
-        // observable output.
-        //
-        // The closure is applied unconditionally rather than only when
-        // resurrected + ensured > 0: it is a no-op when there is nothing
-        // to translate, and gating it on a counter would silently miss a
-        // future caller that adds functions to the module by another
-        // route.
-        // ------------------------------------------------------------------
+        // Close over IR callees of resurrected functions. retranslateClinit
+        // builds only one function and does not walk its call graph; the
+        // orchestrator's translate() closure has already run before Analyzer
+        // is constructed, so without this second pass a resurrected <clinit>
+        // that calls its class's <init> or $values() reaches the LLVM emitter
+        // with a missing callee and traps at __jnative_unresolved_slot.
+        // Unconditional — a no-op when there is nothing to translate, and
+        // gating it on a counter would miss a future caller that adds
+        // functions another way.
         if (translator != null) {
             translator.closeOverIrCalleesWithSsa();
         }
@@ -732,61 +683,22 @@ public class Analyzer {
     }
 
     /**
-     * Collects the internal names of every class whose static initialization
-     * must be scheduled into the compiled image.
+     * Collects internal names of every class whose static initializer must be
+     * scheduled. Closure of:
      *
-     * <p>The result is the closure of two relations:</p>
+     *   1. Explicit bytecode references: getstatic/putstatic/new, and
+     *      invokestatic into a non-native method. Native static calls are
+     *      excluded: JVMS §5.5 does not initialize the class for them.
      *
-     * <ol>
-     *   <li>Every class referenced explicitly from the compiled bytecode:
-     *       by a {@code getstatic}/{@code putstatic}, a {@code new}, an
-     *       {@code invokestatic} (the trigger owners), or by the owner of a
-     *       direct call ({@code CALL}). A call whose target is a
-     *       {@code native} method is excluded, because such an invocation
-     *       does not trigger class initialization. This is what the previous
-     *       revision computed, and it is what the ordinary reachability walk
-     *       already discovers.</li>
+     *   2. The transitive superclass chain. JVMS §5.5 requires a superclass
+     *      <clinit> to run before the subclass's, but no bytecode expresses
+     *      that edge, so a class that appears only as an ancestor is
+     *      missed otherwise. Missing java.security.SecureClassLoader
+     *      .<clinit> in particular caused "InternalError: Unable to
+     *      register as parallel capable" on BuiltinClassLoader.
      *
-     *   <li>The transitive superclass closure of the first set. JVMS §5.5
-     *       guarantees that a class's superclass is initialized before the
-     *       class itself, but that rule is enforced by the VM, not by the
-     *       bytecode: no compiled program ever contains an explicit
-     *       "initialize the superclass of this class" instruction. A class
-     *       that participates only as a superclass — it is never
-     *       instantiated, has no static field read or written from the
-     *       image, and has no static method called — would therefore be
-     *       missing from the first set, and its {@code <clinit>} would
-     *       never be resurrected into the module.</li>
-     * </ol>
-     *
-     * <p>The concrete failure this closure fixes is
-     * {@code java.security.SecureClassLoader}: it is the direct superclass
-     * of {@code jdk.internal.loader.BuiltinClassLoader}, it is abstract,
-     * and nothing in the compiled image references it directly. Its
-     * {@code <clinit>} body is
-     * <pre>
-     *     static { ClassLoader.registerAsParallelCapable(); }
-     * </pre>
-     * and {@code ClassLoader.registerAsParallelCapable} consults
-     * {@code ParallelLoaders.loaderTypes}, whose contents are determined by
-     * the order in which the superclass chain initializes:</p>
-     *
-     * <pre>
-     *     ClassLoader.<clinit>         adds ClassLoader
-     *     SecureClassLoader.<clinit>   adds SecureClassLoader
-     *     BuiltinClassLoader.<clinit>  adds BuiltinClassLoader
-     * </pre>
-     *
-     * <p>With {@code SecureClassLoader.<clinit>} missing from the module,
-     * the middle entry is never inserted, and {@code BuiltinClassLoader}'s
-     * own registration fails with
-     * {@code java.lang.InternalError: Unable to register as parallel capable}.</p>
-     *
-     * <p>The closure walks superclasses only, not interfaces. Interfaces are
-     * excluded on purpose: JVMS §5.5 does not initialize an interface when a
-     * class that implements it is initialized, and the JDK's own
-     * {@code ParallelLoaders.loaderTypes} chain is a superclass chain, not a
-     * superinterface chain.</p>
+     * Interfaces are not walked (JVMS §5.5 does not initialize an interface
+     * through an implementing class).
      */
     private Set<String> collectTriggeredOwners(Module module, DependencyResolver resolver) {
         Set<String> owners = new HashSet<>();
@@ -1042,52 +954,23 @@ public class Analyzer {
     }
 
     /**
-     * Builds the initialization schedule in two stages: first the
-     * {@code <clinit>} functions are linearized by their own Tarjan pass over
-     * their own subgraph, then the bootstrap phases
-     * {@code System.initPhase1/2/3} are inserted into that finished order.
+     * Builds the initialization schedule in two stages.
      *
-     * <h2>Why the phases stay out of the SCC decomposition</h2>
+     * Stage 1: <clinit> functions linearized by Tarjan over the clinit-only
+     * dependency graph.
      *
-     * <p>The phase order is fixed by the JDK contract:
-     * {@code initPhase1 -> initPhase2 -> initPhase3}. It must not be broken.
-     * If the phases are placed in the same graph as the {@code <clinit>}s,
-     * they land in one huge SCC and the linearizer breaks edges inside the
-     * cycle arbitrarily — including the hard {@code phase2 -> phase1} edge.
-     * After that {@code initPhase2} runs before {@code initPhase1} and
-     * {@code VM.initLevel()} is still 0 when phase 2 starts.</p>
-     *
-     * <p>The position of each phase is computed on the finished
-     * {@code <clinit>} order:</p>
-     * <ul>
-     *   <li>{@code after(P)} = 1 + the largest index of a {@code <clinit>}
-     *       whose static fields {@code P} reads (transitively);</li>
-     *   <li>{@code before(P)} = the smallest index of a {@code <clinit>}
-     *       that reads (transitively) a static field written by {@code P}.</li>
-     * </ul>
-     *
-     * <p>If {@code after(P) <= before(P)} the phase is placed at position
-     * {@code after(P)} — right after its dependencies and before all of its
-     * readers. If {@code after(P) > before(P)} (a phase and a clinit depend
-     * on each other through a field), priority is given to {@code after(P)}:
-     * the phase is placed AFTER all of its dependencies even if that means
-     * some of its readers run before it. The choice is deliberate — see the
-     * block comment at the merge site for the full reasoning — and is the
-     * opposite of the previous revision's. A warning is printed for every
-     * such break.</p>
-     *
-     * <h2>Why trigger edges from phases are dropped</h2>
-     *
-     * <p>The scope of phase 1 covers nearly all of {@code java.base} startup,
-     * so "phase triggers class X" degenerates into "the phase depends on
-     * almost every {@code <clinit>}". In a linear schedule this is
-     * meaningless: a triggered initialization of X completes before the
-     * trigger instruction inside the phase is reached, and everything the
-     * phase actually reads from X is already covered by field-provenance
-     * edges (X — through the phase scope — lands in the fieldReaders of the
-     * corresponding field). Dropping trigger edges from phases keeps exactly
-     * the dependencies that really affect correctness and stops the phases
-     * from being pushed to the end of the schedule.</p>
+     * Stage 2: bootstrap phases initPhase1/2/3 inserted into that finished
+     * order. The phases do not participate in the SCC decomposition: if they
+     * did, they would land in one huge SCC and arbitrary edge-breaking could
+     * reorder phase2 before phase1, leaving VM.initLevel() == 0 at phase 2.
+     * Phase position is after(P) = 1 + max index of a clinit whose static
+     * fields P transitively reads; before(P) = min index of a clinit that
+     * transitively reads a field P writes. On a cycle the phase wins (after >
+     * before): a phase is straight-line code that dereferences its
+     * dependencies, so running it before them NPEs (the StringConcatHelper
+     * .UNSAFE case). Trigger edges from phases are dropped: they degenerate
+     * to "depends on almost everything" and are already covered by the
+     * field-provenance edges.
      */
     private List<ClinitScheduleEntry> sortInitializers(
             List<Function> clinitFunctions,
@@ -1739,48 +1622,26 @@ public class Analyzer {
     }
 
     /**
-     * Determines which <clinit> functions must be deferred to lazy
+     * Identifies <clinit> functions that must be deferred to lazy
      * initialization because eager scheduling cannot satisfy them together
      * with the bootstrap phases.
      *
-     * <p>This method is a bitset-driven version of the original algorithm.
-     * Its correctness is identical to the previous implementation — the
-     * family-A / family-B split, the fixed point over the surviving
-     * schedule, and the {@code afterMap} clamping are unchanged — but the
-     * inner test is now two {@code long[] & long[]} operations instead of
-     * a nested walk over every instruction of every function in the
-     * candidate clinit's scope.</p>
+     * A clinit is deferred iff it reads (transitively) a static field written
+     * by a phase, but does not itself write a field the phase's own body
+     * reads. Such a clinit would be scheduled before the phase (given the
+     * phase's after(P) position) and would observe a null field; deferring
+     * makes it run on first active use, which is by construction after the
+     * phase.
      *
-     * <p>The relevant sets are precomputed once, during the init-scope BFS
-     * in {@link #sortInitializers}:</p>
-     *
-     * <ul>
-     *   <li>{@code pWrites} = {@code initWriteBits.get(p.getName())} —
-     *       every static field written anywhere in the phase's transitive
-     *       scope;</li>
-     *   <li>{@code cReads} = {@code initReadBits.get(c.getName())} —
-     *       every static field read anywhere in the clinit's transitive
-     *       scope;</li>
-     *   <li>{@code cWrites} = {@code initWriteBits.get(c.getName())} —
-     *       every static field written anywhere in the clinit's scope;</li>
-     *   <li>{@code pDirectReads} — every static field read by the phase's
-     *       <em>own body only</em>. This is the only piece of information
-     *       that the init-scope BFS cannot supply, because it deliberately
-     *       collapses the phase's own body and its transitive scope into
-     *       one union. It is recomputed here directly from the phase's
-     *       instruction stream — a single pass over one function, once per
-     *       call.</li>
-     * </ul>
-     *
-     * <p>The three tests in the loop then become:</p>
-     *
-     * <pre>
-     *     cReadsP  == (cReads  &amp; pWrites)      != 0
-     *     cWritesP == (cWrites &amp; pDirectReads) != 0
-     * </pre>
-     *
-     * <p>which is exactly the original semantics, evaluated on the same
-     * precomputed universes.</p>
+     * Iterates because defers shift later clinits' indices; MAX_PASSES
+     * bounds the loop. Bitsets are precomputed by the init-scope BFS:
+     *   pWrites      = initWriteBits[p]
+     *   cReads       = initReadBits[c]
+     *   cWrites      = initWriteBits[c]
+     *   pDirectReads = recomputed here (phase body only, not its scope)
+     * and the two tests become
+     *   cReadsP  = cReads & pWrites != 0
+     *   cWritesP = cWrites & pDirectReads != 0.
      */
     private Set<String> computeDeferredClinits(
             List<Function> clinitOrder,

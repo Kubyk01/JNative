@@ -24,121 +24,25 @@ import static io.github.kubyk01.util.LlvmUtil.isAllocation;
 import static io.github.kubyk01.util.LlvmUtil.isLazyClinitWrapper;
 
 /**
- * Computes an {@link EscapeSummary} for every function in the module.
+ * Computes an EscapeSummary per function.
  *
- * <h2>What changed relative to the previous revision</h2>
+ * Adds transitive site containment (localPointsTo / localSiteContents /
+ * sitesReachableFromParams) so that a nested site is visible to callers
+ * of a constructor. The motivating chain:
  *
- * <p>The previous revision of this class tracked only <em>parameter</em>
- * escape facts: which parameters escape, which are returned, which are
- * stored into static fields, and the parameter-to-parameter escape
- * edges. The {@code sitesReachableFromParams} field was populated with
- * the allocation sites that were <b>directly</b> stored into a field of
- * a parameter:</p>
+ *   BufferedWriter.<init>  : this.cb = new char[8192]
+ *   PrintStream.<init>     : this.textOut = new BufferedWriter(...)
+ *   System.<clinit>        : System.out = new PrintStream(...)
  *
- * <pre>
- *     // InternalLock.&lt;init&gt;:
- *     this.lock = new ReentrantLock();       // sitesReachableFromParams[0] = {ReentrantLock}
- * </pre>
+ * Without the transitive tracking, the GLOBAL promotion at System.out
+ * stopped at the BufferedWriter site and never reached cb, so cb stayed
+ * HEAP and received a per-use destructor — the freed array then caused
+ * "Cannot invoke String.getChars ... because <array> is null".
  *
- * <p>That was sufficient for the {@code InternalLock} case because the
- * owner ({@code InternalLock}) was allocated in the very same function
- * that later promoted it to {@code RETURN}, so the promotion reached the
- * {@code ReentrantLock} site directly.</p>
- *
- * <p>It is <b>not</b> sufficient for the {@code BufferedWriter} and
- * {@code ProtectionDomain} cases. There the owner lives in one function
- * and the nested site lives in another:</p>
- *
- * <pre>
- *     BufferedWriter.&lt;init&gt;(Writer):
- *         this.cb = new char[8192];          // sitesReachableFromParams[0] = {cb}
- *
- *     PrintStream.&lt;init&gt;(OutputStream, ...):
- *         this.charOut = new OutputStreamWriter(out, charset);
- *         this.textOut = new BufferedWriter(charOut);
- *         // direct tracking sees only: sitesReachableFromParams[0] = {charOut, textOut}
- *         // DOES NOT see the cb site inside textOut
- *
- *     System.&lt;clinit&gt;:
- *         System.out = new PrintStream(...); // promotes PrintStream to GLOBAL
- * </pre>
- *
- * <p>Because {@code cb} was never in {@code PrintStream.&lt;init&gt;}'s
- * summary, the {@code GLOBAL} promotion at {@code System.&lt;clinit&gt;}
- * stopped at {@code BufferedWriter} and never reached {@code cb}.
- * {@code cb} stayed {@code HEAP}, {@link io.github.kubyk01.application.service.analyzer.lifetime.LifetimeAnalyzer}
- * placed a destruction point at the {@code PUT_FIELD this.cb = …}, and
- * {@link io.github.kubyk01.application.service.optimizer.DestructorInserter}
- * emitted a {@code free} followed by a null-out of {@code this.cb}. The
- * next write to {@code BufferedWriter.cb} loaded a null array and
- * {@code String.getChars} reported
- * {@code "Cannot invoke java.lang.String.getChars(IICIV) because <array> is null"}.</p>
- *
- * <h2>What this revision adds</h2>
- *
- * <p>Two new transitive tracking structures:</p>
- *
- * <ol>
- *   <li>{@code localPointsTo}: value &rarr; allocation sites it may point
- *       to. Seeded from every {@code NEW}/{@code NEW_ARRAY}/{@code
- *       MULTI_NEW_ARRAY} result, propagated through {@code LOAD},
- *       {@code STORE}, {@code PHI}, {@code CAST}, {@code CHECKCAST}, and
- *       call return values.</li>
- *
- *   <li>{@code localSiteContents}: site &rarr; sites reachable from it
- *       by following field references. Populated from three sources:
- *       direct {@code PUT_FIELD}/{@code ASTORE} with a non-parameter
- *       base; the callee's own {@code sitesReachableFromParams} at every
- *       call site; and the transitive closure of the rhs in the
- *       containing value.</li>
- * </ol>
- *
- * <p>With both, the summary's {@code sitesReachableFromParams[i]} for a
- * constructor of {@code BufferedWriter} says: "the value passed as
- * parameter {@code i} transitively contains {@code cb}". The same
- * property is then preserved by {@code PrintStream.&lt;init&gt;}:
- * {@code sitesReachableFromParams[0] = {charOut, textOut, cb, ...}} —
- * the transitive closure of everything reachable through the receiver
- * of a {@code PrintStream}.</p>
- *
- * <p>At {@code System.&lt;clinit&gt;}, when the {@code PrintStream}
- * allocation is promoted to {@code GLOBAL}, the
- * {@link IntraproceduralEscape#processCall} promotion loop reaches every
- * site in the summary's closure — including {@code cb} — and marks it
- * {@code GLOBAL} as well. {@code LifetimeAnalyzer} therefore skips it
- * (GLOBAL returns early, no destruction point), and no {@code free} or
- * null-out is emitted at {@code PUT_FIELD}. The crash is gone at the
- * source.</p>
- *
- * <h2>SCC-driven fixed point</h2>
- *
- * <p>Two properties are required for the fixed point to converge in
- * O(lattice height) iterations rather than oscillate:</p>
- *
- * <ol>
- *   <li><b>Pre-fill with &perp;.</b> Every SCC member receives an empty
- *       summary in {@link #summaries} before the fixed point starts.
- *       Without this, the first iteration sees
- *       {@code snapshot.get(calleeName) == null} for every intra-SCC
- *       call, and {@code processCall} takes its conservative
- *       "all-reference-args-escape" branch, producing a near-&top;
- *       value that the next iteration then shrinks — the SCC oscillates
- *       between the two bounds and hits
- *       {@link #MAX_SCC_ITERATIONS}.</li>
- *
- *   <li><b>Monotone merge on commit.</b> Old and new summaries are
- *       merged rather than replaced, so the stored value never
- *       decreases across iterations even when the freshly computed
- *       value is strictly smaller than the previous one. This is the
- *       same commit discipline
- *       {@link io.github.kubyk01.application.service.analyzer.aliasanalysis.SummaryBuilder}
- *       uses, and it is what makes the SCC loop terminate.</li>
- * </ol>
- *
- * <p>Together these two properties reduce the observed oscillation of
- * the largest SCC (size 1290) from 2000 capped iterations to the same
- * O(dozens) that {@code SummaryBuilder} already exhibits on the same
- * graph.</p>
+ * SCC fixed point: every member pre-filled with an empty summary (bottom
+ * of the lattice), commits merge new into old (monotone), so the loop
+ * converges in O(height) iterations instead of oscillating between the
+ * conservative and concrete summaries.
  */
 @Slf4j
 public class EscapeSummaryBuilder {

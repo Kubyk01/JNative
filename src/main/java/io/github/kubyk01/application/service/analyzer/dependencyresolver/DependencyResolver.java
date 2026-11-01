@@ -34,49 +34,18 @@ import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
 
 /**
- * Resolves class metadata from the input (a JAR, a directory of .class
- * files, or a single .class file) and from the JDK's own modular runtime
- * image when the input references a system class.
+ * Resolves class metadata from the input (JAR, directory, or single
+ * .class) and from the JDK image when the input references a system class.
  *
- * <h2>Thread-safety model</h2>
- *
- * <p>This class is used concurrently. The reachability walk, the clinit
- * sort, and the code-generation phase all call back into it — often in
- * parallel on the Reactor scheduler that {@link
- * io.github.kubyk01.application.service.Orchestrator} owns — in order to
- * resolve a method in a hierarchy, look up a field's owner, or force a
- * class to load. Every cache in this class is therefore a concurrent
- * container:</p>
- *
- * <ul>
- *   <li>{@link #classMap} and {@link #classBytes} are
- *       {@link ConcurrentHashMap}s. The map is lazily expanded from
- *       inside the parallel phases: {@link #getClassNode} and
- *       {@link #findMethodInHierarchy} force a class to load on cache
- *       miss, and that load writes into the same maps that other workers
- *       are reading.</li>
- *
- *   <li>{@link #subclasses} maps a supertype to the set of its direct
- *       subtypes. Both the outer map and every value set are concurrent:
- *       the outer map because new supertypes are observed while the
- *       subclass index is being queried, and the value sets because
- *       {@link #getSubclasses} iterates them while a concurrent class
- *       load may add to the same set. The earlier revision used a plain
- *       {@code HashMap<String, HashSet<String>>} and produced a
- *       {@link ConcurrentModificationException} inside
- *       {@code collectSubclasses} the first time a class was forced to
- *       load while another worker walked the subclass closure of a
- *       different class.</li>
- *
- *   <li>{@link #missingClasses} and {@link #loadedClasses} are concurrent
- *       key sets. They are written on the same lazy-load path as the two
- *       maps above and read by the same callers.</li>
- * </ul>
- *
- * <p>The JRT filesystem handle is guarded by the two {@code load*}
- * methods being {@code synchronized}; the handle itself is only assigned
- * on the first call to {@link #getJrtFileSystem()}, and every subsequent
- * caller simply reads the already-assigned field.</p>
+ * Thread-safe: called concurrently by the reachability walk, the clinit
+ * sort, and code generation. classMap and classBytes are concurrent
+ * because lazy-load writes into them while other workers read. subclasses
+ * value sets are ConcurrentHashMap.newKeySet() so concurrent lazy-load
+ * additions cannot break in-flight subclass-closure iteration (the earlier
+ * HashMap/HashSet pair produced a CME the first time a class was forced
+ * to load during another worker's getSubclasses). The JRT handle is
+ * guarded by synchronizing the load methods; every subsequent caller
+ * reads the already-assigned field.
  */
 @Slf4j
 @RequiredArgsConstructor

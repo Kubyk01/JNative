@@ -31,87 +31,24 @@ import static io.github.kubyk01.util.LlvmUtil.isAllocation;
 import static io.github.kubyk01.util.LlvmUtil.isLazyClinitWrapper;
 
 /**
- * Interprocedural escape analysis driver.
+ * Interprocedural escape fixed point: runs IntraproceduralEscape over every
+ * live function and merges the results into a global site->status map.
  *
- * <h2>What this class does</h2>
+ * Two earlier gaps:
+ *   1. IntraproceduralEscape started every site at STACK and read only its
+ *      own map, so a site promoted by another function was invisible to
+ *      its allocator on re-run. Fix: workers seed from the shared
+ *      globalStatus map, and getMaxStatus takes max(local, seed).
+ *   2. When a site was upgraded, only its callers were re-enqueued; the
+ *      allocator (whose sitesReachableFromParams contributions had to be
+ *      recomputed against the new status) was not. Fix: enqueue both
+ *      the allocator and the callers of the observing function.
  *
- * <p>Runs {@link IntraproceduralEscape} over every live function in the
- * module and merges the per-function results into a single global map
- * from allocation site to escape status. The map produced here is
- * consumed by {@link io.github.kubyk01.application.service.analyzer.lifetime.LifetimeAnalyzer}
- * (to decide whether a per-use destruction point is legitimate) and by
- * {@link io.github.kubyk01.application.service.optimizer.DestructorInserter}
- * (to decide whether to emit a {@code free} and a null-out at a field
- * overwrite).</p>
- *
- * <h2>What changed relative to the previous revision</h2>
- *
- * <p>The previous revision had two structural gaps that made the
- * transitive {@code sitesReachableFromParams} mechanism introduced in
- * {@link EscapeSummaryBuilder} ineffective for anything but the simplest
- * single-function cases.</p>
- *
- * <h3>Gap 1 — the shared status map was not visible to workers</h3>
- *
- * <p>{@link IntraproceduralEscape#analyze()} starts from a per-function
- * map in which every local allocation site is {@code STACK}, and
- * {@link IntraproceduralEscape#getMaxStatus} reads <b>only</b> that
- * per-function map. A site allocated by a caller was therefore invisible
- * to the callee: the callee saw {@code STACK}, regardless of how far the
- * caller had promoted the site. The concrete failure this produced was
- * the {@code BufferedWriter.cb} case described at the top of
- * {@link EscapeSummaryBuilder}'s javadoc: {@code PrintStream.<init>}
- * allocated {@code BufferedWriter}, promoted it to {@code HEAP} via
- * {@code PUT_FIELD this.textOut}, and later {@code System.<clinit>}
- * promoted {@code PrintStream} to {@code GLOBAL} — but neither the
- * {@code BufferedWriter} site nor the {@code cb} site inside it ever
- * saw the {@code GLOBAL} promotion, because every re-run of their
- * allocator started from a fresh {@code STACK}.</p>
- *
- * <p>The fix is that workers now receive the shared {@link #globalStatus}
- * map and seed their local {@code siteStatus} from it. A site promoted
- * to {@code GLOBAL} by any function in any batch is immediately visible
- * to every subsequent run of its allocator, and to any run of any
- * function whose {@code valueEscapeStatus} / {@code getMaxStatus}
- * consults it.</p>
- *
- * <h3>Gap 2 — the allocator was never re-enqueued</h3>
- *
- * <p>When a site's global status was upgraded, only its <em>callers</em>
- * were re-enqueued. That is the correct direction for propagating the
- * upgrade upward through the call graph, but it does not cover the case
- * where the upgrade must also propagate <em>downward</em>: the
- * allocator of the upgraded site is the function that computed its own
- * {@code sitesReachableFromParams} contributions, and those
- * contributions are only recomputed when the allocator itself is
- * re-analysed. Without re-enqueueing the allocator, a promotion observed
- * by an unrelated caller could be lost on the next run of the allocator,
- * because the allocator would re-derive its (now stale) contributions
- * from the {@code STACK}-initialized local map.</p>
- *
- * <p>The fix is that every upgrade re-enqueues both the site's allocator
- * and all callers of the function that first observed the upgrade. The
- * worklist therefore terminates at the lattice fixed point of both
- * propagation directions simultaneously.</p>
- *
- * <h2>Why a fixed point is required and how it terminates</h2>
- *
- * <p>The interprocedural analysis is a monotone dataflow problem: each
- * site's status only ever increases (by {@link EscapeStatus#ordinal()}),
- * and each function's contribution to the shared map only ever grows.
- * The lattice has finite height (six levels of {@link EscapeStatus}),
- * the number of sites is finite, and each batch either commits at least
- * one upgrade or terminates the loop. The loop therefore converges in
- * O(sites × lattice height) iterations, bounded in practice by the
- * number of distinct site-upgrade chains in the module.</p>
- *
- * <p>Concurrency: {@link #globalStatus} is a {@link ConcurrentHashMap}.
- * Workers read it during their analysis (for seeding and for the
- * {@code getMaxStatus} fallback) while the main thread writes it after
- * every batch. Iteration order is not observed anywhere, so the weak
- * consistency of {@code ConcurrentHashMap} is sufficient — a worker that
- * misses a status in one iteration will observe it in the next, because
- * every upgrade re-enqueues the allocator and all callers.</p>
+ * The lattice is monotone (EscapeStatus.ordinal only grows), so the loop
+ * terminates in O(sites x lattice height). globalStatus is a
+ * ConcurrentHashMap: workers read it, the main thread writes after each
+ * batch. Missing a write in one iteration is safe — every upgrade
+ * re-enqueues everything that depends on it.
  */
 @Slf4j
 public class InterproceduralEscape {

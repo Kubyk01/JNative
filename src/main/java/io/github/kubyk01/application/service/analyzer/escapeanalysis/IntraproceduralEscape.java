@@ -21,103 +21,28 @@ import static io.github.kubyk01.util.LlvmUtil.getCallArguments;
 import static io.github.kubyk01.util.LlvmUtil.isAllocation;
 
 /**
- * Intraprocedural escape analysis: computes, for every allocation site
- * that appears in one function, its best-known escape status.
+ * Per-function escape analysis over one function's allocation sites.
  *
- * <h2>What changed relative to the previous revision</h2>
+ * Three fixes over the previous revision:
  *
- * <p>Three independent changes, all necessary for the transitive
- * interprocedural propagation to work end-to-end. Each one closes a
- * distinct hole that the previous revision left open.</p>
+ * 1. Seed siteStatus from the shared seedStatus map (passed by
+ *    InterproceduralEscape). getMaxStatus takes max(local, seed), so a
+ *    promotion observed by any other function's batch is visible here
+ *    from iteration zero.
  *
- * <h3>Change 1 — seed from the interprocedural status map</h3>
+ * 2. A value stored into a field is at minimum HEAP, even when the owner
+ *    is STACK. Frame teardown releases the owner, not its fields
+ *    individually, so the stored value would otherwise leak.
  *
- * <p>The previous revision seeded every local allocation site to
- * {@link EscapeStatus#STACK} and read statuses exclusively from a
- * per-function map. That meant an externally-promoted site (promoted by
- * some other function's analysis) was invisible to this run of the
- * allocator. The fixed point in
- * {@link InterproceduralEscape#analyze()} could therefore not
- * propagate the promotion back to the sites reachable from the promoted
- * site, because the allocator re-derived its (stale) contributions from
- * a fresh STACK-based map every iteration.</p>
+ * 3. Propagate argument status to sites reachable from the parameter
+ *    (EscapeSummary.sitesReachableFromParams). Without this the
+ *    transitive summary computed by EscapeSummaryBuilder was never used
+ *    by callers — e.g. BufferedWriter.cb stayed HEAP and got freed
+ *    at a PUT_FIELD, producing the "Cannot invoke String.getChars
+ *    because <array> is null" crash.
  *
- * <p>The fix is a shared {@link #seedStatus} map that
- * {@link InterproceduralEscape} hands to every worker. It is used in
- * two places:</p>
- *
- * <ul>
- *   <li>{@link #analyze()} seeds {@link #siteStatus} from it, so an
- *       external promotion is visible to the local fixed point from
- *       iteration zero;</li>
- *   <li>{@link #getMaxStatus(Value)} consults it as a lower bound, so
- *       any read of a site's status inside the local fixed point
- *       observes both the local analysis result and the external
- *       promotion.</li>
- * </ul>
- *
- * <h3>Change 2 — a value stored into a field is at minimum HEAP</h3>
- *
- * <p>The previous revision of {@link #processPutField} and
- * {@link #processAStore} computed the promoted status of the stored
- * value as {@code max(baseEsc, rhsEsc)}. When the base was a fresh
- * STACK object — the common {@code this.field = new Foo()} case inside
- * a constructor whose receiver is a stack-allocatable allocation — the
- * promoted status was {@code STACK}. The site then looked like a
- * pure-stack temporary and {@link io.github.kubyk01.application.service.optimizer.DestructorInserter}
- * (which filters STACK sites) never emitted a destructor for it. The
- * object leaked.</p>
- *
- * <p>The fix promotes the stored value to {@code max(baseEsc, HEAP)}.
- * The reasoning: the stored value is now reachable through a field.
- * Even when the field's owner is stack-allocated, the owner's fields are
- * not released by any destructor (the frame teardown releases the
- * owner, not its fields individually), so the value stored in the field
- * is orphaned unless it is explicitly freed at its last use. That is
- * exactly the {@code HEAP} status's semantics, and it is the correct
- * minimum for any value that is stored into any field of any object.</p>
- *
- * <h3>Change 3 — propagate argument status to sites reachable from the
- * parameter</h3>
- *
- * <p>The previous revision never looked at
- * {@link EscapeSummary#getSitesReachableFromParams()}. That meant the
- * transitive site information computed by {@link EscapeSummaryBuilder}
- * was written into the summary but never used by the caller. The
- * consequence was that an object stored into a field of a parameter
- * by the callee (e.g. {@code InternalLock.this.lock = new ReentrantLock()}
- * inside {@code InternalLock.<init>}) was not promoted when the caller
- * promoted the parameter's object to {@code RETURN} or {@code GLOBAL}.</p>
- *
- * <p>The fix is a new propagation block in {@link #processCall}. For
- * every argument {@code i}: if {@code summary.sitesReachableFromParams}
- * contains an entry for {@code i}, then every site in that entry is
- * promoted to {@code max(HEAP, status(args[i]))}. The
- * {@code max(HEAP, …)} floor is the same reasoning as Change 2: the
- * site ended up in a field, so it is at minimum {@code HEAP}. The upper
- * part of the {@code max} is the argument's actual escape status:
- * if the argument is {@code RETURN}, the site is {@code RETURN}; if
- * {@code GLOBAL}, the site is {@code GLOBAL}.</p>
- *
- * <p>Together with the transitive
- * {@code sitesReachableFromParams} computed by
- * {@link EscapeSummaryBuilder}, this closes the {@code BufferedWriter.cb}
- * crash: the {@code char[] cb} site lives three function boundaries
- * away from the {@code System.out} static field that promotes the whole
- * chain to {@code GLOBAL}, and only the combination of transitive
- * summary computation and this propagation block reaches it.</p>
- *
- * <h2>Fixed point</h2>
- *
- * <p>The local analysis iterates until no site's status changes
- * (bounded by {@code MAX_ITERATIONS}). Each iteration walks all
- * instructions, then propagates the {@link #localEscapeEdges} that
- * {@link #processCall} accumulated. Both operations are monotone:
- * {@link #markEscaped(AllocationSite, EscapeStatus)} only ever raises a
- * site's status, and the escape-edge propagation only ever raises the
- * status of {@code from} towards the status of {@code to}. The fixed
- * point therefore exists and is reached in at most
- * {@code latticeHeight × sites × 2} steps.</p>
+ * Local fixed point: iterate until stable. markEscaped only raises a
+ * site's status; edge propagation only raises `from` towards `to`.
  */
 @Slf4j
 public class IntraproceduralEscape {
