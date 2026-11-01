@@ -20,7 +20,6 @@ import io.github.kubyk01.domain.analyzer.dependencyresolver.ClassNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.MethodReference;
 import io.github.kubyk01.domain.analyzer.escapeanalysis.EscapeAnalysisResult;
 import io.github.kubyk01.domain.analyzer.lifetime.LifetimeAnalysisResult;
-import io.github.kubyk01.domain.ir.Function;
 import io.github.kubyk01.domain.ir.Module;
 import io.github.kubyk01.domain.ir.TargetPlatform;
 import io.github.kubyk01.port.primary.OrchestratorPort;
@@ -339,12 +338,14 @@ public class Orchestrator implements OrchestratorPort {
         }
 
         BytecodeToIr translator = new BytecodeToIr(resolver, analysis, nativeOverrides);
+        translator.setScheduler(scheduler);
         Module module = translator.translate();
 
-        SSATransformer ssaTransformer = new SSATransformer();
-        for (Function func : module.getFunctions()) {
-            ssaTransformer.transform(func);
-        }
+        ThreadLocal<SSATransformer> ssaLocal = ThreadLocal.withInitial(SSATransformer::new);
+        LlvmUtil.parallelMapOrdered(new ArrayList<>(module.getFunctions()), scheduler, func -> {
+            ssaLocal.get().transform(func);
+            return func;
+        });
 
         // --- 7. Analysis pipeline -----------------------------------------
         Analyzer analyzer = new Analyzer();

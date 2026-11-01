@@ -187,6 +187,16 @@ public class LlvmGenerator implements LlvmGeneratorPort {
         String extraStructsText = extraBuf.toString();
         String reflectionTypesText = globalEmitter.generateTypeDefinitions();
 
+        // Every .ll file needs the same filtered prelude. Parsing the
+        // runtime declarations once here — instead of once per output
+        // file — removes the dominant cost of buildFilteredPrelude.
+        Map<String, String> preludeDefs = new LinkedHashMap<>();
+        preludeDefs.putAll(parseSingleLineDefinitions(LlvmRuntime.getVtableTypeDefinition()));
+        preludeDefs.putAll(parseSingleLineDefinitions(reflectionTypesText));
+        preludeDefs.putAll(parseSingleLineDefinitions(extraStructsText));
+        preludeDefs.putAll(parseSingleLineDefinitions(structDefs));
+        preludeDefs.putAll(parseSingleLineDefinitions(LlvmRuntime.getDeclarations()));
+
         // ---- 1. Emit EVERY function body, grouped by owner class. The
         //         bodies are accumulated in memory rather than streamed,
         //         because the deferred strings they register are only known
@@ -280,10 +290,7 @@ public class LlvmGenerator implements LlvmGeneratorPort {
             module);
 
         String modulePrelude = buildFilteredPrelude(
-            moduleTail + "\n" + moduleExterns,
-            structDefs,
-            extraStructsText,
-            reflectionTypesText);
+            moduleTail + "\n" + moduleExterns, preludeDefs);
 
         String moduleSb = modulePrelude
             + moduleExterns
@@ -293,7 +300,10 @@ public class LlvmGenerator implements LlvmGeneratorPort {
         Files.writeString(modulePath, moduleSb, StandardCharsets.UTF_8);
 
         // ---- 6. Write one .ll file per class. ----
-        for (Map.Entry<String, StringBuilder> e : classBodies.entrySet()) {
+        // Each file is independent: it reads only the immutable emission
+        // results and the module. Building and writing them in parallel
+        // keeps the single-threaded tail of the compiler short.
+        LlvmUtil.parallelMapOrdered(new ArrayList<>(classBodies.entrySet()), scheduler, e -> {
             String className = e.getKey();
             String body = e.getValue().toString();
 
@@ -301,18 +311,17 @@ public class LlvmGenerator implements LlvmGeneratorPort {
 
             String externs = buildExterns(body, definedHere, knownGlobals, module);
 
-            String prelude = buildFilteredPrelude(
-                body + "\n" + externs,
-                structDefs,
-                extraStructsText,
-                reflectionTypesText);
+            String prelude = buildFilteredPrelude(body + "\n" + externs, preludeDefs);
 
-            String sb = prelude + externs + body;
-
-            Path out = outputDir.resolve(className + ".ll");
-            if (out.getParent() != null) Files.createDirectories(out.getParent());
-            Files.writeString(out, sb, StandardCharsets.UTF_8);
-        }
+            try {
+                Path out = outputDir.resolve(className + ".ll");
+                if (out.getParent() != null) Files.createDirectories(out.getParent());
+                Files.writeString(out, prelude + externs + body, StandardCharsets.UTF_8);
+            } catch (IOException ex) {
+                throw new java.io.UncheckedIOException(ex);
+            }
+            return className;
+        });
     }
 
     /**
@@ -337,23 +346,7 @@ public class LlvmGenerator implements LlvmGeneratorPort {
      * </ol>
      */
     private String buildFilteredPrelude(String bodyContent,
-                                        String structDefsText,
-                                        String extraStructsText,
-                                        String reflectionTypesText) {
-
-        // Single ordered map of every potential definition. The insertion
-        // order matches the current (working) output order:
-        //   1) vtable types
-        //   2) reflection ABI types
-        //   3) lambda structs
-        //   4) class structs
-        //   5) runtime declares
-        Map<String, String> allDefs = new LinkedHashMap<>();
-        allDefs.putAll(parseSingleLineDefinitions(LlvmRuntime.getVtableTypeDefinition()));
-        allDefs.putAll(parseSingleLineDefinitions(reflectionTypesText));
-        allDefs.putAll(parseSingleLineDefinitions(extraStructsText));
-        allDefs.putAll(parseSingleLineDefinitions(structDefsText));
-        allDefs.putAll(parseSingleLineDefinitions(LlvmRuntime.getDeclarations()));
+                                        Map<String, String> allDefs) {
 
         // Transitive closure of the set of used names.
         Set<String> needed = new LinkedHashSet<>();

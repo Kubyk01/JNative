@@ -77,7 +77,9 @@ public class Analyzer {
                                   boolean showLifetime) {
 
         System.out.println("\n--- Running dead code elimination ---");
-        new DeadCodeEliminator(module).eliminate();
+        DeadCodeEliminator dce = new DeadCodeEliminator(module);
+        dce.setScheduler(scheduler);
+        dce.eliminate();
 
         int resurrected = resurrectRemovedClinits(module, resolver);
         if (resurrected > 0) {
@@ -866,19 +868,22 @@ public class Analyzer {
         allInit.addAll(clinitFunctions);
         allInit.addAll(phaseFunctions);
 
-        final Map<String, long[]> initTriggerBits = new ConcurrentHashMap<>();
-        final Map<String, long[]> initReadBits    = new ConcurrentHashMap<>();
-        final Map<String, long[]> initWriteBits   = new ConcurrentHashMap<>();
-        final Map<String, Set<String>> nestedInit = new ConcurrentHashMap<>();
+        final long[][] initTriggerBits = new long[liveFunctions.size()][];
+        final long[][] initReadBits    = new long[liveFunctions.size()][];
+        final long[][] initWriteBits   = new long[liveFunctions.size()][];
+        final int[][]  nestedInit      = new int[liveFunctions.size()][];
         final Set<String> allInitializerNamesF = allInitializerNames;
         final Map<String, Set<String>> callGraphF = callGraph;
 
         forEachParallel(allInit, init -> {
             String initName = init.getName();
+            Integer initIdxObj = funcIndex.get(initName);
+            if (initIdxObj == null) return;
+            int initIdx = initIdxObj;
             long[] trig = new long[classWords];
             long[] rd   = new long[fieldWords];
             long[] wr   = new long[fieldWords];
-            Set<String> nested   = new LinkedHashSet<>();
+            IntArrayList nested = new IntArrayList();
             Set<String> visited  = new HashSet<>();
             Deque<String> worklist = new ArrayDeque<>();
 
@@ -892,7 +897,11 @@ public class Analyzer {
                 Set<String> callees = callGraphF.get(cur);
                 if (callees == null) continue;
                 for (String callee : callees) {
-                    if (allInitializerNamesF.contains(callee)) { nested.add(callee); continue; }
+                    if (allInitializerNamesF.contains(callee)) {
+                        Integer nIdx = funcIndex.get(callee);
+                        if (nIdx != null) nested.add(nIdx);
+                        continue;
+                    }
                     if (visited.add(callee)) {
                         worklist.push(callee);
                         orInFunctionFacts(callee, funcIndex,
@@ -901,15 +910,22 @@ public class Analyzer {
                 }
             }
 
-            initTriggerBits.put(initName, trig);
-            initReadBits.put(initName, rd);
-            initWriteBits.put(initName, wr);
-            nestedInit.put(initName, nested);
+            initTriggerBits[initIdx] = trig;
+            initReadBits[initIdx] = rd;
+            initWriteBits[initIdx] = wr;
+            nestedInit[initIdx] = nested.toArray();
         });
 
-        Map<Function, Set<String>> triggeredClasses = new ConcurrentHashMap<>();
+        // Every initializer's trigger facts become direct dependency
+        // edges, indexed by function position instead of by Function or
+        // name hash lookups.
+        final int[][] triggeredDeps = new int[liveFunctions.size()][];
         forEachParallel(allInit, init -> {
-            Set<String> triggered = new LinkedHashSet<>();
+            if (phaseSet.contains(init)) return;
+            Integer initIdxObj = funcIndex.get(init.getName());
+            if (initIdxObj == null) return;
+            int initIdx = initIdxObj;
+            IntArrayList depList = new IntArrayList();
 
             String ownClass = clinitNameToClassName.get(init.getName());
             if (ownClass != null) {
@@ -920,96 +936,148 @@ public class Analyzer {
                     && visited.add(cn.getSuperName())) {
                     String sup = cn.getSuperName();
                     if ("java/lang/Object".equals(sup)) break;
-                    triggered.add(sup);
+                    Function dep = classNameToClinit.get(sup);
+                    if (dep != null) {
+                        int depIdx = funcIndex.get(dep.getName());
+                        if (depIdx != initIdx) depList.add(depIdx);
+                    }
                     cn = resolver.getClassNode(sup);
                 }
             }
 
-            Set<String> nested = nestedInit.get(init.getName());
+            int[] nested = nestedInit[initIdx];
             if (nested != null) {
-                for (String nestedName : nested) {
-                    String nestedClass = clinitNameToClassName.get(nestedName);
-                    if (nestedClass != null) triggered.add(nestedClass);
+                for (int nestedIdx : nested) {
+                    String nestedClass = clinitNameToClassName.get(
+                        liveFunctions.get(nestedIdx).getName());
+                    if (nestedClass == null) continue;
+                    Function dep = classNameToClinit.get(nestedClass);
+                    if (dep != null) {
+                        int depIdx = funcIndex.get(dep.getName());
+                        if (depIdx != initIdx) depList.add(depIdx);
+                    }
                 }
             }
 
-            long[] bits = initTriggerBits.get(init.getName());
+            long[] bits = initTriggerBits[initIdx];
             if (bits != null) {
                 for (int w = 0; w < bits.length; w++) {
                     long word = bits[w];
                     while (word != 0) {
                         int bit = Long.numberOfTrailingZeros(word);
-                        triggered.add(classList.get((w << 6) + bit));
+                        Function dep = classNameToClinit.get(
+                            classList.get((w << 6) + bit));
+                        if (dep != null) {
+                            int depIdx = funcIndex.get(dep.getName());
+                            if (depIdx != initIdx) depList.add(depIdx);
+                        }
                         word &= word - 1;
                     }
                 }
             }
 
-            triggeredClasses.put(init, triggered);
+            depList.sortUnique();
+            triggeredDeps[initIdx] = depList.toArray();
         });
 
-        Map<Function, Set<Function>> deps = new LinkedHashMap<>();
-        for (Function f : allInit) deps.put(f, new LinkedHashSet<>());
-
-        for (Map.Entry<Function, Set<String>> entry : triggeredClasses.entrySet()) {
-            Function f = entry.getKey();
-            if (phaseSet.contains(f)) continue;
-            for (String triggered : entry.getValue()) {
-                Function dep = classNameToClinit.get(triggered);
-                if (dep != null && dep != f) deps.get(f).add(dep);
-            }
-        }
-
-        Map<String, Set<Function>> fieldWriters = new ConcurrentHashMap<>();
-        Map<String, Set<Function>> fieldReaders = new ConcurrentHashMap<>();
-
-        forEachParallel(allInit, init -> {
-            long[] rbits = initReadBits.get(init.getName());
+        // Field writers/readers, as function indices per field id.
+        IntArrayList[] fieldWriters = new IntArrayList[fieldList.size()];
+        IntArrayList[] fieldReaders = new IntArrayList[fieldList.size()];
+        for (Function init : allInit) {
+            Integer initIdxObj = funcIndex.get(init.getName());
+            if (initIdxObj == null) continue;
+            int initIdx = initIdxObj;
+            long[] rbits = initReadBits[initIdx];
             if (rbits != null) {
                 for (int w = 0; w < rbits.length; w++) {
                     long word = rbits[w];
                     while (word != 0) {
-                        int bit = Long.numberOfTrailingZeros(word);
-                        String field = fieldList.get((w << 6) + bit);
-                        fieldReaders.computeIfAbsent(field, k -> ConcurrentHashMap.newKeySet())
-                            .add(init);
+                        int fieldId = (w << 6) + Long.numberOfTrailingZeros(word);
+                        if (fieldReaders[fieldId] == null) {
+                            fieldReaders[fieldId] = new IntArrayList();
+                        }
+                        fieldReaders[fieldId].add(initIdx);
                         word &= word - 1;
                     }
                 }
             }
-            long[] wbits = initWriteBits.get(init.getName());
+            long[] wbits = initWriteBits[initIdx];
             if (wbits != null) {
                 for (int w = 0; w < wbits.length; w++) {
                     long word = wbits[w];
                     while (word != 0) {
-                        int bit = Long.numberOfTrailingZeros(word);
-                        String field = fieldList.get((w << 6) + bit);
-                        fieldWriters.computeIfAbsent(field, k -> ConcurrentHashMap.newKeySet())
-                            .add(init);
+                        int fieldId = (w << 6) + Long.numberOfTrailingZeros(word);
+                        if (fieldWriters[fieldId] == null) {
+                            fieldWriters[fieldId] = new IntArrayList();
+                        }
+                        fieldWriters[fieldId].add(initIdx);
                         word &= word - 1;
                     }
                 }
             }
-        });
+        }
 
-        int provenanceEdges = 0;
-        for (Map.Entry<String, Set<Function>> entry : fieldReaders.entrySet()) {
-            String field = entry.getKey();
-            Set<Function> writers = fieldWriters.get(field);
-            if (writers == null || writers.isEmpty()) continue;
-            for (Function reader : entry.getValue()) {
-                if (writers.contains(reader)) continue;
-                Set<Function> rd = deps.get(reader);
+        IntArrayList[] depsList = new IntArrayList[liveFunctions.size()];
+        int baseEdges = 0;
+        for (Function f : allInit) {
+            Integer idxObj = funcIndex.get(f.getName());
+            if (idxObj == null) continue;
+            int idx = idxObj;
+            IntArrayList d = new IntArrayList();
+            int[] base = triggeredDeps[idx];
+            if (base != null) d.addAll(base);
+            d.sortUnique();
+            depsList[idx] = d;
+            baseEdges += d.size();
+        }
+
+        for (int fieldId = 0; fieldId < fieldList.size(); fieldId++) {
+            IntArrayList writers = fieldWriters[fieldId];
+            IntArrayList readers = fieldReaders[fieldId];
+            if (writers == null || writers.isEmpty() || readers == null) continue;
+            for (int ri = 0; ri < readers.size(); ri++) {
+                int reader = readers.get(ri);
+                IntArrayList rd = depsList[reader];
                 if (rd == null) continue;
-                for (Function writer : writers) {
-                    if (reader == writer) continue;
-                    if (rd.add(writer)) provenanceEdges++;
+                for (int wi = 0; wi < writers.size(); wi++) {
+                    int writer = writers.get(wi);
+                    if (reader != writer) rd.add(writer);
                 }
             }
         }
+
+        int[][] deps = new int[liveFunctions.size()][];
+        int finalEdges = 0;
+        for (Function f : allInit) {
+            Integer idxObj = funcIndex.get(f.getName());
+            if (idxObj == null) continue;
+            int idx = idxObj;
+            IntArrayList d = depsList[idx];
+            d.sortUnique();
+            deps[idx] = d.toArray();
+            finalEdges += deps[idx].length;
+        }
+        int provenanceEdges = finalEdges - baseEdges;
         if (provenanceEdges > 0) {
             System.out.println("Added " + provenanceEdges
                 + " static-field provenance edge(s) to init dependency graph.");
+        }
+
+        IntArrayList[] revList = new IntArrayList[liveFunctions.size()];
+        for (Function f : allInit) {
+            Integer readerObj = funcIndex.get(f.getName());
+            if (readerObj == null) continue;
+            int reader = readerObj;
+            for (int dep : deps[reader]) {
+                if (revList[dep] == null) revList[dep] = new IntArrayList();
+                revList[dep].add(reader);
+            }
+        }
+        int[][] revDeps = new int[liveFunctions.size()][];
+        for (int i = 0; i < revList.length; i++) {
+            if (revList[i] == null) continue;
+            revList[i].sortUnique();
+            revDeps[i] = revList[i].toArray();
         }
 
         Map<String, Integer> activationDepth = computeActivationDepth(
@@ -1019,9 +1087,10 @@ public class Analyzer {
         Map<Function, Set<Function>> clinitDeps = new LinkedHashMap<>();
         for (Function c : clinitFunctions) {
             Set<Function> filtered = new LinkedHashSet<>();
-            Set<Function> succ = deps.get(c);
-            if (succ != null) {
-                for (Function d : succ) {
+            Integer idxObj = funcIndex.get(c.getName());
+            if (idxObj != null) {
+                for (int depIdx : deps[idxObj]) {
+                    Function d = liveFunctions.get(depIdx);
                     if (clinitNames.contains(d.getName())) filtered.add(d);
                 }
             }
@@ -1032,32 +1101,28 @@ public class Analyzer {
         List<Function> phaseOrder = new ArrayList<>(phaseFunctions);
         phaseOrder.sort(Comparator.comparingInt(Analyzer::phaseOrdinal));
 
-        Map<Function, Set<Function>> revDeps = new HashMap<>();
-        for (Map.Entry<Function, Set<Function>> e : deps.entrySet()) {
-            for (Function d : e.getValue()) {
-                revDeps.computeIfAbsent(d, k -> new HashSet<>()).add(e.getKey());
-            }
+        int[] clinitIndex = new int[liveFunctions.size()];
+        Arrays.fill(clinitIndex, -1);
+        for (int i = 0; i < clinitOrder.size(); i++) {
+            Integer idxObj = funcIndex.get(clinitOrder.get(i).getName());
+            if (idxObj != null) clinitIndex[idxObj] = i;
         }
-
-        Map<Function, Integer> clinitIndex = new HashMap<>();
-        for (int i = 0; i < clinitOrder.size(); i++) clinitIndex.put(clinitOrder.get(i), i);
 
         Map<Function, Integer> afterMap  = new HashMap<>();
         Map<Function, Integer> beforeMap = new HashMap<>();
         for (Function p : phaseOrder) {
-            Set<Function> depsOfP = transitiveClosure(deps, p);
+            int pIdx = funcIndex.get(p.getName());
             int after = 0;
-            for (Function d : depsOfP) {
-                Integer idx = clinitIndex.get(d);
-                if (idx != null && idx + 1 > after) after = idx + 1;
+            for (int d : transitiveClosureInt(deps, pIdx)) {
+                int idx = clinitIndex[d];
+                if (idx >= 0 && idx + 1 > after) after = idx + 1;
             }
             afterMap.put(p, after);
 
-            Set<Function> dependentsOfP = transitiveClosure(revDeps, p);
             int before = clinitOrder.size();
-            for (Function d : dependentsOfP) {
-                Integer idx = clinitIndex.get(d);
-                if (idx != null && idx < before) before = idx;
+            for (int d : transitiveClosureInt(revDeps, pIdx)) {
+                int idx = clinitIndex[d];
+                if (idx >= 0 && idx < before) before = idx;
             }
             beforeMap.put(p, before);
 
@@ -1067,7 +1132,7 @@ public class Analyzer {
 
         Set<String> deferred = computeDeferredClinits(
             clinitOrder, phaseOrder, afterMap,
-            initReadBits, initWriteBits, fieldIdMap, fieldWords);
+            initReadBits, initWriteBits, funcIndex, fieldIdMap, fieldWords);
 
         if (!deferred.isEmpty()) {
             this.deferredClinits.addAll(deferred);
@@ -1081,22 +1146,25 @@ public class Analyzer {
             }
             clinitOrder.removeIf(deferredSet::contains);
 
-            Map<Function, Integer> trimmedIdx = new HashMap<>();
-            for (int i = 0; i < clinitOrder.size(); i++) trimmedIdx.put(clinitOrder.get(i), i);
+            int[] trimmedAfterDefer = new int[liveFunctions.size()];
+            Arrays.fill(trimmedAfterDefer, -1);
+            for (int i = 0; i < clinitOrder.size(); i++) {
+                Integer idxObj = funcIndex.get(clinitOrder.get(i).getName());
+                if (idxObj != null) trimmedAfterDefer[idxObj] = i;
+            }
             for (Function p : phaseOrder) {
-                Set<Function> depsOfP = transitiveClosure(deps, p);
+                int pIdx = funcIndex.get(p.getName());
                 int afterTrimmed = 0;
-                for (Function d : depsOfP) {
-                    Integer idx = trimmedIdx.get(d);
-                    if (idx != null && idx + 1 > afterTrimmed) afterTrimmed = idx + 1;
+                for (int d : transitiveClosureInt(deps, pIdx)) {
+                    int idx = trimmedAfterDefer[d];
+                    if (idx >= 0 && idx + 1 > afterTrimmed) afterTrimmed = idx + 1;
                 }
                 afterMap.put(p, afterTrimmed);
 
-                Set<Function> dependentsOfP = transitiveClosure(revDeps, p);
                 int beforeTrimmed = clinitOrder.size();
-                for (Function d : dependentsOfP) {
-                    Integer idx = trimmedIdx.get(d);
-                    if (idx != null && idx < beforeTrimmed) beforeTrimmed = idx;
+                for (int d : transitiveClosureInt(revDeps, pIdx)) {
+                    int idx = trimmedAfterDefer[d];
+                    if (idx >= 0 && idx < beforeTrimmed) beforeTrimmed = idx;
                 }
                 beforeMap.put(p, beforeTrimmed);
 
@@ -1111,22 +1179,25 @@ public class Analyzer {
 
         clinitOrder.sort(Comparator.comparingInt(f -> clinitLevels.getOrDefault(f, 0)));
 
-        Map<Function, Integer> trimmedIdx = new HashMap<>();
-        for (int i = 0; i < clinitOrder.size(); i++) trimmedIdx.put(clinitOrder.get(i), i);
+        int[] trimmedIdx = new int[liveFunctions.size()];
+        Arrays.fill(trimmedIdx, -1);
+        for (int i = 0; i < clinitOrder.size(); i++) {
+            Integer idxObj = funcIndex.get(clinitOrder.get(i).getName());
+            if (idxObj != null) trimmedIdx[idxObj] = i;
+        }
         for (Function p : phaseOrder) {
-            Set<Function> depsOfP = transitiveClosure(deps, p);
+            int pIdx = funcIndex.get(p.getName());
             int after = 0;
-            for (Function d : depsOfP) {
-                Integer idx = trimmedIdx.get(d);
-                if (idx != null && idx + 1 > after) after = idx + 1;
+            for (int d : transitiveClosureInt(deps, pIdx)) {
+                int idx = trimmedIdx[d];
+                if (idx >= 0 && idx + 1 > after) after = idx + 1;
             }
             afterMap.put(p, after);
 
-            Set<Function> dependentsOfP = transitiveClosure(revDeps, p);
             int before = clinitOrder.size();
-            for (Function d : dependentsOfP) {
-                Integer idx = trimmedIdx.get(d);
-                if (idx != null && idx < before) before = idx;
+            for (int d : transitiveClosureInt(revDeps, pIdx)) {
+                int idx = trimmedIdx[d];
+                if (idx >= 0 && idx < before) before = idx;
             }
             beforeMap.put(p, before);
         }
@@ -1207,26 +1278,79 @@ public class Analyzer {
         }
     }
 
-    private static Set<Function> transitiveClosure(Map<Function, Set<Function>> graph, Function start) {
-        Set<Function> visited = new HashSet<>();
-        Deque<Function> worklist = new ArrayDeque<>();
-        worklist.add(start);
-        while (!worklist.isEmpty()) {
-            Function cur = worklist.poll();
-            if (!visited.add(cur)) continue;
-            Set<Function> succ = graph.get(cur);
+    private static int[] transitiveClosureInt(int[][] graph, int start) {
+        boolean[] visited = new boolean[graph.length];
+        int[] stack = new int[graph.length];
+        IntArrayList order = new IntArrayList();
+        int top = 0;
+        visited[start] = true;
+        stack[top++] = start;
+        while (top > 0) {
+            int cur = stack[--top];
+            order.add(cur);
+            int[] succ = graph[cur];
             if (succ == null) continue;
-            worklist.addAll(succ);
+            for (int next : succ) {
+                if (!visited[next]) {
+                    visited[next] = true;
+                    stack[top++] = next;
+                }
+            }
         }
-        return visited;
+        return order.toArray();
+    }
+
+    private static final class IntArrayList {
+        private int[] data = new int[4];
+        private int size;
+
+        void add(int value) {
+            if (size == data.length) {
+                data = Arrays.copyOf(data, size << 1);
+            }
+            data[size++] = value;
+        }
+
+        void addAll(int[] values) {
+            for (int value : values) add(value);
+        }
+
+        int get(int index) {
+            return data[index];
+        }
+
+        int size() {
+            return size;
+        }
+
+        boolean isEmpty() {
+            return size == 0;
+        }
+
+        void sortUnique() {
+            if (size < 2) return;
+            Arrays.sort(data, 0, size);
+            int write = 1;
+            for (int read = 1; read < size; read++) {
+                if (data[read] != data[write - 1]) {
+                    data[write++] = data[read];
+                }
+            }
+            size = write;
+        }
+
+        int[] toArray() {
+            return Arrays.copyOf(data, size);
+        }
     }
 
     private Set<String> computeDeferredClinits(
         List<Function> clinitOrder,
         List<Function> phaseOrder,
         Map<Function, Integer> afterMap,
-        Map<String, long[]> initReadBits,
-        Map<String, long[]> initWriteBits,
+        long[][] initReadBits,
+        long[][] initWriteBits,
+        Map<String, Integer> funcIndex,
         Map<String, Integer> fieldIdMap,
         int fieldWords) {
 
@@ -1257,7 +1381,7 @@ public class Analyzer {
                 int after = afterMap.getOrDefault(p, 0);
                 if (after <= 0) continue;
 
-                long[] pWrites = initWriteBits.get(p.getName());
+                long[] pWrites = initWriteBits[funcIndex.get(p.getName())];
                 if (pWrites == null || bitsEmpty(pWrites)) continue;
 
                 long[] pDirectReads = phaseDirectReadBits.get(p);
@@ -1268,8 +1392,11 @@ public class Analyzer {
                     String cName = c.getName();
                     if (deferred.contains(cName)) continue;
 
-                    long[] cReads  = initReadBits.get(cName);
-                    long[] cWrites = initWriteBits.get(cName);
+                    Integer cIdxObj = funcIndex.get(cName);
+                    if (cIdxObj == null) continue;
+                    int cIdx = cIdxObj;
+                    long[] cReads  = initReadBits[cIdx];
+                    long[] cWrites = initWriteBits[cIdx];
                     if (cReads == null || cWrites == null) continue;
 
                     boolean cReadsP  = bitsIntersect(cReads,  pWrites);

@@ -14,8 +14,12 @@ import io.github.kubyk01.domain.ir.Temporary;
 import io.github.kubyk01.domain.ir.Terminator;
 import io.github.kubyk01.domain.ir.ThrowTerminator;
 import io.github.kubyk01.domain.ir.Value;
+import io.github.kubyk01.util.LlvmUtil;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import reactor.core.publisher.Flux;
+import reactor.core.scheduler.Scheduler;
+import reactor.core.scheduler.Schedulers;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -23,6 +27,8 @@ import java.util.Deque;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Consumer;
 
 import static io.github.kubyk01.util.LlvmUtil.extractCalleeName;
 import static io.github.kubyk01.util.LlvmUtil.extractFieldName;
@@ -32,6 +38,21 @@ import static io.github.kubyk01.util.LlvmUtil.extractFieldName;
 public class DeadCodeEliminator {
 
     private final Module module;
+
+    private Scheduler scheduler = Schedulers.single();
+
+    public void setScheduler(Scheduler scheduler) {
+        if (scheduler != null) this.scheduler = scheduler;
+    }
+
+    private void forEachParallel(List<Function> functions, Consumer<Function> action) {
+        LlvmUtil.awaitMono(Flux.fromIterable(functions)
+            .parallel()
+            .runOn(scheduler)
+            .doOnNext(action)
+            .sequential()
+            .then());
+    }
 
     public void eliminate() {
         boolean changed = true;
@@ -148,9 +169,9 @@ public class DeadCodeEliminator {
     }
 
     private Set<String> collectReadStaticFields() {
-        Set<String> fields = new HashSet<>();
-        for (Function func : module.getFunctions()) {
-            if (func.getEntryBlock() == null) continue;
+        Set<String> fields = ConcurrentHashMap.newKeySet();
+        forEachParallel(new ArrayList<>(module.getFunctions()), func -> {
+            if (func.getEntryBlock() == null) return;
             for (BasicBlock block : func.getBlocks()) {
                 for (Instruction inst : block.getInstructions()) {
                     if (inst.getOpcode() == Opcode.GET_STATIC) {
@@ -159,33 +180,33 @@ public class DeadCodeEliminator {
                     }
                 }
             }
-        }
+        });
         return fields;
     }
 
     private Set<Value> collectUsedValues(Set<String> readStaticFields) {
-        Set<Value> used = new HashSet<>();
-        Deque<Value> worklist = new ArrayDeque<>();
+        Set<Value> used = ConcurrentHashMap.newKeySet();
 
-        for (Function func : module.getFunctions()) {
-            if (func.getEntryBlock() == null) continue;
+        forEachParallel(new ArrayList<>(module.getFunctions()), func -> {
+            if (func.getEntryBlock() == null) return;
             for (BasicBlock block : func.getBlocks()) {
                 for (Instruction inst : block.getInstructions()) {
                     if (isRoot(inst, readStaticFields)) {
                         for (Value op : inst.getOperands()) {
-                            if (op != null && used.add(op)) worklist.add(op);
+                            if (op != null) used.add(op);
                         }
                     }
                 }
                 Terminator term = block.getTerminator();
                 if (term != null) {
                     for (Value v : terminatorOperands(term)) {
-                        if (v != null && used.add(v)) worklist.add(v);
+                        if (v != null) used.add(v);
                     }
                 }
             }
-        }
+        });
 
+        Deque<Value> worklist = new ArrayDeque<>(used);
         while (!worklist.isEmpty()) {
             Value v = worklist.poll();
             if (v instanceof Temporary t) {

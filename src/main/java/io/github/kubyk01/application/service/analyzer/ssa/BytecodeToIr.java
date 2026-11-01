@@ -15,11 +15,14 @@ import io.github.kubyk01.domain.ir.Module;
 import io.github.kubyk01.domain.ir.Opcode;
 import io.github.kubyk01.domain.ir.Parameter;
 import io.github.kubyk01.domain.ir.Type;
+import io.github.kubyk01.util.LlvmUtil;
 import lombok.extern.slf4j.Slf4j;
 import org.objectweb.asm.ClassReader;
 import org.objectweb.asm.ClassVisitor;
 import org.objectweb.asm.MethodVisitor;
 import org.objectweb.asm.Opcodes;
+import reactor.core.scheduler.Scheduler;
+import reactor.core.scheduler.Schedulers;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -39,6 +42,8 @@ public class BytecodeToIr {
     private final ReachabilityAnalysis reachability;
     private final IrBuilder builder = new IrBuilder();
 
+    private Scheduler scheduler = Schedulers.single();
+
     /** Mangling of a Java method -> the C override that replaces it. */
     private final Map<String, NativeOverride> overrides = new HashMap<>();
 
@@ -52,6 +57,10 @@ public class BytecodeToIr {
         }
     }
 
+    public void setScheduler(Scheduler scheduler) {
+        if (scheduler != null) this.scheduler = scheduler;
+    }
+
     public Module translate() {
         // 1. Register every override function up front, before any
         //    Java method is translated. This makes the alias resolvable
@@ -60,19 +69,25 @@ public class BytecodeToIr {
         registerOverrides();
 
         // 2. Translate every reachable method, skipping those that have
-        //    an override.
-        for (MethodReference ref : reachability.getReachableMethods()) {
-            NativeOverride match = findOverride(ref);
-            if (match != null) {
-                // Alias every reachable overload onto the single C function.
-                String key = LlvmRuntime.mangleMethod(
-                    ref.getOwner(), ref.getName(), ref.getDescriptor());
-                Function target = module.getFunction(match.getCFunctionName());
-                module.registerAlias(key, target);
-                continue;
-            }
-            translateMethod(ref);
-        }
+        //    an override. Each task gets its own builder so that the
+        //    mutable current-function/current-block state is not shared;
+        //    the module itself is concurrent.
+        ThreadLocal<IrBuilder> builders =
+            ThreadLocal.withInitial(() -> new IrBuilder(module));
+        LlvmUtil.parallelMapOrdered(
+            new ArrayList<>(reachability.getReachableMethods()), scheduler, ref -> {
+                NativeOverride match = findOverride(ref);
+                if (match != null) {
+                    // Alias every reachable overload onto the single C function.
+                    String key = LlvmRuntime.mangleMethod(
+                        ref.getOwner(), ref.getName(), ref.getDescriptor());
+                    Function target = module.getFunction(match.getCFunctionName());
+                    module.registerAlias(key, target);
+                    return null;
+                }
+                translateMethod(ref, builders.get());
+                return null;
+            });
 
         closeOverIrCallees();
 
@@ -114,7 +129,7 @@ public class BytecodeToIr {
      */
     public void closeOverIrCallees() {
         Module module = builder.getModule();
-        var worklist = new java.util.ArrayDeque<Function>(module.getFunctions());
+        var worklist = new java.util.ArrayDeque<>(module.getFunctions());
         var processed = java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
 
         while (!worklist.isEmpty()) {
@@ -267,11 +282,15 @@ public class BytecodeToIr {
     }
 
     private void translateMethod(MethodReference methodRef) {
+        translateMethod(methodRef, builder);
+    }
+
+    private void translateMethod(MethodReference methodRef, IrBuilder ir) {
         if ("java/lang/Class".equals(methodRef.getOwner())
             && "getEnumConstantsShared".equals(methodRef.getName())
             && "()[Ljava/lang/Object;".equals(methodRef.getDescriptor())) {
             EnumConstantsSharedEmitter.emit(
-                methodRef, builder, resolver, reachability);
+                methodRef, ir, resolver, reachability);
             return;
         }
 
@@ -286,7 +305,7 @@ public class BytecodeToIr {
             boolean isStatic = methodNode != null && methodNode.isStatic();
 
             if (classNode.isExternal()) {
-                createExternalFunction(methodRef, isStatic);
+                createExternalFunction(methodRef, isStatic, ir);
                 return;
             }
 
@@ -347,22 +366,22 @@ public class BytecodeToIr {
                     func.addParameter(new Parameter(t, slot, i));
                     slot += (t == Type.LONG || t == Type.DOUBLE) ? 2 : 1;
                 }
-                builder.getModule().addFunction(func);
+                ir.getModule().addFunction(func);
 
                 // The emitter looks up call targets by the mangled JNative
                 // name and by the "__jnative_"-prefixed form. Register both
                 // as aliases so the call site resolves to the JNI function
                 // without a second lookup.
                 String jnativeMangled = LlvmRuntime.mangleMethod(declaringOwner, name, desc);
-                builder.getModule().registerAlias(jnativeMangled, func);
-                builder.getModule().registerAlias("__jnative_" + jnativeMangled, func);
+                ir.getModule().registerAlias(jnativeMangled, func);
+                ir.getModule().registerAlias("__jnative_" + jnativeMangled, func);
 
                 // Also alias under the original owner, in case the emitter
                 // walks through the un-resolved method reference.
                 if (!declaringOwner.equals(owner)) {
                     String originalMangled = LlvmRuntime.mangleMethod(owner, name, desc);
-                    builder.getModule().registerAlias(originalMangled, func);
-                    builder.getModule().registerAlias("__jnative_" + originalMangled, func);
+                    ir.getModule().registerAlias(originalMangled, func);
+                    ir.getModule().registerAlias("__jnative_" + originalMangled, func);
                 }
                 return;
             }
@@ -445,7 +464,7 @@ public class BytecodeToIr {
             }
 
             MethodTranslator translator = new MethodTranslator(
-                    methodRef, methodNode.isStatic(), builder, resolver);
+                    methodRef, methodNode.isStatic(), ir, resolver);
 
             // Override readBytecodeInstructionOffset so the translator can
             // record, for every basic block, the bytecode offset of its
@@ -482,13 +501,13 @@ public class BytecodeToIr {
             Function func = translator.getCurrentFunction();
             if (func != null) {
             } else {
-                createExternalFunction(methodRef, isStatic);
+                createExternalFunction(methodRef, isStatic, ir);
             }
         } catch (Exception e) {
             log.warn("Failed to translate method {}; falling back to external declaration: {}",
                 methodRef, e.getMessage());
             boolean isStatic = methodNode != null && methodNode.isStatic();
-            createExternalFunction(methodRef, isStatic);
+            createExternalFunction(methodRef, isStatic, ir);
         }
     }
 
@@ -563,7 +582,8 @@ public class BytecodeToIr {
         return null;
     }
 
-    private Function createExternalFunction(MethodReference ref, boolean isStatic) {
+    private Function createExternalFunction(MethodReference ref, boolean isStatic,
+                                            IrBuilder ir) {
         Type retType = TypeResolver.descToReturnType(ref.getDescriptor());
         List<Type> paramTypes = TypeResolver.descToParamTypes(ref.getDescriptor());
         List<Type> allParams = new ArrayList<>();
@@ -581,7 +601,7 @@ public class BytecodeToIr {
             func.addParameter(new Parameter(t, slot, i));
             slot += (t == Type.LONG || t == Type.DOUBLE) ? 2 : 1;
         }
-        builder.getModule().addFunction(func);
+        ir.getModule().addFunction(func);
         return func;
     }
 }
