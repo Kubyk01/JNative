@@ -27,6 +27,7 @@ import io.github.kubyk01.domain.ir.Value;
 import io.github.kubyk01.domain.ir.TargetPlatform;
 import io.github.kubyk01.domain.analyzer.reflection.ReflectClassInfo;
 import io.github.kubyk01.domain.analyzer.reflection.ReflectInfo;
+import io.github.kubyk01.port.secondary.LlvmGeneratorPort;
 import io.github.kubyk01.util.LlvmUtil;
 import lombok.extern.slf4j.Slf4j;
 import org.objectweb.asm.Handle;
@@ -54,7 +55,7 @@ import java.util.Set;
 import static io.github.kubyk01.util.LlvmUtil.getElementSizeOfType;
 
 @Slf4j
-public class LlvmGenerator {
+public class LlvmGenerator implements LlvmGeneratorPort {
 
     private final Module module;
     private final DependencyResolver resolver;
@@ -79,6 +80,7 @@ public class LlvmGenerator {
     private Map<String, String> clinitWrappers = new HashMap<>();
     private Scheduler scheduler = Schedulers.single();
 
+    @Override
     public void setScheduler(Scheduler scheduler) {
         if (scheduler != null) this.scheduler = scheduler;
     }
@@ -107,14 +109,17 @@ public class LlvmGenerator {
      */
     private List<Map.Entry<String, byte[]>> embeddedResources = new ArrayList<>();
 
+    @Override
     public void setClinitSchedule(List<ClinitScheduleEntry> schedule) {
         this.clinitSchedule = (schedule != null) ? schedule : new ArrayList<>();
     }
 
+    @Override
     public void setEmbeddedResources(List<Map.Entry<String, byte[]>> resources) {
         this.embeddedResources = (resources != null) ? resources : new ArrayList<>();
     }
 
+    @Override
     public void setClinitWrappers(Map<String, String> wrappers) {
         this.clinitWrappers = wrappers != null ? wrappers : new HashMap<>();
         // Forwarded so that LlvmGlobalEmitter.emitLazyClinitMap() can emit
@@ -132,6 +137,7 @@ public class LlvmGenerator {
      * argument conditionally does not need a null check at the call
      * site.</p>
      */
+    @Override
     public void setTargetPlatform(TargetPlatform platform) {
         if (platform != null) {
             this.targetPlatform = platform;
@@ -163,6 +169,7 @@ public class LlvmGenerator {
         return wrapper != null ? wrapper : realClinitName;
     }
 
+    @Override
     public void generate(Path outputDir) throws IOException {
         Files.createDirectories(outputDir);
         ensureExternalDeclarations();

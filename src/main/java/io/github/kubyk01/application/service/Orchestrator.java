@@ -25,6 +25,7 @@ import io.github.kubyk01.domain.ir.Module;
 import io.github.kubyk01.domain.ir.TargetPlatform;
 import io.github.kubyk01.port.primary.OrchestratorPort;
 import io.github.kubyk01.port.secondary.CompilerPort;
+import io.github.kubyk01.port.secondary.LlvmGeneratorPort;
 import io.github.kubyk01.util.LlvmUtil;
 import lombok.extern.slf4j.Slf4j;
 import reactor.core.publisher.Flux;
@@ -414,7 +415,7 @@ public class Orchestrator implements OrchestratorPort {
         System.out.println("Embedding " + embedded.size()
             + " built-in resource(s) from java.base and JDK runtime data.");
 
-        LlvmGenerator llvmGen = new LlvmGenerator(module, resolver, aliasResult,
+        LlvmGeneratorPort llvmGen = new LlvmGenerator(module, resolver, aliasResult,
                 entryClass, entryMethod, entryDescriptor, analysis.getReflectInfo(),
                 polymorphicResolver);
         llvmGen.setScheduler(scheduler);
