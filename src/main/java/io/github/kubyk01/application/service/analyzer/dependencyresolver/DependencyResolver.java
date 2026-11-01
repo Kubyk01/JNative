@@ -82,6 +82,10 @@ import java.util.zip.ZipInputStream;
 @RequiredArgsConstructor
 public class DependencyResolver {
 
+    private record MethodKey(String owner, String name, String desc) {}
+    private record MethodResult(MethodNode method, String foundOwner) {}
+    private final Map<MethodKey, MethodResult> methodCache = new ConcurrentHashMap<>();
+
     private static final String NATIVE_IMAGE_METADATA_PREFIX = "META-INF/native-image/";
 
     @Getter
@@ -1048,6 +1052,22 @@ public class DependencyResolver {
     }
 
     public MethodNode findMethodInHierarchy(String className, String methodName, String descriptor, String[] foundOwner) {
+        MethodKey key = new MethodKey(className, methodName, descriptor);
+        MethodResult cached = methodCache.get(key);
+        if (cached != null) {
+            if (foundOwner != null) foundOwner[0] = cached.foundOwner();
+            return cached.method();
+        }
+        MethodNode result = findMethodInHierarchyUncached(className, methodName, descriptor, foundOwner);
+        if (result != null) {
+            methodCache.put(key, new MethodResult(result,
+                foundOwner != null ? foundOwner[0] : null));
+        }
+        return result;
+    }
+
+    private MethodNode findMethodInHierarchyUncached(String className, String methodName,
+                                                     String descriptor, String[] foundOwner) {
         ClassNode cn = classMap.get(className);
         if (cn == null) {
             loadSystemClass(className);
@@ -1060,26 +1080,24 @@ public class DependencyResolver {
                 return mn;
             }
         }
-
         for (MethodNode mn : cn.getMethods()) {
             if (mn.getName().equals(methodName) && mn.isPolymorphicSignature()) {
                 if (foundOwner != null) foundOwner[0] = className;
                 return mn;
             }
         }
-
         String superName = cn.getSuperName();
         if (superName != null && !superName.equals(className)) {
-            MethodNode result = findMethodInHierarchy(superName, methodName, descriptor, foundOwner);
-            if (result != null) return result;
+            MethodNode r = findMethodInHierarchy(superName, methodName, descriptor, foundOwner);
+            if (r != null) return r;
         } else if (superName == null && !"java/lang/Object".equals(className)) {
-            MethodNode result = findMethodInHierarchy("java/lang/Object", methodName, descriptor, foundOwner);
-            if (result != null) return result;
+            MethodNode r = findMethodInHierarchy("java/lang/Object", methodName, descriptor, foundOwner);
+            if (r != null) return r;
         }
         for (String iface : cn.getInterfaces()) {
             if (iface.equals(className)) continue;
-            MethodNode result = findMethodInHierarchy(iface, methodName, descriptor, foundOwner);
-            if (result != null) return result;
+            MethodNode r = findMethodInHierarchy(iface, methodName, descriptor, foundOwner);
+            if (r != null) return r;
         }
         return null;
     }

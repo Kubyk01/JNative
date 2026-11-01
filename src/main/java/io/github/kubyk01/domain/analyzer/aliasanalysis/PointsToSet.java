@@ -1,154 +1,116 @@
 package io.github.kubyk01.domain.analyzer.aliasanalysis;
 
-import lombok.Getter;
-
-import java.util.Collections;
-import java.util.HashSet;
+import java.util.AbstractSet;
+import java.util.Collection;
+import java.util.Iterator;
+import java.util.NoSuchElementException;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
-@Getter
-public final class PointsToSet {
+/**
+ * Hybrid set: linear array for ≤4 sites, {@link ConcurrentHashMap} beyond.
+ * Monotone growth only. {@code add}/{@code addAll} synchronized; reads are lock-free.
+ */
+public final class PointsToSet extends AbstractSet<AllocationSite> {
+    private static final int SMALL_MAX = 4;
+    public static final PointsToSet EMPTY = new PointsToSet(true);
 
-    /**
-     * Shared immutable instance representing the empty points-to set.
-     *
-     * <p>Backed by {@link Collections#emptySet()}, so every read is
-     * well-defined and every attempt to mutate it raises
-     * {@link UnsupportedOperationException} — which the mutators below
-     * translate into a clearer diagnostic before the underlying set
-     * ever sees the call. There is exactly one such instance for the
-     * lifetime of the process, and it is the answer returned by every
-     * read of a value or field that has no points-to information
-     * yet.</p>
-     *
-     * <p>The whole point of this singleton is that the hot paths of
-     * {@link PointsToGraph#get(io.github.kubyk01.domain.ir.Value)}
-     * and friends become non-allocating. On a full JDK reachability
-     * closure the points-to graph observes several million distinct
-     * {@code Value} instances, of which the overwhelming majority
-     * never acquire a single allocation site. Allocating a fresh
-     * {@code HashSet}-backed {@code PointsToSet} for every one of
-     * those reads is what triggered the C2 "failed reallocation of
-     * scalar replaced objects" abort: HotSpot's escape analysis
-     * scalar-replaced the per-read {@code PointsToSet}, and the
-     * analysis worker threads collectively held enough materialised
-     * copies to exhaust the heap.</p>
-     */
-    public static final PointsToSet EMPTY =
-            new PointsToSet(Collections.emptySet(), false);
+    private final boolean immutable;
+    private volatile AllocationSite[] small;
+    private volatile int smallSize;
+    private volatile ConcurrentHashMap<AllocationSite, Boolean> large;
 
-    /**
-     * -- GETTER --
-     *  Direct view of the backing store. Callers must not mutate the
-     *  returned set on
-     *  and must not retain the view
-     *  beyond the current evaluation if the set is thread-safe and
-     *  concurrently mutable.
-     */
-    private final Set<AllocationSite> sites;
-    private final boolean mutable;
-
-    private PointsToSet(Set<AllocationSite> sites, boolean mutable) {
-        this.sites = sites;
-        this.mutable = mutable;
+    private PointsToSet(boolean immutable) {
+        this.immutable = immutable;
+        if (!immutable) this.small = new AllocationSite[SMALL_MAX];
     }
 
-    /**
-     * Thread-safe mutable set. Use for any set that can be written by
-     * more than one thread concurrently: field-level points-to sets,
-     * static-field points-to sets, and read-only singletons that are
-     * shared across workers.
-     */
-    public static PointsToSet shared() {
-        return new PointsToSet(ConcurrentHashMap.newKeySet(), true);
+    public static PointsToSet shared() { return new PointsToSet(false); }
+    public static PointsToSet local()  { return new PointsToSet(false); }
+    public static PointsToSet empty()  { return EMPTY; }
+
+    @Override public int size()          { var l = large; return l != null ? l.size() : smallSize; }
+    @Override public boolean isEmpty()   { var l = large; return l != null ? l.isEmpty() : smallSize == 0; }
+
+    @Override public boolean contains(Object o) {
+        var l = large;
+        if (l != null) return l.containsKey(o);
+        AllocationSite[] arr = small; int n = smallSize;
+        for (int i = 0; i < n; i++) if (arr[i].equals(o)) return true;
+        return false;
     }
 
-    /**
-     * Non-thread-safe mutable set, sized for the overwhelmingly common
-     * case of one to three allocation sites per value. The default
-     * HashSet capacity of 16 wastes ~96 bytes per empty set — measurable
-     * at the millions of PointsToSet instances created by the
-     * points-to fixed point on a full JDK closure.
-     */
-    public static PointsToSet local() {
-        return new PointsToSet(new HashSet<>(4), true);
+    public boolean containsUnknown() { return contains(AllocationSite.UNKNOWN); }
+
+    @Override public synchronized boolean add(AllocationSite site) {
+        if (immutable) throw new UnsupportedOperationException("immutable PointsToSet");
+        return addInternal(site);
     }
 
-    /**
-     * Immutable empty set. Returns the shared singleton; use this in
-     * every read-only lookup that must not allocate.
-     */
-    public static PointsToSet empty() {
-        return EMPTY;
-    }
+    public boolean addSite(AllocationSite site) { return add(site); }
 
-    public boolean add(AllocationSite site) {
-        if (!mutable) {
-            throw new UnsupportedOperationException(
-                "PointsToSet.EMPTY is immutable; call PointsToSet.local() "
-                    + "or PointsToSet.shared() to obtain a mutable set");
+    @Override
+    public synchronized boolean addAll(Collection<? extends AllocationSite> c) {
+        if (immutable) throw new UnsupportedOperationException("immutable PointsToSet");
+        if (c == this || c.isEmpty()) return false;
+        boolean changed = false;
+        if (c instanceof PointsToSet pts && pts.large == null) {
+            AllocationSite[] arr = pts.small; int n = pts.smallSize;
+            for (int i = 0; i < n; i++) if (addInternal(arr[i])) changed = true;
+        } else {
+            for (AllocationSite s : c) if (addInternal(s)) changed = true;
         }
-        return sites.add(site);
+        return changed;
     }
 
-    public boolean addSite(AllocationSite site) {
-        return add(site);
+    private boolean addInternal(AllocationSite site) {
+        var l = large;
+        if (l != null) return l.putIfAbsent(site, Boolean.TRUE) == null;
+        AllocationSite[] arr = small; int n = smallSize;
+        for (int i = 0; i < n; i++) if (arr[i].equals(site)) return false;
+        if (n < SMALL_MAX) { arr[n] = site; smallSize = n + 1; return true; }
+        promoteToLarge();
+        return large.putIfAbsent(site, Boolean.TRUE) == null;
     }
 
-    public void addAll(PointsToSet other) {
-        if (other == null || other.sites.isEmpty()) return;
-        if (!mutable) {
-            throw new UnsupportedOperationException(
-                "PointsToSet.EMPTY is immutable; call PointsToSet.local() "
-                    + "or PointsToSet.shared() to obtain a mutable set");
-        }
-        sites.addAll(other.sites);
+    private void promoteToLarge() {
+        ConcurrentHashMap<AllocationSite, Boolean> m = new ConcurrentHashMap<>(16);
+        AllocationSite[] arr = small; int n = smallSize;
+        for (int i = 0; i < n; i++) m.put(arr[i], Boolean.TRUE);
+        this.large = m;
     }
 
-    public boolean contains(AllocationSite site) {
-        return sites.contains(site);
-    }
-
-    public boolean containsUnknown() {
-        return sites.contains(AllocationSite.UNKNOWN);
-    }
-
-    public boolean isEmpty() {
-        return sites.isEmpty();
-    }
-
-    public int size() {
-        return sites.size();
+    @Override public Iterator<AllocationSite> iterator() {
+        var l = large;
+        if (l != null) return l.keySet().iterator();
+        return new Iterator<>() {
+            private final AllocationSite[] arr = small;
+            private final int n = smallSize;
+            private int i;
+            @Override public boolean hasNext() { return i < n; }
+            @Override public AllocationSite next() {
+                if (i >= n) throw new NoSuchElementException();
+                return arr[i++];
+            }
+        };
     }
 
     public PointsToSet copy() {
-        if (sites.isEmpty()) return EMPTY;
-        PointsToSet c = new PointsToSet(new HashSet<>(), true);
-        c.sites.addAll(this.sites);
+        if (isEmpty()) return EMPTY;
+        PointsToSet c = new PointsToSet(false);
+        synchronized (this) {
+            c.addAll(this);
+        }
         return c;
     }
 
     public boolean intersects(PointsToSet other) {
-        if (other == null) return false;
-        Set<AllocationSite> a = this.sites;
-        Set<AllocationSite> b = other.sites;
-        if (a.isEmpty() || b.isEmpty()) return false;
-        // Iterate the smaller set to minimise the number of probes into
-        // the larger one.
-        if (a.size() > b.size()) {
-            Set<AllocationSite> tmp = a;
-            a = b;
-            b = tmp;
-        }
-        for (AllocationSite s : a) {
-            if (b.contains(s)) return true;
-        }
+        if (other == null || isEmpty() || other.isEmpty()) return false;
+        if (size() > other.size()) { for (AllocationSite s : other) if (contains(s)) return true; }
+        else                       { for (AllocationSite s : this)  if (other.contains(s)) return true; }
         return false;
     }
 
-    @Override
-    public String toString() {
-        return sites.toString();
-    }
+    /** Backwards-compatible alias — returns this (which is a Set). */
+    public Set<AllocationSite> getSites() { return this; }
 }

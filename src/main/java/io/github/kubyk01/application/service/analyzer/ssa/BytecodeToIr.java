@@ -114,88 +114,69 @@ public class BytecodeToIr {
      */
     public void closeOverIrCallees() {
         Module module = builder.getModule();
-        final int MAX_PASSES = 64;
-        int pass = 0;
+        var worklist = new java.util.ArrayDeque<Function>(module.getFunctions());
+        var processed = java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
 
-        while (pass++ < MAX_PASSES) {
-            List<MethodReference> missing = new ArrayList<>();
-            Set<MethodReference> seen = new HashSet<>();
+        while (!worklist.isEmpty()) {
+            Function func = worklist.poll();
+            if (!processed.add(func) || func.getEntryBlock() == null) continue;
 
-            for (Function func : module.getFunctions()) {
-                if (func.getEntryBlock() == null) continue;
-                for (BasicBlock block : func.getBlocks()) {
-                    for (Instruction inst : block.getInstructions()) {
-                        Opcode op = inst.getOpcode();
-                        if (op != Opcode.CALL
-                            && op != Opcode.STATIC_CALL
-                            && op != Opcode.VIRTUAL_CALL
-                            && op != Opcode.INTERFACE_CALL
-                            && op != Opcode.SPECIAL_CALL) {
-                            continue;
-                        }
-                        String callee = extractCalleeName(inst);
-                        if (callee == null) continue;
+            for (BasicBlock block : func.getBlocks()) {
+                for (Instruction inst : block.getInstructions()) {
+                    Opcode op = inst.getOpcode();
+                    if (op != Opcode.CALL && op != Opcode.STATIC_CALL
+                        && op != Opcode.VIRTUAL_CALL && op != Opcode.INTERFACE_CALL
+                        && op != Opcode.SPECIAL_CALL) continue;
 
-                        int dotIdx   = callee.lastIndexOf('.');
-                        int parenIdx = callee.indexOf('(');
-                        if (dotIdx <= 0 || parenIdx <= dotIdx) continue;
+                    String callee = extractCalleeName(inst);
+                    if (callee == null) continue;
 
-                        String owner      = callee.substring(0, dotIdx);
-                        String methodPart = callee.substring(dotIdx + 1);
-                        int    localParen = parenIdx - dotIdx - 1;
-                        String name       = methodPart.substring(0, localParen);
-                        String desc       = methodPart.substring(localParen);
+                    int dotIdx = callee.lastIndexOf('.');
+                    int parenIdx = callee.indexOf('(');
+                    if (dotIdx <= 0 || parenIdx <= dotIdx) continue;
 
-                        MethodReference ref = new MethodReference(owner, name, desc);
-                        if (!seen.add(ref)) continue;
+                    String owner = callee.substring(0, dotIdx);
+                    String methodPart = callee.substring(dotIdx + 1);
+                    int localParen = parenIdx - dotIdx - 1;
+                    String name = methodPart.substring(0, localParen);
+                    String desc = methodPart.substring(localParen);
 
-                        String mangled = LlvmRuntime.mangleMethod(owner, name, desc);
-                        Function existing = module.getFunction(mangled);
-                        if (existing != null && existing.getEntryBlock() != null) {
-                            continue;
-                        }
+                    String mangled = LlvmRuntime.mangleMethod(owner, name, desc);
+                    if (isResolved(module.getFunction(mangled), mangled)) continue;
 
-                        // Force-load the class if it is still an external stub
-                        // or has no bytecode at all.
-                        ClassNode cn = resolver.getClassNode(owner);
-                        if (cn == null || cn.isExternal()
-                            || resolver.getClassBytes(owner) == null) {
-                            resolver.forceLoadSystemClass(owner);
-                            cn = resolver.getClassNode(owner);
-                        }
-                        // If the class really is external (C helper, JNI
-                        // symbol, runtime function) skip it: such calls are
-                        // emitted as declarations and resolved by the linker.
-                        if (cn == null || cn.isExternal()) continue;
+                    ClassNode cn = resolver.getClassNode(owner);
+                    if (cn == null || cn.isExternal() || resolver.getClassBytes(owner) == null) {
+                        resolver.forceLoadSystemClass(owner);
+                        cn = resolver.getClassNode(owner);
+                    }
+                    if (cn == null || cn.isExternal()) continue;
+                    if (isResolved(module.getFunction(mangled), mangled)) continue;
 
-                        // Check once more after forceLoad: the function may
-                        // have been registered as an alias.
-                        existing = module.getFunction(mangled);
-                        if (existing != null && existing.getEntryBlock() != null) {
-                            continue;
-                        }
+                    MethodReference ref = new MethodReference(owner, name, desc);
 
-                        missing.add(ref);
+                    NativeOverride match = findOverride(ref);
+                    if (match != null) {
+                        Function target = module.getFunction(match.getCFunctionName());
+                        if (target != null) module.registerAlias(mangled, target);
+                        continue;
+                    }
+
+                    int before = module.getFunctions().size();
+                    translateMethod(ref);
+                    int after = module.getFunctions().size();
+                    for (int i = before; i < after; i++) {
+                        Function f = module.getFunctions().get(i);
+                        if (f.getEntryBlock() != null && !processed.contains(f)) worklist.add(f);
                     }
                 }
-            }
-
-            if (missing.isEmpty()) return;
-
-            for (MethodReference ref : missing) {
-                NativeOverride match = findOverride(ref);
-                if (match != null) {
-                    String key = LlvmRuntime.mangleMethod(
-                        ref.getOwner(), ref.getName(), ref.getDescriptor());
-                    Function target = module.getFunction(match.getCFunctionName());
-                    if (target != null) {
-                        module.registerAlias(key, target);
-                    }
-                    continue;
-                }
-                translateMethod(ref);
             }
         }
+    }
+
+    private static boolean isResolved(Function f, String mangled) {
+        if (f == null) return false;
+        if (f.getEntryBlock() != null) return true;
+        return !f.getName().equals(mangled);
     }
 
     /**
@@ -305,7 +286,7 @@ public class BytecodeToIr {
             boolean isStatic = methodNode != null && methodNode.isStatic();
 
             if (classNode.isExternal()) {
-                Function func = createExternalFunction(methodRef, isStatic);
+                createExternalFunction(methodRef, isStatic);
                 return;
             }
 
