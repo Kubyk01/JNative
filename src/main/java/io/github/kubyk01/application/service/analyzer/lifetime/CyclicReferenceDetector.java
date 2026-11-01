@@ -18,57 +18,16 @@ import java.util.NoSuchElementException;
 import java.util.Set;
 
 /**
- * Detects cyclic references in the field-sensitive points-to graph using
- * Tarjan's strongly-connected-components algorithm.
+ * Finds cyclic sites in the field points-to graph via iterative Tarjan SCC.
  *
- * <p>The previous implementation launched a separate DFS from every allocation
- * site, which is O(N*M) for N ~ tens of thousands of sites on a full JDK
- * closure. That was the dominant wall-clock phase after escape analysis and it
- * serialised the whole lifetime stage (the parallel phases waited for it on the
- * CountDownLatch inside {@code LlvmUtil.awaitMono}).</p>
- *
- * <p>Tarjan computes all SCCs in a single O(V+E) pass. A site counts as cyclic
- * when it lies in an SCC of size &gt; 1, or when it has a self-loop (an SCC of
- * size 1 with an edge to itself).</p>
- *
- * <h2>Streaming successor iteration</h2>
- *
- * <p>An earlier revision of this class built a full
- * {@code Map<AllocationSite, Set<AllocationSite>>} adjacency list up front.
- * On a full JDK closure the field points-to graph contains millions of
- * {@code (site, successor)} pairs, and materialising it as a
- * {@code LinkedHashSet} per site — with its ~32–48 byte per-node and
- * per-set overhead on top of the entries themselves — pushed the lifetime
- * stage over the default heap size. The failure that motivated this
- * revision was</p>
- *
- * <pre>
- *   java.lang.OutOfMemoryError: Java heap space:
- *       failed reallocation of scalar replaced objects
- *       at java.util.HashMap.put(HashMap.java:618)
- *       at java.util.HashSet.add(HashSet.java:229)
- *       at ...CyclicReferenceDetector.buildSuccessors(CyclicReferenceDetector.java:67)
- * </pre>
- *
- * <p>That OOM is not avoidable by raising {@code -Xmx}: the graph is
- * quadratic in the number of sites that can reach a given field, and on a
- * ~7.4k-class image it is measured in hundreds of millions of edges. Tarjan
- * only ever needs to (a) iterate a node's successors once per DFS frame, and
- * (b) for a singleton SCC, ask "does this node have a self-loop?". Both
- * questions can be answered directly from {@link PointsToGraph#getFieldPointsToMap}
- * without storing anything, so this revision streams the successor sequence
- * through {@link SuccessorIterator} and replaces the self-loop membership
- * test with {@link #hasSelfLoop(AllocationSite)}. The pass now allocates
- * O(V) instead of O(V + E), which on the same image is the difference
- * between the whole heap and a few hundred megabytes.</p>
- *
- * <p>The behaviour is unchanged: the set of cyclic sites that this class
- * returns is identical to the one the adjacency-list implementation
- * produced, because {@code SuccessorIterator} yields exactly the sequence
- * that used to be stored in the {@code LinkedHashSet} — every non-null,
- * non-{@code UNKNOWN} site in every {@code PointsToSet} of the node's
- * field map, and {@code hasSelfLoop} performs the same membership test
- * that {@code successors.get(single).contains(single)} used to.</p>
+ * The previous revision built a full Map<Site, Set<Site>> adjacency list
+ * up front; on a full JDK closure the graph has hundreds of millions of
+ * edges and materialising them caused OOM. This revision streams
+ * successors from PointsToGraph.getFieldPointsToMap directly via
+ * SuccessorIterator, and replaces the self-loop membership test with
+ * hasSelfLoop. The pass is O(V) in memory; the set of cyclic sites is
+ * identical to the adjacency-list version. Recursion is emulated with an
+ * explicit frame stack so deep hierarchies do not overflow.
  */
 @RequiredArgsConstructor
 public class CyclicReferenceDetector {

@@ -210,25 +210,16 @@ public class InterproceduralPointsTo {
     private void processFunction(Function func, EvalContext ctx) {
         Map<Integer, PointsToSet> slots = slotsFor(func);
 
-        // Seed slots with parameters. The parameter's points-to set is
-        // populated by the caller via processCall's precise propagation.
         for (Parameter p : func.getParameters()) {
             PointsToSet paramPts = graph.get(p);
             if (paramPts.isEmpty()) continue;
-            PointsToSet slotPts = slots.computeIfAbsent(
-                p.getIndex(), k -> PointsToSet.local());
-            int oldSize = slotPts.getSites().size();
-            slotPts.addAll(paramPts);
-            if (slotPts.getSites().size() > oldSize) {
-                ctx.slotsChanged = true;
-            }
+            PointsToSet slotPts = slots.computeIfAbsent(p.getIndex(), k -> PointsToSet.local());
+            if (slotPts.addAll(paramPts)) ctx.slotsChanged = true;
         }
 
-        for (BasicBlock block : func.getBlocks()) {
-            for (Instruction inst : block.getInstructions()) {
+        for (BasicBlock block : func.getBlocks())
+            for (Instruction inst : block.getInstructions())
                 processInstruction(inst, func, slots, ctx);
-            }
-        }
     }
 
     private void processInstruction(Instruction inst,
@@ -262,13 +253,8 @@ public class InterproceduralPointsTo {
 
                 int idx = inst.getLocalIndex();
                 if (idx >= 0) {
-                    PointsToSet slotPts = slots.computeIfAbsent(
-                        idx, k -> PointsToSet.local());
-                    int oldSize = slotPts.getSites().size();
-                    slotPts.addAll(storedPts);
-                    if (slotPts.getSites().size() > oldSize) {
-                        ctx.slotsChanged = true;
-                    }
+                    PointsToSet slotPts = slots.computeIfAbsent(idx, k -> PointsToSet.local());
+                    if (slotPts.addAll(storedPts)) ctx.slotsChanged = true;
                 }
                 break;
             }
@@ -302,12 +288,10 @@ public class InterproceduralPointsTo {
                 PointsToSet rhsPts  = graph.get(rhs);
                 if (rhsPts.isEmpty()) break;
                 if (basePts.isEmpty()) {
-                    ctx.changed |= graph.mergeFieldPointsTo(
-                        AllocationSite.UNKNOWN, field, rhsPts);
+                    ctx.changed |= graph.mergeFieldPointsTo(AllocationSite.UNKNOWN, field, rhsPts);
                 } else {
-                    for (AllocationSite site : basePts.getSites()) {
-                        ctx.changed |= graph.mergeFieldPointsTo(
-                            site, field, rhsPts);
+                    for (AllocationSite site : basePts) {
+                        ctx.changed |= graph.mergeFieldPointsTo(site, field, rhsPts);
                     }
                 }
                 break;
@@ -331,12 +315,10 @@ public class InterproceduralPointsTo {
                 PointsToSet valuePts = graph.get(value);
                 if (valuePts.isEmpty()) break;
                 if (arrayPts.isEmpty()) {
-                    ctx.changed |= graph.mergeArrayElementPointsTo(
-                        AllocationSite.UNKNOWN, valuePts);
+                    ctx.changed |= graph.mergeArrayElementPointsTo(AllocationSite.UNKNOWN, valuePts);
                 } else {
-                    for (AllocationSite site : arrayPts.getSites()) {
-                        ctx.changed |= graph.mergeArrayElementPointsTo(
-                            site, valuePts);
+                    for (AllocationSite site : arrayPts) {
+                        ctx.changed |= graph.mergeArrayElementPointsTo(site, valuePts);
                     }
                 }
                 break;

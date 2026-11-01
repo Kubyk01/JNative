@@ -23,65 +23,21 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * Computes a {@link EscapeSummary} for a native Java method by reading
- * the method's C implementation and analyzing which of its parameters
- * can outlive the call.
+ * Computes an EscapeSummary for a native Java method by parsing its C body.
  *
- * <h2>What "escape" means here</h2>
+ * Escape routes recognized: return escape (parameter is returned) and
+ * heap escape (parameter written into a field / array / global). Every
+ * other use — read, compare, passed to a non-retaining library
+ * function — is treated as non-escaping.
  *
- * <p>There are exactly two escape routes this analyzer recognizes:</p>
+ * The C source is scanned linearly (no regex backtracking on the whole
+ * source). Helper calls within the same translation unit are resolved
+ * recursively; both the top-level callee and every helper push onto a
+ * per-thread stack and break cycles on revisit with the conservative
+ * "everything escapes" summary. Helper summaries are cached.
  *
- * <ul>
- *   <li><b>Return escape</b>: the parameter (or an object reachable
- *       from it) is returned to the caller.</li>
- *   <li><b>Heap escape</b>: the parameter is written into a field of
- *       another object, into an array element, or into a global.</li>
- * </ul>
- *
- * <p>Any parameter that is only read, compared, passed to a library
- * function whose contract forbids retaining pointers, or returned
- * through a helper that itself does not retain it, is <b>not</b>
- * escaping and therefore does not need to be pinned to the heap.</p>
- *
- * <h2>How the C source is parsed</h2>
- *
- * <p>The analyzer does <b>not</b> use a regex to find function
- * definitions. A single linear scan of the source text collects every
- * top-level function into a map, which is then consulted by name. The
- * scan is O(N) in the size of the file and uses no backtracking
- * regular expressions, so it can neither run out of Java stack nor
- * blow up on an input whose shape happens to be pathological for a
- * regex engine.</p>
- *
- * <h2>Recursion and cycles</h2>
- *
- * <p>Calls to helper functions defined in the same C translation unit
- * are resolved recursively. Both the top-level callee and every helper
- * push their identity onto a per-thread stack; a second visit of the
- * same identity breaks the cycle by returning the conservative
- * "everything escapes" summary. Helper summaries are cached, so each
- * (owner, helper) pair is analyzed at most once across the whole run,
- * no matter how many different callers reference it.</p>
- *
- * <h2>Thread-safety</h2>
- *
- * <p>One instance is shared by every thread of the Reactor pool that
- * {@link EscapeSummaryBuilder} uses to compute summaries in parallel.
- * All mutable state is either concurrent or thread-local:</p>
- *
- * <ul>
- *   <li>{@link #cache} — {@link ConcurrentHashMap}, deterministic value
- *       per key, so concurrent writes of the same key are benign.</li>
- *   <li>{@link #helperCache} — {@link ConcurrentHashMap}, same
- *       reasoning.</li>
- *   <li>{@link #sourceByOwner} — {@link ConcurrentHashMap}, cache of C
- *       source text keyed by internal class name.</li>
- *   <li>{@link #functionsByOwner} — {@link ConcurrentHashMap}, cache of
- *       the parsed function maps keyed by internal class name.</li>
- *   <li>{@link #inProgressLocal} — {@link ThreadLocal}, per-thread
- *       stack used for cycle detection in the two mutually recursive
- *       analyses.</li>
- * </ul>
+ * Thread-safe: cache / helperCache / sourceByOwner / functionsByOwner are
+ * ConcurrentHashMap; inProgressLocal is a ThreadLocal.
  */
 @Slf4j
 public final class NativeBodyEscapeAnalyzer {

@@ -2,20 +2,19 @@ package io.github.kubyk01.domain.ir;
 
 import lombok.Getter;
 
-import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 
 public class Module {
     @Getter
-    private final List<Function> functions = new ArrayList<>();
-    private final Map<String, Function> functionMap = new HashMap<>();
+    private final List<Function> functions = new CopyOnWriteArrayList<>();
+    private final Map<String, Function> functionMap = new ConcurrentHashMap<>();
 
     public void addFunction(Function func) {
-        if (!functionMap.containsKey(func.getName())) {
+        if (functionMap.putIfAbsent(func.getName(), func) == null) {
             functions.add(func);
-            functionMap.put(func.getName(), func);
             func.setModule(this);
         }
     }

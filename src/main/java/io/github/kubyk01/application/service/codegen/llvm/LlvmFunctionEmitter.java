@@ -3786,18 +3786,10 @@ public class LlvmFunctionEmitter {
     }
 
     /**
-     * Checks whether a symbol is guaranteed to have a definition at link
-     * time.
-     * <p>
-     * The previous revision returned {@code true} for every
-     * {@code __jnative_fn_*} symbol without verifying that the owning
-     * class has a JNative C file. When the analysis runs on Linux but
-     * the target is Windows, the closure pulls in {@code sun.nio.ch.EPoll},
-     * {@code FileDispatcherImpl}, {@code IOUtil} and {@code Net} — none
-     * of which has a {@code jnative/**} C source — and the fabricated
-     * symbols then fail to link. With the check below, such symbols are
-     * classified as undefined and the emitter falls through to
-     * {@code __jnative_unresolved_slot} (which is always defined).
+     * Whether a symbol has a definition available at link time. Symbols
+     * starting with {@code __jnative_fn_} count only when the owning class
+     * ships a JNative C source; otherwise the emitter falls back to
+     * {@code __jnative_unresolved_slot}.
      */
     private boolean isCallableSymbolDefined(String symbol) {
         if (symbol == null || symbol.isEmpty()) return false;

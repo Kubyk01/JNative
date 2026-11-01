@@ -21,7 +21,6 @@ import io.github.kubyk01.domain.analyzer.dependencyresolver.ClassNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.MethodNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.MethodReference;
 import io.github.kubyk01.domain.analyzer.escapeanalysis.EscapeAnalysisResult;
-import io.github.kubyk01.domain.analyzer.escapeanalysis.EscapeStatus;
 import io.github.kubyk01.domain.analyzer.lifetime.DestructionPoint;
 import io.github.kubyk01.domain.analyzer.lifetime.LifetimeAnalysisResult;
 import io.github.kubyk01.domain.ir.BasicBlock;
@@ -45,106 +44,24 @@ import reactor.core.publisher.Flux;
 import reactor.core.scheduler.Scheduler;
 import reactor.core.scheduler.Schedulers;
 
-import java.util.ArrayDeque;
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.Comparator;
-import java.util.Deque;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.LinkedHashMap;
-import java.util.LinkedHashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
-import java.util.TreeSet;
+import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static io.github.kubyk01.util.LlvmUtil.isAllocation;
 
-/**
- * Orchestrates the analysis pipeline for a compiled module.
- *
- * <h2>Parallelism</h2>
- *
- * <p>Every parallel phase in this class — the call-graph construction,
- * the scope/nested-clinit construction, the triggered-class collection,
- * the field writer/reader collection, and the lazy-clinit
- * instrumentation — runs on the {@link Scheduler} that
- * {@link io.github.kubyk01.application.service.Orchestrator} creates
- * once and hands in through {@link #setScheduler(Scheduler)}. The class
- * never calls {@code parallelStream()} and therefore never touches
- * {@code ForkJoinPool.commonPool()}; the {@code common.parallelism}
- * system property is irrelevant to it.</p>
- *
- * <p>The scheduler is not owned by this class. The orchestrator disposes
- * it after the analysis pipeline has finished; the default
- * {@link Schedulers#single()} that is used when no scheduler has been
- * provided keeps the class usable from unit tests that never touch the
- * reactor runtime at all.</p>
- *
- * <h2>Removed pre-analysis pass</h2>
- *
- * <p>Earlier revisions of this class ran a separate {@link AliasAnalyzer}
- * pass over a synthetic {@link Module} containing only the {@code <clinit>}
- * bodies, immediately before the real alias analysis. That pre-pass was
- * dead code: its result was thrown away, and the same functions were
- * re-analyzed a few lines later as part of the full module. It doubled
- * the cost of the two fixed-point passes inside {@link AliasAnalyzer}
- * (the summary builder and the points-to propagation) for every class
- * initializer in the image, and on a full JDK reachability closure it
- * was the dominant contributor to wall-clock time. It has been removed;
- * the single remaining pass over the full module already covers every
- * {@code <clinit>} body, because the sort that precedes it only reorders
- * the functions, it does not remove them.</p>
- */
 @Slf4j
 public class Analyzer {
 
-    /**
-     * Scheduler for every parallel phase in this class and in the
-     * {@link AliasAnalyzer} it constructs. Set by
-     * {@link #setScheduler(Scheduler)} from
-     * {@code Orchestrator}. Defaults to {@link Schedulers#single()} so
-     * the class is usable from tests that do not care about parallelism.
-     */
     private Scheduler scheduler = Schedulers.single();
 
     public void setScheduler(Scheduler scheduler) {
-        if (scheduler != null) {
-            this.scheduler = scheduler;
-        }
+        if (scheduler != null) this.scheduler = scheduler;
     }
 
-    /**
-     * Mangled names of {@code <clinit>} functions the scheduler has deferred
-     * to lazy initialization because their eager position conflicts with a
-     * bootstrap phase. Populated by {@link #sortInitializers}; read by
-     * {@link #analyze} and passed through to the lazy-clinit instrumenter.
-     */
     private final Set<String> deferredClinits = new LinkedHashSet<>();
 
-    /**
-     * Optional IR translator that produced the module being analyzed.
-     *
-     * <p>When non-null, {@link #analyze} uses it to close over the IR
-     * callees of every function it resurrects — most importantly the
-     * {@code <clinit>} bodies added by
-     * {@link #resurrectRemovedClinits} and
-     * {@link #ensureReferencedClinitsPresent}. Those bodies call their
-     * class's constructor and the synthetic {@code $values()} method,
-     * and those callees may not be in the module yet; without closing
-     * over them the LLVM emitter turns every such call into a runtime
-     * {@code __jnative_unresolved_slot} trap.</p>
-     *
-     * <p>The orchestrator always sets this before invoking
-     * {@link #analyze}. The default of {@code null} keeps the class
-     * usable from unit tests that construct a module by hand and do not
-     * care about the closure.</p>
-     */
     @Setter
     private BytecodeToIr translator;
 
@@ -159,94 +76,39 @@ public class Analyzer {
                                   boolean showEscape,
                                   boolean showLifetime) {
 
-        // --- 1. Dead code elimination -------------------------------------
         System.out.println("\n--- Running dead code elimination ---");
         DeadCodeEliminator dce = new DeadCodeEliminator(module);
+        dce.setScheduler(scheduler);
         dce.eliminate();
 
         int resurrected = resurrectRemovedClinits(module, resolver);
         if (resurrected > 0) {
-            System.out.println("Resurrected " + resurrected
-                + " missing <clinit> function(s) into the module.");
+            System.out.println("Resurrected " + resurrected + " missing <clinit> function(s).");
         }
         int ensured = ensureReferencedClinitsPresent(module, resolver);
         if (ensured > 0) {
-            System.out.println("Added " + ensured
-                + " missing <clinit> function(s) for referenced classes.");
+            System.out.println("Added " + ensured + " missing <clinit> function(s) for referenced classes.");
         }
         int declaredNatives = declareMissingNativeTargets(module, resolver);
         if (declaredNatives > 0) {
-            System.out.println("Declared " + declaredNatives
-                + " missing native-method symbol(s).");
+            System.out.println("Declared " + declaredNatives + " missing native-method symbol(s).");
         }
 
-        // ------------------------------------------------------------------
-        // Close over the IR callees of every function resurrected above.
-        //
-        // resurrectRemovedClinits and ensureReferencedClinitsPresent add
-        // <clinit> bodies directly to the module via retranslateClinit,
-        // which builds only the one function it is asked for and does not
-        // walk its outgoing call graph. The bodies it produces therefore
-        // reference their class's constructor <init>(...)V and the
-        // synthetic $values() method by mangled name, without either
-        // method having been translated into the module.
-        //
-        // The orchestrator's initial translate() pass would normally have
-        // caught those missing callees through closeOverIrCallees(), but
-        // that pass has already completed by the time this code runs: it
-        // executes inside BytecodeToIr.translate(), long before Analyzer
-        // is constructed. Without a second closure pass here, every call
-        // site inside a resurrected <clinit> reaches the LLVM emitter
-        // with a callee that has no body, and the emitter converts each
-        // one into a call to __jnative_unresolved_slot followed by
-        // unreachable.
-        //
-        // The concrete failure this closes is documented in the fun.txt
-        // report: a resurrected
-        // java/net/Authenticator$RequestorType.<clinit> called both
-        // RequestorType.<init>(Ljava/lang/String;I)V and
-        // RequestorType.$values(), neither of which was in the module,
-        // and the resulting trap fired before main() had produced any
-        // observable output.
-        //
-        // The closure is applied unconditionally rather than only when
-        // resurrected + ensured > 0: it is a no-op when there is nothing
-        // to translate, and gating it on a counter would silently miss a
-        // future caller that adds functions to the module by another
-        // route.
-        // ------------------------------------------------------------------
         if (translator != null) {
             translator.closeOverIrCalleesWithSsa();
         }
 
-        // --- 2. Collect + sort <clinit> functions -------------------------
         List<Function> clinitFunctions = new ArrayList<>();
         for (Function func : module.getFunctions()) {
-            if (func.getName().endsWith("__clinit____V")) {
-                clinitFunctions.add(func);
-            }
+            if (func.getName().endsWith("__clinit____V")) clinitFunctions.add(func);
         }
 
-        // Collect the bootstrap phases System.initPhase1/2/3 as ordinary IR
-        // functions and include them in the same dependency graph as the
-        // <clinit>s. The topological sort itself places them in the correct
-        // positions: any phase that (transitively) writes a static field is
-        // placed before every initializer that reads that field; any phase
-        // that (transitively) triggers a class is placed after its <clinit>.
         List<Function> phaseFunctions = collectPhaseFunctions(module, resolver);
 
         List<ClinitScheduleEntry> clinitSchedule = sortInitializers(
             clinitFunctions, phaseFunctions, resolver, module,
             entryClass, entryMethod, entryDescriptor);
 
-        // The list of only the real <clinit>s (without the phases) is needed
-        // by applyLazyClinitForCyclicClasses, because lazy instrumentation
-        // makes sense only for class initializers, not for System methods.
-        //
-        // The eager schedule contains only the clinits that survived the
-        // deferral step. Every deferred clinit still needs a wrapper so
-        // that lazy triggering works; it is added to the instrumentation
-        // pass explicitly.
         List<Function> clinitsToInstrument = new ArrayList<>();
         Set<String> scheduledNames = new HashSet<>();
         for (ClinitScheduleEntry e : clinitSchedule) {
@@ -264,23 +126,10 @@ public class Analyzer {
 
         Map<String, String> clinitWrappers = new HashMap<>();
         applyLazyClinitForCyclicClasses(module, resolver,
-                                        clinitsToInstrument, clinitWrappers,
-                                        deferredClinits);
+            clinitsToInstrument, clinitWrappers,
+            deferredClinits);
 
-        // --- 3. Alias analysis --------------------------------------------
-        //
-        // There used to be a separate AliasAnalyzer pass over a synthetic
-        // Module containing only the <clinit> functions, run just before
-        // this one. Its result was discarded — the AliasAnalysisResult
-        // returned below is produced by the call on the full module, which
-        // already contains every <clinit> body. That pre-pass therefore
-        // doubled the cost of both fixed-points (SummaryBuilder and
-        // InterproceduralPointsTo) for every class initializer in the
-        // image, and it was the reason the "Processing N static
-        // initializers" step dominated the wall clock on a full JDK
-        // reachability closure. It is gone.
-        AliasAnalyzer aliasAnalyzer = new AliasAnalyzer(module, scheduler);
-        AliasAnalysisResult aliasResult = aliasAnalyzer.analyze();
+        AliasAnalysisResult aliasResult = new AliasAnalyzer(module, scheduler).analyze();
         if (showAlias) {
             System.out.println("\n--- Alias Analysis ---");
             System.out.println("Alias analysis complete.");
@@ -301,10 +150,8 @@ public class Analyzer {
             }
         }
 
-        // --- 4. Escape analysis -------------------------------------------
-        EscapeAnalyzer escapeAnalyzer =
-            new EscapeAnalyzer(module, aliasResult, resolver, scheduler);
-        EscapeAnalysisResult escapeResult = escapeAnalyzer.analyze();
+        EscapeAnalysisResult escapeResult = new EscapeAnalyzer(
+            module, aliasResult, resolver, scheduler).analyze();
         if (showEscape) {
             System.out.println("\n--- Escape Analysis ---");
             System.out.println("Escape analysis complete.");
@@ -318,8 +165,8 @@ public class Analyzer {
                             for (AllocationSite site : pts.getSites()) {
                                 if (!includeSystem && !isUserAllocationSite(site)) continue;
                                 if (!matchesDebug(debugName, site)) continue;
-                                EscapeStatus status = escapeResult.getSiteStatus(site);
-                                System.out.println("  " + site + " -> " + status);
+                                System.out.println("  " + site + " -> " +
+                                    escapeResult.getSiteStatus(site));
                             }
                         }
                     }
@@ -327,7 +174,6 @@ public class Analyzer {
             }
         }
 
-        // --- 5. Lifetime analysis -----------------------------------------
         Map<String, FunctionSummary> summaries = aliasResult.getFunctionSummaries();
         LifetimeAnalyzer lifetimeAnalyzer =
             new LifetimeAnalyzer(module, aliasResult, escapeResult, summaries);
@@ -367,9 +213,9 @@ public class Analyzer {
             aliasResult, escapeResult, lifetimeResult);
     }
 
-    // =====================================================================
-    //  Lazy <clinit> instrumentation for cyclic initialization groups
-    // =====================================================================
+    // ------------------------------------------------------------------
+    //  Lazy <clinit> for cyclic groups
+    // ------------------------------------------------------------------
 
     private void applyLazyClinitForCyclicClasses(Module module,
                                                  DependencyResolver resolver,
@@ -395,38 +241,14 @@ public class Analyzer {
 
         Set<String> allWithClinit = new HashSet<>(classNameToClinitName.keySet());
 
-        // Force-include any class that the scheduler deferred. A deferred
-        // class is not in the cyclic classDeps graph computed below — the
-        // cycle it participates in goes through the bootstrap phases,
-        // which are not represented in classDeps at all — so without this
-        // merge it would never receive a wrapper and its active-use sites
-        // would never be instrumented. Then the deferred <clinit> would
-        // simply never run, and the first read of a field it initializes
-        // would observe null.
-        //
-        // We add the class to the cyclicClasses set below and let the
-        // ordinary propagation and instrumentation passes do the rest.
         Set<String> forcedClasses = new LinkedHashSet<>();
         if (forcedDeferredClinits != null) {
             for (String clinitName : forcedDeferredClinits) {
                 String cls = clinitNameToClassName.get(clinitName);
-                if (cls != null && allWithClinit.contains(cls)) {
-                    forcedClasses.add(cls);
-                }
+                if (cls != null && allWithClinit.contains(cls)) forcedClasses.add(cls);
             }
         }
 
-        // ---- Parallel call-graph construction (Reactor).
-        //
-        // The call graph is the only persistent structure this method
-        // keeps alive. It maps every live function to the set of
-        // functions it calls directly, and it is consumed twice: once
-        // by the BFS in the next block and once more by the
-        // activation-depth computation at the end. Its memory cost is
-        // proportional to the number of direct call edges in the
-        // module — on a full JDK closure a few hundred thousand
-        // entries, a few tens of megabytes — which is the only large
-        // data structure that survives the phase.
         Map<String, Set<String>> callGraph = new ConcurrentHashMap<>();
         List<Function> functionsSnapshot = new ArrayList<>(module.getFunctions());
         LlvmUtil.awaitMono(Flux.fromIterable(functionsSnapshot)
@@ -443,61 +265,16 @@ public class Analyzer {
                 callGraph.put(func.getName(), callees);
             })
             .sequential()
-            .then()
-        );
+            .then());
 
-        // ---- Single-pass scope walk for every <clinit> body.
-        //
-        // This block replaces three separate parallel passes that used
-        // to run one after the other:
-        //
-        //   1. a pass that built a persistent Map<String, Set<String>>
-        //      holding the entire reachable call graph of every
-        //      <clinit> (the "clinitScope" map),
-        //
-        //   2. a pass that walked every such scope to build the
-        //      per-class dependency deltas,
-        //
-        //   3. a pass that walked every such scope again to build the
-        //      field-writer / field-reader maps.
-        //
-        // The old arrangement was O(#clinit x (V + E)) in memory, not
-        // just in time. For each of the ~500 to ~2500 <clinit>
-        // functions it retained a full LinkedHashSet of every
-        // function reachable without crossing another <clinit>. On
-        // the failing run that was several GB of live strings, all
-        // strongly referenced by the clinitScope map for the entire
-        // duration of the phase, none of it reachable by the garbage
-        // collector. G1 filled the 4-GB heap to 99.9 %, the
-        // concurrent cycle stopped making progress, and the JVM
-        // eventually aborted with
-        //
-        //     OutOfMemoryError: Java heap space: failed reallocation
-        //     of scalar replaced objects
-        //
-        // raised from C2's deoptimization path while the compiler was
-        // itself running out of heap.
-        //
-        // The rework below performs the same BFS once per clinit, but
-        // accumulates every derived fact DURING the walk and discards
-        // the scope set as soon as the walk returns. The three
-        // outputs the method actually needs — the set of directly
-        // nested <clinit> bodies, the per-class dependency delta, and
-        // the field writer/reader index — are all small relative to
-        // the scope. The scope is the only thing that grows with the
-        // reachable subgraph size, and it is exactly what the rework
-        // eliminates.
-        //
-        // Each BFS is still bounded by one clinit's own reachability,
-        // which is what makes the transient memory profile linear
-        // rather than quadratic in the number of clinit bodies. The
-        // instruction scan that used to run three times per scope
-        // member (once per consuming pass) now runs exactly once,
-        // folded into the BFS itself.
         Map<String, Set<String>> nestedClinits  = new ConcurrentHashMap<>();
         Map<String, Set<String>> classDepDeltas = new ConcurrentHashMap<>();
         Map<String, Set<String>> fieldWriters   = new ConcurrentHashMap<>();
         Map<String, Set<String>> fieldReaders   = new ConcurrentHashMap<>();
+
+        Map<String, Set<String>> triggerCache    = new ConcurrentHashMap<>();
+        Map<String, Set<String>> fieldWriteCache = new ConcurrentHashMap<>();
+        Map<String, Set<String>> fieldReadCache  = new ConcurrentHashMap<>();
 
         LlvmUtil.awaitMono(Flux.fromIterable(clinitFunctions)
             .parallel()
@@ -506,155 +283,71 @@ public class Analyzer {
                 String className = clinitNameToClassName.get(clinit.getName());
                 if (className == null) return;
 
-                // Transient visited set for the BFS. Bounded by this
-                // clinit's own reachable call graph; the moment the
-                // walk returns, the only reference to it dies with
-                // this stack frame and the whole set becomes garbage.
                 Set<String> visited = new HashSet<>();
-
-                // Retained outputs. `nested` is small: one entry per
-                // directly-triggered <clinit>. `delta` is small: one
-                // entry per class this clinit's scope touches, which
-                // on a large module is a few hundred at most.
-                Set<String> nested = new LinkedHashSet<>();
-                Set<String> delta  = new HashSet<>();
-
+                Set<String> nested  = new LinkedHashSet<>();
+                Set<String> delta   = new HashSet<>();
                 Deque<String> worklist = new ArrayDeque<>();
+
                 visited.add(clinit.getName());
                 worklist.push(clinit.getName());
 
                 while (!worklist.isEmpty()) {
                     String cur = worklist.pop();
+                    Function f = module.getFunction(cur);
+                    if (f != null && f.getEntryBlock() != null) {
+                        Set<String> trig = triggerCache.computeIfAbsent(cur,
+                            k -> scanTriggers(module.getFunction(k)));
+                        for (String t : trig) if (!t.equals(className)) delta.add(t);
 
-                    // (a) Instruction scan. Every function the BFS
-                    // reaches is scanned exactly once, here, while its
-                    // name is on the stack. The previous revision
-                    // walked each scope three separate times, and
-                    // every one of those walks paid the same
-                    // per-instruction cost; folding the scan into the
-                    // BFS removes that threefold redundancy as a
-                    // side-effect of the memory fix.
-                    Function func = module.getFunction(cur);
-                    if (func != null && func.getEntryBlock() != null) {
-                        for (BasicBlock block : func.getBlocks()) {
-                            for (Instruction inst : block.getInstructions()) {
-                                Opcode op = inst.getOpcode();
-
-                                if (op == Opcode.NEW
-                                    || op == Opcode.GET_STATIC
-                                    || op == Opcode.PUT_STATIC
-                                    || op == Opcode.STATIC_CALL) {
-                                    String owner = extractTriggerOwner(inst);
-                                    if (owner != null
-                                        && !owner.isEmpty()
-                                        && !owner.equals(className)) {
-                                        delta.add(owner);
-                                    }
-                                }
-
-                                if (op == Opcode.GET_STATIC
-                                    || op == Opcode.PUT_STATIC) {
-                                    String field = extractStaticFieldKey(inst);
-                                    if (field != null) {
-                                        if (op == Opcode.PUT_STATIC) {
-                                            fieldWriters
-                                                .computeIfAbsent(field, k ->
-                                                    ConcurrentHashMap.newKeySet())
-                                                .add(className);
-                                        } else {
-                                            fieldReaders
-                                                .computeIfAbsent(field, k ->
-                                                    ConcurrentHashMap.newKeySet())
-                                                .add(className);
-                                        }
-                                    }
-                                }
-                            }
+                        for (String fld : fieldWriteCache.computeIfAbsent(cur,
+                            k -> scanFieldWrites(module.getFunction(k)))) {
+                            fieldWriters.computeIfAbsent(fld, k -> ConcurrentHashMap.newKeySet())
+                                .add(className);
+                        }
+                        for (String fld : fieldReadCache.computeIfAbsent(cur,
+                            k -> scanFieldReads(module.getFunction(k)))) {
+                            fieldReaders.computeIfAbsent(fld, k -> ConcurrentHashMap.newKeySet())
+                                .add(className);
                         }
                     }
 
-                    // (b) Call-graph expansion. A callee that is
-                    // itself a <clinit> body is recorded in `nested`
-                    // and not descended into: this clinit's scope
-                    // deliberately stops at another class's
-                    // initializer. A callee that is an ordinary
-                    // function is pushed onto the worklist exactly
-                    // once, guarded by `visited`.
                     Set<String> callees = callGraph.get(cur);
                     if (callees == null) continue;
                     for (String callee : callees) {
-                        if (clinitNames.contains(callee)) {
-                            nested.add(callee);
-                            continue;
-                        }
-                        if (visited.add(callee)) {
-                            worklist.push(callee);
-                        }
+                        if (clinitNames.contains(callee)) { nested.add(callee); continue; }
+                        if (visited.add(callee)) worklist.push(callee);
                     }
                 }
 
-                // (c) Superclass chain. The delta also carries every
-                // ancestor that declares a <clinit>, because JVMS
-                // §5.5 requires a superclass initializer to run
-                // before its subclass. This walk is independent of
-                // the call graph; it is done here so that all of this
-                // clinit's dependency edges are collected by exactly
-                // one task.
                 ClassNode cn = resolver.getClassNode(className);
                 Set<String> supVisited = new HashSet<>();
-                while (cn != null
-                       && cn.getSuperName() != null
-                       && !cn.getSuperName().equals(cn.getName())
-                       && supVisited.add(cn.getSuperName())) {
+                while (cn != null && cn.getSuperName() != null
+                    && !cn.getSuperName().equals(cn.getName())
+                    && supVisited.add(cn.getSuperName())) {
                     String sup = cn.getSuperName();
                     if ("java/lang/Object".equals(sup)) break;
                     delta.add(sup);
                     cn = resolver.getClassNode(sup);
                 }
-
-                // (d) Nested clinit classes contribute to the delta
-                // exactly as the superclass chain does. `nested` is
-                // the set of clinit function names collected in step
-                // (b); the corresponding class names are looked up
-                // through the same reverse index the rest of the
-                // method uses.
-                for (String nestedClinit : nested) {
-                    String nestedClass =
-                        clinitNameToClassName.get(nestedClinit);
-                    if (nestedClass != null
-                        && !nestedClass.equals(className)) {
-                        delta.add(nestedClass);
-                    }
+                for (String nc : nested) {
+                    String ncls = clinitNameToClassName.get(nc);
+                    if (ncls != null && !ncls.equals(className)) delta.add(ncls);
                 }
 
                 nestedClinits.put(clinit.getName(), nested);
-
                 if (!delta.isEmpty()) {
-                    classDepDeltas.compute(className, (k, existing) -> {
-                        if (existing == null) return delta;
-                        existing.addAll(delta);
-                        return existing;
+                    classDepDeltas.compute(className, (k, e) -> {
+                        if (e == null) return delta;
+                        e.addAll(delta);
+                        return e;
                     });
                 }
             })
             .sequential()
-            .then()
-        );
+            .then());
 
-        // ---- Class-dependency graph, assembled on the caller thread.
-        //
-        // The deltas collected by the parallel walk above are merged
-        // here, single-threaded, so that the LinkedHashSet inside
-        // each classDeps entry keeps a deterministic iteration order.
-        // Sorting each incoming delta before inserting it is what
-        // guarantees that two runs of the same build produce
-        // byte-identical emitted IR; the parallel producers cannot
-        // offer that guarantee on their own, because two threads can
-        // observe the same call graph in different orders.
         Map<String, Set<String>> classDeps = new LinkedHashMap<>();
-        for (String cls : allWithClinit) {
-            classDeps.put(cls, new LinkedHashSet<>());
-        }
+        for (String cls : allWithClinit) classDeps.put(cls, new LinkedHashSet<>());
 
         for (Map.Entry<String, Set<String>> entry : classDepDeltas.entrySet()) {
             Set<String> deps = classDeps.get(entry.getKey());
@@ -664,14 +357,6 @@ public class Analyzer {
             deps.addAll(sorted);
         }
 
-        // ---- Field-provenance edges.
-        //
-        // A class that reads a static field written by another class
-        // must be initialized after that writer's <clinit> has run.
-        // The fieldWriters / fieldReaders maps built in the
-        // single-pass walk above index both sides of that relation
-        // by field key; the loop below materialises the edges into
-        // classDeps.
         for (Map.Entry<String, Set<String>> entry : fieldReaders.entrySet()) {
             Set<String> writers = fieldWriters.get(entry.getKey());
             if (writers == null || writers.isEmpty()) continue;
@@ -703,24 +388,64 @@ public class Analyzer {
             cyclicClasses, allWithClinit, resolver);
 
         System.out.println("Lazy <clinit>: " + cyclicClasses.size()
-            + " cyclic class(es), " + lazyClasses.size()
-            + " total lazy class(es) after superclass/subclass closure.");
+            + " cyclic class(es), " + lazyClasses.size() + " total lazy class(es).");
 
         LazyClinitInstrumenter instrumenter =
             new LazyClinitInstrumenter(module, resolver, lazyClasses, scheduler);
         int inserted = instrumenter.instrument();
-        System.out.println("Lazy <clinit>: instrumented " + inserted
-            + " trigger site(s).");
+        System.out.println("Lazy <clinit>: instrumented " + inserted + " trigger site(s).");
 
         for (String cls : lazyClasses) {
             String clinitName = classNameToClinitName.get(cls);
             if (clinitName == null) continue;
             String wrapperName = "fn___lazy_clinit_run_" + sanitizeForWrapper(cls);
             Function wrapper = module.getFunction(wrapperName);
-            if (wrapper != null) {
-                clinitWrappers.put(clinitName, wrapper.getName());
+            if (wrapper != null) clinitWrappers.put(clinitName, wrapper.getName());
+        }
+    }
+
+    private static Set<String> scanTriggers(Function f) {
+        if (f == null || f.getEntryBlock() == null) return Set.of();
+        Set<String> out = new HashSet<>();
+        for (BasicBlock b : f.getBlocks()) {
+            for (Instruction i : b.getInstructions()) {
+                Opcode op = i.getOpcode();
+                if (op == Opcode.NEW || op == Opcode.GET_STATIC
+                    || op == Opcode.PUT_STATIC || op == Opcode.STATIC_CALL) {
+                    String owner = extractTriggerOwner(i);
+                    if (owner != null && !owner.isEmpty()) out.add(owner);
+                }
             }
         }
+        return out;
+    }
+
+    private static Set<String> scanFieldWrites(Function f) {
+        if (f == null || f.getEntryBlock() == null) return Set.of();
+        Set<String> out = new HashSet<>();
+        for (BasicBlock b : f.getBlocks()) {
+            for (Instruction i : b.getInstructions()) {
+                if (i.getOpcode() == Opcode.PUT_STATIC) {
+                    String k = extractStaticFieldKey(i);
+                    if (k != null) out.add(k);
+                }
+            }
+        }
+        return out;
+    }
+
+    private static Set<String> scanFieldReads(Function f) {
+        if (f == null || f.getEntryBlock() == null) return Set.of();
+        Set<String> out = new HashSet<>();
+        for (BasicBlock b : f.getBlocks()) {
+            for (Instruction i : b.getInstructions()) {
+                if (i.getOpcode() == Opcode.GET_STATIC) {
+                    String k = extractStaticFieldKey(i);
+                    if (k != null) out.add(k);
+                }
+            }
+        }
+        return out;
     }
 
     private static String sanitizeForWrapper(String s) {
@@ -737,9 +462,9 @@ public class Analyzer {
         return sb.toString();
     }
 
-    // =====================================================================
+    // ------------------------------------------------------------------
     //  <clinit> resurrection / ensuring / native declaration
-    // =====================================================================
+    // ------------------------------------------------------------------
 
     private int resurrectRemovedClinits(Module module, DependencyResolver resolver) {
         int total = 0;
@@ -780,10 +505,6 @@ public class Analyzer {
                 if (resurrected != null) {
                     total++;
                     anyAdded = true;
-                    // Distinguish "was in the module before DCE and got removed"
-                    // from "was never added at all". The previous single message
-                    // ("removed by DCE") was misleading: for the NativeImageBuffer
-                    // case the function had never been translated in the first place.
                     log.debug("Resurrected <clinit> of {}", owner);
                 }
             }
@@ -834,67 +555,9 @@ public class Analyzer {
         return added;
     }
 
-    /**
-     * Collects the internal names of every class whose static initialization
-     * must be scheduled into the compiled image.
-     *
-     * <p>The result is the closure of two relations:</p>
-     *
-     * <ol>
-     *   <li>Every class referenced explicitly from the compiled bytecode:
-     *       by a {@code getstatic}/{@code putstatic}, a {@code new}, an
-     *       {@code invokestatic} (the trigger owners), or by the owner of a
-     *       direct call ({@code CALL}). A call whose target is a
-     *       {@code native} method is excluded, because such an invocation
-     *       does not trigger class initialization. This is what the previous
-     *       revision computed, and it is what the ordinary reachability walk
-     *       already discovers.</li>
-     *
-     *   <li>The transitive superclass closure of the first set. JVMS §5.5
-     *       guarantees that a class's superclass is initialized before the
-     *       class itself, but that rule is enforced by the VM, not by the
-     *       bytecode: no compiled program ever contains an explicit
-     *       "initialize the superclass of this class" instruction. A class
-     *       that participates only as a superclass — it is never
-     *       instantiated, has no static field read or written from the
-     *       image, and has no static method called — would therefore be
-     *       missing from the first set, and its {@code <clinit>} would
-     *       never be resurrected into the module.</li>
-     * </ol>
-     *
-     * <p>The concrete failure this closure fixes is
-     * {@code java.security.SecureClassLoader}: it is the direct superclass
-     * of {@code jdk.internal.loader.BuiltinClassLoader}, it is abstract,
-     * and nothing in the compiled image references it directly. Its
-     * {@code <clinit>} body is
-     * <pre>
-     *     static { ClassLoader.registerAsParallelCapable(); }
-     * </pre>
-     * and {@code ClassLoader.registerAsParallelCapable} consults
-     * {@code ParallelLoaders.loaderTypes}, whose contents are determined by
-     * the order in which the superclass chain initializes:</p>
-     *
-     * <pre>
-     *     ClassLoader.<clinit>         adds ClassLoader
-     *     SecureClassLoader.<clinit>   adds SecureClassLoader
-     *     BuiltinClassLoader.<clinit>  adds BuiltinClassLoader
-     * </pre>
-     *
-     * <p>With {@code SecureClassLoader.<clinit>} missing from the module,
-     * the middle entry is never inserted, and {@code BuiltinClassLoader}'s
-     * own registration fails with
-     * {@code java.lang.InternalError: Unable to register as parallel capable}.</p>
-     *
-     * <p>The closure walks superclasses only, not interfaces. Interfaces are
-     * excluded on purpose: JVMS §5.5 does not initialize an interface when a
-     * class that implements it is initialized, and the JDK's own
-     * {@code ParallelLoaders.loaderTypes} chain is a superclass chain, not a
-     * superinterface chain.</p>
-     */
     private Set<String> collectTriggeredOwners(Module module, DependencyResolver resolver) {
         Set<String> owners = new HashSet<>();
 
-        // ---- 1. Explicit references from bytecode. ----
         for (Function f : module.getFunctions()) {
             if (f.getEntryBlock() == null) continue;
             for (BasicBlock b : f.getBlocks()) {
@@ -903,28 +566,8 @@ public class Analyzer {
                     if (op == Opcode.GET_STATIC || op == Opcode.PUT_STATIC
                         || op == Opcode.NEW) {
                         String owner = extractTriggerOwner(inst);
-                        if (owner != null && !owner.isEmpty()) {
-                            owners.add(owner);
-                        }
+                        if (owner != null && !owner.isEmpty()) owners.add(owner);
                     } else if (op == Opcode.STATIC_CALL || op == Opcode.CALL) {
-                        // An invokestatic to a *native* method does NOT
-                        // trigger class initialization (JVMS §5.5): the body
-                        // lives in C and reads no Java-side static state.
-                        // Excluding native targets here is what keeps this
-                        // pass consistent with
-                        // MethodBytecodeVisitor.visitMethodInsn and with
-                        // LazyClinitInstrumenter.triggeredClassFor.
-                        //
-                        // The earlier revision added the owner of every
-                        // STATIC_CALL unconditionally. That resurrected
-                        // <clinit> functions for classes whose only entry
-                        // point was a native static method — most notably
-                        // jdk.internal.jimage.NativeImageBuffer — and the
-                        // resurrected bodies were missing their transitive
-                        // closure because retranslateClinit() does not run
-                        // the reachability walk. The result was a vtable
-                        // slot populated with an unresolved thunk and a
-                        // runtime __jnative_unresolved_slot trap.
                         String callee = extractCalleeConstant(inst, 0);
                         if (callee == null) continue;
 
@@ -941,45 +584,24 @@ public class Analyzer {
                         String[] foundOwner = new String[1];
                         MethodNode mn = resolver.findMethodInHierarchy(
                             owner, methodName, descriptor, foundOwner);
-                        if (mn != null && mn.isNative()) {
-                            continue;
-                        }
-                        String declOwner = (foundOwner[0] != null
-                            && !foundOwner[0].isEmpty())
-                            ? foundOwner[0]
-                            : owner;
+                        if (mn != null && mn.isNative()) continue;
+                        String declOwner = (foundOwner[0] != null && !foundOwner[0].isEmpty())
+                            ? foundOwner[0] : owner;
                         owners.add(declOwner);
                     }
                 }
             }
         }
 
-        // ---- 2. Transitive superclass closure. ----
-        //
-        // See the javadoc above for the full rationale. The walk is
-        // monotone (owners is a growing set, each class is enqueued at
-        // most once) and terminates at java/lang/Object or at the first
-        // missing ClassNode. External classes and interfaces are not
-        // added; the callers of this method (resurrectRemovedClinits and
-        // ensureReferencedClinitsPresent) skip both categories again when
-        // they iterate the result, so no special handling is required
-        // here.
         Deque<String> worklist = new ArrayDeque<>(owners);
         while (!worklist.isEmpty()) {
             String owner = worklist.poll();
             ClassNode cn = resolver.getClassNode(owner);
             if (cn == null) continue;
-
             String sup = cn.getSuperName();
-            if (sup == null
-                || sup.isEmpty()
-                || sup.equals(owner)
-                || "java/lang/Object".equals(sup)) {
-                continue;
-            }
-            if (owners.add(sup)) {
-                worklist.add(sup);
-            }
+            if (sup == null || sup.isEmpty() || sup.equals(owner)
+                || "java/lang/Object".equals(sup)) continue;
+            if (owners.add(sup)) worklist.add(sup);
         }
 
         return owners;
@@ -999,9 +621,7 @@ public class Analyzer {
                 @Override
                 public MethodVisitor visitMethod(int access, String name, String desc,
                                                  String signature, String[] exceptions) {
-                    if (name.equals("<clinit>") && desc.equals("()V")) {
-                        return translator;
-                    }
+                    if (name.equals("<clinit>") && desc.equals("()V")) return translator;
                     return null;
                 }
             }, ClassReader.SKIP_DEBUG);
@@ -1083,30 +703,15 @@ public class Analyzer {
         return added;
     }
 
-    // =====================================================================
+    // ------------------------------------------------------------------
     //  <clinit> sorting
-    // =====================================================================
+    // ------------------------------------------------------------------
 
-    /**
-     * Collects the mangled names of all static bootstrap phases declared in
-     * java.lang.System: initPhase1, initPhase2, initPhase3.
-     *
-     * <p>Discovery is driven by the "initPhase" prefix among the static
-     * methods of System rather than by a hard-coded list. A JDK that renames
-     * or adds a phase is picked up automatically.</p>
-     *
-     * <p>The returned names match what {@link LlvmRuntime#mangleMethod}
-     * produces, so the caller can look them up in
-     * {@link Module#getFunction(String)} without further conversion. The list
-     * is sorted so that initPhase1 runs before initPhase2, and initPhase2
-     * before initPhase3, independently of the method traversal order.</p>
-     */
     private List<String> collectBootstrapPhaseFunctions(DependencyResolver resolver) {
         List<String> phases = new ArrayList<>();
         ClassNode systemNode = resolver.getClassNode("java/lang/System");
         if (systemNode == null || systemNode.isExternal()) {
-            log.warn("java.lang.System is not loaded; no bootstrap phases "
-                + "will be scheduled and System.out/err/in may stay unset");
+            log.warn("java.lang.System is not loaded; no bootstrap phases will be scheduled");
             return phases;
         }
         for (MethodNode mn : systemNode.getMethods()) {
@@ -1114,100 +719,38 @@ public class Analyzer {
             String n = mn.getName();
             if (!n.startsWith("initPhase")) continue;
             if (n.equals("<clinit>") || n.equals("<init>")) continue;
-            phases.add(LlvmRuntime.mangleMethod(
-                "java/lang/System", n, mn.getDescriptor()));
+            phases.add(LlvmRuntime.mangleMethod("java/lang/System", n, mn.getDescriptor()));
         }
         phases.sort(Comparator.naturalOrder());
         return phases;
     }
 
-    /**
-     * Resolves the mangled names of the bootstrap phases returned by
-     * {@link #collectBootstrapPhaseFunctions} into the real IR functions of
-     * the module.
-     *
-     * <p>Phases whose bodies are absent from the module (the System class was
-     * not loaded, no IR was generated) are silently skipped: this is equivalent
-     * to the phase doing nothing and preserves the previous generator
-     * behaviour, which wrote a warning in that case.</p>
-     */
     private List<Function> collectPhaseFunctions(Module module,
                                                  DependencyResolver resolver) {
         List<String> names = collectBootstrapPhaseFunctions(resolver);
         List<Function> result = new ArrayList<>(names.size());
         for (String name : names) {
             Function f = module.getFunction(name);
-            if (f != null && f.getEntryBlock() != null) {
-                result.add(f);
-            }
+            if (f != null && f.getEntryBlock() != null) result.add(f);
         }
         return result;
     }
 
-    /**
-     * Builds the initialization schedule in two stages: first the
-     * {@code <clinit>} functions are linearized by their own Tarjan pass over
-     * their own subgraph, then the bootstrap phases
-     * {@code System.initPhase1/2/3} are inserted into that finished order.
-     *
-     * <h2>Why the phases stay out of the SCC decomposition</h2>
-     *
-     * <p>The phase order is fixed by the JDK contract:
-     * {@code initPhase1 -> initPhase2 -> initPhase3}. It must not be broken.
-     * If the phases are placed in the same graph as the {@code <clinit>}s,
-     * they land in one huge SCC and the linearizer breaks edges inside the
-     * cycle arbitrarily — including the hard {@code phase2 -> phase1} edge.
-     * After that {@code initPhase2} runs before {@code initPhase1} and
-     * {@code VM.initLevel()} is still 0 when phase 2 starts.</p>
-     *
-     * <p>The position of each phase is computed on the finished
-     * {@code <clinit>} order:</p>
-     * <ul>
-     *   <li>{@code after(P)} = 1 + the largest index of a {@code <clinit>}
-     *       whose static fields {@code P} reads (transitively);</li>
-     *   <li>{@code before(P)} = the smallest index of a {@code <clinit>}
-     *       that reads (transitively) a static field written by {@code P}.</li>
-     * </ul>
-     *
-     * <p>If {@code after(P) <= before(P)} the phase is placed at position
-     * {@code after(P)} — right after its dependencies and before all of its
-     * readers. If {@code after(P) > before(P)} (a phase and a clinit depend
-     * on each other through a field), priority is given to {@code after(P)}:
-     * the phase is placed AFTER all of its dependencies even if that means
-     * some of its readers run before it. The choice is deliberate — see the
-     * block comment at the merge site for the full reasoning — and is the
-     * opposite of the previous revision's. A warning is printed for every
-     * such break.</p>
-     *
-     * <h2>Why trigger edges from phases are dropped</h2>
-     *
-     * <p>The scope of phase 1 covers nearly all of {@code java.base} startup,
-     * so "phase triggers class X" degenerates into "the phase depends on
-     * almost every {@code <clinit>}". In a linear schedule this is
-     * meaningless: a triggered initialization of X completes before the
-     * trigger instruction inside the phase is reached, and everything the
-     * phase actually reads from X is already covered by field-provenance
-     * edges (X — through the phase scope — lands in the fieldReaders of the
-     * corresponding field). Dropping trigger edges from phases keeps exactly
-     * the dependencies that really affect correctness and stops the phases
-     * from being pushed to the end of the schedule.</p>
-     */
     private List<ClinitScheduleEntry> sortInitializers(
-            List<Function> clinitFunctions,
-            List<Function> phaseFunctions,
-            DependencyResolver resolver,
-            Module module,
-            String entryClass,
-            String entryMethod,
-            String entryDescriptor) {
+        List<Function> clinitFunctions,
+        List<Function> phaseFunctions,
+        DependencyResolver resolver,
+        Module module,
+        String entryClass,
+        String entryMethod,
+        String entryDescriptor) {
 
         if (clinitFunctions.isEmpty() && phaseFunctions.isEmpty()) {
             return List.of();
         }
 
         System.out.println("Sorting " + clinitFunctions.size()
-            + " <clinit> and " + phaseFunctions.size()
-            + " bootstrap-phase function(s) by initialization dependency...");
+            + " <clinit> and " + phaseFunctions.size() + " bootstrap-phase function(s)...");
 
         Set<Function> phaseSet = new HashSet<>(phaseFunctions);
 
@@ -1225,7 +768,6 @@ public class Analyzer {
             clinitNameToClassName.put(clinitName, cn.getName());
         }
 
-        // ---- Parallel call-graph construction ----
         Map<String, Set<String>> callGraph = new ConcurrentHashMap<>();
         List<Function> functionsSnapshot = new ArrayList<>(module.getFunctions());
         forEachParallel(functionsSnapshot, func -> {
@@ -1239,22 +781,6 @@ public class Analyzer {
             callGraph.put(func.getName(), callees);
         });
 
-        // =================================================================
-        //  Pre-computation pass 1: per-function direct facts.
-        //
-        //  For every live function we pre-collect:
-        //    - the set of trigger-owner classes it observes directly
-        //      (NEW / GET_STATIC / PUT_STATIC / STATIC_CALL owners);
-        //    - the set of static fields it reads directly;
-        //    - the set of static fields it writes directly.
-        //
-        //  These are stored as int[] arrays of IDs into two global
-        //  universes (trigger classes and static field keys).  Downstream
-        //  passes then only ever need OR / AND bit operations over long[]
-        //  bitsets instead of re-scanning the instructions of every
-        //  function in every init's scope.
-        // =================================================================
-
         List<Function> liveFunctions = new ArrayList<>(functionsSnapshot.size());
         for (Function f : functionsSnapshot) {
             if (f.getEntryBlock() != null) liveFunctions.add(f);
@@ -1265,7 +791,6 @@ public class Analyzer {
             funcIndex.put(liveFunctions.get(i).getName(), i);
         }
 
-        // Serial deterministic pre-scan of the two universes.
         TreeSet<String> triggerClassUniverse = new TreeSet<>();
         TreeSet<String> fieldKeyUniverse     = new TreeSet<>();
         for (Function f : liveFunctions) {
@@ -1275,9 +800,7 @@ public class Analyzer {
                     if (op == Opcode.NEW || op == Opcode.GET_STATIC
                         || op == Opcode.PUT_STATIC || op == Opcode.STATIC_CALL) {
                         String owner = extractTriggerOwner(inst);
-                        if (owner != null && !owner.isEmpty()) {
-                            triggerClassUniverse.add(owner);
-                        }
+                        if (owner != null && !owner.isEmpty()) triggerClassUniverse.add(owner);
                     }
                     if (op == Opcode.GET_STATIC || op == Opcode.PUT_STATIC) {
                         String key = extractStaticFieldKey(inst);
@@ -1298,9 +821,8 @@ public class Analyzer {
         final int classWords = (classList.size() + 63) >>> 6;
         final int fieldWords = (fieldList.size() + 63) >>> 6;
 
-        System.out.println("Pre-computing per-function initialization facts: "
-            + classList.size() + " distinct trigger class(es), "
-            + fieldList.size() + " distinct static field key(s)");
+        System.out.println("Pre-computing init facts: " + classList.size()
+            + " trigger class(es), " + fieldList.size() + " static field key(s)");
 
         final int[][] funcTriggerIds = new int[liveFunctions.size()][];
         final int[][] funcReadIds    = new int[liveFunctions.size()][];
@@ -1328,7 +850,7 @@ public class Analyzer {
                             Integer id = fieldIdMap.get(key);
                             if (id != null) {
                                 if (op == Opcode.PUT_STATIC) wr.add(id);
-                                else                        rd.add(id);
+                                else                         rd.add(id);
                             }
                         }
                     }
@@ -1339,49 +861,36 @@ public class Analyzer {
             funcWriteIds[idx]   = toIntArray(wr);
         });
 
-        // =================================================================
-        //  Pre-computation pass 2: init-scope BFS with fact accumulation.
-        //
-        //  For each init (clinit or bootstrap phase) we BFS through the
-        //  call graph, never entering another init's body, and — instead
-        //  of building a huge Set<String> scope — we accumulate three
-        //  bitsets by OR-ing the small per-function id arrays of every
-        //  visited function.
-        //
-        //  This replaces the previous three independent passes
-        //  (initScope, triggeredClasses, fieldWriters/fieldReaders), each
-        //  of which walked the whole scope and all of its instructions.
-        // =================================================================
-
         Set<String> allInitializerNames = new HashSet<>(clinitNames);
         for (Function f : phaseFunctions) allInitializerNames.add(f.getName());
 
-        List<Function> allInit = new ArrayList<>(
-            clinitFunctions.size() + phaseFunctions.size());
+        List<Function> allInit = new ArrayList<>(clinitFunctions.size() + phaseFunctions.size());
         allInit.addAll(clinitFunctions);
         allInit.addAll(phaseFunctions);
 
-        final Map<String, long[]> initTriggerBits = new ConcurrentHashMap<>();
-        final Map<String, long[]> initReadBits    = new ConcurrentHashMap<>();
-        final Map<String, long[]> initWriteBits   = new ConcurrentHashMap<>();
-        final Map<String, Set<String>> nestedInit = new ConcurrentHashMap<>();
+        final long[][] initTriggerBits = new long[liveFunctions.size()][];
+        final long[][] initReadBits    = new long[liveFunctions.size()][];
+        final long[][] initWriteBits   = new long[liveFunctions.size()][];
+        final int[][]  nestedInit      = new int[liveFunctions.size()][];
         final Set<String> allInitializerNamesF = allInitializerNames;
         final Map<String, Set<String>> callGraphF = callGraph;
 
         forEachParallel(allInit, init -> {
             String initName = init.getName();
+            Integer initIdxObj = funcIndex.get(initName);
+            if (initIdxObj == null) return;
+            int initIdx = initIdxObj;
             long[] trig = new long[classWords];
             long[] rd   = new long[fieldWords];
             long[] wr   = new long[fieldWords];
-            Set<String> nested   = new LinkedHashSet<>();
+            IntArrayList nested = new IntArrayList();
             Set<String> visited  = new HashSet<>();
             Deque<String> worklist = new ArrayDeque<>();
 
             visited.add(initName);
             worklist.push(initName);
             orInFunctionFacts(initName, funcIndex,
-                              funcTriggerIds, funcReadIds, funcWriteIds,
-                              trig, rd, wr);
+                funcTriggerIds, funcReadIds, funcWriteIds, trig, rd, wr);
 
             while (!worklist.isEmpty()) {
                 String cur = worklist.pop();
@@ -1389,28 +898,34 @@ public class Analyzer {
                 if (callees == null) continue;
                 for (String callee : callees) {
                     if (allInitializerNamesF.contains(callee)) {
-                        nested.add(callee);
+                        Integer nIdx = funcIndex.get(callee);
+                        if (nIdx != null) nested.add(nIdx);
                         continue;
                     }
                     if (visited.add(callee)) {
                         worklist.push(callee);
                         orInFunctionFacts(callee, funcIndex,
-                                          funcTriggerIds, funcReadIds, funcWriteIds,
-                                          trig, rd, wr);
+                            funcTriggerIds, funcReadIds, funcWriteIds, trig, rd, wr);
                     }
                 }
             }
 
-            initTriggerBits.put(initName, trig);
-            initReadBits.put(initName, rd);
-            initWriteBits.put(initName, wr);
-            nestedInit.put(initName, nested);
+            initTriggerBits[initIdx] = trig;
+            initReadBits[initIdx] = rd;
+            initWriteBits[initIdx] = wr;
+            nestedInit[initIdx] = nested.toArray();
         });
 
-        // ---- Parallel triggered-class collection ----
-        Map<Function, Set<String>> triggeredClasses = new ConcurrentHashMap<>();
+        // Every initializer's trigger facts become direct dependency
+        // edges, indexed by function position instead of by Function or
+        // name hash lookups.
+        final int[][] triggeredDeps = new int[liveFunctions.size()][];
         forEachParallel(allInit, init -> {
-            Set<String> triggered = new LinkedHashSet<>();
+            if (phaseSet.contains(init)) return;
+            Integer initIdxObj = funcIndex.get(init.getName());
+            if (initIdxObj == null) return;
+            int initIdx = initIdxObj;
+            IntArrayList depList = new IntArrayList();
 
             String ownClass = clinitNameToClassName.get(init.getName());
             if (ownClass != null) {
@@ -1421,166 +936,193 @@ public class Analyzer {
                     && visited.add(cn.getSuperName())) {
                     String sup = cn.getSuperName();
                     if ("java/lang/Object".equals(sup)) break;
-                    triggered.add(sup);
+                    Function dep = classNameToClinit.get(sup);
+                    if (dep != null) {
+                        int depIdx = funcIndex.get(dep.getName());
+                        if (depIdx != initIdx) depList.add(depIdx);
+                    }
                     cn = resolver.getClassNode(sup);
                 }
             }
 
-            Set<String> nested = nestedInit.get(init.getName());
+            int[] nested = nestedInit[initIdx];
             if (nested != null) {
-                for (String nestedName : nested) {
-                    String nestedClass = clinitNameToClassName.get(nestedName);
-                    if (nestedClass != null) triggered.add(nestedClass);
+                for (int nestedIdx : nested) {
+                    String nestedClass = clinitNameToClassName.get(
+                        liveFunctions.get(nestedIdx).getName());
+                    if (nestedClass == null) continue;
+                    Function dep = classNameToClinit.get(nestedClass);
+                    if (dep != null) {
+                        int depIdx = funcIndex.get(dep.getName());
+                        if (depIdx != initIdx) depList.add(depIdx);
+                    }
                 }
             }
 
-            long[] bits = initTriggerBits.get(init.getName());
+            long[] bits = initTriggerBits[initIdx];
             if (bits != null) {
                 for (int w = 0; w < bits.length; w++) {
                     long word = bits[w];
                     while (word != 0) {
                         int bit = Long.numberOfTrailingZeros(word);
-                        triggered.add(classList.get((w << 6) + bit));
+                        Function dep = classNameToClinit.get(
+                            classList.get((w << 6) + bit));
+                        if (dep != null) {
+                            int depIdx = funcIndex.get(dep.getName());
+                            if (depIdx != initIdx) depList.add(depIdx);
+                        }
                         word &= word - 1;
                     }
                 }
             }
 
-            triggeredClasses.put(init, triggered);
+            depList.sortUnique();
+            triggeredDeps[initIdx] = depList.toArray();
         });
 
-        // ---- Deps assembly ----
-        Map<Function, Set<Function>> deps = new LinkedHashMap<>();
-        for (Function f : allInit) deps.put(f, new LinkedHashSet<>());
-
-        for (Map.Entry<Function, Set<String>> entry : triggeredClasses.entrySet()) {
-            Function f = entry.getKey();
-            // Trigger edges from phases are dropped (see javadoc).
-            if (phaseSet.contains(f)) continue;
-            for (String triggered : entry.getValue()) {
-                Function dep = classNameToClinit.get(triggered);
-                if (dep != null && dep != f) {
-                    deps.get(f).add(dep);
-                }
-            }
-        }
-
-        // ---- Field writer/reader maps, built from bitsets ----
-        Map<String, Set<Function>> fieldWriters = new ConcurrentHashMap<>();
-        Map<String, Set<Function>> fieldReaders = new ConcurrentHashMap<>();
-
-        forEachParallel(allInit, init -> {
-            long[] rbits = initReadBits.get(init.getName());
+        // Field writers/readers, as function indices per field id.
+        IntArrayList[] fieldWriters = new IntArrayList[fieldList.size()];
+        IntArrayList[] fieldReaders = new IntArrayList[fieldList.size()];
+        for (Function init : allInit) {
+            Integer initIdxObj = funcIndex.get(init.getName());
+            if (initIdxObj == null) continue;
+            int initIdx = initIdxObj;
+            long[] rbits = initReadBits[initIdx];
             if (rbits != null) {
                 for (int w = 0; w < rbits.length; w++) {
                     long word = rbits[w];
                     while (word != 0) {
-                        int bit = Long.numberOfTrailingZeros(word);
-                        String field = fieldList.get((w << 6) + bit);
-                        fieldReaders
-                            .computeIfAbsent(field, k -> ConcurrentHashMap.newKeySet())
-                            .add(init);
+                        int fieldId = (w << 6) + Long.numberOfTrailingZeros(word);
+                        if (fieldReaders[fieldId] == null) {
+                            fieldReaders[fieldId] = new IntArrayList();
+                        }
+                        fieldReaders[fieldId].add(initIdx);
                         word &= word - 1;
                     }
                 }
             }
-            long[] wbits = initWriteBits.get(init.getName());
+            long[] wbits = initWriteBits[initIdx];
             if (wbits != null) {
                 for (int w = 0; w < wbits.length; w++) {
                     long word = wbits[w];
                     while (word != 0) {
-                        int bit = Long.numberOfTrailingZeros(word);
-                        String field = fieldList.get((w << 6) + bit);
-                        fieldWriters
-                            .computeIfAbsent(field, k -> ConcurrentHashMap.newKeySet())
-                            .add(init);
+                        int fieldId = (w << 6) + Long.numberOfTrailingZeros(word);
+                        if (fieldWriters[fieldId] == null) {
+                            fieldWriters[fieldId] = new IntArrayList();
+                        }
+                        fieldWriters[fieldId].add(initIdx);
                         word &= word - 1;
                     }
                 }
             }
-        });
+        }
 
-        // ---- Field-provenance edges ----
-        int provenanceEdges = 0;
-        for (Map.Entry<String, Set<Function>> entry : fieldReaders.entrySet()) {
-            String field = entry.getKey();
-            Set<Function> writers = fieldWriters.get(field);
-            if (writers == null || writers.isEmpty()) continue;
-            for (Function reader : entry.getValue()) {
-                if (writers.contains(reader)) continue;
-                Set<Function> rd = deps.get(reader);
+        IntArrayList[] depsList = new IntArrayList[liveFunctions.size()];
+        int baseEdges = 0;
+        for (Function f : allInit) {
+            Integer idxObj = funcIndex.get(f.getName());
+            if (idxObj == null) continue;
+            int idx = idxObj;
+            IntArrayList d = new IntArrayList();
+            int[] base = triggeredDeps[idx];
+            if (base != null) d.addAll(base);
+            d.sortUnique();
+            depsList[idx] = d;
+            baseEdges += d.size();
+        }
+
+        for (int fieldId = 0; fieldId < fieldList.size(); fieldId++) {
+            IntArrayList writers = fieldWriters[fieldId];
+            IntArrayList readers = fieldReaders[fieldId];
+            if (writers == null || writers.isEmpty() || readers == null) continue;
+            for (int ri = 0; ri < readers.size(); ri++) {
+                int reader = readers.get(ri);
+                IntArrayList rd = depsList[reader];
                 if (rd == null) continue;
-                for (Function writer : writers) {
-                    if (reader == writer) continue;
-                    if (rd.add(writer)) provenanceEdges++;
+                for (int wi = 0; wi < writers.size(); wi++) {
+                    int writer = writers.get(wi);
+                    if (reader != writer) rd.add(writer);
                 }
             }
         }
+
+        int[][] deps = new int[liveFunctions.size()][];
+        int finalEdges = 0;
+        for (Function f : allInit) {
+            Integer idxObj = funcIndex.get(f.getName());
+            if (idxObj == null) continue;
+            int idx = idxObj;
+            IntArrayList d = depsList[idx];
+            d.sortUnique();
+            deps[idx] = d.toArray();
+            finalEdges += deps[idx].length;
+        }
+        int provenanceEdges = finalEdges - baseEdges;
         if (provenanceEdges > 0) {
             System.out.println("Added " + provenanceEdges
-                + " static-field provenance edge(s) to initialization dependency graph.");
+                + " static-field provenance edge(s) to init dependency graph.");
         }
 
-        // ---- Activation depth (over <clinit> only) ----
+        IntArrayList[] revList = new IntArrayList[liveFunctions.size()];
+        for (Function f : allInit) {
+            Integer readerObj = funcIndex.get(f.getName());
+            if (readerObj == null) continue;
+            int reader = readerObj;
+            for (int dep : deps[reader]) {
+                if (revList[dep] == null) revList[dep] = new IntArrayList();
+                revList[dep].add(reader);
+            }
+        }
+        int[][] revDeps = new int[liveFunctions.size()][];
+        for (int i = 0; i < revList.length; i++) {
+            if (revList[i] == null) continue;
+            revList[i].sortUnique();
+            revDeps[i] = revList[i].toArray();
+        }
+
         Map<String, Integer> activationDepth = computeActivationDepth(
             callGraph, clinitNames,
             entryRoots(entryClass, entryMethod, entryDescriptor));
 
-        // ---- Linearize <clinit> ONLY ----
-        //
-        // The phases are excluded from the Tarjan graph. To do that, deps is
-        // filtered down to clinit-to-clinit edges: the successor set of every
-        // clinit function keeps only the nodes whose name belongs to
-        // clinitNames. Tarjan then physically cannot place a phase in any SCC.
         Map<Function, Set<Function>> clinitDeps = new LinkedHashMap<>();
         for (Function c : clinitFunctions) {
             Set<Function> filtered = new LinkedHashSet<>();
-            Set<Function> succ = deps.get(c);
-            if (succ != null) {
-                for (Function d : succ) {
-                    if (clinitNames.contains(d.getName())) {
-                        filtered.add(d);
-                    }
+            Integer idxObj = funcIndex.get(c.getName());
+            if (idxObj != null) {
+                for (int depIdx : deps[idxObj]) {
+                    Function d = liveFunctions.get(depIdx);
+                    if (clinitNames.contains(d.getName())) filtered.add(d);
                 }
             }
             clinitDeps.put(c, filtered);
         }
-        List<Function> clinitOrder = tarjanLinearize(
-            clinitFunctions, clinitDeps, activationDepth);
+        List<Function> clinitOrder = tarjanLinearize(clinitFunctions, clinitDeps, activationDepth);
 
-        // ---- Phase placement ----
         List<Function> phaseOrder = new ArrayList<>(phaseFunctions);
         phaseOrder.sort(Comparator.comparingInt(Analyzer::phaseOrdinal));
 
-        // Reverse graph for computing before(P)
-        Map<Function, Set<Function>> revDeps = new HashMap<>();
-        for (Map.Entry<Function, Set<Function>> e : deps.entrySet()) {
-            for (Function d : e.getValue()) {
-                revDeps.computeIfAbsent(d, k -> new HashSet<>()).add(e.getKey());
-            }
-        }
-
-        Map<Function, Integer> clinitIndex = new HashMap<>();
+        int[] clinitIndex = new int[liveFunctions.size()];
+        Arrays.fill(clinitIndex, -1);
         for (int i = 0; i < clinitOrder.size(); i++) {
-            clinitIndex.put(clinitOrder.get(i), i);
+            Integer idxObj = funcIndex.get(clinitOrder.get(i).getName());
+            if (idxObj != null) clinitIndex[idxObj] = i;
         }
 
         Map<Function, Integer> afterMap  = new HashMap<>();
         Map<Function, Integer> beforeMap = new HashMap<>();
         for (Function p : phaseOrder) {
-            Set<Function> depsOfP = transitiveClosure(deps, p);
+            int pIdx = funcIndex.get(p.getName());
             int after = 0;
-            for (Function d : depsOfP) {
-                Integer idx = clinitIndex.get(d);
-                if (idx != null && idx + 1 > after) after = idx + 1;
+            for (int d : transitiveClosureInt(deps, pIdx)) {
+                int idx = clinitIndex[d];
+                if (idx >= 0 && idx + 1 > after) after = idx + 1;
             }
             afterMap.put(p, after);
 
-            Set<Function> dependentsOfP = transitiveClosure(revDeps, p);
             int before = clinitOrder.size();
-            for (Function d : dependentsOfP) {
-                Integer idx = clinitIndex.get(d);
-                if (idx != null && idx < before) before = idx;
+            for (int d : transitiveClosureInt(revDeps, pIdx)) {
+                int idx = clinitIndex[d];
+                if (idx >= 0 && idx < before) before = idx;
             }
             beforeMap.put(p, before);
 
@@ -1588,32 +1130,15 @@ public class Analyzer {
                 + " after=" + after + ", before=" + before);
         }
 
-        // ---- Defer the family-B side of the phase/clinit cycle ----
-        //
-        // Any initializer that reads a static field written by a phase,
-        // but does not itself write a field any phase reads, must run
-        // after that phase. In a linear schedule whose phase positions
-        // are dictated by after(P) — which is what the schedule needs
-        // to satisfy the phase's own dependencies — such an initializer
-        // would run before the phase and observe a null field. Rather
-        // than move the phase (which reintroduces the StringConcatHelper
-        // failure) this code removes the conflicting initializer from
-        // the eager schedule entirely. Its wrapper fires on first active
-        // use, which is by construction after the phase that provoked
-        // that use. See computeDeferredClinits() for the full rationale.
         Set<String> deferred = computeDeferredClinits(
             clinitOrder, phaseOrder, afterMap,
-            initReadBits, initWriteBits,
-            fieldIdMap, fieldWords);
+            initReadBits, initWriteBits, funcIndex, fieldIdMap, fieldWords);
 
         if (!deferred.isEmpty()) {
             this.deferredClinits.addAll(deferred);
 
             System.out.println("Deferring " + deferred.size()
-                + " <clinit>(s) to lazy initialization: they read a field "
-                + "written by a bootstrap phase but do not contribute to any "
-                + "phase's own dependencies, so eager scheduling would place "
-                + "them before the phase and observe a null field.");
+                + " <clinit>(s) to lazy initialization.");
 
             Set<Function> deferredSet = new HashSet<>();
             for (Function c : clinitOrder) {
@@ -1621,29 +1146,25 @@ public class Analyzer {
             }
             clinitOrder.removeIf(deferredSet::contains);
 
-            // Recompute after/before positions against the trimmed list.
-            Map<Function, Integer> trimmedIdx = new HashMap<>();
+            int[] trimmedAfterDefer = new int[liveFunctions.size()];
+            Arrays.fill(trimmedAfterDefer, -1);
             for (int i = 0; i < clinitOrder.size(); i++) {
-                trimmedIdx.put(clinitOrder.get(i), i);
+                Integer idxObj = funcIndex.get(clinitOrder.get(i).getName());
+                if (idxObj != null) trimmedAfterDefer[idxObj] = i;
             }
             for (Function p : phaseOrder) {
-                Set<Function> depsOfP = transitiveClosure(deps, p);
+                int pIdx = funcIndex.get(p.getName());
                 int afterTrimmed = 0;
-                for (Function d : depsOfP) {
-                    Integer idx = trimmedIdx.get(d);
-                    if (idx != null && idx + 1 > afterTrimmed) {
-                        afterTrimmed = idx + 1;
-                    }
+                for (int d : transitiveClosureInt(deps, pIdx)) {
+                    int idx = trimmedAfterDefer[d];
+                    if (idx >= 0 && idx + 1 > afterTrimmed) afterTrimmed = idx + 1;
                 }
                 afterMap.put(p, afterTrimmed);
 
-                Set<Function> dependentsOfP = transitiveClosure(revDeps, p);
                 int beforeTrimmed = clinitOrder.size();
-                for (Function d : dependentsOfP) {
-                    Integer idx = trimmedIdx.get(d);
-                    if (idx != null && idx < beforeTrimmed) {
-                        beforeTrimmed = idx;
-                    }
+                for (int d : transitiveClosureInt(revDeps, pIdx)) {
+                    int idx = trimmedAfterDefer[d];
+                    if (idx >= 0 && idx < beforeTrimmed) beforeTrimmed = idx;
                 }
                 beforeMap.put(p, beforeTrimmed);
 
@@ -1652,53 +1173,35 @@ public class Analyzer {
             }
         }
 
-        // ============================================================
-        // Level-sort AFTER deferred is finalized, and recompute
-        // afterMap/beforeMap to reflect new positions.
-        // ============================================================
-        //
-        // Cyclic clinits (SCC size > 1) must run sequentially: their linear
-        // order within the SCC is a deliberate choice of orderScc() that must
-        // be preserved, and the lazy-<clinit> state machine already makes them
-        // safe under cross-thread triggering. Non-cyclic clinits have no
-        // dependency edges between them at the same level and are therefore
-        // safe to parallelise.
         Map<Function, Integer> clinitLevels = new HashMap<>();
         Set<Function> cyclicClinits = new HashSet<>();
-        computeClinitLevelsAndCyclic(clinitOrder, clinitDeps,
-                                     clinitLevels, cyclicClinits);
+        computeClinitLevelsAndCyclic(clinitOrder, clinitDeps, clinitLevels, cyclicClinits);
 
-        // Re-sort by level so that same-level clinits are adjacent. Stable
-        // sort preserves intra-SCC ordering for multi-member SCCs (they all
-        // share one level). Preserves topological validity: for any edge
-        // A -> B (A depends on B), level(B) < level(A), so B still precedes A.
-        clinitOrder.sort(Comparator.comparingInt(
-            f -> clinitLevels.getOrDefault(f, 0)));
+        clinitOrder.sort(Comparator.comparingInt(f -> clinitLevels.getOrDefault(f, 0)));
 
-        // Positions changed — recompute the phase placement bounds.
-        Map<Function, Integer> trimmedIdx = new HashMap<>();
+        int[] trimmedIdx = new int[liveFunctions.size()];
+        Arrays.fill(trimmedIdx, -1);
         for (int i = 0; i < clinitOrder.size(); i++) {
-            trimmedIdx.put(clinitOrder.get(i), i);
+            Integer idxObj = funcIndex.get(clinitOrder.get(i).getName());
+            if (idxObj != null) trimmedIdx[idxObj] = i;
         }
         for (Function p : phaseOrder) {
-            Set<Function> depsOfP = transitiveClosure(deps, p);
+            int pIdx = funcIndex.get(p.getName());
             int after = 0;
-            for (Function d : depsOfP) {
-                Integer idx = trimmedIdx.get(d);
-                if (idx != null && idx + 1 > after) after = idx + 1;
+            for (int d : transitiveClosureInt(deps, pIdx)) {
+                int idx = trimmedIdx[d];
+                if (idx >= 0 && idx + 1 > after) after = idx + 1;
             }
             afterMap.put(p, after);
 
-            Set<Function> dependentsOfP = transitiveClosure(revDeps, p);
             int before = clinitOrder.size();
-            for (Function d : dependentsOfP) {
-                Integer idx = trimmedIdx.get(d);
-                if (idx != null && idx < before) before = idx;
+            for (int d : transitiveClosureInt(revDeps, pIdx)) {
+                int idx = trimmedIdx[d];
+                if (idx >= 0 && idx < before) before = idx;
             }
             beforeMap.put(p, before);
         }
 
-        // ---- Merge: clinits + phases with a hard phase order ----
         List<ClinitScheduleEntry> result =
             new ArrayList<>(clinitOrder.size() + phaseOrder.size());
         int ci = 0;
@@ -1710,53 +1213,11 @@ public class Analyzer {
             int before = beforeMap.get(p);
             int target = Math.max(after, prevPhaseSlot);
 
-            // Cycle between the phase and the clinit set.  Exactly one of the
-            // two edge families has to run in reverse in the emitted schedule;
-            // the one chosen here is "clinit -> phase" (the phase's readers),
-            // not "phase -> clinit" (the phase's own dependencies).
-            //
-            // Rationale.  A phase is a straight-line entry point that
-            // unconditionally walks into the code of every class in its
-            // transitive dependency closure.  Placing it before those
-            // initializers makes it read null from a static field that its
-            // own body dereferences on the next instruction — the exact
-            // failure this build reported:
-            //
-            //   java.lang.NullPointerException: Cannot invoke
-            //     java.lang.StringConcatHelper.newArray(JB) because receiver
-            //     of ...Unsafe.allocateUninitializedArray(...) is null
-            //       at StringConcatHelper.newArray
-            //       at StringConcatHelper.simpleConcat
-            //       at String.concat
-            //       at SystemProps.fillI18nProps
-            //       at SystemProps.initProperties
-            //       at System.initPhase1
-            //
-            // The only writer of StringConcatHelper.UNSAFE is
-            // StringConcatHelper.<clinit>; under the previous branch that
-            // clinit was scheduled at position 1121 while initPhase1 was
-            // placed at position 24, so UNSAFE was null on entry.
-            //
-            // The reader edges broken in their place belong to initializers
-            // that read a field written by the phase.  Not every such reader
-            // is actually harmed: one that reads a phase-produced field only
-            // on a path the program does not take is unaffected, and one that
-            // reads it unconditionally but tolerates the default (System.props,
-            // for example, already holds the bootstrap Properties installed
-            // by @main before the schedule runs) is unaffected as well.  The
-            // warning below names the phase and both boundary indices so that
-            // a reader that genuinely cannot tolerate an uninitialized field
-            // is visible at build time and can be examined against its own
-            // bytecode.
             if (target > before) {
                 System.out.println("WARNING: phase " + p.getName()
-                    + " has cyclic dependency with clinits "
-                    + "(after=" + after + ", before=" + before
-                    + "); placed at " + target
-                    + " (phase's own dependency edges take priority; "
-                    + "reader initializers that would have run between "
-                    + "position " + before + " and " + target
-                    + " now run before the phase)");
+                    + " has cyclic dependency with clinits (after=" + after
+                    + ", before=" + before + "); placed at " + target
+                    + " (phase's own dependency edges take priority)");
             }
 
             while (ci < target && ci < clinitOrder.size()) {
@@ -1773,7 +1234,7 @@ public class Analyzer {
                 result.add(new ClinitScheduleEntry(c, false, pg));
             }
             result.add(new ClinitScheduleEntry(p, true, -1));
-            currentLevel = -2;  // phase is a hard barrier
+            currentLevel = -2;
             prevPhaseSlot = target;
         }
         while (ci < clinitOrder.size()) {
@@ -1802,11 +1263,6 @@ public class Analyzer {
         return result;
     }
 
-    /**
-     * Extracts the bootstrap-phase number from a mangled method name:
-     * {@code fn_java_lang_System_initPhase2__ZZ_I} -> 2.
-     * Returns {@link Integer#MAX_VALUE} for non-phase names.
-     */
     private static int phaseOrdinal(Function f) {
         String name = f.getName();
         int idx = name.indexOf("initPhase");
@@ -1822,82 +1278,82 @@ public class Analyzer {
         }
     }
 
-    /**
-     * Transitive closure from {@code start} over {@code graph}.
-     * The returned set contains {@code start}.
-     */
-    private static Set<Function> transitiveClosure(
-            Map<Function, Set<Function>> graph, Function start) {
-        Set<Function> visited = new HashSet<>();
-        Deque<Function> worklist = new ArrayDeque<>();
-        worklist.add(start);
-        while (!worklist.isEmpty()) {
-            Function cur = worklist.poll();
-            if (!visited.add(cur)) continue;
-            Set<Function> succ = graph.get(cur);
+    private static int[] transitiveClosureInt(int[][] graph, int start) {
+        boolean[] visited = new boolean[graph.length];
+        int[] stack = new int[graph.length];
+        IntArrayList order = new IntArrayList();
+        int top = 0;
+        visited[start] = true;
+        stack[top++] = start;
+        while (top > 0) {
+            int cur = stack[--top];
+            order.add(cur);
+            int[] succ = graph[cur];
             if (succ == null) continue;
-            worklist.addAll(succ);
+            for (int next : succ) {
+                if (!visited[next]) {
+                    visited[next] = true;
+                    stack[top++] = next;
+                }
+            }
         }
-        return visited;
+        return order.toArray();
     }
 
-    /**
-     * Determines which <clinit> functions must be deferred to lazy
-     * initialization because eager scheduling cannot satisfy them together
-     * with the bootstrap phases.
-     *
-     * <p>This method is a bitset-driven version of the original algorithm.
-     * Its correctness is identical to the previous implementation — the
-     * family-A / family-B split, the fixed point over the surviving
-     * schedule, and the {@code afterMap} clamping are unchanged — but the
-     * inner test is now two {@code long[] & long[]} operations instead of
-     * a nested walk over every instruction of every function in the
-     * candidate clinit's scope.</p>
-     *
-     * <p>The relevant sets are precomputed once, during the init-scope BFS
-     * in {@link #sortInitializers}:</p>
-     *
-     * <ul>
-     *   <li>{@code pWrites} = {@code initWriteBits.get(p.getName())} —
-     *       every static field written anywhere in the phase's transitive
-     *       scope;</li>
-     *   <li>{@code cReads} = {@code initReadBits.get(c.getName())} —
-     *       every static field read anywhere in the clinit's transitive
-     *       scope;</li>
-     *   <li>{@code cWrites} = {@code initWriteBits.get(c.getName())} —
-     *       every static field written anywhere in the clinit's scope;</li>
-     *   <li>{@code pDirectReads} — every static field read by the phase's
-     *       <em>own body only</em>. This is the only piece of information
-     *       that the init-scope BFS cannot supply, because it deliberately
-     *       collapses the phase's own body and its transitive scope into
-     *       one union. It is recomputed here directly from the phase's
-     *       instruction stream — a single pass over one function, once per
-     *       call.</li>
-     * </ul>
-     *
-     * <p>The three tests in the loop then become:</p>
-     *
-     * <pre>
-     *     cReadsP  == (cReads  &amp; pWrites)      != 0
-     *     cWritesP == (cWrites &amp; pDirectReads) != 0
-     * </pre>
-     *
-     * <p>which is exactly the original semantics, evaluated on the same
-     * precomputed universes.</p>
-     */
-    private Set<String> computeDeferredClinits(
-            List<Function> clinitOrder,
-            List<Function> phaseOrder,
-            Map<Function, Integer> afterMap,
-            Map<String, long[]> initReadBits,
-            Map<String, long[]> initWriteBits,
-            Map<String, Integer> fieldIdMap,
-            int fieldWords) {
+    private static final class IntArrayList {
+        private int[] data = new int[4];
+        private int size;
 
-        // Per-phase direct reads (phase body only). This is the only
-        // piece of information that the scope BFS could not have provided
-        // — it aggregated scope-level unions, and pDirectReads is the
-        // phase's own body reads, which is a strictly smaller set.
+        void add(int value) {
+            if (size == data.length) {
+                data = Arrays.copyOf(data, size << 1);
+            }
+            data[size++] = value;
+        }
+
+        void addAll(int[] values) {
+            for (int value : values) add(value);
+        }
+
+        int get(int index) {
+            return data[index];
+        }
+
+        int size() {
+            return size;
+        }
+
+        boolean isEmpty() {
+            return size == 0;
+        }
+
+        void sortUnique() {
+            if (size < 2) return;
+            Arrays.sort(data, 0, size);
+            int write = 1;
+            for (int read = 1; read < size; read++) {
+                if (data[read] != data[write - 1]) {
+                    data[write++] = data[read];
+                }
+            }
+            size = write;
+        }
+
+        int[] toArray() {
+            return Arrays.copyOf(data, size);
+        }
+    }
+
+    private Set<String> computeDeferredClinits(
+        List<Function> clinitOrder,
+        List<Function> phaseOrder,
+        Map<Function, Integer> afterMap,
+        long[][] initReadBits,
+        long[][] initWriteBits,
+        Map<String, Integer> funcIndex,
+        Map<String, Integer> fieldIdMap,
+        int fieldWords) {
+
         Map<Function, long[]> phaseDirectReadBits = new HashMap<>();
         for (Function p : phaseOrder) {
             long[] bits = new long[fieldWords];
@@ -1914,7 +1370,6 @@ public class Analyzer {
         }
 
         Set<String> deferred = new LinkedHashSet<>();
-
         final int MAX_PASSES = 8;
         boolean changed = true;
         int pass = 0;
@@ -1926,7 +1381,7 @@ public class Analyzer {
                 int after = afterMap.getOrDefault(p, 0);
                 if (after <= 0) continue;
 
-                long[] pWrites = initWriteBits.get(p.getName());
+                long[] pWrites = initWriteBits[funcIndex.get(p.getName())];
                 if (pWrites == null || bitsEmpty(pWrites)) continue;
 
                 long[] pDirectReads = phaseDirectReadBits.get(p);
@@ -1937,13 +1392,15 @@ public class Analyzer {
                     String cName = c.getName();
                     if (deferred.contains(cName)) continue;
 
-                    long[] cReads  = initReadBits.get(cName);
-                    long[] cWrites = initWriteBits.get(cName);
+                    Integer cIdxObj = funcIndex.get(cName);
+                    if (cIdxObj == null) continue;
+                    int cIdx = cIdxObj;
+                    long[] cReads  = initReadBits[cIdx];
+                    long[] cWrites = initWriteBits[cIdx];
                     if (cReads == null || cWrites == null) continue;
 
                     boolean cReadsP  = bitsIntersect(cReads,  pWrites);
-                    boolean cWritesP = (pDirectReads != null)
-                        && bitsIntersect(cWrites, pDirectReads);
+                    boolean cWritesP = (pDirectReads != null) && bitsIntersect(cWrites, pDirectReads);
 
                     if (cReadsP && !cWritesP) {
                         deferred.add(cName);
@@ -1952,52 +1409,27 @@ public class Analyzer {
                 }
             }
 
-            // Each pass may unblock new candidates because defers shift
-            // the index of later clinits. Clamp `after` against the
-            // trimmed schedule before the next pass — same conservative
-            // approximation as the previous revision (a smaller `after`
-            // makes strictly more candidates eligible, which is the safe
-            // direction).
             if (changed) {
                 Map<Function, Integer> trimmedIdx = new HashMap<>();
                 int k = 0;
                 for (Function c : clinitOrder) {
-                    if (!deferred.contains(c.getName())) {
-                        trimmedIdx.put(c, k++);
-                    }
+                    if (!deferred.contains(c.getName())) trimmedIdx.put(c, k++);
                 }
                 for (Function p : phaseOrder) {
                     Integer prev = afterMap.get(p);
-                    if (prev != null && prev > trimmedIdx.size()) {
-                        afterMap.put(p, trimmedIdx.size());
-                    }
+                    if (prev != null && prev > trimmedIdx.size()) afterMap.put(p, trimmedIdx.size());
                 }
             }
         }
 
         if (pass >= MAX_PASSES) {
-            System.out.println("Deferral fixed point did not converge after "
-                + MAX_PASSES + " passes; " + deferred.size()
-                + " clinit(s) deferred so far.");
+            System.out.println("Deferral fixed point did not converge after " + MAX_PASSES
+                + " passes; " + deferred.size() + " clinit(s) deferred so far.");
         }
 
         return deferred;
     }
 
-    /**
-     * ORs the pre-computed fact arrays of one function into three
-     * accumulator bitsets.
-     *
-     * <p>The three {@code int[]} arrays are indexed by function index
-     * (see {@code funcIndex}); every entry is an ID into the corresponding
-     * global universe. The bitsets are updated in place.</p>
-     *
-     * <p>Called from the init-scope BFS for every function newly visited
-     * by a given init. Because the per-function arrays are typically only
-     * a handful of elements long, this is a few dozen {@code OR}
-     * operations at most, versus the tens of thousands of instruction
-     * scans that the previous implementation performed per init.</p>
-     */
     private static void orInFunctionFacts(String funcName,
                                           Map<String, Integer> funcIndex,
                                           int[][] funcTriggers,
@@ -2010,36 +1442,17 @@ public class Analyzer {
         if (idxObj == null) return;
         int idx = idxObj;
 
-        int[] trig = funcTriggers[idx];
-        for (int id : trig) {
-            trigBits[id >>> 6] |= 1L << (id & 63);
-        }
-        int[] rd = funcReads[idx];
-        for (int id : rd) {
-            readBits[id >>> 6] |= 1L << (id & 63);
-        }
-        int[] wr = funcWrites[idx];
-        for (int id : wr) {
-            writeBits[id >>> 6] |= 1L << (id & 63);
-        }
+        for (int id : funcTriggers[idx]) trigBits[id >>> 6] |= 1L << (id & 63);
+        for (int id : funcReads[idx])    readBits[id >>> 6] |= 1L << (id & 63);
+        for (int id : funcWrites[idx])   writeBits[id >>> 6] |= 1L << (id & 63);
     }
 
-    /**
-     * Converts a {@code List<Integer>} to an {@code int[]}. Used once per
-     * function during the pre-computation pass; the JIT folds the manual
-     * loop well enough that there is no reason to pull in a stream.
-     */
     private static int[] toIntArray(List<Integer> list) {
         int[] arr = new int[list.size()];
         for (int i = 0; i < list.size(); i++) arr[i] = list.get(i);
         return arr;
     }
 
-    /**
-     * Word-wise intersection test with early exit on the first
-     * overlapping bit. Both arrays are expected to be the same length;
-     * the {@code Math.min} guard is purely defensive.
-     */
     private static boolean bitsIntersect(long[] a, long[] b) {
         int n = Math.min(a.length, b.length);
         for (int i = 0; i < n; i++) {
@@ -2048,11 +1461,6 @@ public class Analyzer {
         return false;
     }
 
-    /**
-     * Returns true iff every word of {@code bits} is zero, i.e. the
-     * represented set is empty. Used as a fast-path skip for phases whose
-     * transitive scope writes nothing at all.
-     */
     private static boolean bitsEmpty(long[] bits) {
         for (long bit : bits) {
             if (bit != 0) return false;
@@ -2060,23 +1468,6 @@ public class Analyzer {
         return true;
     }
 
-    /**
-     * Runs {@code action} for every element of {@code items} in parallel
-     * through a dedicated {@link Scheduler.Worker} and waits for all tasks to
-     * finish.
-     *
-     * <p>It does not use {@code Mono/Flux.block()}: the Reactor worker runs
-     * the tasks on the pool owned by the given {@link Scheduler} and
-     * completion is synchronized with a {@link CountDownLatch}. The first
-     * exception caught by any task is rethrown to the caller after all tasks
-     * have run — the same behaviour as the previous sequence
-     * {@code Flux.parallel().runOn(scheduler).doOnNext(...).sequential().then().block()},
-     * but without the reactive wrapper.</p>
-     *
-     * <p>The order of side effects of {@code action} between different
-     * elements is undefined — as it was in the Reactor parallel branch. Every
-     * call to {@code action.accept(item)} happens exactly once.</p>
-     */
     private <T> void forEachParallel(List<T> items,
                                      java.util.function.Consumer<T> action) {
         if (items.isEmpty()) return;
@@ -2100,14 +1491,12 @@ public class Analyzer {
             latch.await();
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            throw new RuntimeException(
-                "parallel initialization phase interrupted", e);
+            throw new RuntimeException("parallel initialization phase interrupted", e);
         }
 
         Throwable first = failure.get();
         if (first != null) {
-            throw new RuntimeException(
-                "parallel initialization phase failed", first);
+            throw new RuntimeException("parallel initialization phase failed", first);
         }
     }
 
@@ -2117,8 +1506,7 @@ public class Analyzer {
                                              DependencyResolver resolver) {
         Opcode op = inst.getOpcode();
         switch (op) {
-            case STATIC_CALL:
-            case CALL: {
+            case STATIC_CALL, CALL -> {
                 String callee = extractCalleeConstant(inst, 0);
                 if (callee == null) break;
                 Function calleeFunc = module.getFunction(callee);
@@ -2128,9 +1516,8 @@ public class Analyzer {
                 if (calleeFunc != null && calleeFunc.getEntryBlock() != null) {
                     out.add(calleeFunc.getName());
                 }
-                break;
             }
-            case SPECIAL_CALL: {
+            case SPECIAL_CALL -> {
                 String callee = extractCalleeConstant(inst, 1);
                 if (callee == null) break;
                 Function calleeFunc = module.getFunction(callee);
@@ -2140,10 +1527,8 @@ public class Analyzer {
                 if (calleeFunc != null && calleeFunc.getEntryBlock() != null) {
                     out.add(calleeFunc.getName());
                 }
-                break;
             }
-            case VIRTUAL_CALL:
-            case INTERFACE_CALL: {
+            case VIRTUAL_CALL, INTERFACE_CALL -> {
                 String callee = extractCalleeConstant(inst, 1);
                 if (callee == null) break;
                 int dotIdx = callee.lastIndexOf('.');
@@ -2167,41 +1552,24 @@ public class Analyzer {
                     String decl = foundOwner[0] != null ? foundOwner[0] : cls;
                     String mangled = LlvmRuntime.mangleMethod(decl, methodName, descriptor);
                     Function f = module.getFunction(mangled);
-                    if (f != null && f.getEntryBlock() != null) {
-                        out.add(mangled);
-                    }
+                    if (f != null && f.getEntryBlock() != null) out.add(mangled);
                 }
-                break;
             }
-            default:
-                break;
+            default -> { }
         }
     }
 
-    /**
-     * Computes the SCC-condensation level of every clinit and marks every
-     * clinit that belongs to a non-trivial SCC as cyclic.
-     *
-     * <p>The level is the length of the longest path in the SCC-condensation
-     * DAG starting at a source. Clinits sharing a level belong to different
-     * SCCs and therefore have no dependency edges between them — they may run
-     * concurrently.</p>
-     *
-     * <p>Tarjan emits SCCs in reverse topological order (sinks first), so
-     * iterating them in emission order guarantees that every SCC's dependency
-     * levels are already known when its own level is computed.</p>
-     */
     private static void computeClinitLevelsAndCyclic(
-            List<Function> clinitOrder,
-            Map<Function, Set<Function>> clinitDeps,
-            Map<Function, Integer> outLevels,
-            Set<Function> outCyclic) {
+        List<Function> clinitOrder,
+        Map<Function, Set<Function>> clinitDeps,
+        Map<Function, Integer> outLevels,
+        Set<Function> outCyclic) {
 
         Map<Function, Integer> index   = new HashMap<>();
         Map<Function, Integer> lowlink = new HashMap<>();
-        Deque<Function>        stack   = new ArrayDeque<>();
-        Set<Function>          onStack = new HashSet<>();
-        List<List<Function>>   sccs    = new ArrayList<>();
+        Deque<Function> stack   = new ArrayDeque<>();
+        Set<Function> onStack   = new HashSet<>();
+        List<List<Function>> sccs = new ArrayList<>();
         int[] counter = {0};
 
         for (Function c : clinitOrder) {
@@ -2295,9 +1663,7 @@ public class Analyzer {
         }
 
         List<Function> result = new ArrayList<>(nodes.size());
-        for (List<Function> scc : sccs) {
-            result.addAll(orderScc(scc, deps, activationDepth));
-        }
+        for (List<Function> scc : sccs) result.addAll(orderScc(scc, deps, activationDepth));
         return result;
     }
 
@@ -2336,16 +1702,13 @@ public class Analyzer {
         }
 
         List<Function> rest = new ArrayList<>();
-        for (Function f : scc) {
-            if (!visited.contains(f)) rest.add(f);
-        }
+        for (Function f : scc) if (!visited.contains(f)) rest.add(f);
         rest.sort(Comparator.comparing(Function::getName));
         ordered.addAll(rest);
         return ordered;
     }
 
-    private static int compareActivation(Function a,
-                                         Function b,
+    private static int compareActivation(Function a, Function b,
                                          Map<String, Integer> activationDepth) {
         int da = activationDepth.getOrDefault(a.getName(), Integer.MAX_VALUE);
         int db = activationDepth.getOrDefault(b.getName(), Integer.MAX_VALUE);
@@ -2375,14 +1738,13 @@ public class Analyzer {
                 if (previous != null && previous <= next) continue;
                 depth.put(callee, next);
                 if (next == curDepth) queue.addFirst(callee);
-                else queue.addLast(callee);
+                else                  queue.addLast(callee);
             }
         }
         return depth;
     }
 
-    private static List<String> entryRoots(String entryClass,
-                                           String entryMethod,
+    private static List<String> entryRoots(String entryClass, String entryMethod,
                                            String entryDescriptor) {
         List<String> roots = new ArrayList<>();
         roots.add(LlvmRuntime.mangleMethod(entryClass, entryMethod, entryDescriptor));
@@ -2467,10 +1829,6 @@ public class Analyzer {
         return name;
     }
 
-    // =====================================================================
-    //  Debug / user-vs-system filtering helpers
-    // =====================================================================
-
     private static boolean matchesDebug(String debugName, Function func) {
         if (debugName == null) return true;
         return func != null && func.getName() != null && func.getName().contains(debugName);
@@ -2499,14 +1857,10 @@ public class Analyzer {
         if (type.isArray()) {
             Type elem = type.getElementType();
             if (elem.isPrimitive()) return false;
-            if (elem.isReference()) {
-                return !LlvmUtil.isSystemClassName(elem.getClassName());
-            }
+            if (elem.isReference()) return !LlvmUtil.isSystemClassName(elem.getClassName());
             return false;
         }
-        if (type.isReference()) {
-            return !LlvmUtil.isSystemClassName(type.getClassName());
-        }
+        if (type.isReference()) return !LlvmUtil.isSystemClassName(type.getClassName());
         return false;
     }
 }

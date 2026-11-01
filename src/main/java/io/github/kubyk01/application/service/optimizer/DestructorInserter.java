@@ -1982,33 +1982,9 @@ private void emitDestructionGuard(BasicBlock entry,
 
         if (!noLaterUse(objRef, block, insertIndex)) return;
 
-        // ------------------------------------------------------------------
-        // Dominance check at the *insertion position*.
-        //
-        // objectRefAvailableAt consults the dominator tree of the block.
-        // The tree itself is computed lazily and cached per function;
-        // insertDestructorCall runs before any block split done by
-        // emitPolymorphicRelease of the SAME function — but not before
-        // splits done in *other* functions of the same module. Since the
-        // dominator tree is stored per Function, a fresh computation is
-        // required when insts have been reshuffled (the previous call may
-        // have called emitPolymorphicRelease on a different Function).
-        //
-        // The domTrees field is populated from DominatorTree(func), which
-        // is O(V+E) per function. To avoid recomputing it per insertion,
-        // invalidate the cached tree whenever the block or its predecessors
-        // change. Today emitPolymorphicRelease adds a new predecessor to
-        // `tail` and to the handler; the safest thing to do is to drop the
-        // cache entry for the function containing `block` right here if the
-        // tree was created before the current call.
-        //
-        // The simplest correct fix: compute the tree freshly at this point
-        // (objectRefAvailableAt does not cache), and let domTrees be
-        // memoised only by callers that know the CFG has been rebuilt.
-        // ------------------------------------------------------------------
         Function func = block.getFunction();
         if (func == null) return;
-        DominatorTree dom = new DominatorTree(func);
+        DominatorTree dom = domTrees.computeIfAbsent(func, DominatorTree::new);
         if (!valueAvailableAt(objRef, block, dom)) {
             return;
         }

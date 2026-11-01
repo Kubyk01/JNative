@@ -63,77 +63,8 @@ public class LifetimeAnalyzer {
         livenessAnalyzer.computeLiveSets(allSites);
 
         // -------- 3b. Publish live-out per block -------------------------
-        //
-        // DestructorInserter.instrumentFieldOverwrites() consumes this map
-        // to decide whether the previous value of a reference-typed field
-        // is provably dead at a PUT_FIELD. The gate is:
-        //
-        //   emit the release iff no allocation site that could currently
-        //   be in the field is live on exit from the block AND no
-        //   subsequent instruction in the same block (or its terminator)
-        //   reads such a site.
-        //
-        // The block-level part of that gate is exactly what live-out
-        // provides. Getting it wrong in either direction is fatal:
-        //
-        //   - Emitting without live-out information frees objects that
-        //     are still reachable through locals, parameters, other
-        //     fields, or array elements. The concrete counterexample is
-        //     java.util.HashMap.resize():
-        //
-        //         Node<K,V>[] oldTab = table;
-        //         ...
-        //         table = newTab;
-        //         if (oldTab != null) {
-        //             for (int j = 0; j < oldCap; ++j) {
-        //                 e = oldTab[j];          // reads freed memory
-        //                 ...
-        //             }
-        //         }
-        //
-        //     `oldTab` is still live in the local variable across the
-        //     `table = newTab` store, so releasing the old table at the
-        //     store corrupts the loop that follows. The observed
-        //     AIOOBE — "Array index out of bounds in
-        //     java.util.HashMap.resize" — was the emitter's bounds
-        //     check firing on a garbage length word read from a
-        //     recycled chunk.
-        //
-        //   - Not emitting at all leaves HEAP-escape sites with no
-        //     destruction point (LifetimeAnalyzer.computeSite
-        //     short-circuits on EscapeStatus.HEAP) and therefore leaks
-        //     every intermediate value stored into an overwritten field.
-        //     TestHeap's `h.payload = new Payload(...)` in a loop is
-        //     the canonical case: without the pass, 9 999 999 Payloads
-        //     are orphaned with no GC to reclaim them.
-        //
-        // The snapshot below includes one entry per block of every live
-        // function — including terminal blocks, whose live-out is an
-        // empty set. That "present but empty" state is what
-        // DestructorInserter's gate distinguishes from "absent":
-        //
-        //     entry is empty set  -> nothing is live after this block,
-        //                             so releasing the field's previous
-        //                             value is safe.
-        //     entry is absent     -> no liveness information for this
-        //                             block (should not happen on a
-        //                             well-formed module, but a future
-        //                             pass that adds blocks after the
-        //                             analysis could produce it).
-        //                             Conservative: do not emit.
-        //
-        // The copy is shallow: the sets are read-only after
-        // computeLiveSets() returns, so putting them into a plain
-        // HashMap is both cheap and correct.
-        // ------------------------------------------------------------------
-        Map<BasicBlock, Set<AllocationSite>> liveOutSnapshot = new HashMap<>();
-        for (Function f : module.getFunctions()) {
-            if (f.getEntryBlock() == null) continue;
-            for (BasicBlock b : f.getBlocks()) {
-                liveOutSnapshot.put(b, livenessAnalyzer.getLiveOut(b));
-            }
-        }
-        result.setLiveOut(liveOutSnapshot);
+        Map<BasicBlock, Set<AllocationSite>> liveOutMap = livenessAnalyzer.getLiveOutMap();
+        result.setLiveOut(liveOutMap != null ? liveOutMap : Map.of());
 
         // -------- 4. Dominator trees + natural loops, in parallel --------
         List<Function> live = new ArrayList<>();
@@ -208,70 +139,22 @@ public class LifetimeAnalyzer {
                                    Map<AllocationSite, Value> siteToValue) {
         EscapeStatus status = escapeResult.getSiteStatus(site);
 
-        // ------------------------------------------------------------------
-        // Ownership rule for GLOBAL / THREAD / RETURN.
+        // GLOBAL / THREAD / RETURN: object outlives the frame, so no per-use
+        // destruction point is legal.
         //
-        // An object that reaches a static field, another thread, or the
-        // caller outlives the frame that allocated it. Its lifetime is
-        // bounded by an entity outside the destruction-point machinery, so
-        // there is no point inside the defining function at which a
-        // destructor could legally run: any such call would free storage
-        // that the new owner still observes.
-        // ------------------------------------------------------------------
+        // HEAP: per-use destruction point. Such objects are only reachable
+        // through a field of a container; if the container is STACK, the frame
+        // teardown does not walk its fields, so the object must be freed at its
+        // last use (paired with a field null-out in insertDestructorCall, so the
+        // container's destructor cannot double-free it).
+        //
+        // STACK: skipped — materialised via alloca, released by frame teardown.
+        // UNKNOWN: treated conservatively as freeable.
         if (status == EscapeStatus.GLOBAL
                 || status == EscapeStatus.THREAD
                 || status == EscapeStatus.RETURN) {
             return new SiteResult(site, List.of(), false);
         }
-
-        // ------------------------------------------------------------------
-        // HEAP sites DO get a per-use destruction point.
-        //
-        // A HEAP allocation is one whose only remaining reference is a
-        // field of another object. The usual reclaim path for such an
-        // object is the owner's destructor chain: DestructorInserter's
-        // createClassDestructor walks every reference-typed field of the
-        // owner and releases it recursively.
-        //
-        // That chain, however, only exists when the owner itself has a
-        // destructor. The owner may be a STACK object -- an object that
-        // does not escape its defining function. A STACK object's storage
-        // is released by the frame teardown; no destructor ever runs for
-        // it, so the chain stops at the container and the HEAP object it
-        // holds is never released. The only way to reclaim such an object
-        // is to free it at its last use, BEFORE the container becomes
-        // unreachable.
-        //
-        // The per-use destructor emitted for a HEAP site is therefore
-        // paired with a null-out of the field that held the object (see
-        // DestructorInserter.insertDestructorCall). The null-out is what
-        // keeps the two reclaim paths from colliding:
-        //
-        //   - when the container's own destructor does run, it observes
-        //     NULL instead of a dangling pointer and does not free the
-        //     storage a second time;
-        //   - the field-overwrite instrumentation of the next loop
-        //     iteration loads NULL and skips the release, so no double
-        //     free can happen there either.
-        //
-        // The runtime's single-free rule (__jnative_dtor_enter /
-        // __jnative_dtor_unclaim) stays the last line of defence: the
-        // first destructor call claims the object, every later call on
-        // the same pointer is a no-op.
-        //
-        // STACK is intentionally not listed here. A STACK object that is
-        // used as an object is materialised via alloca (see
-        // LlvmFunctionEmitter's NEW case and ScalarReplacer's first pass),
-        // and its storage is released by the frame teardown. The
-        // DestructorInserter.insert() method filters STACK sites with the
-        // same reasoning, one layer later.
-        //
-        // UNKNOWN is likewise not listed. It is the default status returned
-        // by EscapeAnalysisResult.getSiteStatus for a site that the
-        // analysis did not classify at all; treating such a site as
-        // potentially free-able at its last use preserves the previous
-        // conservative behaviour.
-        // ------------------------------------------------------------------
 
         Function func = module.getFunction(site.getMethodName());
         if (func == null || func.getEntryBlock() == null) {
@@ -398,37 +281,13 @@ public class LifetimeAnalyzer {
                 return new SiteResult(site, List.of(), true);
             }
 
-            // ------------------------------------------------------------------
-            // Dominance check for the fallback path.
-            //
-            // The main path above already filters out candidates whose root
-            // value is not available at the insertion block (see
-            // valueAvailableAt). The fallback path bypasses that filter and
-            // uses the raw allocation value directly, so it must re-apply the
-            // same check here. Without it, an allocation performed in a
-            // block that does not dominate the LCA of the return blocks —
-            // for example, an allocation inside a branch or inside a
-            // try-guarded body whose merge point lies above the returns —
-            // produces a DestructionPoint whose objectRef cannot legally be
-            // named at the insertion site. The LLVM backend then rejects the
-            // module with:
-            //
-            //   Instruction does not dominate all uses!
-            //     %tmp = bitcast ptr %alloc to ptr
-            //     call void @__destruct_X(ptr %tmp)
-            //
-            // Observed on ObjectInputStream$SerialCallbackContext inside
-            // ObjectInputStream.readOrdinaryObject and on the two HashSets
-            // inside ObjectInputStream$BlockDataInputStream, all three of
-            // which are created inside a try-guard body and whose only
-            // legal insertion point would be inside that guarded body, not
-            // at the LCA of the returns.
-            //
-            // Treating such an allocation as unresolved is the correct
-            // conservative answer: the analysis has no safe point at which
-            // it can release the object, so the object is left to the
-            // runtime's own shutdown path, exactly as a cyclic object is.
-            // ------------------------------------------------------------------
+            // Dominance check for the fallback path. The main path already filtered
+            // by valueAvailableAt; the fallback uses allocVal directly, so it must
+            // re-apply the same check. Otherwise an allocation in a branch or
+            // try-guarded body whose merge point lies above the returns produces
+            // a DestructionPoint with a non-dominating operand, and clang rejects
+            // the module with "Instruction does not dominate all uses!".
+            // Such sites are marked unresolved and left to shutdown reclamation.
             if (!valueAvailableAt(allocVal, lca, dom)) {
                 return new SiteResult(site, List.of(), true);
             }

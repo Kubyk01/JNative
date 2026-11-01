@@ -31,17 +31,16 @@ public class LivenessAnalyzer {
         if (scheduler != null) this.scheduler = scheduler;
     }
 
-    // Points-to cache: aliasResult is frozen once escape analysis is done,
-    // so a concurrent map is safe and saves repeated lookups.
     private final Map<Value, Set<AllocationSite>> pointsToCache = new ConcurrentHashMap<>();
+    private final Map<Function, Map<Value, List<ValueLastUse>>> valueLastUsesCache =
+        new ConcurrentHashMap<>();
 
     private Map<BasicBlock, Set<AllocationSite>> liveInGlobal;
     private Map<BasicBlock, Set<AllocationSite>> liveOutGlobal;
 
     private Set<AllocationSite> getPointsTo(Value v) {
         if (v == null) return Collections.emptySet();
-        return pointsToCache.computeIfAbsent(v,
-            key -> aliasResult.getPointsTo(key).getSites());
+        return pointsToCache.computeIfAbsent(v, key -> aliasResult.getPointsTo(key).getSites());
     }
 
     public void computeLiveSets(Collection<AllocationSite> allSites) {
@@ -57,7 +56,6 @@ public class LivenessAnalyzer {
             return;
         }
 
-        // -------- Phase 1: use/def for every block, in parallel --------
         Map<BasicBlock, Set<AllocationSite>> use = new ConcurrentHashMap<>();
         Map<BasicBlock, Set<AllocationSite>> def = new ConcurrentHashMap<>();
 
@@ -73,9 +71,7 @@ public class LivenessAnalyzer {
                         blockDef.addAll(getAllocationSitesDef(inst, allowed));
                     }
                     Terminator term = block.getTerminator();
-                    if (term != null) {
-                        blockUse.addAll(getAllocationSitesUsed(term, allowed));
-                    }
+                    if (term != null) blockUse.addAll(getAllocationSitesUsed(term, allowed));
                     use.put(block, blockUse);
                     def.put(block, blockDef);
                 }
@@ -84,7 +80,6 @@ public class LivenessAnalyzer {
             .then()
         );
 
-        // -------- Phase 2: liveIn/liveOut storage, concurrent --------
         liveInGlobal = new ConcurrentHashMap<>();
         liveOutGlobal = new ConcurrentHashMap<>();
         for (Function func : live) {
@@ -94,13 +89,6 @@ public class LivenessAnalyzer {
             }
         }
 
-        // -------- Phase 3: per-function fixed point, in parallel --------
-        //
-        // The dataflow equations only reference block.getSuccessors(),
-        // i.e. blocks inside the same function. use/def are frozen
-        // after phase 1. Consequently the fixed point for each function
-        // is independent from every other function, and the whole
-        // iteration can run per-function in parallel.
         LlvmUtil.awaitMono(Flux.fromIterable(live)
             .parallel()
             .runOn(scheduler)
@@ -113,26 +101,48 @@ public class LivenessAnalyzer {
     private void solveFunction(Function func,
                                Map<BasicBlock, Set<AllocationSite>> use,
                                Map<BasicBlock, Set<AllocationSite>> def) {
+        Set<AllocationSite> newLiveOut = new HashSet<>();
+        Set<AllocationSite> newLiveIn  = new HashSet<>();
+        Set<AllocationSite> temp       = new HashSet<>();
+
         boolean changed = true;
         while (changed) {
             changed = false;
             for (BasicBlock block : func.getBlocks()) {
-                Set<AllocationSite> newLiveOut = new HashSet<>();
+                newLiveOut.clear();
                 for (BasicBlock succ : block.getSuccessors()) {
                     Set<AllocationSite> succLiveIn = liveInGlobal.get(succ);
-                    if (succLiveIn != null) newLiveOut.addAll(succLiveIn);
+                    if (succLiveIn != null && !succLiveIn.isEmpty()) {
+                        newLiveOut.addAll(succLiveIn);
+                    }
                 }
-                if (!newLiveOut.equals(liveOutGlobal.get(block))) {
-                    liveOutGlobal.put(block, newLiveOut);
+                Set<AllocationSite> currentOut = liveOutGlobal.get(block);
+                if (currentOut == null) {
+                    liveOutGlobal.put(block, new HashSet<>(newLiveOut));
+                    changed = true;
+                } else if (!newLiveOut.equals(currentOut)) {
+                    currentOut.clear();
+                    currentOut.addAll(newLiveOut);
                     changed = true;
                 }
 
-                Set<AllocationSite> newLiveIn = new HashSet<>(use.get(block));
-                Set<AllocationSite> liveOutMinusDef = new HashSet<>(newLiveOut);
-                liveOutMinusDef.removeAll(def.get(block));
-                newLiveIn.addAll(liveOutMinusDef);
-                if (!newLiveIn.equals(liveInGlobal.get(block))) {
-                    liveInGlobal.put(block, newLiveIn);
+                newLiveIn.clear();
+                Set<AllocationSite> u = use.get(block);
+                if (u != null && !u.isEmpty()) newLiveIn.addAll(u);
+
+                temp.clear();
+                temp.addAll(newLiveOut);
+                Set<AllocationSite> d = def.get(block);
+                if (d != null && !d.isEmpty()) temp.removeAll(d);
+                newLiveIn.addAll(temp);
+
+                Set<AllocationSite> currentIn = liveInGlobal.get(block);
+                if (currentIn == null) {
+                    liveInGlobal.put(block, new HashSet<>(newLiveIn));
+                    changed = true;
+                } else if (!newLiveIn.equals(currentIn)) {
+                    currentIn.clear();
+                    currentIn.addAll(newLiveIn);
                     changed = true;
                 }
             }
@@ -151,67 +161,27 @@ public class LivenessAnalyzer {
             : Collections.emptySet();
     }
 
-    /**
-     * A single syntactic occurrence of a value as an operand: the block it
-     * appears in, the index of the instruction that consumes it (equal to
-     * {@code block.getInstructions().size()} when the consumer is the
-     * terminator), and the value itself.
-     */
+    public Map<BasicBlock, Set<AllocationSite>> getLiveOutMap() {
+        return liveOutGlobal;
+    }
+
     public record ValueLastUse(BasicBlock block, int instructionIndex, Value value) {}
 
-    /**
-     * Value-level liveness support: for every value that appears as an
-     * operand anywhere in {@code func}, the list of its occurrences. The
-     * last element of each list is the value's last syntactic use.
-     *
-     * <h2>Why PHI operands are excluded</h2>
-     *
-     * <p>A PHI instruction's operand list is not a list of uses in the
-     * PHI's own block: each operand is semantically evaluated on the
-     * incoming edge from the corresponding predecessor. Recording a PHI
-     * operand as a use in the PHI's block therefore claims the operand is
-     * live at a point where it may not be available: if the value is
-     * defined in one predecessor and the PHI block has other
-     * predecessors, the value's definition does not dominate the PHI
-     * block, and any instruction placed there that names the operand
-     * directly produces IR that clang rejects with</p>
-     *
-     * <pre>
-     *   Instruction does not dominate all uses!
-     *     %v = bitcast ... (in predecessor A)
-     *     call void @__destruct_X(ptr %v)   (in PHI block B, not dominated by A)
-     * </pre>
-     *
-     * <p>The PI value that actually carries the object through the join is
-     * the PHI's own result, which is recorded as a separate value with its
-     * own uses (in the PHI block's body). Omitting the operands here
-     * therefore loses nothing: a value used only as a PHI operand has no
-     * candidate death site, and the PHI result becomes the natural
-     * candidate instead, defined in a block that dominates every one of
-     * its own uses.</p>
-     *
-     * <p>The block-level liveness analysis is unaffected: it uses
-     * {@link #getAllocationSitesUsed(Instruction, Set)} directly, not this
-     * method, and continues to treat every operand of every instruction —
-     * PHI operands included — as a use for the purpose of the dataflow
-     * equations.</p>
-     */
     public Map<Value, List<ValueLastUse>> computeValueLastUses(Function func) {
+        return valueLastUsesCache.computeIfAbsent(func, this::doComputeValueLastUses);
+    }
+
+    private Map<Value, List<ValueLastUse>> doComputeValueLastUses(Function func) {
         Map<Value, List<ValueLastUse>> lastUses = new HashMap<>();
         for (BasicBlock block : func.getBlocks()) {
             List<Instruction> insts = block.getInstructions();
             for (int i = 0; i < insts.size(); i++) {
                 Instruction inst = insts.get(i);
-                // PHI operands are values flowing in from the
-                // predecessor on an edge, not values used in this block.
-                // See the method javadoc for the full reasoning.
-                if (inst.getOpcode() == Opcode.PHI) {
-                    continue;
-                }
+                if (inst.getOpcode() == Opcode.PHI) continue;
                 for (Value operand : inst.getOperands()) {
                     if (operand == null) continue;
                     lastUses.computeIfAbsent(operand, k -> new ArrayList<>())
-                            .add(new ValueLastUse(block, i, operand));
+                        .add(new ValueLastUse(block, i, operand));
                 }
             }
             Terminator term = block.getTerminator();
@@ -219,43 +189,25 @@ public class LivenessAnalyzer {
                 for (Value operand : terminatorOperands(term)) {
                     if (operand == null) continue;
                     lastUses.computeIfAbsent(operand, k -> new ArrayList<>())
-                            .add(new ValueLastUse(block, insts.size(), operand));
+                        .add(new ValueLastUse(block, insts.size(), operand));
                 }
             }
         }
         return lastUses;
     }
 
-    /**
-     * The operands a terminator consumes, in the same spirit as
-     * {@link Instruction#getOperands()}.
-     */
     public List<Value> terminatorOperands(Terminator term) {
         List<Value> result = new ArrayList<>();
-        if (term instanceof ReturnTerminator) {
-            Value v = ((ReturnTerminator) term).getValue();
-            if (v != null) result.add(v);
-        } else if (term instanceof ThrowTerminator) {
-            Value v = ((ThrowTerminator) term).getException();
-            if (v != null) result.add(v);
-        } else if (term instanceof CondBranchTerminator) {
-            Value v = ((CondBranchTerminator) term).getCondition();
-            if (v != null) result.add(v);
-        } else if (term instanceof LookupSwitchTerminator) {
-            Value v = ((LookupSwitchTerminator) term).getKey();
-            if (v != null) result.add(v);
-        } else if (term instanceof TableSwitchTerminator) {
-            Value v = ((TableSwitchTerminator) term).getKey();
-            if (v != null) result.add(v);
-        } else if (term instanceof IndirectBranchTerminator) {
-            Value v = ((IndirectBranchTerminator) term).getTargetBlock();
-            if (v != null) result.add(v);
-        }
+        if (term instanceof ReturnTerminator rt) { if (rt.getValue() != null) result.add(rt.getValue()); }
+        else if (term instanceof ThrowTerminator tt) { if (tt.getException() != null) result.add(tt.getException()); }
+        else if (term instanceof CondBranchTerminator cbt) { if (cbt.getCondition() != null) result.add(cbt.getCondition()); }
+        else if (term instanceof LookupSwitchTerminator lst) { if (lst.getKey() != null) result.add(lst.getKey()); }
+        else if (term instanceof TableSwitchTerminator tst) { if (tst.getKey() != null) result.add(tst.getKey()); }
+        else if (term instanceof IndirectBranchTerminator ibt) { if (ibt.getTargetBlock() != null) result.add(ibt.getTargetBlock()); }
         return result;
     }
 
-    private Set<AllocationSite> getAllocationSitesDef(Instruction inst,
-                                                      Set<AllocationSite> allowed) {
+    private Set<AllocationSite> getAllocationSitesDef(Instruction inst, Set<AllocationSite> allowed) {
         Set<AllocationSite> result = new HashSet<>();
         Opcode op = inst.getOpcode();
         if (op == Opcode.FREE) {
@@ -266,18 +218,16 @@ public class LivenessAnalyzer {
                 }
             }
         } else if (op == Opcode.CALL || op == Opcode.VIRTUAL_CALL
-                || op == Opcode.INTERFACE_CALL || op == Opcode.STATIC_CALL
-                || op == Opcode.SPECIAL_CALL) {
+            || op == Opcode.INTERFACE_CALL || op == Opcode.STATIC_CALL
+            || op == Opcode.SPECIAL_CALL) {
             String calleeName = extractCalleeName(inst);
             if (calleeName == null) return result;
-            String calleeKey = canonicalCalleeKey(calleeName);
-            FunctionSummary summary = summaries.get(calleeKey);
+            FunctionSummary summary = summaries.get(canonicalCalleeKey(calleeName));
             if (summary == null) return result;
             List<Value> args = getCallArguments(inst);
             for (int i = 0; i < args.size(); i++) {
                 if (summary.getParamsDestroyed().contains(i)) {
-                    Value arg = args.get(i);
-                    for (AllocationSite site : getPointsTo(arg)) {
+                    for (AllocationSite site : getPointsTo(args.get(i))) {
                         if (allowed.contains(site)) result.add(site);
                     }
                 }
@@ -286,8 +236,7 @@ public class LivenessAnalyzer {
         return result;
     }
 
-    private Set<AllocationSite> getAllocationSitesUsed(Instruction inst,
-                                                      Set<AllocationSite> allowed) {
+    private Set<AllocationSite> getAllocationSitesUsed(Instruction inst, Set<AllocationSite> allowed) {
         Set<AllocationSite> result = new HashSet<>();
         for (Value operand : inst.getOperands()) {
             if (operand == null) continue;
@@ -298,21 +247,14 @@ public class LivenessAnalyzer {
         return result;
     }
 
-    private Set<AllocationSite> getAllocationSitesUsed(Terminator term,
-                                                      Set<AllocationSite> allowed) {
+    private Set<AllocationSite> getAllocationSitesUsed(Terminator term, Set<AllocationSite> allowed) {
         Set<AllocationSite> result = new HashSet<>();
         Value used = null;
-        if (term instanceof ReturnTerminator) {
-            used = ((ReturnTerminator) term).getValue();
-        } else if (term instanceof ThrowTerminator) {
-            used = ((ThrowTerminator) term).getException();
-        } else if (term instanceof CondBranchTerminator) {
-            used = ((CondBranchTerminator) term).getCondition();
-        } else if (term instanceof LookupSwitchTerminator) {
-            used = ((LookupSwitchTerminator) term).getKey();
-        } else if (term instanceof TableSwitchTerminator) {
-            used = ((TableSwitchTerminator) term).getKey();
-        }
+        if (term instanceof ReturnTerminator rt) used = rt.getValue();
+        else if (term instanceof ThrowTerminator tt) used = tt.getException();
+        else if (term instanceof CondBranchTerminator cbt) used = cbt.getCondition();
+        else if (term instanceof LookupSwitchTerminator lst) used = lst.getKey();
+        else if (term instanceof TableSwitchTerminator tst) used = tst.getKey();
         if (used != null) {
             for (AllocationSite site : getPointsTo(used)) {
                 if (allowed.contains(site)) result.add(site);

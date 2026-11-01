@@ -27,9 +27,13 @@ import io.github.kubyk01.domain.ir.Value;
 import io.github.kubyk01.domain.ir.TargetPlatform;
 import io.github.kubyk01.domain.analyzer.reflection.ReflectClassInfo;
 import io.github.kubyk01.domain.analyzer.reflection.ReflectInfo;
+import io.github.kubyk01.port.secondary.LlvmGeneratorPort;
+import io.github.kubyk01.util.LlvmUtil;
 import lombok.extern.slf4j.Slf4j;
 import org.objectweb.asm.Handle;
 import org.objectweb.asm.Opcodes;
+import reactor.core.scheduler.Scheduler;
+import reactor.core.scheduler.Schedulers;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -51,7 +55,7 @@ import java.util.Set;
 import static io.github.kubyk01.util.LlvmUtil.getElementSizeOfType;
 
 @Slf4j
-public class LlvmGenerator {
+public class LlvmGenerator implements LlvmGeneratorPort {
 
     private final Module module;
     private final DependencyResolver resolver;
@@ -74,6 +78,12 @@ public class LlvmGenerator {
 
     private List<ClinitScheduleEntry> clinitSchedule = new ArrayList<>();
     private Map<String, String> clinitWrappers = new HashMap<>();
+    private Scheduler scheduler = Schedulers.single();
+
+    @Override
+    public void setScheduler(Scheduler scheduler) {
+        if (scheduler != null) this.scheduler = scheduler;
+    }
 
     /**
      * LLVM target platform: the {@code target datalayout} and
@@ -99,14 +109,17 @@ public class LlvmGenerator {
      */
     private List<Map.Entry<String, byte[]>> embeddedResources = new ArrayList<>();
 
+    @Override
     public void setClinitSchedule(List<ClinitScheduleEntry> schedule) {
         this.clinitSchedule = (schedule != null) ? schedule : new ArrayList<>();
     }
 
+    @Override
     public void setEmbeddedResources(List<Map.Entry<String, byte[]>> resources) {
         this.embeddedResources = (resources != null) ? resources : new ArrayList<>();
     }
 
+    @Override
     public void setClinitWrappers(Map<String, String> wrappers) {
         this.clinitWrappers = wrappers != null ? wrappers : new HashMap<>();
         // Forwarded so that LlvmGlobalEmitter.emitLazyClinitMap() can emit
@@ -124,6 +137,7 @@ public class LlvmGenerator {
      * argument conditionally does not need a null check at the call
      * site.</p>
      */
+    @Override
     public void setTargetPlatform(TargetPlatform platform) {
         if (platform != null) {
             this.targetPlatform = platform;
@@ -155,6 +169,7 @@ public class LlvmGenerator {
         return wrapper != null ? wrapper : realClinitName;
     }
 
+    @Override
     public void generate(Path outputDir) throws IOException {
         Files.createDirectories(outputDir);
         ensureExternalDeclarations();
@@ -172,6 +187,16 @@ public class LlvmGenerator {
         String extraStructsText = extraBuf.toString();
         String reflectionTypesText = globalEmitter.generateTypeDefinitions();
 
+        // Every .ll file needs the same filtered prelude. Parsing the
+        // runtime declarations once here — instead of once per output
+        // file — removes the dominant cost of buildFilteredPrelude.
+        Map<String, String> preludeDefs = new LinkedHashMap<>();
+        preludeDefs.putAll(parseSingleLineDefinitions(LlvmRuntime.getVtableTypeDefinition()));
+        preludeDefs.putAll(parseSingleLineDefinitions(reflectionTypesText));
+        preludeDefs.putAll(parseSingleLineDefinitions(extraStructsText));
+        preludeDefs.putAll(parseSingleLineDefinitions(structDefs));
+        preludeDefs.putAll(parseSingleLineDefinitions(LlvmRuntime.getDeclarations()));
+
         // ---- 1. Emit EVERY function body, grouped by owner class. The
         //         bodies are accumulated in memory rather than streamed,
         //         because the deferred strings they register are only known
@@ -184,19 +209,30 @@ public class LlvmGenerator {
         toEmit.sort(Comparator.comparing(f ->
             f.getOwnerClass() == null ? "" : f.getOwnerClass()));
 
-        LlvmFunctionEmitter emitter = new LlvmFunctionEmitter(
-            module, globalEmitter, polymorphicResolverRef, resolver);
+        List<String> bodies = LlvmUtil.parallelMapOrdered(toEmit, scheduler, func -> {
+            LlvmFunctionEmitter emitter = new LlvmFunctionEmitter(
+                module, globalEmitter, polymorphicResolverRef, resolver);
+            return emitter.emitFunction(func);
+        });
 
         Map<String, StringBuilder> classBodies = new LinkedHashMap<>();
         StringBuilder moduleBodies = new StringBuilder();
-
-        for (Function func : toEmit) {
-            String body = emitter.emitFunction(func);
+        for (int i = 0; i < toEmit.size(); i++) {
+            Function func = toEmit.get(i);
+            String body = bodies.get(i);
             String owner = func.getOwnerClass();
             if (owner != null && !owner.isEmpty()) {
                 classBodies.computeIfAbsent(owner, k -> new StringBuilder()).append(body);
             } else {
                 moduleBodies.append(body);
+            }
+        }
+
+        Map<String, Set<String>> functionsByOwner = new HashMap<>();
+        for (Function f : toEmit) {
+            String owner = f.getOwnerClass();
+            if (owner != null && !owner.isEmpty()) {
+                functionsByOwner.computeIfAbsent(owner, k -> new HashSet<>()).add(f.getName());
             }
         }
 
@@ -254,10 +290,7 @@ public class LlvmGenerator {
             module);
 
         String modulePrelude = buildFilteredPrelude(
-            moduleTail + "\n" + moduleExterns,
-            structDefs,
-            extraStructsText,
-            reflectionTypesText);
+            moduleTail + "\n" + moduleExterns, preludeDefs);
 
         String moduleSb = modulePrelude
             + moduleExterns
@@ -267,31 +300,28 @@ public class LlvmGenerator {
         Files.writeString(modulePath, moduleSb, StandardCharsets.UTF_8);
 
         // ---- 6. Write one .ll file per class. ----
-        for (Map.Entry<String, StringBuilder> e : classBodies.entrySet()) {
+        // Each file is independent: it reads only the immutable emission
+        // results and the module. Building and writing them in parallel
+        // keeps the single-threaded tail of the compiler short.
+        LlvmUtil.parallelMapOrdered(new ArrayList<>(classBodies.entrySet()), scheduler, e -> {
             String className = e.getKey();
             String body = e.getValue().toString();
 
-            Set<String> definedHere = new HashSet<>();
-            for (Function f : toEmit) {
-                if (className.equals(f.getOwnerClass())) {
-                    definedHere.add(f.getName());
-                }
-            }
+            Set<String> definedHere = functionsByOwner.getOrDefault(className, Set.of());
 
             String externs = buildExterns(body, definedHere, knownGlobals, module);
 
-            String prelude = buildFilteredPrelude(
-                body + "\n" + externs,
-                structDefs,
-                extraStructsText,
-                reflectionTypesText);
+            String prelude = buildFilteredPrelude(body + "\n" + externs, preludeDefs);
 
-            String sb = prelude + externs + body;
-
-            Path out = outputDir.resolve(className + ".ll");
-            if (out.getParent() != null) Files.createDirectories(out.getParent());
-            Files.writeString(out, sb, StandardCharsets.UTF_8);
-        }
+            try {
+                Path out = outputDir.resolve(className + ".ll");
+                if (out.getParent() != null) Files.createDirectories(out.getParent());
+                Files.writeString(out, prelude + externs + body, StandardCharsets.UTF_8);
+            } catch (IOException ex) {
+                throw new java.io.UncheckedIOException(ex);
+            }
+            return className;
+        });
     }
 
     /**
@@ -316,23 +346,7 @@ public class LlvmGenerator {
      * </ol>
      */
     private String buildFilteredPrelude(String bodyContent,
-                                        String structDefsText,
-                                        String extraStructsText,
-                                        String reflectionTypesText) {
-
-        // Single ordered map of every potential definition. The insertion
-        // order matches the current (working) output order:
-        //   1) vtable types
-        //   2) reflection ABI types
-        //   3) lambda structs
-        //   4) class structs
-        //   5) runtime declares
-        Map<String, String> allDefs = new LinkedHashMap<>();
-        allDefs.putAll(parseSingleLineDefinitions(LlvmRuntime.getVtableTypeDefinition()));
-        allDefs.putAll(parseSingleLineDefinitions(reflectionTypesText));
-        allDefs.putAll(parseSingleLineDefinitions(extraStructsText));
-        allDefs.putAll(parseSingleLineDefinitions(structDefsText));
-        allDefs.putAll(parseSingleLineDefinitions(LlvmRuntime.getDeclarations()));
+                                        Map<String, String> allDefs) {
 
         // Transitive closure of the set of used names.
         Set<String> needed = new LinkedHashSet<>();

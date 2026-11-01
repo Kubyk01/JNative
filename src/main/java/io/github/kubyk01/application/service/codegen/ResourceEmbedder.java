@@ -22,84 +22,22 @@ import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 
 /**
- * Collects the bytes of the resources the JDK reads through
- * {@code Class.getResourceAsStream}, so they can be baked into the image.
+ * Collects resource bytes the JDK reads through Class.getResourceAsStream,
+ * for baking into the image. The override installed on
+ * Class.getResourceAsStream looks these up in a flat table.
  *
- * <p>The consumer of these bytes is the native override installed by
- * {@code LlvmGlobalEmitter.overrideMethod(...)} on
- * {@code java/lang/Class.getResourceAsStream}. In a plain JVM, that call
- * resolves through the module system to a resource lookup on
- * {@code jrt:/modules/java.base/}; in a JNative image there is no module
- * system and no jimage, so the only path that keeps the call well-defined
- * is to have the bytes already linked into the executable and indexed by a
- * flat lookup table the runtime walks.</p>
+ * Sources tried in order: $JAVA_HOME/jmods/java.base.jmod (zip,
+ * entries under classes/), then jrt:/modules/java.base. Loading via
+ * ClassLoader / getResourceAsStream does not work for these because the
+ * files live in the module image, not on the class path.
  *
- * <h2>Which files</h2>
- *
- * <p>Two collections are offered:</p>
- *
- * <ul>
- *   <li>{@link #collectJavaBaseResources()} — everything in the
- *       {@code java.base} module except {@code .class} files. This is the
- *       entry point the build uses, because statically deciding which
- *       resource a reachable path will request is not possible: names are
- *       often assembled from strings or read from fields. The first such
- *       client was {@code sun.net.www.MimeTable.load()}, which throws
- *       {@code InternalError: default mime table not found} when
- *       {@code content-types.properties} is missing.</li>
- *
- *   <li>{@link #collectIcuResources()} — only what lives under
- *       {@code jdk/internal/icu/impl/data/icudt<NN>b/}. On JDK 21 that is
- *       exactly four files — {@code nfc.nrm}, {@code nfkc.nrm},
- *       {@code ubidi.icu}, {@code uprops.icu} — but the version number
- *       ({@code 72} on JDK 21, {@code 76} on JDK 23, …) and the exact file
- *       set change from release to release. Rather than spell out a list
- *       that is correct on exactly one JDK, this class <em>enumerates</em>
- *       the ICU data directory and takes whatever is there. Kept for
- *       callers that want the minimal set.</li>
- * </ul>
- *
- * <h2>Where the bytes come from</h2>
- *
- * <p>Two sources are tried, in order, and the first that yields a non-empty
- * result wins:</p>
- *
- * <ol>
- *   <li><b>{@code $JAVA_HOME/jmods/java.base.jmod}</b> — a plain zip whose
- *       entries are prefixed with {@code classes/}. The zip API reads it
- *       without any JDK internals, and the class-file payload is dropped by
- *       {@code keepAsResource(String)}: only non-bytecode entries are
- *       kept.</li>
- *
- *   <li><b>{@code jrt:/modules/java.base}</b> — the running JVM's view of
- *       the same module contents, mounted as a read-only filesystem. Used
- *       when {@code jmods/java.base.jmod} is absent, which happens on a JDK
- *       distribution that ships only the runtime image.</li>
- * </ol>
- *
- * <p>The class-loader API and {@code Class.getResourceAsStream} on an
- * {@code ICUBinary} mirror are deliberately not used: on every JDK this
- * runtime has been built against they return {@code null} for these
- * resources regardless of {@code --add-opens}, because the resources live
- * in the module image rather than on a class path.</p>
- *
- * <h2>Failure policy</h2>
- *
- * <p>The two collectors differ on purpose. {@link #collectIcuResources()}
- * treats an empty result as a hard error, because a silently empty
- * {@code jnative_builtin_resources} array means every
- * {@code Class.getResourceAsStream} on an ICU resource returns null, which
- * in turn means {@code ICUBinary.getRequiredData} throws
- * {@code InternalError: Missing resource: ...} on the first
- * {@code Norm2AllModes} class load; failing at code-generation time with a
- * message that names both attempted sources is strictly more useful than
- * failing at run time inside an unrelated JDK class.</p>
- *
- * <p>{@link #collectJavaBaseResources()} only warns, because its clients
- * (starting with {@code MimeTable.load()}) already report the missing
- * resource themselves, and an environment without {@code jmods/} is a
- * legitimate one for a runtime-image-only JDK. The warning still names both
- * attempted sources.</p>
+ * Two collectors: collectJavaBaseResources() embeds every non-.class
+ * entry of java.base (statically deciding which resource a reachable
+ * path will request is not possible; MimeTable.load() was the first
+ * client outside the ICU data); an empty result is a warning.
+ * collectIcuResources() embeds only the ICU data directory and treats an
+ * empty result as a hard error (ICUBinary.getRequiredData would
+ * InternalError on the first Norm2AllModes load).
  */
 public final class ResourceEmbedder {
 

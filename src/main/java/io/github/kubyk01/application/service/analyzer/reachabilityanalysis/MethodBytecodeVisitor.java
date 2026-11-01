@@ -263,15 +263,11 @@ public class MethodBytecodeVisitor extends ClassVisitor {
 
         @Override
         public void visitFieldInsn(int opcode, String owner, String name, String descriptor) {
-            // getstatic/putstatic on owner's static field is an active use of
-            // the owner class (JLS §12.4.1) and must trigger its <clinit>.
-            // getfield/putfield only touch an already-created instance and
-            // do not require class initialization.
             if (opcode == Opcodes.GETSTATIC || opcode == Opcodes.PUTSTATIC) {
                 analysis.triggerClinit(owner, reachableFromUser);
             }
             simulator.visitFieldInsn(opcode, descriptor);
-            super.visitFieldInsn(opcode, owner, name == null ? name : name, name);
+            super.visitFieldInsn(opcode, owner, name, descriptor);
         }
 
         @Override

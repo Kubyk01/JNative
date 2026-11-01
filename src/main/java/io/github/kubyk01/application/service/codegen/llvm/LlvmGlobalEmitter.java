@@ -40,75 +40,26 @@ import static io.github.kubyk01.util.LlvmUtil.getElementSizeOfType;
 import static io.github.kubyk01.util.LlvmUtil.extractFieldName;
 
 /**
- * Emits the global data section of a generated LLVM module: struct type
- * definitions, vtables, itables, type-info tables, string literals and the
- * reflection registry.
+ * Emits the global data section of the generated module: struct types,
+ * vtables, itables, type-info tables, string literals, reflection data.
  *
- * <h2>Thread-safety model</h2>
+ * Thread-safety: writes happen before parallel emission, reads happen
+ * during. Caches populated before the parallel phase are concurrent;
+ * prepareLayouts() is double-checked and idempotent; the only write during
+ * emission is registerDeferredString(), guarded by a synchronized set
+ * whose readers snapshot under the same monitor. getFieldOffset is safe
+ * to call concurrently for the same pair (deterministic result, benign
+ * duplicate write).
  *
- * <p>{@code LlvmGlobalEmitter} is shared between the main thread (which
- * drives the pre-emission setup) and every worker thread that runs in
- * parallel during the function-emission phase. It is designed around a
- * simple rule: <b>writes happen before parallel emission, reads happen
- * during and after</b>.</p>
- *
- * <p>Concretely:</p>
- * <ul>
- *   <li>Every cache that is fully populated before the parallel phase is
- *       held in a {@link ConcurrentHashMap} (or a
- *       {@code ConcurrentHashMap.newKeySet()}) so that concurrent reads
- *       never observe a partially-constructed internal table.</li>
- *   <li>{@link #prepareLayouts()} is guarded by double-checked locking on
- *       a {@code volatile} flag; it is idempotent and safe to call from
- *       any number of threads.</li>
- *   <li>{@link #registerDeferredString(String)} is the only method that
- *       writes shared state during the parallel phase. It updates a
- *       {@code synchronized} set, and the reader
- *       ({@link #generateDeferredStringConstants()}) takes a snapshot
- *       under the same monitor before iterating.</li>
- *   <li>{@link #getFieldOffset(String, String)} may be called
- *       concurrently for the same (class, field) pair. The computation
- *       is deterministic — both threads compute the same offset — and
- *       the cache is a {@code ConcurrentHashMap}, so the duplicate
- *       write is harmless.</li>
- * </ul>
- *
- * <h2>Mutability of emitted globals</h2>
- *
- * <p>Most emitted globals are {@code constant}: vtables, itables,
- * interface maps, method/field/constructor descriptors, type-info tables,
- * and the {@code @refifaces_*} arrays are compile-time metadata that
- * generated code and the C runtime only ever read. They live in
- * {@code .rodata} and take a hardware write barrier if anything tries to
- * modify them.</p>
- *
- * <p>The per-class {@code @refclass_*} mirrors are the exception. A
- * {@code java.lang.Class} object is a live Java object whose JDK-side
- * methods store into a number of lazily-computed cache fields — {@code
- * name}, {@code packageName}, {@code componentType}, {@code
- * enumConstants}, {@code enumConstantDirectory}, {@code annotationData},
- * {@code reflectionData}, {@code classValueMap} — on the first read of
- * each. Because those fields live inside the {@code %ReflectionClass}
- * struct, the struct itself must be writable. See the emission site in
- * {@link #generateReflectionData()} for the full rationale; emitting it
- * as {@code constant} was the root cause of a SIGSEGV inside
- * {@code Class.getPackageName()} while the VarHandle bootstrap was
- * resolving {@code ConcurrentSkipListMap.<clinit>}.</p>
- *
- * <p>The bootstrap-loader module singleton
- * {@code @jnative_unnamed_module} is the second exception. Its initial
- * field values describe the unnamed module (all reference slots null,
- * {@code isNamed == false}), but the JDK's own module bootstrap — which
- * runs from {@code System.initPhase2()} through
- * {@code ModuleLayer.defineModules()} — takes that same object back out
- * of the class mirror registry as the {@code java.base} module and
- * writes its {@code reads} / {@code exports} / {@code opens} fields, and
- * later its {@code name} / {@code loader} / {@code descriptor} fields.
- * The object is therefore emitted as a writable {@code global} rather
- * than as a {@code constant}. See
- * {@link #generateUnnamedModule()} for the full rationale and for the
- * SIGSEGV ({@code SEGV_ACCERR} at offset {@code 0x30}) that the previous
- * {@code constant} emission produced.</p>
+ * Emitted globals are `constant` except two writable cases:
+ *   - @refclass_* mirrors, because Class's own bytecode caches name,
+ *     packageName, enumConstants, reflectionData, classValueMap, etc.
+ *     in slots of %ReflectionClass on first read. Emitting `constant`
+ *     placed them in .rodata and the first lazy store SIGSEGV'd
+ *     (Class.getPackageName during ConcurrentSkipListMap.<clinit>).
+ *   - @jnative_unnamed_module, which the JDK's Module.defineModules
+ *     writes into as java.base (reads/exports/opens); same failure
+ *     mode otherwise (SEGV_ACCERR at offset 0x30).
  */
 @Slf4j
 @RequiredArgsConstructor
@@ -977,87 +928,20 @@ public class LlvmGlobalEmitter {
         }
     }
     /**
-     * Emits the one shared {@code java.lang.Module} object that stands for the
-     * bootstrap loader's module.
+     * Emits the shared java.lang.Module object pointed at by every
+     * @refclass_*.module slot (offset 80).
      *
-     * <p>Every {@code @refclass_*} mirror has a {@code module} slot at offset
-     * 80, and the bytecode of {@code Class.getModule()} is a plain read of
-     * that slot. Emitting {@code null} there makes every
-     * {@code Class.getResourceAsStream} dereference a null {@code Module} and
-     * die with an NPE on the {@code thisModule.isNamed()} call that follows.</p>
+     * Initially describes the unnamed module of the boot loader
+     * (isNamed == false, name == null). Class.getModule() is a plain read of
+     * that slot, so emitting null there NPEs on thisModule.isNamed().
      *
-     * <p>So every mirror points at this object instead. Initially it describes
-     * the unnamed module of the bootstrap loader: {@code isNamed == false},
-     * {@code name == null}, {@code loader == null}, no descriptor — which is
-     * the state {@code Module.isNamed()} tests ({@code name != null}) and the
-     * state that steers {@code Class.getResourceAsStream} down its "unnamed
-     * module" branch.</p>
-     *
-     * <h2>Why this global must be writable</h2>
-     *
-     * <p>The object is emitted as a plain, writable {@code global} — not as a
-     * {@code constant} — and that distinction is load-bearing. The JDK's own
-     * module bootstrap, running from {@code System.initPhase2()} through
-     * {@code ModuleBootstrap.boot()} into
-     * {@code ModuleLayer.defineModules()}, takes this same object back out of
-     * the class mirror registry as the {@code java.base} module and writes
-     * into its fields:</p>
-     *
-     * <pre>
-     *   Module.defineModules(Configuration, Function&lt;ClassLoader, List&lt;Module&gt;&gt;, ModuleLayer):
-     *       ...
-     *       Module module = Object.class.getModule();   // this global
-     *       modules[i] = module;
-     *       ...
-     *       module.reads = new HashSet&lt;&gt;();           // store into field 6 (offset 0x30)
-     *       ...
-     * </pre>
-     *
-     * <p>When this object is emitted as a {@code constant}, LLVM places it in
-     * {@code .data.rel.ro}, the linker applies RELRO, and the runtime maps the
-     * page {@code r--p}. The store at {@code module.reads} then takes a
-     * hardware write barrier and the process dies with {@code SIGSEGV} and
-     * {@code si_code == 2} ({@code SEGV_ACCERR}) inside
-     * {@code java.lang.Module.defineModules}, before any user code has
-     * produced output:</p>
-     *
-     * <pre>
-     *   RIP: fn_java_lang_Module_defineModules_..._+0xddb
-     *        mov %rax, 0x30(%r14)      ; r14 = &amp;jnative_unnamed_module
-     *   si_code = 2  (SEGV_ACCERR — write to a read-only page)
-     * </pre>
-     *
-     * <p>Emitting it as a writable {@code global} lets those stores succeed.
-     * Every field the JDK's module system writes to — {@code reads},
-     * {@code exports}, {@code opens}, and the identity fields {@code name} /
-     * {@code loader} / {@code descriptor} — is a slot inside this struct. The
-     * struct layout comes from {@link #collectInstanceFields(ClassNode)} and
-     * therefore covers every instance field that {@code java.lang.Module}
-     * declares on the JDK the image is built against, including any that a
-     * future JDK release adds.</p>
-     *
-     * <h2>Shared identity with the JDK's {@code java.base} module</h2>
-     *
-     * <p>All classes in the image initially share this object, because every
-     * {@code @refclass_*} mirror points its {@code module} slot at it. After
-     * the JDK's module bootstrap has run, that same object has become the
-     * {@code java.base} module, and every class that has not been assigned a
-     * module of its own still reports it as its module. That sharing is a
-     * deliberate simplification of this runtime's module model: the image has
-     * no user-defined module layer, no module path, and no resolver that could
-     * partition its classes into distinct named modules. The object must be
-     * writable precisely because the JDK's own bootstrap performs those writes
-     * unconditionally on every JDK release this runtime targets, and those
-     * writes are the difference between a well-formed {@code java.base} module
-     * and an NPE on {@code Module.isNamed()} three frames later.</p>
-     *
-     * <p>A future revision that wants fully separate unnamed / {@code java.base}
-     * module identities would have to emit a per-class module pointer rather
-     * than a single shared one, and teach {@code Object.class.getModule()} to
-     * return the {@code java.base} module while every other class returns the
-     * unnamed one. The current single-object model is the smallest change that
-     * keeps the JDK's own bootstrap working without giving up the rest of the
-     * runtime's module-free design.</p>
+     * MUST be writable (`global`, not `constant`): the JDK's own module
+     * bootstrap (ModuleBootstrap.boot -> ModuleLayer.defineModules) later
+     * writes reads/exports/opens and the identity fields on this same
+     * object. Emitting `constant` places it in .data.rel.ro, RELRO maps the
+     * page read-only, and the first store SIGSEGVs with SEGV_ACCERR inside
+     * java.lang.Module.defineModules. Sharing identity between every class
+     * is a deliberate simplification of this runtime's module model.
      */
     private String generateUnnamedModule() {
         ClassNode moduleNode = resolver.getClassNode("java/lang/Module");
@@ -2353,138 +2237,30 @@ public class LlvmGlobalEmitter {
     }
 
     /**
-     * Emits every Java string literal that appears anywhere in the module.
+     * Emits every Java string literal as two globals:
+     *   @strbytes_<hex> — the backing byte[] (canonical array header:
+     *                     klass@0, length@8, elem_size@12, payload@16).
+     *   @jstr_<hex>     — the String object (value -> @strbytes, coder
+     *                     selects interpretation).
      *
-     * <p>Each literal becomes two globals:</p>
+     * Encoding follows the compact-string contract:
+     *   coder == 0: LATIN1, one byte per char (all chars <= U+00FF).
+     *   coder == 1: UTF-16BE, two bytes per char (otherwise).
+     * The length word is the byte count; String.length() recovers the char
+     * count via `value.length >> coder`.
      *
-     * <ul>
-     *   <li>{@code @strbytes_<hex>} — the {@code byte[]} that backs the
-     *       {@link String}. This is a real Java array and therefore carries
-     *       the canonical runtime array header, byte for byte:</li>
-     * </ul>
+     * The previous revision encoded everything as UTF-8 with coder=0, so
+     * every non-ASCII literal reported the UTF-8 byte count as its character
+     * length. "\uFFFD" (3 UTF-8 bytes) triggered
+     * IllegalArgumentException: Replacement too long in
+     * JceSecurity.<clinit>.
      *
-     * <pre>
-     *     offset  0 : %ReflectionClass*  klass      (mirror of "[B")
-     *     offset  8 : i32                length     (Java-visible byte count)
-     *     offset 12 : i32                elem_size  (always 1 for byte[])
-     *     offset 16 : [len+1 x i8]       payload    (bytes + NUL terminator)
-     * </pre>
-     *
-     * <ul>
-     *   <li>{@code @jstr_<hex>} — the {@link String} object itself, whose
-     *       {@code value} field points at the matching {@code @strbytes_*}
-     *       global, and whose {@code coder} field selects the interpretation
-     *       of that array.</li>
-     * </ul>
-     *
-     * <h2>Compact-string encoding of the payload</h2>
-     *
-     * <p>A {@link String} does not store characters directly. Its
-     * {@code value} field is a {@code byte[]}, and the {@code coder} field
-     * selects how those bytes are to be interpreted:</p>
-     *
-     * <ul>
-     *   <li>{@code coder == 0} — <b>LATIN1</b>. One byte per character;
-     *       the byte value is the character's low 8 bits. Valid only when
-     *       every character of the string is in {@code U+0000..U+00FF}.</li>
-     *
-     *   <li>{@code coder == 1} — <b>UTF-16</b>. Two bytes per character,
-     *       high byte first (big-endian), one pair per {@code char} code
-     *       unit. Surrogate pairs are therefore two consecutive code units
-     *       in the array, exactly as they appear in the Java {@code String}.</li>
-     * </ul>
-     *
-     * <p>This is the same representation that {@code java.lang.String} uses
-     * internally when {@code String.COMPACT_STRINGS} is {@code true} — the
-     * flag that {@code String.<clinit>} installs, and that
-     * {@code String.coder()} reads before returning either the byte at
-     * offset 16 of the object or the UTF-16 sentinel {@code 1}. The
-     * {@code @jstr_*} globals emitted below must therefore carry the same
-     * {@code coder} value the corresponding {@code @strbytes_*} payload was
-     * encoded with; the emitter cannot choose one and the runtime the
-     * other.</p>
-     *
-     * <p>The {@code length} word at offset 8 of {@code @strbytes_*} is the
-     * <b>byte</b> count of the payload, not the character count. That is
-     * what {@code String.length()} and every other length-sensitive method
-     * of {@code String} ultimately reads, via
-     *
-     * <pre>
-     *     length() == value.length &gt;&gt; coder
-     * </pre>
-     *
-     * For the LATIN1 branch the stored word equals the character count; for
-     * the UTF-16 branch it equals twice the character count, and the
-     * right-shift recovers the character count exactly.</p>
-     *
-     * <h2>Why the previous UTF-8 encoding was wrong</h2>
-     *
-     * <p>The earlier revision of this method encoded every literal as UTF-8
-     * bytes and hard-coded {@code coder == 0} in {@code @jstr_*}. That made
-     * the two halves of the runtime's {@code String} contract disagree
-     * whenever a literal contained a character above {@code U+007F}:</p>
-     *
-     * <ul>
-     *   <li>UTF-8 is not Latin-1, so a character such as {@code "\uFFFD"}
-     *       occupies three bytes in the array while {@code coder} still
-     *       claims one byte per character;</li>
-     *   <li>the {@code length} word therefore reports the UTF-8 byte count
-     *       (3 for {@code "\uFFFD"}), and {@code String.length()} returns
-     *       {@code 3 >> 0 == 3} instead of {@code 1};</li>
-     *   <li>every consumer of {@code length()}, {@code charAt()},
-     *       {@code substring()}, {@code indexOf()}, {@code hashCode()} and
-     *       the {@code makeConcatWithConstants} machinery is then wrong by
-     *       the ratio between the UTF-8 length and the character count.</li>
-     * </ul>
-     *
-     * <p>The concrete failure that motivated the change was a {@code
-     * java.lang.IllegalArgumentException: Replacement too long} raised from
-     * {@code CharsetDecoder.replaceWith} while
-     * {@code javax.crypto.JceSecurity.<clinit>} was initialising: the
-     * literal {@code "\uFFFD"} passed to the three-argument
-     * {@code CharsetDecoder} constructor reported a length of {@code 3}
-     * against a {@code maxCharsPerByte} of {@code 1.0}, and the
-     * {@code len > maxCharsPerByte} check rejected it.</p>
-     *
-     * <p>Encoding the payload as one of the two compact-string forms
-     * restores the invariant {@code length() == value.length >> coder} for
-     * every literal, including the ones that contain characters above
-     * {@code U+007F}, and leaves ASCII-only literals byte-identical to
-     * what the previous revision emitted.</p>
-     *
-     * <h2>Why the backing array is emitted as an anonymous struct</h2>
-     *
-     * <p>The canonical layout is fixed by {@code JAVA_ARR_KLASS_OFFSET},
-     * {@code JAVA_ARR_LENGTH_OFFSET}, {@code JAVA_ARR_ELEM_SIZE_OFFSET} and
-     * {@code JAVA_ARR_HDR} in {@code jnative_runtime.h}, and every other
-     * array-producing site in this codebase writes those exact offsets:</p>
-     *
-     * <p>The earlier revision of this method emitted the backing array as
-     * {@code [N x i8] c"..."} with the header laid out at
-     * {@code length@0 / elem_size@4 / payload@8}. That is a silent,
-     * deterministic eight-byte-short layout: any load of {@code length}
-     * through {@code +8} read the first four bytes of the payload instead,
-     * and any load of the payload through {@code +16} read eight bytes into
-     * the string. On the literal {@code "sun.nio.MaxDirectMemorySize"} the
-     * "length" that {@code String.hashCode()} observed was
-     * {@code 0x2e6e7573} (the ASCII bytes of {@code "sun."}), so the
-     * vectorised latin1 hash loop ran for roughly 7.79e8 iterations from a
-     * bogus starting index and faulted on an address ~15 MB past the end of
-     * the 36-byte constant in {@code .rodata}.</p>
-     *
-     * <p>An anonymous struct is used rather than a hand-escaped byte string
-     * because the {@code klass} word is a pointer to {@code @refclass__B}.
-     * The address of that global is a link-time relocation, not a
-     * compile-time byte sequence, so it cannot be spliced into a
-     * {@code [N x i8]} initializer. Expressing the header as a struct lets
-     * LLVM emit the relocation itself, in the right slot, with the right
-     * alignment, and guarantees that the offsets the runtime reads are the
-     * offsets the emitter wrote. Any future change to the array layout in
-     * {@code jnative_runtime.h} must be mirrored here, in
-     * {@link LlvmFunctionEmitter}, and in
-     * {@link LlvmGlobalEmitter#generateReflectionData} — the comment at the
-     * top of {@code JAVA_ARR_*} in {@code jnative_runtime.h} is the single
-     * source of truth for all three.</p>
+     * The backing array is an anonymous struct because the klass word is a
+     * link-time relocation to @refclass__B, not a compile-time byte
+     * sequence. The prior hand-laid [N x i8] layout put the header at
+     * length@0 / elem_size@4 / payload@8, so length reads landed 8 bytes
+     * short of the payload's true start and String.hashCode() ran off the
+     * end of .rodata.
      */
     private String generateStringLiterals() {
         StringBuilder sb = new StringBuilder();
@@ -3640,62 +3416,19 @@ public class LlvmGlobalEmitter {
                 accessFlags = (classNode != null) ? classNode.getAccess() : 0;
             }
 
-            // =================================================================
-            //  MUTABLE GLOBAL — NOT `constant`.
+            // MUTABLE GLOBAL — NOT `constant`.
             //
-            // java.lang.Class is a live Java object whose own bytecode stores
-            // into a number of lazily-computed cache fields on the first read
-            // of each. Those fields are slots inside %ReflectionClass, which
-            // means the struct itself must live in writable memory. Emitting
-            // it as `constant` places the object in .rodata; the first such
-            // cache store then takes a hardware write barrier and the process
-            // dies with a SIGSEGV against a read-only page.
+            // java.lang.Class is a live Java object whose own bytecode stores into
+            // lazy cache fields on first read: name (8), componentType (88),
+            // packageName (96), enumConstants (104), annotationData (112),
+            // reflectionData (128), classValueMap (136), enumConstantDirectory (144).
+            // `constant` places the mirror in .rodata; the first store takes a
+            // SIGSEGV (observed in Class.getPackageName during the VarHandle
+            // bootstrap of ConcurrentSkipListMap).
             //
-            // The failure that motivated this change:
-            //
-            //     java.lang.invoke.MethodHandles.Lookup.findVarHandle
-            //         -> resolveOrFail
-            //             -> checkSymbolicClass
-            //                 -> VerifyAccess.isClassAccessible
-            //                     -> Class.getPackageName()
-            //                         -> this.packageName = <computed>;
-            //
-            // Class.getPackageName() writes to the field at offset 96
-            // ("packageName" in JAVA_LANG_CLASS_FIELD_OFFSETS) on the very
-            // first call. When the mirror was emitted as `constant`, that
-            // store faulted with SIGSEGV at the address of the mirror's
-            // packageName slot inside .rodata. The crash surfaced while
-            // ConcurrentSkipListMap.<clinit> was resolving its VarHandle
-            // fields at the tail of the InetAddress.<clinit> chain.
-            //
-            // Every field below at offsets 8, 88, 96, 104, 112, 128, 136 and
-            // 144 is a write target of some java.lang.Class method:
-            //
-            //     offset  8   name                  -> Class.getName()
-            //     offset 88   componentType         -> Class.getComponentType()
-            //     offset 96   packageName           -> Class.getPackageName()
-            //     offset104   enumConstants         -> Class.getEnumConstantsShared()
-            //     offset144   enumConstantDirectory -> Class.enumConstantDirectory()
-            //     offset112   annotationData        -> Class.annotationData()
-            //     offset128   reflectionData        -> Class.ReflectionData path
-            //     offset136   classValueMap         -> ClassValue
-            //
-            // The struct is a compiled-in descriptor. Java code cannot reach
-            // the vtable, cname, methods, fields, or constructors slots
-            // because they lie outside the range of any declared Java field
-            // of java.lang.Class — those slots are only addressed by the C
-            // runtime, which reads them. Making the whole object writable
-            // therefore does not expose anything the JDK does not already
-            // write to through the fields above.
-            //
-            // Compare with the sibling emissions: @refmethod_*, @reffield_*,
-            // @refctor_*, @refifaces_*, @vtable_*, @ifacemap_* and
-            // @__type_info_* are metadata that no Java method writes to, and
-            // they remain `constant`. The two `i8* null` name caches above
-            // this struct — @strbytes_* and @jstr_* — are also read-only by
-            // construction (a String's contents never change after
-            // construction), so they too remain `constant`.
-            // =================================================================
+            // Every other @ref* / @vtable_ / @ifacemap_ / @__type_info_* is
+            // read-only metadata and stays `constant`. @strbytes_* / @jstr_* are
+            // also immutable (String contents never change after construction).
             sb.append(classVarName).append(" = global %ReflectionClass { %JNativeVTable* ")
                 .append(classVtableRef)
                 // name — always null. The bytecode of Class.getName() reads
