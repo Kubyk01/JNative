@@ -35,6 +35,9 @@ public class LivenessAnalyzer {
     // so a concurrent map is safe and saves repeated lookups.
     private final Map<Value, Set<AllocationSite>> pointsToCache = new ConcurrentHashMap<>();
 
+    private final Map<Function, Map<Value, List<ValueLastUse>>> valueLastUsesCache =
+        new ConcurrentHashMap<>();
+
     private Map<BasicBlock, Set<AllocationSite>> liveInGlobal;
     private Map<BasicBlock, Set<AllocationSite>> liveOutGlobal;
 
@@ -151,6 +154,10 @@ public class LivenessAnalyzer {
             : Collections.emptySet();
     }
 
+    public Map<BasicBlock, Set<AllocationSite>> getLiveOutMap() {
+        return liveOutGlobal;
+    }
+
     /**
      * A single syntactic occurrence of a value as an operand: the block it
      * appears in, the index of the instruction that consumes it (equal to
@@ -160,51 +167,21 @@ public class LivenessAnalyzer {
     public record ValueLastUse(BasicBlock block, int instructionIndex, Value value) {}
 
     /**
-     * Value-level liveness support: for every value that appears as an
-     * operand anywhere in {@code func}, the list of its occurrences. The
-     * last element of each list is the value's last syntactic use.
-     *
-     * <h2>Why PHI operands are excluded</h2>
-     *
-     * <p>A PHI instruction's operand list is not a list of uses in the
-     * PHI's own block: each operand is semantically evaluated on the
-     * incoming edge from the corresponding predecessor. Recording a PHI
-     * operand as a use in the PHI's block therefore claims the operand is
-     * live at a point where it may not be available: if the value is
-     * defined in one predecessor and the PHI block has other
-     * predecessors, the value's definition does not dominate the PHI
-     * block, and any instruction placed there that names the operand
-     * directly produces IR that clang rejects with</p>
-     *
-     * <pre>
-     *   Instruction does not dominate all uses!
-     *     %v = bitcast ... (in predecessor A)
-     *     call void @__destruct_X(ptr %v)   (in PHI block B, not dominated by A)
-     * </pre>
-     *
-     * <p>The PI value that actually carries the object through the join is
-     * the PHI's own result, which is recorded as a separate value with its
-     * own uses (in the PHI block's body). Omitting the operands here
-     * therefore loses nothing: a value used only as a PHI operand has no
-     * candidate death site, and the PHI result becomes the natural
-     * candidate instead, defined in a block that dominates every one of
-     * its own uses.</p>
-     *
-     * <p>The block-level liveness analysis is unaffected: it uses
-     * {@link #getAllocationSitesUsed(Instruction, Set)} directly, not this
-     * method, and continues to treat every operand of every instruction —
-     * PHI operands included — as a use for the purpose of the dataflow
-     * equations.</p>
+     * Value → all its uses. The last element is the last use. Cached per
+     * function; PHI operands are excluded.
      */
     public Map<Value, List<ValueLastUse>> computeValueLastUses(Function func) {
+        return valueLastUsesCache.computeIfAbsent(func, this::doComputeValueLastUses);
+    }
+
+    private Map<Value, List<ValueLastUse>> doComputeValueLastUses(Function func) {
         Map<Value, List<ValueLastUse>> lastUses = new HashMap<>();
         for (BasicBlock block : func.getBlocks()) {
             List<Instruction> insts = block.getInstructions();
             for (int i = 0; i < insts.size(); i++) {
                 Instruction inst = insts.get(i);
-                // PHI operands are values flowing in from the
-                // predecessor on an edge, not values used in this block.
-                // See the method javadoc for the full reasoning.
+                // PHI operands are values flowing in on an edge, not
+                // values used in this block.
                 if (inst.getOpcode() == Opcode.PHI) {
                     continue;
                 }

@@ -21,6 +21,9 @@ public class LlvmRuntime {
     private static final ConcurrentHashMap<String, String> STRING_ID_CACHE =
         new ConcurrentHashMap<>();
 
+    private static final ConcurrentHashMap<String, Integer> BYTE_LEN_CACHE =
+        new ConcurrentHashMap<>();
+
     /**
      * Replaces every character outside {@code [a-zA-Z0-9_]} with {@code '_'}.
      *
@@ -221,7 +224,8 @@ public class LlvmRuntime {
      * as {@code [N x i8]} globals.
      */
     public static int typeStringArrayLength(String s) {
-        return s.getBytes(StandardCharsets.UTF_8).length + 1;
+        return BYTE_LEN_CACHE.computeIfAbsent(
+            s, k -> k.getBytes(StandardCharsets.UTF_8).length) + 1;
     }
 
     /**

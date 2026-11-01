@@ -27,9 +27,12 @@ import io.github.kubyk01.domain.ir.Value;
 import io.github.kubyk01.domain.ir.TargetPlatform;
 import io.github.kubyk01.domain.analyzer.reflection.ReflectClassInfo;
 import io.github.kubyk01.domain.analyzer.reflection.ReflectInfo;
+import io.github.kubyk01.util.LlvmUtil;
 import lombok.extern.slf4j.Slf4j;
 import org.objectweb.asm.Handle;
 import org.objectweb.asm.Opcodes;
+import reactor.core.scheduler.Scheduler;
+import reactor.core.scheduler.Schedulers;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -74,6 +77,11 @@ public class LlvmGenerator {
 
     private List<ClinitScheduleEntry> clinitSchedule = new ArrayList<>();
     private Map<String, String> clinitWrappers = new HashMap<>();
+    private Scheduler scheduler = Schedulers.single();
+
+    public void setScheduler(Scheduler scheduler) {
+        if (scheduler != null) this.scheduler = scheduler;
+    }
 
     /**
      * LLVM target platform: the {@code target datalayout} and
@@ -184,19 +192,30 @@ public class LlvmGenerator {
         toEmit.sort(Comparator.comparing(f ->
             f.getOwnerClass() == null ? "" : f.getOwnerClass()));
 
-        LlvmFunctionEmitter emitter = new LlvmFunctionEmitter(
-            module, globalEmitter, polymorphicResolverRef, resolver);
+        List<String> bodies = LlvmUtil.parallelMapOrdered(toEmit, scheduler, func -> {
+            LlvmFunctionEmitter emitter = new LlvmFunctionEmitter(
+                module, globalEmitter, polymorphicResolverRef, resolver);
+            return emitter.emitFunction(func);
+        });
 
         Map<String, StringBuilder> classBodies = new LinkedHashMap<>();
         StringBuilder moduleBodies = new StringBuilder();
-
-        for (Function func : toEmit) {
-            String body = emitter.emitFunction(func);
+        for (int i = 0; i < toEmit.size(); i++) {
+            Function func = toEmit.get(i);
+            String body = bodies.get(i);
             String owner = func.getOwnerClass();
             if (owner != null && !owner.isEmpty()) {
                 classBodies.computeIfAbsent(owner, k -> new StringBuilder()).append(body);
             } else {
                 moduleBodies.append(body);
+            }
+        }
+
+        Map<String, Set<String>> functionsByOwner = new HashMap<>();
+        for (Function f : toEmit) {
+            String owner = f.getOwnerClass();
+            if (owner != null && !owner.isEmpty()) {
+                functionsByOwner.computeIfAbsent(owner, k -> new HashSet<>()).add(f.getName());
             }
         }
 
@@ -271,12 +290,7 @@ public class LlvmGenerator {
             String className = e.getKey();
             String body = e.getValue().toString();
 
-            Set<String> definedHere = new HashSet<>();
-            for (Function f : toEmit) {
-                if (className.equals(f.getOwnerClass())) {
-                    definedHere.add(f.getName());
-                }
-            }
+            Set<String> definedHere = functionsByOwner.getOrDefault(className, Set.of());
 
             String externs = buildExterns(body, definedHere, knownGlobals, module);
 

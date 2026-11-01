@@ -417,6 +417,7 @@ public class Orchestrator implements OrchestratorPort {
         LlvmGenerator llvmGen = new LlvmGenerator(module, resolver, aliasResult,
                 entryClass, entryMethod, entryDescriptor, analysis.getReflectInfo(),
                 polymorphicResolver);
+        llvmGen.setScheduler(scheduler);
         llvmGen.setClinitSchedule(analysisResult.clinitSchedule());
         llvmGen.setClinitWrappers(analysisResult.clinitWrappers());
         llvmGen.setEmbeddedResources(embedded);
@@ -593,7 +594,7 @@ public class Orchestrator implements OrchestratorPort {
     /**
      * Forces the java.nio methods used by the C implementation of
      * jdk.internal.perf.Perf.create* into the reachable set.
-     *
+     * <p>
      * Perf.create* is native; its C body cannot construct the ByteBuffer
      * directly (field layout is JDK-version dependent and HeapByteBuffer is
      * package-private), so Perf.c dlsyms ByteBuffer.allocate. For that to
@@ -603,7 +604,7 @@ public class Orchestrator implements OrchestratorPort {
      *     ByteBuffer.asLongBuffer() call from PerfCounter.<init>.
      *   - HeapByteBuffer.putLong(int, long) — non-zero initial counter value.
      *   - ByteBuffer.put(byte[]) — Perf.createByteArray.
-     *
+     * <p>
      * Without this, Perf.create* returned NULL, PerfCounter.<clinit> NPE'd on
      * bb.order(...) / bb.asLongBuffer(), and the failure cascaded through
      * ClassLoader.findClass, ZipFile.open and ModuleBootstrap.boot.

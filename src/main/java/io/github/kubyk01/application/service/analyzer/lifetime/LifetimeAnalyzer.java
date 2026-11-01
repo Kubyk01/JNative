@@ -63,33 +63,8 @@ public class LifetimeAnalyzer {
         livenessAnalyzer.computeLiveSets(allSites);
 
         // -------- 3b. Publish live-out per block -------------------------
-        //
-        // Snapshot liveOut per block for DestructorInserter's field-overwrite gate.
-        //
-        // Gate semantics: emit a release iff no site that could currently be in
-        // the overwritten field is live on block exit, and none is read by a later
-        // instruction in the same block.
-        //
-        // The gate is load-bearing in both directions:
-        //   - emitting without liveness (HashMap.resize: `table = newTab` while
-        //     `oldTab` is still live in the loop) frees an object the loop is
-        //     about to read -> use-after-free;
-        //   - never emitting leaks every intermediate value in an overwritten
-        //     field (TestHeap's `h.payload = new Payload(...)` loop).
-        //
-        // Entries are present for every block of every live function; an empty
-        // set is a legitimate terminal-block state. An absent entry means "no
-        // information" and the pass must skip the block (conservative direction).
-        // The copy is shallow — the sets are read-only after computeLiveSets().
-        // ------------------------------------------------------------------
-        Map<BasicBlock, Set<AllocationSite>> liveOutSnapshot = new HashMap<>();
-        for (Function f : module.getFunctions()) {
-            if (f.getEntryBlock() == null) continue;
-            for (BasicBlock b : f.getBlocks()) {
-                liveOutSnapshot.put(b, livenessAnalyzer.getLiveOut(b));
-            }
-        }
-        result.setLiveOut(liveOutSnapshot);
+        Map<BasicBlock, Set<AllocationSite>> liveOutMap = livenessAnalyzer.getLiveOutMap();
+        result.setLiveOut(liveOutMap != null ? liveOutMap : Map.of());
 
         // -------- 4. Dominator trees + natural loops, in parallel --------
         List<Function> live = new ArrayList<>();
