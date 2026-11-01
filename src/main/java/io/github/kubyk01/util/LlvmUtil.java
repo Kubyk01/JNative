@@ -340,15 +340,7 @@ public class LlvmUtil {
             dot.startsWith("javax.") ||
             dot.startsWith("sun.") ||
             dot.startsWith("com.sun.") ||
-            dot.startsWith("jdk.") ||
-            dot.startsWith("org.objectweb.asm.") ||
-            dot.startsWith("picocli.") ||
-            dot.startsWith("reactor.") ||
-            dot.startsWith("org.slf4j.") ||
-            dot.startsWith("org.reactivestreams.") ||
-            dot.startsWith("io.micrometer.") ||
-            dot.startsWith("org.junit.") ||
-            dot.startsWith("com.fasterxml.");
+            dot.startsWith("jdk.");
     }
 
     private static final ConcurrentHashMap<String, String> CANONICAL_CALLEE_KEY_CACHE =
