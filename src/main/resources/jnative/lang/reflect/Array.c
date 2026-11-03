@@ -259,3 +259,155 @@ int32_t __jnative_fn_java_lang_reflect_Array_getLength__Ljava_lang_Object__I(
 
     return jnative_array_length(array);
 }
+
+extern void* fn_java_lang_Boolean_valueOf__Z_Ljava_lang_Boolean_(_Bool)        __attribute__((weak));
+extern void* fn_java_lang_Byte_valueOf__B_Ljava_lang_Byte_(int8_t)             __attribute__((weak));
+extern void* fn_java_lang_Short_valueOf__S_Ljava_lang_Short_(int16_t)          __attribute__((weak));
+extern void* fn_java_lang_Character_valueOf__C_Ljava_lang_Character_(uint16_t) __attribute__((weak));
+extern void* fn_java_lang_Integer_valueOf__I_Ljava_lang_Integer_(int32_t)      __attribute__((weak));
+extern void* fn_java_lang_Long_valueOf__J_Ljava_lang_Long_(int64_t)            __attribute__((weak));
+extern void* fn_java_lang_Float_valueOf__F_Ljava_lang_Float_(float)            __attribute__((weak));
+extern void* fn_java_lang_Double_valueOf__D_Ljava_lang_Double_(double)         __attribute__((weak));
+
+static void* box_primitive(char type_char, const void* elem) {
+    switch (type_char) {
+        case 'Z':
+            return fn_java_lang_Boolean_valueOf__Z_Ljava_lang_Boolean_
+                   ? fn_java_lang_Boolean_valueOf__Z_Ljava_lang_Boolean_(*(const _Bool*)elem)
+                   : NULL;
+        case 'B':
+            return fn_java_lang_Byte_valueOf__B_Ljava_lang_Byte_
+                   ? fn_java_lang_Byte_valueOf__B_Ljava_lang_Byte_(*(const int8_t*)elem)
+                   : NULL;
+        case 'S':
+            return fn_java_lang_Short_valueOf__S_Ljava_lang_Short_
+                   ? fn_java_lang_Short_valueOf__S_Ljava_lang_Short_(*(const int16_t*)elem)
+                   : NULL;
+        case 'C':
+            return fn_java_lang_Character_valueOf__C_Ljava_lang_Character_
+                   ? fn_java_lang_Character_valueOf__C_Ljava_lang_Character_(*(const uint16_t*)elem)
+                   : NULL;
+        case 'I':
+            return fn_java_lang_Integer_valueOf__I_Ljava_lang_Integer_
+                   ? fn_java_lang_Integer_valueOf__I_Ljava_lang_Integer_(*(const int32_t*)elem)
+                   : NULL;
+        case 'J':
+            return fn_java_lang_Long_valueOf__J_Ljava_lang_Long_
+                   ? fn_java_lang_Long_valueOf__J_Ljava_lang_Long_(*(const int64_t*)elem)
+                   : NULL;
+        case 'F':
+            return fn_java_lang_Float_valueOf__F_Ljava_lang_Float_
+                   ? fn_java_lang_Float_valueOf__F_Ljava_lang_Float_(*(const float*)elem)
+                   : NULL;
+        case 'D':
+            return fn_java_lang_Double_valueOf__D_Ljava_lang_Double_
+                   ? fn_java_lang_Double_valueOf__D_Ljava_lang_Double_(*(const double*)elem)
+                   : NULL;
+        default:
+            return NULL;
+    }
+}
+
+void* __jnative_fn_java_lang_reflect_Array_get__Ljava_lang_Object_I_Ljava_lang_Object_(
+        void* array, int32_t index) {
+
+    if (array == NULL) {
+        __jnative_throw_null_pointer_exception();
+        return NULL;
+    }
+
+    int32_t length = jnative_array_length(array);
+    if (index < 0 || index >= length) {
+        __jnative_throw_array_index_out_of_bounds();
+        return NULL;
+    }
+
+    struct ReflectionClass* arr_cls =
+        *(struct ReflectionClass**)((char*)array + JAVA_ARR_KLASS_OFFSET);
+    const char* desc = (arr_cls != NULL) ? arr_cls->cname : NULL;
+    if (desc == NULL || desc[0] != '[') {
+        __jnative_throw_exception(NULL);
+        return NULL;
+    }
+
+    int32_t elem_size = *(int32_t*)((char*)array + JAVA_ARR_ELEM_SIZE_OFFSET);
+    char* elem = (char*)jnative_array_data(array) + ((size_t)index * elem_size);
+
+    char type_char = desc[1];
+
+    if (type_char == 'L' || type_char == '[') {
+        return *(void**)elem;
+    }
+
+    if (type_char == 'Z' || type_char == 'B' || type_char == 'S'
+        || type_char == 'C' || type_char == 'I' || type_char == 'J'
+        || type_char == 'F' || type_char == 'D') {
+        void* boxed = box_primitive(type_char, elem);
+        if (boxed == NULL) {
+            __jnative_throw_exception(NULL);
+        }
+        return boxed;
+    }
+
+    __jnative_throw_exception(NULL);
+    return NULL;
+}
+
+#define BOXED_PRIMITIVE_FIELD_OFFSET 8
+
+static int unbox_into(char type_char, void* boxed, char* dest) {
+    if (boxed == NULL) {
+        return 0;
+    }
+    const char* src = (const char*)boxed + BOXED_PRIMITIVE_FIELD_OFFSET;
+    switch (type_char) {
+        case 'Z': *(int8_t*)dest   = *(const int8_t*)src;   return 1;
+        case 'B': *(int8_t*)dest   = *(const int8_t*)src;   return 1;
+        case 'S': *(int16_t*)dest  = *(const int16_t*)src;  return 1;
+        case 'C': *(uint16_t*)dest = *(const uint16_t*)src; return 1;
+        case 'I': *(int32_t*)dest  = *(const int32_t*)src;  return 1;
+        case 'J': *(int64_t*)dest  = *(const int64_t*)src;  return 1;
+        case 'F': *(float*)dest    = *(const float*)src;    return 1;
+        case 'D': *(double*)dest   = *(const double*)src;   return 1;
+        default:  return 0;
+    }
+}
+
+void __jnative_fn_java_lang_reflect_Array_set__Ljava_lang_Object_ILjava_lang_Object__V(
+        void* array, int32_t index, void* value) {
+
+    if (array == NULL) {
+        __jnative_throw_null_pointer_exception();
+        return;
+    }
+
+    int32_t length = jnative_array_length(array);
+    if (index < 0 || index >= length) {
+        __jnative_throw_array_index_out_of_bounds();
+        return;
+    }
+
+    struct ReflectionClass* arr_cls =
+        *(struct ReflectionClass**)((char*)array + JAVA_ARR_KLASS_OFFSET);
+    const char* desc = (arr_cls != NULL) ? arr_cls->cname : NULL;
+    if (desc == NULL || desc[0] != '[') {
+        __jnative_throw_exception(NULL);
+        return;
+    }
+
+    int32_t elem_size = *(int32_t*)((char*)array + JAVA_ARR_ELEM_SIZE_OFFSET);
+    char* elem = (char*)jnative_array_data(array) + ((size_t)index * elem_size);
+
+    char type_char = desc[1];
+
+    if (type_char == 'L' || type_char == '[') {
+        *(void**)elem = value;
+        return;
+    }
+
+    if (unbox_into(type_char, value, elem)) {
+        return;
+    }
+
+    __jnative_throw_exception(NULL);
+}
