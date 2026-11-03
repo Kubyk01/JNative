@@ -42,7 +42,7 @@ import static io.github.kubyk01.util.LlvmUtil.extractFieldName;
 /**
  * Emits the global data section of the generated module: struct types,
  * vtables, itables, type-info tables, string literals, reflection data.
- *
+ * <p>
  * Thread-safety: writes happen before parallel emission, reads happen
  * during. Caches populated before the parallel phase are concurrent;
  * prepareLayouts() is double-checked and idempotent; the only write during
@@ -50,7 +50,7 @@ import static io.github.kubyk01.util.LlvmUtil.extractFieldName;
  * whose readers snapshot under the same monitor. getFieldOffset is safe
  * to call concurrently for the same pair (deterministic result, benign
  * duplicate write).
- *
+ * <p>
  * Emitted globals are `constant` except two writable cases:
  *   - @refclass_* mirrors, because Class's own bytecode caches name,
  *     packageName, enumConstants, reflectionData, classValueMap, etc.
@@ -930,11 +930,11 @@ public class LlvmGlobalEmitter {
     /**
      * Emits the shared java.lang.Module object pointed at by every
      * @refclass_*.module slot (offset 80).
-     *
+     * <p>
      * Initially describes the unnamed module of the boot loader
      * (isNamed == false, name == null). Class.getModule() is a plain read of
      * that slot, so emitting null there NPEs on thisModule.isNamed().
-     *
+     * <p>
      * MUST be writable (`global`, not `constant`): the JDK's own module
      * bootstrap (ModuleBootstrap.boot -> ModuleLayer.defineModules) later
      * writes reads/exports/opens and the identity fields on this same
@@ -2242,19 +2242,19 @@ public class LlvmGlobalEmitter {
      *                     klass@0, length@8, elem_size@12, payload@16).
      *   @jstr_<hex>     — the String object (value -> @strbytes, coder
      *                     selects interpretation).
-     *
+     * <p>
      * Encoding follows the compact-string contract:
      *   coder == 0: LATIN1, one byte per char (all chars <= U+00FF).
      *   coder == 1: UTF-16BE, two bytes per char (otherwise).
      * The length word is the byte count; String.length() recovers the char
      * count via `value.length >> coder`.
-     *
+     * <p>
      * The previous revision encoded everything as UTF-8 with coder=0, so
      * every non-ASCII literal reported the UTF-8 byte count as its character
      * length. "\uFFFD" (3 UTF-8 bytes) triggered
      * IllegalArgumentException: Replacement too long in
      * JceSecurity.<clinit>.
-     *
+     * <p>
      * The backing array is an anonymous struct because the klass word is a
      * link-time relocation to @refclass__B, not a compile-time byte
      * sequence. The prior hand-laid [N x i8] layout put the header at
@@ -3353,18 +3353,11 @@ public class LlvmGlobalEmitter {
             String ctorsArray = "@refctors_" + cleanClassName;
             appendNullTerminatedPtrArray(sb, ctorsArray, ctorPtrs);
 
-            // ---- Superclass / interface pointer arrays ----
-            //
-            // An array mirror points at java/lang/Object as its superclass
-            // (see the JLS note above); every other class points at its
-            // declared superclass, except Object itself, whose superclass
-            // slot stays null.
             String superClassPtr = "null";
             if (isArrayPseudoClass) {
                 String objVar = classVarNames.get("java/lang/Object");
                 if (objVar != null) superClassPtr = objVar;
-            } else if (info.getSuperName() != null
-                && !info.getSuperName().equals("java/lang/Object")) {
+            } else if (info.getSuperName() != null) {
                 String superVar = classVarNames.get(info.getSuperName());
                 if (superVar != null) superClassPtr = superVar;
             }
