@@ -313,11 +313,13 @@ public class LlvmFunctionEmitter {
                 tryRegionExit.put(block, false);
                 continue;
             }
-            boolean isEntry = false;
-            for (BasicBlock pred : block.getPredecessors()) {
-                if (!sameRanges(effectiveRangesFor(pred), myRanges)) {
-                    isEntry = true;
-                    break;
+            boolean isEntry = block.getPredecessors().isEmpty();
+            if (!isEntry) {
+                for (BasicBlock pred : block.getPredecessors()) {
+                    if (!sameRanges(effectiveRangesFor(pred), myRanges)) {
+                        isEntry = true;
+                        break;
+                    }
                 }
             }
             boolean isExit = block.getTerminator() instanceof ReturnTerminator;
@@ -387,6 +389,7 @@ public class LlvmFunctionEmitter {
         }
 
         BasicBlock entry = func.getEntryBlock();
+        boolean entryHasBodyLabel = Boolean.TRUE.equals(tryRegionEntry.get(entry));
 
         for (TryCatchRange range : ranges) {
             BasicBlock handler = byLabel.get("L" + range.handler);
@@ -412,13 +415,13 @@ public class LlvmFunctionEmitter {
             for (BasicBlock B : catchReachable) {
                 for (Instruction inst : B.getInstructions()) {
                     for (Value op : inst.getOperands()) {
-                        addIfCrossing(result, op, B, bodySet, entry);
+                        addIfCrossing(result, op, B, bodySet, entry, entryHasBodyLabel);
                     }
                 }
                 Terminator term = B.getTerminator();
                 if (term != null) {
                     for (Value op : terminatorOperands(term)) {
-                        addIfCrossing(result, op, B, bodySet, entry);
+                        addIfCrossing(result, op, B, bodySet, entry, entryHasBodyLabel);
                     }
                 }
             }
@@ -430,14 +433,15 @@ public class LlvmFunctionEmitter {
                                       Value op,
                                       BasicBlock useBlock,
                                       Set<BasicBlock> bodyBlocks,
-                                      BasicBlock entry) {
+                                      BasicBlock entry,
+                                      boolean entryHasBodyLabel) {
         if (!(op instanceof Temporary t)) return;
         Instruction def = t.getDefiningInstruction();
         if (def == null) return;
         BasicBlock defBlock = def.getParent();
         if (defBlock == null) return;
         if (defBlock == useBlock) return;
-        if (defBlock == entry) return;
+        if (defBlock == entry && !entryHasBodyLabel) return;
         if (!bodyBlocks.contains(defBlock)) return;
         result.add(op);
     }

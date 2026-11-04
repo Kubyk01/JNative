@@ -8,6 +8,8 @@
 #include "jnative_runtime.h"
 
 extern struct ReflectionClass* reflect_all_classes[];
+extern struct JNativeLazyClinitEntryC jnative_lazy_clinit_map[];
+extern const int64_t jnative_lazy_clinit_map_size;
 extern int __jnative_instanceof(void* obj, void** type_info);
 
 extern void* __jnative_make_string_obj(const char* bytes, int32_t len);
@@ -854,6 +856,20 @@ void __jnative_fn_java_lang_Class_registerNatives___V(void) {
  * Class.forName0
  * ------------------------------------------------------------------------ */
 
+static void run_lazy_clinit_if_present(struct ReflectionClass* cls) {
+    if (cls == NULL) return;
+    const int64_t size = jnative_lazy_clinit_map_size;
+    if (size <= 0) return;
+    for (int64_t i = 0; i < size; i++) {
+        if (jnative_lazy_clinit_map[i].cls == cls) {
+            void (*wrapper)(void) =
+                (void (*)(void))jnative_lazy_clinit_map[i].wrapper;
+            if (wrapper != NULL) wrapper();
+            return;
+        }
+    }
+}
+
 static void* make_class_not_found_exception(const char* name, int32_t len) {
     char buf[512];
     if (name != NULL && len > 0 && (size_t)len < sizeof(buf)) {
@@ -873,7 +889,6 @@ void* __jnative_fn_java_lang_Class_forName0__Ljava_lang_String_ZLjava_lang_Class
         void* loader,
         void* caller)
 {
-    (void)initialize;
     (void)loader;
     (void)caller;
 
@@ -893,6 +908,10 @@ void* __jnative_fn_java_lang_Class_forName0__Ljava_lang_String_ZLjava_lang_Class
     if (cls == NULL) {
         __jnative_throw_exception(make_class_not_found_exception(name, len));
         return NULL;
+    }
+
+    if (initialize) {
+        run_lazy_clinit_if_present(cls);
     }
     return (void*)cls;
 }

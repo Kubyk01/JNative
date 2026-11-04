@@ -2836,6 +2836,17 @@ public class LlvmGlobalEmitter {
                 if (cls == null || cls.isEmpty()) continue;
                 emitClasses.add(cls);
             }
+            for (ReflectClassInfo info : reflectInfo.getClassInfoMap().values()) {
+                for (MethodReference method : info.getMethods()) {
+                    addReflectionDescriptorTypes(emitClasses, method.getDescriptor());
+                }
+                for (MethodReference ctor : info.getConstructors()) {
+                    addReflectionDescriptorTypes(emitClasses, ctor.getDescriptor());
+                }
+                for (FieldReference field : info.getFields()) {
+                    addReflectionDescriptorTypes(emitClasses, field.getDescriptor());
+                }
+            }
         }
 
         // ------------------------------------------------------------------
@@ -3306,6 +3317,30 @@ public class LlvmGlobalEmitter {
             }
             String fieldsArray = "@reffields_" + cleanClassName;
             appendNullTerminatedPtrArray(sb, fieldsArray, fieldPtrs);
+
+            if (!isPrimitive && !isArrayPseudoClass
+                && classNode != null && !classNode.isExternal()) {
+                Set<String> existingCtorDescs = new HashSet<>();
+                for (MethodReference ctor : info.getConstructors()) {
+                    existingCtorDescs.add(ctor.getDescriptor());
+                }
+                List<MethodReference> moduleCtorAdditions = new ArrayList<>();
+                for (MethodNode mn : classNode.getMethods()) {
+                    if (!mn.getName().equals("<init>")) continue;
+                    String desc = mn.getDescriptor();
+                    if (desc == null || desc.isEmpty()) continue;
+                    if (!existingCtorDescs.add(desc)) continue;
+                    String mangled = LlvmRuntime.mangleMethod(className, "<init>", desc);
+                    Function f = module.getFunction(mangled);
+                    if (f != null && f.getEntryBlock() != null) {
+                        moduleCtorAdditions.add(
+                            new MethodReference(className, "<init>", desc));
+                    }
+                }
+                for (MethodReference ctor : moduleCtorAdditions) {
+                    info.addConstructor(ctor);
+                }
+            }
 
             // ---- Constructors ----
             List<MethodReference> sortedCtors = new ArrayList<>(info.getConstructors());
@@ -3910,6 +3945,56 @@ public class LlvmGlobalEmitter {
             };
         }
         return null;
+    }
+
+    private static void addReflectionDescriptorTypes(Set<String> emitClasses, String descriptor) {
+        if (descriptor == null || descriptor.isEmpty()) return;
+
+        final int n = descriptor.length();
+        for (int i = 0; i < n; i++) {
+            char c = descriptor.charAt(i);
+            if (c == '[') {
+                int end = arrayDescriptorEnd(descriptor, i);
+                if (end <= i) continue;
+                emitClasses.add(descriptor.substring(i, end));
+
+                int j = i;
+                while (j < end && descriptor.charAt(j) == '[') j++;
+                int dims = j - i;
+                for (int k = dims - 1; k >= 1; k--) {
+                    emitClasses.add(descriptor.substring(i + dims - k, end));
+                }
+                if (j < end && descriptor.charAt(j) == 'L') {
+                    String className = descriptor.substring(j + 1, end - 1);
+                    if (!className.isEmpty()) emitClasses.add(className);
+                }
+                i = end - 1;
+            } else if (c == 'L') {
+                int semi = descriptor.indexOf(';', i);
+                if (semi > i) {
+                    String className = descriptor.substring(i + 1, semi);
+                    if (!className.isEmpty()) emitClasses.add(className);
+                    i = semi;
+                }
+            }
+        }
+    }
+
+    private static int arrayDescriptorEnd(String descriptor, int start) {
+        final int n = descriptor.length();
+        int j = start;
+        while (j < n && descriptor.charAt(j) == '[') j++;
+        if (j >= n) return -1;
+        char c = descriptor.charAt(j);
+        if (c == 'L') {
+            int semi = descriptor.indexOf(';', j);
+            return semi < 0 ? -1 : semi + 1;
+        }
+        if (c == 'Z' || c == 'B' || c == 'C' || c == 'S'
+            || c == 'I' || c == 'J' || c == 'F' || c == 'D') {
+            return j + 1;
+        }
+        return -1;
     }
 
     private String ensureStringConstantPtr(StringBuilder defsBuffer, String s) {
