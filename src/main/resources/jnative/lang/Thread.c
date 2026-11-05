@@ -1,7 +1,6 @@
 #define _GNU_SOURCE
 #include "jnative_platform.h"
 #include <time.h>
-#include <sched.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -503,6 +502,60 @@ void __jnative_fn_java_lang_Thread_yield0___V(void) {
 
 void __jnative_fn_java_lang_Thread_sleep0__J_V(long millis) {
     __jnative_fn_java_lang_Thread_sleep__J(millis);
+}
+
+__attribute__((noreturn))
+static void throw_sleep_interrupted(ThreadState* s) {
+    s->interrupted = 0;
+    jn_mutex_unlock(&s->mutex);
+    void* exc = __jnative_construct_exception(
+        "vtable_java_lang_InterruptedException", "sleep interrupted");
+    __jnative_throw_exception(exc);
+}
+
+void __jnative_fn_java_lang_Thread_sleepNanos0__J_V(int64_t nanos) {
+    ThreadState* s = tls_state;
+    if (!s) s = ensure_main_thread();
+    if (!s) {
+        if (nanos <= 0) return;
+        struct timespec req, rem;
+        req.tv_sec = (time_t)(nanos / 1000000000LL);
+        req.tv_nsec = (long)(nanos % 1000000000LL);
+        while (jn_sleep_ns_ns(&req, &rem) == -1 && errno == EINTR) req = rem;
+        return;
+    }
+
+    jn_mutex_lock(&s->mutex);
+    if (s->interrupted) throw_sleep_interrupted(s);
+    if (nanos <= 0) {
+        jn_mutex_unlock(&s->mutex);
+        jn_yield();
+        return;
+    }
+
+    const int64_t max_secs = (int64_t)INT32_MAX * 16;
+    struct timespec deadline;
+    jn_now_realtime(&deadline);
+    int64_t add_secs = nanos / 1000000000LL;
+    if (add_secs > max_secs) add_secs = max_secs;
+    int64_t sec = (int64_t)deadline.tv_sec + add_secs;
+    int64_t nsec = (int64_t)deadline.tv_nsec + nanos % 1000000000LL;
+    if (nsec >= 1000000000LL) { sec++; nsec -= 1000000000LL; }
+    deadline.tv_sec = (time_t)sec;
+    deadline.tv_nsec = (long)nsec;
+
+    for (;;) {
+        int rc = jn_cond_timedwait(&s->cond, &s->mutex, &deadline);
+        if (s->interrupted) throw_sleep_interrupted(s);
+        if (rc == ETIMEDOUT) break;
+        struct timespec now;
+        jn_now_realtime(&now);
+        if (now.tv_sec > deadline.tv_sec
+            || (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec)) {
+            break;
+        }
+    }
+    jn_mutex_unlock(&s->mutex);
 }
 
 /*

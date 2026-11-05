@@ -6,6 +6,7 @@
 #include <time.h>
 #include <stdio.h>
 #include "jnative_runtime.h"
+#include "jnative_portability.h"
 
 /* ==========================================================================
  *  Registry hash maps
@@ -48,7 +49,7 @@ typedef struct {
 
 static PtrToClassMap    class_mirror_map;      /* ReflectionClass* -> itself */
 static PtrToClassMap    vtable_to_class_map;   /* vtable pointer   -> class  */
-static pthread_once_t   registry_maps_once = PTHREAD_ONCE_INIT;
+static jn_once_t   registry_maps_once = JN_ONCE_INIT;
 
 static inline uintptr_t jnative_hash_pointer(const void* p) {
     uintptr_t h = (uintptr_t)p;
@@ -167,7 +168,7 @@ static void build_registry_maps(void) {
 }
 
 static inline void ensure_registry_maps(void) {
-    pthread_once(&registry_maps_once, build_registry_maps);
+    jn_once(&registry_maps_once, build_registry_maps);
 }
 
 /*

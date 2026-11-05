@@ -35,3 +35,9 @@ int32_t __jnative_fn_java_lang_ref_PhantomReference_refersTo0__Ljava_lang_Object
     if (this_ref == NULL) return 0;
     return (*referent_slot(this_ref) == o) ? 1 : 0;
 }
+void __jnative_fn_java_lang_ref_PhantomReference_clear0___V(void* this_ref) {
+    if (this_ref == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    *referent_slot(this_ref) = NULL;
+}

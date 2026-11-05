@@ -106,14 +106,26 @@ extern "C" {
 /* ------------------------------------------------------------------ *
  *  Attribute shims
  * ------------------------------------------------------------------ */
-#if defined(__GNUC__) || defined(__clang__)
-#  define JNATIVE_NORETURN __attribute__((noreturn))
-#  define JNATIVE_WEAK     __attribute__((weak))
-#  define JNATIVE_UNUSED   __attribute__((unused))
-#else
-#  define JNATIVE_NORETURN
-#  define JNATIVE_WEAK
-#  define JNATIVE_UNUSED
+#ifndef JNATIVE_NORETURN
+#  if defined(__GNUC__) || defined(__clang__)
+#    define JNATIVE_NORETURN __attribute__((noreturn))
+#  else
+#    define JNATIVE_NORETURN
+#  endif
+#endif
+#ifndef JNATIVE_WEAK
+#  if defined(__GNUC__) || defined(__clang__)
+#    define JNATIVE_WEAK     __attribute__((weak))
+#  else
+#    define JNATIVE_WEAK
+#  endif
+#endif
+#ifndef JNATIVE_UNUSED
+#  if defined(__GNUC__) || defined(__clang__)
+#    define JNATIVE_UNUSED   __attribute__((unused))
+#  else
+#    define JNATIVE_UNUSED
+#  endif
 #endif
 
 /* ==================================================================

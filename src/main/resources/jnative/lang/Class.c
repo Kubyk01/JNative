@@ -1084,3 +1084,35 @@ void* __jnative_override_Class_getResourceAsStream(void* this_class,
 
     return __jnative_make_byte_array_input_stream(bytes);
 }
+typedef struct {
+    ReflectionClass* cls;
+    int32_t          version;
+} JNativeClassFileVersionEntry;
+
+extern const JNativeClassFileVersionEntry jnative_class_file_versions[] JNATIVE_WEAK;
+extern const int64_t jnative_class_file_versions_size JNATIVE_WEAK;
+
+#define JNATIVE_DEFAULT_CLASS_FILE_VERSION 69
+
+static int32_t jnative_class_file_version_of(const ReflectionClass* cls) {
+    if (cls == NULL || jnative_class_file_versions == NULL
+        || &jnative_class_file_versions_size == NULL) {
+        return -1;
+    }
+    for (int64_t i = 0; i < jnative_class_file_versions_size; i++) {
+        if (jnative_class_file_versions[i].cls == cls) {
+            return jnative_class_file_versions[i].version;
+        }
+    }
+    return -1;
+}
+
+int32_t __jnative_fn_java_lang_Class_getClassFileVersion0___I(void* this_class) {
+    if (this_class == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    int32_t version = jnative_class_file_version_of((const ReflectionClass*)this_class);
+    if (version >= 0) return version;
+    version = jnative_class_file_version_of(jnative_class_by_name("java/lang/Object"));
+    return version >= 0 ? version : JNATIVE_DEFAULT_CLASS_FILE_VERSION;
+}

@@ -663,7 +663,7 @@ static ClinitEntry* clinit_lookup_or_create(const char* name) {
     e->name = strdup(name);
     if (e->name == NULL) { free(e); return NULL; }
     e->state               = CLINIT_STATE_NOT_STARTED;
-    e->initializing_thread = (jn_thread_t)0;
+    e->initializing_thread = jn_thread_none();
     jn_cond_init(&e->done_cond, NULL);
     e->next = clinit_buckets[bucket];
     clinit_buckets[bucket] = e;
@@ -721,7 +721,7 @@ void __jnative_clinit_exit(void* name_str) {
     ClinitEntry* e = clinit_lookup(name);
     if (e != NULL) {
         e->state               = CLINIT_STATE_DONE;
-        e->initializing_thread = (jn_thread_t)0;
+        e->initializing_thread = jn_thread_none();
         jn_cond_broadcast(&e->done_cond);
     }
     jn_mutex_unlock(&clinit_lock);
@@ -743,7 +743,7 @@ static void mark_abandoned_clinits(CatchContext* target) {
         ClinitEntry* e = clinit_lookup(f->name);
         if (e != NULL && e->state == CLINIT_STATE_IN_PROGRESS) {
             e->state               = CLINIT_STATE_FAILED;
-            e->initializing_thread = (jn_thread_t)0;
+            e->initializing_thread = jn_thread_none();
             jn_cond_broadcast(&e->done_cond);
         }
         fprintf(stderr, "jnative: <clinit> of %s abandoned: %s\n",
@@ -2451,12 +2451,12 @@ void __jnative_run_parallel(void** fns, int32_t count) {
         if (chunks[c].end > count) chunks[c].end = count;
         if (jn_thread_create(&threads[c], NULL, jnative_run_parallel_chunk,
                              &chunks[c]) != 0) {
-            threads[c] = 0;
+            threads[c] = jn_thread_none();
             jnative_run_parallel_chunk(&chunks[c]);
         }
     }
     for (int32_t c = 0; c < n_chunks; c++) {
-        if (threads[c] != 0) jn_thread_join(threads[c], NULL);
+        if (jn_thread_is_valid(threads[c])) jn_thread_join(threads[c], NULL);
     }
     free(threads);
     free(chunks);

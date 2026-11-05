@@ -25,6 +25,8 @@ import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 @Slf4j
@@ -256,7 +258,16 @@ public class Compiler implements CompilerPort {
             linkCmd.add("-O" + effectiveOptLevel);
 
             if (msvcLinker) {
-                linkCmd.add("-Wl,--threads=" + effectiveCores);
+                if (!isAvailable("lld-link")) {
+                    throw new IllegalStateException(
+                            "ThinLTO for target '" + target.triple() + "' requires the "
+                                    + "LLVM linker 'lld-link', but it was not found on PATH. "
+                                    + "MSVC link.exe cannot consume LLVM bitcode objects. "
+                                    + "Install LLVM with lld (e.g. `winget install LLVM.LLVM`) "
+                                    + "and make sure its bin directory is on PATH.");
+                }
+                linkCmd.add("-fuse-ld=lld");
+                linkCmd.add("-flto-jobs=" + effectiveCores);
             } else {
                 if (!isAvailable("ld.lld")) {
                     throw new IllegalStateException(
@@ -299,9 +310,14 @@ public class Compiler implements CompilerPort {
 
             appendWindowsSysrootToLinker(linkCmd, mingwSysroot, target);
 
+            List<String> objectLines = new ArrayList<>(tasks.size());
             for (CompileTask task : tasks) {
-                linkCmd.add(task.obj.toString());
+                String objPath = task.obj.toAbsolutePath().toString().replace('\\', '/');
+                objectLines.add("\"" + objPath + "\"");
             }
+            Path objectsRsp = tempDir.resolve("link_objects.rsp");
+            Files.write(objectsRsp, objectLines, StandardCharsets.UTF_8);
+            linkCmd.add("@" + objectsRsp.toAbsolutePath());
             linkCmd.add("-o");
             linkCmd.add(exePath.toString());
 
@@ -598,10 +614,25 @@ public class Compiler implements CompilerPort {
                             + "Reinstall the Windows SDK via Visual Studio Installer.");
         }
         Arrays.sort(sdkVersions, Comparator.comparing(File::getName).reversed());
-        String sdkRoot = sdkVersions[0].getAbsolutePath();
-        if (!new File(sdkRoot, "ucrt\\stdlib.h").exists()) {
+        File sdkVersionDir = sdkVersions[0];
+
+        File sdkRootDir = sdkIncludeRoot.getParentFile();
+        if (sdkRootDir == null
+                || !sdkRootDir.isDirectory()
+                || !new File(sdkRootDir, "Include").isDirectory()
+                || !new File(sdkRootDir, "Lib").isDirectory()) {
             throw new IllegalStateException(
-                    "Windows SDK at " + sdkRoot + " has no ucrt\\stdlib.h.\n"
+                    "Cannot determine the Windows SDK root directory from:\n  "
+                            + sdkIncludeRoot + "\n\n"
+                            + "Expected layout:\n"
+                            + "  <SDK root>\\Include\\<version>\\ucrt\\stdlib.h\n"
+                            + "  <SDK root>\\Lib\\<version>\\ucrt\\x64\\ucrt.lib\n\n"
+                            + "Reinstall the Windows SDK via Visual Studio Installer.");
+        }
+        if (!new File(sdkVersionDir, "ucrt\\stdlib.h").exists()) {
+            throw new IllegalStateException(
+                    "Windows SDK version directory " + sdkVersionDir
+                            + " has no ucrt\\stdlib.h.\n"
                             + "The installation is corrupted or incomplete. "
                             + "Reinstall the Windows 10/11 SDK.");
         }
@@ -609,10 +640,11 @@ public class Compiler implements CompilerPort {
         System.out.println("MSVC toolchain:");
         System.out.println("  VC tools : " + versions[0].getName()
                 + " (" + vcToolsInclude + ")");
-        System.out.println("  Win SDK  : " + sdkVersions[0].getName()
-                + " (" + sdkRoot + ")");
+        System.out.println("  Win SDK  : " + sdkVersionDir.getName()
+                + " (root: " + sdkRootDir.getAbsolutePath() + ")");
 
-        return new MsvcToolchain(versions[0].getAbsolutePath(), sdkRoot);
+        return new MsvcToolchain(versions[0].getAbsolutePath(),
+                sdkRootDir.getAbsolutePath());
     }
 
     private record MsvcToolchain(String vcToolsRoot, String windowsSdkRoot) {}
@@ -1100,7 +1132,9 @@ public class Compiler implements CompilerPort {
         command.add("-g");
         command.add("-fno-omit-frame-pointer");
 
-        if (!task.isIr) {
+        if (task.isIr) {
+            command.add("-Wno-override-module");
+        } else {
             command.add("-I" + includeDir.toString());
             Path portability = includeDir.resolve("jnative_portability");
             if (Files.isDirectory(portability)) {
@@ -1114,10 +1148,10 @@ public class Compiler implements CompilerPort {
 
             if (isMsvc) {
                 if (msvcToolchain != null) {
-                    command.add("-Xmicrosoft-visualc-tools-root="
-                            + msvcToolchain.vcToolsRoot());
-                    command.add("-Xmicrosoft-windows-sdk-root="
-                            + msvcToolchain.windowsSdkRoot());
+                    command.add("-Xmicrosoft-visualc-tools-root");
+                    command.add(msvcToolchain.vcToolsRoot());
+                    command.add("-Xmicrosoft-windows-sdk-root");
+                    command.add(msvcToolchain.windowsSdkRoot());
                 }
                 if (!isMinGwWrapper(compiler)) {
                     command.add("--target=" + target.triple());
@@ -1126,6 +1160,7 @@ public class Compiler implements CompilerPort {
                 command.add("-DWINVER=0x0A00");
                 command.add("-D_WINSOCK_DEPRECATED_NO_WARNINGS=1");
                 command.add("-D_CRT_SECURE_NO_WARNINGS=1");
+                command.add("-D_CRT_NONSTDC_NO_DEPRECATE=1");
                 command.add("-D__USE_MINGW_ANSI_STDIO=1");
             } else {
                 appendWindowsSysrootToCompiler(command, mingwSysroot, task.isIr, target);
@@ -1196,7 +1231,10 @@ public class Compiler implements CompilerPort {
             throws IOException {
         List<Path> extracted = new ArrayList<>();
         Set<String> seenResources = new HashSet<>();
-        for (String cls : usedClasses) {
+        Set<String> seenSymbols = new HashSet<>();
+        Deque<String> pending = new ArrayDeque<>(usedClasses);
+        while (!pending.isEmpty()) {
+            String cls = pending.poll();
             String resourcePath = findNativeResourcePath(cls);
             if (resourcePath == null || !seenResources.add(resourcePath)) continue;
             Path targetPath = tempDir.resolve(
@@ -1210,8 +1248,28 @@ public class Compiler implements CompilerPort {
                 Files.copy(in, targetPath, StandardCopyOption.REPLACE_EXISTING);
                 extracted.add(targetPath);
             }
+            Matcher m = NATIVE_SYMBOL_REFERENCE.matcher(Files.readString(targetPath));
+            while (m.find()) {
+                if (!seenSymbols.add(m.group(1))) continue;
+                String owner = findNativeOwnerOfSymbol(m.group(1));
+                if (owner != null) pending.add(owner);
+            }
         }
         return extracted;
+    }
+
+    private static final Pattern NATIVE_SYMBOL_REFERENCE =
+            Pattern.compile("__jnative_fn_([A-Za-z0-9_]+)");
+
+    private String findNativeOwnerOfSymbol(String mangled) {
+        int sep = mangled.indexOf("__");
+        String head = sep < 0 ? mangled : mangled.substring(0, sep);
+        String[] parts = head.split("_");
+        for (int k = parts.length; k >= 1; k--) {
+            String candidate = String.join("/", Arrays.copyOfRange(parts, 0, k));
+            if (findNativeResourcePath(candidate) != null) return candidate;
+        }
+        return null;
     }
 
     // =====================================================================
@@ -1451,6 +1509,21 @@ public class Compiler implements CompilerPort {
     private static void appendLinkerLibraries(List<String> linkCmd,
                                               TargetPlatform target,
                                               Path defFile) {
+        if (target.isWindows()
+                && target.triple().toLowerCase(Locale.ROOT).contains("-msvc")) {
+            linkCmd.add("-Wl,/subsystem:console");
+            if (defFile != null) {
+                linkCmd.add("-Wl,/def:" + defFile.toAbsolutePath());
+            }
+            linkCmd.add("-Wl,/opt:ref");
+            linkCmd.add("-ldbghelp");
+            linkCmd.add("-lws2_32");
+            linkCmd.add("-liphlpapi");
+            linkCmd.add("-lpsapi");
+            linkCmd.add("-ladvapi32");
+            return;
+        }
+
         if (target.isWindows()) {
             linkCmd.add("-mconsole");
             linkCmd.add("-Wl,--subsystem,console");

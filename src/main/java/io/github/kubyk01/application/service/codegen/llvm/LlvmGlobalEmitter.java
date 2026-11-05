@@ -2,6 +2,7 @@ package io.github.kubyk01.application.service.codegen.llvm;
 
 import io.github.kubyk01.application.service.analyzer.dependencyresolver.DependencyResolver;
 import io.github.kubyk01.application.service.analyzer.ssa.TypeResolver;
+import io.github.kubyk01.application.service.codegen.llvm.nativepolymorphicfunctionresolver.VarHandleTargetResolver;
 import io.github.kubyk01.domain.analyzer.aliasanalysis.AliasAnalysisResult;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.ClassNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.FieldNode;
@@ -210,6 +211,7 @@ public class LlvmGlobalEmitter {
 
     private final Map<String, String> structNames = new ConcurrentHashMap<>();
     private final Map<String, Integer> fieldOffsets = new ConcurrentHashMap<>();
+    private volatile VarHandleTargetResolver varHandleTargets;
     private final Set<String> emittedStringConstants = ConcurrentHashMap.newKeySet();
     private final List<String> stringLiteralPool =
         Collections.synchronizedList(new ArrayList<>());
@@ -1947,6 +1949,13 @@ public class LlvmGlobalEmitter {
             for (BasicBlock block : function.getBlocks()) {
                 for (Instruction inst : block.getInstructions()) {
                     Opcode op = inst.getOpcode();
+                    if (op == Opcode.VIRTUAL_CALL) {
+                        VarHandleTargetResolver.Target vh = getVarHandleTargets().resolveCallSite(inst);
+                        if (vh != null && vh.kind() == VarHandleTargetResolver.Kind.STATIC_FIELD) {
+                            allFields.add(vh.owner() + "." + vh.fieldName());
+                        }
+                        continue;
+                    }
                     if (op != Opcode.GET_STATIC && op != Opcode.PUT_STATIC) continue;
                     String fullName = extractFieldName(inst);
                     if (fullName == null || fullName.isEmpty()
@@ -2629,6 +2638,20 @@ public class LlvmGlobalEmitter {
     // =========================================================================
     //  Field offsets
     // =========================================================================
+
+    public VarHandleTargetResolver getVarHandleTargets() {
+        VarHandleTargetResolver r = varHandleTargets;
+        if (r == null) {
+            synchronized (this) {
+                r = varHandleTargets;
+                if (r == null) {
+                    r = new VarHandleTargetResolver(resolver);
+                    varHandleTargets = r;
+                }
+            }
+        }
+        return r;
+    }
 
     public int getFieldOffset(String className, String fieldName) {
         String key = className + "." + fieldName;
@@ -3510,6 +3533,7 @@ public class LlvmGlobalEmitter {
         sb.append("%ReflectionClass* null]\n");
 
         sb.append(generateSymbolClassMap(strConsts, classVarNames));
+        sb.append(generateClassFileVersionMap(classVarNames));
         sb.append(generateCallerSensitiveSymbols(strConsts));
 
         sb.append(strConsts);
@@ -3801,6 +3825,32 @@ public class LlvmGlobalEmitter {
         sb.append("]\n");
         sb.append("@jnative_symbol_class_map_size = constant i64 ")
             .append(map.size()).append("\n");
+        return sb.toString();
+    }
+
+    private String generateClassFileVersionMap(Map<String, String> classVarNames) {
+        TreeMap<String, Integer> versions = new TreeMap<>();
+        for (ClassNode cn : resolver.getClassMap().values()) {
+            String className = cn.getName();
+            if (className == null || cn.getClassFileVersion() == 0) continue;
+            if (classVarNames.containsKey(className)) {
+                versions.put(className, cn.getClassFileVersion());
+            }
+        }
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("@jnative_class_file_versions = constant [")
+            .append(versions.size() + 1)
+            .append(" x { %ReflectionClass*, i32 }] [\n");
+        for (Map.Entry<String, Integer> e : versions.entrySet()) {
+            sb.append("  { %ReflectionClass*, i32 } { %ReflectionClass* ")
+                .append(classVarNames.get(e.getKey()))
+                .append(", i32 ").append(e.getValue()).append(" },\n");
+        }
+        sb.append("  { %ReflectionClass*, i32 } { %ReflectionClass* null, i32 0 }\n");
+        sb.append("]\n");
+        sb.append("@jnative_class_file_versions_size = constant i64 ")
+            .append(versions.size()).append("\n");
         return sb.toString();
     }
 

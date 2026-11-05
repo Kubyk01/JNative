@@ -613,6 +613,7 @@ public class DependencyResolver {
                                 .superName(superName)
                                 .interfaces(interfaces != null ? Arrays.asList(interfaces) : Collections.emptyList())
                                 .access(access)
+                                .classFileVersion(version)
                                 .isInterface((access & Opcodes.ACC_INTERFACE) != 0)
                                 .isExternal(false);
                     }
@@ -778,6 +779,7 @@ public class DependencyResolver {
                             .superName(superName)
                             .interfaces(interfaces != null ? Arrays.asList(interfaces) : Collections.emptyList())
                             .access(access)
+                            .classFileVersion(version)
                             .isInterface((access & Opcodes.ACC_INTERFACE) != 0)
                             .isExternal(false);
                 }

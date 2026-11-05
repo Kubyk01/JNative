@@ -1,18 +1,7 @@
-/*
- * jnative_platform.c — Windows-only implementations.
- *
- * On POSIX this file is not compiled at all (jnative_platform.h provides
- * everything inline). On MinGW the pthread shims below are compiled out
- * because MinGW's WinPthreads is used directly; only the dlfcn helper
- * and the Win32 time functions are shared with MSVC.
- */
 #ifdef _WIN32
 
 #include "jnative_platform.h"
 
-/* ====================================================================
- * Process-image handle for symbol lookup
- * ==================================================================== */
 void* jn_dlsym_default = NULL;
 
 static void __attribute__((constructor))
@@ -21,17 +10,11 @@ _jn_init_dlsym_default(void) {
     jn_dlsym_default = (void*)h;
 }
 
-/* ====================================================================
- * CPU count
- * ==================================================================== */
 int jn_cpu_count(void) {
     DWORD n = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
     return (n > 0) ? (int)n : 1;
 }
 
-/* ====================================================================
- * Time
- * ==================================================================== */
 int jn_now_realtime_win(struct timespec* ts) {
     FILETIME ft;
     GetSystemTimePreciseAsFileTime(&ft);
@@ -74,12 +57,6 @@ int jn_sleep_ns_ns_win(const struct timespec* req, struct timespec* rem) {
     return 0;
 }
 
-/* ====================================================================
- * MSVC-only pthread shim
- *
- * MinGW has WinPthreads — do not compile these on MinGW (the header
- * already maps pthread_* to the real functions there).
- * ==================================================================== */
 #if !defined(__MINGW32__) && !defined(__MINGW64__)
 
 static BOOL CALLBACK _jn_init_cs_cb(PINIT_ONCE once, PVOID param, PVOID* ctx) {
@@ -146,12 +123,15 @@ static unsigned __stdcall _jn_thread_trampoline(void* p) {
 
 int jn_pthread_create_win(pthread_t* t, const pthread_attr_t* attr,
                           void* (*fn)(void*), void* arg) {
-    (void)attr;
     _jn_thread_start_t* s = (_jn_thread_start_t*)malloc(sizeof(*s));
     if (s == NULL) return ENOMEM;
     s->fn = fn;
     s->arg = arg;
-    uintptr_t h = _beginthreadex(NULL, JN_DEFAULT_STACK_SIZE,
+    unsigned stack_size = 0;
+    if (attr != NULL && attr->stack_size > 0) {
+        stack_size = (unsigned)attr->stack_size;
+    }
+    uintptr_t h = _beginthreadex(NULL, stack_size,
                                  _jn_thread_trampoline, s, 0, NULL);
     if (h == 0) { free(s); return errno ? errno : EAGAIN; }
     t->handle = (HANDLE)h;
@@ -181,6 +161,17 @@ int jn_pthread_equal_win(pthread_t a, pthread_t b) {
     return a.id == b.id;
 }
 
-#endif /* MSVC-only */
+static BOOL CALLBACK _jn_once_cb(PINIT_ONCE once, PVOID param, PVOID* ctx) {
+    (void)once; (void)ctx;
+    void (*fn)(void) = (void (*)(void))param;
+    fn();
+    return TRUE;
+}
 
-#endif /* _WIN32 */
+int jn_pthread_once_win(pthread_once_t* once, void (*init)(void)) {
+    return InitOnceExecuteOnce(once, _jn_once_cb, (PVOID)init, NULL) ? 0 : -1;
+}
+
+#endif
+
+#endif

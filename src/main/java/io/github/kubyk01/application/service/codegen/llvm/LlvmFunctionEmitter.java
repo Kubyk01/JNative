@@ -4,6 +4,7 @@ import io.github.kubyk01.application.service.analyzer.dependencyresolver.Depende
 import io.github.kubyk01.application.service.analyzer.ssa.GraphUtils;
 import io.github.kubyk01.application.service.analyzer.ssa.TypeResolver;
 import io.github.kubyk01.application.service.codegen.llvm.nativepolymorphicfunctionresolver.PolymorphicResolver;
+import io.github.kubyk01.application.service.codegen.llvm.nativepolymorphicfunctionresolver.VarHandleTargetResolver;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.ClassNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.FieldNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.MethodNode;
@@ -1258,6 +1259,11 @@ public class LlvmFunctionEmitter {
                         });
                         break;
                     }
+                }
+
+                if (inst.isPolymorphicSignature()
+                        && emitVarHandleAccess(sb, inst, methodName, retType, ranges)) {
+                    break;
                 }
 
                 if (inst.isPolymorphicSignature()) {
@@ -2649,6 +2655,221 @@ public class LlvmFunctionEmitter {
                             + " (the SSA transformer must set parent on every phi)");
         }
         return parent;
+    }
+
+    private boolean emitVarHandleAccess(StringBuilder sb, Instruction inst, String mode,
+                                        Type retType, List<TryCatchRange> ranges) {
+        VarHandleTargetResolver.Target target = globalEmitter.getVarHandleTargets().resolveCallSite(inst);
+        if (target == null) return false;
+
+        Type vt = target.valueType();
+        boolean isFloat = vt == Type.FLOAT || vt == Type.DOUBLE;
+        boolean isRef = !vt.isPrimitive();
+
+        String loadOrder = null;
+        String storeOrder = null;
+        String rmwOp = null;
+        String rmwOrder = null;
+        String casSuccess = null;
+        String casFailure = null;
+        boolean weak = false;
+        boolean exchange = false;
+        int valueCount;
+
+        switch (mode) {
+            case "get" -> { loadOrder = "unordered"; valueCount = 0; }
+            case "getOpaque" -> { loadOrder = "monotonic"; valueCount = 0; }
+            case "getAcquire" -> { loadOrder = "acquire"; valueCount = 0; }
+            case "getVolatile" -> { loadOrder = "seq_cst"; valueCount = 0; }
+            case "set" -> { storeOrder = "unordered"; valueCount = 1; }
+            case "setOpaque" -> { storeOrder = "monotonic"; valueCount = 1; }
+            case "setRelease" -> { storeOrder = "release"; valueCount = 1; }
+            case "setVolatile" -> { storeOrder = "seq_cst"; valueCount = 1; }
+            case "compareAndSet", "compareAndExchange" -> {
+                casSuccess = "seq_cst"; casFailure = "seq_cst"; valueCount = 2;
+            }
+            case "compareAndExchangeAcquire", "weakCompareAndSetAcquire" -> {
+                casSuccess = "acquire"; casFailure = "acquire"; valueCount = 2;
+            }
+            case "compareAndExchangeRelease", "weakCompareAndSetRelease" -> {
+                casSuccess = "release"; casFailure = "monotonic"; valueCount = 2;
+            }
+            case "weakCompareAndSet" -> {
+                casSuccess = "seq_cst"; casFailure = "seq_cst"; valueCount = 2;
+            }
+            case "weakCompareAndSetPlain" -> {
+                casSuccess = "monotonic"; casFailure = "monotonic"; valueCount = 2;
+            }
+            default -> {
+                String base;
+                if (mode.endsWith("Acquire")) {
+                    rmwOrder = "acquire";
+                    base = mode.substring(0, mode.length() - "Acquire".length());
+                } else if (mode.endsWith("Release")) {
+                    rmwOrder = "release";
+                    base = mode.substring(0, mode.length() - "Release".length());
+                } else {
+                    rmwOrder = "seq_cst";
+                    base = mode;
+                }
+                switch (base) {
+                    case "getAndSet" -> rmwOp = "xchg";
+                    case "getAndAdd" -> rmwOp = (isRef || vt == Type.BOOLEAN) ? null : (isFloat ? "fadd" : "add");
+                    case "getAndBitwiseOr" -> rmwOp = (isRef || isFloat) ? null : "or";
+                    case "getAndBitwiseAnd" -> rmwOp = (isRef || isFloat) ? null : "and";
+                    case "getAndBitwiseXor" -> rmwOp = (isRef || isFloat) ? null : "xor";
+                    default -> rmwOp = null;
+                }
+                if (rmwOp == null) return false;
+                valueCount = 1;
+            }
+        }
+        if (casSuccess != null) {
+            weak = mode.startsWith("weak");
+            exchange = mode.startsWith("compareAndExchange");
+        }
+        if (storeOrder != null && !retType.isVoid()) return false;
+
+        List<Value> args = inst.getOperands().subList(2, inst.getOperands().size());
+        int coordinateCount = switch (target.kind()) {
+            case INSTANCE_FIELD -> 1;
+            case STATIC_FIELD -> 0;
+            case ARRAY_ELEMENT -> 2;
+        };
+        if (args.size() != coordinateCount + valueCount) return false;
+
+        String slot = newAux("vh_slot");
+        switch (target.kind()) {
+            case INSTANCE_FIELD -> {
+                Value obj = args.getFirst();
+                emitNullCheck(sb, obj, ranges, "field '" + target.owner() + "." + target.fieldName() + "'");
+                String base = emitBaseToI8Pointer(sb, obj);
+                int offset = globalEmitter.getFieldOffset(target.owner(), target.fieldName());
+                sb.append("  ").append(slot).append(" = getelementptr i8, i8* ").append(base)
+                        .append(", i32 ").append(offset).append("\n");
+            }
+            case STATIC_FIELD -> {
+                String wrapper = LAZY_CLINIT_WRAPPER_PREFIX + LlvmTypeMapper.sanitizeIdentifier(target.owner());
+                String clinit = LlvmRuntime.mangleMethod(target.owner(), "<clinit>", "()V");
+                if (module.getFunction(wrapper) != null
+                        && !wrapper.equals(currentFunctionName)
+                        && !clinit.equals(currentFunctionName)) {
+                    emitCall(sb, Type.VOID, null, null, ranges,
+                            (callSb, r) -> callSb.append("  call void @").append(wrapper).append("()\n"));
+                }
+                String global = "gv_" + LlvmTypeMapper.sanitizeIdentifier(target.owner() + "." + target.fieldName());
+                sb.append("  ").append(slot).append(" = bitcast ").append(LlvmTypeMapper.toLlvmType(vt))
+                        .append("* @").append(global).append(" to i8*\n");
+            }
+            case ARRAY_ELEMENT -> {
+                Value arr = args.get(0);
+                Value idx = args.get(1);
+                emitNullCheck(sb, arr, ranges, "<array>");
+                String arrPtr = asPointer(sb, arr);
+                String idxI32 = castValueToType(sb, getLlvmValue(sb, idx), idx.getType(), Type.INT);
+                emitBoundsCheck(sb, arrPtr, idxI32, ranges);
+                String offset = newAux("vh_offset");
+                sb.append("  ").append(offset).append(" = mul i32 ").append(idxI32).append(", ")
+                        .append(getElementSizeOfType(vt)).append("\n");
+                String offset64 = newAux("vh_offset64");
+                sb.append("  ").append(offset64).append(" = zext i32 ").append(offset).append(" to i64\n");
+                String data = newAux("vh_data");
+                sb.append("  ").append(data).append(" = getelementptr i8, i8* ").append(arrPtr)
+                        .append(", i64 16\n");
+                sb.append("  ").append(slot).append(" = getelementptr i8, i8* ").append(data)
+                        .append(", i64 ").append(offset64).append("\n");
+            }
+        }
+
+        String memTy = vt == Type.BOOLEAN ? "i8" : LlvmTypeMapper.toLlvmType(vt);
+        String casTy = vt == Type.FLOAT ? "i32" : vt == Type.DOUBLE ? "i64" : memTy;
+        int align = getElementSizeOfType(vt);
+        List<Value> values = args.subList(coordinateCount, args.size());
+
+        String out = null;
+        Type outType = vt;
+
+        if (loadOrder != null) {
+            String ptr = vhTypedPointer(sb, slot, memTy);
+            String loaded = newAux("vh_load");
+            sb.append("  ").append(loaded).append(" = load atomic ").append(memTy).append(", ")
+                    .append(memTy).append("* ").append(ptr).append(" ").append(loadOrder)
+                    .append(", align ").append(align).append("\n");
+            out = vhFromMemory(sb, loaded, vt);
+        } else if (storeOrder != null) {
+            String ptr = vhTypedPointer(sb, slot, memTy);
+            String v = vhToMemory(sb, values.getFirst(), vt);
+            sb.append("  store atomic ").append(memTy).append(" ").append(v).append(", ")
+                    .append(memTy).append("* ").append(ptr).append(" ").append(storeOrder)
+                    .append(", align ").append(align).append("\n");
+        } else if (casSuccess != null) {
+            String ptr = vhTypedPointer(sb, slot, casTy);
+            String expected = vhMemoryToCas(sb, vhToMemory(sb, values.get(0), vt), memTy, casTy);
+            String desired = vhMemoryToCas(sb, vhToMemory(sb, values.get(1), vt), memTy, casTy);
+            String pair = newAux("vh_cas");
+            sb.append("  ").append(pair).append(" = cmpxchg ");
+            if (weak) sb.append("weak ");
+            sb.append(casTy).append("* ").append(ptr)
+                    .append(", ").append(casTy).append(" ").append(expected)
+                    .append(", ").append(casTy).append(" ").append(desired)
+                    .append(" ").append(casSuccess).append(" ").append(casFailure)
+                    .append(", align ").append(align).append("\n");
+            if (exchange) {
+                String witness = newAux("vh_witness");
+                sb.append("  ").append(witness).append(" = extractvalue { ").append(casTy)
+                        .append(", i1 } ").append(pair).append(", 0\n");
+                out = vhFromMemory(sb, vhMemoryToCas(sb, witness, casTy, memTy), vt);
+            } else {
+                String ok = newAux("vh_ok");
+                sb.append("  ").append(ok).append(" = extractvalue { ").append(casTy)
+                        .append(", i1 } ").append(pair).append(", 1\n");
+                out = ok;
+                outType = Type.BOOLEAN;
+            }
+        } else {
+            String ptr = vhTypedPointer(sb, slot, memTy);
+            String v = vhToMemory(sb, values.getFirst(), vt);
+            String old = newAux("vh_old");
+            sb.append("  ").append(old).append(" = atomicrmw ").append(rmwOp).append(" ")
+                    .append(memTy).append("* ").append(ptr).append(", ").append(memTy).append(" ").append(v)
+                    .append(" ").append(rmwOrder).append(", align ").append(align).append("\n");
+            out = vhFromMemory(sb, old, vt);
+        }
+
+        if (inst.getResult() != null && !retType.isVoid()) {
+            valueMapper.setValue(inst.getResult(), castValueToType(sb, out, outType, retType));
+        }
+        return true;
+    }
+
+    private String vhTypedPointer(StringBuilder sb, String slot, String ty) {
+        String ptr = newAux("vh_ptr");
+        sb.append("  ").append(ptr).append(" = bitcast i8* ").append(slot).append(" to ")
+                .append(ty).append("*\n");
+        return ptr;
+    }
+
+    private String vhToMemory(StringBuilder sb, Value v, Type vt) {
+        String converted = castValueToType(sb, getLlvmValue(sb, v), v.getType(), vt);
+        if (vt != Type.BOOLEAN) return converted;
+        String widened = newAux("vh_zext");
+        sb.append("  ").append(widened).append(" = zext i1 ").append(converted).append(" to i8\n");
+        return widened;
+    }
+
+    private String vhFromMemory(StringBuilder sb, String memValue, Type vt) {
+        if (vt != Type.BOOLEAN) return memValue;
+        String narrowed = newAux("vh_bool");
+        sb.append("  ").append(narrowed).append(" = icmp ne i8 ").append(memValue).append(", 0\n");
+        return narrowed;
+    }
+
+    private String vhMemoryToCas(StringBuilder sb, String value, String fromTy, String toTy) {
+        if (fromTy.equals(toTy)) return value;
+        String cast = newAux("vh_bits");
+        sb.append("  ").append(cast).append(" = bitcast ").append(fromTy).append(" ").append(value)
+                .append(" to ").append(toTy).append("\n");
+        return cast;
     }
 
     private void emitPolymorphicCall(StringBuilder sb, List<Value> args,

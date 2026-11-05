@@ -259,3 +259,178 @@ int32_t __jnative_fn_java_lang_reflect_Array_getLength__Ljava_lang_Object__I(
 
     return jnative_array_length(array);
 }
+
+extern void* __jnative_fn_java_lang_Object_getClass___Ljava_lang_Class_(void* obj);
+extern int __jnative_fn_java_lang_Class_isInstance__Ljava_lang_Object__Z(void* this_cls, void* obj);
+extern int __jnative_fn_java_lang_Class_isAssignableFrom__Ljava_lang_Class__Z(void* this_cls, void* other_cls);
+
+__attribute__((noreturn))
+static void array_throw_iae(const char* msg) {
+    __jnative_throw_exception(__jnative_construct_exception(
+        "vtable_java_lang_IllegalArgumentException", msg));
+}
+
+static ReflectionClass* array_class_of(void* array) {
+    if (array == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    ReflectionClass* cls = jnative_array_klass(array);
+    if (cls == NULL || !__jnative_is_class_mirror(cls)
+        || cls->cname == NULL || cls->cname[0] != '[') {
+        array_throw_iae("Argument is not an array");
+    }
+    return cls;
+}
+
+static void* array_element_address(void* array, int32_t index, int32_t elem_size) {
+    int32_t length = jnative_array_length(array);
+    if (index < 0 || index >= length) {
+        char msg[96];
+        snprintf(msg, sizeof(msg), "Index %d out of bounds for length %d",
+                 (int)index, (int)length);
+        __jnative_throw_exception(__jnative_construct_exception(
+            "vtable_java_lang_ArrayIndexOutOfBoundsException", msg));
+    }
+    return (char*)jnative_array_data(array) + (size_t)index * (size_t)elem_size;
+}
+
+static int32_t wrapper_value_offset(ReflectionClass* cls) {
+    for (ReflectionClass* c = cls; c != NULL; c = c->superclass) {
+        if (c->fields == NULL) continue;
+        for (ReflectionField** fp = c->fields; *fp != NULL; fp++) {
+            ReflectionField* f = *fp;
+            if (f->name != NULL && strcmp((const char*)f->name, "value") == 0
+                && (f->modifiers & JNATIVE_ACC_STATIC) == 0) {
+                return f->offset;
+            }
+        }
+    }
+    return OBJECT_HEADER_SIZE;
+}
+
+static char unbox_primitive(void* value, int64_t* ival, double* dval) {
+    ReflectionClass* vcls =
+        (ReflectionClass*)__jnative_fn_java_lang_Object_getClass___Ljava_lang_Class_(value);
+    if (vcls == NULL || vcls->cname == NULL) return 0;
+    static const struct { const char* name; char code; } wrappers[] = {
+        {"java/lang/Boolean", 'Z'}, {"java/lang/Byte", 'B'},
+        {"java/lang/Character", 'C'}, {"java/lang/Short", 'S'},
+        {"java/lang/Integer", 'I'}, {"java/lang/Long", 'J'},
+        {"java/lang/Float", 'F'}, {"java/lang/Double", 'D'},
+        {NULL, 0}
+    };
+    char code = 0;
+    for (int i = 0; wrappers[i].name != NULL; i++) {
+        if (strcmp(vcls->cname, wrappers[i].name) == 0) {
+            code = wrappers[i].code;
+            break;
+        }
+    }
+    if (code == 0) return 0;
+    const char* p = (const char*)value + wrapper_value_offset(vcls);
+    switch (code) {
+        case 'Z': *ival = (*(const uint8_t*)p) != 0; break;
+        case 'B': *ival = *(const int8_t*)p; break;
+        case 'C': *ival = *(const uint16_t*)p; break;
+        case 'S': *ival = *(const int16_t*)p; break;
+        case 'I': *ival = *(const int32_t*)p; break;
+        case 'J': *ival = *(const int64_t*)p; break;
+        case 'F': *dval = *(const float*)p; break;
+        case 'D': *dval = *(const double*)p; break;
+    }
+    return code;
+}
+
+static int primitive_widens_to(char src, char dst) {
+    if (src == dst) return 1;
+    switch (src) {
+        case 'B': return dst == 'S' || dst == 'I' || dst == 'J' || dst == 'F' || dst == 'D';
+        case 'S':
+        case 'C': return dst == 'I' || dst == 'J' || dst == 'F' || dst == 'D';
+        case 'I': return dst == 'J' || dst == 'F' || dst == 'D';
+        case 'J': return dst == 'F' || dst == 'D';
+        case 'F': return dst == 'D';
+        default:  return 0;
+    }
+}
+
+static ReflectionClass* component_class_of(const char* array_name) {
+    const char* comp = array_name + 1;
+    if (comp[0] == '[') return jnative_class_by_name(comp);
+    if (comp[0] != 'L') return NULL;
+    size_t len = strlen(comp);
+    if (len < 3 || comp[len - 1] != ';') return NULL;
+    char name[512];
+    if (len - 2 >= sizeof(name)) return NULL;
+    memcpy(name, comp + 1, len - 2);
+    name[len - 2] = '\0';
+    return jnative_class_by_name(name);
+}
+
+static int reference_store_allowed(const char* array_name, void* value) {
+    if (value == NULL) return 1;
+    if (strcmp(array_name, "[Ljava/lang/Object;") == 0) return 1;
+    ReflectionClass* comp = component_class_of(array_name);
+    if (comp == NULL) return 0;
+    if (__jnative_fn_java_lang_Class_isInstance__Ljava_lang_Object__Z(comp, value)) return 1;
+    void* vcls = __jnative_fn_java_lang_Object_getClass___Ljava_lang_Class_(value);
+    return __jnative_fn_java_lang_Class_isAssignableFrom__Ljava_lang_Class__Z(comp, vcls);
+}
+
+void __jnative_fn_java_lang_reflect_Array_set__Ljava_lang_Object_ILjava_lang_Object__V(
+        void* array, int32_t index, void* value) {
+
+    ReflectionClass* cls = array_class_of(array);
+    char dst = cls->cname[1];
+
+    if (dst == '[' || dst == 'L') {
+        if (!reference_store_allowed(cls->cname, value)) {
+            array_throw_iae("array element type mismatch");
+        }
+        void** slot = (void**)array_element_address(array, index, (int32_t)sizeof(void*));
+        *slot = value;
+        return;
+    }
+
+    if (value == NULL) {
+        array_throw_iae("argument type mismatch");
+    }
+    int64_t ival = 0;
+    double dval = 0.0;
+    char src = unbox_primitive(value, &ival, &dval);
+    if (src == 0 || !primitive_widens_to(src, dst)) {
+        array_throw_iae("argument type mismatch");
+    }
+    int src_is_fp = (src == 'F' || src == 'D');
+
+    switch (dst) {
+        case 'Z':
+            *(uint8_t*)array_element_address(array, index, 1) = (uint8_t)(ival != 0);
+            break;
+        case 'B':
+            *(int8_t*)array_element_address(array, index, 1) = (int8_t)ival;
+            break;
+        case 'C':
+            *(uint16_t*)array_element_address(array, index, 2) = (uint16_t)ival;
+            break;
+        case 'S':
+            *(int16_t*)array_element_address(array, index, 2) = (int16_t)ival;
+            break;
+        case 'I':
+            *(int32_t*)array_element_address(array, index, 4) = (int32_t)ival;
+            break;
+        case 'J':
+            *(int64_t*)array_element_address(array, index, 8) = ival;
+            break;
+        case 'F':
+            *(float*)array_element_address(array, index, 4) =
+                src_is_fp ? (float)dval : (float)ival;
+            break;
+        case 'D':
+            *(double*)array_element_address(array, index, 8) =
+                src_is_fp ? dval : (double)ival;
+            break;
+        default:
+            array_throw_iae("argument type mismatch");
+    }
+}

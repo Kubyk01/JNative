@@ -5,6 +5,7 @@
 #include <errno.h>
 
 #include "jnative_runtime.h"
+#include "jnative_portability.h"
 
 /*
  * sun.nio.ch.NativeThread
@@ -55,8 +56,8 @@ void __jnative_fn_sun_nio_ch_NativeThread_init___V(void) {
  * platform this runtime targets, so the reinterpretation is exact.
  */
 int64_t __jnative_fn_sun_nio_ch_NativeThread_current0___J(void) {
-    jn_thread_t self = pthread_self();
-    return (int64_t)(uintptr_t)self;
+    jn_thread_t self = jn_thread_self();
+    return jn_thread_id(self);
 }
 
 /*
