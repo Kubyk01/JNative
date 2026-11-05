@@ -1,1 +1,83 @@
+TASK: make the Windows MSVC link of JNative succeed (fix all undefined symbols) with full implementations, no stubs, no code comments.
 
+CONTEXT
+- Repo: C:\Users\Oles\Documents\JNative. Host: Windows 11, target x86_64-pc-windows-msvc, clang 23 + lld-link. The JDK is GraalVM 25, and javap is on PATH.
+- Runtime C lives in src/main/resources/ (jnative_runtime.h/.c, jnative_jni_bridge.c, jnative_portability/*).
+  Per-JDK-class natives live in src/main/resources/jnative/**. The path is the class internal name with a leading "java/" stripped:
+  java/lang/Thread -> jnative/lang/Thread.c, sun/nio/fs/X -> jnative/sun/nio/fs/X.c.
+- Symbol naming (BytecodeToIr.java ~312): if a class (or an enclosing class) has a C file, EVERY native of that class is
+  called as "__jnative_" + LlvmRuntime.mangleMethod(owner,name,desc), using the plain C ABI: instance natives get void* this first,
+  static natives get no class arg, int->int32_t, long->int64_t, boolean->int32_t, objects->void*.
+  If no C file exists, the native is called JNI-style as Java_*. Nothing provides those symbols for JDK classes, so the fix is to create the class's
+  C file, and then ALL natives of that class (from javap -p -s --module java.base <class>) must be implemented.
+- Existing C was written against JDK 21. JDK 25 changed or added natives.
+- Conventions: jnative/sun/nio/fs/UnixNativeDispatcher.c shows how exceptions are thrown: jnative_class_by_name + jnative_alloc_object + the ctor
+  found via jn_dlsym_default("fn_<cls>__init__I_V") + __jnative_throw_exception. jnative/io/WinNTFileSystem.c shows Windows strings and paths.
+  Look up field offsets at runtime by name via ReflectionClass->fields up the superclass chain (see find_field_hier in
+  jnative_jni_bridge.c). Do not hardcode them. Use the W variants of the Windows APIs.
+
+ALREADY DONE (do not redo)
+- StackFrameInfo.c includes jnative_portability.h, and the JNATIVE_* macros in jnative_portability.h are guarded with #ifndef.
+- Compiler.java:
+  - .ll compiles pass -Wno-override-module.
+  - MSVC builds pass -D_CRT_NONSTDC_NO_DEPRECATE=1.
+  - The object list goes to the linker through the response file link_objects.rsp.
+  - MSVC links use -fuse-ld=lld (after checking that lld-link is on PATH) and -flto-jobs.
+  - MSVC links get their own flags: /subsystem:console, /def:, /opt:ref, dbghelp ws2_32 iphlpapi psapi advapi32.
+  - extractSystemNativeSources now follows C-to-C references: every __jnative_fn_* used in an extracted C file pulls in the
+    C file of its owner class (findNativeOwnerOfSymbol). Example: DirectMethodHandleAccessor.c -> NativeMethodAccessorImpl.c.
+    This has NOT been compiled yet.
+- jnative/sun/nio/fs/WindowsNativeDispatcher.c: complete. All 69 JDK 25 natives are implemented and verified with clang and llvm-nm.
+
+PARTIALLY DONE (an agent was interrupted). Review each file, finish it, and verify it.
+1. Windows sun.nio.ch and misc (match the OpenJDK src/java.base/windows/native sources):
+   - jnative/sun/nio/ch/FileDispatcherImpl.c: add the Windows-variant natives under #if defined(_WIN32): allocationGranularity0,
+     available0, duplicateHandle, isOther0, map0, maxDirectTransferSize0, release0, setDirect0, size0, truncate0, unmap0,
+     write0, writev0, plus any other Windows natives from javap. The Linux build must keep working.
+   - jnative/sun/nio/ch/SocketDispatcher.c: Windows close0(I)V plus any other Windows natives.
+   - jnative/sun/nio/ch/WEPoll.c (new): create, ctl, wait, close, eventSize, eventsOffset, dataOffset. This must be a real epoll
+     emulation for SOCKETs: a per-handle registration table + WSAPoll, with EPOLLIN/OUT/ERR/HUP/ONESHOT and ADD/MOD/DEL. It must be thread-safe
+     against ctl calls during wait, and handle timeouts of -1, 0 and >0.
+   - jnative/lang/ProcessEnvironment.c (new): environmentBlock() from GetEnvironmentStringsW.
+   - jnative/sun/io/Win32ErrorMode.c (new): setErrorMode(J)J.
+   - jnative/sun/security/provider/NativeSeedGenerator.c (new): nativeGenerateSeed([B)Z via RtlGenRandom (SystemFunction036).
+2. JDK 25 drift (a C edit was started in some of these files; the Java part was never started):
+   - Console.ttyStatus()I
+   - FileInputStream.isRegularFile0(FileDescriptor)Z
+   - WinNTFileSystem.getFinalPath0(String)String
+   - Class.getClassFileVersion0()I
+   - PhantomReference.clear0()V
+   - StackStreamFactory$AbstractStackWalker:
+       callStackWalk(IILjdk/internal/vm/ContinuationScope;Ljdk/internal/vm/Continuation;II[Ljava/lang/Object;)Ljava/lang/Object;
+       fetchStackFrames(IJIII[Ljava/lang/Object;)I
+     Port the existing JDK 21 logic in jnative/lang/StackStreamFactory.c to these signatures.
+   - Thread.sleepNanos0(J)V (must honour interrupts like the existing sleep)
+   - VirtualThread: notifyJvmtiStart, notifyJvmtiEnd, notifyJvmtiDisableSuspend(Z), postPinnedEvent(String),
+     takeVirtualThreadListToUnblock()
+   - jdk.internal.vm.Continuation: pin()V, unpin()V, enterSpecial(Continuation,ZZ)V. These must be consistent with
+     jnative/jdk/internal/vm/ContinuationSupport.c.
+   - CDS: getCDSConfigStatus()I, needsClassInitBarrier0(Class)Z
+   - ScopedMemoryAccess.closeScope0(MemorySessionImpl, ScopedMemoryAccess$ScopedAccessError)V
+   - MappedMemoryUtils.registerNatives()V
+   - java.lang.reflect.Array.set(Object,int,Object)V (full semantics: unboxing, NPE, IAE, AIOOBE)
+   - __jnative_run_method_slot and __jnative_tostring_slot are referenced but not defined. Find the root cause (Java emitter or
+     runtime) and fix it.
+3. VarHandle polymorphic call sites. These were interrupted before compiling, and the edits may not compile. Review
+   nativepolymorphicfunctionresolver/VarHandleTargetResolver.java (new), plus the modified LlvmFunctionEmitter, LlvmGenerator, LlvmGlobalEmitter,
+   DependencyResolver and ClassNode.
+   Missing: __jnative_fn_java_lang_invoke_VarHandle_{compareAndExchange,compareAndSet,getAcquire,getAndAdd,getAndSet,
+   getOpaque,getVolatile}__<call-site descriptor>. Examples: __Ljava_lang_ThreadBuilders_BaseThreadFactory_I_J, the array form
+   ___Ljava_lang_Object_I_Ljava_lang_Object_, and a void return like getAndAdd(...)V.
+   Fix the root cause so that every polymorphic VarHandle call site (instance fields, static fields, array elements, all access modes)
+   gets a definition with correct memory ordering. See VarHandle.c and PolymorphicResolver.java.
+
+Full list of missing symbols (computed from the generated .ll files against the C object symbols):
+C:\Users\Oles\AppData\Local\Temp\claude\ad30abcdfe57f1ce\a95bfdbe-8437-4f43-9d83-542631f38786\scratchpad\missing_symbols.txt
+
+VERIFY
+- Each C file:
+    cd src/main/resources && clang -fsyntax-only --target=x86_64-pc-windows-msvc -D_WIN32_WINNT=0x0A00 -D_CRT_SECURE_NO_WARNINGS=1 -D_CRT_NONSTDC_NO_DEPRECATE=1 -I. -Ijnative_portability <file>
+  This must produce no errors and no warnings. Then compile to .o and use llvm-nm to confirm that every symbol in the list is defined.
+- Java: mvn -q compile must succeed.
+- Then regenerate the IR and run the full Windows build. lld-link stops after 20 errors by default, so add -Wl,/errorlimit:0 once to see the
+  full list.
