@@ -862,16 +862,27 @@ int32_t __jnative_fn_jdk_internal_misc_Unsafe_arrayIndexScale__Ljava_lang_Class_
 }
 
 /* ---- Misc ---- */
+void __jnative_fn_jdk_internal_misc_Unsafe_ensureClassInitialized__Ljava_lang_Class_V(void* this_unsafe, void* cls);
+
 void* __jnative_fn_jdk_internal_misc_Unsafe_allocateInstance__Ljava_lang_Class__Ljava_lang_Object_(
         void* this_unsafe, void* cls) {
-    (void)this_unsafe;
     if (!cls) {
         __jnative_throw_null_pointer_exception();
         return NULL;
     }
-    int size = ((ReflectionClass*)cls)->object_size;
-    if (size <= 0) size = 8;
-    return calloc(1, (size_t)size);
+    ReflectionClass* rc = (ReflectionClass*)cls;
+    const char* cname = rc->cname != NULL ? rc->cname : "<unknown>";
+    if ((rc->modifiers & (0x0200 | 0x0400)) != 0 || cname[0] == '[') {
+        __jnative_throw_exception(__jnative_construct_exception(
+            "vtable_java_lang_InstantiationException", cname));
+    }
+    __jnative_fn_jdk_internal_misc_Unsafe_ensureClassInitialized__Ljava_lang_Class_V(this_unsafe, cls);
+    void* obj = jnative_alloc_object(rc);
+    if (obj == NULL) {
+        __jnative_throw_exception(__jnative_construct_exception(
+            "vtable_java_lang_InstantiationException", cname));
+    }
+    return obj;
 }
 
 void* __jnative_fn_jdk_internal_misc_Unsafe_defineClass0__Ljava_lang_String__BIILjava_lang_ClassLoader_Ljava_security_ProtectionDomain__Ljava_lang_Class_(
@@ -905,14 +916,36 @@ void __jnative_fn_jdk_internal_misc_Unsafe_throwException__Ljava_lang_Throwable_
     __jnative_throw_exception(throwable);
 }
 
+static JNativeLazyClinitEntry* unsafe_lazy_clinit_entry(void* cls) {
+    if (cls == NULL || jnative_lazy_clinit_map == NULL) return NULL;
+    int64_t size = jnative_lazy_clinit_map_size;
+    for (int64_t i = 0; i < size; i++) {
+        if (jnative_lazy_clinit_map[i].cls == (ReflectionClass*)cls) {
+            return &jnative_lazy_clinit_map[i];
+        }
+    }
+    return NULL;
+}
+
 int32_t __jnative_fn_jdk_internal_misc_Unsafe_shouldBeInitialized__Ljava_lang_Class_Z(void* this_unsafe, void* cls) {
     (void)this_unsafe;
-    (void)cls;
-    return 0;
+    if (cls == NULL) __jnative_throw_null_pointer_exception();
+    JNativeLazyClinitEntry* entry = unsafe_lazy_clinit_entry(cls);
+    if (entry == NULL || entry->wrapper == NULL) return 0;
+    const char* cname = ((ReflectionClass*)cls)->cname;
+    int32_t* done = cname != NULL
+        ? (int32_t*)jnative_static_field_address(cname, "__clinit_done")
+        : NULL;
+    if (done == NULL) return 1;
+    return __atomic_load_n(done, __ATOMIC_ACQUIRE) == 0;
 }
 void __jnative_fn_jdk_internal_misc_Unsafe_ensureClassInitialized__Ljava_lang_Class_V(void* this_unsafe, void* cls) {
     (void)this_unsafe;
-    (void)cls;
+    if (cls == NULL) __jnative_throw_null_pointer_exception();
+    JNativeLazyClinitEntry* entry = unsafe_lazy_clinit_entry(cls);
+    if (entry != NULL && entry->wrapper != NULL) {
+        ((void (*)(void))entry->wrapper)();
+    }
 }
 int32_t __jnative_fn_jdk_internal_misc_Unsafe_getLoadAverage___D_I(void* this_unsafe, double* loadavg, int32_t nelems) {
     (void)this_unsafe;

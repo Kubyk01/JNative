@@ -12,4 +12,5 @@ public class FieldNode {
     private Type type;          // resolved type
     private int access;
     private String owner;
+    private Object constantValue;
 }

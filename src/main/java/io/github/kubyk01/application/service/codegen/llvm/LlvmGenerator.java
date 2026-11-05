@@ -260,6 +260,12 @@ public class LlvmGenerator implements LlvmGeneratorPort {
             if (func.getEntryBlock() == null
                 && moduleAvailable.add(func.getName())) {
                 moduleDecls.append(emitDeclaration(func));
+                if (func.getName().startsWith("__jnative_fn_java_lang_invoke_MethodHandle_invoke")) {
+                    classBodies.computeIfAbsent("java/lang/invoke/MethodHandle", k -> new StringBuilder())
+                        .append(emitWeakDefaultDefinition(func));
+                    functionsByOwner.computeIfAbsent("java/lang/invoke/MethodHandle", k -> new HashSet<>())
+                        .add(func.getName());
+                }
             }
         }
 
@@ -906,6 +912,21 @@ public class LlvmGenerator implements LlvmGeneratorPort {
             sb.append(LlvmTypeMapper.toLlvmType(params.get(i).getType()));
         }
         sb.append(")\n");
+        return sb.toString();
+    }
+
+    private String emitWeakDefaultDefinition(Function func) {
+        String ret = LlvmTypeMapper.toLlvmType(func.getReturnType());
+        StringBuilder sb = new StringBuilder();
+        sb.append("define weak ").append(ret).append(" @").append(func.getName()).append("(");
+        List<Parameter> params = func.getParameters();
+        for (int i = 0; i < params.size(); i++) {
+            if (i > 0) sb.append(", ");
+            sb.append(LlvmTypeMapper.toLlvmType(params.get(i).getType()));
+        }
+        sb.append(") {\n  ret ").append(ret);
+        if (!"void".equals(ret)) sb.append(" zeroinitializer");
+        sb.append("\n}\n");
         return sb.toString();
     }
 

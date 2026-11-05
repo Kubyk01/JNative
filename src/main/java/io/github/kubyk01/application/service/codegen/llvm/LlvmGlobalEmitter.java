@@ -1939,9 +1939,14 @@ public class LlvmGlobalEmitter {
     //  Static fields
     // =========================================================================
 
+    private final Set<String> staticFieldStringConstants = new LinkedHashSet<>();
+
     private String generateStaticFields() {
         Set<String> allFields = new TreeSet<>(aliasResult.getGraph()
                 .getStaticFieldPointsToMap().keySet());
+        if (reflectInfo != null) {
+            allFields.addAll(reflectInfo.staticFieldKeys(resolver::getField));
+        }
 
         for (Function function : module.getFunctions()) {
             for (BasicBlock block : function.getBlocks()) {
@@ -2024,15 +2029,7 @@ public class LlvmGlobalEmitter {
             if (fieldType == null) fieldType = Type.UNKNOWN;
             String llvmType = LlvmTypeMapper.toLlvmType(fieldType);
 
-            String init;
-            if (fieldType.isReference() || fieldType.isArray()
-                || fieldType.isNull() || fieldType.isUnknown()) {
-                init = "null";
-            } else if (fieldType == Type.FLOAT || fieldType == Type.DOUBLE) {
-                init = "0.0";
-            } else {
-                init = "0";
-            }
+            String init = staticFieldInitializer(owner, fieldName, fieldType, llvmType);
 
             String globalName = "gv_" + LlvmTypeMapper.sanitizeIdentifier(fullName);
             sb.append("@").append(globalName).append(" = global ").append(llvmType)
@@ -2040,6 +2037,32 @@ public class LlvmGlobalEmitter {
         }
         sb.append("\n");
         return sb.toString();
+    }
+
+    private String staticFieldInitializer(String owner, String fieldName,
+                                          Type fieldType, String llvmType) {
+        FieldNode fn = resolver.getField(owner, fieldName);
+        Object cv = (fn != null && java.lang.reflect.Modifier.isStatic(fn.getAccess()))
+            ? fn.getConstantValue()
+            : null;
+        boolean refLike = fieldType.isReference() || fieldType.isArray()
+            || fieldType.isNull() || fieldType.isUnknown();
+        if (refLike) {
+            if (cv instanceof String str && "i8*".equals(llvmType)) {
+                staticFieldStringConstants.add(str);
+                return "bitcast (%struct.java_lang_String* @"
+                    + LlvmRuntime.stringObjectGlobalName(str) + " to i8*)";
+            }
+            return "null";
+        }
+        if (fieldType == Type.FLOAT || fieldType == Type.DOUBLE) {
+            double d = (cv instanceof Number num) ? num.doubleValue() : 0.0;
+            if (fieldType == Type.FLOAT) d = (float) d;
+            return String.format("0x%016X", Double.doubleToRawLongBits(d));
+        }
+        long v = (cv instanceof Number num) ? num.longValue() : 0L;
+        if ("i1".equals(llvmType)) return v != 0 ? "true" : "false";
+        return Long.toString(v);
     }
 
     // =========================================================================
@@ -2171,7 +2194,7 @@ public class LlvmGlobalEmitter {
     }
 
     private Set<String> collectJavaStringLiterals() {
-        Set<String> result = new LinkedHashSet<>();
+        Set<String> result = new LinkedHashSet<>(staticFieldStringConstants);
         for (Function func : module.getFunctions()) {
             for (BasicBlock block : func.getBlocks()) {
                 for (Instruction inst : block.getInstructions()) {
@@ -2686,8 +2709,8 @@ public class LlvmGlobalEmitter {
                 "Cannot resolve class for field offset: " + className + "." + fieldName);
         }
         if (cls.isExternal()) {
-            throw new IllegalStateException(
-                "Cannot compute field offset for external class: " + className + "." + fieldName);
+            fieldOffsets.put(key, OBJECT_HEADER_SIZE);
+            return OBJECT_HEADER_SIZE;
         }
 
         List<FieldNode> allFields = collectInstanceFields(cls);

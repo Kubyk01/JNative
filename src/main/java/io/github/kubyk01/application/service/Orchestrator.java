@@ -143,6 +143,7 @@ public class Orchestrator implements OrchestratorPort {
         // hold unresolved thunks.
         forceResourceStreamMethods(analysis);
         forcePerfMethods(analysis);
+        forceReflectionInvokeMethods(analysis);
 
         // ------------------------------------------------------------------
         // Superclass-<clinit> closure.
@@ -351,6 +352,7 @@ public class Orchestrator implements OrchestratorPort {
         Analyzer analyzer = new Analyzer();
         analyzer.setScheduler(scheduler);
         analyzer.setTranslator(translator);
+        analyzer.setReflectInfo(analysis.getReflectInfo());
         AnalyzerResult analysisResult = analyzer.analyze(
                 module, resolver,
                 entryClass, entryMethod, entryDescriptor,
@@ -573,6 +575,22 @@ public class Orchestrator implements OrchestratorPort {
      * stream: {@code available}, the two {@code read} overloads, and
      * {@code close} from the try-with-resources.
      */
+    private void forceReflectionInvokeMethods(ReachabilityAnalysis analysis) {
+        String[][] boxes = {
+            {"java/lang/Boolean", "Z"}, {"java/lang/Byte", "B"},
+            {"java/lang/Short", "S"}, {"java/lang/Character", "C"},
+            {"java/lang/Integer", "I"}, {"java/lang/Long", "J"},
+            {"java/lang/Float", "F"}, {"java/lang/Double", "D"}
+        };
+        for (String[] box : boxes) {
+            analysis.addExtraReachableMethod(new MethodReference(
+                box[0], "valueOf", "(" + box[1] + ")L" + box[0] + ";"));
+        }
+        analysis.addInstantiatedClass("java/lang/reflect/InvocationTargetException", false);
+        analysis.addExtraReachableMethod(new MethodReference(
+            "java/lang/reflect/InvocationTargetException", "<init>", "(Ljava/lang/Throwable;)V"));
+    }
+
     private void forceResourceStreamMethods(ReachabilityAnalysis analysis) {
         String owner = "java/io/ByteArrayInputStream";
         analysis.addExtraReachableMethod(

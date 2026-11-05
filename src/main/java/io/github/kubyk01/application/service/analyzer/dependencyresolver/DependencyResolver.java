@@ -668,6 +668,7 @@ public class DependencyResolver {
                             .type(Type.fromDescriptor(descriptor))
                             .access(access)
                             .owner(currentClassName[0])   // declaring class
+                            .constantValue(value)
                             .build());
                         return null;
                     }
@@ -833,6 +834,7 @@ public class DependencyResolver {
                             .type(Type.fromDescriptor(descriptor))
                             .access(access)
                             .owner(currentClassName[0])   // declaring class
+                            .constantValue(value)
                             .build());
                     return null;
                 }

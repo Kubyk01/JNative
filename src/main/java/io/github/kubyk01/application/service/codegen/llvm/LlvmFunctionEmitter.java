@@ -180,20 +180,15 @@ public class LlvmFunctionEmitter {
         computeTryRegions(func);
         tryCrossingValues.addAll(computeTryCrossingValues(func));
 
-        List<String> bodies = new ArrayList<>();
+        List<BasicBlock> blocks = func.getBlocks();
         int entryIdx = 0;
-        boolean firstBlock = true;
-        for (int i = 0; i < func.getBlocks().size(); i++) {
-            BasicBlock block = func.getBlocks().get(i);
-            boolean isEntry = (block == currentEntryBlock)
-                    || (currentEntryBlock == null && firstBlock);
-            if (isEntry && (currentEntryBlock != null)) {
-                entryIdx = i;
-            } else if (isEntry) {
-                entryIdx = i;
-            }
-            bodies.add(emitBlock(block, isEntry));
-            firstBlock = false;
+        if (currentEntryBlock != null) {
+            int idx = blocks.indexOf(currentEntryBlock);
+            if (idx >= 0) entryIdx = idx;
+        }
+        List<String> bodies = new ArrayList<>(Collections.nCopies(blocks.size(), null));
+        for (int i : emissionOrder(blocks, entryIdx)) {
+            bodies.set(i, emitBlock(blocks.get(i), i == entryIdx));
         }
 
         StringBuilder sb = new StringBuilder();
@@ -244,6 +239,54 @@ public class LlvmFunctionEmitter {
 
         sb.append("}\n\n");
         return sb.toString();
+    }
+
+    private static List<Integer> emissionOrder(List<BasicBlock> blocks, int entryIdx) {
+        Map<BasicBlock, Integer> indexOf = new IdentityHashMap<>();
+        for (int i = 0; i < blocks.size(); i++) indexOf.put(blocks.get(i), i);
+
+        List<Integer> postOrder = new ArrayList<>(blocks.size());
+        boolean[] visited = new boolean[blocks.size()];
+        Deque<int[]> stack = new ArrayDeque<>();
+        Map<Integer, List<BasicBlock>> succCache = new HashMap<>();
+        if (!blocks.isEmpty()) {
+            visited[entryIdx] = true;
+            stack.push(new int[]{entryIdx, 0});
+        }
+        while (!stack.isEmpty()) {
+            int[] top = stack.peek();
+            List<BasicBlock> succs = succCache.computeIfAbsent(top[0], k -> successorsOf(blocks.get(k)));
+            if (top[1] < succs.size()) {
+                Integer next = indexOf.get(succs.get(top[1]++));
+                if (next != null && !visited[next]) {
+                    visited[next] = true;
+                    stack.push(new int[]{next, 0});
+                }
+            } else {
+                postOrder.add(stack.pop()[0]);
+            }
+        }
+
+        List<Integer> order = new ArrayList<>(blocks.size());
+        for (int i = postOrder.size() - 1; i >= 0; i--) order.add(postOrder.get(i));
+        for (int i = 0; i < blocks.size(); i++) {
+            if (!visited[i]) order.add(i);
+        }
+        return order;
+    }
+
+    private static List<BasicBlock> successorsOf(BasicBlock block) {
+        List<BasicBlock> out = new ArrayList<>();
+        Terminator term = block.getTerminator();
+        if (term != null) {
+            for (BasicBlock t : term.getTargets()) {
+                if (t != null && !out.contains(t)) out.add(t);
+            }
+        }
+        for (BasicBlock s : block.getSuccessors()) {
+            if (s != null && !out.contains(s)) out.add(s);
+        }
+        return out;
     }
 
     private void buildTryCatchInfo(Function func) {
@@ -305,6 +348,11 @@ public class LlvmFunctionEmitter {
         return true;
     }
 
+    private boolean leavesRegion(BasicBlock succ, List<TryCatchRange> ranges) {
+        return !sameRanges(effectiveRangesFor(succ), ranges)
+                || tryRegionEntry.getOrDefault(succ, false);
+    }
+
     private void computeTryRegions(Function func) {
         for (BasicBlock block : func.getBlocks()) {
             List<TryCatchRange> myRanges = effectiveRangesFor(block);
@@ -322,16 +370,21 @@ public class LlvmFunctionEmitter {
                     }
                 }
             }
+            tryRegionEntry.put(block, isEntry);
+        }
+
+        for (BasicBlock block : func.getBlocks()) {
+            List<TryCatchRange> myRanges = effectiveRangesFor(block);
+            if (myRanges.isEmpty()) continue;
             boolean isExit = block.getTerminator() instanceof ReturnTerminator;
             if (!isExit) {
                 for (BasicBlock succ : block.getSuccessors()) {
-                    if (!sameRanges(effectiveRangesFor(succ), myRanges)) {
+                    if (leavesRegion(succ, myRanges)) {
                         isExit = true;
                         break;
                     }
                 }
             }
-            tryRegionEntry.put(block, isEntry);
             tryRegionExit.put(block, isExit);
         }
 
@@ -347,14 +400,14 @@ public class LlvmFunctionEmitter {
             boolean hasInsideNormalSucc  = false;
             boolean hasOutsideNormalSucc = false;
             for (BasicBlock succ : term.getTargets()) {
-                if (sameRanges(effectiveRangesFor(succ), myRanges)) hasInsideNormalSucc  = true;
-                else                                                hasOutsideNormalSucc = true;
+                if (!leavesRegion(succ, myRanges)) hasInsideNormalSucc  = true;
+                else                               hasOutsideNormalSucc = true;
             }
             if (!hasInsideNormalSucc || !hasOutsideNormalSucc) continue;
 
             Map<BasicBlock, BasicBlock> redirects = new HashMap<>();
             for (BasicBlock succ : term.getTargets()) {
-                if (sameRanges(effectiveRangesFor(succ), myRanges)) continue;
+                if (!leavesRegion(succ, myRanges)) continue;
 
                 BasicBlock tramp = new BasicBlock(
                         block.getLabel() + "_exit_tramp_" + (trampolinePops.size()
@@ -564,8 +617,8 @@ public class LlvmFunctionEmitter {
             boolean hasOutsideNormalSucc = false;
             if (!isReturn) {
                 for (BasicBlock succ : term.getTargets()) {
-                    if (sameRanges(effectiveRangesFor(succ), ranges)) hasInsideNormalSucc  = true;
-                    else                                                hasOutsideNormalSucc = true;
+                    if (!leavesRegion(succ, ranges)) hasInsideNormalSucc  = true;
+                    else                             hasOutsideNormalSucc = true;
                 }
             }
 

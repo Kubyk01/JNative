@@ -22,25 +22,25 @@ import static io.github.kubyk01.util.LlvmUtil.isAllocation;
 
 /**
  * Per-function escape analysis over one function's allocation sites.
- *
+ * <p>
  * Three fixes over the previous revision:
- *
+ * <p>
  * 1. Seed siteStatus from the shared seedStatus map (passed by
  *    InterproceduralEscape). getMaxStatus takes max(local, seed), so a
  *    promotion observed by any other function's batch is visible here
  *    from iteration zero.
- *
+ * <p>
  * 2. A value stored into a field is at minimum HEAP, even when the owner
  *    is STACK. Frame teardown releases the owner, not its fields
  *    individually, so the stored value would otherwise leak.
- *
+ * <p>
  * 3. Propagate argument status to sites reachable from the parameter
  *    (EscapeSummary.sitesReachableFromParams). Without this the
  *    transitive summary computed by EscapeSummaryBuilder was never used
  *    by callers — e.g. BufferedWriter.cb stayed HEAP and got freed
  *    at a PUT_FIELD, producing the "Cannot invoke String.getChars
  *    because <array> is null" crash.
- *
+ * <p>
  * Local fixed point: iterate until stable. markEscaped only raises a
  * site's status; edge propagation only raises `from` towards `to`.
  */
@@ -262,7 +262,7 @@ public class IntraproceduralEscape {
         // STACK-allocated owner does not release its fields through any
         // destructor, so the value would be orphaned without an explicit
         // free at its last use.
-        EscapeStatus rhsPromoted = maxEscape(baseEsc, EscapeStatus.HEAP);
+        EscapeStatus rhsPromoted = maxEscape(baseEsc, storeFloor(base));
         markEscaped(rhs, rhsPromoted);
 
         EscapeStatus rhsEsc   = valueEscapeStatus(rhs);
@@ -356,7 +356,7 @@ public class IntraproceduralEscape {
         if (value == null) return;
 
         EscapeStatus arrayEsc = valueEscapeStatus(array);
-        EscapeStatus valuePromoted = maxEscape(arrayEsc, EscapeStatus.HEAP);
+        EscapeStatus valuePromoted = maxEscape(arrayEsc, storeFloor(array));
         markEscaped(value, valuePromoted);
 
         EscapeStatus valueEsc = valueEscapeStatus(value);
@@ -721,6 +721,16 @@ public class IntraproceduralEscape {
         if (status.ordinal() > existing.ordinal()) {
             map.put(field, status);
         }
+    }
+
+    private EscapeStatus storeFloor(Value container) {
+        if (container instanceof Parameter) return EscapeStatus.RETURN;
+        Set<AllocationSite> sites = aliasResult.getPointsTo(container).getSites();
+        if (sites.isEmpty()) return EscapeStatus.RETURN;
+        for (AllocationSite site : sites) {
+            if (!function.getName().equals(site.getMethodName())) return EscapeStatus.RETURN;
+        }
+        return EscapeStatus.HEAP;
     }
 
     private EscapeStatus maxEscape(EscapeStatus a, EscapeStatus b) {
