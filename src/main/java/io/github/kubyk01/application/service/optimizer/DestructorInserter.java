@@ -16,6 +16,7 @@ import io.github.kubyk01.domain.ir.*;
 import io.github.kubyk01.util.LlvmUtil;
 import lombok.Getter;
 import lombok.RequiredArgsConstructor;
+import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
 import org.objectweb.asm.Opcodes;
 
@@ -49,8 +50,11 @@ public class DestructorInserter {
      */
     private Set<Type> allocatedTypes = Collections.emptySet();
 
-  // todo refactor this  
+  // todo refactor this
   private Set<AllocationSite> staticFieldSites = Collections.emptySet();
+
+    @Setter
+    private Set<String> coAllocatedFields = Collections.emptySet();
 
     public void insert() {
         this.allocatedTypes = collectAllocatedTypes();
@@ -1522,6 +1526,7 @@ private void emitDestructionGuard(BasicBlock entry,
             String fieldOwner = field.getOwner();
             if (fieldOwner == null || fieldOwner.isEmpty()) fieldOwner = className;
             String fullFieldName = fieldOwner + "." + field.getName();
+            if (coAllocatedFields.contains(fullFieldName)) continue;
 
             Instruction getField = new Instruction(Opcode.GET_FIELD);
             getField.addOperand(thisParam);
@@ -1551,6 +1556,7 @@ private void emitDestructionGuard(BasicBlock entry,
             String fieldOwner = field.getOwner();
             if (fieldOwner == null || fieldOwner.isEmpty()) fieldOwner = className;
             String fullFieldName = fieldOwner + "." + field.getName();
+            if (coAllocatedFields.contains(fullFieldName)) continue;
 
             Instruction getField = new Instruction(Opcode.GET_FIELD);
             getField.addOperand(thisParam);

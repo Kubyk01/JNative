@@ -2150,6 +2150,31 @@ public class LlvmFunctionEmitter {
                         .append(" = ptrtoint ").append(structType)
                         .append("* ").append(gepReg).append(" to i64\n");
 
+                if (inst.getOperands().size() >= 3
+                        && inst.getOperands().get(2) instanceof Constant inlineElemConst) {
+                    Value inlineLen = inst.getOperands().get(1);
+                    int inlineElemSize = getElementSizeOfType(
+                            elemTypeFromConst(inlineElemConst.getValue().toString()));
+                    String inlineLenRef = coerceSizeToInt(sb, inlineLen, getLlvmValue(sb, inlineLen));
+
+                    String inlineBytes = newAux("inline_arr_bytes");
+                    sb.append("  ").append(inlineBytes).append(" = mul i32 ")
+                            .append(inlineLenRef).append(", ").append(inlineElemSize).append("\n");
+
+                    String inlineBytes64 = newAux("inline_arr_bytes64");
+                    sb.append("  ").append(inlineBytes64).append(" = zext i32 ")
+                            .append(inlineBytes).append(" to i64\n");
+
+                    String inlineArrSize = newAux("inline_arr_size");
+                    sb.append("  ").append(inlineArrSize).append(" = add i64 ")
+                            .append(inlineBytes64).append(", 16\n");
+
+                    String totalSize = newAux("alloc_total_size");
+                    sb.append("  ").append(totalSize).append(" = add i64 ")
+                            .append(sizeReg).append(", ").append(inlineArrSize).append("\n");
+                    sizeReg = totalSize;
+                }
+
                 String allocReg = newAux("alloc");
                 sb.append("  ").append(allocReg)
                         .append(" = call i8* @calloc(i64 1, i64 ").append(sizeReg).append(")\n");
@@ -2198,9 +2223,30 @@ public class LlvmFunctionEmitter {
                         .append(totalSize64).append(", 16\n");
 
                 String allocReg = newAux("alloc");
-                sb.append("  ").append(allocReg)
-                        .append(" = call i8* @calloc(i64 1, i64 ")
-                        .append(allocSize).append(")\n");
+                if (inst.getOperands().size() >= 4
+                        && inst.getOperands().get(3) instanceof Constant inlineOwnerConst) {
+                    String ownerStruct = globalEmitter.getStructName(
+                            inlineOwnerConst.getValue().toString());
+                    String ownerPtr = asPointer(sb, inst.getOperands().get(2));
+
+                    String ownerEnd = newAux("inline_owner_end");
+                    sb.append("  ").append(ownerEnd)
+                            .append(" = getelementptr ").append(ownerStruct)
+                            .append(", ").append(ownerStruct).append("* null, i32 1\n");
+
+                    String ownerSize = newAux("inline_owner_size");
+                    sb.append("  ").append(ownerSize)
+                            .append(" = ptrtoint ").append(ownerStruct)
+                            .append("* ").append(ownerEnd).append(" to i64\n");
+
+                    sb.append("  ").append(allocReg)
+                            .append(" = getelementptr inbounds i8, i8* ").append(ownerPtr)
+                            .append(", i64 ").append(ownerSize).append("\n");
+                } else {
+                    sb.append("  ").append(allocReg)
+                            .append(" = call i8* @calloc(i64 1, i64 ")
+                            .append(allocSize).append(")\n");
+                }
 
                 String arrClassName = arrayClassDescriptorFor(elemTypeName);
                 if (arrClassName == null) arrClassName = "[Ljava/lang/Object;";
