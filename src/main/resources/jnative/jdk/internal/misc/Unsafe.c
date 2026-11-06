@@ -705,7 +705,6 @@ int64_t __jnative_fn_jdk_internal_misc_Unsafe_staticFieldOffset__Ljava_lang_refl
         cur = cur->superclass;
     }
 
-    dlclose(handle);
     return result;
 }
 

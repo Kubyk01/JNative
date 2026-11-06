@@ -129,7 +129,6 @@ static void *get_class_vtable(struct ReflectionClass *cls) {
  * memory exhaustion at the cost of the old slow path.
  */
 static void build_registry_maps(void) {
-    if (reflect_all_classes == NULL) return;
 
     size_t class_count = 0;
     while (reflect_all_classes[class_count] != NULL) class_count++;
@@ -181,7 +180,7 @@ static inline void ensure_registry_maps(void) {
  * the process.
  */
 static struct ReflectionClass *find_class_object_in_registry(void *ptr) {
-    if (ptr == NULL || reflect_all_classes == NULL) return NULL;
+    if (ptr == NULL) return NULL;
 
     ensure_registry_maps();
 

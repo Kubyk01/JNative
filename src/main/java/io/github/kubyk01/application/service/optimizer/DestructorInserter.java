@@ -49,6 +49,9 @@ public class DestructorInserter {
      */
     private Set<Type> allocatedTypes = Collections.emptySet();
 
+  // todo refactor this  
+  private Set<AllocationSite> staticFieldSites = Collections.emptySet();
+
     public void insert() {
         this.allocatedTypes = collectAllocatedTypes();
         log.debug("DestructorInserter: {} distinct allocated type(s)",
@@ -216,6 +219,13 @@ public class DestructorInserter {
             log.warn("DestructorInserter: no live-out map was published; "
                 + "field-overwrite releases will not be emitted.");
             return 0;
+        }
+
+        staticFieldSites = new HashSet<>();
+        for (PointsToSet pts : aliasResult.getGraph().getStaticFieldPointsToMap().values()) {
+            for (AllocationSite site : pts.getSites()) {
+                if (site != AllocationSite.UNKNOWN) staticFieldSites.add(site);
+            }
         }
 
         Deque<BasicBlock> pending = new ArrayDeque<>();
@@ -929,6 +939,11 @@ public class DestructorInserter {
         // ------------------------------------------------------------------
         if (fieldSites.isEmpty() || fieldSites.containsUnknown()) {
             return false;
+        }
+        for (AllocationSite site : fieldSites.getSites()) {
+            if (staticFieldSites.contains(site)) {
+                return false;
+            }
         }
 
         // ------------------------------------------------------------------

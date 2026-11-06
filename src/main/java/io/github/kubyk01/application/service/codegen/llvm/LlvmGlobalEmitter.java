@@ -73,7 +73,7 @@ public class LlvmGlobalEmitter {
      * ReflectionClass}. Fields of {@code java.lang.Class} that the
      * emitter has not enumerated land here.
      */
-    private static final int CLASS_RESERVED_OFFSET_START = 152;
+    private static final int CLASS_RESERVED_OFFSET_START = 160;
 
     /**
      * Authoritative mapping from {@code java.lang.Class} instance-field names to
@@ -142,7 +142,8 @@ public class LlvmGlobalEmitter {
             Map.entry("genericInfo", 120),   // Object                | null
             Map.entry("reflectionData", 128),   // SoftReference         | null
             Map.entry("classValueMap", 136),   // ClassValue            | null
-            Map.entry("enumConstantDirectory", 144));
+            Map.entry("enumConstantDirectory", 144),
+            Map.entry("primitive", 152));
     }
 
     /**
@@ -2790,6 +2791,7 @@ public class LlvmGlobalEmitter {
                 case "module" -> Type.reference("java/lang/Module");
                 case "annotationData", "enumConstantDirectory" -> Type.reference("java/util/Map");
                 case "classValueMap" -> Type.reference("java/lang/ClassValue");
+                case "primitive" -> Type.BOOLEAN;
                 default -> Type.reference("java/lang/Object");
             };
         }
@@ -3509,7 +3511,7 @@ public class LlvmGlobalEmitter {
                 .append(", i8* null")  // [17] reflectionData
                 .append(", i8* null")  // [18] classValueMap
                 .append(", i8* null")  // [19] enumConstantDirectory
-                .append(", i8* null")  // [20] reserved[0]
+                .append(isPrimitive ? ", i8* inttoptr (i64 1 to i8*)" : ", i8* null")
                 .append(", i8* null")  // [21] reserved[1]
                 .append(", i8* null")  // [22] reserved[2]
                 .append(", i8* null")  // [23] reserved[3]
@@ -3535,6 +3537,8 @@ public class LlvmGlobalEmitter {
         sb.append(generateSymbolClassMap(strConsts, classVarNames));
         sb.append(generateClassFileVersionMap(classVarNames));
         sb.append(generateCallerSensitiveSymbols(strConsts));
+        sb.append(generateClassIntConstants(strConsts,
+            "jnative_systemprops_raw_constants", "jdk/internal/util/SystemProps$Raw"));
 
         sb.append(strConsts);
         return sb.toString();
@@ -3851,6 +3855,26 @@ public class LlvmGlobalEmitter {
         sb.append("]\n");
         sb.append("@jnative_class_file_versions_size = constant i64 ")
             .append(versions.size()).append("\n");
+        return sb.toString();
+    }
+
+    private String generateClassIntConstants(StringBuilder strConsts, String symbol, String className) {
+        List<String> rows = new ArrayList<>();
+        ClassNode cn = resolver.getClassNode(className);
+        if (cn != null && cn.getFields() != null) {
+            for (FieldNode f : cn.getFields()) {
+                int required = Opcodes.ACC_STATIC | Opcodes.ACC_FINAL;
+                if ((f.getAccess() & required) != required) continue;
+                if (!(f.getConstantValue() instanceof Integer value)) continue;
+                rows.add("  { i8*, i32 } { i8* " + ensureStringConstantPtr(strConsts, f.getName())
+                    + ", i32 " + value + " },\n");
+            }
+        }
+        StringBuilder sb = new StringBuilder();
+        sb.append("@").append(symbol).append(" = constant [").append(rows.size() + 1)
+            .append(" x { i8*, i32 }] [\n");
+        rows.forEach(sb::append);
+        sb.append("  { i8*, i32 } zeroinitializer\n]\n");
         return sb.toString();
     }
 

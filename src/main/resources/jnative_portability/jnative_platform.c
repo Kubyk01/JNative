@@ -2,13 +2,8 @@
 
 #include "jnative_platform.h"
 
-void* jn_dlsym_default = NULL;
-
-static void __attribute__((constructor))
-_jn_init_dlsym_default(void) {
-    HMODULE h = GetModuleHandleA(NULL);
-    jn_dlsym_default = (void*)h;
-}
+extern IMAGE_DOS_HEADER __ImageBase;
+void* jn_dlsym_default = &__ImageBase;
 
 int jn_cpu_count(void) {
     DWORD n = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);

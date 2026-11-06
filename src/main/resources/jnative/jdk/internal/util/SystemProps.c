@@ -48,7 +48,7 @@
 #define HASHMAP_LOADFACTOR_OFF 52
 
 static struct ReflectionClass* find_class(const char* name) {
-    if (!name || reflect_all_classes == NULL) return NULL;
+    if (!name) return NULL;
     struct ReflectionClass** pp = reflect_all_classes;
     while (*pp) {
         const char* n = (*pp)->cname;
@@ -68,7 +68,6 @@ static void* lookup_class_vtable(struct ReflectionClass* cls) {
     void* handle = jn_dlsym_default;
     if (!handle) return NULL;
     void** type_info = (void**)jn_dlsym_default( buf);
-    dlclose(handle);
     return type_info ? type_info[0] : NULL;
 }
 
@@ -240,85 +239,28 @@ static void resolve_locale(char* lang, size_t langsz,
     }
 }
 
-/*
- * -------------------------------------------------------------------------
- *  Positional layout of Raw.platformProperties()
- * -------------------------------------------------------------------------
- *
- * The reference JDK's SystemProps.initProperties() reads the array
- * returned by this native positionally, against the parallel string
- * table RAW_PLATFORM_PROPERTIES declared on the Java side:
- *
- *     String[] platformProps = Raw.platformProperties();
- *     for (int i = 0; i < RAW_PLATFORM_PROPERTIES.length; i++) {
- *         if (platformProps[i] != null) {
- *             put(props, RAW_PLATFORM_PROPERTIES[i], platformProps[i], false);
- *         }
- *     }
- *
- * Each array slot is the VALUE of one property; the corresponding
- * property NAME comes from the Java-side table at the same index. The
- * slot layout is therefore a plain "one value per property" vector, not
- * an alternating key/value sequence, and the array length must equal
- * RAW_PLATFORM_PROPERTIES.length exactly.
- *
- * RAW_FIXED_LENGTH must therefore be 39 — the number of entries in the
- * Java-side table — and every RAW_NDX_<name> below is the index of the
- * corresponding property inside that table. The order is frozen by the
- * JDK's own source file and cannot be permuted without breaking the
- * positional lookup on the Java side.
- *
- * The corresponding platform-property array entries are emitted by
- * SystemProps.Raw.platformProperties() at the bottom of this file, and
- * the RAW_NDX_<name> constants are consumed there.
- */
-#define RAW_NDX_display_country           0
-#define RAW_NDX_display_language          1
-#define RAW_NDX_display_script            2
-#define RAW_NDX_display_variant           3
-#define RAW_NDX_file_encoding             4
-#define RAW_NDX_file_separator            5
-#define RAW_NDX_format_country            6
-#define RAW_NDX_format_language           7
-#define RAW_NDX_format_script             8
-#define RAW_NDX_format_variant            9
-#define RAW_NDX_ftp_nonProxyHosts        10
-#define RAW_NDX_ftp_proxyHost            11
-#define RAW_NDX_ftp_proxyPort            12
-#define RAW_NDX_http_nonProxyHosts       13
-#define RAW_NDX_http_proxyHost           14
-#define RAW_NDX_http_proxyPort           15
-#define RAW_NDX_https_proxyHost          16
-#define RAW_NDX_https_proxyPort          17
-#define RAW_NDX_java_io_tmpdir           18
-#define RAW_NDX_line_separator           19
-#define RAW_NDX_os_arch                  20
-#define RAW_NDX_os_name                  21
-#define RAW_NDX_os_version               22
-#define RAW_NDX_path_separator           23
-#define RAW_NDX_socksNonProxyHosts       24
-#define RAW_NDX_socksProxyHost           25
-#define RAW_NDX_socksProxyPort           26
-#define RAW_NDX_stderr_encoding          27
-#define RAW_NDX_stdout_encoding          28
-#define RAW_NDX_sun_arch_abi             29
-#define RAW_NDX_sun_arch_data_model      30
-#define RAW_NDX_sun_cpu_endian           31
-#define RAW_NDX_sun_cpu_isalist          32
-#define RAW_NDX_sun_io_unicode_encoding  33
-#define RAW_NDX_sun_jnu_encoding         34
-#define RAW_NDX_sun_os_patch_level       35
-#define RAW_NDX_user_dir                 36
-#define RAW_NDX_user_home                37
-#define RAW_NDX_user_name                38
-#define RAW_FIXED_LENGTH                 39
+typedef struct {
+    const char* name;
+    int32_t     value;
+} JNativeClassIntConstant;
+
+extern const JNativeClassIntConstant jnative_systemprops_raw_constants[];
+
+static int32_t raw_constant(const char* name) {
+    for (const JNativeClassIntConstant* c = jnative_systemprops_raw_constants; c->name != NULL; c++) {
+        if (strcmp(c->name, name) == 0) return c->value;
+    }
+    return -1;
+}
+
+#define RAW_NDX(prop) raw_constant("_" #prop "_NDX")
 
 static void* make_string_array(int32_t len) {
     return jnative_ref_array_of_class(NULL, len, "[Ljava/lang/String;");
 }
 
 static void string_array_set(void* arr, int32_t index, const char* value) {
-    if (arr == NULL || value == NULL) return;
+    if (arr == NULL || value == NULL || index < 0) return;
     *(void**)((char*)arr + JAVA_ARR_HDR + (size_t)index * sizeof(void*)) =
         __jnative_make_string_obj(value, (int32_t)strlen(value));
 }
@@ -468,7 +410,6 @@ void* __jnative_fn_jdk_internal_util_SystemProps_Raw_cmdProperties___Ljava_util_
     *(int32_t*)((char*)map + HASHMAP_THRESHOLD_OFF)= 12;
     *(float*)((char*)map + HASHMAP_LOADFACTOR_OFF) = 0.75f;
 
-    dlclose(handle);
     return map;
 }
 
@@ -479,7 +420,7 @@ void* __jnative_fn_jdk_internal_util_SystemProps_Raw_cmdProperties___Ljava_util_
  *
  * Returns the platform-derived properties as a positional String[]
  * indexed against the Java-side RAW_PLATFORM_PROPERTIES table (see the
- * block of RAW_NDX_* constants above for the exact order).
+ * _<name>_NDX constants of SystemProps$Raw for the exact order).
  *
  * Each array slot carries the VALUE of one property. A slot whose value
  * is not available on this platform is left NULL, and the Java-side
@@ -488,7 +429,12 @@ void* __jnative_fn_jdk_internal_util_SystemProps_Raw_cmdProperties___Ljava_util_
  * mentioned at all".
  */
 void* __jnative_fn_jdk_internal_util_SystemProps_Raw_platformProperties____Ljava_lang_String_(void) {
-    void* arr = make_string_array(RAW_FIXED_LENGTH);
+    int32_t fixed_length = raw_constant("FIXED_LENGTH");
+    if (fixed_length < 0) {
+        fprintf(stderr, "jnative: fatal: SystemProps$Raw.FIXED_LENGTH not found\n");
+        abort();
+    }
+    void* arr = make_string_array(fixed_length);
     if (arr == NULL) {
         fprintf(stderr, "jnative: fatal: out of memory in platformProperties\n");
         abort();
@@ -506,34 +452,36 @@ void* __jnative_fn_jdk_internal_util_SystemProps_Raw_platformProperties____Ljava
     const char* cwd = getcwd(cwd_buf, sizeof(cwd_buf));
     if (cwd == NULL) cwd = "/";
 
-    string_array_set(arr, RAW_NDX_display_language, lang_buf);
-    string_array_set(arr, RAW_NDX_display_country,  country_buf);
-    string_array_set(arr, RAW_NDX_format_language,  lang_buf);
-    string_array_set(arr, RAW_NDX_format_country,   country_buf);
+    string_array_set(arr, RAW_NDX(display_language), lang_buf);
+    string_array_set(arr, RAW_NDX(display_country),  country_buf);
+    string_array_set(arr, RAW_NDX(format_language),  lang_buf);
+    string_array_set(arr, RAW_NDX(format_country),   country_buf);
 
-    string_array_set(arr, RAW_NDX_file_encoding,   "UTF-8");
-    string_array_set(arr, RAW_NDX_file_separator,  "/");
-    string_array_set(arr, RAW_NDX_java_io_tmpdir,
+    string_array_set(arr, RAW_NDX(file_encoding),   "UTF-8");
+    string_array_set(arr, RAW_NDX(native_encoding), "UTF-8");
+    string_array_set(arr, RAW_NDX(file_separator),  "/");
+    string_array_set(arr, RAW_NDX(java_io_tmpdir),
                      resolve_tmpdir(tmpdir_buf, sizeof(tmpdir_buf)));
-    string_array_set(arr, RAW_NDX_line_separator,  "\n");
-    string_array_set(arr, RAW_NDX_os_arch,         resolve_os_arch());
-    string_array_set(arr, RAW_NDX_os_name,         "Linux");
-    string_array_set(arr, RAW_NDX_os_version,      "");
-    string_array_set(arr, RAW_NDX_path_separator,  ":");
+    string_array_set(arr, RAW_NDX(line_separator),  "\n");
+    string_array_set(arr, RAW_NDX(os_arch),         resolve_os_arch());
+    string_array_set(arr, RAW_NDX(os_name),         "Linux");
+    string_array_set(arr, RAW_NDX(os_version),      "");
+    string_array_set(arr, RAW_NDX(path_separator),  ":");
 
-    string_array_set(arr, RAW_NDX_stderr_encoding, "UTF-8");
-    string_array_set(arr, RAW_NDX_stdout_encoding, "UTF-8");
-    string_array_set(arr, RAW_NDX_sun_arch_abi,    resolve_arch_abi());
-    string_array_set(arr, RAW_NDX_sun_arch_data_model, "64");
-    string_array_set(arr, RAW_NDX_sun_cpu_endian,  "little");
-    string_array_set(arr, RAW_NDX_sun_io_unicode_encoding, "UnicodeLittle");
-    string_array_set(arr, RAW_NDX_sun_jnu_encoding, "UTF-8");
-    string_array_set(arr, RAW_NDX_sun_os_patch_level, "unknown");
+    string_array_set(arr, RAW_NDX(stderr_encoding), "UTF-8");
+    string_array_set(arr, RAW_NDX(stdin_encoding),  "UTF-8");
+    string_array_set(arr, RAW_NDX(stdout_encoding), "UTF-8");
+    string_array_set(arr, RAW_NDX(sun_arch_abi),    resolve_arch_abi());
+    string_array_set(arr, RAW_NDX(sun_arch_data_model), "64");
+    string_array_set(arr, RAW_NDX(sun_cpu_endian),  "little");
+    string_array_set(arr, RAW_NDX(sun_io_unicode_encoding), "UnicodeLittle");
+    string_array_set(arr, RAW_NDX(sun_jnu_encoding), "UTF-8");
+    string_array_set(arr, RAW_NDX(sun_os_patch_level), "unknown");
 
-    string_array_set(arr, RAW_NDX_user_dir,        cwd);
-    string_array_set(arr, RAW_NDX_user_home,
+    string_array_set(arr, RAW_NDX(user_dir),        cwd);
+    string_array_set(arr, RAW_NDX(user_home),
                      resolve_user_home(home_buf, sizeof(home_buf)));
-    string_array_set(arr, RAW_NDX_user_name,
+    string_array_set(arr, RAW_NDX(user_name),
                      resolve_user_name(user_buf, sizeof(user_buf)));
 
     return arr;
@@ -756,6 +704,5 @@ void* __jnative_make_bootstrap_props(
 
     *(int64_t*)((char*)chm + chm_basecount_off) = (int64_t)entry_count;
 
-    dlclose(handle);
     return props;
 }

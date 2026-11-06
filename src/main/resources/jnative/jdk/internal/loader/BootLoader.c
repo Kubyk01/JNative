@@ -16,7 +16,7 @@ void* __jnative_fn_jdk_internal_loader_BootLoader_getSystemPackageNames____Ljava
     }
 
     ReflectionClass** pp = reflect_all_classes;
-    while (pp != NULL && *pp != NULL) {
+    while (*pp != NULL) {
         const char* clsName = (*pp)->cname;
         pp++;
 

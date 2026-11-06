@@ -50,3 +50,20 @@ void __jnative_fn_java_lang_StackStreamFactory_AbstractStackWalker_setContinuati
     (void)frames;
     (void)continuation;
 }
+void* __jnative_fn_java_lang_StackStreamFactory_AbstractStackWalker_callStackWalk__IILjdk_internal_vm_ContinuationScope_Ljdk_internal_vm_Continuation_II_Ljava_lang_Object__Ljava_lang_Object_(
+        void* self, int32_t mode, int32_t skipFrames, void* contScope, void* continuation,
+        int32_t bufferSize, int32_t startIndex, void* frames)
+{
+    (void)self; (void)mode; (void)skipFrames; (void)contScope; (void)continuation;
+    (void)bufferSize; (void)startIndex; (void)frames;
+    return (void*)0;
+}
+
+int32_t __jnative_fn_java_lang_StackStreamFactory_AbstractStackWalker_fetchStackFrames__IJIII_Ljava_lang_Object__I(
+        void* self, int32_t mode, int64_t anchor, int32_t lastBatchFrameCount,
+        int32_t bufferSize, int32_t startIndex, void* frames)
+{
+    (void)self; (void)mode; (void)anchor; (void)lastBatchFrameCount;
+    (void)bufferSize; (void)startIndex; (void)frames;
+    return 0;
+}

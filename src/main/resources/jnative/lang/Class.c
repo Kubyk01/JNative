@@ -170,7 +170,6 @@ static void** lookup_type_info(struct ReflectionClass* cls) {
     void* handle = jn_dlsym_default;
     if (!handle) return NULL;
     void** type_info = (void**)jn_dlsym_default( symbol);
-    dlclose(handle);
     return type_info;
 }
 
@@ -545,13 +544,7 @@ int __jnative_fn_java_lang_Class_isArray___Z(void* this_cls) {
 
 int __jnative_fn_java_lang_Class_isPrimitive___Z(void* this_cls) {
     if (this_cls == NULL) return 0;
-    const char* name = ((struct ReflectionClass*)this_cls)->cname;
-    if (!name) return 0;
-    return strcmp(name, "boolean") == 0 || strcmp(name, "byte") == 0 ||
-           strcmp(name, "short")   == 0 || strcmp(name, "char") == 0 ||
-           strcmp(name, "int")     == 0 || strcmp(name, "long") == 0 ||
-           strcmp(name, "float")   == 0 || strcmp(name, "double") == 0 ||
-           strcmp(name, "void")    == 0;
+    return ((struct ReflectionClass*)this_cls)->primitive != NULL;
 }
 
 /* ============================================================================

@@ -47,11 +47,6 @@
 
 void* jn_dlsym_default = NULL;
 
-static void __attribute__((constructor))
-_jn_init_dlsym_default_posix(void) {
-    jn_dlsym_default = dlopen(NULL, RTLD_LAZY);
-}
-
 #endif /* !_WIN32 */
 
 /* ========================================================================
@@ -116,7 +111,6 @@ static uint32_t hash_class_name(const char* s) {
 }
 
 static void build_class_name_map(void) {
-    if (reflect_all_classes == NULL) return;
 
     size_t count = 0;
     while (reflect_all_classes[count] != NULL) count++;
@@ -152,7 +146,6 @@ static void build_class_name_map(void) {
 
 ReflectionClass* jnative_class_by_name(const char* name) {
     if (name == NULL) return NULL;
-    if (reflect_all_classes == NULL) return NULL;
 
     jn_once(&class_name_map_once, build_class_name_map);
 
@@ -211,15 +204,14 @@ static uintptr_t     jnative_static_low  = 0;
 static uintptr_t     jnative_static_high = 0;
 
 #if defined(__linux__)
-static int jnative_collect_main_writable_segments(struct dl_phdr_info* info,
-                                                  size_t size, void* data) {
+static int jnative_collect_main_segments(struct dl_phdr_info* info,
+                                         size_t size, void* data) {
     (void)size;
     (void)data;
     if (info->dlpi_name != NULL && info->dlpi_name[0] != '\0') return 0;
     for (int i = 0; i < info->dlpi_phnum; i++) {
         const ElfW(Phdr)* ph = &info->dlpi_phdr[i];
         if (ph->p_type != PT_LOAD) continue;
-        if (!(ph->p_flags & PF_W)) continue;
         uintptr_t lo = (uintptr_t)info->dlpi_addr + (uintptr_t)ph->p_vaddr;
         uintptr_t hi = lo + (uintptr_t)ph->p_memsz;
         if (jnative_static_low  == 0 || lo < jnative_static_low)  jnative_static_low  = lo;
@@ -237,20 +229,10 @@ static void jnative_build_static_range(void) {
     if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
     PIMAGE_NT_HEADERS nt = (PIMAGE_NT_HEADERS)((char*)self + dos->e_lfanew);
     if (nt->Signature != IMAGE_NT_SIGNATURE) return;
-    PIMAGE_SECTION_HEADER sec = IMAGE_FIRST_SECTION(nt);
-    for (int i = 0; i < nt->FileHeader.NumberOfSections; i++) {
-        DWORD chars = sec[i].Characteristics;
-        if (!(chars & IMAGE_SCN_MEM_WRITE)) continue;
-        if (!(chars & (IMAGE_SCN_CNT_INITIALIZED_DATA
-                     | IMAGE_SCN_CNT_UNINITIALIZED_DATA))) continue;
-        uintptr_t lo = (uintptr_t)self + sec[i].VirtualAddress;
-        uintptr_t hi = lo + sec[i].Misc.VirtualSize;
-        if (lo == 0 || hi <= lo) continue;
-        if (jnative_static_low  == 0 || lo < jnative_static_low)  jnative_static_low  = lo;
-        if (jnative_static_high == 0 || hi > jnative_static_high) jnative_static_high = hi;
-    }
+    jnative_static_low  = (uintptr_t)self;
+    jnative_static_high = (uintptr_t)self + nt->OptionalHeader.SizeOfImage;
 #elif defined(__linux__)
-    dl_iterate_phdr(jnative_collect_main_writable_segments, NULL);
+    dl_iterate_phdr(jnative_collect_main_segments, NULL);
     {
         extern char __data_start[] __attribute__((weak));
         extern char _end[]        __attribute__((weak));
@@ -598,6 +580,13 @@ typedef struct ClinitEntry {
 } ClinitEntry;
 
 static void mark_abandoned_clinits(CatchContext* target);
+
+static JN_NORETURN void jn_catch_longjmp(void* buf) {
+#ifdef _WIN64
+    ((_JUMP_BUFFER*)buf)->Frame = 0;
+#endif
+    longjmp(*(jmp_buf*)buf, 1);
+}
 
 #define CLINIT_HASH_BUCKETS 1024
 
@@ -1474,6 +1463,7 @@ static void __jnative_install_fatal_handlers(void) {
 
 __attribute__((constructor))
 static void __jnative_auto_init(void) {
+    jn_dlsym_default = dlopen(NULL, RTLD_LAZY);
     jnative_build_static_range();
     __jnative_install_fatal_handlers();
     __jnative_run_all_initializers();
@@ -1492,7 +1482,6 @@ static JNativeVTable* __jnative_lookup_vtable_weak(const char* symbol) {
     void* handle = jn_dlsym_default;
     if (handle == NULL) return NULL;
     void* sym = dlsym(handle, symbol);
-    if (handle != (void*)-1) dlclose(handle);
     return (JNativeVTable*)sym;
 }
 
@@ -1712,7 +1701,7 @@ void __jnative_throw_exception_ctx(void* exc, const char* caller) {
     CatchContext* ctx = current_catch_ctx();
     if (ctx) {
         mark_abandoned_clinits(ctx);
-        longjmp(*(jmp_buf*)ctx->jmp_buf_ptr, 1);
+        jn_catch_longjmp(ctx->jmp_buf_ptr);
     }
     __jnative_log_unhandled_exception(exc, NULL, caller, NULL);
 }
@@ -1725,7 +1714,7 @@ void __jnative_throw_null_pointer_exception_ctx(const char* caller,
     CatchContext* ctx = current_catch_ctx();
     if (ctx) {
         mark_abandoned_clinits(ctx);
-        longjmp(*(jmp_buf*)ctx->jmp_buf_ptr, 1);
+        jn_catch_longjmp(ctx->jmp_buf_ptr);
     }
     __jnative_log_unhandled_exception(npe, "java.lang.NullPointerException",
                                       caller, var_desc);
@@ -1736,7 +1725,7 @@ void __jnative_throw_array_index_out_of_bounds_ctx(const char* caller) {
     void* exc = __jnative_make_array_index_out_of_bounds_exception(caller);
     current_exception = exc;
     CatchContext* ctx = current_catch_ctx();
-    if (ctx) { mark_abandoned_clinits(ctx); longjmp(*(jmp_buf*)ctx->jmp_buf_ptr, 1); }
+    if (ctx) { mark_abandoned_clinits(ctx); jn_catch_longjmp(ctx->jmp_buf_ptr); }
     __jnative_log_unhandled_exception(exc,
         "java.lang.ArrayIndexOutOfBoundsException", caller, NULL);
 }
@@ -1746,7 +1735,7 @@ void __jnative_throw_class_cast_exception_ctx(const char* caller) {
     void* exc = __jnative_make_class_cast_exception(caller);
     current_exception = exc;
     CatchContext* ctx = current_catch_ctx();
-    if (ctx) { mark_abandoned_clinits(ctx); longjmp(*(jmp_buf*)ctx->jmp_buf_ptr, 1); }
+    if (ctx) { mark_abandoned_clinits(ctx); jn_catch_longjmp(ctx->jmp_buf_ptr); }
     __jnative_log_unhandled_exception(exc,
         "java.lang.ClassCastException", caller, NULL);
 }
@@ -1756,7 +1745,7 @@ void __jnative_throw_arithmetic_exception_ctx(const char* caller) {
     void* exc = __jnative_make_arithmetic_exception(caller);
     current_exception = exc;
     CatchContext* ctx = current_catch_ctx();
-    if (ctx) { mark_abandoned_clinits(ctx); longjmp(*(jmp_buf*)ctx->jmp_buf_ptr, 1); }
+    if (ctx) { mark_abandoned_clinits(ctx); jn_catch_longjmp(ctx->jmp_buf_ptr); }
     __jnative_log_unhandled_exception(exc,
         "java.lang.ArithmeticException", caller, NULL);
 }
@@ -1795,7 +1784,7 @@ void __jnative_throw_io_ctx(const char* extra, const char* caller) {
     CatchContext* ctx = current_catch_ctx();
     if (ctx) {
         mark_abandoned_clinits(ctx);
-        longjmp(*(jmp_buf*)ctx->jmp_buf_ptr, 1);
+        jn_catch_longjmp(ctx->jmp_buf_ptr);
     }
     __jnative_log_unhandled_exception(exc, "java.io.IOException", caller, extra);
 }
@@ -1846,7 +1835,7 @@ void __jnative_throw_clone_not_supported_exception_ctx(const char* caller) {
     }
     current_exception = exc;
     CatchContext* ctx = current_catch_ctx();
-    if (ctx) { mark_abandoned_clinits(ctx); longjmp(*(jmp_buf*)ctx->jmp_buf_ptr, 1); }
+    if (ctx) { mark_abandoned_clinits(ctx); jn_catch_longjmp(ctx->jmp_buf_ptr); }
     __jnative_log_unhandled_exception(exc,
         "java.lang.CloneNotSupportedException", caller, NULL);
 }
@@ -1882,7 +1871,7 @@ void __jnative_throw_out_of_memory_error_ctx(const char* caller) {
     }
     current_exception = exc;
     CatchContext* ctx = current_catch_ctx();
-    if (ctx) { mark_abandoned_clinits(ctx); longjmp(*(jmp_buf*)ctx->jmp_buf_ptr, 1); }
+    if (ctx) { mark_abandoned_clinits(ctx); jn_catch_longjmp(ctx->jmp_buf_ptr); }
     __jnative_log_unhandled_exception(exc, "java.lang.OutOfMemoryError",
                                       caller, NULL);
 }
@@ -1938,7 +1927,6 @@ static uintptr_t jnative_hash_pointer(const void* p) {
 }
 
 static void jnative_build_mirror_set(void) {
-    if (reflect_all_classes == NULL) return;
     ReflectionClass** pp = reflect_all_classes;
     while (*pp != NULL) {
         const void* ptr = (const void*)*pp;

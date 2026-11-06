@@ -65,7 +65,6 @@ int32_t __jnative_fn_java_io_ObjectStreamClass_hasStaticInitializer__Ljava_lang_
     if (handle == NULL) return 0;
 
     void* sym = jn_dlsym_default( symbol);
-    dlclose(handle);
 
     return sym != NULL ? 1 : 0;
 }
