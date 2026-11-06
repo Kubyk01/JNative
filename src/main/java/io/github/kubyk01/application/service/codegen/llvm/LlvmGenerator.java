@@ -903,7 +903,8 @@ public class LlvmGenerator implements LlvmGeneratorPort {
         List<Parameter> params = func.getParameters();
         for (int i = 0; i < params.size(); i++) {
             if (i > 0) sb.append(", ");
-            sb.append(LlvmTypeMapper.toLlvmType(params.get(i).getType()));
+            Type pt = params.get(i).getType();
+            sb.append(LlvmTypeMapper.toLlvmType(func.getEntryBlock() == null ? LlvmTypeMapper.toCAbiType(pt) : pt));
         }
         sb.append(")\n");
         return sb.toString();

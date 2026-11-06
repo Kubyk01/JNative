@@ -1154,8 +1154,9 @@ public class LlvmGlobalEmitter {
             // inherited slot emits the same function-pointer type.
             StringBuilder params = new StringBuilder();
             params.append(LlvmTypeMapper.toLlvmType(Type.reference(overrideOwner[0])));
+            boolean overrideCAbi = module.getFunction(overrideName).getEntryBlock() == null;
             for (Type pt : mn.getParameterTypes()) {
-                params.append(", ").append(LlvmTypeMapper.toLlvmType(pt));
+                params.append(", ").append(LlvmTypeMapper.toLlvmType(overrideCAbi ? LlvmTypeMapper.toCAbiType(pt) : pt));
             }
             String ret = LlvmTypeMapper.toLlvmType(mn.getReturnType());
             return new ResolvedFn(overrideName, ret + " (" + params + ")*");
@@ -1294,8 +1295,10 @@ public class LlvmGlobalEmitter {
         String ret = LlvmTypeMapper.toLlvmType(mn.getReturnType());
         StringBuilder params = new StringBuilder();
         params.append(LlvmTypeMapper.toLlvmType(Type.reference(owner)));
+        Function resolved = module.getFunction(funcName);
+        boolean cAbi = resolved == null || resolved.getEntryBlock() == null;
         for (Type pt : mn.getParameterTypes()) {
-            params.append(", ").append(LlvmTypeMapper.toLlvmType(pt));
+            params.append(", ").append(LlvmTypeMapper.toLlvmType(cAbi ? LlvmTypeMapper.toCAbiType(pt) : pt));
         }
         return new ResolvedFn(funcName, ret + " (" + params + ")*");
     }
@@ -3769,7 +3772,8 @@ public class LlvmGlobalEmitter {
         List<Parameter> params = f.getParameters();
         for (int i = 0; i < params.size(); i++) {
             if (i > 0) sb.append(", ");
-            sb.append(LlvmTypeMapper.toLlvmType(params.get(i).getType()));
+            Type pt = params.get(i).getType();
+            sb.append(LlvmTypeMapper.toLlvmType(f.getEntryBlock() == null ? LlvmTypeMapper.toCAbiType(pt) : pt));
         }
         sb.append(")*");
         return sb.toString();
@@ -4048,10 +4052,22 @@ public class LlvmGlobalEmitter {
             argsCsv.append("i8* %obj");
             firstArg = false;
         }
+        Function target = module.getFunction(origFuncName);
+        boolean cAbi = target != null && target.getEntryBlock() == null;
         for (int i = 0; i < argLoads.size(); i++) {
             if (!firstArg) argsCsv.append(", ");
-            argsCsv.append(LlvmTypeMapper.toLlvmType(paramTypes.get(i)))
-                .append(" ").append(argLoads.get(i));
+            Type pt = paramTypes.get(i);
+            String arg = argLoads.get(i);
+            if (cAbi && LlvmTypeMapper.toCAbiType(pt) != pt) {
+                String wide = "%arg" + i + "_abi";
+                sb.append("  ").append(wide)
+                    .append(pt == Type.BOOLEAN || pt == Type.CHAR ? " = zext " : " = sext ")
+                    .append(LlvmTypeMapper.toLlvmType(pt)).append(" ").append(arg).append(" to i32\n");
+                pt = Type.INT;
+                arg = wide;
+            }
+            argsCsv.append(LlvmTypeMapper.toLlvmType(pt))
+                .append(" ").append(arg);
             firstArg = false;
         }
 

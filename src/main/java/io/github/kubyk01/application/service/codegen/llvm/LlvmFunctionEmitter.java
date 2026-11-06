@@ -1238,7 +1238,7 @@ public class LlvmFunctionEmitter {
                                 Value arg = argsForCall.get(i);
                                 Type paramType = (calleeForCall != null
                                         && i < calleeForCall.getParameters().size())
-                                        ? calleeForCall.getParameters().get(i).getType()
+                                        ? callParamType(calleeForCall, i)
                                         : arg.getType();
                                 String val = castValueToType(callSb, getLlvmValue(callSb, arg),
                                         arg.getType(), paramType);
@@ -1294,7 +1294,7 @@ public class LlvmFunctionEmitter {
                                     if (i > 0) argList.append(", ");
                                     Value arg = argsForCall.get(i);
                                     Type paramType = (calleeForCall != null && i < calleeForCall.getParameters().size())
-                                            ? calleeForCall.getParameters().get(i).getType()
+                                            ? callParamType(calleeForCall, i)
                                             : arg.getType();
                                     String val = castValueToType(callSb, getLlvmValue(callSb, arg), arg.getType(), paramType);
                                     argList.append(LlvmTypeMapper.toLlvmType(paramType))
@@ -1339,7 +1339,7 @@ public class LlvmFunctionEmitter {
                             if (i > 0) argList.append(", ");
                             Value arg = argsForCall.get(i);
                             Type paramType = (i < nativeFuncForCall.getParameters().size())
-                                    ? nativeFuncForCall.getParameters().get(i).getType()
+                                    ? callParamType(nativeFuncForCall, i)
                                     : arg.getType();
                             String val = castValueToType(callSb, getLlvmValue(callSb, arg), arg.getType(), paramType);
                             argList.append(LlvmTypeMapper.toLlvmType(paramType))
@@ -1375,7 +1375,7 @@ public class LlvmFunctionEmitter {
                             if (i > 0) argList.append(", ");
                             Value arg = argsForCall.get(i);
                             Type paramType = (i < nativeFuncForCall.getParameters().size())
-                                    ? nativeFuncForCall.getParameters().get(i).getType()
+                                    ? callParamType(nativeFuncForCall, i)
                                     : arg.getType();
                             String val = castValueToType(callSb, getLlvmValue(callSb, arg), arg.getType(), paramType);
                             argList.append(LlvmTypeMapper.toLlvmType(paramType)).append(" ").append(val);
@@ -1462,7 +1462,7 @@ public class LlvmFunctionEmitter {
                                 Value arg = argsForCall.get(i);
                                 Type paramType;
                                 if (calleeForCallFinal != null && i < calleeForCallFinal.getParameters().size()) {
-                                    paramType = calleeForCallFinal.getParameters().get(i).getType();
+                                    paramType = callParamType(calleeForCallFinal, i);
                                 } else if (i == 0) {
                                     paramType = receiverTypeFinal;
                                 } else if (i - 1 < paramTypesFinal.size()) {
@@ -1597,7 +1597,7 @@ public class LlvmFunctionEmitter {
                         Value arg = argsForCall.get(i);
                         Type paramType;
                         if (i == 0) paramType = receiverTypeFinal;
-                        else if (i - 1 < paramTypesFinal.size()) paramType = paramTypesFinal.get(i - 1);
+                        else if (i - 1 < paramTypesFinal.size()) paramType = LlvmTypeMapper.toCAbiType(paramTypesFinal.get(i - 1));
                         else paramType = arg.getType();
                         String val = castValueToType(callSb, getLlvmValue(callSb, arg), arg.getType(), paramType);
                         argList.append(LlvmTypeMapper.toLlvmType(paramType)).append(" ").append(val);
@@ -1704,7 +1704,7 @@ public class LlvmFunctionEmitter {
                                         if (i > 0) argList.append(", ");
                                         Value arg = argsForCall.get(i);
                                         Type paramType = (calleeForCall != null && i < calleeForCall.getParameters().size())
-                                                ? calleeForCall.getParameters().get(i).getType()
+                                                ? callParamType(calleeForCall, i)
                                                 : arg.getType();
                                         String val = castValueToType(callSb, getLlvmValue(callSb, arg), arg.getType(), paramType);
                                         argList.append(LlvmTypeMapper.toLlvmType(paramType))
@@ -1865,7 +1865,7 @@ public class LlvmFunctionEmitter {
                         Value arg = argsForCall.get(i);
                         Type paramType;
                         if (calleeForCall != null && i < calleeForCall.getParameters().size()) {
-                            paramType = calleeForCall.getParameters().get(i).getType();
+                            paramType = callParamType(calleeForCall, i);
                         } else {
                             paramType = arg.getType();
                         }
@@ -1928,7 +1928,7 @@ public class LlvmFunctionEmitter {
                                         if (i > 0) argList.append(", ");
                                         Value arg = argsForCall.get(i);
                                         Type paramType = (calleeForCall != null && i < calleeForCall.getParameters().size())
-                                                ? calleeForCall.getParameters().get(i).getType()
+                                                ? callParamType(calleeForCall, i)
                                                 : arg.getType();
                                         String val = castValueToType(callSb, getLlvmValue(callSb, arg),
                                                 arg.getType(), paramType);
@@ -2073,7 +2073,7 @@ public class LlvmFunctionEmitter {
                         Value arg = argsForCall.get(i);
                         Type paramType;
                         if (calleeForCall != null && i < calleeForCall.getParameters().size()) {
-                            paramType = calleeForCall.getParameters().get(i).getType();
+                            paramType = callParamType(calleeForCall, i);
                         } else {
                             paramType = arg.getType();
                         }
@@ -3616,6 +3616,11 @@ public class LlvmFunctionEmitter {
         }
 
         return "bitcast";
+    }
+
+    private static Type callParamType(Function callee, int i) {
+        Type t = callee.getParameters().get(i).getType();
+        return callee.getEntryBlock() == null ? LlvmTypeMapper.toCAbiType(t) : t;
     }
 
     private boolean isIntegerType(Type type) {

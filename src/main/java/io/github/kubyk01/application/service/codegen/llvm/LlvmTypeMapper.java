@@ -45,6 +45,11 @@ public class LlvmTypeMapper {
         return "i8*";
     }
 
+    public static Type toCAbiType(Type type) {
+        if (type == Type.BOOLEAN || type == Type.BYTE || type == Type.SHORT || type == Type.CHAR) return Type.INT;
+        return type;
+    }
+
     public static String toLlvmStruct(String className) {
         return "%struct." + sanitizeIdentifier(className);
     }
