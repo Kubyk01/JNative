@@ -31,7 +31,7 @@
 #include <direct.h>
 #include <signal.h>
 #include <errno.h>
-#include <BaseTsd.h>
+#include <basetsd.h>
 
 #ifndef PATH_MAX
 #define PATH_MAX MAX_PATH

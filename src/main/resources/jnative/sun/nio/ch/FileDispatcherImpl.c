@@ -517,6 +517,57 @@ int32_t __jnative_fn_sun_nio_ch_FileDispatcherImpl_setDirect0__Ljava_io_FileDesc
     return (int32_t)bps;
 }
 
+void __jnative_fn_sun_nio_ch_FileDispatcherImpl_init0___V(void)
+{
+}
+
+int32_t __jnative_fn_sun_nio_ch_FileDispatcherImpl_write0__Ljava_io_FileDescriptor_JI_I(
+        void* fdo, int64_t address, int32_t len)
+{
+    return __jnative_fn_sun_nio_ch_FileDispatcherImpl_write0__Ljava_io_FileDescriptor_JIZ_I(
+            fdo, address, len, 0);
+}
+
+int64_t __jnative_fn_sun_nio_ch_FileDispatcherImpl_writev0__Ljava_io_FileDescriptor_JI_J(
+        void* fdo, int64_t address, int32_t len)
+{
+    return __jnative_fn_sun_nio_ch_FileDispatcherImpl_writev0__Ljava_io_FileDescriptor_JIZ_J(
+            fdo, address, len, 0);
+}
+
+void __jnative_fn_sun_nio_ch_FileDispatcherImpl_force0__Ljava_io_FileDescriptor_Z_V(
+        void* fdo, int32_t metadata)
+{
+    __jnative_fn_sun_nio_ch_FileDispatcherImpl_force0__Ljava_io_FileDescriptor_Z_I(fdo, metadata);
+}
+
+void __jnative_fn_sun_nio_ch_FileDispatcherImpl_close0__Ljava_io_FileDescriptor_V(
+        void* fdo)
+{
+    __jnative_fn_sun_nio_ch_FileDispatcherImpl_close0__Ljava_io_FileDescriptor__V(fdo);
+}
+
+int32_t __jnative_fn_sun_nio_ch_FileDispatcherImpl_dup0__Ljava_io_FileDescriptor_I(
+        void* fdo)
+{
+    if (fdo == NULL) __jnative_throw_null_pointer_exception();
+    int32_t fd = jnative_fd_of(fdo);
+    int nd = (fd >= 0) ? _dup(fd) : -1;
+    if (nd < 0) {
+        __jnative_throw_exception(__jnative_construct_exception(
+            "vtable_java_io_IOException", "dup failed"));
+    }
+    return nd;
+}
+
+int64_t __jnative_fn_sun_nio_ch_FileDispatcherImpl_transferFrom0__Ljava_io_FileDescriptor_Ljava_io_FileDescriptor_JJZ_J(
+        void* src_fdo, void* dst_fdo, int64_t position, int64_t count,
+        int32_t append)
+{
+    (void)src_fdo; (void)dst_fdo; (void)position; (void)count; (void)append;
+    return IOS_UNSUPPORTED_CASE;
+}
+
 #else
 
 /* =========== portable FD and pread/pwrite/read/write wrappers =========== */
