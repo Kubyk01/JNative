@@ -364,7 +364,7 @@ public class Orchestrator implements OrchestratorPort {
 
         // --- 8. Destructor insertion + optimization -----------------------
         Set<String> coAllocatedFields = new ArrayCoAllocator(module, resolver, aliasResult,
-                escapeResult, lifetimeResult, analysis.getReflectInfo().getAllClasses()).apply();
+                escapeResult, lifetimeResult, analysis.getReflectInfo()).apply();
 
         DestructorInserter inserter = new DestructorInserter(module, resolver, lifetimeResult,
                 aliasResult.getAllocationSiteToValue(), aliasResult, escapeResult);
