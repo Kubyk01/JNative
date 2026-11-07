@@ -329,12 +329,6 @@ public class Compiler implements CompilerPort {
             List<Path> nativeLibs = collectNativeLibraries(module, resolver, target);
             Set<Path> nativeLibDirs = new LinkedHashSet<>();
             for (Path lib : nativeLibs) {
-                if (target.isWindows()) {
-                    linkCmd.add(lib.toString());
-                } else {
-                    linkCmd.add("-Wl,--no-as-needed");
-                    linkCmd.add(lib.toString());
-                }
                 Path parent = lib.toAbsolutePath().getParent();
                 if (parent != null) nativeLibDirs.add(parent);
             }
@@ -343,9 +337,6 @@ public class Compiler implements CompilerPort {
                 linkCmd.add("-Wl,--disable-new-dtags");
                 linkCmd.add("-Wl,-rpath,$ORIGIN");
                 linkCmd.add("-Wl,-rpath," + new File(".").getAbsolutePath());
-                for (Path dir : nativeLibDirs) {
-                    linkCmd.add("-Wl,-rpath," + dir);
-                }
             }
 
             System.out.println("Linking for target " + target.triple() + "...");
@@ -1580,115 +1571,79 @@ public class Compiler implements CompilerPort {
                                              TargetPlatform target)
             throws IOException {
 
-        Set<String> wanted = new HashSet<>();
+        boolean usesJni = false;
         for (io.github.kubyk01.domain.ir.Function f : module.getFunctions()) {
-            if (f.isJniNative()) wanted.add(f.getName());
+            if (f.isJniNative()) {
+                usesJni = true;
+                break;
+            }
         }
-        if (wanted.isEmpty()) return List.of();
-
-        List<Path> candidates = new ArrayList<>();
+        if (!usesJni) return List.of();
 
         Path extractDir = Files.createTempDirectory("jnative-natives-");
         extractDir.toFile().deleteOnExit();
-        scanClasspathJarsForNatives(target, extractDir, candidates);
-
-        Set<String> stillWanted = new HashSet<>(wanted);
         List<Path> result = new ArrayList<>();
-        Collections.sort(candidates);
-
-        for (Path lib : candidates) {
-            if (stillWanted.isEmpty()) break;
-            Set<String> exported = readExportedSymbols(lib, target);
-            Set<String> overlap = new HashSet<>(exported);
-            overlap.retainAll(stillWanted);
-            if (overlap.isEmpty()) continue;
-            result.add(lib);
-            stillWanted.removeAll(overlap);
-            log.info("Native library {} provides {} required JNI symbol(s)",
-                    lib, overlap.size());
+        Set<Path> jars = new LinkedHashSet<>(resolver.getScannedJars());
+        for (Path jar : jars) {
+            extractNativeLibraries(jar, target, extractDir, result);
         }
-
-        if (!stillWanted.isEmpty()) {
-            log.warn("{} JNI symbol(s) have neither a JNative C implementation "
-                            + "under jnative/** nor a matching platform library under "
-                            + "META-INF/native/. The link step will fail. Missing "
-                            + "symbols: {}",
-                    stillWanted.size(),
-                    stillWanted.stream().limit(5).collect(Collectors.joining(", ")));
-        }
+        Collections.sort(result);
         return result;
     }
 
-    private Set<String> readExportedSymbols(Path lib, TargetPlatform target)
-            throws IOException {
-        if (target.isWindows()) {
-            return PeSymbolReader.read(lib);
-        }
-        try {
-            return ElfSymbolReader.read(lib);
-        } catch (Throwable t) {
-            return readExportedSymbolsViaNm(lib);
-        }
-    }
-
-    private Set<String> readExportedSymbolsViaNm(Path lib) {
-        try {
-            Process p = new ProcessBuilder("nm", "-D", "--defined-only", lib.toString())
-                    .redirectErrorStream(true).start();
-            Set<String> syms = new HashSet<>();
-            try (var r = new java.io.BufferedReader(
-                    new java.io.InputStreamReader(p.getInputStream()))) {
-                String line;
-                while ((line = r.readLine()) != null) {
-                    int sp = line.lastIndexOf(' ');
-                    if (sp < 0 || sp + 1 >= line.length()) continue;
-                    String name = line.substring(sp + 1).trim();
-                    if (!name.isEmpty()) syms.add(name);
-                }
-            }
-            p.waitFor();
-            return syms;
-        } catch (Exception e) {
-            return Set.of();
-        }
-    }
-
-    private void scanClasspathJarsForNatives(TargetPlatform target,
-                                             Path extractDir,
-                                             List<Path> out) {
+    private void extractNativeLibraries(Path jar, TargetPlatform target,
+                                        Path extractDir, List<Path> out) {
         String suffix = target.nativeLibrarySuffix();
-
-        String cp = System.getProperty("java.class.path", "");
-        Set<Path> jars = new LinkedHashSet<>();
-        for (String entry : cp.split(File.pathSeparator)) {
-            if (entry.isEmpty()) continue;
-            Path p = Paths.get(entry);
-            if (Files.isRegularFile(p) && entry.endsWith(".jar")) {
-                jars.add(p);
+        try (JarFile jf = new JarFile(jar.toFile())) {
+            Enumeration<JarEntry> entries = jf.entries();
+            while (entries.hasMoreElements()) {
+                JarEntry e = entries.nextElement();
+                String n = e.getName();
+                if (e.isDirectory() || !n.endsWith(suffix)) continue;
+                if (!n.contains("native/") && !n.contains("natives/")) continue;
+                if (!matchesTargetArch(n, target)) continue;
+                String base = n.substring(n.lastIndexOf('/') + 1);
+                Path dest = extractDir.resolve(base);
+                if (Files.exists(dest)) continue;
+                try (InputStream is = jf.getInputStream(e)) {
+                    Files.copy(is, dest, StandardCopyOption.REPLACE_EXISTING);
+                }
+                out.add(dest);
+                log.info("Extracted native library {} from {}", base, jar.getFileName());
             }
+        } catch (IOException e) {
+            log.debug("Skipping JAR {}: {}", jar, e.getMessage());
         }
+    }
 
-        for (Path jar : jars) {
-            try (JarFile jf = new JarFile(jar.toFile())) {
-                Enumeration<JarEntry> entries = jf.entries();
-                while (entries.hasMoreElements()) {
-                    JarEntry e = entries.nextElement();
-                    String n = e.getName();
-                    if (!n.endsWith(suffix)) continue;
-                    if (!n.contains("native/") && !n.contains("natives/")) continue;
-                    String base = n.substring(n.lastIndexOf('/') + 1);
-                    Path dest = extractDir.resolve(base);
-                    if (Files.exists(dest)) continue;
-                    try (InputStream is = jf.getInputStream(e)) {
-                        Files.copy(is, dest, StandardCopyOption.REPLACE_EXISTING);
-                        out.add(dest);
-                        log.info("Extracted native library {} from {}", base, jar);
+    private static final Map<String, List<String>> ARCH_ALIASES = Map.of(
+            "x86_64", List.of("x86_64", "amd64", "x64"),
+            "aarch64", List.of("aarch64", "arm64", "aarch_64"),
+            "i686", List.of("i686", "i386", "x86", "x86_32"),
+            "arm", List.of("arm", "armv7", "armhf", "arm32"),
+            "ppc64le", List.of("ppc64le"),
+            "s390x", List.of("s390x"),
+            "riscv64", List.of("riscv64"),
+            "loongarch64", List.of("loongarch64"));
+
+    private static boolean matchesTargetArch(String entry, TargetPlatform target) {
+        String arch = target.triple().split("-")[0].toLowerCase(Locale.ROOT);
+        if (arch.matches("i[3-6]86")) arch = "i686";
+        if (arch.startsWith("arm") && !arch.equals("arm64")) arch = "arm";
+        if (arch.equals("arm64")) arch = "aarch64";
+        String[] tokens = entry.toLowerCase(Locale.ROOT).split("[/\\\\.-]");
+        String matched = null;
+        for (Map.Entry<String, List<String>> a : ARCH_ALIASES.entrySet()) {
+            for (String alias : a.getValue()) {
+                for (String t : tokens) {
+                    if (t.equals(alias) || t.endsWith("_" + alias)) {
+                        if (a.getKey().equals(arch)) return true;
+                        matched = a.getKey();
                     }
                 }
-            } catch (IOException e) {
-                log.debug("Skipping JAR {}: {}", jar, e.getMessage());
             }
         }
+        return matched == null;
     }
 
     // =====================================================================

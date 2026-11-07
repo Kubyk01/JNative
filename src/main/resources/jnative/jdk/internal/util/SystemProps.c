@@ -128,6 +128,43 @@ static const char* resolve_java_home(char* buf, size_t bufsz) {
     return buf;
 }
 
+static const char* resolve_library_path(char* buf, size_t bufsz) {
+    if (bufsz == 0) return "";
+    buf[0] = '\0';
+#if defined(_WIN32)
+    DWORD n = GetModuleFileNameA(NULL, buf, (DWORD)bufsz);
+    long len = (n > 0 && n < bufsz) ? (long)n : -1;
+    const char sep = ';';
+    const char* env = getenv("PATH");
+#else
+    long len = jn_readlink("/proc/self/exe", buf, bufsz - 1);
+    const char sep = ':';
+    const char* env = getenv("LD_LIBRARY_PATH");
+#endif
+    size_t pos = 0;
+    if (len > 0) {
+        buf[len] = '\0';
+        char* cut = NULL;
+        for (char* p = buf; *p != '\0'; p++) {
+            if (*p == '/' || *p == '\\') cut = p;
+        }
+        if (cut == buf) cut++;
+        if (cut != NULL) *cut = '\0';
+        pos = strlen(buf);
+    } else {
+        buf[0] = '\0';
+    }
+    if (env != NULL && env[0] != '\0') {
+        size_t elen = strlen(env);
+        if (pos > 0 && pos + 1 < bufsz) buf[pos++] = sep;
+        if (pos + elen >= bufsz) elen = bufsz - pos - 1;
+        memcpy(buf + pos, env, elen);
+        pos += elen;
+        buf[pos] = '\0';
+    }
+    return buf;
+}
+
 static const char* resolve_tmpdir(char* buf, size_t bufsz) {
     if (bufsz == 0) return "/tmp";
 
@@ -387,7 +424,12 @@ void* __jnative_fn_jdk_internal_util_SystemProps_Raw_cmdProperties___Ljava_util_
     char home_buf[PATH_MAX];
     const char* java_home = resolve_java_home(home_buf, sizeof(home_buf));
 
+    char libpath_buf[PATH_MAX * 4];
+    const char* libpath = resolve_library_path(libpath_buf, sizeof(libpath_buf));
+
     cmd_props_put(table, table_size, node_vtable, "java.home", java_home);
+    cmd_props_put(table, table_size, node_vtable, "java.library.path", libpath);
+    cmd_props_put(table, table_size, node_vtable, "sun.boot.library.path", libpath);
     cmd_props_put(table, table_size, node_vtable,
                   "jdk.reflect.useNativeAccessorOnly", "true");
     cmd_props_put(table, table_size, node_vtable,
@@ -398,8 +440,8 @@ void* __jnative_fn_jdk_internal_util_SystemProps_Raw_cmdProperties___Ljava_util_
 
     *(void**)((char*)map + HASHMAP_TABLE_OFF)      = table;
     *(void**)((char*)map + HASHMAP_ENTRYSET_OFF)   = NULL;
-    *(int32_t*)((char*)map + HASHMAP_SIZE_OFF)     = 3;
-    *(int32_t*)((char*)map + HASHMAP_MODCOUNT_OFF) = 3;
+    *(int32_t*)((char*)map + HASHMAP_SIZE_OFF)     = 5;
+    *(int32_t*)((char*)map + HASHMAP_MODCOUNT_OFF) = 5;
     *(int32_t*)((char*)map + HASHMAP_THRESHOLD_OFF)= 12;
     *(float*)((char*)map + HASHMAP_LOADFACTOR_OFF) = 0.75f;
 
@@ -638,6 +680,8 @@ void* __jnative_make_bootstrap_props(
     const char* home = resolve_user_home(userhome_buf, sizeof(userhome_buf));
     char tmpdir_buf[PATH_MAX];
     const char* tmpdir = resolve_tmpdir(tmpdir_buf, sizeof(tmpdir_buf));
+    char libpath_buf[PATH_MAX * 4];
+    const char* libpath = resolve_library_path(libpath_buf, sizeof(libpath_buf));
     char lang_buf[32];
     char country_buf[32];
     resolve_locale(lang_buf, sizeof(lang_buf), country_buf, sizeof(country_buf));
@@ -647,6 +691,8 @@ void* __jnative_make_bootstrap_props(
     JNATIVE_INSERT("user.dir",  cwd);
     JNATIVE_INSERT("user.name", user);
     JNATIVE_INSERT("java.io.tmpdir", tmpdir);
+    JNATIVE_INSERT("java.library.path", libpath);
+    JNATIVE_INSERT("sun.boot.library.path", libpath);
     JNATIVE_INSERT("user.language", lang_buf);
     JNATIVE_INSERT("user.country",  country_buf);
 

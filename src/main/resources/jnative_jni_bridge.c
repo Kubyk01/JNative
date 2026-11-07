@@ -1253,18 +1253,90 @@ IMPL_ELEMS(Double,  8)
 
 /* ---- RegisterNatives / monitors / VM ------------------------------- */
 
+typedef struct {
+    const char* name;
+    const char* signature;
+    void*       fnPtr;
+} JNINativeMethodRec;
+
+typedef struct JNRegisteredNative {
+    ReflectionClass*           cls;
+    char*                      name;
+    char*                      sig;
+    void*                      fn;
+    struct JNRegisteredNative* next;
+} JNRegisteredNative;
+
+typedef struct JNLoadedLibrary {
+    void*                   handle;
+    struct JNLoadedLibrary* next;
+} JNLoadedLibrary;
+
+static JNRegisteredNative* jn_registered_natives = NULL;
+static JNLoadedLibrary*    jn_loaded_libraries   = NULL;
+static jn_mutex_t          jn_natives_lock       = JN_MUTEX_INITIALIZER;
+
+void* __jnative_get_jnienv(void);
+void* __jnative_get_javavm(void);
+
+static char* jn_strdup(const char* s) {
+    size_t n = strlen(s) + 1;
+    char* d = (char*)malloc(n);
+    if (d != NULL) memcpy(d, s, n);
+    return d;
+}
+
 static jint jn_RegisterNatives(void* env, jclass cls,
                                const void* methods, jint n) {
-    /* Registration is by link-time symbol name in this runtime (see
-     * BytecodeToIr.translateMethod). Dynamic registration would need a
-     * per-symbol override table wired into LlvmFunctionEmitter's JNI
-     * call path, which the emitter does not currently support. */
-    ENV_UNUSED; (void)cls; (void)methods; (void)n;
+    ENV_UNUSED;
+    if (cls == NULL || n < 0 || (methods == NULL && n > 0)) return JNI_ERR;
+    const JNINativeMethodRec* m = (const JNINativeMethodRec*)methods;
+    jn_mutex_lock(&jn_natives_lock);
+    for (jint i = 0; i < n; i++) {
+        if (m[i].name == NULL || m[i].signature == NULL || m[i].fnPtr == NULL) continue;
+        JNRegisteredNative* e = jn_registered_natives;
+        while (e != NULL) {
+            if (e->cls == (ReflectionClass*)cls
+                && strcmp(e->name, m[i].name) == 0
+                && strcmp(e->sig, m[i].signature) == 0) break;
+            e = e->next;
+        }
+        if (e != NULL) {
+            e->fn = m[i].fnPtr;
+            continue;
+        }
+        e = (JNRegisteredNative*)calloc(1, sizeof(JNRegisteredNative));
+        if (e == NULL) {
+            jn_mutex_unlock(&jn_natives_lock);
+            return JNI_ENOMEM;
+        }
+        e->cls  = (ReflectionClass*)cls;
+        e->name = jn_strdup(m[i].name);
+        e->sig  = jn_strdup(m[i].signature);
+        e->fn   = m[i].fnPtr;
+        e->next = jn_registered_natives;
+        jn_registered_natives = e;
+    }
+    jn_mutex_unlock(&jn_natives_lock);
     return JNI_OK;
 }
 
 static jint jn_UnregisterNatives(void* env, jclass cls) {
-    ENV_UNUSED; (void)cls;
+    ENV_UNUSED;
+    jn_mutex_lock(&jn_natives_lock);
+    JNRegisteredNative** pp = &jn_registered_natives;
+    while (*pp != NULL) {
+        JNRegisteredNative* e = *pp;
+        if (e->cls == (ReflectionClass*)cls) {
+            *pp = e->next;
+            free(e->name);
+            free(e->sig);
+            free(e);
+        } else {
+            pp = &e->next;
+        }
+    }
+    jn_mutex_unlock(&jn_natives_lock);
     return JNI_OK;
 }
 
@@ -1280,15 +1352,170 @@ static jint jn_MonitorExit(void* env, jobject obj) {
     return JNI_OK;
 }
 
+static jint jvm_DestroyJavaVM(void* vm) {
+    (void)vm;
+    return JNI_ERR;
+}
+
+static jint jvm_AttachCurrentThread(void* vm, void** penv, void* args) {
+    (void)vm; (void)args;
+    if (penv != NULL) *penv = __jnative_get_jnienv();
+    return JNI_OK;
+}
+
+static jint jvm_DetachCurrentThread(void* vm) {
+    (void)vm;
+    return JNI_OK;
+}
+
+static jint jvm_GetEnv(void* vm, void** penv, jint version) {
+    (void)vm; (void)version;
+    if (penv != NULL) *penv = __jnative_get_jnienv();
+    return JNI_OK;
+}
+
+static void* const jn_invoke_interface[8] = {
+    NULL, NULL, NULL,
+    (void*)jvm_DestroyJavaVM,
+    (void*)jvm_AttachCurrentThread,
+    (void*)jvm_DetachCurrentThread,
+    (void*)jvm_GetEnv,
+    (void*)jvm_AttachCurrentThread
+};
+
+static void* const* const jn_java_vm = jn_invoke_interface;
+
+void* __jnative_get_javavm(void) {
+    return (void*)&jn_java_vm;
+}
+
 static jint jn_GetJavaVM(void* env, void** vm) {
     ENV_UNUSED;
-    /* Single static JavaVM. AttachCurrentThread / DetachCurrentThread
-     * are no-ops because the runtime already maintains per-thread state
-     * for its own bookkeeping. */
-    static void* jn_vm_iface[8] = { NULL };
-    static void* jn_vm_ptr = jn_vm_iface;
-    if (vm) *vm = &jn_vm_ptr;
+    if (vm != NULL) *vm = __jnative_get_javavm();
     return JNI_OK;
+}
+
+int32_t __jnative_jni_register_library(void* handle, int32_t is_jni) {
+    if (handle == NULL) return 0;
+    jn_mutex_lock(&jn_natives_lock);
+    JNLoadedLibrary* l = jn_loaded_libraries;
+    while (l != NULL && l->handle != handle) l = l->next;
+    int fresh = (l == NULL);
+    if (fresh) {
+        l = (JNLoadedLibrary*)calloc(1, sizeof(JNLoadedLibrary));
+        if (l == NULL) {
+            jn_mutex_unlock(&jn_natives_lock);
+            return 0;
+        }
+        l->handle = handle;
+        l->next = jn_loaded_libraries;
+        jn_loaded_libraries = l;
+    }
+    jn_mutex_unlock(&jn_natives_lock);
+
+    if (fresh && is_jni) {
+        typedef jint (*jni_onload_fn)(void* vm, void* reserved);
+        jni_onload_fn onload = (jni_onload_fn)dlsym(handle, "JNI_OnLoad");
+        if (onload != NULL) {
+            jint version = onload(__jnative_get_javavm(), NULL);
+            if (version < 0) return 0;
+        }
+    }
+    return 1;
+}
+
+static void* jn_lookup_registered(const char* owner, const char* name, const char* desc) {
+    void* fn = NULL;
+    jn_mutex_lock(&jn_natives_lock);
+    for (JNRegisteredNative* e = jn_registered_natives; e != NULL; e = e->next) {
+        if (e->cls == NULL || e->cls->cname == NULL) continue;
+        if (strcmp(e->cls->cname, owner) != 0) continue;
+        if (strcmp(e->name, name) != 0) continue;
+        if (strcmp(e->sig, desc) != 0) continue;
+        fn = e->fn;
+        break;
+    }
+    jn_mutex_unlock(&jn_natives_lock);
+    return fn;
+}
+
+static void* jn_lookup_loaded(const char* short_sym, const char* long_sym) {
+    void* fn = NULL;
+    jn_mutex_lock(&jn_natives_lock);
+    for (JNLoadedLibrary* l = jn_loaded_libraries; l != NULL && fn == NULL; l = l->next) {
+        fn = dlsym(l->handle, short_sym);
+        if (fn == NULL) fn = dlsym(l->handle, long_sym);
+    }
+    jn_mutex_unlock(&jn_natives_lock);
+#ifdef RTLD_NEXT
+    if (fn == NULL) fn = dlsym(RTLD_NEXT, short_sym);
+    if (fn == NULL) fn = dlsym(RTLD_NEXT, long_sym);
+#endif
+    return fn;
+}
+
+JNATIVE_NORETURN static void jn_throw_unsatisfied_link(const char* owner,
+                                                      const char* name,
+                                                      const char* desc) {
+    char dotted[512];
+    size_t k = 0;
+    for (; owner[k] != '\0' && k < sizeof(dotted) - 1; k++) {
+        dotted[k] = owner[k] == '/' ? '.' : owner[k];
+    }
+    dotted[k] = '\0';
+    char msg[1024];
+    snprintf(msg, sizeof(msg), "'%s.%s%s'", dotted, name, desc);
+    static const char* const candidates[] = {
+        "vtable_java_lang_UnsatisfiedLinkError",
+        "vtable_java_lang_LinkageError",
+        "vtable_java_lang_Error",
+        "vtable_java_lang_RuntimeException",
+        NULL
+    };
+    for (int i = 0; candidates[i] != NULL; i++) {
+        void* exc = __jnative_construct_exception(candidates[i], msg);
+        if (exc != NULL) __jnative_throw_exception(exc);
+    }
+    fprintf(stderr, "jnative: UnsatisfiedLinkError: %s\n", msg);
+    abort();
+}
+
+static int64_t jn_zero_native_integral(void) {
+    return 0;
+}
+
+static double jn_zero_native_floating(void) {
+    return 0.0;
+}
+
+static int jn_is_jdk_class(const char* owner) {
+    static const char* const prefixes[] = {
+        "java/", "javax/", "jdk/", "sun/", "com/sun/", NULL
+    };
+    for (int i = 0; prefixes[i] != NULL; i++) {
+        if (strncmp(owner, prefixes[i], strlen(prefixes[i])) == 0) return 1;
+    }
+    return 0;
+}
+
+static void* jn_zero_native_for(const char* desc) {
+    const char* close = strrchr(desc, ')');
+    char ret = close != NULL ? close[1] : 'V';
+    if (ret == 'F' || ret == 'D') return (void*)jn_zero_native_floating;
+    return (void*)jn_zero_native_integral;
+}
+
+void* __jnative_jni_resolve(void** slot, const char* owner, const char* name,
+                            const char* desc, const char* short_sym,
+                            const char* long_sym) {
+    void* fn = *(void* volatile*)slot;
+    if (fn != NULL) return fn;
+    fn = jn_lookup_registered(owner, name, desc);
+    if (fn == NULL) fn = jn_lookup_loaded(short_sym, long_sym);
+    if (fn == NULL && jn_is_jdk_class(owner)) fn = jn_zero_native_for(desc);
+    if (fn == NULL) jn_throw_unsatisfied_link(owner, name, desc);
+    *(void* volatile*)slot = fn;
+    return fn;
 }
 
 /* ========================================================================
@@ -1411,115 +1638,187 @@ struct JNINativeInterface {
 };
 
 static const struct JNINativeInterface __jnative_jni_functions = {
-    NULL, NULL, NULL, NULL,
-    (void*)jn_GetVersion,
-    NULL,
-    (void*)jn_FindClass,
-    NULL, NULL, NULL,
-    (void*)jn_GetSuperclass,
-    (void*)jn_IsAssignableFrom,
-    NULL,
-    (void*)jn_Throw,
-    (void*)jn_ThrowNew,
-    (void*)jn_ExceptionOccurred,
-    (void*)jn_ExceptionDescribe,
-    (void*)jn_ExceptionClear,
-    NULL,
-    (void*)jn_PushLocalFrame,
-    (void*)jn_PopLocalFrame,
-    (void*)jn_NewGlobalRef,
-    (void*)jn_DeleteGlobalRef,
-    (void*)jn_DeleteLocalRef,
-    (void*)jn_IsSameObject,
-    (void*)jn_NewLocalRef,
-    (void*)jn_EnsureLocalCapacity,
-    (void*)jn_AllocObject,
-    (void*)jn_NewObject,
-    (void*)jn_NewObjectV,
-    (void*)jn_NewObjectA,
-    (void*)jn_GetObjectClass,
-    (void*)jn_IsInstanceOf,
-    (void*)jn_GetMethodID,
-    (void*)jn_CallObjectMethod, (void*)jn_CallObjectMethodV, (void*)jn_CallObjectMethodA,
-    (void*)jn_CallBooleanMethod, (void*)jn_CallBooleanMethodV, (void*)jn_CallBooleanMethodA,
-    (void*)jn_CallByteMethod, (void*)jn_CallByteMethodV, (void*)jn_CallByteMethodA,
-    (void*)jn_CallCharMethod, (void*)jn_CallCharMethodV, (void*)jn_CallCharMethodA,
-    (void*)jn_CallShortMethod, (void*)jn_CallShortMethodV, (void*)jn_CallShortMethodA,
-    (void*)jn_CallIntMethod, (void*)jn_CallIntMethodV, (void*)jn_CallIntMethodA,
-    (void*)jn_CallLongMethod, (void*)jn_CallLongMethodV, (void*)jn_CallLongMethodA,
-    (void*)jn_CallFloatMethod, (void*)jn_CallFloatMethodV, (void*)jn_CallFloatMethodA,
-    (void*)jn_CallDoubleMethod, (void*)jn_CallDoubleMethodV, (void*)jn_CallDoubleMethodA,
-    (void*)jn_CallVoidMethod, (void*)jn_CallVoidMethodV, (void*)jn_CallVoidMethodA,
-    /* CallNonvirtual* — not implemented */
-    NULL,NULL,NULL, NULL,NULL,NULL, NULL,NULL,NULL, NULL,NULL,NULL,
-    NULL,NULL,NULL, NULL,NULL,NULL, NULL,NULL,NULL, NULL,NULL,NULL,
-    NULL,NULL,NULL,
-    (void*)jn_GetFieldID,
-    (void*)jn_GetObjectField, (void*)jn_GetBooleanField, (void*)jn_GetByteField,
-    (void*)jn_GetCharField, (void*)jn_GetShortField, (void*)jn_GetIntField,
-    (void*)jn_GetLongField, (void*)jn_GetFloatField, (void*)jn_GetDoubleField,
-    (void*)jn_SetObjectField, (void*)jn_SetBooleanField, (void*)jn_SetByteField,
-    (void*)jn_SetCharField, (void*)jn_SetShortField, (void*)jn_SetIntField,
-    (void*)jn_SetLongField, (void*)jn_SetFloatField, (void*)jn_SetDoubleField,
-    (void*)jn_GetStaticMethodID,
-    (void*)jn_CallStaticObjectMethod, (void*)jn_CallStaticObjectMethodV, (void*)jn_CallStaticObjectMethodA,
-    (void*)jn_CallStaticBooleanMethod, (void*)jn_CallStaticBooleanMethodV, (void*)jn_CallStaticBooleanMethodA,
-    (void*)jn_CallStaticByteMethod, (void*)jn_CallStaticByteMethodV, (void*)jn_CallStaticByteMethodA,
-    (void*)jn_CallStaticCharMethod, (void*)jn_CallStaticCharMethodV, (void*)jn_CallStaticCharMethodA,
-    (void*)jn_CallStaticShortMethod, (void*)jn_CallStaticShortMethodV, (void*)jn_CallStaticShortMethodA,
-    (void*)jn_CallStaticIntMethod, (void*)jn_CallStaticIntMethodV, (void*)jn_CallStaticIntMethodA,
-    (void*)jn_CallStaticLongMethod, (void*)jn_CallStaticLongMethodV, (void*)jn_CallStaticLongMethodA,
-    (void*)jn_CallStaticFloatMethod, (void*)jn_CallStaticFloatMethodV, (void*)jn_CallStaticFloatMethodA,
-    (void*)jn_CallStaticDoubleMethod, (void*)jn_CallStaticDoubleMethodV, (void*)jn_CallStaticDoubleMethodA,
-    (void*)jn_CallStaticVoidMethod, (void*)jn_CallStaticVoidMethodV, (void*)jn_CallStaticVoidMethodA,
-    (void*)jn_GetStaticFieldID,
-    (void*)jn_GetStaticObjectField, (void*)jn_GetStaticBooleanField, (void*)jn_GetStaticByteField,
-    (void*)jn_GetStaticCharField, (void*)jn_GetStaticShortField, (void*)jn_GetStaticIntField,
-    (void*)jn_GetStaticLongField, (void*)jn_GetStaticFloatField, (void*)jn_GetStaticDoubleField,
-    (void*)jn_SetStaticObjectField, (void*)jn_SetStaticBooleanField, (void*)jn_SetStaticByteField,
-    (void*)jn_SetStaticCharField, (void*)jn_SetStaticShortField, (void*)jn_SetStaticIntField,
-    (void*)jn_SetStaticLongField, (void*)jn_SetStaticFloatField, (void*)jn_SetStaticDoubleField,
-    (void*)jn_NewString,
-    (void*)jn_GetStringLength,
-    (void*)jn_GetStringChars,
-    (void*)jn_ReleaseStringChars,
-    (void*)jn_NewStringUTF,
-    (void*)jn_GetStringUTFLength,
-    (void*)jn_GetStringUTFChars,
-    (void*)jn_ReleaseStringUTFChars,
-    (void*)jn_GetArrayLength,
-    (void*)jn_NewObjectArray,
-    (void*)jn_GetObjectArrayElement,
-    (void*)jn_SetObjectArrayElement,
-    (void*)jn_NewBooleanArray, (void*)jn_NewByteArray, (void*)jn_NewCharArray,
-    (void*)jn_NewShortArray, (void*)jn_NewIntArray, (void*)jn_NewLongArray,
-    (void*)jn_NewFloatArray, (void*)jn_NewDoubleArray,
-    (void*)jn_GetBooleanArrayElements, (void*)jn_GetByteArrayElements, (void*)jn_GetCharArrayElements,
-    (void*)jn_GetShortArrayElements, (void*)jn_GetIntArrayElements, (void*)jn_GetLongArrayElements,
-    (void*)jn_GetFloatArrayElements, (void*)jn_GetDoubleArrayElements,
-    (void*)jn_ReleaseBooleanArrayElements, (void*)jn_ReleaseByteArrayElements, (void*)jn_ReleaseCharArrayElements,
-    (void*)jn_ReleaseShortArrayElements, (void*)jn_ReleaseIntArrayElements, (void*)jn_ReleaseLongArrayElements,
-    (void*)jn_ReleaseFloatArrayElements, (void*)jn_ReleaseDoubleArrayElements,
-    (void*)jn_GetBooleanArrayRegion, (void*)jn_GetByteArrayRegion, (void*)jn_GetCharArrayRegion,
-    (void*)jn_GetShortArrayRegion, (void*)jn_GetIntArrayRegion, (void*)jn_GetLongArrayRegion,
-    (void*)jn_GetFloatArrayRegion, (void*)jn_GetDoubleArrayRegion,
-    (void*)jn_SetBooleanArrayRegion, (void*)jn_SetByteArrayRegion, (void*)jn_SetCharArrayRegion,
-    (void*)jn_SetShortArrayRegion, (void*)jn_SetIntArrayRegion, (void*)jn_SetLongArrayRegion,
-    (void*)jn_SetFloatArrayRegion, (void*)jn_SetDoubleArrayRegion,
-    (void*)jn_RegisterNatives,
-    (void*)jn_UnregisterNatives,
-    (void*)jn_MonitorEnter,
-    (void*)jn_MonitorExit,
-    (void*)jn_GetJavaVM,
-    /* GetStringRegion, GetStringUTFRegion, GetPrimitiveArrayCritical,
-     * ReleasePrimitiveArrayCritical, GetStringCritical, ReleaseStringCritical,
-     * NewWeakGlobalRef, DeleteWeakGlobalRef: not implemented */
-    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-    (void*)jn_ExceptionCheck,
-    /* NewDirectByteBuffer, GetDirectBufferAddress, GetDirectBufferCapacity,
-     * GetObjectRefType, GetModule: not implemented */
-    NULL, NULL, NULL, NULL, NULL,
-    NULL, NULL, NULL, NULL, NULL, NULL
+    .GetVersion = (void*)jn_GetVersion,
+    .FindClass = (void*)jn_FindClass,
+    .GetSuperclass = (void*)jn_GetSuperclass,
+    .IsAssignableFrom = (void*)jn_IsAssignableFrom,
+    .Throw = (void*)jn_Throw,
+    .ThrowNew = (void*)jn_ThrowNew,
+    .ExceptionOccurred = (void*)jn_ExceptionOccurred,
+    .ExceptionDescribe = (void*)jn_ExceptionDescribe,
+    .ExceptionClear = (void*)jn_ExceptionClear,
+    .PushLocalFrame = (void*)jn_PushLocalFrame,
+    .PopLocalFrame = (void*)jn_PopLocalFrame,
+    .NewGlobalRef = (void*)jn_NewGlobalRef,
+    .DeleteGlobalRef = (void*)jn_DeleteGlobalRef,
+    .DeleteLocalRef = (void*)jn_DeleteLocalRef,
+    .IsSameObject = (void*)jn_IsSameObject,
+    .NewLocalRef = (void*)jn_NewLocalRef,
+    .EnsureLocalCapacity = (void*)jn_EnsureLocalCapacity,
+    .AllocObject = (void*)jn_AllocObject,
+    .NewObject = (void*)jn_NewObject,
+    .NewObjectV = (void*)jn_NewObjectV,
+    .NewObjectA = (void*)jn_NewObjectA,
+    .GetObjectClass = (void*)jn_GetObjectClass,
+    .IsInstanceOf = (void*)jn_IsInstanceOf,
+    .GetMethodID = (void*)jn_GetMethodID,
+    .CallObjectMethod = (void*)jn_CallObjectMethod,
+    .CallObjectMethodV = (void*)jn_CallObjectMethodV,
+    .CallObjectMethodA = (void*)jn_CallObjectMethodA,
+    .CallBooleanMethod = (void*)jn_CallBooleanMethod,
+    .CallBooleanMethodV = (void*)jn_CallBooleanMethodV,
+    .CallBooleanMethodA = (void*)jn_CallBooleanMethodA,
+    .CallByteMethod = (void*)jn_CallByteMethod,
+    .CallByteMethodV = (void*)jn_CallByteMethodV,
+    .CallByteMethodA = (void*)jn_CallByteMethodA,
+    .CallCharMethod = (void*)jn_CallCharMethod,
+    .CallCharMethodV = (void*)jn_CallCharMethodV,
+    .CallCharMethodA = (void*)jn_CallCharMethodA,
+    .CallShortMethod = (void*)jn_CallShortMethod,
+    .CallShortMethodV = (void*)jn_CallShortMethodV,
+    .CallShortMethodA = (void*)jn_CallShortMethodA,
+    .CallIntMethod = (void*)jn_CallIntMethod,
+    .CallIntMethodV = (void*)jn_CallIntMethodV,
+    .CallIntMethodA = (void*)jn_CallIntMethodA,
+    .CallLongMethod = (void*)jn_CallLongMethod,
+    .CallLongMethodV = (void*)jn_CallLongMethodV,
+    .CallLongMethodA = (void*)jn_CallLongMethodA,
+    .CallFloatMethod = (void*)jn_CallFloatMethod,
+    .CallFloatMethodV = (void*)jn_CallFloatMethodV,
+    .CallFloatMethodA = (void*)jn_CallFloatMethodA,
+    .CallDoubleMethod = (void*)jn_CallDoubleMethod,
+    .CallDoubleMethodV = (void*)jn_CallDoubleMethodV,
+    .CallDoubleMethodA = (void*)jn_CallDoubleMethodA,
+    .CallVoidMethod = (void*)jn_CallVoidMethod,
+    .CallVoidMethodV = (void*)jn_CallVoidMethodV,
+    .CallVoidMethodA = (void*)jn_CallVoidMethodA,
+    .GetFieldID = (void*)jn_GetFieldID,
+    .GetObjectField = (void*)jn_GetObjectField,
+    .GetBooleanField = (void*)jn_GetBooleanField,
+    .GetByteField = (void*)jn_GetByteField,
+    .GetCharField = (void*)jn_GetCharField,
+    .GetShortField = (void*)jn_GetShortField,
+    .GetIntField = (void*)jn_GetIntField,
+    .GetLongField = (void*)jn_GetLongField,
+    .GetFloatField = (void*)jn_GetFloatField,
+    .GetDoubleField = (void*)jn_GetDoubleField,
+    .SetObjectField = (void*)jn_SetObjectField,
+    .SetBooleanField = (void*)jn_SetBooleanField,
+    .SetByteField = (void*)jn_SetByteField,
+    .SetCharField = (void*)jn_SetCharField,
+    .SetShortField = (void*)jn_SetShortField,
+    .SetIntField = (void*)jn_SetIntField,
+    .SetLongField = (void*)jn_SetLongField,
+    .SetFloatField = (void*)jn_SetFloatField,
+    .SetDoubleField = (void*)jn_SetDoubleField,
+    .GetStaticMethodID = (void*)jn_GetStaticMethodID,
+    .CallStaticObjectMethod = (void*)jn_CallStaticObjectMethod,
+    .CallStaticObjectMethodV = (void*)jn_CallStaticObjectMethodV,
+    .CallStaticObjectMethodA = (void*)jn_CallStaticObjectMethodA,
+    .CallStaticBooleanMethod = (void*)jn_CallStaticBooleanMethod,
+    .CallStaticBooleanMethodV = (void*)jn_CallStaticBooleanMethodV,
+    .CallStaticBooleanMethodA = (void*)jn_CallStaticBooleanMethodA,
+    .CallStaticByteMethod = (void*)jn_CallStaticByteMethod,
+    .CallStaticByteMethodV = (void*)jn_CallStaticByteMethodV,
+    .CallStaticByteMethodA = (void*)jn_CallStaticByteMethodA,
+    .CallStaticCharMethod = (void*)jn_CallStaticCharMethod,
+    .CallStaticCharMethodV = (void*)jn_CallStaticCharMethodV,
+    .CallStaticCharMethodA = (void*)jn_CallStaticCharMethodA,
+    .CallStaticShortMethod = (void*)jn_CallStaticShortMethod,
+    .CallStaticShortMethodV = (void*)jn_CallStaticShortMethodV,
+    .CallStaticShortMethodA = (void*)jn_CallStaticShortMethodA,
+    .CallStaticIntMethod = (void*)jn_CallStaticIntMethod,
+    .CallStaticIntMethodV = (void*)jn_CallStaticIntMethodV,
+    .CallStaticIntMethodA = (void*)jn_CallStaticIntMethodA,
+    .CallStaticLongMethod = (void*)jn_CallStaticLongMethod,
+    .CallStaticLongMethodV = (void*)jn_CallStaticLongMethodV,
+    .CallStaticLongMethodA = (void*)jn_CallStaticLongMethodA,
+    .CallStaticFloatMethod = (void*)jn_CallStaticFloatMethod,
+    .CallStaticFloatMethodV = (void*)jn_CallStaticFloatMethodV,
+    .CallStaticFloatMethodA = (void*)jn_CallStaticFloatMethodA,
+    .CallStaticDoubleMethod = (void*)jn_CallStaticDoubleMethod,
+    .CallStaticDoubleMethodV = (void*)jn_CallStaticDoubleMethodV,
+    .CallStaticDoubleMethodA = (void*)jn_CallStaticDoubleMethodA,
+    .CallStaticVoidMethod = (void*)jn_CallStaticVoidMethod,
+    .CallStaticVoidMethodV = (void*)jn_CallStaticVoidMethodV,
+    .CallStaticVoidMethodA = (void*)jn_CallStaticVoidMethodA,
+    .GetStaticFieldID = (void*)jn_GetStaticFieldID,
+    .GetStaticObjectField = (void*)jn_GetStaticObjectField,
+    .GetStaticBooleanField = (void*)jn_GetStaticBooleanField,
+    .GetStaticByteField = (void*)jn_GetStaticByteField,
+    .GetStaticCharField = (void*)jn_GetStaticCharField,
+    .GetStaticShortField = (void*)jn_GetStaticShortField,
+    .GetStaticIntField = (void*)jn_GetStaticIntField,
+    .GetStaticLongField = (void*)jn_GetStaticLongField,
+    .GetStaticFloatField = (void*)jn_GetStaticFloatField,
+    .GetStaticDoubleField = (void*)jn_GetStaticDoubleField,
+    .SetStaticObjectField = (void*)jn_SetStaticObjectField,
+    .SetStaticBooleanField = (void*)jn_SetStaticBooleanField,
+    .SetStaticByteField = (void*)jn_SetStaticByteField,
+    .SetStaticCharField = (void*)jn_SetStaticCharField,
+    .SetStaticShortField = (void*)jn_SetStaticShortField,
+    .SetStaticIntField = (void*)jn_SetStaticIntField,
+    .SetStaticLongField = (void*)jn_SetStaticLongField,
+    .SetStaticFloatField = (void*)jn_SetStaticFloatField,
+    .SetStaticDoubleField = (void*)jn_SetStaticDoubleField,
+    .NewString = (void*)jn_NewString,
+    .GetStringLength = (void*)jn_GetStringLength,
+    .GetStringChars = (void*)jn_GetStringChars,
+    .ReleaseStringChars = (void*)jn_ReleaseStringChars,
+    .NewStringUTF = (void*)jn_NewStringUTF,
+    .GetStringUTFLength = (void*)jn_GetStringUTFLength,
+    .GetStringUTFChars = (void*)jn_GetStringUTFChars,
+    .ReleaseStringUTFChars = (void*)jn_ReleaseStringUTFChars,
+    .GetArrayLength = (void*)jn_GetArrayLength,
+    .NewObjectArray = (void*)jn_NewObjectArray,
+    .GetObjectArrayElement = (void*)jn_GetObjectArrayElement,
+    .SetObjectArrayElement = (void*)jn_SetObjectArrayElement,
+    .NewBooleanArray = (void*)jn_NewBooleanArray,
+    .NewByteArray = (void*)jn_NewByteArray,
+    .NewCharArray = (void*)jn_NewCharArray,
+    .NewShortArray = (void*)jn_NewShortArray,
+    .NewIntArray = (void*)jn_NewIntArray,
+    .NewLongArray = (void*)jn_NewLongArray,
+    .NewFloatArray = (void*)jn_NewFloatArray,
+    .NewDoubleArray = (void*)jn_NewDoubleArray,
+    .GetBooleanArrayElements = (void*)jn_GetBooleanArrayElements,
+    .GetByteArrayElements = (void*)jn_GetByteArrayElements,
+    .GetCharArrayElements = (void*)jn_GetCharArrayElements,
+    .GetShortArrayElements = (void*)jn_GetShortArrayElements,
+    .GetIntArrayElements = (void*)jn_GetIntArrayElements,
+    .GetLongArrayElements = (void*)jn_GetLongArrayElements,
+    .GetFloatArrayElements = (void*)jn_GetFloatArrayElements,
+    .GetDoubleArrayElements = (void*)jn_GetDoubleArrayElements,
+    .ReleaseBooleanArrayElements = (void*)jn_ReleaseBooleanArrayElements,
+    .ReleaseByteArrayElements = (void*)jn_ReleaseByteArrayElements,
+    .ReleaseCharArrayElements = (void*)jn_ReleaseCharArrayElements,
+    .ReleaseShortArrayElements = (void*)jn_ReleaseShortArrayElements,
+    .ReleaseIntArrayElements = (void*)jn_ReleaseIntArrayElements,
+    .ReleaseLongArrayElements = (void*)jn_ReleaseLongArrayElements,
+    .ReleaseFloatArrayElements = (void*)jn_ReleaseFloatArrayElements,
+    .ReleaseDoubleArrayElements = (void*)jn_ReleaseDoubleArrayElements,
+    .GetBooleanArrayRegion = (void*)jn_GetBooleanArrayRegion,
+    .GetByteArrayRegion = (void*)jn_GetByteArrayRegion,
+    .GetCharArrayRegion = (void*)jn_GetCharArrayRegion,
+    .GetShortArrayRegion = (void*)jn_GetShortArrayRegion,
+    .GetIntArrayRegion = (void*)jn_GetIntArrayRegion,
+    .GetLongArrayRegion = (void*)jn_GetLongArrayRegion,
+    .GetFloatArrayRegion = (void*)jn_GetFloatArrayRegion,
+    .GetDoubleArrayRegion = (void*)jn_GetDoubleArrayRegion,
+    .SetBooleanArrayRegion = (void*)jn_SetBooleanArrayRegion,
+    .SetByteArrayRegion = (void*)jn_SetByteArrayRegion,
+    .SetCharArrayRegion = (void*)jn_SetCharArrayRegion,
+    .SetShortArrayRegion = (void*)jn_SetShortArrayRegion,
+    .SetIntArrayRegion = (void*)jn_SetIntArrayRegion,
+    .SetLongArrayRegion = (void*)jn_SetLongArrayRegion,
+    .SetFloatArrayRegion = (void*)jn_SetFloatArrayRegion,
+    .SetDoubleArrayRegion = (void*)jn_SetDoubleArrayRegion,
+    .RegisterNatives = (void*)jn_RegisterNatives,
+    .UnregisterNatives = (void*)jn_UnregisterNatives,
+    .MonitorEnter = (void*)jn_MonitorEnter,
+    .MonitorExit = (void*)jn_MonitorExit,
+    .GetJavaVM = (void*)jn_GetJavaVM,
+    .ExceptionCheck = (void*)jn_ExceptionCheck,
 };
 
 /* ========================================================================
@@ -1540,12 +1839,10 @@ static const struct JNINativeInterface __jnative_jni_functions = {
  */
 static const struct JNINativeInterface* const __jnative_jni_iface_ptr =
     &__jnative_jni_functions;
-static const void* __jnative_jni_env_ptr = &__jnative_jni_iface_ptr;
-
 void* __jnative_get_jnienv(void) {
-    return (void*)&__jnative_jni_env_ptr;
+    return (void*)&__jnative_jni_iface_ptr;
 }
 
 void* __jnative_get_thread_jnienv(void) {
-    return (void*)&__jnative_jni_env_ptr;
+    return (void*)&__jnative_jni_iface_ptr;
 }

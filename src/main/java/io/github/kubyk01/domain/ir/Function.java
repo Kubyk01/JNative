@@ -47,6 +47,12 @@ public class Function {
     @Setter
     private boolean staticJniNative;
 
+    @Setter
+    private String jniMethodName;
+
+    @Setter
+    private String jniDescriptor;
+
     public Function(String name, Type returnType) {
         this.name = name;
         this.returnType = returnType;

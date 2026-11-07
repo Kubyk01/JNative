@@ -104,6 +104,12 @@ public class DependencyResolver {
      */
     private volatile Path inputArchive;
 
+    private final List<Path> scannedJars = new java.util.concurrent.CopyOnWriteArrayList<>();
+
+    public List<Path> getScannedJars() {
+        return List.copyOf(scannedJars);
+    }
+
     /**
      * Lazy index of every .class entry that lives inside a nested jar of a
      * Spring Boot fat jar.
@@ -494,6 +500,7 @@ public class DependencyResolver {
      *                      class the resolver already knows about.
      */
     private void scanJar(Path jarPath, boolean skipExisting) throws IOException {
+        scannedJars.add(jarPath);
         try (JarFile jar = new JarFile(jarPath.toFile())) {
             Enumeration<JarEntry> entries = jar.entries();
             while (entries.hasMoreElements()) {

@@ -248,9 +248,26 @@ public class LlvmGenerator implements LlvmGeneratorPort {
                 moduleAvailable.add(f.getName());
             }
         }
+        boolean jniResolveDeclared = false;
         for (Function func : new ArrayList<>(module.getFunctions())) {
             if (func.getEntryBlock() == null
+                && func.isJniNative()
+                && func.getJniMethodName() != null
                 && moduleAvailable.add(func.getName())) {
+                if (!jniResolveDeclared) {
+                    moduleDecls.append("declare i8* @__jnative_jni_resolve(i8**, i8*, i8*, i8*, i8*, i8*)\n");
+                    jniResolveDeclared = true;
+                }
+                moduleDecls.append(emitJniTrampoline(func));
+                continue;
+            }
+            if (func.getEntryBlock() == null
+                && moduleAvailable.add(func.getName())) {
+                if (func.getName().startsWith("__jnative_fn_")
+                    && !func.getName().startsWith("__jnative_fn_java_lang_invoke_MethodHandle_invoke")) {
+                    moduleDecls.append(emitWeakNativeDefault(func));
+                    continue;
+                }
                 moduleDecls.append(emitDeclaration(func));
                 if (func.getName().startsWith("__jnative_fn_java_lang_invoke_MethodHandle_invoke")) {
                     classBodies.computeIfAbsent("java/lang/invoke/MethodHandle", k -> new StringBuilder())
@@ -708,29 +725,15 @@ public class LlvmGenerator implements LlvmGeneratorPort {
     private String buildExterns(String bodyContent,
                                 Map<String, GlobalDecl> knownGlobals,
                                 Module module) {
-        Set<String> used = new HashSet<>();
-        int i = 0, n = bodyContent.length();
-        while ((i = bodyContent.indexOf("@", i)) >= 0) {
-            int j = i + 1;
-            while (j < n) {
-                char c = bodyContent.charAt(j);
-                // a-zA-Z0-9_ . $ - — the exact set LLVM accepts in
-                // unquoted identifiers and the exact set the mangler
-                // produces.
-                if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
-                    || (c >= '0' && c <= '9') || c == '_' || c == '.'
-                    || c == '$' || c == '-') {
-                    j++;
-                } else {
-                    break;
-                }
-            }
-            if (j > i + 1) used.add(bodyContent.substring(i + 1, j));
-            i = j;
+        Set<String> used = collectUsedSymbols(bodyContent);
+        String adapters = buildJniAliasAdapters(used, collectLocalDefinitions(bodyContent), module);
+        if (!adapters.isEmpty()) {
+            bodyContent = bodyContent + "\n" + adapters;
+            used = collectUsedSymbols(bodyContent);
         }
 
         Set<String> definedHere = collectLocalDefinitions(bodyContent);
-        StringBuilder sb = new StringBuilder();
+        StringBuilder sb = new StringBuilder(adapters);
         List<String> sorted = new ArrayList<>(used);
         Collections.sort(sorted);
         for (String name : sorted) {
@@ -763,6 +766,74 @@ public class LlvmGenerator implements LlvmGeneratorPort {
                 String stub = weakNativeStub(name, bodyContent);
                 if (stub != null) sb.append(stub);
             }
+        }
+        return sb.toString();
+    }
+
+    private static Set<String> collectUsedSymbols(String bodyContent) {
+        Set<String> used = new HashSet<>();
+        int i = 0, n = bodyContent.length();
+        while ((i = bodyContent.indexOf("@", i)) >= 0) {
+            int j = i + 1;
+            while (j < n) {
+                char c = bodyContent.charAt(j);
+                // a-zA-Z0-9_ . $ - — the exact set LLVM accepts in
+                // unquoted identifiers and the exact set the mangler
+                // produces.
+                if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+                    || (c >= '0' && c <= '9') || c == '_' || c == '.'
+                    || c == '$' || c == '-') {
+                    j++;
+                } else {
+                    break;
+                }
+            }
+            if (j > i + 1) used.add(bodyContent.substring(i + 1, j));
+            i = j;
+        }
+
+        return used;
+    }
+
+    private String buildJniAliasAdapters(Set<String> used, Set<String> definedHere, Module module) {
+        StringBuilder sb = new StringBuilder();
+        List<String> sorted = new ArrayList<>(used);
+        Collections.sort(sorted);
+        for (String name : sorted) {
+            if (definedHere.contains(name)) continue;
+            Function func = module.getFunction(name);
+            if (func == null || !func.isJniNative() || func.getJniMethodName() == null) continue;
+            if (func.getEntryBlock() != null || func.getName().equals(name)) continue;
+
+            String ret = LlvmTypeMapper.toLlvmType(func.getReturnType());
+            List<String> types = new ArrayList<>();
+            for (Parameter p : func.getParameters()) {
+                types.add(LlvmTypeMapper.toLlvmType(LlvmTypeMapper.toCAbiType(p.getType())));
+            }
+            StringBuilder params = new StringBuilder();
+            StringBuilder args = new StringBuilder("i8* %env");
+            if (func.isStaticJniNative()) {
+                args.append(", i8* bitcast (%ReflectionClass* ")
+                    .append(globalEmitter.getRefClassGlobalName(func.getOwnerClass()))
+                    .append(" to i8*)");
+            }
+            for (int k = 0; k < types.size(); k++) {
+                if (k > 0) params.append(", ");
+                params.append(types.get(k)).append(" %a").append(k);
+                args.append(", ").append(types.get(k)).append(" %a").append(k);
+            }
+            sb.append("define weak ").append(ret).append(" @").append(name)
+              .append("(").append(params).append(") {\n");
+            sb.append("  %env = call i8* @__jnative_get_jnienv()\n");
+            if ("void".equals(ret)) {
+                sb.append("  call void @").append(func.getName()).append("(").append(args).append(")\n");
+                sb.append("  ret void\n");
+            } else {
+                sb.append("  %r = call ").append(ret).append(" @").append(func.getName())
+                  .append("(").append(args).append(")\n");
+                sb.append("  ret ").append(ret).append(" %r\n");
+            }
+            sb.append("}\n");
         }
         return sb.toString();
     }
@@ -968,8 +1039,100 @@ public class LlvmGenerator implements LlvmGeneratorPort {
         }
     }
 
+    private static List<String> jniParamTypes(Function func) {
+        List<String> types = new ArrayList<>();
+        types.add("i8*");
+        if (func.isStaticJniNative()) types.add("i8*");
+        for (Parameter p : func.getParameters()) {
+            types.add(LlvmTypeMapper.toLlvmType(LlvmTypeMapper.toCAbiType(p.getType())));
+        }
+        return types;
+    }
+
+    private static String jniStringConstant(StringBuilder defs, String global, String value) {
+        byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
+        StringBuilder lit = new StringBuilder();
+        for (byte b : bytes) {
+            int c = b & 0xFF;
+            if (c >= 0x20 && c < 0x7F && c != '"' && c != '\\') {
+                lit.append((char) c);
+            } else {
+                lit.append('\\').append(String.format("%02X", c));
+            }
+        }
+        int len = bytes.length + 1;
+        defs.append(global).append(" = private unnamed_addr constant [").append(len)
+            .append(" x i8] c\"").append(lit).append("\\00\"\n");
+        return "i8* getelementptr inbounds ([" + len + " x i8], [" + len + " x i8]* "
+            + global + ", i32 0, i32 0)";
+    }
+
+    private String emitJniTrampoline(Function func) {
+        String sym = func.getName();
+        String owner = func.getOwnerClass();
+        String method = func.getJniMethodName();
+        String desc = func.getJniDescriptor();
+        String[] values = {
+            owner, method, desc,
+            LlvmRuntime.toJniSymbolName(owner, method, desc, 1),
+            LlvmRuntime.toJniSymbolName(owner, method, desc, 2)
+        };
+
+        StringBuilder sb = new StringBuilder();
+        String slot = "@__jni_slot_" + sym;
+        sb.append(slot).append(" = internal global i8* null\n");
+        List<String> refs = new ArrayList<>();
+        for (int i = 0; i < values.length; i++) {
+            refs.add(jniStringConstant(sb, "@__jni_s" + i + "_" + sym, values[i]));
+        }
+
+        List<String> types = jniParamTypes(func);
+        String ret = LlvmTypeMapper.toLlvmType(func.getReturnType());
+        boolean boolRet = func.getReturnType() == Type.BOOLEAN;
+        String nativeRet = boolRet ? "i8" : ret;
+
+        StringBuilder params = new StringBuilder();
+        StringBuilder args = new StringBuilder();
+        for (int i = 0; i < types.size(); i++) {
+            if (i > 0) {
+                params.append(", ");
+                args.append(", ");
+            }
+            params.append(types.get(i)).append(" %a").append(i);
+            args.append(types.get(i)).append(" %a").append(i);
+        }
+
+        sb.append("define weak ").append(ret).append(" @").append(sym)
+          .append("(").append(params).append(") {\n");
+        sb.append("  %fp = call i8* @__jnative_jni_resolve(i8** ").append(slot);
+        for (String r : refs) sb.append(", ").append(r);
+        sb.append(")\n");
+        sb.append("  %fn = bitcast i8* %fp to ").append(nativeRet)
+          .append(" (").append(String.join(", ", types)).append(")*\n");
+        if ("void".equals(ret)) {
+            sb.append("  call void %fn(").append(args).append(")\n");
+            sb.append("  ret void\n");
+        } else {
+            sb.append("  %r = call ").append(nativeRet).append(" %fn(").append(args).append(")\n");
+            if (boolRet) {
+                sb.append("  %b = icmp ne i8 %r, 0\n");
+                sb.append("  ret i1 %b\n");
+            } else {
+                sb.append("  ret ").append(ret).append(" %r\n");
+            }
+        }
+        sb.append("}\n");
+        return sb.toString();
+    }
+
     private String emitDeclaration(Function func) {
         StringBuilder sb = new StringBuilder();
+        if (func.isJniNative() && func.getEntryBlock() == null && func.getJniMethodName() != null) {
+            sb.append("declare ").append(LlvmTypeMapper.toLlvmType(func.getReturnType()))
+              .append(" @").append(func.getName()).append("(")
+              .append(String.join(", ", jniParamTypes(func))).append(")\n");
+            return sb.toString();
+        }
         sb.append("declare ").append(LlvmTypeMapper.toLlvmType(func.getReturnType()))
             .append(" @").append(func.getName()).append("(");
         List<Parameter> params = func.getParameters();
@@ -979,6 +1142,21 @@ public class LlvmGenerator implements LlvmGeneratorPort {
             sb.append(LlvmTypeMapper.toLlvmType(func.getEntryBlock() == null ? LlvmTypeMapper.toCAbiType(pt) : pt));
         }
         sb.append(")\n");
+        return sb.toString();
+    }
+
+    private String emitWeakNativeDefault(Function func) {
+        String ret = LlvmTypeMapper.toLlvmType(func.getReturnType());
+        StringBuilder sb = new StringBuilder();
+        sb.append("define weak ").append(ret).append(" @").append(func.getName()).append("(");
+        List<Parameter> params = func.getParameters();
+        for (int i = 0; i < params.size(); i++) {
+            if (i > 0) sb.append(", ");
+            sb.append(LlvmTypeMapper.toLlvmType(LlvmTypeMapper.toCAbiType(params.get(i).getType())));
+        }
+        sb.append(") {\n  ret ").append(ret);
+        if (!"void".equals(ret)) sb.append(" zeroinitializer");
+        sb.append("\n}\n");
         return sb.toString();
     }
 
