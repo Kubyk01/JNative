@@ -475,6 +475,16 @@ public class DependencyResolver {
                     // is already in the map — the input jar must always win.
                     scanJar(depJar, true);
                 }
+                List<Path> referencedJars =
+                        MavenDependencyLoader.resolveReferencedDependencies(path, dependencyJars);
+                if (!referencedJars.isEmpty()) {
+                    System.out.println("Loading " + referencedJars.size()
+                            + " additional jar(s) that provide classes referenced by the application");
+                    for (Path extraJar : referencedJars) {
+                        System.out.println("  " + extraJar.getFileName());
+                        scanJar(extraJar, true);
+                    }
+                }
             }
         } else if (path.toString().endsWith(".class")) {
             parseClassFile(path);

@@ -49,12 +49,7 @@
  *
  *   - DefineClass, To/FromReflectedMethod, To/FromReflectedField
  *   - CallNonvirtual* (all variants)
- *   - GetStringRegion, GetStringUTFRegion
- *   - GetPrimitiveArrayCritical, ReleasePrimitiveArrayCritical
- *   - GetStringCritical, ReleaseStringCritical
- *   - NewWeakGlobalRef, DeleteWeakGlobalRef
- *   - NewDirectByteBuffer, GetDirectBufferAddress, GetDirectBufferCapacity
- *   - GetObjectRefType, GetModule
+ *   - GetModule
  *
  * ============================================================================
  * Limitations worth knowing about
@@ -797,7 +792,27 @@ static jmethodID jn_GetMethodID(void* env, jclass cls, const char* name,
     ENV_UNUSED;
     if (cls == NULL || name == NULL || sig == NULL) return NULL;
     ReflectionClass* declaring = NULL;
-    ReflectionMethod* rm = find_method_hier((ReflectionClass*)cls, name, sig, &declaring);
+    ReflectionMethod* rm = NULL;
+    if (strcmp(name, "<init>") == 0) {
+        ReflectionClass* c = (ReflectionClass*)cls;
+        if (c->constructors != NULL) {
+            for (ReflectionConstructor** cp = c->constructors; *cp != NULL; cp++) {
+                ReflectionConstructor* ctor = *cp;
+                if (ctor->descriptor == NULL
+                    || strcmp((const char*)ctor->descriptor, sig) != 0) continue;
+                rm = (ReflectionMethod*)calloc(1, sizeof(ReflectionMethod));
+                if (rm == NULL) return NULL;
+                rm->name       = (void*)"<init>";
+                rm->descriptor = ctor->descriptor;
+                rm->adaptor    = ctor->adaptor;
+                rm->modifiers  = ctor->modifiers;
+                declaring = c;
+                break;
+            }
+        }
+    } else {
+        rm = find_method_hier((ReflectionClass*)cls, name, sig, &declaring);
+    }
     if (rm == NULL) return NULL;
     JNIMethodID* id = (JNIMethodID*)malloc(sizeof(JNIMethodID));
     if (id == NULL) return NULL;
@@ -1480,6 +1495,48 @@ JNATIVE_NORETURN static void jn_throw_unsatisfied_link(const char* owner,
     abort();
 }
 
+extern const char* const __jnative_bundled_jni_libraries[];
+
+static size_t jn_executable_dir(char* buf, size_t bufsz) {
+#if defined(_WIN32)
+    DWORD n = GetModuleFileNameA(NULL, buf, (DWORD)bufsz);
+    long len = (n > 0 && n < bufsz) ? (long)n : -1;
+#else
+    long len = jn_readlink("/proc/self/exe", buf, bufsz - 1);
+#endif
+    if (len <= 0) return 0;
+    buf[len] = '\0';
+    char* cut = NULL;
+    for (char* p = buf; *p != '\0'; p++) {
+        if (*p == '/' || *p == '\\') cut = p;
+    }
+    if (cut == NULL) return 0;
+    cut[1] = '\0';
+    return strlen(buf);
+}
+
+void __jnative_jni_preload_bundled(void) {
+    if (__jnative_bundled_jni_libraries[0] == NULL) return;
+    char dir[4096];
+    size_t dlen = jn_executable_dir(dir, sizeof(dir));
+    for (size_t i = 0; __jnative_bundled_jni_libraries[i] != NULL; i++) {
+        const char* name = __jnative_bundled_jni_libraries[i];
+        char path[4096 + 256];
+        if (dlen > 0) snprintf(path, sizeof(path), "%s%s", dir, name);
+        else snprintf(path, sizeof(path), "%s", name);
+        void* handle = dlopen(path, RTLD_NOW | RTLD_GLOBAL);
+        if (handle == NULL) {
+            const char* err = dlerror();
+            fprintf(stderr, "jnative: warning: cannot preload %s: %s\n",
+                    path, err != NULL ? err : "unknown error");
+            continue;
+        }
+        if (!__jnative_jni_register_library(handle, 1)) {
+            fprintf(stderr, "jnative: warning: JNI_OnLoad failed for %s\n", path);
+        }
+    }
+}
+
 static int64_t jn_zero_native_integral(void) {
     return 0;
 }
@@ -1516,6 +1573,110 @@ void* __jnative_jni_resolve(void** slot, const char* owner, const char* name,
     if (fn == NULL) jn_throw_unsatisfied_link(owner, name, desc);
     *(void* volatile*)slot = fn;
     return fn;
+}
+
+static void jn_FatalError(void* env, const char* msg) {
+    ENV_UNUSED;
+    fprintf(stderr, "FATAL ERROR in native method: %s\n", msg != NULL ? msg : "");
+    abort();
+}
+
+static jobject jn_NewWeakGlobalRef(void* env, jobject obj) {
+    return jn_NewGlobalRef(env, obj);
+}
+
+static void jn_DeleteWeakGlobalRef(void* env, jobject obj) {
+    jn_DeleteGlobalRef(env, obj);
+}
+
+static jint jn_GetObjectRefType(void* env, jobject obj) {
+    ENV_UNUSED;
+    return obj == NULL ? 0 : 1;
+}
+
+static void jn_GetStringRegion(void* env, jstring s, jsize start, jsize len, jchar* buf) {
+    ENV_UNUSED;
+    if (s == NULL || buf == NULL || len <= 0) return;
+    jsize n = 0;
+    jchar* chars = string_to_utf16(s, &n);
+    if (chars == NULL) return;
+    if (start >= 0 && start + len <= n) {
+        memcpy(buf, chars + start, (size_t)len * sizeof(jchar));
+    }
+    free(chars);
+}
+
+static void jn_GetStringUTFRegion(void* env, jstring s, jsize start, jsize len, char* buf) {
+    ENV_UNUSED;
+    if (s == NULL || buf == NULL) return;
+    jsize n = 0;
+    jchar* chars = string_to_utf16(s, &n);
+    if (chars == NULL) return;
+    if (start >= 0 && len >= 0 && start + len <= n) {
+        jsize out_len = 0;
+        char* utf = utf16_to_modified_utf8(chars + start, len, &out_len);
+        memcpy(buf, utf, (size_t)out_len + 1);
+        free(utf);
+    }
+    free(chars);
+}
+
+static void* jn_GetPrimitiveArrayCritical(void* env, jarray arr, jboolean* isCopy) {
+    ENV_UNUSED;
+    if (arr == NULL) return NULL;
+    if (isCopy) *isCopy = JNI_FALSE;
+    return jnative_array_data(arr);
+}
+
+static void jn_ReleasePrimitiveArrayCritical(void* env, jarray arr, void* elems, jint mode) {
+    ENV_UNUSED; (void)arr; (void)elems; (void)mode;
+}
+
+static const jchar* jn_GetStringCritical(void* env, jstring s, jboolean* isCopy) {
+    return jn_GetStringChars(env, s, isCopy);
+}
+
+static void jn_ReleaseStringCritical(void* env, jstring s, const jchar* chars) {
+    jn_ReleaseStringChars(env, s, chars);
+}
+
+static ReflectionField* jn_buffer_field(void* env, jobject buf, const char* name) {
+    if (buf == NULL) return NULL;
+    ReflectionClass* cls = (ReflectionClass*)jn_GetObjectClass(env, buf);
+    if (cls == NULL) cls = jnative_class_by_name("java/nio/Buffer");
+    ReflectionField* f = find_field_hier(cls, name, NULL);
+    if (f == NULL) f = find_field_hier(jnative_class_by_name("java/nio/Buffer"), name, NULL);
+    return f;
+}
+
+static void* jn_GetDirectBufferAddress(void* env, jobject buf) {
+    ReflectionField* f = jn_buffer_field(env, buf, "address");
+    if (f == NULL) return NULL;
+    return (void*)(intptr_t)*(int64_t*)((char*)buf + f->offset);
+}
+
+static jlong jn_GetDirectBufferCapacity(void* env, jobject buf) {
+    ReflectionField* f = jn_buffer_field(env, buf, "capacity");
+    if (f == NULL) return -1;
+    return (jlong)*(int32_t*)((char*)buf + f->offset);
+}
+
+static jobject jn_NewDirectByteBuffer(void* env, void* address, jlong capacity) {
+    jclass cls = (jclass)jnative_class_by_name("java/nio/DirectByteBuffer");
+    if (cls == NULL) return NULL;
+    jvalue args[2];
+    args[0].j = (jlong)(intptr_t)address;
+    jmethodID mid = jn_GetMethodID(env, cls, "<init>", "(JJ)V");
+    if (mid != NULL) {
+        args[1].j = capacity;
+        return jn_NewObjectA(env, cls, mid, args);
+    }
+    mid = jn_GetMethodID(env, cls, "<init>", "(JI)V");
+    if (mid != NULL) {
+        args[1].i = (jint)capacity;
+        return jn_NewObjectA(env, cls, mid, args);
+    }
+    return NULL;
 }
 
 /* ========================================================================
@@ -1818,6 +1979,19 @@ static const struct JNINativeInterface __jnative_jni_functions = {
     .MonitorEnter = (void*)jn_MonitorEnter,
     .MonitorExit = (void*)jn_MonitorExit,
     .GetJavaVM = (void*)jn_GetJavaVM,
+    .FatalError = (void*)jn_FatalError,
+    .NewWeakGlobalRef = (void*)jn_NewWeakGlobalRef,
+    .DeleteWeakGlobalRef = (void*)jn_DeleteWeakGlobalRef,
+    .GetObjectRefType = (void*)jn_GetObjectRefType,
+    .GetStringRegion = (void*)jn_GetStringRegion,
+    .GetStringUTFRegion = (void*)jn_GetStringUTFRegion,
+    .GetPrimitiveArrayCritical = (void*)jn_GetPrimitiveArrayCritical,
+    .ReleasePrimitiveArrayCritical = (void*)jn_ReleasePrimitiveArrayCritical,
+    .GetStringCritical = (void*)jn_GetStringCritical,
+    .ReleaseStringCritical = (void*)jn_ReleaseStringCritical,
+    .NewDirectByteBuffer = (void*)jn_NewDirectByteBuffer,
+    .GetDirectBufferAddress = (void*)jn_GetDirectBufferAddress,
+    .GetDirectBufferCapacity = (void*)jn_GetDirectBufferCapacity,
     .ExceptionCheck = (void*)jn_ExceptionCheck,
 };
 

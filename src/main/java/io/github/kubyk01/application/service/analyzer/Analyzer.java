@@ -52,6 +52,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static io.github.kubyk01.util.LlvmUtil.isAllocation;
+import static io.github.kubyk01.util.LlvmUtil.isSystemClassName;
 
 @Slf4j
 public class Analyzer {
@@ -1039,19 +1040,27 @@ public class Analyzer {
             baseEdges += d.size();
         }
 
+        BitSet[] provenance = new BitSet[liveFunctions.size()];
         for (int fieldId = 0; fieldId < fieldList.size(); fieldId++) {
             IntArrayList writers = fieldWriters[fieldId];
             IntArrayList readers = fieldReaders[fieldId];
             if (writers == null || writers.isEmpty() || readers == null) continue;
+            BitSet writerBits = new BitSet(liveFunctions.size());
+            for (int wi = 0; wi < writers.size(); wi++) writerBits.set(writers.get(wi));
             for (int ri = 0; ri < readers.size(); ri++) {
                 int reader = readers.get(ri);
-                IntArrayList rd = depsList[reader];
-                if (rd == null) continue;
-                for (int wi = 0; wi < writers.size(); wi++) {
-                    int writer = writers.get(wi);
-                    if (reader != writer) rd.add(writer);
-                }
+                if (depsList[reader] == null) continue;
+                if (provenance[reader] == null) provenance[reader] = new BitSet(liveFunctions.size());
+                provenance[reader].or(writerBits);
             }
+        }
+        for (int reader = 0; reader < provenance.length; reader++) {
+            BitSet bits = provenance[reader];
+            if (bits == null) continue;
+            bits.clear(reader);
+            IntArrayList rd = depsList[reader];
+            for (int w = bits.nextSetBit(0); w >= 0; w = bits.nextSetBit(w + 1)) rd.add(w);
+            provenance[reader] = null;
         }
 
         int[][] deps = new int[liveFunctions.size()][];
@@ -1141,6 +1150,7 @@ public class Analyzer {
         Set<String> deferred = computeDeferredClinits(
             clinitOrder, phaseOrder, afterMap,
             initReadBits, initWriteBits, funcIndex, fieldIdMap, fieldWords);
+        deferred.addAll(computeJniDependentClinits(module, clinitOrder));
 
         if (!deferred.isEmpty()) {
             this.deferredClinits.addAll(deferred);
@@ -1350,6 +1360,58 @@ public class Analyzer {
         int[] toArray() {
             return Arrays.copyOf(data, size);
         }
+    }
+
+
+    private static Function resolveCallTarget(Module module, String callee) {
+        if (callee == null || callee.indexOf('(') < 0) return null;
+        Function f = module.getFunction(LlvmRuntime.mangleCallable(callee));
+        if (f == null) f = module.getFunction("__jnative_" + LlvmRuntime.mangleCallable(callee));
+        if (f == null) f = module.getFunction(callee);
+        return f;
+    }
+
+    private Set<String> computeJniDependentClinits(Module module, List<Function> clinitOrder) {
+        Map<Function, Set<Function>> callers = new HashMap<>();
+        Set<Function> tainted = new HashSet<>();
+        Deque<Function> work = new ArrayDeque<>();
+
+        for (Function f : module.getFunctions()) {
+            if (f.getEntryBlock() == null || isSystemClassName(f.getOwnerClass())) continue;
+            for (BasicBlock b : f.getBlocks()) {
+                for (Instruction inst : b.getInstructions()) {
+                    Opcode op = inst.getOpcode();
+                    if (op != Opcode.CALL && op != Opcode.STATIC_CALL && op != Opcode.SPECIAL_CALL
+                        && op != Opcode.VIRTUAL_CALL && op != Opcode.INTERFACE_CALL) continue;
+                    for (int k = 0; k < Math.min(2, inst.getOperands().size()); k++) {
+                        Function target = resolveCallTarget(module, extractCalleeConstant(inst, k));
+                        if (target == null) continue;
+                        if (target.isJniNative() && !isSystemClassName(target.getOwnerClass())) {
+                            if (tainted.add(f)) work.add(f);
+                        } else {
+                            callers.computeIfAbsent(target, x -> new HashSet<>()).add(f);
+                        }
+                    }
+                }
+            }
+        }
+
+        while (!work.isEmpty()) {
+            Function f = work.poll();
+            for (Function caller : callers.getOrDefault(f, Set.of())) {
+                if (tainted.add(caller)) work.add(caller);
+            }
+        }
+
+        Set<String> result = new LinkedHashSet<>();
+        for (Function c : clinitOrder) {
+            if (!isSystemClassName(c.getOwnerClass()) && tainted.contains(c)) result.add(c.getName());
+        }
+        if (!result.isEmpty()) {
+            System.out.println("Deferring " + result.size()
+                + " <clinit>(s) that call JNI natives to lazy initialization.");
+        }
+        return result;
     }
 
     private Set<String> computeDeferredClinits(

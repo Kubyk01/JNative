@@ -1,6 +1,7 @@
 package io.github.kubyk01.application.service.analyzer.dependencyresolver;
 
 import lombok.extern.slf4j.Slf4j;
+import org.objectweb.asm.ClassReader;
 
 import java.io.File;
 import java.io.IOException;
@@ -188,6 +189,274 @@ public final class MavenDependencyLoader {
                 selfGav != null ? selfGav : "the input jar");
         }
         return jars;
+    }
+
+    public static List<Path> resolveReferencedDependencies(Path inputJar, List<Path> loadedJars) {
+        Path repository = localRepositoryRoot();
+        if (repository == null) return List.of();
+
+        List<Path> scanned = new ArrayList<>();
+        scanned.add(inputJar);
+        scanned.addAll(loadedJars);
+
+        Set<String> known = new HashSet<>();
+        Set<String> referenced = new HashSet<>();
+        for (Path jar : scanned) {
+            collectClasses(jar, known, referenced);
+        }
+
+        Map<String, Path> loadedByKey = new LinkedHashMap<>();
+        for (Path jar : loadedJars) {
+            String key = artifactKey(repository, jar);
+            if (key != null) loadedByKey.put(key, jar);
+        }
+
+        List<String> mavenCommand = locateMaven(inputJar.toAbsolutePath().getParent());
+        Set<String> attempted = new HashSet<>(loadedByKey.keySet());
+        Deque<PomRef> pomQueue = new ArrayDeque<>();
+        for (Path jar : loadedByKey.values()) pomQueue.add(new PomRef(siblingPom(jar), true));
+
+        List<Path> added = new ArrayList<>();
+        List<Candidate> candidates = new ArrayList<>();
+        boolean progress = true;
+        while (progress) {
+            progress = false;
+            Set<String> missing = missingClasses(known, referenced);
+            if (missing.isEmpty()) break;
+
+            while (!pomQueue.isEmpty()) {
+                PomRef ref = pomQueue.poll();
+                PomModel pom = readPomModel(ref.pom(), repository, new HashSet<>());
+                if (pom == null) continue;
+                for (DepNode dep : pom.dependencies) {
+                    String scope = dep.scope == null ? "compile" : dep.scope.trim();
+                    if (scope.equals("test") || scope.equals("system")) continue;
+                    if (!ref.includeOptional() && (dep.optional || scope.equals("provided"))) continue;
+                    String key = dep.groupId + ":" + dep.artifactId;
+                    if (loadedByKey.containsKey(key)) continue;
+                    String version = resolveVersion(dep.version, pom);
+                    if (version == null || version.isBlank() || version.contains("${")) version = null;
+                    candidates.add(new Candidate(dep.groupId, dep.artifactId, version, pom));
+                }
+            }
+
+            for (Candidate c : new ArrayList<>(candidates)) {
+                String key = c.groupId + ":" + c.artifactId;
+                if (loadedByKey.containsKey(key) || attempted.contains(key)) continue;
+                List<String> download = isPlausibleProvider(c.groupId, missing) ? mavenCommand : null;
+                Path jar = locateArtifact(repository, c.groupId, c.artifactId, c.version, download, false);
+                if (jar == null || !jarProvidesAny(jar, missing)) continue;
+                attempted.add(key);
+                acceptArtifact(key, jar, loadedByKey, added, known, referenced, pomQueue);
+                for (Candidate sibling : candidates) {
+                    String skey = sibling.groupId + ":" + sibling.artifactId;
+                    if (!sibling.groupId.equals(c.groupId) || !sibling.artifactId.startsWith("native")) continue;
+                    if (loadedByKey.containsKey(skey) || !attempted.add(skey)) continue;
+                    Path njar = locateArtifact(repository, sibling.groupId, sibling.artifactId,
+                        sibling.version, mavenCommand, true);
+                    if (njar != null) acceptArtifact(skey, njar, loadedByKey, added, known, referenced, pomQueue);
+                }
+                progress = true;
+            }
+
+        }
+
+        Set<String> stillMissing = missingClasses(known, referenced);
+        if (!added.isEmpty()) {
+            log.info("Resolved {} additional jar(s) for classes referenced by the application: {}",
+                added.size(), added.stream().map(p -> p.getFileName().toString()).toList());
+        }
+        if (!stillMissing.isEmpty()) {
+            log.info("{} referenced class(es) are provided by no resolvable dependency, e.g. {}",
+                stillMissing.size(), stillMissing.stream().sorted().limit(5).toList());
+        }
+        return added;
+    }
+
+    private static boolean isPlausibleProvider(String groupId, Set<String> missing) {
+        String path = groupId.replace('.', '/') + "/";
+        for (String name : missing) {
+            if (name.startsWith(path)) return true;
+        }
+        return false;
+    }
+
+    private record Candidate(String groupId, String artifactId, String version, PomModel declaringPom) {}
+
+    private record PomRef(Path pom, boolean includeOptional) {}
+
+    private static void acceptArtifact(String key, Path jar, Map<String, Path> loadedByKey,
+                                       List<Path> added, Set<String> known,
+                                       Set<String> referenced, Deque<PomRef> pomQueue) {
+        loadedByKey.put(key, jar);
+        added.add(jar);
+        collectClasses(jar, known, referenced);
+        Path pom = siblingPom(jar);
+        if (pom != null) pomQueue.add(new PomRef(pom, false));
+    }
+
+    private static Path siblingPom(Path jar) {
+        String name = jar.getFileName().toString();
+        if (!name.endsWith(".jar")) return null;
+        Path dir = jar.getParent();
+        String base = name.substring(0, name.length() - ".jar".length());
+        String version = dir.getFileName().toString();
+        String artifact = dir.getParent().getFileName().toString();
+        Path pom = dir.resolve(artifact + "-" + version + ".pom");
+        if (Files.isRegularFile(pom)) return pom;
+        pom = dir.resolve(base + ".pom");
+        return Files.isRegularFile(pom) ? pom : null;
+    }
+
+    private static String artifactKey(Path repository, Path jar) {
+        Path abs = jar.toAbsolutePath().normalize();
+        Path repo = repository.toAbsolutePath().normalize();
+        if (!abs.startsWith(repo)) return null;
+        Path rel = repo.relativize(abs);
+        int n = rel.getNameCount();
+        if (n < 4) return null;
+        String artifact = rel.getName(n - 3).toString();
+        StringBuilder group = new StringBuilder();
+        for (int i = 0; i < n - 3; i++) {
+            if (i > 0) group.append('.');
+            group.append(rel.getName(i));
+        }
+        return group + ":" + artifact;
+    }
+
+    private static Path locateArtifact(Path repository, String groupId, String artifactId,
+                                       String version, List<String> mavenCommand,
+                                       boolean allowAnyLocalVersion) {
+        Path artifactRoot = repository.resolve(groupId.replace('.', '/')).resolve(artifactId);
+        if (version != null) {
+            Path jar = artifactRoot.resolve(version).resolve(artifactId + "-" + version + ".jar");
+            if (Files.isRegularFile(jar)) return jar;
+            if (mavenCommand != null && downloadArtifact(mavenCommand, groupId, artifactId, version)
+                && Files.isRegularFile(jar)) {
+                return jar;
+            }
+        }
+        if (version == null || allowAnyLocalVersion || Files.isDirectory(artifactRoot)) {
+            return newestLocalJar(artifactRoot, artifactId);
+        }
+        return null;
+    }
+
+    private static Path newestLocalJar(Path artifactRoot, String artifactId) {
+        if (!Files.isDirectory(artifactRoot)) return null;
+        try (var stream = Files.list(artifactRoot)) {
+            return stream
+                .filter(Files::isDirectory)
+                .map(dir -> dir.resolve(artifactId + "-" + dir.getFileName() + ".jar"))
+                .filter(Files::isRegularFile)
+                .max((a, b) -> compareVersions(
+                    a.getParent().getFileName().toString(),
+                    b.getParent().getFileName().toString()))
+                .orElse(null);
+        } catch (IOException e) {
+            return null;
+        }
+    }
+
+    private static int compareVersions(String a, String b) {
+        String[] pa = a.split("[.\\-]");
+        String[] pb = b.split("[.\\-]");
+        for (int i = 0; i < Math.max(pa.length, pb.length); i++) {
+            String x = i < pa.length ? pa[i] : "0";
+            String y = i < pb.length ? pb[i] : "0";
+            int c;
+            if (x.matches("\\d+") && y.matches("\\d+")) {
+                c = new java.math.BigInteger(x).compareTo(new java.math.BigInteger(y));
+            } else {
+                c = x.compareTo(y);
+            }
+            if (c != 0) return c;
+        }
+        return 0;
+    }
+
+    private static boolean downloadArtifact(List<String> mavenCommand, String groupId,
+                                            String artifactId, String version) {
+        List<String> cmd = new ArrayList<>(mavenCommand);
+        cmd.add("-q");
+        cmd.add("dependency:get");
+        cmd.add("-Dartifact=" + groupId + ":" + artifactId + ":" + version);
+        cmd.add("-Dtransitive=false");
+        try {
+            Process process = new ProcessBuilder(cmd)
+                .redirectErrorStream(true)
+                .redirectOutput(ProcessBuilder.Redirect.DISCARD)
+                .start();
+            boolean ok = process.waitFor() == 0;
+            if (ok) log.info("Downloaded {}:{}:{} via Maven", groupId, artifactId, version);
+            return ok;
+        } catch (IOException e) {
+            return false;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
+    }
+
+    private static void collectClasses(Path jar, Set<String> known, Set<String> referenced) {
+        try (JarFile jf = new JarFile(jar.toFile())) {
+            Enumeration<JarEntry> entries = jf.entries();
+            while (entries.hasMoreElements()) {
+                JarEntry e = entries.nextElement();
+                String name = e.getName();
+                if (!name.endsWith(".class") || name.startsWith("META-INF/")) continue;
+                known.add(name.substring(0, name.length() - ".class".length()));
+                try (InputStream is = jf.getInputStream(e)) {
+                    collectReferencedClasses(is.readAllBytes(), referenced);
+                } catch (RuntimeException ignored) {
+                }
+            }
+        } catch (IOException e) {
+            log.debug("Cannot scan {}: {}", jar, e.getMessage());
+        }
+    }
+
+    private static void collectReferencedClasses(byte[] bytes, Set<String> out) {
+        ClassReader cr = new ClassReader(bytes);
+        char[] buf = new char[cr.getMaxStringLength()];
+        for (int i = 1; i < cr.getItemCount(); i++) {
+            int offset = cr.getItem(i);
+            if (offset <= 0) continue;
+            if (cr.readByte(offset - 1) != 7) continue;
+            String name = cr.readUTF8(offset, buf);
+            if (name == null) continue;
+            int k = 0;
+            while (k < name.length() && name.charAt(k) == '[') k++;
+            if (k > 0) {
+                if (k < name.length() && name.charAt(k) == 'L' && name.endsWith(";")) {
+                    out.add(name.substring(k + 1, name.length() - 1));
+                }
+            } else {
+                out.add(name);
+            }
+        }
+    }
+
+    private static Set<String> missingClasses(Set<String> known, Set<String> referenced) {
+        Set<String> missing = new HashSet<>();
+        ClassLoader platform = ClassLoader.getPlatformClassLoader();
+        for (String name : referenced) {
+            if (known.contains(name)) continue;
+            if (platform.getResource(name + ".class") != null) continue;
+            missing.add(name);
+        }
+        return missing;
+    }
+
+    private static boolean jarProvidesAny(Path jar, Set<String> classNames) {
+        try (JarFile jf = new JarFile(jar.toFile())) {
+            for (String name : classNames) {
+                if (jf.getEntry(name + ".class") != null) return true;
+            }
+        } catch (IOException e) {
+            return false;
+        }
+        return false;
     }
 
     // =====================================================================

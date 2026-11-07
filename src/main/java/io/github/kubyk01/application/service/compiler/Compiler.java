@@ -198,6 +198,11 @@ public class Compiler implements CompilerPort {
                 tasks.add(new CompileTask(src, objWithPath, false));
             }
 
+            List<Path> nativeLibs = resolveNativeLoadOrder(
+                    collectNativeLibraries(module, resolver, target), target);
+            Path bundledLibsSource = writeBundledLibrariesSource(tempDir, nativeLibs);
+            tasks.add(new CompileTask(bundledLibsSource, cDir.resolve("jnative_bundled_libs.o"), false));
+
             int irIndex = 0;
             for (Path ll : llPaths) {
                 String base = sanitizeForObjName(ll.getFileName().toString());
@@ -326,13 +331,6 @@ public class Compiler implements CompilerPort {
             // ------------------------------------------------------------------
             // 6. Native library discovery and bundling.
             // ------------------------------------------------------------------
-            List<Path> nativeLibs = collectNativeLibraries(module, resolver, target);
-            Set<Path> nativeLibDirs = new LinkedHashSet<>();
-            for (Path lib : nativeLibs) {
-                Path parent = lib.toAbsolutePath().getParent();
-                if (parent != null) nativeLibDirs.add(parent);
-            }
-
             if (!target.isWindows()) {
                 linkCmd.add("-Wl,--disable-new-dtags");
                 linkCmd.add("-Wl,-rpath,$ORIGIN");
@@ -348,7 +346,7 @@ public class Compiler implements CompilerPort {
                         + " (target: " + target.triple() + ")");
             }
 
-            bundleNativeLibraries(exePath, nativeLibs, nativeLibDirs, target);
+            bundleNativeLibraries(exePath, nativeLibs);
 
         } finally {
             Files.walk(tempDir)
@@ -932,9 +930,8 @@ public class Compiler implements CompilerPort {
         if (root == null || root.isEmpty()) return false;
         Path p = Paths.get(root);
         if (Files.exists(p.resolve("include").resolve("stdlib.h"))) return true;
-        if (Files.exists(p.resolve("sys-root").resolve("mingw")
-                .resolve("include").resolve("stdlib.h"))) return true;
-        return false;
+        return Files.exists(p.resolve("sys-root").resolve("mingw")
+            .resolve("include").resolve("stdlib.h"));
     }
 
     private static String findExecutable(String name) {
@@ -1650,61 +1647,87 @@ public class Compiler implements CompilerPort {
     //  Native library bundling
     // =====================================================================
 
-    private void bundleNativeLibraries(Path exePath, List<Path> nativeLibs,
-                                       Set<Path> nativeLibDirs,
-                                       TargetPlatform target) throws IOException {
-
+    private void bundleNativeLibraries(Path exePath, List<Path> nativeLibs) throws IOException {
         if (nativeLibs.isEmpty()) return;
-
         Path exeDir = exePath.toAbsolutePath().getParent();
-        Set<Path> copied = new LinkedHashSet<>();
-
+        int copied = 0;
         for (Path lib : nativeLibs) {
             Path dest = exeDir.resolve(lib.getFileName().toString());
-            if (Files.exists(dest)) continue;
             Files.copy(lib, dest, StandardCopyOption.REPLACE_EXISTING);
-            copied.add(dest);
+            copied++;
         }
+        System.out.println("Bundled " + copied
+                + " native library/libraries next to " + exePath);
+    }
 
-        Deque<Path> toVisit = new ArrayDeque<>(copied);
-        while (!toVisit.isEmpty()) {
-            Path lib = toVisit.poll();
+    private List<Path> resolveNativeLoadOrder(List<Path> roots, TargetPlatform target) {
+        Set<Path> dirs = new LinkedHashSet<>();
+        for (Path lib : roots) {
+            Path parent = lib.toAbsolutePath().getParent();
+            if (parent != null) dirs.add(parent);
+        }
+        LinkedHashSet<Path> ordered = new LinkedHashSet<>();
+        Set<Path> visiting = new HashSet<>();
+        for (Path lib : roots) {
+            visitNativeLibrary(lib.toAbsolutePath(), dirs, target, ordered, visiting);
+        }
+        return new ArrayList<>(ordered);
+    }
 
-            Set<String> needed = target.isWindows()
+    private void visitNativeLibrary(Path lib, Set<Path> dirs, TargetPlatform target,
+                                    LinkedHashSet<Path> ordered, Set<Path> visiting) {
+        if (ordered.contains(lib) || !visiting.add(lib)) return;
+        Set<String> needed;
+        try {
+            needed = target.isWindows()
                     ? PeSymbolReader.readImportedLibraries(lib)
                     : ElfSymbolReader.readNeededLibraries(lib);
-
-            for (String soname : needed) {
-                if (soname.startsWith("/") || soname.contains("\\")) continue;
-
-                Path source = null;
-                for (Path dir : nativeLibDirs) {
-                    Path candidate = dir.resolve(soname);
-                    if (Files.isRegularFile(candidate)) {
-                        source = candidate;
-                        break;
-                    }
-                    if (target.isWindows()) {
-                        try (var stream = Files.list(dir)) {
-                            source = stream
-                                    .filter(p -> p.getFileName().toString()
-                                            .equalsIgnoreCase(soname))
-                                    .findFirst().orElse(null);
-                        }
-                        if (source != null) break;
-                    }
-                }
-                if (source == null) continue;
-
-                Path dest = exeDir.resolve(source.getFileName().toString());
-                if (Files.exists(dest)) continue;
-                Files.copy(source, dest, StandardCopyOption.REPLACE_EXISTING);
-                toVisit.add(dest);
+        } catch (IOException e) {
+            log.warn("Could not read dependencies of {}: {}", lib, e.getMessage());
+            needed = Set.of();
+        }
+        for (String soname : needed) {
+            if (soname.startsWith("/") || soname.contains("\\")) continue;
+            Path dep = findBundledDependency(soname, dirs, target);
+            if (dep != null) {
+                visitNativeLibrary(dep.toAbsolutePath(), dirs, target, ordered, visiting);
             }
         }
+        ordered.add(lib);
+    }
 
-        System.out.println("Bundled " + copied.size()
-                + " native library/libraries next to " + exePath);
+    private static Path findBundledDependency(String soname, Set<Path> dirs, TargetPlatform target) {
+        for (Path dir : dirs) {
+            Path candidate = dir.resolve(soname);
+            if (Files.isRegularFile(candidate)) return candidate;
+            if (target.isWindows()) {
+                try (var stream = Files.list(dir)) {
+                    Path match = stream
+                            .filter(p -> p.getFileName().toString().equalsIgnoreCase(soname))
+                            .findFirst().orElse(null);
+                    if (match != null) return match;
+                } catch (IOException ignored) {
+                }
+            }
+        }
+        return null;
+    }
+
+    private static Path writeBundledLibrariesSource(Path tempDir, List<Path> libs) throws IOException {
+        StringBuilder sb = new StringBuilder();
+        sb.append("const char* const __jnative_bundled_jni_libraries[] = {\n");
+        for (Path lib : libs) {
+            sb.append("    \"");
+            for (char c : lib.getFileName().toString().toCharArray()) {
+                if (c == '"' || c == '\\') sb.append('\\');
+                sb.append(c);
+            }
+            sb.append("\",\n");
+        }
+        sb.append("    0\n};\n");
+        Path src = tempDir.resolve("jnative_bundled_libs.c");
+        Files.writeString(src, sb.toString());
+        return src;
     }
 
     // =====================================================================

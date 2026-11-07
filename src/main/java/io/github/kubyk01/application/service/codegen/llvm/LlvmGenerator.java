@@ -1145,6 +1145,13 @@ public class LlvmGenerator implements LlvmGeneratorPort {
         return sb.toString();
     }
 
+    private static boolean isJdkClass(String owner) {
+        if (owner == null) return true;
+        return owner.startsWith("java/") || owner.startsWith("javax/")
+            || owner.startsWith("jdk/") || owner.startsWith("sun/")
+            || owner.startsWith("com/sun/");
+    }
+
     private String emitWeakNativeDefault(Function func) {
         String ret = LlvmTypeMapper.toLlvmType(func.getReturnType());
         StringBuilder sb = new StringBuilder();
@@ -1444,6 +1451,8 @@ public class LlvmGenerator implements LlvmGeneratorPort {
         int bootstrapPhaseIdx = 0;
         List<ClinitScheduleEntry> currentBatch = new ArrayList<>();
         int batchIdCounter = 0;
+        boolean jniPreloaded = false;
+        globals.append("declare void @__jnative_jni_preload_bundled()\n");
 
         for (ClinitScheduleEntry entry : clinitSchedule) {
             Function f = entry.function();
@@ -1451,6 +1460,15 @@ public class LlvmGenerator implements LlvmGeneratorPort {
 
             if (bootstrapPrereqNames.contains(name)) continue;
             if (name.equals(hashedModulesClinitName)) continue;
+
+            if (!jniPreloaded && !entry.bootstrapPhase() && !isJdkClass(f.getOwnerClass())) {
+                if (!currentBatch.isEmpty()) {
+                    emitParallelBatch(sb, globals, currentBatch, batchIdCounter++);
+                    currentBatch.clear();
+                }
+                sb.append("  call void @__jnative_jni_preload_bundled()\n");
+                jniPreloaded = true;
+            }
 
             // Deferred clinits are NOT in clinitSchedule: Analyzer.sortInitializers
             // removes them before emitting the schedule so that Stage 4 cannot
@@ -1525,6 +1543,9 @@ public class LlvmGenerator implements LlvmGeneratorPort {
         }
         if (!currentBatch.isEmpty()) {
             emitParallelBatch(sb, globals, currentBatch, batchIdCounter++);
+        }
+        if (!jniPreloaded) {
+            sb.append("  call void @__jnative_jni_preload_bundled()\n");
         }
 
         // ------------------------------------------------------------------

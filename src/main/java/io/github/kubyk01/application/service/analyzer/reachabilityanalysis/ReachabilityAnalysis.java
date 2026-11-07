@@ -299,6 +299,16 @@ public class ReachabilityAnalysis {
             String className = jc.getName().replace('.', '/');
             addClassWithInit(className, true);
             instantiatedClasses.add(className);
+            applyReflectEntry(ReachabilityMetadata.ReflectClass.builder()
+                .name(jc.getName())
+                .allDeclaredMethods(true)
+                .allDeclaredFields(true)
+                .allDeclaredConstructors(true)
+                .build());
+        }
+        if (!metadata.getJniClasses().isEmpty()) {
+            drainWorklist();
+            resolveVirtualDispatchFixedPoint();
         }
 
         log.info("Applied reachability metadata: {} reflect classes applied, "
