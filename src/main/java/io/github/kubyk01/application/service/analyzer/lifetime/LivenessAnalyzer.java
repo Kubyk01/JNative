@@ -35,8 +35,14 @@ public class LivenessAnalyzer {
     private final Map<Function, Map<Value, List<ValueLastUse>>> valueLastUsesCache =
         new ConcurrentHashMap<>();
 
-    private Map<BasicBlock, Set<AllocationSite>> liveInGlobal;
-    private Map<BasicBlock, Set<AllocationSite>> liveOutGlobal;
+    private final Map<AllocationSite, Integer> siteIds = new HashMap<>();
+    private List<AllocationSite> sitesById = List.of();
+
+    private Map<BasicBlock, BitSet> liveInBits;
+    private Map<BasicBlock, BitSet> liveOutBits;
+
+    private final Map<BasicBlock, Set<AllocationSite>> liveInCache = new ConcurrentHashMap<>();
+    private final Map<BasicBlock, Set<AllocationSite>> liveOutCache = new ConcurrentHashMap<>();
 
     private Set<AllocationSite> getPointsTo(Value v) {
         if (v == null) return Collections.emptySet();
@@ -44,125 +50,171 @@ public class LivenessAnalyzer {
     }
 
     public void computeLiveSets(Collection<AllocationSite> allSites) {
-        Set<AllocationSite> allowed = new HashSet<>(allSites);
+        siteIds.clear();
+        List<AllocationSite> ordered = new ArrayList<>(allSites.size());
+        for (AllocationSite site : allSites) {
+            if (siteIds.putIfAbsent(site, ordered.size()) == null) ordered.add(site);
+        }
+        sitesById = ordered;
+        liveInCache.clear();
+        liveOutCache.clear();
 
         List<Function> live = new ArrayList<>();
         for (Function f : module.getFunctions()) {
             if (f.getEntryBlock() != null) live.add(f);
         }
-        if (live.isEmpty()) {
-            liveInGlobal = Collections.emptyMap();
-            liveOutGlobal = Collections.emptyMap();
-            return;
-        }
-
-        Map<BasicBlock, Set<AllocationSite>> use = new ConcurrentHashMap<>();
-        Map<BasicBlock, Set<AllocationSite>> def = new ConcurrentHashMap<>();
+        liveInBits = new ConcurrentHashMap<>();
+        liveOutBits = new ConcurrentHashMap<>();
+        if (live.isEmpty()) return;
 
         LlvmUtil.awaitMono(Flux.fromIterable(live)
             .parallel()
             .runOn(scheduler)
-            .doOnNext(func -> {
-                for (BasicBlock block : func.getBlocks()) {
-                    Set<AllocationSite> blockUse = new HashSet<>();
-                    Set<AllocationSite> blockDef = new HashSet<>();
-                    for (Instruction inst : block.getInstructions()) {
-                        blockUse.addAll(getAllocationSitesUsed(inst, allowed));
-                        blockDef.addAll(getAllocationSitesDef(inst, allowed));
-                    }
-                    Terminator term = block.getTerminator();
-                    if (term != null) blockUse.addAll(getAllocationSitesUsed(term, allowed));
-                    use.put(block, blockUse);
-                    def.put(block, blockDef);
-                }
-            })
-            .sequential()
-            .then()
-        );
-
-        liveInGlobal = new ConcurrentHashMap<>();
-        liveOutGlobal = new ConcurrentHashMap<>();
-        for (Function func : live) {
-            for (BasicBlock block : func.getBlocks()) {
-                liveInGlobal.put(block, new HashSet<>());
-                liveOutGlobal.put(block, new HashSet<>());
-            }
-        }
-
-        LlvmUtil.awaitMono(Flux.fromIterable(live)
-            .parallel()
-            .runOn(scheduler)
-            .doOnNext(func -> solveFunction(func, use, def))
+            .doOnNext(this::solveFunction)
             .sequential()
             .then()
         );
     }
 
-    private void solveFunction(Function func,
-                               Map<BasicBlock, Set<AllocationSite>> use,
-                               Map<BasicBlock, Set<AllocationSite>> def) {
-        Set<AllocationSite> newLiveOut = new HashSet<>();
-        Set<AllocationSite> newLiveIn  = new HashSet<>();
-        Set<AllocationSite> temp       = new HashSet<>();
+    private void solveFunction(Function func) {
+        List<BasicBlock> blocks = func.getBlocks();
+        int n = blocks.size();
+        if (n == 0) return;
 
+        Map<BasicBlock, Integer> blockIndex = new HashMap<>(n * 2);
+        BitSet[] use = new BitSet[n];
+        BitSet[] def = new BitSet[n];
+        for (int i = 0; i < n; i++) {
+            BasicBlock block = blocks.get(i);
+            blockIndex.put(block, i);
+            BitSet u = new BitSet();
+            BitSet d = new BitSet();
+            for (Instruction inst : block.getInstructions()) {
+                collectUses(inst, u);
+                collectDefs(inst, d);
+            }
+            Terminator term = block.getTerminator();
+            if (term != null) collectTerminatorUses(term, u);
+            use[i] = u;
+            def[i] = d;
+        }
+
+        int[][] succs = new int[n][];
+        for (int i = 0; i < n; i++) {
+            List<BasicBlock> ss = blocks.get(i).getSuccessors();
+            int[] idx = new int[ss.size()];
+            int k = 0;
+            for (BasicBlock succ : ss) {
+                Integer si = blockIndex.get(succ);
+                if (si != null) idx[k++] = si;
+            }
+            succs[i] = k == idx.length ? idx : Arrays.copyOf(idx, k);
+        }
+
+        BitSet[] liveIn = new BitSet[n];
+        BitSet[] liveOut = new BitSet[n];
+        for (int i = 0; i < n; i++) {
+            liveIn[i] = new BitSet();
+            liveOut[i] = new BitSet();
+        }
+
+        BitSet newLiveOut = new BitSet();
+        BitSet newLiveIn = new BitSet();
         boolean changed = true;
         while (changed) {
             changed = false;
-            for (BasicBlock block : func.getBlocks()) {
+            for (int i = 0; i < n; i++) {
                 newLiveOut.clear();
-                for (BasicBlock succ : block.getSuccessors()) {
-                    Set<AllocationSite> succLiveIn = liveInGlobal.get(succ);
-                    if (succLiveIn != null && !succLiveIn.isEmpty()) {
-                        newLiveOut.addAll(succLiveIn);
-                    }
-                }
-                Set<AllocationSite> currentOut = liveOutGlobal.get(block);
-                if (currentOut == null) {
-                    liveOutGlobal.put(block, new HashSet<>(newLiveOut));
-                    changed = true;
-                } else if (!newLiveOut.equals(currentOut)) {
-                    currentOut.clear();
-                    currentOut.addAll(newLiveOut);
+                for (int si : succs[i]) newLiveOut.or(liveIn[si]);
+                if (!newLiveOut.equals(liveOut[i])) {
+                    liveOut[i] = (BitSet) newLiveOut.clone();
                     changed = true;
                 }
 
                 newLiveIn.clear();
-                Set<AllocationSite> u = use.get(block);
-                if (u != null && !u.isEmpty()) newLiveIn.addAll(u);
-
-                temp.clear();
-                temp.addAll(newLiveOut);
-                Set<AllocationSite> d = def.get(block);
-                if (d != null && !d.isEmpty()) temp.removeAll(d);
-                newLiveIn.addAll(temp);
-
-                Set<AllocationSite> currentIn = liveInGlobal.get(block);
-                if (currentIn == null) {
-                    liveInGlobal.put(block, new HashSet<>(newLiveIn));
-                    changed = true;
-                } else if (!newLiveIn.equals(currentIn)) {
-                    currentIn.clear();
-                    currentIn.addAll(newLiveIn);
+                newLiveIn.or(newLiveOut);
+                newLiveIn.andNot(def[i]);
+                newLiveIn.or(use[i]);
+                if (!newLiveIn.equals(liveIn[i])) {
+                    liveIn[i] = (BitSet) newLiveIn.clone();
                     changed = true;
                 }
             }
         }
+
+        for (int i = 0; i < n; i++) {
+            BasicBlock block = blocks.get(i);
+            liveInBits.put(block, liveIn[i]);
+            liveOutBits.put(block, liveOut[i]);
+        }
+    }
+
+    private void setSites(Set<AllocationSite> sites, BitSet out) {
+        for (AllocationSite site : sites) {
+            Integer id = siteIds.get(site);
+            if (id != null) out.set(id);
+        }
+    }
+
+    private void collectUses(Instruction inst, BitSet out) {
+        for (Value operand : inst.getOperands()) {
+            if (operand != null) setSites(getPointsTo(operand), out);
+        }
+    }
+
+    private void collectDefs(Instruction inst, BitSet out) {
+        Opcode op = inst.getOpcode();
+        if (op == Opcode.FREE) {
+            if (!inst.getOperands().isEmpty()) setSites(getPointsTo(inst.getOperands().getFirst()), out);
+        } else if (op == Opcode.CALL || op == Opcode.VIRTUAL_CALL
+            || op == Opcode.INTERFACE_CALL || op == Opcode.STATIC_CALL
+            || op == Opcode.SPECIAL_CALL) {
+            String calleeName = extractCalleeName(inst);
+            if (calleeName == null) return;
+            FunctionSummary summary = summaries.get(canonicalCalleeKey(calleeName));
+            if (summary == null) return;
+            List<Value> args = getCallArguments(inst);
+            for (int i = 0; i < args.size(); i++) {
+                if (summary.getParamsDestroyed().contains(i)) setSites(getPointsTo(args.get(i)), out);
+            }
+        }
+    }
+
+    private void collectTerminatorUses(Terminator term, BitSet out) {
+        Value used = null;
+        if (term instanceof ReturnTerminator rt) used = rt.getValue();
+        else if (term instanceof ThrowTerminator tt) used = tt.getException();
+        else if (term instanceof CondBranchTerminator cbt) used = cbt.getCondition();
+        else if (term instanceof LookupSwitchTerminator lst) used = lst.getKey();
+        else if (term instanceof TableSwitchTerminator tst) used = tst.getKey();
+        if (used != null) setSites(getPointsTo(used), out);
     }
 
     public Set<AllocationSite> getLiveIn(BasicBlock block) {
-        return liveInGlobal != null
-            ? liveInGlobal.getOrDefault(block, Collections.emptySet())
-            : Collections.emptySet();
+        return materialize(block, liveInBits, liveInCache);
     }
 
     public Set<AllocationSite> getLiveOut(BasicBlock block) {
-        return liveOutGlobal != null
-            ? liveOutGlobal.getOrDefault(block, Collections.emptySet())
-            : Collections.emptySet();
+        return materialize(block, liveOutBits, liveOutCache);
+    }
+
+    private Set<AllocationSite> materialize(BasicBlock block, Map<BasicBlock, BitSet> bitsMap,
+                                            Map<BasicBlock, Set<AllocationSite>> cache) {
+        Set<AllocationSite> cached = cache.get(block);
+        if (cached != null) return cached;
+        BitSet bits = bitsMap != null ? bitsMap.get(block) : null;
+        if (bits == null) return Collections.emptySet();
+        Set<AllocationSite> out = new HashSet<>(Math.max(4, bits.cardinality() * 2));
+        for (int i = bits.nextSetBit(0); i >= 0; i = bits.nextSetBit(i + 1)) out.add(sitesById.get(i));
+        Set<AllocationSite> prev = cache.putIfAbsent(block, out);
+        return prev != null ? prev : out;
     }
 
     public Map<BasicBlock, Set<AllocationSite>> getLiveOutMap() {
-        return liveOutGlobal;
+        if (liveOutBits == null) return null;
+        Map<BasicBlock, Set<AllocationSite>> m = new ConcurrentHashMap<>();
+        for (BasicBlock b : liveOutBits.keySet()) m.put(b, getLiveOut(b));
+        return m;
     }
 
     public record ValueLastUse(BasicBlock block, int instructionIndex, Value value) {}
@@ -204,62 +256,6 @@ public class LivenessAnalyzer {
         else if (term instanceof LookupSwitchTerminator lst) { if (lst.getKey() != null) result.add(lst.getKey()); }
         else if (term instanceof TableSwitchTerminator tst) { if (tst.getKey() != null) result.add(tst.getKey()); }
         else if (term instanceof IndirectBranchTerminator ibt) { if (ibt.getTargetBlock() != null) result.add(ibt.getTargetBlock()); }
-        return result;
-    }
-
-    private Set<AllocationSite> getAllocationSitesDef(Instruction inst, Set<AllocationSite> allowed) {
-        Set<AllocationSite> result = new HashSet<>();
-        Opcode op = inst.getOpcode();
-        if (op == Opcode.FREE) {
-            if (!inst.getOperands().isEmpty()) {
-                Value obj = inst.getOperands().getFirst();
-                for (AllocationSite site : getPointsTo(obj)) {
-                    if (allowed.contains(site)) result.add(site);
-                }
-            }
-        } else if (op == Opcode.CALL || op == Opcode.VIRTUAL_CALL
-            || op == Opcode.INTERFACE_CALL || op == Opcode.STATIC_CALL
-            || op == Opcode.SPECIAL_CALL) {
-            String calleeName = extractCalleeName(inst);
-            if (calleeName == null) return result;
-            FunctionSummary summary = summaries.get(canonicalCalleeKey(calleeName));
-            if (summary == null) return result;
-            List<Value> args = getCallArguments(inst);
-            for (int i = 0; i < args.size(); i++) {
-                if (summary.getParamsDestroyed().contains(i)) {
-                    for (AllocationSite site : getPointsTo(args.get(i))) {
-                        if (allowed.contains(site)) result.add(site);
-                    }
-                }
-            }
-        }
-        return result;
-    }
-
-    private Set<AllocationSite> getAllocationSitesUsed(Instruction inst, Set<AllocationSite> allowed) {
-        Set<AllocationSite> result = new HashSet<>();
-        for (Value operand : inst.getOperands()) {
-            if (operand == null) continue;
-            for (AllocationSite site : getPointsTo(operand)) {
-                if (allowed.contains(site)) result.add(site);
-            }
-        }
-        return result;
-    }
-
-    private Set<AllocationSite> getAllocationSitesUsed(Terminator term, Set<AllocationSite> allowed) {
-        Set<AllocationSite> result = new HashSet<>();
-        Value used = null;
-        if (term instanceof ReturnTerminator rt) used = rt.getValue();
-        else if (term instanceof ThrowTerminator tt) used = tt.getException();
-        else if (term instanceof CondBranchTerminator cbt) used = cbt.getCondition();
-        else if (term instanceof LookupSwitchTerminator lst) used = lst.getKey();
-        else if (term instanceof TableSwitchTerminator tst) used = tst.getKey();
-        if (used != null) {
-            for (AllocationSite site : getPointsTo(used)) {
-                if (allowed.contains(site)) result.add(site);
-            }
-        }
         return result;
     }
 }

@@ -41,8 +41,22 @@ public class LlvmRuntime {
      * {@code mangleMethod} is unnecessary and has been removed: it was a pure
      * no-op relative to the final result.</p>
      */
+    private static final ConcurrentHashMap<String, String> SANITIZE_CACHE =
+        new ConcurrentHashMap<>();
+
+    private static final ConcurrentHashMap<String, String> MANGLED_METHOD_CACHE =
+        new ConcurrentHashMap<>();
+
     private static String sanitizeToAsciiIdentifier(String s) {
         if (s == null) return "_";
+        String cached = SANITIZE_CACHE.get(s);
+        if (cached != null) return cached;
+        String result = doSanitize(s);
+        SANITIZE_CACHE.putIfAbsent(s, result);
+        return result;
+    }
+
+    private static String doSanitize(String s) {
         int n = s.length();
         StringBuilder sb = new StringBuilder(n);
         for (int i = 0; i < n; i++) {
@@ -374,9 +388,14 @@ public class LlvmRuntime {
      * memoises the result.</p>
      */
     public static String mangleMethod(String className, String methodName, String descriptor) {
-        return "fn_" + sanitizeToAsciiIdentifier(className)
+        String key = className + '\u0001' + methodName + '\u0001' + descriptor;
+        String cached = MANGLED_METHOD_CACHE.get(key);
+        if (cached != null) return cached;
+        String result = "fn_" + sanitizeToAsciiIdentifier(className)
             + "_" + sanitizeToAsciiIdentifier(methodName)
             + "_" + sanitizeToAsciiIdentifier(descriptor);
+        MANGLED_METHOD_CACHE.putIfAbsent(key, result);
+        return result;
     }
 
     /**
