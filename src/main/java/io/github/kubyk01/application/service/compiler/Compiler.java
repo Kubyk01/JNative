@@ -528,18 +528,21 @@ public class Compiler implements CompilerPort {
         String vswhere = findVswhere();
         if (vswhere == null) {
             throw new IllegalStateException(
-                    "Visual Studio Installer not found.\n"
-                            + "Expected vswhere.exe at:\n"
-                            + "  %ProgramFiles(x86)%\\Microsoft Visual Studio\\Installer\\vswhere.exe\n\n"
-                            + "Install one of:\n"
-                            + "  - Visual Studio Build Tools (no IDE, recommended):\n"
-                            + "      winget install Microsoft.VisualStudio.2022.BuildTools --override "
-                            + "\"--passive --wait --add Microsoft.VisualStudio.Workload.VCTools "
-                            + "--includeRecommended\"\n"
-                            + "  - Full Visual Studio with \"Desktop development with C++\" workload.\n\n"
-                            + "Or switch to a GNU toolchain that bundles everything:\n"
-                            + "  --target=x86_64-w64-windows-gnu   (llvm-mingw, no MSVC needed)\n"
-                            + "  https://github.com/mstorsjo/llvm-mingw/releases");
+                """
+                    Visual Studio Installer not found.
+                    Expected vswhere.exe at:
+                      %ProgramFiles(x86)%\\Microsoft Visual Studio\\Installer\\vswhere.exe
+                    
+                    Install one of:
+                      - Visual Studio Build Tools (no IDE, recommended):
+                          winget install Microsoft.VisualStudio.2022.BuildTools --override \
+                    "--passive --wait --add Microsoft.VisualStudio.Workload.VCTools \
+                    --includeRecommended"
+                      - Full Visual Studio with "Desktop development with C++" workload.
+                    
+                    Or switch to a GNU toolchain that bundles everything:
+                      --target=x86_64-w64-windows-gnu   (llvm-mingw, no MSVC needed)
+                      https://github.com/mstorsjo/llvm-mingw/releases""");
         }
 
         String installationPath = runCapture(vswhere,
@@ -549,21 +552,25 @@ public class Compiler implements CompilerPort {
 
         if (installationPath == null || installationPath.isBlank()) {
             throw new IllegalStateException(
-                    "Visual Studio Build Tools are installed, but the C++ "
-                            + "workload (Microsoft.VisualStudio.Component.VC.Tools.x86.x64) "
-                            + "is missing.\n\n"
-                            + "Open Visual Studio Installer and add:\n"
-                            + "  Workload: \"Desktop development with C++\"\n"
-                            + "  Components (in the right panel):\n"
-                            + "    - MSVC v143 - VS 2022 C++ x64/x86 build tools\n"
-                            + "    - Windows 10/11 SDK\n\n"
-                            + "Or re-run the installer with the C++ workload:\n"
-                            + "  winget install Microsoft.VisualStudio.2022.BuildTools --override "
-                            + "\"--passive --wait --add Microsoft.VisualStudio.Workload.VCTools "
-                            + "--includeRecommended\"\n\n"
-                            + "Alternatively, use a self-contained GNU toolchain:\n"
-                            + "  --target=x86_64-w64-windows-gnu\n"
-                            + "  https://github.com/mstorsjo/llvm-mingw/releases");
+                """
+                    Visual Studio Build Tools are installed, but the C++ \
+                    workload (Microsoft.VisualStudio.Component.VC.Tools.x86.x64) \
+                    is missing.
+                    
+                    Open Visual Studio Installer and add:
+                      Workload: "Desktop development with C++"
+                      Components (in the right panel):
+                        - MSVC v143 - VS 2022 C++ x64/x86 build tools
+                        - Windows 10/11 SDK
+                    
+                    Or re-run the installer with the C++ workload:
+                      winget install Microsoft.VisualStudio.2022.BuildTools --override \
+                    "--passive --wait --add Microsoft.VisualStudio.Workload.VCTools \
+                    --includeRecommended"
+                    
+                    Alternatively, use a self-contained GNU toolchain:
+                      --target=x86_64-w64-windows-gnu
+                      https://github.com/mstorsjo/llvm-mingw/releases""");
         }
 
         String vcToolsRoot = installationPath.trim();
@@ -698,7 +705,6 @@ public class Compiler implements CompilerPort {
 
         if (!isMsvc && mingwSysroot != null) {
             command.add("--sysroot=" + mingwSysroot);
-            command.add("--gcc-toolchain=" + mingwSysroot);
         }
 
         command.add("-fsyntax-only");
@@ -881,7 +887,7 @@ public class Compiler implements CompilerPort {
             if (gccPath == null) continue;
 
             String printed = queryGccSysroot(gccPath);
-            if (printed != null && hasStdlibHeader(printed)) {
+            if (hasStdlibHeader(printed)) {
                 return printed;
             }
 
@@ -988,14 +994,15 @@ public class Compiler implements CompilerPort {
         if (isMsvc) return;
 
         command.add("--sysroot=" + sysroot);
-        command.add("--gcc-toolchain=" + sysroot);
 
         if (isIr) return;
 
+        String tripleDir = mingwTripleDir(target);
+        if (Files.isDirectory(Paths.get(sysroot, tripleDir, "include"))) {
+            addIfDirectory(command, "-I", sysroot, tripleDir, "include");
+            return;
+        }
         addIfDirectory(command, "-I", sysroot, "include");
-        addIfDirectory(command, "-I", sysroot, "x86_64-w64-mingw32", "include");
-        addIfDirectory(command, "-I", sysroot, "i686-w64-mingw32", "include");
-        addIfDirectory(command, "-I", sysroot, "aarch64-w64-mingw32", "include");
         addIfDirectory(command, "-I", sysroot, "sys-root", "mingw", "include");
     }
 
@@ -1018,11 +1025,17 @@ public class Compiler implements CompilerPort {
 
         linkCmd.add("--sysroot=" + sysroot);
         linkCmd.add("--gcc-toolchain=" + sysroot);
+        String tripleDir = mingwTripleDir(target);
+        if (Files.isDirectory(Paths.get(sysroot, tripleDir, "lib"))) {
+            addLibIfDir(linkCmd, sysroot, tripleDir, "lib");
+            return;
+        }
         addLibIfDir(linkCmd, sysroot, "lib");
-        addLibIfDir(linkCmd, sysroot, "x86_64-w64-mingw32", "lib");
-        addLibIfDir(linkCmd, sysroot, "i686-w64-mingw32", "lib");
-        addLibIfDir(linkCmd, sysroot, "aarch64-w64-mingw32", "lib");
         addLibIfDir(linkCmd, sysroot, "sys-root", "mingw", "lib");
+    }
+
+    private static String mingwTripleDir(TargetPlatform target) {
+        return target.triple().split("-")[0] + "-w64-mingw32";
     }
 
     private static void addLibIfDir(List<String> cmd, String root, String... rel) {
@@ -1453,7 +1466,7 @@ public class Compiler implements CompilerPort {
             if (j > after && j < n && content.charAt(j) == '"') {
                 out.add(content.substring(after, j));
             }
-            i = j > after ? j : after;
+            i = Math.max(j, after);
         }
     }
 
