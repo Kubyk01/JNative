@@ -228,14 +228,6 @@ public class LlvmGenerator implements LlvmGeneratorPort {
             }
         }
 
-        Map<String, Set<String>> functionsByOwner = new HashMap<>();
-        for (Function f : toEmit) {
-            String owner = f.getOwnerClass();
-            if (owner != null && !owner.isEmpty()) {
-                functionsByOwner.computeIfAbsent(owner, k -> new HashSet<>()).add(f.getName());
-            }
-        }
-
         // ---- 2. Deferred strings are now fully known. Collect them. ----
         String deferred = globalEmitter.generateDeferredStringConstants();
 
@@ -263,8 +255,6 @@ public class LlvmGenerator implements LlvmGeneratorPort {
                 if (func.getName().startsWith("__jnative_fn_java_lang_invoke_MethodHandle_invoke")) {
                     classBodies.computeIfAbsent("java/lang/invoke/MethodHandle", k -> new StringBuilder())
                         .append(emitWeakDefaultDefinition(func));
-                    functionsByOwner.computeIfAbsent("java/lang/invoke/MethodHandle", k -> new HashSet<>())
-                        .add(func.getName());
                 }
             }
         }
@@ -291,7 +281,6 @@ public class LlvmGenerator implements LlvmGeneratorPort {
 
         String moduleExterns = buildExterns(
             moduleTail,
-            moduleAvailable,
             Collections.emptyMap(),
             module);
 
@@ -313,9 +302,7 @@ public class LlvmGenerator implements LlvmGeneratorPort {
             String className = e.getKey();
             String body = e.getValue().toString();
 
-            Set<String> definedHere = functionsByOwner.getOrDefault(className, Set.of());
-
-            String externs = buildExterns(body, definedHere, knownGlobals, module);
+            String externs = buildExterns(body, knownGlobals, module);
 
             String prelude = buildFilteredPrelude(body + "\n" + externs, preludeDefs);
 
@@ -719,7 +706,6 @@ public class LlvmGenerator implements LlvmGeneratorPort {
      * whole-module extern list would be.</p>
      */
     private String buildExterns(String bodyContent,
-                                Set<String> definedHere,
                                 Map<String, GlobalDecl> knownGlobals,
                                 Module module) {
         Set<String> used = new HashSet<>();
@@ -743,6 +729,7 @@ public class LlvmGenerator implements LlvmGeneratorPort {
             i = j;
         }
 
+        Set<String> definedHere = collectLocalDefinitions(bodyContent);
         StringBuilder sb = new StringBuilder();
         List<String> sorted = new ArrayList<>(used);
         Collections.sort(sorted);
@@ -762,10 +749,89 @@ public class LlvmGenerator implements LlvmGeneratorPort {
             }
             Function func = module.getFunction(name);
             if (func != null) {
-                sb.append(emitDeclaration(func));
+                String stub = func.getEntryBlock() == null && name.startsWith("__jnative_fn_")
+                    ? weakNativeStub(name, bodyContent)
+                    : null;
+                sb.append(stub != null ? stub : emitDeclaration(func));
+                continue;
+            }
+            if (name.startsWith("refclass_")) {
+                sb.append("@").append(name).append(" = extern_weak global %ReflectionClass\n");
+                continue;
+            }
+            if (name.startsWith("__jnative_fn_")) {
+                String stub = weakNativeStub(name, bodyContent);
+                if (stub != null) sb.append(stub);
             }
         }
         return sb.toString();
+    }
+
+    private static Set<String> collectLocalDefinitions(String body) {
+        Set<String> out = new HashSet<>();
+        int n = body.length();
+        int i = 0;
+        while (i < n) {
+            int eol = body.indexOf('\n', i);
+            if (eol < 0) eol = n;
+            int start = i;
+            if (body.startsWith("define ", start) || body.startsWith("declare ", start)) {
+                int at = body.indexOf(" @", start);
+                if (at >= 0 && at < eol) {
+                    int paren = body.indexOf('(', at);
+                    if (paren > at && paren < eol) out.add(body.substring(at + 2, paren));
+                }
+            } else if (body.charAt(start) == '@') {
+                int end = start + 1;
+                while (end < eol && body.charAt(end) != ' ' && body.charAt(end) != '=') end++;
+                if (end > start + 1) out.add(body.substring(start + 1, end));
+            }
+            i = eol + 1;
+        }
+        return out;
+    }
+
+    private static String weakNativeStub(String name, String body) {
+        String key = " @" + name + "(";
+        int at = body.indexOf(key);
+        if (at < 0) return null;
+        int lineStart = body.lastIndexOf('\n', at) + 1;
+        int callIdx = body.lastIndexOf("call ", at);
+        if (callIdx < lineStart) return null;
+        String ret = body.substring(callIdx + 5, at).trim();
+        if (ret.isEmpty()) return null;
+
+        List<String> types = new ArrayList<>();
+        int p = at + key.length();
+        int argStart = p;
+        int depth = 1;
+        for (; p < body.length() && depth > 0; p++) {
+            char c = body.charAt(p);
+            if (c == '(' || c == '[' || c == '{') {
+                depth++;
+            } else if (c == ')' || c == ']' || c == '}') {
+                depth--;
+                if (depth == 0) addArgType(types, body.substring(argStart, p));
+            } else if (c == ',' && depth == 1) {
+                addArgType(types, body.substring(argStart, p));
+                argStart = p + 1;
+            }
+        }
+        if (depth != 0) return null;
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("define weak ").append(ret).append(" @").append(name).append("(")
+          .append(String.join(", ", types)).append(") {\n  ret ").append(ret);
+        if (!"void".equals(ret)) sb.append(" zeroinitializer");
+        sb.append("\n}\n");
+        return sb.toString();
+    }
+
+    private static void addArgType(List<String> types, String arg) {
+        String a = arg.trim();
+        if (a.isEmpty()) return;
+        int sp = a.indexOf(' ');
+        types.add(sp < 0 ? a : a.substring(0, sp));
     }
 
     private void ensureExternalDeclarations() {
