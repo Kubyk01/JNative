@@ -41,6 +41,12 @@ public class DeadCodeEliminator {
 
     private Scheduler scheduler = Schedulers.single();
 
+    private Set<String> reflectivelyReadStaticFields = Set.of();
+
+    public void setReflectivelyReadStaticFields(Set<String> fields) {
+        this.reflectivelyReadStaticFields = fields != null ? fields : Set.of();
+    }
+
     public void setScheduler(Scheduler scheduler) {
         if (scheduler != null) this.scheduler = scheduler;
     }
@@ -170,6 +176,7 @@ public class DeadCodeEliminator {
 
     private Set<String> collectReadStaticFields() {
         Set<String> fields = ConcurrentHashMap.newKeySet();
+        fields.addAll(reflectivelyReadStaticFields);
         forEachParallel(new ArrayList<>(module.getFunctions()), func -> {
             if (func.getEntryBlock() == null) return;
             for (BasicBlock block : func.getBlocks()) {

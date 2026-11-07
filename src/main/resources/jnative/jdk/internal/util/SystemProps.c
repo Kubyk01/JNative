@@ -334,6 +334,26 @@ static uint32_t jnative_map_spread(int32_t h) {
  * refers to those constants rather than to a string literal plus a
  * hard-coded integer.
  */
+static void cmd_props_put(void* table, int table_size, void* node_vtable,
+                          const char* key_cstr, const char* val_cstr)
+{
+    int32_t klen = (int32_t)strlen(key_cstr);
+    int32_t h = jnative_string_hash(key_cstr, klen);
+    uint32_t spread = jnative_map_spread(h);
+    int idx = (int)(spread & (uint32_t)(table_size - 1));
+    void** slot = (void**)((char*)table + JAVA_ARR_HDR + (size_t)idx * sizeof(void*));
+
+    void* node = calloc(1, NODE_SIZE);
+    if (node == NULL) abort();
+    *(void**)((char*)node + 0) = node_vtable;
+    *(int32_t*)((char*)node + NODE_HASH_OFFSET) = (int32_t)spread;
+    *(void**)((char*)node + NODE_KEY_OFFSET) = __jnative_make_string_obj(key_cstr, klen);
+    *(void**)((char*)node + NODE_VAL_OFFSET) =
+        __jnative_make_string_obj(val_cstr, (int32_t)strlen(val_cstr));
+    *(void**)((char*)node + NODE_NEXT_OFFSET) = *slot;
+    *slot = node;
+}
+
 void* __jnative_fn_jdk_internal_util_SystemProps_Raw_cmdProperties___Ljava_util_HashMap_(
         void* self)
 {
@@ -367,46 +387,19 @@ void* __jnative_fn_jdk_internal_util_SystemProps_Raw_cmdProperties___Ljava_util_
     char home_buf[PATH_MAX];
     const char* java_home = resolve_java_home(home_buf, sizeof(home_buf));
 
-    /*
-     * The key, its byte length, and its hash are all derived from these
-     * two constants. If the key is ever renamed, only the definition
-     * here changes and every downstream site picks up the new length
-     * automatically.
-     */
-    static const char JAVA_HOME_KEY[] = "java.home";
-    static const int32_t JAVA_HOME_KEY_LEN =
-        (int32_t)(sizeof(JAVA_HOME_KEY) - 1);   /* 9 */
-
-    void* key = __jnative_make_string_obj(JAVA_HOME_KEY, JAVA_HOME_KEY_LEN);
-    void* value = __jnative_make_string_obj(
-        java_home, (int32_t)strlen(java_home));
-
-    /*
-     * Compute the hash over exactly JAVA_HOME_KEY_LEN bytes. Hashing
-     * over the C literal's full sizeof() would include the terminator
-     * byte and land the node in the wrong bucket — this is the exact
-     * mistake that produced the "java.home not set" assertion.
-     */
-    int32_t h = jnative_string_hash(JAVA_HOME_KEY, JAVA_HOME_KEY_LEN);
-    uint32_t spread = jnative_map_spread(h);
-    int idx = (int)(spread & (uint32_t)(table_size - 1));
-
-    void* node = calloc(1, NODE_SIZE);
-    if (node == NULL) abort();
-    *(void**)((char*)node + 0) = node_vtable;
-    *(int32_t*)((char*)node + NODE_HASH_OFFSET) = (int32_t)spread;
-    *(void**)((char*)node + NODE_KEY_OFFSET) = key;
-    *(void**)((char*)node + NODE_VAL_OFFSET) = value;
-    *(void**)((char*)node + NODE_NEXT_OFFSET) = NULL;
-    *(void**)((char*)table + JAVA_ARR_HDR + (size_t)idx * sizeof(void*)) = node;
+    cmd_props_put(table, table_size, node_vtable, "java.home", java_home);
+    cmd_props_put(table, table_size, node_vtable,
+                  "jdk.reflect.useNativeAccessorOnly", "true");
+    cmd_props_put(table, table_size, node_vtable,
+                  "jdk.reflect.useDirectMethodHandle", "methods");
 
     *(void**)((char*)map + 8)  = NULL;
     *(void**)((char*)map + 16) = NULL;
 
     *(void**)((char*)map + HASHMAP_TABLE_OFF)      = table;
     *(void**)((char*)map + HASHMAP_ENTRYSET_OFF)   = NULL;
-    *(int32_t*)((char*)map + HASHMAP_SIZE_OFF)     = 1;
-    *(int32_t*)((char*)map + HASHMAP_MODCOUNT_OFF) = 1;
+    *(int32_t*)((char*)map + HASHMAP_SIZE_OFF)     = 3;
+    *(int32_t*)((char*)map + HASHMAP_MODCOUNT_OFF) = 3;
     *(int32_t*)((char*)map + HASHMAP_THRESHOLD_OFF)= 12;
     *(float*)((char*)map + HASHMAP_LOADFACTOR_OFF) = 0.75f;
 
@@ -673,6 +666,8 @@ void* __jnative_make_bootstrap_props(
     JNATIVE_INSERT("java.vm.name",               "jnative");
     JNATIVE_INSERT("java.vm.info",               "jnative");
     JNATIVE_INSERT("jdk.debug",                  "release");
+    JNATIVE_INSERT("jdk.reflect.useNativeAccessorOnly", "true");
+    JNATIVE_INSERT("jdk.reflect.useDirectMethodHandle", "methods");
 
     JNATIVE_INSERT("os.name", "Linux");
     JNATIVE_INSERT("os.arch", resolve_os_arch());

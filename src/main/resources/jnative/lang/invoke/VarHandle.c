@@ -490,6 +490,262 @@ int64_t __jnative_fn_java_lang_invoke_VarHandle_getAndAddLong___BIJ_J(
     return __jnative_fn_java_lang_invoke_VarHandle_getAndAdd___BIJ_J(arr, index, delta);
 }
 
+static inline int32_t* iarr_slot(void* arr, int32_t index) {
+    if (arr == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    int32_t len = jnative_array_length(arr);
+    if (index < 0 || index >= len) {
+        __jnative_throw_array_index_out_of_bounds();
+    }
+    return (int32_t*)jnative_array_data(arr) + index;
+}
+
+static inline int64_t* larr_slot(void* arr, int32_t index) {
+    if (arr == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    int32_t len = jnative_array_length(arr);
+    if (index < 0 || index >= len) {
+        __jnative_throw_array_index_out_of_bounds();
+    }
+    return (int64_t*)jnative_array_data(arr) + index;
+}
+
+int32_t __jnative_fn_java_lang_invoke_VarHandle_get___II_I(void* arr, int32_t index) {
+    return *iarr_slot(arr, index);
+}
+
+void __jnative_fn_java_lang_invoke_VarHandle_set___III_V(void* arr, int32_t index, int32_t value) {
+    *iarr_slot(arr, index) = value;
+}
+
+int32_t __jnative_fn_java_lang_invoke_VarHandle_getVolatile___II_I(void* arr, int32_t index) {
+    return __atomic_load_n(iarr_slot(arr, index), __ATOMIC_SEQ_CST);
+}
+
+void __jnative_fn_java_lang_invoke_VarHandle_setVolatile___III_V(void* arr, int32_t index, int32_t value) {
+    __atomic_store_n(iarr_slot(arr, index), value, __ATOMIC_SEQ_CST);
+}
+
+int32_t __jnative_fn_java_lang_invoke_VarHandle_getAcquire___II_I(void* arr, int32_t index) {
+    return __atomic_load_n(iarr_slot(arr, index), __ATOMIC_ACQUIRE);
+}
+
+void __jnative_fn_java_lang_invoke_VarHandle_setRelease___III_V(void* arr, int32_t index, int32_t value) {
+    __atomic_store_n(iarr_slot(arr, index), value, __ATOMIC_RELEASE);
+}
+
+int32_t __jnative_fn_java_lang_invoke_VarHandle_getOpaque___II_I(void* arr, int32_t index) {
+    return __atomic_load_n(iarr_slot(arr, index), __ATOMIC_RELAXED);
+}
+
+void __jnative_fn_java_lang_invoke_VarHandle_setOpaque___III_V(void* arr, int32_t index, int32_t value) {
+    __atomic_store_n(iarr_slot(arr, index), value, __ATOMIC_RELAXED);
+}
+
+int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet___IIII_Z(
+        void* arr, int32_t index, int32_t expected, int32_t newValue) {
+    int32_t exp = expected;
+    return __atomic_compare_exchange_n(iarr_slot(arr, index), &exp, newValue, 0,
+                                       __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;
+}
+
+int32_t __jnative_fn_java_lang_invoke_VarHandle_weakCompareAndSet___IIII_Z(
+        void* arr, int32_t index, int32_t expected, int32_t newValue) {
+    return __jnative_fn_java_lang_invoke_VarHandle_compareAndSet___IIII_Z(
+        arr, index, expected, newValue);
+}
+
+int32_t __jnative_fn_java_lang_invoke_VarHandle_weakCompareAndSetPlain___IIII_Z(
+        void* arr, int32_t index, int32_t expected, int32_t newValue) {
+    return __jnative_fn_java_lang_invoke_VarHandle_compareAndSet___IIII_Z(
+        arr, index, expected, newValue);
+}
+
+int32_t __jnative_fn_java_lang_invoke_VarHandle_weakCompareAndSetAcquire___IIII_Z(
+        void* arr, int32_t index, int32_t expected, int32_t newValue) {
+    return __jnative_fn_java_lang_invoke_VarHandle_compareAndSet___IIII_Z(
+        arr, index, expected, newValue);
+}
+
+int32_t __jnative_fn_java_lang_invoke_VarHandle_weakCompareAndSetRelease___IIII_Z(
+        void* arr, int32_t index, int32_t expected, int32_t newValue) {
+    return __jnative_fn_java_lang_invoke_VarHandle_compareAndSet___IIII_Z(
+        arr, index, expected, newValue);
+}
+
+int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndExchange___IIII_I(
+        void* arr, int32_t index, int32_t expected, int32_t newValue) {
+    int32_t exp = expected;
+    __atomic_compare_exchange_n(iarr_slot(arr, index), &exp, newValue, 0,
+                                __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    return exp;
+}
+
+int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndExchangeAcquire___IIII_I(
+        void* arr, int32_t index, int32_t expected, int32_t newValue) {
+    return __jnative_fn_java_lang_invoke_VarHandle_compareAndExchange___IIII_I(
+        arr, index, expected, newValue);
+}
+
+int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndExchangeRelease___IIII_I(
+        void* arr, int32_t index, int32_t expected, int32_t newValue) {
+    return __jnative_fn_java_lang_invoke_VarHandle_compareAndExchange___IIII_I(
+        arr, index, expected, newValue);
+}
+
+int32_t __jnative_fn_java_lang_invoke_VarHandle_getAndSet___III_I(
+        void* arr, int32_t index, int32_t newValue) {
+    return __atomic_exchange_n(iarr_slot(arr, index), newValue, __ATOMIC_SEQ_CST);
+}
+
+int32_t __jnative_fn_java_lang_invoke_VarHandle_getAndSetAcquire___III_I(
+        void* arr, int32_t index, int32_t newValue) {
+    return __jnative_fn_java_lang_invoke_VarHandle_getAndSet___III_I(
+        arr, index, newValue);
+}
+
+int32_t __jnative_fn_java_lang_invoke_VarHandle_getAndSetRelease___III_I(
+        void* arr, int32_t index, int32_t newValue) {
+    return __jnative_fn_java_lang_invoke_VarHandle_getAndSet___III_I(
+        arr, index, newValue);
+}
+
+int32_t __jnative_fn_java_lang_invoke_VarHandle_getAndAdd___III_I(
+        void* arr, int32_t index, int32_t delta) {
+    return __atomic_fetch_add(iarr_slot(arr, index), delta, __ATOMIC_SEQ_CST);
+}
+
+int32_t __jnative_fn_java_lang_invoke_VarHandle_getAndAddAcquire___III_I(
+        void* arr, int32_t index, int32_t delta) {
+    return __jnative_fn_java_lang_invoke_VarHandle_getAndAdd___III_I(
+        arr, index, delta);
+}
+
+int32_t __jnative_fn_java_lang_invoke_VarHandle_getAndAddRelease___III_I(
+        void* arr, int32_t index, int32_t delta) {
+    return __jnative_fn_java_lang_invoke_VarHandle_getAndAdd___III_I(
+        arr, index, delta);
+}
+
+int64_t __jnative_fn_java_lang_invoke_VarHandle_get___JI_J(void* arr, int32_t index) {
+    return *larr_slot(arr, index);
+}
+
+void __jnative_fn_java_lang_invoke_VarHandle_set___JIJ_V(void* arr, int32_t index, int64_t value) {
+    *larr_slot(arr, index) = value;
+}
+
+int64_t __jnative_fn_java_lang_invoke_VarHandle_getVolatile___JI_J(void* arr, int32_t index) {
+    return __atomic_load_n(larr_slot(arr, index), __ATOMIC_SEQ_CST);
+}
+
+void __jnative_fn_java_lang_invoke_VarHandle_setVolatile___JIJ_V(void* arr, int32_t index, int64_t value) {
+    __atomic_store_n(larr_slot(arr, index), value, __ATOMIC_SEQ_CST);
+}
+
+int64_t __jnative_fn_java_lang_invoke_VarHandle_getAcquire___JI_J(void* arr, int32_t index) {
+    return __atomic_load_n(larr_slot(arr, index), __ATOMIC_ACQUIRE);
+}
+
+void __jnative_fn_java_lang_invoke_VarHandle_setRelease___JIJ_V(void* arr, int32_t index, int64_t value) {
+    __atomic_store_n(larr_slot(arr, index), value, __ATOMIC_RELEASE);
+}
+
+int64_t __jnative_fn_java_lang_invoke_VarHandle_getOpaque___JI_J(void* arr, int32_t index) {
+    return __atomic_load_n(larr_slot(arr, index), __ATOMIC_RELAXED);
+}
+
+void __jnative_fn_java_lang_invoke_VarHandle_setOpaque___JIJ_V(void* arr, int32_t index, int64_t value) {
+    __atomic_store_n(larr_slot(arr, index), value, __ATOMIC_RELAXED);
+}
+
+int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet___JIJJ_Z(
+        void* arr, int32_t index, int64_t expected, int64_t newValue) {
+    int64_t exp = expected;
+    return __atomic_compare_exchange_n(larr_slot(arr, index), &exp, newValue, 0,
+                                       __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;
+}
+
+int32_t __jnative_fn_java_lang_invoke_VarHandle_weakCompareAndSet___JIJJ_Z(
+        void* arr, int32_t index, int64_t expected, int64_t newValue) {
+    return __jnative_fn_java_lang_invoke_VarHandle_compareAndSet___JIJJ_Z(
+        arr, index, expected, newValue);
+}
+
+int32_t __jnative_fn_java_lang_invoke_VarHandle_weakCompareAndSetPlain___JIJJ_Z(
+        void* arr, int32_t index, int64_t expected, int64_t newValue) {
+    return __jnative_fn_java_lang_invoke_VarHandle_compareAndSet___JIJJ_Z(
+        arr, index, expected, newValue);
+}
+
+int32_t __jnative_fn_java_lang_invoke_VarHandle_weakCompareAndSetAcquire___JIJJ_Z(
+        void* arr, int32_t index, int64_t expected, int64_t newValue) {
+    return __jnative_fn_java_lang_invoke_VarHandle_compareAndSet___JIJJ_Z(
+        arr, index, expected, newValue);
+}
+
+int32_t __jnative_fn_java_lang_invoke_VarHandle_weakCompareAndSetRelease___JIJJ_Z(
+        void* arr, int32_t index, int64_t expected, int64_t newValue) {
+    return __jnative_fn_java_lang_invoke_VarHandle_compareAndSet___JIJJ_Z(
+        arr, index, expected, newValue);
+}
+
+int64_t __jnative_fn_java_lang_invoke_VarHandle_compareAndExchange___JIJJ_J(
+        void* arr, int32_t index, int64_t expected, int64_t newValue) {
+    int64_t exp = expected;
+    __atomic_compare_exchange_n(larr_slot(arr, index), &exp, newValue, 0,
+                                __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    return exp;
+}
+
+int64_t __jnative_fn_java_lang_invoke_VarHandle_compareAndExchangeAcquire___JIJJ_J(
+        void* arr, int32_t index, int64_t expected, int64_t newValue) {
+    return __jnative_fn_java_lang_invoke_VarHandle_compareAndExchange___JIJJ_J(
+        arr, index, expected, newValue);
+}
+
+int64_t __jnative_fn_java_lang_invoke_VarHandle_compareAndExchangeRelease___JIJJ_J(
+        void* arr, int32_t index, int64_t expected, int64_t newValue) {
+    return __jnative_fn_java_lang_invoke_VarHandle_compareAndExchange___JIJJ_J(
+        arr, index, expected, newValue);
+}
+
+int64_t __jnative_fn_java_lang_invoke_VarHandle_getAndSet___JIJ_J(
+        void* arr, int32_t index, int64_t newValue) {
+    return __atomic_exchange_n(larr_slot(arr, index), newValue, __ATOMIC_SEQ_CST);
+}
+
+int64_t __jnative_fn_java_lang_invoke_VarHandle_getAndSetAcquire___JIJ_J(
+        void* arr, int32_t index, int64_t newValue) {
+    return __jnative_fn_java_lang_invoke_VarHandle_getAndSet___JIJ_J(
+        arr, index, newValue);
+}
+
+int64_t __jnative_fn_java_lang_invoke_VarHandle_getAndSetRelease___JIJ_J(
+        void* arr, int32_t index, int64_t newValue) {
+    return __jnative_fn_java_lang_invoke_VarHandle_getAndSet___JIJ_J(
+        arr, index, newValue);
+}
+
+int64_t __jnative_fn_java_lang_invoke_VarHandle_getAndAdd___JIJ_J(
+        void* arr, int32_t index, int64_t delta) {
+    return __atomic_fetch_add(larr_slot(arr, index), delta, __ATOMIC_SEQ_CST);
+}
+
+int64_t __jnative_fn_java_lang_invoke_VarHandle_getAndAddAcquire___JIJ_J(
+        void* arr, int32_t index, int64_t delta) {
+    return __jnative_fn_java_lang_invoke_VarHandle_getAndAdd___JIJ_J(
+        arr, index, delta);
+}
+
+int64_t __jnative_fn_java_lang_invoke_VarHandle_getAndAddRelease___JIJ_J(
+        void* arr, int32_t index, int64_t delta) {
+    return __jnative_fn_java_lang_invoke_VarHandle_getAndAdd___JIJ_J(
+        arr, index, delta);
+}
+
 /* ===========================================================================
  *  Legacy void** entry points (kept for older call shapes)
  * =========================================================================== */

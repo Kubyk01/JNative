@@ -60,6 +60,22 @@ public class MethodBytecodeVisitor extends ClassVisitor {
         this.caller = caller;
     }
 
+    private static final class ReflectiveMember {
+        private final String ownerClass;
+        private final String name;
+        private final String descriptor;
+
+        ReflectiveMember(String ownerClass, String name, String descriptor) {
+            this.ownerClass = ownerClass;
+            this.name = name;
+            this.descriptor = descriptor;
+        }
+
+        String ownerClass() { return ownerClass; }
+        String name()       { return name; }
+        String descriptor() { return descriptor; }
+    }
+
     @Override
     public MethodVisitor visitMethod(int access, String name, String descriptor,
                                      String signature, String[] exceptions) {
@@ -266,7 +282,7 @@ public class MethodBytecodeVisitor extends ClassVisitor {
             if (opcode == Opcodes.GETSTATIC || opcode == Opcodes.PUTSTATIC) {
                 analysis.triggerClinit(owner, reachableFromUser);
             }
-            simulator.visitFieldInsn(opcode, descriptor);
+            simulator.visitFieldInsn(opcode, owner, name, descriptor);
             super.visitFieldInsn(opcode, owner, name, descriptor);
         }
 
@@ -431,7 +447,9 @@ public class MethodBytecodeVisitor extends ClassVisitor {
                     }
                 }
                 // For INVOKESPECIAL we already added ownerRef above.
-                simulator.visitMethodInsn(opcode, mDesc);
+                TypedValue overrideResult =
+                    tryHandleExactReflectionAccessor(opcode, owner, mName, mDesc);
+                simulator.visitMethodInsn(opcode, mDesc, overrideResult);
             }
             super.visitMethodInsn(opcode, owner, mName, mDesc, isInterface);
         }
@@ -926,19 +944,13 @@ public class MethodBytecodeVisitor extends ClassVisitor {
                 if (args.isEmpty()) return null;
 
                 TypedValue nameArg = args.getFirst();
-                if (!nameArg.isConstant() || !(nameArg.getValue() instanceof String methodName)) return null;
-                switch (methodName) {
-                    case "" -> {
-                        return null;
-                    }
-                    // <clinit> is never requested reflectively; <init> is
-                    // requested only through the constructor APIs.
-                    case "<clinit>" -> {
-                        return null;
-                    }
-                    case "<init>" -> {
-                        return null;
-                    }
+                if (!nameArg.isConstant() || !(nameArg.getValue() instanceof String methodName)) {
+                    return null;
+                }
+                if (methodName.isEmpty()
+                    || methodName.equals("<clinit>")
+                    || methodName.equals("<init>")) {
+                    return null;
                 }
 
                 List<String> paramClassNames = new ArrayList<>();
@@ -957,21 +969,19 @@ public class MethodBytecodeVisitor extends ClassVisitor {
                             paramsFullyResolved = false;
                         }
                     } else {
-                        // Array argument — the common varargs Class[] form.
-                        // Its elements are not visible through the
-                        // simulator, so the list cannot be completed.
                         paramsFullyResolved = false;
                         break;
                     }
                 }
 
-                // Target class = receiver of the INVOKEVIRTUAL. Fall back to
-                // lastLoadedClass only when the receiver was not statically
-                // resolvable (for example, it was stored into a local under
-                // an opaque type).
                 String targetClass = null;
                 if (receiver != null) {
                     targetClass = resolveClassNameFromValue(receiver);
+                    if (targetClass == null
+                        && receiver.getType().isReference()
+                        && "java/lang/Class".equals(receiver.getType().getClassName())) {
+                        return null;
+                    }
                 }
                 if (targetClass == null) {
                     targetClass = lastLoadedClass;
@@ -981,7 +991,7 @@ public class MethodBytecodeVisitor extends ClassVisitor {
                 ClassNode cn = resolver.getClassNode(targetClass);
                 if (cn == null || cn.isExternal()) return null;
 
-                boolean anyRegistered = false;
+                List<MethodReference> registered = new ArrayList<>();
 
                 if (paramsFullyResolved) {
                     for (MethodNode mn : cn.getMethods()) {
@@ -994,9 +1004,7 @@ public class MethodBytecodeVisitor extends ClassVisitor {
 
                         boolean match = true;
                         for (int i = 0; i < paramTypes.size(); i++) {
-                            Type pt = paramTypes.get(i);
-                            String expected = paramClassNames.get(i);
-                            if (!typeMatches(expected, pt)) {
+                            if (!typeMatches(paramClassNames.get(i), paramTypes.get(i))) {
                                 match = false;
                                 break;
                             }
@@ -1006,13 +1014,20 @@ public class MethodBytecodeVisitor extends ClassVisitor {
                                 targetClass, mn.getName(), mn.getDescriptor());
                             reflectInfo.addMethod(targetClass, ref);
                             addMethodWithContext(ref, true);
-                            anyRegistered = true;
+                            registered.add(ref);
                         }
                     }
                 }
 
-                if (!anyRegistered) {
-                    registerAllMethodsByName(targetClass, cn, methodName);
+                if (registered.isEmpty()) {
+                    registered = registerAllMethodsByName(targetClass, cn, methodName);
+                }
+
+                if (registered.size() == 1) {
+                    MethodReference only = registered.getFirst();
+                    return TypedValue.fromConstant(
+                        Type.reference("java/lang/reflect/Method"),
+                        new ReflectiveMember(only.getOwner(), only.getName(), only.getDescriptor()));
                 }
                 return null;
             }
@@ -1322,7 +1337,10 @@ public class MethodBytecodeVisitor extends ClassVisitor {
          * function body to point the adaptor at, and would emit
          * {@code i8* null} for that slot.</p>
          */
-        private void registerAllMethodsByName(String targetClass, ClassNode cn, String methodName) {
+        private List<MethodReference> registerAllMethodsByName(
+                String targetClass, ClassNode cn, String methodName) {
+            List<MethodReference> registered = new ArrayList<>();
+
             if ("<init>".equals(methodName)) {
                 for (MethodNode mn : cn.getMethods()) {
                     if (!mn.getName().equals("<init>")) continue;
@@ -1336,8 +1354,9 @@ public class MethodBytecodeVisitor extends ClassVisitor {
                     // Reachability edge: forces BytecodeToIr to emit
                     // the constructor's body into the module.
                     addMethodWithContext(ref, true);
+                    registered.add(ref);
                 }
-                return;
+                return registered;
             }
 
             Set<String> visited = new HashSet<>();
@@ -1356,6 +1375,7 @@ public class MethodBytecodeVisitor extends ClassVisitor {
                         current.getName(), mn.getName(), mn.getDescriptor());
                     reflectInfo.addMethod(current.getName(), ref);
                     addMethodWithContext(ref, true);
+                    registered.add(ref);
                     found = true;
                 }
 
@@ -1373,6 +1393,8 @@ public class MethodBytecodeVisitor extends ClassVisitor {
                 if (superNode == null || superNode.isExternal()) break;
                 current = superNode;
             }
+
+            return registered;
         }
 
         /**
@@ -1474,6 +1496,76 @@ public class MethodBytecodeVisitor extends ClassVisitor {
             return null;
         }
 
+        private TypedValue tryHandleExactReflectionAccessor(
+                int opcode, String owner, String mName, String mDesc) {
+            if (opcode != Opcodes.INVOKEVIRTUAL) return null;
+
+            if (owner.equals("java/lang/reflect/Method")
+                && mName.equals("getReturnType")
+                && mDesc.equals("()Ljava/lang/Class;")) {
+                return computeMethodReturnType(simulator.peekReceiver(opcode, mDesc));
+            }
+
+            if (owner.equals("java/lang/Class")
+                && mName.equals("getComponentType")
+                && mDesc.equals("()Ljava/lang/Class;")) {
+                return computeComponentType(simulator.peekReceiver(opcode, mDesc));
+            }
+
+            return null;
+        }
+
+        private TypedValue computeMethodReturnType(TypedValue receiver) {
+            if (receiver == null || !receiver.isConstant()) return null;
+            Object value = receiver.getValue();
+            if (!(value instanceof ReflectiveMember member)) return null;
+
+            String descriptor = member.descriptor();
+            if (descriptor == null || descriptor.isEmpty()) return null;
+
+            int closeParen = descriptor.indexOf(')');
+            if (closeParen < 0) return null;
+
+            String returnDesc = descriptor.substring(closeParen + 1);
+            if (returnDesc.isEmpty() || "V".equals(returnDesc)) return null;
+
+            String className = descriptorToClassName(returnDesc);
+            if (className == null) return null;
+
+            return TypedValue.fromConstant(Type.reference("java/lang/Class"), className);
+        }
+
+        private TypedValue computeComponentType(TypedValue receiver) {
+            if (receiver == null) return null;
+
+            String className = resolveClassNameFromValue(receiver);
+            if (className == null || className.length() < 2) return null;
+            if (className.charAt(0) != '[') return null;
+
+            char second = className.charAt(1);
+            String componentType;
+            if (second == '[') {
+                componentType = className.substring(1);
+            } else if (second == 'L' && className.endsWith(";")) {
+                componentType = className.substring(2, className.length() - 1);
+            } else {
+                return null;
+            }
+            if (componentType.isEmpty()) return null;
+
+            return TypedValue.fromConstant(Type.reference("java/lang/Class"), componentType);
+        }
+
+        private static String descriptorToClassName(String desc) {
+            if (desc == null || desc.isEmpty() || desc.length() == 1) return null;
+            char first = desc.charAt(0);
+            if (first == '[') return desc;
+            if (first == 'L' && desc.endsWith(";")) {
+                return desc.substring(1, desc.length() - 1);
+            }
+            return null;
+        }
+
         private boolean typeMatches(String expected, Type actual) {
             Type expectedType =
                 fromDescriptor(
@@ -1558,6 +1650,7 @@ public class MethodBytecodeVisitor extends ClassVisitor {
     private static class TypeSimulator {
         private final Deque<TypedValue> stack = new ArrayDeque<>();
         private final Map<Integer, TypedValue> locals = new HashMap<>();
+        private final Map<String, TypedValue> trackedFields = new HashMap<>();
 
         void push(TypedValue tv) { stack.push(tv); }
         TypedValue pop() { return stack.isEmpty() ? TypedValue.UNKNOWN : stack.pop(); }
@@ -1717,16 +1810,24 @@ public class MethodBytecodeVisitor extends ClassVisitor {
             }
         }
 
-        void visitFieldInsn(int opcode, String descriptor) {
+        void visitFieldInsn(int opcode, String owner, String name, String descriptor) {
             Type fieldType = fromDescriptor(descriptor);
             switch (opcode) {
-                case Opcodes.GETFIELD:
+                case Opcodes.GETFIELD: {
                     pop();
-                    push(TypedValue.fromType(fieldType));
+                    TypedValue tracked = trackedFields.get(owner + "." + name);
+                    push(tracked != null ? tracked : TypedValue.fromType(fieldType));
                     break;
-                case Opcodes.PUTFIELD:
-                    pop(); pop();
+                }
+                case Opcodes.PUTFIELD: {
+                    TypedValue value = pop();
+                    pop();
+                    if (isReflectiveFieldDescriptor(descriptor)
+                        && (value.isConstant() || value.isExact())) {
+                        trackedFields.put(owner + "." + name, value);
+                    }
                     break;
+                }
                 case Opcodes.GETSTATIC:
                     push(TypedValue.fromType(fieldType));
                     break;
@@ -1737,20 +1838,45 @@ public class MethodBytecodeVisitor extends ClassVisitor {
             }
         }
 
+        private static boolean isReflectiveFieldDescriptor(String descriptor) {
+            return "Ljava/lang/reflect/Method;".equals(descriptor)
+                || "Ljava/lang/reflect/Field;".equals(descriptor)
+                || "Ljava/lang/reflect/Constructor;".equals(descriptor)
+                || "Ljava/lang/Class;".equals(descriptor);
+        }
+
         void visitMethodInsn(int opcode, String desc) {
+            visitMethodInsn(opcode, desc, null);
+        }
+
+        void visitMethodInsn(int opcode, String desc, TypedValue overrideResult) {
             int argCount = countArguments(desc);
             Type retType = fromDescriptor(desc.substring(desc.lastIndexOf(')') + 1));
-
-            for (int i = 0; i < argCount; i++) {
-                pop();
-            }
-            if (opcode == Opcodes.INVOKEVIRTUAL || opcode == Opcodes.INVOKEINTERFACE
+            for (int i = 0; i < argCount; i++) pop();
+            if (opcode == Opcodes.INVOKEVIRTUAL
+                || opcode == Opcodes.INVOKEINTERFACE
                 || opcode == Opcodes.INVOKESPECIAL) {
                 pop();
             }
             if (!retType.isVoid()) {
-                push(TypedValue.fromType(retType));
+                push(overrideResult != null ? overrideResult : TypedValue.fromType(retType));
             }
+        }
+
+        TypedValue peekReceiver(int opcode, String desc) {
+            if (opcode != Opcodes.INVOKEVIRTUAL
+                && opcode != Opcodes.INVOKEINTERFACE
+                && opcode != Opcodes.INVOKESPECIAL) {
+                return null;
+            }
+            int argCount = countArguments(desc);
+            if (stack.size() < argCount + 1) return null;
+            int idx = 0;
+            for (TypedValue tv : stack) {
+                if (idx == argCount) return tv;
+                idx++;
+            }
+            return null;
         }
 
         void visitLdcInsn(Object value) {

@@ -602,7 +602,7 @@ extern const int64_t        jnative_function_index_size  JNATIVE_WEAK;
  * access (see the file's header comment for the access-order
  * invariant it enforces).
  */
-typedef struct {
+typedef struct JNativeLazyClinitEntryC {
     ReflectionClass* cls;
     void*            wrapper;   /* void (*)(void) */
 } JNativeLazyClinitEntry;

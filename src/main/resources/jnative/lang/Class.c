@@ -8,6 +8,8 @@
 #include "jnative_runtime.h"
 
 extern struct ReflectionClass* reflect_all_classes[];
+extern struct JNativeLazyClinitEntryC jnative_lazy_clinit_map[];
+extern const int64_t jnative_lazy_clinit_map_size;
 extern int __jnative_instanceof(void* obj, void** type_info);
 
 extern void* __jnative_make_string_obj(const char* bytes, int32_t len);
@@ -19,20 +21,18 @@ extern const char* __jnative_read_string_bytes(void* s, int32_t* out_len);
  *
  * JNATIVE_METHOD_ROOT_OFFSET and JNATIVE_CTOR_ROOT_OFFSET are emitted by
  * LlvmGlobalEmitter.generateLayoutConstants() as `constant i32` globals.
- * The guard exists because the value is not guaranteed to be meaningful
- * on every JDK: a field that a given JDK release no longer declares is
- * published as -1, and a future rename could surface any other value the
- * layout computation produced.
+ * The value is not guaranteed to be meaningful on every JDK: a field that
+ * a given JDK release no longer declares is published as -1, and a future
+ * rename could surface any other value the layout computation produced.
  *
  * The bounds check below is the last line of defence: it is better to
- * silently skip the root write (which only matters for one corner case of
- * Method.copy()) than to corrupt arbitrary heap. The upper bound is
- * generous relative to any plausible reflect-mirror layout — JDK 21's
- * Method and Constructor both put root within the first ~256 bytes of the
- * object.
+ * silently skip the (redundant) NULL store than to corrupt arbitrary
+ * heap. The upper bound is generous relative to any plausible
+ * reflect-mirror layout — JDK 21's Method and Constructor both put root
+ * within the first ~256 bytes of the object.
  *
  * A root offset of -1 (the value published when the JDK does not declare
- * the field) means "not set" and the write is skipped.
+ * the field) means "not set" and the store is skipped.
  */
 #define JNATIVE_ROOT_OFFSET_MAX 512
 
@@ -369,14 +369,75 @@ static void* create_field_mirror(ReflectionClass* declaring_cls,
  * (which LlvmGlobalEmitter computes as an unaligned sum) cannot cause a
  * heap overflow.
  *
- * The `root` write — which is what makes Method.copy() work on a mirror
- * that has already had its methodAccessor set — is gated on a bounds
- * check. When the emitted constant is -1 (this JDK does not declare the
- * field) or a value that does not fall inside the plausible range, the
- * write is skipped rather than performed at a wild address.
- * A mirror that is not marked as its own root will fail Method.copy()
- * with "Can not copy a non-root Method", which is a clean Java-level
- * error rather than a segfault.
+ * ----------------------------------------------------------------------
+ * THE `root` FIELD — CRITICAL SEMANTICS
+ * ----------------------------------------------------------------------
+ *
+ * In the JDK's java.lang.reflect.Method, `root` distinguishes an
+ * ORIGINAL Method from a COPY produced by Method.copy():
+ *
+ *     // original Method created by reflection
+ *     root == null
+ *
+ *     // copy created by Class.getMethod() -> ReflectionFactory.copyMethod()
+ *     Method res = new Method(...);
+ *     res.root = original;   // non-null -> res IS a copy
+ *
+ * The very first thing Method.copy() does is reject copies:
+ *
+ *     if (this.root != null)
+ *         throw new IllegalArgumentException("Can not copy a non-root Method");
+ *     Method res = new Method(...);
+ *     res.root = this;
+ *     res.methodAccessor = methodAccessor;
+ *     return res;
+ *
+ * Constructor.copy() mirrors the same logic with the message
+ * "Can not copy a non-root Constructor".
+ *
+ * Therefore a mirror produced by this routine MUST behave as an ORIGINAL:
+ * its `root` field must be NULL, and the JDK will set it to point at this
+ * mirror on the first copy(). The JDK layer explicitly relies on this:
+ *
+ *     Class.getDeclaredMethod(...)
+ *         -> getDeclaredMethods0()    // this routine; produces root-candidates
+ *         -> searchMethods()          // picks the matching mirror
+ *         -> ReflectionFactory.copyMethod(mirror)
+ *             -> mirror.copy()        // requires mirror.root == null
+ *
+ * A previous revision of this file wrote `root = method` ("self"),
+ * intending to make the mirror "its own root". That reading is incorrect
+ * for the JDK's actual semantics: `root != null` marks a mirror as
+ * ALREADY a copy, and the next copy() throws. The observable failure was
+ * the very first reflective lookup performed by any JDK or library code:
+ *
+ *     com.google.gson.internal.reflect.ReflectionHelper.<clinit>
+ *         -> Class.class.getMethod("isRecord")
+ *             -> Method.copy()
+ *                 -> IllegalArgumentException:
+ *                        Can not copy a non-root Method
+ *
+ * Gson 2.10.1's <clinit> runs this exact sequence to set up its
+ * RecordSupportedHelper, and the resulting exception cascaded through
+ * the entire image:
+ *
+ *     jnative: <clinit> of com/google/gson/internal/reflect/ReflectionHelper
+ *              abandoned: ...
+ *     Exception in thread "main"
+ *         java.lang.IllegalArgumentException:
+ *             GSON (2.10.1) cannot handle io.github.kubyk01.Main$Person
+ *
+ * The fix is to leave `root` at its calloc-initialised value of NULL.
+ * Because `jnative_alloc_object_at_least()` uses calloc(1, size), the
+ * root slot is already zero. The bounds-checked write below is retained
+ * purely as an explicit no-op for the reader — it stores NULL (the value
+ * the slot already has), which is idempotent and keeps the invariant
+ * visible at every call site. The guard still protects against a wild
+ * offset from a JDK whose Method layout changed and in which
+ * JNATIVE_METHOD_ROOT_OFFSET ended up pointing outside the object.
+ *
+ * The same reasoning and the same fix apply to
+ * create_constructor_mirror().
  */
 static void* create_method_mirror(ReflectionClass* declaring_cls,
                                   ReflectionMethod* rm)
@@ -441,8 +502,14 @@ static void* create_method_mirror(ReflectionClass* declaring_cls,
     *(void**)((char*)method + JNATIVE_METHOD_EXC_TYPES_OFFSET)   = exc_types;
     *(int32_t*)((char*)method + JNATIVE_METHOD_MODIFIERS_OFFSET) = rm->modifiers;
 
+    /*
+     * root MUST be NULL for the mirror to be a valid "original" Method.
+     * jnative_alloc_object_at_least() calloc()s the storage, so the slot
+     * is already NULL; the store below is a self-documenting no-op that
+     * also re-applies the bounds guard. See the long comment above.
+     */
     if (jnative_root_offset_is_sane(JNATIVE_METHOD_ROOT_OFFSET)) {
-        *(void**)((char*)method + JNATIVE_METHOD_ROOT_OFFSET) = method;
+        *(void**)((char*)method + JNATIVE_METHOD_ROOT_OFFSET) = NULL;
     }
 
     return method;
@@ -453,7 +520,13 @@ static void* create_method_mirror(ReflectionClass* declaring_cls,
  * ReflectionConstructor descriptor.
  *
  * Same non-null contract for both parameterTypes and exceptionTypes as
- * create_method_mirror above, and the same bounds-checked root write.
+ * create_method_mirror above.
+ *
+ * The same `root == NULL` invariant applies here: Constructor.copy()
+ * begins with exactly the same check as Method.copy() and rejects a
+ * source whose `root != null`. The mirror produced by this routine is
+ * an ORIGINAL — root stays NULL until the JDK's first copy() sets it to
+ * point back at the mirror.
  */
 static void* create_constructor_mirror(ReflectionClass* declaring_cls,
                                        ReflectionConstructor* rc_ctor)
@@ -505,7 +578,7 @@ static void* create_constructor_mirror(ReflectionClass* declaring_cls,
     *(int32_t*)((char*)ctor + JNATIVE_CTOR_MODIFIERS_OFFSET) = rc_ctor->modifiers;
 
     if (jnative_root_offset_is_sane(JNATIVE_CTOR_ROOT_OFFSET)) {
-        *(void**)((char*)ctor + JNATIVE_CTOR_ROOT_OFFSET) = ctor;
+        *(void**)((char*)ctor + JNATIVE_CTOR_ROOT_OFFSET) = NULL;
     }
 
     return ctor;
@@ -776,6 +849,20 @@ void __jnative_fn_java_lang_Class_registerNatives___V(void) {
  * Class.forName0
  * ------------------------------------------------------------------------ */
 
+static void run_lazy_clinit_if_present(struct ReflectionClass* cls) {
+    if (cls == NULL) return;
+    const int64_t size = jnative_lazy_clinit_map_size;
+    if (size <= 0) return;
+    for (int64_t i = 0; i < size; i++) {
+        if (jnative_lazy_clinit_map[i].cls == cls) {
+            void (*wrapper)(void) =
+                (void (*)(void))jnative_lazy_clinit_map[i].wrapper;
+            if (wrapper != NULL) wrapper();
+            return;
+        }
+    }
+}
+
 static void* make_class_not_found_exception(const char* name, int32_t len) {
     char buf[512];
     if (name != NULL && len > 0 && (size_t)len < sizeof(buf)) {
@@ -795,7 +882,6 @@ void* __jnative_fn_java_lang_Class_forName0__Ljava_lang_String_ZLjava_lang_Class
         void* loader,
         void* caller)
 {
-    (void)initialize;
     (void)loader;
     (void)caller;
 
@@ -815,6 +901,10 @@ void* __jnative_fn_java_lang_Class_forName0__Ljava_lang_String_ZLjava_lang_Class
     if (cls == NULL) {
         __jnative_throw_exception(make_class_not_found_exception(name, len));
         return NULL;
+    }
+
+    if (initialize) {
+        run_lazy_clinit_if_present(cls);
     }
     return (void*)cls;
 }

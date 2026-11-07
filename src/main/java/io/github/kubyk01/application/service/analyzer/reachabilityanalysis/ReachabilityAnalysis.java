@@ -575,11 +575,43 @@ public class ReachabilityAnalysis {
         drainWorklist();
         resolveVirtualDispatchFixedPoint();
 
+        if (seedPregeneratedBmhSpecies()) {
+            drainWorklist();
+            resolveVirtualDispatchFixedPoint();
+        }
+
         log.info("Reachability analysis complete. Reachable classes: {}, methods: {}",
             reachableClasses.size(), reachableMethods.size());
         log.info("User-reached classes: {}, user-reachable methods: {}",
             userReachedClasses.size(), userReachableMethods.size());
         log.info("Instantiated classes: {}", instantiatedClasses.size());
+    }
+
+    private boolean seedPregeneratedBmhSpecies() {
+        if (!reachableClasses.contains("java/lang/invoke/BoundMethodHandle$Species_L")) return false;
+        List<String> species = new ArrayList<>();
+        try (java.util.stream.Stream<java.nio.file.Path> files = java.nio.file.Files.list(
+                java.nio.file.FileSystems.getFileSystem(java.net.URI.create("jrt:/"))
+                        .getPath("/modules/java.base/java/lang/invoke"))) {
+            files.map(f -> f.getFileName().toString())
+                    .filter(n -> n.startsWith("BoundMethodHandle$Species_") && n.endsWith(".class"))
+                    .forEach(n -> species.add("java/lang/invoke/" + n.substring(0, n.length() - 6)));
+        } catch (Exception e) {
+            log.warn("Could not list pre-generated BoundMethodHandle species: {}", e.getMessage());
+            return false;
+        }
+        boolean added = false;
+        for (String cls : species) {
+            if (reachableClasses.contains(cls)) continue;
+            addClassWithInit(cls, false);
+            ClassNode cn = resolver.getClassNode(cls);
+            if (cn == null || cn.isExternal()) continue;
+            for (MethodNode m : cn.getMethods()) {
+                addMethod(new MethodReference(cls, m.getName(), m.getDescriptor()), false);
+            }
+            added = true;
+        }
+        return added;
     }
 
     /**

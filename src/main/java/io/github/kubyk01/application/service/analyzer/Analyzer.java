@@ -1,5 +1,7 @@
 package io.github.kubyk01.application.service.analyzer;
 
+import io.github.kubyk01.domain.analyzer.reflection.ReflectInfo;
+
 import io.github.kubyk01.application.service.analyzer.aliasanalysis.AliasAnalyzer;
 import io.github.kubyk01.application.service.analyzer.dependencyresolver.DependencyResolver;
 import io.github.kubyk01.application.service.analyzer.escapeanalysis.EscapeAnalyzer;
@@ -65,6 +67,9 @@ public class Analyzer {
     @Setter
     private BytecodeToIr translator;
 
+    @Setter
+    private ReflectInfo reflectInfo;
+
     public AnalyzerResult analyze(Module module,
                                   DependencyResolver resolver,
                                   String entryClass,
@@ -79,6 +84,9 @@ public class Analyzer {
         System.out.println("\n--- Running dead code elimination ---");
         DeadCodeEliminator dce = new DeadCodeEliminator(module);
         dce.setScheduler(scheduler);
+        if (reflectInfo != null) {
+            dce.setReflectivelyReadStaticFields(reflectInfo.staticFieldKeys(resolver::getField));
+        }
         dce.eliminate();
 
         int resurrected = resurrectRemovedClinits(module, resolver);

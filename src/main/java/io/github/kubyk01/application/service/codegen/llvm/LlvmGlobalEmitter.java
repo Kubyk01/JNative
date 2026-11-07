@@ -43,7 +43,7 @@ import static io.github.kubyk01.util.LlvmUtil.extractFieldName;
 /**
  * Emits the global data section of the generated module: struct types,
  * vtables, itables, type-info tables, string literals, reflection data.
- *
+ * <p>
  * Thread-safety: writes happen before parallel emission, reads happen
  * during. Caches populated before the parallel phase are concurrent;
  * prepareLayouts() is double-checked and idempotent; the only write during
@@ -51,7 +51,7 @@ import static io.github.kubyk01.util.LlvmUtil.extractFieldName;
  * whose readers snapshot under the same monitor. getFieldOffset is safe
  * to call concurrently for the same pair (deterministic result, benign
  * duplicate write).
- *
+ * <p>
  * Emitted globals are `constant` except two writable cases:
  *   - @refclass_* mirrors, because Class's own bytecode caches name,
  *     packageName, enumConstants, reflectionData, classValueMap, etc.
@@ -933,11 +933,11 @@ public class LlvmGlobalEmitter {
     /**
      * Emits the shared java.lang.Module object pointed at by every
      * @refclass_*.module slot (offset 80).
-     *
+     * <p>
      * Initially describes the unnamed module of the boot loader
      * (isNamed == false, name == null). Class.getModule() is a plain read of
      * that slot, so emitting null there NPEs on thisModule.isNamed().
-     *
+     * <p>
      * MUST be writable (`global`, not `constant`): the JDK's own module
      * bootstrap (ModuleBootstrap.boot -> ModuleLayer.defineModules) later
      * writes reads/exports/opens and the identity fields on this same
@@ -1945,9 +1945,14 @@ public class LlvmGlobalEmitter {
     //  Static fields
     // =========================================================================
 
+    private final Set<String> staticFieldStringConstants = new LinkedHashSet<>();
+
     private String generateStaticFields() {
         Set<String> allFields = new TreeSet<>(aliasResult.getGraph()
                 .getStaticFieldPointsToMap().keySet());
+        if (reflectInfo != null) {
+            allFields.addAll(reflectInfo.staticFieldKeys(resolver::getField));
+        }
 
         for (Function function : module.getFunctions()) {
             for (BasicBlock block : function.getBlocks()) {
@@ -2037,15 +2042,7 @@ public class LlvmGlobalEmitter {
             if (fieldType == null) fieldType = Type.UNKNOWN;
             String llvmType = LlvmTypeMapper.toLlvmType(fieldType);
 
-            String init;
-            if (fieldType.isReference() || fieldType.isArray()
-                || fieldType.isNull() || fieldType.isUnknown()) {
-                init = "null";
-            } else if (fieldType == Type.FLOAT || fieldType == Type.DOUBLE) {
-                init = "0.0";
-            } else {
-                init = "0";
-            }
+            String init = staticFieldInitializer(owner, fieldName, fieldType, llvmType);
 
             String globalName = "gv_" + LlvmTypeMapper.sanitizeIdentifier(fullName);
             sb.append("@").append(globalName).append(" = global ").append(llvmType)
@@ -2053,6 +2050,32 @@ public class LlvmGlobalEmitter {
         }
         sb.append("\n");
         return sb.toString();
+    }
+
+    private String staticFieldInitializer(String owner, String fieldName,
+                                          Type fieldType, String llvmType) {
+        FieldNode fn = resolver.getField(owner, fieldName);
+        Object cv = (fn != null && java.lang.reflect.Modifier.isStatic(fn.getAccess()))
+            ? fn.getConstantValue()
+            : null;
+        boolean refLike = fieldType.isReference() || fieldType.isArray()
+            || fieldType.isNull() || fieldType.isUnknown();
+        if (refLike) {
+            if (cv instanceof String str && "i8*".equals(llvmType)) {
+                staticFieldStringConstants.add(str);
+                return "bitcast (%struct.java_lang_String* @"
+                    + LlvmRuntime.stringObjectGlobalName(str) + " to i8*)";
+            }
+            return "null";
+        }
+        if (fieldType == Type.FLOAT || fieldType == Type.DOUBLE) {
+            double d = (cv instanceof Number num) ? num.doubleValue() : 0.0;
+            if (fieldType == Type.FLOAT) d = (float) d;
+            return String.format("0x%016X", Double.doubleToRawLongBits(d));
+        }
+        long v = (cv instanceof Number num) ? num.longValue() : 0L;
+        if ("i1".equals(llvmType)) return v != 0 ? "true" : "false";
+        return Long.toString(v);
     }
 
     // =========================================================================
@@ -2184,7 +2207,7 @@ public class LlvmGlobalEmitter {
     }
 
     private Set<String> collectJavaStringLiterals() {
-        Set<String> result = new LinkedHashSet<>();
+        Set<String> result = new LinkedHashSet<>(staticFieldStringConstants);
         for (Function func : module.getFunctions()) {
             for (BasicBlock block : func.getBlocks()) {
                 for (Instruction inst : block.getInstructions()) {
@@ -2255,19 +2278,19 @@ public class LlvmGlobalEmitter {
      *                     klass@0, length@8, elem_size@12, payload@16).
      *   @jstr_<hex>     — the String object (value -> @strbytes, coder
      *                     selects interpretation).
-     *
+     * <p>
      * Encoding follows the compact-string contract:
      *   coder == 0: LATIN1, one byte per char (all chars <= U+00FF).
      *   coder == 1: UTF-16BE, two bytes per char (otherwise).
      * The length word is the byte count; String.length() recovers the char
      * count via `value.length >> coder`.
-     *
+     * <p>
      * The previous revision encoded everything as UTF-8 with coder=0, so
      * every non-ASCII literal reported the UTF-8 byte count as its character
      * length. "\uFFFD" (3 UTF-8 bytes) triggered
      * IllegalArgumentException: Replacement too long in
      * JceSecurity.<clinit>.
-     *
+     * <p>
      * The backing array is an anonymous struct because the klass word is a
      * link-time relocation to @refclass__B, not a compile-time byte
      * sequence. The prior hand-laid [N x i8] layout put the header at
@@ -2713,8 +2736,8 @@ public class LlvmGlobalEmitter {
                 "Cannot resolve class for field offset: " + className + "." + fieldName);
         }
         if (cls.isExternal()) {
-            throw new IllegalStateException(
-                "Cannot compute field offset for external class: " + className + "." + fieldName);
+            fieldOffsets.put(key, OBJECT_HEADER_SIZE);
+            return OBJECT_HEADER_SIZE;
         }
 
         List<FieldNode> allFields = collectInstanceFields(cls);
@@ -2863,6 +2886,17 @@ public class LlvmGlobalEmitter {
             for (String cls : reflectInfo.getAllClasses()) {
                 if (cls == null || cls.isEmpty()) continue;
                 emitClasses.add(cls);
+            }
+            for (ReflectClassInfo info : reflectInfo.getClassInfoMap().values()) {
+                for (MethodReference method : info.getMethods()) {
+                    addReflectionDescriptorTypes(emitClasses, method.getDescriptor());
+                }
+                for (MethodReference ctor : info.getConstructors()) {
+                    addReflectionDescriptorTypes(emitClasses, ctor.getDescriptor());
+                }
+                for (FieldReference field : info.getFields()) {
+                    addReflectionDescriptorTypes(emitClasses, field.getDescriptor());
+                }
             }
         }
 
@@ -3335,6 +3369,30 @@ public class LlvmGlobalEmitter {
             String fieldsArray = "@reffields_" + cleanClassName;
             appendNullTerminatedPtrArray(sb, fieldsArray, fieldPtrs);
 
+            if (!isPrimitive && !isArrayPseudoClass
+                && classNode != null && !classNode.isExternal()) {
+                Set<String> existingCtorDescs = new HashSet<>();
+                for (MethodReference ctor : info.getConstructors()) {
+                    existingCtorDescs.add(ctor.getDescriptor());
+                }
+                List<MethodReference> moduleCtorAdditions = new ArrayList<>();
+                for (MethodNode mn : classNode.getMethods()) {
+                    if (!mn.getName().equals("<init>")) continue;
+                    String desc = mn.getDescriptor();
+                    if (desc == null || desc.isEmpty()) continue;
+                    if (!existingCtorDescs.add(desc)) continue;
+                    String mangled = LlvmRuntime.mangleMethod(className, "<init>", desc);
+                    Function f = module.getFunction(mangled);
+                    if (f != null && f.getEntryBlock() != null) {
+                        moduleCtorAdditions.add(
+                            new MethodReference(className, "<init>", desc));
+                    }
+                }
+                for (MethodReference ctor : moduleCtorAdditions) {
+                    info.addConstructor(ctor);
+                }
+            }
+
             // ---- Constructors ----
             List<MethodReference> sortedCtors = new ArrayList<>(info.getConstructors());
             sortedCtors.sort(Comparator.comparing(MethodReference::toString));
@@ -3381,18 +3439,11 @@ public class LlvmGlobalEmitter {
             String ctorsArray = "@refctors_" + cleanClassName;
             appendNullTerminatedPtrArray(sb, ctorsArray, ctorPtrs);
 
-            // ---- Superclass / interface pointer arrays ----
-            //
-            // An array mirror points at java/lang/Object as its superclass
-            // (see the JLS note above); every other class points at its
-            // declared superclass, except Object itself, whose superclass
-            // slot stays null.
             String superClassPtr = "null";
             if (isArrayPseudoClass) {
                 String objVar = classVarNames.get("java/lang/Object");
                 if (objVar != null) superClassPtr = objVar;
-            } else if (info.getSuperName() != null
-                && !info.getSuperName().equals("java/lang/Object")) {
+            } else if (info.getSuperName() != null) {
                 String superVar = classVarNames.get(info.getSuperName());
                 if (superVar != null) superClassPtr = superVar;
             }
@@ -3995,6 +4046,56 @@ public class LlvmGlobalEmitter {
             };
         }
         return null;
+    }
+
+    private static void addReflectionDescriptorTypes(Set<String> emitClasses, String descriptor) {
+        if (descriptor == null || descriptor.isEmpty()) return;
+
+        final int n = descriptor.length();
+        for (int i = 0; i < n; i++) {
+            char c = descriptor.charAt(i);
+            if (c == '[') {
+                int end = arrayDescriptorEnd(descriptor, i);
+                if (end <= i) continue;
+                emitClasses.add(descriptor.substring(i, end));
+
+                int j = i;
+                while (j < end && descriptor.charAt(j) == '[') j++;
+                int dims = j - i;
+                for (int k = dims - 1; k >= 1; k--) {
+                    emitClasses.add(descriptor.substring(i + dims - k, end));
+                }
+                if (j < end && descriptor.charAt(j) == 'L') {
+                    String className = descriptor.substring(j + 1, end - 1);
+                    if (!className.isEmpty()) emitClasses.add(className);
+                }
+                i = end - 1;
+            } else if (c == 'L') {
+                int semi = descriptor.indexOf(';', i);
+                if (semi > i) {
+                    String className = descriptor.substring(i + 1, semi);
+                    if (!className.isEmpty()) emitClasses.add(className);
+                    i = semi;
+                }
+            }
+        }
+    }
+
+    private static int arrayDescriptorEnd(String descriptor, int start) {
+        final int n = descriptor.length();
+        int j = start;
+        while (j < n && descriptor.charAt(j) == '[') j++;
+        if (j >= n) return -1;
+        char c = descriptor.charAt(j);
+        if (c == 'L') {
+            int semi = descriptor.indexOf(';', j);
+            return semi < 0 ? -1 : semi + 1;
+        }
+        if (c == 'Z' || c == 'B' || c == 'C' || c == 'S'
+            || c == 'I' || c == 'J' || c == 'F' || c == 'D') {
+            return j + 1;
+        }
+        return -1;
     }
 
     private String ensureStringConstantPtr(StringBuilder defsBuffer, String s) {
