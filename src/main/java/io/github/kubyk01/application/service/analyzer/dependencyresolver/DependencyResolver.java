@@ -450,30 +450,24 @@ public class DependencyResolver {
                             && p.toString().contains(NATIVE_IMAGE_METADATA_PREFIX))
                     .forEach(this::parseMetadataFile);
         } else if (path.toString().endsWith(".jar")) {
-            try (JarFile jar = new JarFile(path.toFile())) {
-                Enumeration<JarEntry> entries = jar.entries();
-                while (entries.hasMoreElements()) {
-                    JarEntry entry = entries.nextElement();
-                    String name = entry.getName();
+            // Load the input jar's classes first (as before), so the class map is
+            // fully populated before any dependency detection runs.
+            scanJar(path, false);
 
-                    // Spring Boot fat jars keep dependencies as nested jars under
-                    // BOOT-INF/lib/; those are indexed and parsed on demand.
-                    if (name.endsWith(".jar")) {
-                        indexNestedJar(jar, entry);
-                        continue;
-                    }
-
-                    if (name.endsWith(".class")) {
-                        try (InputStream is = jar.getInputStream(entry)) {
-                            parseClassStream(is);
-                        }
-                    }
-                    if (name.startsWith(NATIVE_IMAGE_METADATA_PREFIX)
-                            && name.endsWith(".json")) {
-                        try (InputStream is = jar.getInputStream(entry)) {
-                            parseMetadataStream(is, name);
-                        }
-                    }
+            // Then, if the input is a Maven-built thin jar, resolve and load its
+            // declared dependencies. A fat jar (Spring Boot nested jars, shaded,
+            // assembly) returns an empty list and its behaviour is unchanged.
+            boolean hasNestedJars = !nestedClassIndex.isEmpty();
+            List<Path> dependencyJars = MavenDependencyLoader.resolveFromThinJar(
+                    path, classMap.keySet(), hasNestedJars);
+            if (!dependencyJars.isEmpty()) {
+                System.out.println("Loading " + dependencyJars.size()
+                        + " Maven dependency jar(s) declared in META-INF/maven/*/pom.xml");
+                for (Path depJar : dependencyJars) {
+                    System.out.println("  " + depJar.getFileName());
+                    // Load the dependency's classes, skipping any class whose name
+                    // is already in the map — the input jar must always win.
+                    scanJar(depJar, true);
                 }
             }
         } else if (path.toString().endsWith(".class")) {
@@ -483,6 +477,54 @@ public class DependencyResolver {
         }
 
         buildSubclassIndex();
+    }
+
+    /**
+     * Loads the {@code .class}, nested-jar and metadata entries of one jar
+     * into the class map.
+     *
+     * @param jarPath       the jar to read
+     * @param skipExisting  when {@code true}, a class whose internal name is
+     *                      already present in {@link #classMap} is skipped
+     *                      instead of being re-parsed. Used when loading
+     *                      dependency jars, so that a user class that shares
+     *                      a fully-qualified name with a dependency class
+     *                      keeps the user's version. It also avoids
+     *                      re-adding the dependency's subclass edges for a
+     *                      class the resolver already knows about.
+     */
+    private void scanJar(Path jarPath, boolean skipExisting) throws IOException {
+        try (JarFile jar = new JarFile(jarPath.toFile())) {
+            Enumeration<JarEntry> entries = jar.entries();
+            while (entries.hasMoreElements()) {
+                JarEntry entry = entries.nextElement();
+                String name = entry.getName();
+
+                if (name.endsWith(".jar")) {
+                    indexNestedJar(jar, jarPath, entry);
+                    continue;
+                }
+
+                if (name.endsWith(".class")) {
+                    if (skipExisting) {
+                        String internalName = name.substring(0, name.length() - ".class".length());
+                        if (classMap.containsKey(internalName)) {
+                            continue;
+                        }
+                    }
+                    try (InputStream is = jar.getInputStream(entry)) {
+                        parseClassStream(is);
+                    }
+                }
+
+                if (name.startsWith(NATIVE_IMAGE_METADATA_PREFIX)
+                        && name.endsWith(".json")) {
+                    try (InputStream is = jar.getInputStream(entry)) {
+                        parseMetadataStream(is, name);
+                    }
+                }
+            }
+        }
     }
 
     private void parseMetadataFile(Path path) {
@@ -519,7 +561,7 @@ public class DependencyResolver {
      * directory. Metadata JSON under {@code META-INF/native-image/} is
      * parsed eagerly (small, consumed in one pass).
      */
-    private void indexNestedJar(JarFile outerJar, JarEntry nestedEntry) {
+    private void indexNestedJar(JarFile outerJar, Path outerJarPath, JarEntry nestedEntry) {
         String nestedName = nestedEntry.getName();
         try (InputStream is = outerJar.getInputStream(nestedEntry);
              ZipInputStream zis = new ZipInputStream(is)) {
@@ -533,7 +575,7 @@ public class DependencyResolver {
                             entryName.substring(0, entryName.length() - 6);
                     nestedClassIndex.putIfAbsent(
                             internalName,
-                            new NestedClassRef(inputArchive, nestedName, entryName));
+                            new NestedClassRef(outerJarPath, nestedName, entryName));
                 } else if (entryName.startsWith(NATIVE_IMAGE_METADATA_PREFIX)
                         && entryName.endsWith(".json")) {
                     parseMetadataStream(zis, nestedName + "!/" + entryName);
@@ -626,6 +668,7 @@ public class DependencyResolver {
                             .type(Type.fromDescriptor(descriptor))
                             .access(access)
                             .owner(currentClassName[0])   // declaring class
+                            .constantValue(value)
                             .build());
                         return null;
                     }
@@ -791,6 +834,7 @@ public class DependencyResolver {
                             .type(Type.fromDescriptor(descriptor))
                             .access(access)
                             .owner(currentClassName[0])   // declaring class
+                            .constantValue(value)
                             .build());
                     return null;
                 }
