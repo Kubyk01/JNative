@@ -157,7 +157,7 @@ int32_t __jnative_fn_sun_nio_ch_SocketDispatcher_read0__Ljava_io_FileDescriptor_
         if (err == WSAEINTR)       return IOS_INTERRUPTED;
         throw_wsa_error("Read failed");
     }
-    return (int32_t)n;
+    return n == 0 ? -1 : (int32_t)n;
 #else
     ssize_t n = read(fd, buf, (size_t)len);
     if (n < 0) {
@@ -165,7 +165,7 @@ int32_t __jnative_fn_sun_nio_ch_SocketDispatcher_read0__Ljava_io_FileDescriptor_
         if (errno == EINTR)                          return IOS_INTERRUPTED;
         throw_errno_error("Read failed");
     }
-    return (int32_t)n;
+    return n == 0 ? -1 : (int32_t)n;
 #endif
 }
 
@@ -257,7 +257,7 @@ int64_t __jnative_fn_sun_nio_ch_SocketDispatcher_readv0__Ljava_io_FileDescriptor
         if (err == WSAEINTR)       return (int64_t)IOS_INTERRUPTED;
         throw_wsa_error("Read failed");
     }
-    return (int64_t)nread;
+    return nread == 0 ? -1 : (int64_t)nread;
 #else
     ssize_t n = readv(fd, iov, len);
     if (n < 0) {
@@ -269,7 +269,7 @@ int64_t __jnative_fn_sun_nio_ch_SocketDispatcher_readv0__Ljava_io_FileDescriptor
         }
         throw_errno_error("Read failed");
     }
-    return (int64_t)n;
+    return n == 0 ? -1 : (int64_t)n;
 #endif
 }
 
@@ -334,3 +334,11 @@ int64_t __jnative_fn_sun_nio_ch_SocketDispatcher_writev0__Ljava_io_FileDescripto
     return (int64_t)n;
 #endif
 }
+#if defined(_WIN32)
+void __jnative_fn_sun_nio_ch_SocketDispatcher_close0__I_V(int32_t fd)
+{
+    if (closesocket((SOCKET)(uintptr_t)(uint32_t)fd) == SOCKET_ERROR) {
+        throw_wsa_error("Socket close failed");
+    }
+}
+#endif

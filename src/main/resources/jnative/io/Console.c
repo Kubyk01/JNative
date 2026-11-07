@@ -11,3 +11,11 @@ void* __jnative_fn_java_io_Console_encoding___Ljava_lang_String_(void) {
     static const char utf8_name[] = "UTF-8";
     return __jnative_make_string_obj(utf8_name, (int32_t)(sizeof(utf8_name) - 1));
 }
+
+int32_t __jnative_fn_java_io_Console_ttyStatus___I(void) {
+    int32_t status = 0;
+    if (isatty(STDIN_FILENO))  status |= 1;
+    if (isatty(STDOUT_FILENO)) status |= 2;
+    if (isatty(STDERR_FILENO)) status |= 4;
+    return status;
+}

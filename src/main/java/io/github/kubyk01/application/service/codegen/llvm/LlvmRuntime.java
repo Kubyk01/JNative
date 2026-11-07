@@ -427,7 +427,7 @@ public class LlvmRuntime {
         sb.append(LlvmTypeMapper.toLlvmType(Type.reference(owner)));
         for (Type pt : paramTypes) {
             sb.append(", ");
-            sb.append(LlvmTypeMapper.toLlvmType(pt));
+            sb.append(LlvmTypeMapper.toLlvmType(LlvmTypeMapper.toCAbiType(pt)));
         }
         sb.append(")*");
         return sb.toString();

@@ -1153,7 +1153,6 @@ int64_t __jnative_fn_java_lang_invoke_MethodHandleNatives_staticFieldOffset__Lja
         cur = cur->superclass;
     }
 
-    dlclose(handle);
     return result;
 }
 

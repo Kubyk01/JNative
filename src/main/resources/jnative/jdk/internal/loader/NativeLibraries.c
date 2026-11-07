@@ -98,7 +98,7 @@ void* __jnative_fn_jdk_internal_loader_NativeLibraries_findBuiltinLib__Ljava_lan
     if (!known) return NULL;
 
     char exe[PATH_MAX];
-    ssize_t len = jn_readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    long len = jn_readlink("/proc/self/exe", exe, sizeof(exe) - 1);
     if (len <= 0) return NULL;
     exe[len] = '\0';
 

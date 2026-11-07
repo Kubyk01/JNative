@@ -5,7 +5,9 @@
 #include <string.h>
 #include <stdio.h>
 #include <errno.h>
+#if !defined(_WIN32)
 #include <sys/time.h>
+#endif
 
 #include "jnative_runtime.h"
 

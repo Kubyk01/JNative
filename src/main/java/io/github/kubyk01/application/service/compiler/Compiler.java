@@ -10,9 +10,12 @@ import io.github.kubyk01.domain.ir.TargetPlatform;
 import io.github.kubyk01.port.secondary.CompilerPort;
 import lombok.extern.slf4j.Slf4j;
 
+import java.io.BufferedReader;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -22,6 +25,8 @@ import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 @Slf4j
@@ -47,16 +52,36 @@ public class Compiler implements CompilerPort {
     private static final int MIN_OPT_LEVEL = 0;
     private static final int MAX_OPT_LEVEL = 3;
 
-    private static final String MINGW_SYSROOT_ENV = "MINGW_SYSROOT";
-
-    private static final String[] MINGW_ROOT_CANDIDATES = {
+   // Todo remove hard-coded ways
+    private static final String[] MINGW_ROOT_CANDIDATES_POSIX = {
             "/usr/x86_64-w64-mingw32",
             "/usr/x86_64-w64-mingw32/sys-root/mingw",
             "/usr/aarch64-w64-mingw32",
             "/usr/aarch64-w64-mingw32/sys-root/mingw",
+            "/usr/i686-w64-mingw32",
+            "/usr/i686-w64-mingw32/sys-root/mingw",
             "/mingw64",
+            "/mingw32",
+    };
+
+    private static final String[] MINGW_ROOT_CANDIDATES_WINDOWS = {
             "C:\\msys64\\mingw64",
+            "C:\\msys64\\ucrt64",
+            "C:\\msys64\\clang64",
+            "C:\\msys64\\mingw32",
+            "C:\\msys2\\mingw64",
+            "C:\\msys2\\ucrt64",
+            "C:\\msys2\\clang64",
             "C:\\mingw64",
+            "C:\\mingw32",
+            "C:\\tools\\mingw64",
+            "C:\\tools\\msys64\\mingw64",
+            "C:\\tools\\msys64\\ucrt64",
+            "C:\\ProgramData\\chocolatey\\lib\\mingw\\tools\\install\\mingw64",
+            "C:\\ProgramData\\chocolatey\\lib\\mingw\\tools\\install\\mingw32",
+            "C:\\llvm-mingw",
+            "C:\\Program Files\\llvm-mingw",
+            "C:\\Program Files (x86)\\llvm-mingw",
     };
 
     private static final String[] GCC_RUNTIME_SEARCH_ROOTS = {
@@ -91,21 +116,19 @@ public class Compiler implements CompilerPort {
         try {
             String compiler = detectCompiler(target);
 
-            String mingwSysroot = target.isWindows()
-                    ? resolveWindowsSysroot(compiler)
-                    : null;
-            if (target.isWindows() && mingwSysroot == null) {
-                System.err.println(
-                        "WARNING: cross-compiling for Windows target '" + target.triple()
-                                + "' without an explicit MinGW-w64 sysroot. If the build "
-                                + "fails with \"'stdlib.h' file not found\", either install "
-                                + "MinGW-w64 (e.g. `sudo apt install mingw-w64` on Debian/"
-                                + "Ubuntu, or `dnf install mingw64-gcc` on Fedora) or set "
-                                + "the " + MINGW_SYSROOT_ENV + " environment variable to the "
-                                + "root of an existing MinGW-w64 tree. If you are using "
-                                + "llvm-mingw, set " + MINGW_SYSROOT_ENV + "=NONE.");
-            } else if (mingwSysroot != null) {
-                System.out.println("MinGW-w64 sysroot: " + mingwSysroot);
+            MsvcToolchain msvcToolchain = null;
+            String mingwSysroot = null;
+
+            if (target.isWindows()) {
+                boolean isMsvc = target.triple().toLowerCase(Locale.ROOT)
+                        .contains("-msvc");
+                if (isMsvc) {
+                    msvcToolchain = checkWindowsMsvcToolchain(target);
+                } else {
+                    mingwSysroot = resolveWindowsSysroot(target);
+                    System.out.println("MinGW-w64 sysroot: " + mingwSysroot);
+                    checkWindowsToolchain(target, compiler, mingwSysroot);
+                }
             }
 
             // ------------------------------------------------------------------
@@ -191,7 +214,7 @@ public class Compiler implements CompilerPort {
                     + threadCount + " thread(s) (target " + target.triple() + ")...");
 
             compileAll(compiler, tasks, tempDir, threadCount, effectiveOptLevel,
-                    target, mingwSysroot);
+                    target, mingwSysroot, msvcToolchain);
 
             // ------------------------------------------------------------------
             // 5. Link.
@@ -235,7 +258,16 @@ public class Compiler implements CompilerPort {
             linkCmd.add("-O" + effectiveOptLevel);
 
             if (msvcLinker) {
-                linkCmd.add("-Wl,--threads=" + effectiveCores);
+                if (!isAvailable("lld-link")) {
+                    throw new IllegalStateException(
+                            "ThinLTO for target '" + target.triple() + "' requires the "
+                                    + "LLVM linker 'lld-link', but it was not found on PATH. "
+                                    + "MSVC link.exe cannot consume LLVM bitcode objects. "
+                                    + "Install LLVM with lld (e.g. `winget install LLVM.LLVM`) "
+                                    + "and make sure its bin directory is on PATH.");
+                }
+                linkCmd.add("-fuse-ld=lld");
+                linkCmd.add("-flto-jobs=" + effectiveCores);
             } else {
                 if (!isAvailable("ld.lld")) {
                     throw new IllegalStateException(
@@ -276,11 +308,16 @@ public class Compiler implements CompilerPort {
                 linkCmd.add("-Wl,--thinlto-jobs=" + effectiveCores);
             }
 
-            appendWindowsSysrootToLinker(linkCmd, mingwSysroot);
+            appendWindowsSysrootToLinker(linkCmd, mingwSysroot, target);
 
+            List<String> objectLines = new ArrayList<>(tasks.size());
             for (CompileTask task : tasks) {
-                linkCmd.add(task.obj.toString());
+                String objPath = task.obj.toAbsolutePath().toString().replace('\\', '/');
+                objectLines.add("\"" + objPath + "\"");
             }
+            Path objectsRsp = tempDir.resolve("link_objects.rsp");
+            Files.write(objectsRsp, objectLines, StandardCharsets.UTF_8);
+            linkCmd.add("@" + objectsRsp.toAbsolutePath());
             linkCmd.add("-o");
             linkCmd.add(exePath.toString());
 
@@ -446,28 +483,319 @@ public class Compiler implements CompilerPort {
 
     private String detectCompiler(TargetPlatform target) {
         if (target.isWindows()) {
-            String mingwClang = "x86_64-w64-mingw32-clang";
-            if (isAvailable(mingwClang)) return mingwClang;
+            boolean isMsvc = target.triple().toLowerCase(Locale.ROOT)
+                    .contains("-msvc");
+
+            if (isMsvc) {
+                if (isAvailable("clang")) return "clang";
+                throw new IllegalStateException(
+                        "MSVC target requires clang on PATH. "
+                                + "Install LLVM for Windows (https://releases.llvm.org/) "
+                                + "or use --target=x86_64-w64-windows-gnu with MinGW-w64.");
+            }
+
+            String wrapperName = "x86_64-w64-mingw32-clang";
+            if (isAvailable(wrapperName)) {
+                return wrapperName;
+            }
+
+            String sysroot = findMinGWSysroot();
+            if (sysroot != null) {
+                Path wrapper = Paths.get(sysroot, "bin", wrapperName + ".exe");
+                if (!Files.exists(wrapper)) {
+                    wrapper = Paths.get(sysroot, "bin", wrapperName);
+                }
+                if (Files.isRegularFile(wrapper)) {
+                    return wrapper.toString();
+                }
+            }
 
             if (isAvailable("clang")) {
                 return "clang";
             }
-
-            String mingwGcc = "x86_64-w64-mingw32-gcc";
-            if (isAvailable(mingwGcc)) {
-                throw new IllegalStateException(
-                        "Windows target requires clang (for .ll files), but only "
-                                + "GCC was found. Install clang or the llvm-mingw toolchain.");
-            }
-
             throw new IllegalStateException(
-                    "No compiler for Windows target. Install clang or llvm-mingw.");
+                    "GNU Windows target requires clang or x86_64-w64-mingw32-clang "
+                            + "on PATH. Install LLVM for Windows or MSYS2 with mingw-w64.");
         }
 
         if (isAvailable("clang")) return "clang";
         if (isAvailable("gcc")) return "gcc";
         throw new IllegalStateException(
                 "Neither clang nor gcc is installed. At least one is required.");
+    }
+
+    private static MsvcToolchain checkWindowsMsvcToolchain(TargetPlatform target) {
+        String vswhere = findVswhere();
+        if (vswhere == null) {
+            throw new IllegalStateException(
+                    "Visual Studio Installer not found.\n"
+                            + "Expected vswhere.exe at:\n"
+                            + "  %ProgramFiles(x86)%\\Microsoft Visual Studio\\Installer\\vswhere.exe\n\n"
+                            + "Install one of:\n"
+                            + "  - Visual Studio Build Tools (no IDE, recommended):\n"
+                            + "      winget install Microsoft.VisualStudio.2022.BuildTools --override "
+                            + "\"--passive --wait --add Microsoft.VisualStudio.Workload.VCTools "
+                            + "--includeRecommended\"\n"
+                            + "  - Full Visual Studio with \"Desktop development with C++\" workload.\n\n"
+                            + "Or switch to a GNU toolchain that bundles everything:\n"
+                            + "  --target=x86_64-w64-windows-gnu   (llvm-mingw, no MSVC needed)\n"
+                            + "  https://github.com/mstorsjo/llvm-mingw/releases");
+        }
+
+        String installationPath = runCapture(vswhere,
+                "-latest", "-products", "*",
+                "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+                "-property", "installationPath");
+
+        if (installationPath == null || installationPath.isBlank()) {
+            throw new IllegalStateException(
+                    "Visual Studio Build Tools are installed, but the C++ "
+                            + "workload (Microsoft.VisualStudio.Component.VC.Tools.x86.x64) "
+                            + "is missing.\n\n"
+                            + "Open Visual Studio Installer and add:\n"
+                            + "  Workload: \"Desktop development with C++\"\n"
+                            + "  Components (in the right panel):\n"
+                            + "    - MSVC v143 - VS 2022 C++ x64/x86 build tools\n"
+                            + "    - Windows 10/11 SDK\n\n"
+                            + "Or re-run the installer with the C++ workload:\n"
+                            + "  winget install Microsoft.VisualStudio.2022.BuildTools --override "
+                            + "\"--passive --wait --add Microsoft.VisualStudio.Workload.VCTools "
+                            + "--includeRecommended\"\n\n"
+                            + "Alternatively, use a self-contained GNU toolchain:\n"
+                            + "  --target=x86_64-w64-windows-gnu\n"
+                            + "  https://github.com/mstorsjo/llvm-mingw/releases");
+        }
+
+        String vcToolsRoot = installationPath.trim();
+        File msvcDir = new File(vcToolsRoot, "VC\\Tools\\MSVC");
+        if (!msvcDir.isDirectory()) {
+            throw new IllegalStateException(
+                    "MSVC C++ toolchain directory not found under:\n  "
+                            + msvcDir + "\n\n"
+                            + "The C++ workload was probably installed partially. "
+                            + "Open Visual Studio Installer and add the "
+                            + "\"MSVC v143 - VS 2022 C++ x64/x86 build tools\" component.");
+        }
+
+        File[] versions = msvcDir.listFiles(File::isDirectory);
+        if (versions == null || versions.length == 0) {
+            throw new IllegalStateException(
+                    "No MSVC versions found under:\n  " + msvcDir + "\n\n"
+                            + "Reinstall the C++ workload via Visual Studio Installer.");
+        }
+        Arrays.sort(versions, Comparator.comparing(File::getName).reversed());
+        String vcToolsInclude = new File(versions[0], "include").getAbsolutePath();
+        if (!new File(vcToolsInclude, "vcruntime.h").exists()) {
+            throw new IllegalStateException(
+                    "MSVC toolchain at " + versions[0] + " has no vcruntime.h.\n"
+                            + "The installation is corrupted. Reinstall the C++ workload.");
+        }
+
+        String programFilesX86 = System.getenv("ProgramFiles(x86)");
+        if (programFilesX86 == null) programFilesX86 = "C:\\Program Files (x86)";
+        File sdkIncludeRoot = new File(programFilesX86,
+                "Windows Kits\\10\\Include");
+        if (!sdkIncludeRoot.isDirectory()) {
+            throw new IllegalStateException(
+                    "Windows SDK not found at:\n  " + sdkIncludeRoot + "\n\n"
+                            + "Open Visual Studio Installer and install:\n"
+                            + "  Windows 10 SDK (or Windows 11 SDK)\n"
+                            + "under the \"Desktop development with C++\" workload.\n\n"
+                            + "Alternatively, use a self-contained GNU toolchain:\n"
+                            + "  --target=x86_64-w64-windows-gnu\n"
+                            + "  https://github.com/mstorsjo/llvm-mingw/releases");
+        }
+
+        File[] sdkVersions = sdkIncludeRoot.listFiles(File::isDirectory);
+        if (sdkVersions == null || sdkVersions.length == 0) {
+            throw new IllegalStateException(
+                    "Windows SDK directory exists but contains no versions:\n  "
+                            + sdkIncludeRoot + "\n\n"
+                            + "Reinstall the Windows SDK via Visual Studio Installer.");
+        }
+        Arrays.sort(sdkVersions, Comparator.comparing(File::getName).reversed());
+        File sdkVersionDir = sdkVersions[0];
+
+        File sdkRootDir = sdkIncludeRoot.getParentFile();
+        if (sdkRootDir == null
+                || !sdkRootDir.isDirectory()
+                || !new File(sdkRootDir, "Include").isDirectory()
+                || !new File(sdkRootDir, "Lib").isDirectory()) {
+            throw new IllegalStateException(
+                    "Cannot determine the Windows SDK root directory from:\n  "
+                            + sdkIncludeRoot + "\n\n"
+                            + "Expected layout:\n"
+                            + "  <SDK root>\\Include\\<version>\\ucrt\\stdlib.h\n"
+                            + "  <SDK root>\\Lib\\<version>\\ucrt\\x64\\ucrt.lib\n\n"
+                            + "Reinstall the Windows SDK via Visual Studio Installer.");
+        }
+        if (!new File(sdkVersionDir, "ucrt\\stdlib.h").exists()) {
+            throw new IllegalStateException(
+                    "Windows SDK version directory " + sdkVersionDir
+                            + " has no ucrt\\stdlib.h.\n"
+                            + "The installation is corrupted or incomplete. "
+                            + "Reinstall the Windows 10/11 SDK.");
+        }
+
+        System.out.println("MSVC toolchain:");
+        System.out.println("  VC tools : " + versions[0].getName()
+                + " (" + vcToolsInclude + ")");
+        System.out.println("  Win SDK  : " + sdkVersionDir.getName()
+                + " (root: " + sdkRootDir.getAbsolutePath() + ")");
+
+        return new MsvcToolchain(versions[0].getAbsolutePath(),
+                sdkRootDir.getAbsolutePath());
+    }
+
+    private record MsvcToolchain(String vcToolsRoot, String windowsSdkRoot) {}
+
+    private static String findVswhere() {
+        String programFilesX86 = System.getenv("ProgramFiles(x86)");
+        if (programFilesX86 == null) programFilesX86 = "C:\\Program Files (x86)";
+        File vswhere = new File(programFilesX86,
+                "Microsoft Visual Studio\\Installer\\vswhere.exe");
+        return vswhere.isFile() ? vswhere.getAbsolutePath() : null;
+    }
+
+    private static String runCapture(String executable, String... args) {
+        List<String> cmd = new ArrayList<>();
+        cmd.add(executable);
+        cmd.addAll(Arrays.asList(args));
+        try {
+            Process p = new ProcessBuilder(cmd).redirectErrorStream(true).start();
+            String output;
+            try (var reader = new BufferedReader(
+                    new InputStreamReader(p.getInputStream(),
+                            StandardCharsets.UTF_8))) {
+                output = reader.lines().collect(Collectors.joining("\n")).trim();
+            }
+            p.waitFor();
+            return output.isEmpty() ? null : output;
+        } catch (IOException | InterruptedException e) {
+            if (e instanceof InterruptedException) Thread.currentThread().interrupt();
+            return null;
+        }
+    }
+
+    private static void checkWindowsToolchain(TargetPlatform target,
+                                              String compiler,
+                                              String mingwSysroot) {
+        if (!target.isWindows()) {
+            return;
+        }
+
+        String testSource = "#include <stdlib.h>\nint main(void){return 0;}\n";
+
+        List<String> command = new ArrayList<>();
+        command.add(compiler);
+
+        boolean isMsvc = target.triple().toLowerCase(Locale.ROOT)
+                .contains("-msvc");
+
+        if (!isMinGwWrapper(compiler)) {
+            command.add("--target=" + target.triple());
+        }
+
+        if (!isMsvc && mingwSysroot != null) {
+            command.add("--sysroot=" + mingwSysroot);
+            command.add("--gcc-toolchain=" + mingwSysroot);
+        }
+
+        command.add("-fsyntax-only");
+        command.add("-x");
+        command.add("c");
+        command.add("-");
+
+        ProcessBuilder pb = new ProcessBuilder(command);
+        pb.redirectErrorStream(true);
+
+        try {
+            Process process = pb.start();
+
+            try (var stdin = process.getOutputStream()) {
+                stdin.write(testSource.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            }
+
+            String output;
+            try (var reader = new java.io.BufferedReader(
+                    new java.io.InputStreamReader(
+                            process.getInputStream(),
+                            java.nio.charset.StandardCharsets.UTF_8))) {
+                output = reader.lines().collect(Collectors.joining("\n"));
+            }
+
+            int exitCode = process.waitFor();
+            if (exitCode == 0) {
+                return;
+            }
+
+            String lower = output.toLowerCase(Locale.ROOT);
+            if (lower.contains("stdlib.h") && lower.contains("not found")) {
+                String advice = isMsvc
+                        ? msvcToolchainAdvice()
+                        : gnuToolchainAdvice();
+                throw new IllegalStateException(
+                        "C toolchain for target '" + target.triple()
+                                + "' cannot find standard C headers.\n"
+                                + "The compiler '" + compiler + "' reported:\n"
+                                + "  fatal error: 'stdlib.h' file not found\n\n"
+                                + advice
+                                + "\n\nAlternatively, switch to a different "
+                                + "toolchain, e.g.:\n"
+                                + "  --target=x86_64-w64-windows-gnu   (MinGW-w64)\n"
+                                + "  --target=x86_64-pc-windows-msvc   (MSVC SDK)\n"
+                                + "\nFull compiler output:\n" + output);
+            }
+
+            throw new IllegalStateException(
+                    "C toolchain check failed for target '" + target.triple()
+                            + "' with exit code " + exitCode + ":\n" + output);
+
+        } catch (IOException | InterruptedException e) {
+            if (e instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
+            throw new IllegalStateException(
+                    "Failed to run C toolchain check for target '"
+                            + target.triple() + "': " + e.getMessage(), e);
+        }
+    }
+
+    private static String msvcToolchainAdvice() {
+        return """
+                The MSVC target requires the Windows SDK and Visual C++ Build Tools.
+                Install one of:
+
+                  1. Visual Studio Build Tools (recommended, no full IDE needed):
+                     winget install Microsoft.VisualStudio.2022.BuildTools --override "--passive --wait --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
+
+                  2. Full Visual Studio with "Desktop development with C++" workload.
+
+                After installation, clang will locate the SDK automatically
+                (via vswhere.exe / environment / registry). No extra flags needed.
+                """;
+    }
+
+    private static String gnuToolchainAdvice() {
+        return """
+                The GNU target requires MinGW-w64 (headers + runtime).
+                Install one of:
+
+                  1. MSYS2 (recommended):
+                     pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-clang
+                     Then add C:\\msys64\\mingw64\\bin to PATH,
+                     or set MINGW_SYSROOT=C:\\msys64\\mingw64.
+
+                  2. llvm-mingw (self-contained clang + MinGW):
+                     https://github.com/mstorsjo/llvm-mingw/releases
+                     Unpack, add its bin/ to PATH, set MINGW_SYSROOT to its root.
+
+                  3. Chocolatey:
+                     choco install mingw
+
+                If MinGW is already installed, point MINGW_SYSROOT at its root
+                (the directory containing include\\stdlib.h).
+                """;
     }
 
     private static boolean isMinGwWrapper(String compiler) {
@@ -493,82 +821,213 @@ public class Compiler implements CompilerPort {
     //  MinGW-w64 sysroot resolution
     // =====================================================================
 
-    private static String resolveWindowsSysroot(String compiler) {
-        String explicit = System.getenv(MINGW_SYSROOT_ENV);
-        if (explicit != null && !explicit.isBlank()) {
-            String trimmed = explicit.trim();
-            if (trimmed.equalsIgnoreCase("NONE")
-                    || trimmed.equalsIgnoreCase("SKIP")) {
-                return null;
-            }
-            Path dir = Paths.get(trimmed);
-            if (!Files.isDirectory(dir)) {
-                throw new IllegalStateException(
-                        "Environment variable " + MINGW_SYSROOT_ENV + " points to a "
-                                + "directory that does not exist: " + trimmed + ". "
-                                + "Set it to a MinGW-w64 installation root (a directory "
-                                + "containing include/stdlib.h), or to NONE to disable "
-                                + "sysroot injection.");
-            }
-            if (!Files.exists(dir.resolve("include").resolve("stdlib.h"))) {
-                throw new IllegalStateException(
-                        "Environment variable " + MINGW_SYSROOT_ENV + " points to '"
-                                + trimmed + "', but that directory does not contain "
-                                + "include/stdlib.h. Set it to the root of a MinGW-w64 "
-                                + "tree, or to NONE to disable sysroot injection.");
-            }
-            return trimmed;
-        }
+    private static String resolveWindowsSysroot(TargetPlatform target) {
+        if (!target.isWindows()) return null;
 
-        if (isMinGwWrapper(compiler)) {
+        boolean isMsvc = target.triple().toLowerCase(Locale.ROOT).contains("-msvc");
+        if (isMsvc) {
             return null;
         }
 
-        return findMinGWSysroot();
+        String sysroot = findMinGWSysroot();
+        if (sysroot == null) {
+            throw new IllegalStateException(
+                    "MinGW-w64 installation not found for GNU target '"
+                            + target.triple() + "'.\n"
+                            + "Install one of:\n"
+                            + "  - MSYS2 (https://www.msys2.org/) with package\n"
+                            + "      mingw-w64-x86_64-gcc   (64-bit)\n"
+                            + "      mingw-w64-i686-gcc     (32-bit)\n"
+                            + "    default install path: C:\\msys64\\mingw64\n"
+                            + "  - llvm-mingw (https://github.com/mstorsjo/llvm-mingw)\n"
+                            + "  - Chocolatey: choco install mingw\n"
+                            + "  - Or set the MINGW_SYSROOT environment variable to\n"
+                            + "    the root of an existing MinGW-w64 installation\n"
+                            + "    (the directory that contains include\\stdlib.h).\n"
+                            + "Searched:\n"
+                            + "  env MINGW_SYSROOT, MSYSTEM_PREFIX, MINGW_PREFIX\n"
+                            + "  `where gcc` / `where x86_64-w64-mingw32-gcc`\n"
+                            + "  gcc --print-sysroot\n"
+                            + String.join("\n  ", MINGW_ROOT_CANDIDATES_WINDOWS));
+        }
+        return sysroot;
     }
 
     private static String findMinGWSysroot() {
-        for (String candidate : MINGW_ROOT_CANDIDATES) {
-            Path include = Paths.get(candidate, "include", "stdlib.h");
-            if (Files.exists(include)) {
+        String[] envVars = { "MINGW_SYSROOT", "MSYSTEM_PREFIX", "MINGW_PREFIX" };
+        for (String env : envVars) {
+            String val = System.getenv(env);
+            if (val != null && !val.isBlank()) {
+                String trimmed = val.trim();
+                if (!trimmed.equalsIgnoreCase("NONE")
+                        && !trimmed.equalsIgnoreCase("SKIP")
+                        && hasStdlibHeader(trimmed)) {
+                    return trimmed;
+                }
+            }
+        }
+
+        boolean isWindowsHost = System.getProperty("os.name", "")
+                .toLowerCase(Locale.ROOT).contains("win");
+
+        String[] gccNames = isWindowsHost
+                ? new String[]{ "x86_64-w64-mingw32-gcc.exe",
+                                "x86_64-w64-mingw32-gcc",
+                                "gcc.exe", "gcc" }
+                : new String[]{ "x86_64-w64-mingw32-gcc", "gcc" };
+
+        for (String gccName : gccNames) {
+            String gccPath = findExecutable(gccName);
+            if (gccPath == null) continue;
+
+            String printed = queryGccSysroot(gccPath);
+            if (printed != null && hasStdlibHeader(printed)) {
+                return printed;
+            }
+
+            File gccFile = new File(gccPath);
+            File binDir = gccFile.getParentFile();
+            if (binDir != null) {
+                File rootDir = binDir.getParentFile();
+                if (rootDir != null && hasStdlibHeader(rootDir.getAbsolutePath())) {
+                    return rootDir.getAbsolutePath();
+                }
+                if (hasStdlibHeader(binDir.getAbsolutePath())) {
+                    return binDir.getAbsolutePath();
+                }
+            }
+        }
+
+        String[] candidates = isWindowsHost
+                ? MINGW_ROOT_CANDIDATES_WINDOWS
+                : MINGW_ROOT_CANDIDATES_POSIX;
+        for (String candidate : candidates) {
+            if (hasStdlibHeader(candidate)) {
                 return candidate;
+            }
+        }
+
+        if (isWindowsHost) {
+            for (String pfVar : new String[]{ "ProgramFiles(x86)", "ProgramFiles" }) {
+                String pf = System.getenv(pfVar);
+                if (pf == null) continue;
+                Path mingwW64Root = Paths.get(pf, "mingw-w64");
+                if (!Files.isDirectory(mingwW64Root)) continue;
+                try (var stream = Files.list(mingwW64Root)) {
+                    for (Path sub : stream.toList()) {
+                        if (!Files.isDirectory(sub)) continue;
+                        for (String triple : new String[]{
+                                "mingw64", "mingw32", "x86_64-w64-mingw32" }) {
+                            Path candidate = sub.resolve(triple);
+                            if (hasStdlibHeader(candidate.toString())) {
+                                return candidate.toString();
+                            }
+                        }
+                    }
+                } catch (IOException ignored) { }
+            }
+        }
+
+        return null;
+    }
+
+    private static boolean hasStdlibHeader(String root) {
+        if (root == null || root.isEmpty()) return false;
+        Path p = Paths.get(root);
+        if (Files.exists(p.resolve("include").resolve("stdlib.h"))) return true;
+        if (Files.exists(p.resolve("sys-root").resolve("mingw")
+                .resolve("include").resolve("stdlib.h"))) return true;
+        return false;
+    }
+
+    private static String findExecutable(String name) {
+        String pathEnv = System.getenv("PATH");
+        if (pathEnv == null) return null;
+        boolean isWindows = System.getProperty("os.name", "")
+                .toLowerCase(Locale.ROOT).contains("win");
+        String[] exts = isWindows
+                ? new String[]{ "", ".exe", ".bat", ".cmd" }
+                : new String[]{ "" };
+        for (String dir : pathEnv.split(File.pathSeparator)) {
+            if (dir.isEmpty()) continue;
+            for (String ext : exts) {
+                File f = new File(dir, name.endsWith(ext) ? name : name + ext);
+                if (f.isFile() && f.canExecute()) {
+                    return f.getAbsolutePath();
+                }
             }
         }
         return null;
     }
 
+    private static String queryGccSysroot(String gccPath) {
+        try {
+            Process p = new ProcessBuilder(gccPath, "--print-sysroot")
+                    .redirectErrorStream(false).start();
+            String output;
+            try (var reader = new java.io.BufferedReader(
+                    new java.io.InputStreamReader(p.getInputStream()))) {
+                output = reader.readLine();
+            }
+            p.waitFor();
+            if (output == null || output.isBlank()) return null;
+            return output.trim();
+        } catch (IOException | InterruptedException e) {
+            if (e instanceof InterruptedException) Thread.currentThread().interrupt();
+            return null;
+        }
+    }
+
     private static void appendWindowsSysrootToCompiler(List<String> command,
                                                        String sysroot,
-                                                       boolean isIr) {
+                                                       boolean isIr,
+                                                       TargetPlatform target) {
         if (sysroot == null) return;
 
+        boolean isMsvc = target.triple().toLowerCase(Locale.ROOT).contains("-msvc");
+        if (isMsvc) return;
+
         command.add("--sysroot=" + sysroot);
+        command.add("--gcc-toolchain=" + sysroot);
 
         if (isIr) return;
 
-        Path debianInclude = Paths.get(sysroot, "include");
-        if (Files.isDirectory(debianInclude)) {
-            command.add("-I" + debianInclude);
-        }
+        addIfDirectory(command, "-I", sysroot, "include");
+        addIfDirectory(command, "-I", sysroot, "x86_64-w64-mingw32", "include");
+        addIfDirectory(command, "-I", sysroot, "i686-w64-mingw32", "include");
+        addIfDirectory(command, "-I", sysroot, "aarch64-w64-mingw32", "include");
+        addIfDirectory(command, "-I", sysroot, "sys-root", "mingw", "include");
+    }
 
-        Path archInclude = Paths.get(sysroot, "x86_64-w64-mingw32", "include");
-        if (Files.isDirectory(archInclude)) {
-            command.add("-I" + archInclude);
-        }
-
-        Path fedoraInclude = Paths.get(sysroot, "sys-root", "mingw", "include");
-        if (Files.isDirectory(fedoraInclude)) {
-            command.add("-I" + fedoraInclude);
+    private static void addIfDirectory(List<String> command,
+                                       String flag,
+                                       String root,
+                                       String... relativePath) {
+        Path p = Paths.get(root, relativePath);
+        if (Files.isDirectory(p)) {
+            command.add(flag + p);
         }
     }
 
     private static void appendWindowsSysrootToLinker(List<String> linkCmd,
-                                                     String sysroot) {
+                                                     String sysroot,
+                                                     TargetPlatform target) {
         if (sysroot == null) return;
+        boolean isMsvc = target.triple().toLowerCase(Locale.ROOT).contains("-msvc");
+        if (isMsvc) return;
+
         linkCmd.add("--sysroot=" + sysroot);
-        linkCmd.add("-L" + sysroot + "/lib");
-        linkCmd.add("-L" + sysroot + "/x86_64-w64-mingw32/lib");
-        linkCmd.add("-L" + sysroot + "/sys-root/mingw/lib");
+        linkCmd.add("--gcc-toolchain=" + sysroot);
+        addLibIfDir(linkCmd, sysroot, "lib");
+        addLibIfDir(linkCmd, sysroot, "x86_64-w64-mingw32", "lib");
+        addLibIfDir(linkCmd, sysroot, "i686-w64-mingw32", "lib");
+        addLibIfDir(linkCmd, sysroot, "aarch64-w64-mingw32", "lib");
+        addLibIfDir(linkCmd, sysroot, "sys-root", "mingw", "lib");
+    }
+
+    private static void addLibIfDir(List<String> cmd, String root, String... rel) {
+        Path p = Paths.get(root, rel);
+        if (Files.isDirectory(p)) cmd.add("-L" + p);
     }
 
     // =====================================================================
@@ -595,13 +1054,13 @@ public class Compiler implements CompilerPort {
     private void compileAll(String compiler, List<CompileTask> tasks,
                             Path includeDir, int threadCount,
                             int optimizationLevel, TargetPlatform target,
-                            String mingwSysroot)
+                            String mingwSysroot, MsvcToolchain msvcToolchain)
             throws IOException, InterruptedException {
 
         if (threadCount <= 1 || tasks.size() <= 1) {
             for (CompileTask task : tasks) {
                 compileOne(compiler, task, includeDir, optimizationLevel,
-                        target, mingwSysroot);
+                        target, mingwSysroot, msvcToolchain);
             }
             return;
         }
@@ -622,7 +1081,8 @@ public class Compiler implements CompilerPort {
                 while ((idx = nextTask.getAndIncrement()) < tasks.size()) {
                     try {
                         compileOne(compiler, tasks.get(idx), includeDir,
-                                optimizationLevel, target, mingwSysroot);
+                                optimizationLevel, target, mingwSysroot,
+                                msvcToolchain);
                     } catch (Throwable t) {
                         failures.add(t);
                     }
@@ -656,7 +1116,7 @@ public class Compiler implements CompilerPort {
 
     private void compileOne(String compiler, CompileTask task, Path includeDir,
                             int optimizationLevel, TargetPlatform target,
-                            String mingwSysroot)
+                            String mingwSysroot, MsvcToolchain msvcToolchain)
             throws IOException, InterruptedException {
 
         Path parent = task.obj.getParent();
@@ -672,7 +1132,9 @@ public class Compiler implements CompilerPort {
         command.add("-g");
         command.add("-fno-omit-frame-pointer");
 
-        if (!task.isIr) {
+        if (task.isIr) {
+            command.add("-Wno-override-module");
+        } else {
             command.add("-I" + includeDir.toString());
             Path portability = includeDir.resolve("jnative_portability");
             if (Files.isDirectory(portability)) {
@@ -681,15 +1143,35 @@ public class Compiler implements CompilerPort {
         }
 
         if (target.isWindows()) {
-            appendWindowsSysrootToCompiler(command, mingwSysroot, task.isIr);
+            boolean isMsvc = target.triple().toLowerCase(Locale.ROOT)
+                    .contains("-msvc");
 
-            command.add("-D_WIN32_WINNT=0x0A00");
-            command.add("-DWINVER=0x0A00");
-            command.add("-D_WINSOCK_DEPRECATED_NO_WARNINGS=1");
-            command.add("-D_CRT_SECURE_NO_WARNINGS=1");
-            command.add("-D__USE_MINGW_ANSI_STDIO=1");
-            if (!isMinGwWrapper(compiler)) {
-                command.add("--target=" + target.triple());
+            if (isMsvc) {
+                if (msvcToolchain != null) {
+                    command.add("-Xmicrosoft-visualc-tools-root");
+                    command.add(msvcToolchain.vcToolsRoot());
+                    command.add("-Xmicrosoft-windows-sdk-root");
+                    command.add(msvcToolchain.windowsSdkRoot());
+                }
+                if (!isMinGwWrapper(compiler)) {
+                    command.add("--target=" + target.triple());
+                }
+                command.add("-D_WIN32_WINNT=0x0A00");
+                command.add("-DWINVER=0x0A00");
+                command.add("-D_WINSOCK_DEPRECATED_NO_WARNINGS=1");
+                command.add("-D_CRT_SECURE_NO_WARNINGS=1");
+                command.add("-D_CRT_NONSTDC_NO_DEPRECATE=1");
+                command.add("-D__USE_MINGW_ANSI_STDIO=1");
+            } else {
+                appendWindowsSysrootToCompiler(command, mingwSysroot, task.isIr, target);
+                if (!isMinGwWrapper(compiler)) {
+                    command.add("--target=" + target.triple());
+                }
+                command.add("-D_WIN32_WINNT=0x0A00");
+                command.add("-DWINVER=0x0A00");
+                command.add("-D_WINSOCK_DEPRECATED_NO_WARNINGS=1");
+                command.add("-D_CRT_SECURE_NO_WARNINGS=1");
+                command.add("-D__USE_MINGW_ANSI_STDIO=1");
             }
         }
 
@@ -749,7 +1231,10 @@ public class Compiler implements CompilerPort {
             throws IOException {
         List<Path> extracted = new ArrayList<>();
         Set<String> seenResources = new HashSet<>();
-        for (String cls : usedClasses) {
+        Set<String> seenSymbols = new HashSet<>();
+        Deque<String> pending = new ArrayDeque<>(usedClasses);
+        while (!pending.isEmpty()) {
+            String cls = pending.poll();
             String resourcePath = findNativeResourcePath(cls);
             if (resourcePath == null || !seenResources.add(resourcePath)) continue;
             Path targetPath = tempDir.resolve(
@@ -763,8 +1248,28 @@ public class Compiler implements CompilerPort {
                 Files.copy(in, targetPath, StandardCopyOption.REPLACE_EXISTING);
                 extracted.add(targetPath);
             }
+            Matcher m = NATIVE_SYMBOL_REFERENCE.matcher(Files.readString(targetPath));
+            while (m.find()) {
+                if (!seenSymbols.add(m.group(1))) continue;
+                String owner = findNativeOwnerOfSymbol(m.group(1));
+                if (owner != null) pending.add(owner);
+            }
         }
         return extracted;
+    }
+
+    private static final Pattern NATIVE_SYMBOL_REFERENCE =
+            Pattern.compile("__jnative_fn_([A-Za-z0-9_]+)");
+
+    private String findNativeOwnerOfSymbol(String mangled) {
+        int sep = mangled.indexOf("__");
+        String head = sep < 0 ? mangled : mangled.substring(0, sep);
+        String[] parts = head.split("_");
+        for (int k = parts.length; k >= 1; k--) {
+            String candidate = String.join("/", Arrays.copyOfRange(parts, 0, k));
+            if (findNativeResourcePath(candidate) != null) return candidate;
+        }
+        return null;
     }
 
     // =====================================================================
@@ -1004,6 +1509,21 @@ public class Compiler implements CompilerPort {
     private static void appendLinkerLibraries(List<String> linkCmd,
                                               TargetPlatform target,
                                               Path defFile) {
+        if (target.isWindows()
+                && target.triple().toLowerCase(Locale.ROOT).contains("-msvc")) {
+            linkCmd.add("-Wl,/subsystem:console");
+            if (defFile != null) {
+                linkCmd.add("-Wl,/def:" + defFile.toAbsolutePath());
+            }
+            linkCmd.add("-Wl,/opt:ref");
+            linkCmd.add("-ldbghelp");
+            linkCmd.add("-lws2_32");
+            linkCmd.add("-liphlpapi");
+            linkCmd.add("-lpsapi");
+            linkCmd.add("-ladvapi32");
+            return;
+        }
+
         if (target.isWindows()) {
             linkCmd.add("-mconsole");
             linkCmd.add("-Wl,--subsystem,console");

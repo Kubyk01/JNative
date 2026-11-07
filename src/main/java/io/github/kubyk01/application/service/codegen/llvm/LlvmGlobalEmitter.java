@@ -2,6 +2,7 @@ package io.github.kubyk01.application.service.codegen.llvm;
 
 import io.github.kubyk01.application.service.analyzer.dependencyresolver.DependencyResolver;
 import io.github.kubyk01.application.service.analyzer.ssa.TypeResolver;
+import io.github.kubyk01.application.service.codegen.llvm.nativepolymorphicfunctionresolver.VarHandleTargetResolver;
 import io.github.kubyk01.domain.analyzer.aliasanalysis.AliasAnalysisResult;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.ClassNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.FieldNode;
@@ -72,7 +73,7 @@ public class LlvmGlobalEmitter {
      * ReflectionClass}. Fields of {@code java.lang.Class} that the
      * emitter has not enumerated land here.
      */
-    private static final int CLASS_RESERVED_OFFSET_START = 152;
+    private static final int CLASS_RESERVED_OFFSET_START = 160;
 
     /**
      * Authoritative mapping from {@code java.lang.Class} instance-field names to
@@ -141,7 +142,8 @@ public class LlvmGlobalEmitter {
             Map.entry("genericInfo", 120),   // Object                | null
             Map.entry("reflectionData", 128),   // SoftReference         | null
             Map.entry("classValueMap", 136),   // ClassValue            | null
-            Map.entry("enumConstantDirectory", 144));
+            Map.entry("enumConstantDirectory", 144),
+            Map.entry("primitive", 152));
     }
 
     /**
@@ -210,6 +212,7 @@ public class LlvmGlobalEmitter {
 
     private final Map<String, String> structNames = new ConcurrentHashMap<>();
     private final Map<String, Integer> fieldOffsets = new ConcurrentHashMap<>();
+    private volatile VarHandleTargetResolver varHandleTargets;
     private final Set<String> emittedStringConstants = ConcurrentHashMap.newKeySet();
     private final List<String> stringLiteralPool =
         Collections.synchronizedList(new ArrayList<>());
@@ -1151,8 +1154,9 @@ public class LlvmGlobalEmitter {
             // inherited slot emits the same function-pointer type.
             StringBuilder params = new StringBuilder();
             params.append(LlvmTypeMapper.toLlvmType(Type.reference(overrideOwner[0])));
+            boolean overrideCAbi = module.getFunction(overrideName).getEntryBlock() == null;
             for (Type pt : mn.getParameterTypes()) {
-                params.append(", ").append(LlvmTypeMapper.toLlvmType(pt));
+                params.append(", ").append(LlvmTypeMapper.toLlvmType(overrideCAbi ? LlvmTypeMapper.toCAbiType(pt) : pt));
             }
             String ret = LlvmTypeMapper.toLlvmType(mn.getReturnType());
             return new ResolvedFn(overrideName, ret + " (" + params + ")*");
@@ -1291,8 +1295,10 @@ public class LlvmGlobalEmitter {
         String ret = LlvmTypeMapper.toLlvmType(mn.getReturnType());
         StringBuilder params = new StringBuilder();
         params.append(LlvmTypeMapper.toLlvmType(Type.reference(owner)));
+        Function resolved = module.getFunction(funcName);
+        boolean cAbi = resolved == null || resolved.getEntryBlock() == null;
         for (Type pt : mn.getParameterTypes()) {
-            params.append(", ").append(LlvmTypeMapper.toLlvmType(pt));
+            params.append(", ").append(LlvmTypeMapper.toLlvmType(cAbi ? LlvmTypeMapper.toCAbiType(pt) : pt));
         }
         return new ResolvedFn(funcName, ret + " (" + params + ")*");
     }
@@ -1952,6 +1958,13 @@ public class LlvmGlobalEmitter {
             for (BasicBlock block : function.getBlocks()) {
                 for (Instruction inst : block.getInstructions()) {
                     Opcode op = inst.getOpcode();
+                    if (op == Opcode.VIRTUAL_CALL) {
+                        VarHandleTargetResolver.Target vh = getVarHandleTargets().resolveCallSite(inst);
+                        if (vh != null && vh.kind() == VarHandleTargetResolver.Kind.STATIC_FIELD) {
+                            allFields.add(vh.owner() + "." + vh.fieldName());
+                        }
+                        continue;
+                    }
                     if (op != Opcode.GET_STATIC && op != Opcode.PUT_STATIC) continue;
                     String fullName = extractFieldName(inst);
                     if (fullName == null || fullName.isEmpty()
@@ -2653,6 +2666,20 @@ public class LlvmGlobalEmitter {
     //  Field offsets
     // =========================================================================
 
+    public VarHandleTargetResolver getVarHandleTargets() {
+        VarHandleTargetResolver r = varHandleTargets;
+        if (r == null) {
+            synchronized (this) {
+                r = varHandleTargets;
+                if (r == null) {
+                    r = new VarHandleTargetResolver(resolver);
+                    varHandleTargets = r;
+                }
+            }
+        }
+        return r;
+    }
+
     public int getFieldOffset(String className, String fieldName) {
         String key = className + "." + fieldName;
         Integer cached = fieldOffsets.get(key);
@@ -2790,6 +2817,7 @@ public class LlvmGlobalEmitter {
                 case "module" -> Type.reference("java/lang/Module");
                 case "annotationData", "enumConstantDirectory" -> Type.reference("java/util/Map");
                 case "classValueMap" -> Type.reference("java/lang/ClassValue");
+                case "primitive" -> Type.BOOLEAN;
                 default -> Type.reference("java/lang/Object");
             };
         }
@@ -3537,7 +3565,7 @@ public class LlvmGlobalEmitter {
                 .append(", i8* null")  // [17] reflectionData
                 .append(", i8* null")  // [18] classValueMap
                 .append(", i8* null")  // [19] enumConstantDirectory
-                .append(", i8* null")  // [20] reserved[0]
+                .append(isPrimitive ? ", i8* inttoptr (i64 1 to i8*)" : ", i8* null")
                 .append(", i8* null")  // [21] reserved[1]
                 .append(", i8* null")  // [22] reserved[2]
                 .append(", i8* null")  // [23] reserved[3]
@@ -3561,7 +3589,10 @@ public class LlvmGlobalEmitter {
         sb.append("%ReflectionClass* null]\n");
 
         sb.append(generateSymbolClassMap(strConsts, classVarNames));
+        sb.append(generateClassFileVersionMap(classVarNames));
         sb.append(generateCallerSensitiveSymbols(strConsts));
+        sb.append(generateClassIntConstants(strConsts,
+            "jnative_systemprops_raw_constants", "jdk/internal/util/SystemProps$Raw"));
 
         sb.append(strConsts);
         return sb.toString();
@@ -3792,7 +3823,8 @@ public class LlvmGlobalEmitter {
         List<Parameter> params = f.getParameters();
         for (int i = 0; i < params.size(); i++) {
             if (i > 0) sb.append(", ");
-            sb.append(LlvmTypeMapper.toLlvmType(params.get(i).getType()));
+            Type pt = params.get(i).getType();
+            sb.append(LlvmTypeMapper.toLlvmType(f.getEntryBlock() == null ? LlvmTypeMapper.toCAbiType(pt) : pt));
         }
         sb.append(")*");
         return sb.toString();
@@ -3852,6 +3884,52 @@ public class LlvmGlobalEmitter {
         sb.append("]\n");
         sb.append("@jnative_symbol_class_map_size = constant i64 ")
             .append(map.size()).append("\n");
+        return sb.toString();
+    }
+
+    private String generateClassFileVersionMap(Map<String, String> classVarNames) {
+        TreeMap<String, Integer> versions = new TreeMap<>();
+        for (ClassNode cn : resolver.getClassMap().values()) {
+            String className = cn.getName();
+            if (className == null || cn.getClassFileVersion() == 0) continue;
+            if (classVarNames.containsKey(className)) {
+                versions.put(className, cn.getClassFileVersion());
+            }
+        }
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("@jnative_class_file_versions = constant [")
+            .append(versions.size() + 1)
+            .append(" x { %ReflectionClass*, i32 }] [\n");
+        for (Map.Entry<String, Integer> e : versions.entrySet()) {
+            sb.append("  { %ReflectionClass*, i32 } { %ReflectionClass* ")
+                .append(classVarNames.get(e.getKey()))
+                .append(", i32 ").append(e.getValue()).append(" },\n");
+        }
+        sb.append("  { %ReflectionClass*, i32 } { %ReflectionClass* null, i32 0 }\n");
+        sb.append("]\n");
+        sb.append("@jnative_class_file_versions_size = constant i64 ")
+            .append(versions.size()).append("\n");
+        return sb.toString();
+    }
+
+    private String generateClassIntConstants(StringBuilder strConsts, String symbol, String className) {
+        List<String> rows = new ArrayList<>();
+        ClassNode cn = resolver.getClassNode(className);
+        if (cn != null && cn.getFields() != null) {
+            for (FieldNode f : cn.getFields()) {
+                int required = Opcodes.ACC_STATIC | Opcodes.ACC_FINAL;
+                if ((f.getAccess() & required) != required) continue;
+                if (!(f.getConstantValue() instanceof Integer value)) continue;
+                rows.add("  { i8*, i32 } { i8* " + ensureStringConstantPtr(strConsts, f.getName())
+                    + ", i32 " + value + " },\n");
+            }
+        }
+        StringBuilder sb = new StringBuilder();
+        sb.append("@").append(symbol).append(" = constant [").append(rows.size() + 1)
+            .append(" x { i8*, i32 }] [\n");
+        rows.forEach(sb::append);
+        sb.append("  { i8*, i32 } zeroinitializer\n]\n");
         return sb.toString();
     }
 
@@ -4075,10 +4153,22 @@ public class LlvmGlobalEmitter {
             argsCsv.append("i8* %obj");
             firstArg = false;
         }
+        Function target = module.getFunction(origFuncName);
+        boolean cAbi = target != null && target.getEntryBlock() == null;
         for (int i = 0; i < argLoads.size(); i++) {
             if (!firstArg) argsCsv.append(", ");
-            argsCsv.append(LlvmTypeMapper.toLlvmType(paramTypes.get(i)))
-                .append(" ").append(argLoads.get(i));
+            Type pt = paramTypes.get(i);
+            String arg = argLoads.get(i);
+            if (cAbi && LlvmTypeMapper.toCAbiType(pt) != pt) {
+                String wide = "%arg" + i + "_abi";
+                sb.append("  ").append(wide)
+                    .append(pt == Type.BOOLEAN || pt == Type.CHAR ? " = zext " : " = sext ")
+                    .append(LlvmTypeMapper.toLlvmType(pt)).append(" ").append(arg).append(" to i32\n");
+                pt = Type.INT;
+                arg = wide;
+            }
+            argsCsv.append(LlvmTypeMapper.toLlvmType(pt))
+                .append(" ").append(arg);
             firstArg = false;
         }
 

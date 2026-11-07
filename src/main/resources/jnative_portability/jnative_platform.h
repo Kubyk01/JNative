@@ -9,9 +9,6 @@
 #include <time.h>
 
 #ifdef _WIN32
-/* ====================================================================
- * Windows
- * ==================================================================== */
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -34,12 +31,16 @@
 #include <direct.h>
 #include <signal.h>
 #include <errno.h>
+#include <BaseTsd.h>
 
 #ifndef PATH_MAX
 #define PATH_MAX MAX_PATH
 #endif
 
-/* MSVC does not ship POSIX names; MinGW does. Only redefine on MSVC. */
+#if !defined(__MINGW32__) && !defined(__MINGW64__)
+typedef SSIZE_T ssize_t;
+#endif
+
 #if !defined(__MINGW32__) && !defined(__MINGW64__)
 #  ifndef strdup
 #    define strdup      _strdup
@@ -95,50 +96,22 @@
 typedef int jn_socket_t;
 #define JN_INVALID_SOCKET INVALID_SOCKET
 
-/* ------------------------------------------------------------------------
- * Portable socklen_t.
- *
- * POSIX declares getsockopt/setsockopt/accept/getpeername/getsockname/
- * recvfrom with `socklen_t *` (unsigned int on Linux), while Winsock2
- * declares the same functions with `int *`. A single `int optlen` will
- * therefore trigger -Wpointer-sign on POSIX while being correct on
- * Windows; the opposite holds for `socklen_t`. jn_socklen_t is the
- * portable spelling that compiles cleanly on both.
- * ------------------------------------------------------------------------ */
-#if defined(_WIN32)
-   typedef int jn_socklen_t;
-#else
-   typedef socklen_t jn_socklen_t;
-#endif
+typedef int jn_socklen_t;
 
-/* Windows has no readlink(2); report failure so callers take their
- * existing error path. */
 static inline long jn_readlink(const char* path, char* buf, size_t len) {
     (void)path; (void)buf; (void)len;
     return -1;
 }
 
-/* Number of logical CPUs, used by the parallel initializer runner. */
 int jn_cpu_count(void);
 
-/*
- * MinGW ships WinPthreads — use it directly. Redefining pthread_mutex_t,
- * pthread_cond_t, pthread_t etc. is exactly what produced the
- * "typedef redefinition with different types" cascade in the error log.
- * On MinGW the real <pthread.h> wins and we simply forward our jn_*
- * aliases to it.
- *
- * MSVC does not ship pthreads at all — there we still provide the
- * CRITICAL_SECTION / CONDITION_VARIABLE shim (implemented in
- * jnative_platform.c so it cannot be shadowed by a system pthread.h).
- */
 #if defined(__MINGW32__) || defined(__MINGW64__)
 #  include <pthread.h>
 #  include <sched.h>
 
-   typedef pthread_t       jn_thread_t;
-   typedef pthread_mutex_t jn_mutex_t;
-   typedef pthread_cond_t  jn_cond_t;
+typedef pthread_t       jn_thread_t;
+typedef pthread_mutex_t jn_mutex_t;
+typedef pthread_cond_t  jn_cond_t;
 
 #  define JN_MUTEX_INITIALIZER PTHREAD_MUTEX_INITIALIZER
 #  define JN_COND_INITIALIZER  PTHREAD_COND_INITIALIZER
@@ -167,22 +140,25 @@ static inline void jn_recmutex_init(jn_mutex_t* m) {
     pthread_mutexattr_destroy(&attr);
 }
 #else
-   /* ---- MSVC shim ---- */
-   typedef struct { CRITICAL_SECTION cs; INIT_ONCE once; } pthread_mutex_t;
+typedef struct { CRITICAL_SECTION cs; INIT_ONCE once; } pthread_mutex_t;
 #  define PTHREAD_MUTEX_INITIALIZER { {0}, INIT_ONCE_STATIC_INIT }
 #  define PTHREAD_MUTEX_RECURSIVE   1
 
-   typedef struct { CONDITION_VARIABLE cv; } pthread_cond_t;
+typedef struct { CONDITION_VARIABLE cv; } pthread_cond_t;
 #  define PTHREAD_COND_INITIALIZER { CONDITION_VARIABLE_INIT }
 
-   typedef struct { HANDLE handle; DWORD id; } pthread_t;
-   typedef int pthread_mutexattr_t;
-   typedef int pthread_attr_t;
+typedef struct { HANDLE handle; DWORD id; } pthread_t;
 
-   int jn_pthread_mutex_init_impl(pthread_mutex_t* m);
-   int jn_pthread_mutex_lock_impl(pthread_mutex_t* m);
-   int jn_pthread_mutex_unlock_impl(pthread_mutex_t* m);
-   int jn_pthread_mutex_destroy_impl(pthread_mutex_t* m);
+typedef struct { size_t stack_size; } pthread_attr_t;
+typedef int pthread_mutexattr_t;
+
+typedef INIT_ONCE pthread_once_t;
+#  define PTHREAD_ONCE_INIT INIT_ONCE_STATIC_INIT
+
+int jn_pthread_mutex_init_impl(pthread_mutex_t* m);
+int jn_pthread_mutex_lock_impl(pthread_mutex_t* m);
+int jn_pthread_mutex_unlock_impl(pthread_mutex_t* m);
+int jn_pthread_mutex_destroy_impl(pthread_mutex_t* m);
 
 #  define pthread_mutex_init(m, a)     ((void)(a), jn_pthread_mutex_init_impl(m))
 #  define pthread_mutex_lock(m)        jn_pthread_mutex_lock_impl(m)
@@ -192,12 +168,17 @@ static inline void jn_recmutex_init(jn_mutex_t* m) {
 #  define pthread_mutexattr_settype(a,t) ((void)(a), (void)(t), 0)
 #  define pthread_mutexattr_destroy(a) ((void)(a), 0)
 
-   int       jn_pthread_cond_init_win(pthread_cond_t* c, const void* attr);
-   int       jn_pthread_cond_timedwait_win(pthread_cond_t* c, pthread_mutex_t* m, const struct timespec* ts);
-   int       jn_pthread_create_win(pthread_t* t, const pthread_attr_t* attr, void* (*fn)(void*), void* arg);
-   int       jn_pthread_join_win(pthread_t t, void** retval);
-   pthread_t jn_pthread_self_win(void);
-   int       jn_pthread_equal_win(pthread_t a, pthread_t b);
+int       jn_pthread_cond_init_win(pthread_cond_t* c, const void* attr);
+int       jn_pthread_cond_timedwait_win(pthread_cond_t* c, pthread_mutex_t* m, const struct timespec* ts);
+int       jn_pthread_create_win(pthread_t* t, const pthread_attr_t* attr, void* (*fn)(void*), void* arg);
+int       jn_pthread_join_win(pthread_t t, void** retval);
+pthread_t jn_pthread_self_win(void);
+int       jn_pthread_equal_win(pthread_t a, pthread_t b);
+int       jn_pthread_once_win(pthread_once_t* once, void (*init)(void));
+
+static inline int pthread_attr_init(pthread_attr_t* a) { a->stack_size = 0; return 0; }
+static inline int pthread_attr_destroy(pthread_attr_t* a) { (void)a; return 0; }
+static inline int pthread_attr_setstacksize(pthread_attr_t* a, size_t sz) { a->stack_size = sz; return 0; }
 
 #  define pthread_cond_init(c, a)         jn_pthread_cond_init_win((c), (a))
 #  define pthread_cond_destroy(c)         ((void)(c), 0)
@@ -209,10 +190,11 @@ static inline void jn_recmutex_init(jn_mutex_t* m) {
 #  define pthread_join(t, r)              jn_pthread_join_win((t), (r))
 #  define pthread_self()                  jn_pthread_self_win()
 #  define pthread_equal(a, b)             jn_pthread_equal_win((a), (b))
+#  define pthread_once(o, f)              jn_pthread_once_win((o), (f))
 
-   typedef pthread_t       jn_thread_t;
-   typedef pthread_mutex_t jn_mutex_t;
-   typedef pthread_cond_t  jn_cond_t;
+typedef pthread_t       jn_thread_t;
+typedef pthread_mutex_t jn_mutex_t;
+typedef pthread_cond_t  jn_cond_t;
 
 #  define JN_MUTEX_INITIALIZER PTHREAD_MUTEX_INITIALIZER
 #  define JN_COND_INITIALIZER  PTHREAD_COND_INITIALIZER
@@ -222,7 +204,6 @@ static inline void jn_recmutex_init(jn_mutex_t* m) {
 #  define jn_mutex_lock(m)      pthread_mutex_lock(m)
 #  define jn_mutex_unlock(m)    pthread_mutex_unlock(m)
 #  define jn_mutex_destroy(m)   pthread_mutex_destroy(m)
-   /* CRITICAL_SECTION is recursive by definition. */
 #  define jn_recmutex_init(m)   pthread_mutex_init((m), NULL)
 
 #  define jn_cond_init(c, a)    pthread_cond_init((c), (a))
@@ -236,10 +217,8 @@ static inline void jn_recmutex_init(jn_mutex_t* m) {
 #  define jn_yield()                   SwitchToThread()
 #endif
 
-/* ---- dlfcn shim (same on MinGW and MSVC) ---- */
 #include "jnative_dlfcn_win32.h"
 
-/* ---- Time (implemented in jnative_platform.c for Windows) ---- */
 int jn_now_realtime_win(struct timespec* ts);
 int jn_now_monotonic_win(struct timespec* ts);
 int jn_sleep_ns_ns_win(const struct timespec* req, struct timespec* rem);
@@ -248,15 +227,10 @@ int jn_sleep_ns_ns_win(const struct timespec* req, struct timespec* rem);
 #define jn_now_monotonic(ts)     jn_now_monotonic_win(ts)
 #define jn_sleep_ns_ns(req, rem) jn_sleep_ns_ns_win((req), (rem))
 
-/* The process-image handle for symbol lookup. Defined in
- * jnative_platform.c; initialised by a constructor before main() runs. */
 extern void* jn_dlsym_default;
 #define jn_dlsym_default(name) dlsym(jn_dlsym_default, name)
 
 #else
-/* ====================================================================
- * POSIX
- * ==================================================================== */
 #include <unistd.h>
 #include <pthread.h>
 #include <sched.h>
@@ -281,21 +255,7 @@ extern void* jn_dlsym_default;
 typedef int jn_socket_t;
 #define JN_INVALID_SOCKET (-1)
 
-/* ------------------------------------------------------------------------
- * Portable socklen_t.
- *
- * POSIX declares getsockopt/setsockopt/accept/getpeername/getsockname/
- * recvfrom with `socklen_t *` (unsigned int on Linux), while Winsock2
- * declares the same functions with `int *`. A single `int optlen` will
- * therefore trigger -Wpointer-sign on POSIX while being correct on
- * Windows; the opposite holds for `socklen_t`. jn_socklen_t is the
- * portable spelling that compiles cleanly on both.
- * ------------------------------------------------------------------------ */
-#if defined(_WIN32)
-   typedef int jn_socklen_t;
-#else
-   typedef socklen_t jn_socklen_t;
-#endif
+typedef socklen_t jn_socklen_t;
 
 typedef pthread_t       jn_thread_t;
 typedef pthread_mutex_t jn_mutex_t;
@@ -365,10 +325,34 @@ static inline void jn_yield(void) { sched_yield(); }
 extern void* jn_dlsym_default;
 #define jn_dlsym_default(name) dlsym(jn_dlsym_default, name)
 
-#endif /* _WIN32 */
+#endif
+
+#if defined(_WIN32) && !defined(__MINGW32__) && !defined(__MINGW64__)
+static inline jn_thread_t jn_thread_none(void) {
+    jn_thread_t t;
+    memset(&t, 0, sizeof(t));
+    return t;
+}
+static inline int jn_thread_is_valid(jn_thread_t t) {
+    return t.handle != NULL;
+}
+static inline int64_t jn_thread_id(jn_thread_t t) {
+    return (int64_t)t.id;
+}
+#else
+static inline jn_thread_t jn_thread_none(void) {
+    return (jn_thread_t)0;
+}
+static inline int jn_thread_is_valid(jn_thread_t t) {
+    return t != (jn_thread_t)0;
+}
+static inline int64_t jn_thread_id(jn_thread_t t) {
+    return (int64_t)(uintptr_t)t;
+}
+#endif
 
 #ifndef JN_DEFAULT_STACK_SIZE
 #define JN_DEFAULT_STACK_SIZE (1024 * 1024)
 #endif
 
-#endif /* JNATIVE_PLATFORM_H */
+#endif

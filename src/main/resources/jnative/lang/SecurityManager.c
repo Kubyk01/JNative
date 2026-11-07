@@ -39,7 +39,7 @@ static const char* extract_class_name(const char* symbol, char* buffer, size_t s
 }
 
 static struct ReflectionClass* lookup_class(const char* name) {
-    if (!name || !reflect_all_classes) return NULL;
+    if (!name) return NULL;
     struct ReflectionClass** pp = reflect_all_classes;
     while (*pp) {
         const char* n = (*pp)->cname;

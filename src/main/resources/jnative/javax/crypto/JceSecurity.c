@@ -136,7 +136,6 @@ static void* lookup_symbol(const char* name) {
     void* handle = jn_dlsym_default;
     if (handle == NULL) return NULL;
     void* sym = jn_dlsym_default( name);
-    dlclose(handle);
     return sym;
 }
 

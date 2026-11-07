@@ -57,3 +57,12 @@ int32_t __jnative_fn_jdk_internal_misc_ScopedMemoryAccess_closeScope0__Ljdk_inte
  */
 void __jnative_fn_jdk_internal_misc_ScopedMemoryAccess_registerNatives___V(void) {
 }
+void __jnative_fn_jdk_internal_misc_ScopedMemoryAccess_closeScope0__Ljdk_internal_foreign_MemorySessionImpl_Ljdk_internal_misc_ScopedMemoryAccess_ScopedAccessError__V(
+        void* self, void* session, void* error) {
+    (void)self;
+    (void)error;
+    if (session == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+}

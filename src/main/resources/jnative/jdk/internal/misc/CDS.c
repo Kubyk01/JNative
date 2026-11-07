@@ -168,3 +168,13 @@ void __jnative_fn_jdk_internal_misc_CDS_defineArchivedModules__Ljava_lang_ClassL
     (void)platform_loader;
     (void)app_loader;
 }
+int32_t __jnative_fn_jdk_internal_misc_CDS_getCDSConfigStatus___I(void) {
+    return 0;
+}
+
+int32_t __jnative_fn_jdk_internal_misc_CDS_needsClassInitBarrier0__Ljava_lang_Class__Z(
+        void* clazz)
+{
+    (void)clazz;
+    return 0;
+}

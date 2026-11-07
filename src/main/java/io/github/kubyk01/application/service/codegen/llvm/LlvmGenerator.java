@@ -909,7 +909,8 @@ public class LlvmGenerator implements LlvmGeneratorPort {
         List<Parameter> params = func.getParameters();
         for (int i = 0; i < params.size(); i++) {
             if (i > 0) sb.append(", ");
-            sb.append(LlvmTypeMapper.toLlvmType(params.get(i).getType()));
+            Type pt = params.get(i).getType();
+            sb.append(LlvmTypeMapper.toLlvmType(func.getEntryBlock() == null ? LlvmTypeMapper.toCAbiType(pt) : pt));
         }
         sb.append(")\n");
         return sb.toString();
@@ -1403,11 +1404,11 @@ public class LlvmGenerator implements LlvmGeneratorPort {
         int ifaceId  = globalEmitter.getInterfaceId("java/lang/Runnable");
         int runSlot  = globalEmitter.getInterfaceMethodSlot("java/lang/Runnable", "run", "()V");
         sb.append("@__jnative_runnable_iface_id = constant i32 ").append(ifaceId).append("\n");
-        sb.append("@__jnative_run_method_slot   = constant i32 ").append(runSlot).append("\n");
+        sb.append("@__jnative_run_method_slot = constant i32 ").append(runSlot).append("\n");
 
         int toStringSlot = globalEmitter.getVirtualSlot(
             "java/lang/Object", "toString", "()Ljava/lang/String;");
-        sb.append("@__jnative_tostring_slot    = constant i32 ")
+        sb.append("@__jnative_tostring_slot = constant i32 ")
             .append(toStringSlot).append("\n\n");
 
         int privActionIfaceId = globalEmitter.getInterfaceId("java/security/PrivilegedAction");

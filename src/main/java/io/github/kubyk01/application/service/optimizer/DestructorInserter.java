@@ -16,6 +16,7 @@ import io.github.kubyk01.domain.ir.*;
 import io.github.kubyk01.util.LlvmUtil;
 import lombok.Getter;
 import lombok.RequiredArgsConstructor;
+import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
 import org.objectweb.asm.Opcodes;
 
@@ -48,6 +49,12 @@ public class DestructorInserter {
      * destructor — see {@link #createArrayDestructor(Type)}.</p>
      */
     private Set<Type> allocatedTypes = Collections.emptySet();
+
+  // todo refactor this
+  private Set<AllocationSite> staticFieldSites = Collections.emptySet();
+
+    @Setter
+    private Set<String> coAllocatedFields = Collections.emptySet();
 
     public void insert() {
         this.allocatedTypes = collectAllocatedTypes();
@@ -216,6 +223,13 @@ public class DestructorInserter {
             log.warn("DestructorInserter: no live-out map was published; "
                 + "field-overwrite releases will not be emitted.");
             return 0;
+        }
+
+        staticFieldSites = new HashSet<>();
+        for (PointsToSet pts : aliasResult.getGraph().getStaticFieldPointsToMap().values()) {
+            for (AllocationSite site : pts.getSites()) {
+                if (site != AllocationSite.UNKNOWN) staticFieldSites.add(site);
+            }
         }
 
         Deque<BasicBlock> pending = new ArrayDeque<>();
@@ -930,6 +944,11 @@ public class DestructorInserter {
         if (fieldSites.isEmpty() || fieldSites.containsUnknown()) {
             return false;
         }
+        for (AllocationSite site : fieldSites.getSites()) {
+            if (staticFieldSites.contains(site)) {
+                return false;
+            }
+        }
 
         // ------------------------------------------------------------------
         // Block-level liveness gate.
@@ -1507,6 +1526,7 @@ private void emitDestructionGuard(BasicBlock entry,
             String fieldOwner = field.getOwner();
             if (fieldOwner == null || fieldOwner.isEmpty()) fieldOwner = className;
             String fullFieldName = fieldOwner + "." + field.getName();
+            if (coAllocatedFields.contains(fullFieldName)) continue;
 
             Instruction getField = new Instruction(Opcode.GET_FIELD);
             getField.addOperand(thisParam);
@@ -1536,6 +1556,7 @@ private void emitDestructionGuard(BasicBlock entry,
             String fieldOwner = field.getOwner();
             if (fieldOwner == null || fieldOwner.isEmpty()) fieldOwner = className;
             String fullFieldName = fieldOwner + "." + field.getName();
+            if (coAllocatedFields.contains(fullFieldName)) continue;
 
             Instruction getField = new Instruction(Opcode.GET_FIELD);
             getField.addOperand(thisParam);

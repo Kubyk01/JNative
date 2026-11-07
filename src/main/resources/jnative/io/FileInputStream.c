@@ -206,3 +206,13 @@ int64_t __jnative_fn_java_io_FileInputStream_position0___J(void* this_fis) {
     if (pos < 0) fis_throw_io("lseek failed");
     return pos;
 }
+int32_t __jnative_fn_java_io_FileInputStream_isRegularFile0__Ljava_io_FileDescriptor__Z(
+        void* this_fis, void* fd_obj)
+{
+    (void)this_fis;
+    int32_t fd = jnative_fd_of(fd_obj);
+    if (fd < 0) return 0;
+    struct stat st;
+    if (fstat(fd, &st) < 0) return 0;
+    return ((st.st_mode & S_IFMT) == S_IFREG) ? 1 : 0;
+}

@@ -106,8 +106,8 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <setjmp.h>
-#include <pthread.h>
 
+#include "jnative_platform.h"
 #include "jnative_runtime.h"
 
 extern JNativeVTable vtable_java_lang_String;
@@ -197,11 +197,11 @@ typedef struct {
     size_t   capacity;
 } LocalRefStack;
 
-static __thread LocalRefStack tls_local_refs = { NULL, 0, 0 };
+static JN_TLS LocalRefStack tls_local_refs = { NULL, 0, 0 };
 
-static __thread size_t* tls_frame_saved = NULL;
-static __thread size_t  tls_frame_depth = 0;
-static __thread size_t  tls_frame_cap   = 0;
+static JN_TLS size_t* tls_frame_saved = NULL;
+static JN_TLS size_t  tls_frame_depth = 0;
+static JN_TLS size_t  tls_frame_cap   = 0;
 
 /* Global refs (process-wide). */
 typedef struct GlobalRefEntry {
@@ -211,7 +211,7 @@ typedef struct GlobalRefEntry {
 
 #define GLOBAL_REF_BUCKETS 1024u
 static GlobalRefEntry*  global_ref_table[GLOBAL_REF_BUCKETS];
-static pthread_mutex_t  global_ref_lock = PTHREAD_MUTEX_INITIALIZER;
+static jn_mutex_t       global_ref_lock = JN_MUTEX_INITIALIZER;
 
 static uint32_t ref_hash(const void* p) {
     uintptr_t h = (uintptr_t)p;
@@ -698,10 +698,10 @@ static jobject jn_NewGlobalRef(void* env, jobject obj) {
     if (e == NULL) return NULL;
     e->obj = obj;
     uint32_t b = ref_hash(obj);
-    pthread_mutex_lock(&global_ref_lock);
+    jn_mutex_lock(&global_ref_lock);
     e->next = global_ref_table[b];
     global_ref_table[b] = e;
-    pthread_mutex_unlock(&global_ref_lock);
+    jn_mutex_unlock(&global_ref_lock);
     return obj;
 }
 
@@ -709,7 +709,7 @@ static void jn_DeleteGlobalRef(void* env, jobject obj) {
     ENV_UNUSED;
     if (obj == NULL) return;
     uint32_t b = ref_hash(obj);
-    pthread_mutex_lock(&global_ref_lock);
+    jn_mutex_lock(&global_ref_lock);
     GlobalRefEntry** pp = &global_ref_table[b];
     while (*pp) {
         if ((*pp)->obj == obj) {
@@ -720,7 +720,7 @@ static void jn_DeleteGlobalRef(void* env, jobject obj) {
         }
         pp = &(*pp)->next;
     }
-    pthread_mutex_unlock(&global_ref_lock);
+    jn_mutex_unlock(&global_ref_lock);
 }
 
 static void jn_DeleteLocalRef(void* env, jobject obj) {

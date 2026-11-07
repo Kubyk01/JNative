@@ -260,6 +260,177 @@ int32_t __jnative_fn_java_lang_reflect_Array_getLength__Ljava_lang_Object__I(
     return jnative_array_length(array);
 }
 
+/* ========================================================================
+ *  Shared externs used by the reflective accessors below.
+ * ===================================================================== */
+
+extern void* __jnative_fn_java_lang_Object_getClass___Ljava_lang_Class_(void* obj);
+extern int   __jnative_fn_java_lang_Class_isInstance__Ljava_lang_Object__Z(void* this_cls, void* obj);
+extern int   __jnative_fn_java_lang_Class_isAssignableFrom__Ljava_lang_Class__Z(void* this_cls, void* other_cls);
+
+/* ========================================================================
+ *  Helper routines used by Array.set.
+ *
+ *  These implement the strict JLS type rules for reflective element
+ *  assignment: a reference store must satisfy isAssignableFrom for the
+ *  component type, and a primitive store must be one of the widening
+ *  primitive conversions (JLS §5.1.2). The check for the reference case
+ *  consults isInstance first (fast path — exact subtype test) and falls
+ *  back to isAssignableFrom on the value's class when isInstance is
+ *  conservative.
+ * ===================================================================== */
+
+__attribute__((noreturn))
+static void array_throw_iae(const char* msg) {
+    __jnative_throw_exception(__jnative_construct_exception(
+        "vtable_java_lang_IllegalArgumentException", msg));
+}
+
+static ReflectionClass* array_class_of(void* array) {
+    if (array == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    ReflectionClass* cls = jnative_array_klass(array);
+    if (cls == NULL || !__jnative_is_class_mirror(cls)
+        || cls->cname == NULL || cls->cname[0] != '[') {
+        array_throw_iae("Argument is not an array");
+    }
+    return cls;
+}
+
+static void* array_element_address(void* array, int32_t index, int32_t elem_size) {
+    int32_t length = jnative_array_length(array);
+    if (index < 0 || index >= length) {
+        char msg[96];
+        snprintf(msg, sizeof(msg), "Index %d out of bounds for length %d",
+                 (int)index, (int)length);
+        __jnative_throw_exception(__jnative_construct_exception(
+            "vtable_java_lang_ArrayIndexOutOfBoundsException", msg));
+    }
+    return (char*)jnative_array_data(array) + (size_t)index * (size_t)elem_size;
+}
+
+/*
+ * Locates the instance "value" field of a boxed-primitive class (or one
+ * of its ancestors) and returns its byte offset. Falls back to
+ * OBJECT_HEADER_SIZE when the field cannot be located; every supported
+ * wrapper class does declare `value`, so the fallback only triggers for
+ * a hand-crafted reflective class that shouldn't reach this code.
+ */
+static int32_t wrapper_value_offset(ReflectionClass* cls) {
+    for (ReflectionClass* c = cls; c != NULL; c = c->superclass) {
+        if (c->fields == NULL) continue;
+        for (ReflectionField** fp = c->fields; *fp != NULL; fp++) {
+            ReflectionField* f = *fp;
+            if (f->name != NULL && strcmp((const char*)f->name, "value") == 0
+                && (f->modifiers & JNATIVE_ACC_STATIC) == 0) {
+                return f->offset;
+            }
+        }
+    }
+    return OBJECT_HEADER_SIZE;
+}
+
+/*
+ * Recognises the eight boxed-primitive classes and extracts the primitive
+ * value they wrap into `*ival` (integral and boolean types) or `*dval`
+ * (float / double). Returns the JVM descriptor code ('Z','B','C','S','I',
+ * 'J','F','D') on success, or 0 when `value` is not a wrapper.
+ */
+static char unbox_primitive(void* value, int64_t* ival, double* dval) {
+    ReflectionClass* vcls =
+        (ReflectionClass*)__jnative_fn_java_lang_Object_getClass___Ljava_lang_Class_(value);
+    if (vcls == NULL || vcls->cname == NULL) return 0;
+    static const struct { const char* name; char code; } wrappers[] = {
+        {"java/lang/Boolean", 'Z'}, {"java/lang/Byte", 'B'},
+        {"java/lang/Character", 'C'}, {"java/lang/Short", 'S'},
+        {"java/lang/Integer", 'I'}, {"java/lang/Long", 'J'},
+        {"java/lang/Float", 'F'}, {"java/lang/Double", 'D'},
+        {NULL, 0}
+    };
+    char code = 0;
+    for (int i = 0; wrappers[i].name != NULL; i++) {
+        if (strcmp(vcls->cname, wrappers[i].name) == 0) {
+            code = wrappers[i].code;
+            break;
+        }
+    }
+    if (code == 0) return 0;
+    const char* p = (const char*)value + wrapper_value_offset(vcls);
+    switch (code) {
+        case 'Z': *ival = (*(const uint8_t*)p) != 0; break;
+        case 'B': *ival = *(const int8_t*)p; break;
+        case 'C': *ival = *(const uint16_t*)p; break;
+        case 'S': *ival = *(const int16_t*)p; break;
+        case 'I': *ival = *(const int32_t*)p; break;
+        case 'J': *ival = *(const int64_t*)p; break;
+        case 'F': *dval = *(const float*)p; break;
+        case 'D': *dval = *(const double*)p; break;
+    }
+    return code;
+}
+
+/*
+ * The JLS §5.1.2 widening primitive conversion table. Returns 1 iff a
+ * value of primitive type `src` may be stored, without an explicit cast,
+ * into an array whose component type is `dst`.
+ */
+static int primitive_widens_to(char src, char dst) {
+    if (src == dst) return 1;
+    switch (src) {
+        case 'B': return dst == 'S' || dst == 'I' || dst == 'J' || dst == 'F' || dst == 'D';
+        case 'S':
+        case 'C': return dst == 'I' || dst == 'J' || dst == 'F' || dst == 'D';
+        case 'I': return dst == 'J' || dst == 'F' || dst == 'D';
+        case 'J': return dst == 'F' || dst == 'D';
+        case 'F': return dst == 'D';
+        default:  return 0;
+    }
+}
+
+/*
+ * Resolves the component class of an array descriptor. Returns NULL for a
+ * descriptor whose component is a primitive (no class object exists for a
+ * primitive component) or for a malformed reference descriptor.
+ */
+static ReflectionClass* component_class_of(const char* array_name) {
+    const char* comp = array_name + 1;
+    if (comp[0] == '[') return jnative_class_by_name(comp);
+    if (comp[0] != 'L') return NULL;
+    size_t len = strlen(comp);
+    if (len < 3 || comp[len - 1] != ';') return NULL;
+    char name[512];
+    if (len - 2 >= sizeof(name)) return NULL;
+    memcpy(name, comp + 1, len - 2);
+    name[len - 2] = '\0';
+    return jnative_class_by_name(name);
+}
+
+/*
+ * The reference-store type check: a null value is always assignable; an
+ * Object[] component accepts anything; otherwise the value's class must
+ * be assignable to the component class.
+ */
+static int reference_store_allowed(const char* array_name, void* value) {
+    if (value == NULL) return 1;
+    if (strcmp(array_name, "[Ljava/lang/Object;") == 0) return 1;
+    ReflectionClass* comp = component_class_of(array_name);
+    if (comp == NULL) return 0;
+    if (__jnative_fn_java_lang_Class_isInstance__Ljava_lang_Object__Z(comp, value)) return 1;
+    void* vcls = __jnative_fn_java_lang_Object_getClass___Ljava_lang_Class_(value);
+    return __jnative_fn_java_lang_Class_isAssignableFrom__Ljava_lang_Class__Z(comp, vcls);
+}
+
+/* ========================================================================
+ *  Helper routines used by Array.get.
+ *
+ *  Boxed primitives are produced through the standard java.lang.<Wrapper>
+ *  .valueOf call, which is linked as a weak extern so that an image that
+ *  never reaches Array.get does not pull the wrapper classes in. When a
+ *  valueOf is not available (unlinked weak symbol) the reflective get
+ *  reports the failure rather than fabricating a value.
+ * ===================================================================== */
+
 extern void* fn_java_lang_Boolean_valueOf__Z_Ljava_lang_Boolean_(_Bool)        __attribute__((weak));
 extern void* fn_java_lang_Byte_valueOf__B_Ljava_lang_Byte_(int8_t)             __attribute__((weak));
 extern void* fn_java_lang_Short_valueOf__S_Ljava_lang_Short_(int16_t)          __attribute__((weak));
@@ -353,61 +524,60 @@ void* __jnative_fn_java_lang_reflect_Array_get__Ljava_lang_Object_I_Ljava_lang_O
     return NULL;
 }
 
-#define BOXED_PRIMITIVE_FIELD_OFFSET 8
-
-static int unbox_into(char type_char, void* boxed, char* dest) {
-    if (boxed == NULL) {
-        return 0;
-    }
-    const char* src = (const char*)boxed + BOXED_PRIMITIVE_FIELD_OFFSET;
-    switch (type_char) {
-        case 'Z': *(int8_t*)dest   = *(const int8_t*)src;   return 1;
-        case 'B': *(int8_t*)dest   = *(const int8_t*)src;   return 1;
-        case 'S': *(int16_t*)dest  = *(const int16_t*)src;  return 1;
-        case 'C': *(uint16_t*)dest = *(const uint16_t*)src; return 1;
-        case 'I': *(int32_t*)dest  = *(const int32_t*)src;  return 1;
-        case 'J': *(int64_t*)dest  = *(const int64_t*)src;  return 1;
-        case 'F': *(float*)dest    = *(const float*)src;    return 1;
-        case 'D': *(double*)dest   = *(const double*)src;   return 1;
-        default:  return 0;
-    }
-}
-
 void __jnative_fn_java_lang_reflect_Array_set__Ljava_lang_Object_ILjava_lang_Object__V(
         void* array, int32_t index, void* value) {
 
-    if (array == NULL) {
-        __jnative_throw_null_pointer_exception();
+    ReflectionClass* cls = array_class_of(array);
+    char dst = cls->cname[1];
+
+    if (dst == '[' || dst == 'L') {
+        if (!reference_store_allowed(cls->cname, value)) {
+            array_throw_iae("array element type mismatch");
+        }
+        void** slot = (void**)array_element_address(array, index, (int32_t)sizeof(void*));
+        *slot = value;
         return;
     }
 
-    int32_t length = jnative_array_length(array);
-    if (index < 0 || index >= length) {
-        __jnative_throw_array_index_out_of_bounds();
-        return;
+    if (value == NULL) {
+        array_throw_iae("argument type mismatch");
     }
-
-    struct ReflectionClass* arr_cls =
-        *(struct ReflectionClass**)((char*)array + JAVA_ARR_KLASS_OFFSET);
-    const char* desc = (arr_cls != NULL) ? arr_cls->cname : NULL;
-    if (desc == NULL || desc[0] != '[') {
-        __jnative_throw_exception(NULL);
-        return;
+    int64_t ival = 0;
+    double dval = 0.0;
+    char src = unbox_primitive(value, &ival, &dval);
+    if (src == 0 || !primitive_widens_to(src, dst)) {
+        array_throw_iae("argument type mismatch");
     }
+    int src_is_fp = (src == 'F' || src == 'D');
 
-    int32_t elem_size = *(int32_t*)((char*)array + JAVA_ARR_ELEM_SIZE_OFFSET);
-    char* elem = (char*)jnative_array_data(array) + ((size_t)index * elem_size);
-
-    char type_char = desc[1];
-
-    if (type_char == 'L' || type_char == '[') {
-        *(void**)elem = value;
-        return;
+    switch (dst) {
+        case 'Z':
+            *(uint8_t*)array_element_address(array, index, 1) = (uint8_t)(ival != 0);
+            break;
+        case 'B':
+            *(int8_t*)array_element_address(array, index, 1) = (int8_t)ival;
+            break;
+        case 'C':
+            *(uint16_t*)array_element_address(array, index, 2) = (uint16_t)ival;
+            break;
+        case 'S':
+            *(int16_t*)array_element_address(array, index, 2) = (int16_t)ival;
+            break;
+        case 'I':
+            *(int32_t*)array_element_address(array, index, 4) = (int32_t)ival;
+            break;
+        case 'J':
+            *(int64_t*)array_element_address(array, index, 8) = ival;
+            break;
+        case 'F':
+            *(float*)array_element_address(array, index, 4) =
+                src_is_fp ? (float)dval : (float)ival;
+            break;
+        case 'D':
+            *(double*)array_element_address(array, index, 8) =
+                src_is_fp ? dval : (double)ival;
+            break;
+        default:
+            array_throw_iae("argument type mismatch");
     }
-
-    if (unbox_into(type_char, value, elem)) {
-        return;
-    }
-
-    __jnative_throw_exception(NULL);
 }

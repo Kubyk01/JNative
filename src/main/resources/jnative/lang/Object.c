@@ -6,6 +6,7 @@
 #include <time.h>
 #include <stdio.h>
 #include "jnative_runtime.h"
+#include "jnative_portability.h"
 
 /* ==========================================================================
  *  Registry hash maps
@@ -48,7 +49,7 @@ typedef struct {
 
 static PtrToClassMap    class_mirror_map;      /* ReflectionClass* -> itself */
 static PtrToClassMap    vtable_to_class_map;   /* vtable pointer   -> class  */
-static pthread_once_t   registry_maps_once = PTHREAD_ONCE_INIT;
+static jn_once_t   registry_maps_once = JN_ONCE_INIT;
 
 static inline uintptr_t jnative_hash_pointer(const void* p) {
     uintptr_t h = (uintptr_t)p;
@@ -128,7 +129,6 @@ static void *get_class_vtable(struct ReflectionClass *cls) {
  * memory exhaustion at the cost of the old slow path.
  */
 static void build_registry_maps(void) {
-    if (reflect_all_classes == NULL) return;
 
     size_t class_count = 0;
     while (reflect_all_classes[class_count] != NULL) class_count++;
@@ -167,7 +167,7 @@ static void build_registry_maps(void) {
 }
 
 static inline void ensure_registry_maps(void) {
-    pthread_once(&registry_maps_once, build_registry_maps);
+    jn_once(&registry_maps_once, build_registry_maps);
 }
 
 /*
@@ -180,7 +180,7 @@ static inline void ensure_registry_maps(void) {
  * the process.
  */
 static struct ReflectionClass *find_class_object_in_registry(void *ptr) {
-    if (ptr == NULL || reflect_all_classes == NULL) return NULL;
+    if (ptr == NULL) return NULL;
 
     ensure_registry_maps();
 

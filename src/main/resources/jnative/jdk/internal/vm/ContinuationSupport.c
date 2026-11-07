@@ -42,3 +42,15 @@ int32_t Java_jdk_internal_vm_Continuation_doYield(void* jni_env, void* jclass) {
     (void)jclass;
     return __jnative_fn_jdk_internal_vm_Continuation_doYield___I(0);
 }
+void __jnative_fn_jdk_internal_vm_Continuation_pin___V(void) {
+}
+
+void __jnative_fn_jdk_internal_vm_Continuation_unpin___V(void) {
+}
+
+void __jnative_fn_jdk_internal_vm_Continuation_enterSpecial__Ljdk_internal_vm_Continuation_ZZ_V(void* cont, int32_t isContinue, int32_t isVirtualThread) {
+    (void)cont;
+    (void)isContinue;
+    (void)isVirtualThread;
+    __jnative_fn_jdk_internal_vm_Continuation_doYield___I(2);
+}

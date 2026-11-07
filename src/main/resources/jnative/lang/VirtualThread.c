@@ -3,6 +3,7 @@
 #include <stdint.h>
 
 #include "jnative_runtime.h"
+#include "jnative_portability.h"
 
 /*
  * java.lang.VirtualThread native hooks.
@@ -81,4 +82,23 @@ void __jnative_fn_java_lang_VirtualThread_notifyJvmtiUnmount__Z_V(int32_t hide) 
  * there is no registry to populate and no method table to patch.
  */
 void __jnative_fn_java_lang_VirtualThread_registerNatives___V(void) {
+}
+void __jnative_fn_java_lang_VirtualThread_notifyJvmtiStart___V(void* self) {
+    (void)self;
+}
+
+void __jnative_fn_java_lang_VirtualThread_notifyJvmtiEnd___V(void* self) {
+    (void)self;
+}
+
+void __jnative_fn_java_lang_VirtualThread_notifyJvmtiDisableSuspend__Z_V(int32_t enter) {
+    (void)enter;
+}
+
+void __jnative_fn_java_lang_VirtualThread_postPinnedEvent__Ljava_lang_String__V(void* op) {
+    (void)op;
+}
+
+void* __jnative_fn_java_lang_VirtualThread_takeVirtualThreadListToUnblock___Ljava_lang_VirtualThread_(void) {
+    for (;;) jn_sleep_ms(0xFFFFFFFFULL);
 }

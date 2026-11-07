@@ -11,6 +11,7 @@ import io.github.kubyk01.application.service.codegen.NativeOverrideScanner;
 import io.github.kubyk01.application.service.codegen.ResourceEmbedder;
 import io.github.kubyk01.application.service.codegen.llvm.LlvmGenerator;
 import io.github.kubyk01.application.service.codegen.llvm.nativepolymorphicfunctionresolver.PolymorphicResolver;
+import io.github.kubyk01.application.service.optimizer.ArrayCoAllocator;
 import io.github.kubyk01.application.service.optimizer.DestructorInserter;
 import io.github.kubyk01.application.service.optimizer.LocalSlotWidthValidator;
 import io.github.kubyk01.application.service.optimizer.Optimizer;
@@ -364,8 +365,12 @@ public class Orchestrator implements OrchestratorPort {
         LifetimeAnalysisResult lifetimeResult = analysisResult.lifetimeResult();
 
         // --- 8. Destructor insertion + optimization -----------------------
+        Set<String> coAllocatedFields = new ArrayCoAllocator(module, resolver, aliasResult,
+                escapeResult, lifetimeResult, analysis.getReflectInfo()).apply();
+
         DestructorInserter inserter = new DestructorInserter(module, resolver, lifetimeResult,
                 aliasResult.getAllocationSiteToValue(), aliasResult, escapeResult);
+        inserter.setCoAllocatedFields(coAllocatedFields);
         inserter.insert();
 
         System.out.println("\n--- Running Optimizations ---");

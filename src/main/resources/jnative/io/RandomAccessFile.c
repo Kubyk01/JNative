@@ -143,7 +143,7 @@ int32_t __jnative_fn_java_io_RandomAccessFile_read0___I(void* this_file) {
     if (fd < 0) raf_throw_io("file closed");
 
     uint8_t byte;
-    ssize_t n;
+    long n;
     do {
         n = read(fd, &byte, 1);
     } while (n < 0 && errno == EINTR);
@@ -167,7 +167,7 @@ int32_t __jnative_fn_java_io_RandomAccessFile_readBytes0___BII_I(
     if (fd < 0) raf_throw_io("file closed");
 
     uint8_t* dst = (uint8_t*)b + JAVA_ARR_HDR + off;
-    ssize_t n;
+    long n;
     do {
         n = read(fd, dst, (size_t)len);
     } while (n < 0 && errno == EINTR);
@@ -196,7 +196,7 @@ void __jnative_fn_java_io_RandomAccessFile_writeBytes0___BII_V(
     int64_t written_total = 0;
 
     while (remaining > 0) {
-        ssize_t n = write(fd, src, (size_t)remaining);
+        long n = write(fd, src, (size_t)remaining);
         if (n < 0) {
             if (errno == EINTR) continue;
             raf_throw_io("write failed");
@@ -221,7 +221,7 @@ void __jnative_fn_java_io_RandomAccessFile_write0__I_V(
     if (fd < 0) raf_throw_io("file closed");
 
     uint8_t byte = (uint8_t)b;
-    ssize_t n;
+    long n;
     do {
         n = write(fd, &byte, 1);
     } while (n < 0 && errno == EINTR);

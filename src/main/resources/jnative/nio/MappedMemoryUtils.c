@@ -264,3 +264,5 @@ void __jnative_fn_java_nio_MappedMemoryUtils_load0__JJ_V(
     (void)madvise((void*)(intptr_t)address, (size_t)length, MADV_WILLNEED);
 #endif
 }
+void __jnative_fn_java_nio_MappedMemoryUtils_registerNatives___V(void) {
+}
