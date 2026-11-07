@@ -96,3 +96,7 @@ void __jnative_fn_sun_nio_ch_NativeThread_signal__J_V(int64_t native_thread) {
 void __jnative_fn_sun_nio_ch_NativeThread_signal0__J_V(int64_t native_thread) {
     __jnative_fn_sun_nio_ch_NativeThread_signal__J_V(native_thread);
 }
+
+int32_t __jnative_fn_sun_nio_ch_NativeThread_supportPendingSignals0___Z(void) {
+    return 0;
+}

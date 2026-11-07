@@ -1738,4 +1738,35 @@ void* __jnative_fn_sun_nio_fs_UnixNativeDispatcher_getgrgid__I__B(int32_t gid) {
     return __jnative_fn_sun_nio_fs_UnixNativeDispatcher_getgrgid0__I__B(gid);
 }
 
+int32_t __jnative_fn_sun_nio_fs_UnixNativeDispatcher_access0__JI_I(
+        int64_t pathAddress, int32_t amode)
+{
+    return access((const char*)(intptr_t)pathAddress, amode) < 0 ? errno : 0;
+}
+
+void __jnative_fn_sun_nio_fs_UnixNativeDispatcher_fchmodat0__IJII_V(
+        int32_t dfd, int64_t pathAddress, int32_t mode, int32_t flag)
+{
+    if (fchmodat(dfd, (const char*)(intptr_t)pathAddress, (mode_t)mode, flag) < 0)
+        throw_unix_exception_from_errno();
+}
+
+int32_t __jnative_fn_sun_nio_fs_UnixNativeDispatcher_fchmodatNoFollowSupported0___Z(void) {
+#if defined(__GLIBC__) && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 32))
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+void __jnative_fn_sun_nio_fs_UnixNativeDispatcher_utimensat0__IJJJI_V(
+        int32_t dfd, int64_t pathAddress, int64_t atime, int64_t mtime, int32_t flags)
+{
+    struct timespec ts[2];
+    ts[0].tv_sec = (time_t)(atime / 1000000000LL); ts[0].tv_nsec = (long)(atime % 1000000000LL);
+    ts[1].tv_sec = (time_t)(mtime / 1000000000LL); ts[1].tv_nsec = (long)(mtime % 1000000000LL);
+    if (utimensat(dfd, (const char*)(intptr_t)pathAddress, ts, flags) < 0)
+        throw_unix_exception_from_errno();
+}
+
 #endif /* _WIN32 */

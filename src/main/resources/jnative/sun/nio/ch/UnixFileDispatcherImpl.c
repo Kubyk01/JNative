@@ -13,6 +13,8 @@
 #  include <sys/types.h>
 #  include <sys/stat.h>
 #  include <sys/mman.h>
+#  include <sys/ioctl.h>
+#  include <limits.h>
 #  include <errno.h>
 #  include <string.h>
 #  ifndef MAP_SYNC
@@ -322,5 +324,38 @@ void __jnative_fn_sun_nio_ch_UnixFileDispatcherImpl_release0__Ljava_io_FileDescr
     if (munmap((void*)(uintptr_t)address, (size_t)length) < 0) {
         ufdi_throw_io("munmap (release) failed");
     }
+#endif
+}
+
+int32_t __jnative_fn_sun_nio_ch_UnixFileDispatcherImpl_isOther0__Ljava_io_FileDescriptor__Z(void* fdo)
+{
+#if defined(_WIN32)
+    (void)fdo;
+    return 0;
+#else
+    struct stat st;
+    if (fstat(ufdi_fdval(fdo), &st) < 0) ufdi_throw_io("isOther failed");
+    return (S_ISREG(st.st_mode) || S_ISDIR(st.st_mode) || S_ISLNK(st.st_mode)) ? 0 : 1;
+#endif
+}
+
+int32_t __jnative_fn_sun_nio_ch_UnixFileDispatcherImpl_available0__Ljava_io_FileDescriptor__I(void* fdo)
+{
+#if defined(_WIN32)
+    (void)fdo;
+    return 0;
+#else
+    int fd = ufdi_fdval(fdo);
+    struct stat st;
+    if (fstat(fd, &st) < 0) ufdi_throw_io("available failed");
+    if (S_ISCHR(st.st_mode) || S_ISFIFO(st.st_mode) || S_ISSOCK(st.st_mode)) {
+        int n;
+        if (ioctl(fd, FIONREAD, &n) >= 0) return n;
+    }
+    off_t cur = lseek(fd, 0, SEEK_CUR);
+    if (cur < 0) ufdi_throw_io("available failed");
+    off_t left = st.st_size - cur;
+    if (left < 0) return 0;
+    return left > INT_MAX ? INT_MAX : (int32_t)left;
 #endif
 }
