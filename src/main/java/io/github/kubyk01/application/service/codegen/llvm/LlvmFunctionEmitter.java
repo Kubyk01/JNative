@@ -625,7 +625,7 @@ public class LlvmFunctionEmitter {
 
             if (isReturn || (hasOutsideNormalSucc && !hasInsideNormalSucc)) {
                 sb.repeat("  call void @__jnative_pop_catch()\n", ranges.size());
-            } else if (hasOutsideNormalSucc) {
+            } else if (hasOutsideNormalSucc && hasInsideNormalSucc) {
                 Map<BasicBlock, BasicBlock> redirects = blockExitRedirects.get(block);
                 if (redirects != null && !redirects.isEmpty()) {
                     targetRedirects = new HashMap<>();

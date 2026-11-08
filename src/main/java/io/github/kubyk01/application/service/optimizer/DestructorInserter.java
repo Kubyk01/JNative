@@ -19,8 +19,10 @@ import lombok.RequiredArgsConstructor;
 import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
 import org.objectweb.asm.Opcodes;
+import reactor.core.scheduler.Scheduler;
 
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 
 @Slf4j
 @RequiredArgsConstructor
@@ -34,7 +36,10 @@ public class DestructorInserter {
     private final AliasAnalysisResult aliasResult;
     private final EscapeAnalysisResult escapeResult;
 
-    private final Map<Function, DominatorTree> domTrees = new HashMap<>();
+    private final Map<Function, DominatorTree> domTrees = new ConcurrentHashMap<>();
+
+    @Setter
+    private Scheduler scheduler;
 
     /**
      * Types with at least one {@code NEW}, {@code NEW_ARRAY} or
@@ -71,10 +76,12 @@ public class DestructorInserter {
         // collectAllocatedTypes), so findDestructor returns null for them
         // and no destructor is emitted.
         // ------------------------------------------------------------------
+        // Destructors are independent of each other; creation is race-safe
+        // through registerDestructor, so the types are processed in parallel.
         int generated = 0;
-        for (Type type : allocatedTypes) {
-            Function dtor = findDestructor(type);
-            if (dtor != null) generated++;
+        for (Boolean made : LlvmUtil.parallelMapOrdered(new ArrayList<>(allocatedTypes), scheduler,
+                type -> findDestructor(type) != null)) {
+            if (made) generated++;
         }
 
         // ------------------------------------------------------------------
@@ -124,6 +131,10 @@ public class DestructorInserter {
         // rationale and for the concrete TestHeap crash that motivated
         // the guard.
         // ------------------------------------------------------------------
+        // Every insertion edits only the block of its destruction point, so
+        // the work is grouped by function and functions run in parallel.
+        // Within a function the points keep their original order.
+        Map<Function, List<PendingDestructor>> byFunction = new LinkedHashMap<>();
         for (Map.Entry<AllocationSite, Set<DestructionPoint>> entry
             : lifetimeResult.getDestructionPoints().entrySet()) {
 
@@ -164,13 +175,33 @@ public class DestructorInserter {
                 continue;
             }
             for (DestructionPoint dp : entry.getValue()) {
-                if (!isLiveReference(dp.getObjectRef())) continue;
-                if (!objectRefAvailableAt(dp.getObjectRef(), dp.getBlock())) continue;
-                insertDestructorCall(site, dp, dtor);
+                byFunction.computeIfAbsent(dp.getBlock().getFunction(), k -> new ArrayList<>())
+                    .add(new PendingDestructor(site, dp, dtor));
             }
         }
+        LlvmUtil.parallelMapOrdered(new ArrayList<>(byFunction.values()), scheduler, pending -> {
+            for (PendingDestructor p : pending) {
+                DestructionPoint dp = p.point();
+                if (!isLiveReference(dp.getObjectRef())) continue;
+                if (!objectRefAvailableAt(dp.getObjectRef(), dp.getBlock())) continue;
+                insertDestructorCall(p.site(), dp, p.dtor());
+            }
+            return null;
+        });
         log.info("Destructor insertion: {} destructor(s) generated",
             generated);
+    }
+
+    private record PendingDestructor(AllocationSite site, DestructionPoint point, Function dtor) {}
+
+    /**
+     * Adds a freshly created destructor to the module. When another thread
+     * registered the same name first, that function is returned and the
+     * caller must abandon its own copy.
+     */
+    private Function registerDestructor(Function func) {
+        module.addFunction(func);
+        return module.getFunction(func.getName());
     }
 
     // =====================================================================
@@ -1499,7 +1530,8 @@ private void emitDestructionGuard(BasicBlock entry,
 
         Function func = new Function(funcName, Type.VOID);
         func.setOwnerClass(className);
-        module.addFunction(func);
+        Function registered = registerDestructor(func);
+        if (registered != func) return registered;
 
         Parameter thisParam = new Parameter(Type.reference(className), 0);
         func.addParameter(thisParam);
@@ -1683,7 +1715,8 @@ private void emitDestructionGuard(BasicBlock entry,
         }
 
         Function func = new Function(funcName, Type.VOID);
-        module.addFunction(func);
+        Function registered = registerDestructor(func);
+        if (registered != func) return registered;
 
         Parameter arrParam = new Parameter(arrayType, 0);
         func.addParameter(arrParam);
@@ -1882,7 +1915,8 @@ private void emitDestructionGuard(BasicBlock entry,
         if (existing != null) return existing;
 
         Function func = new Function(funcName, Type.VOID);
-        module.addFunction(func);
+        Function registered = registerDestructor(func);
+        if (registered != func) return registered;
 
         Parameter arrParam = new Parameter(arrayType, 0);
         func.addParameter(arrParam);

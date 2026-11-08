@@ -236,7 +236,7 @@ public class SSATransformer {
         // liveness. Both use the same typeBucket(...) predicate, see the
         // invariant in the javadoc of collectDefBlocks.
         // ------------------------------------------------------------------
-        Map<BasicBlock, Set<SlotKey>> liveIn = computeLiveInForPhiInsertion(function);
+        Map<BasicBlock, long[]> liveIn = computeLiveInForPhiInsertion(function);
 
         for (Map.Entry<SlotKey, Set<BasicBlock>> entry : defs.entrySet()) {
             SlotKey key = entry.getKey();
@@ -252,8 +252,9 @@ public class SSATransformer {
                 for (BasicBlock frontier : domTree.getDominanceFrontier(block)) {
                     if (hasPhi.contains(frontier)) continue;
 
-                    Set<SlotKey> frontierLiveIn = liveIn.get(frontier);
-                    if (frontierLiveIn == null || !frontierLiveIn.contains(key)) {
+                    long[] frontierLiveIn = liveIn.get(frontier);
+                    if (frontierLiveIn == null
+                        || !isLiveIn(frontierLiveIn, key.index, key.typeClass)) {
                         continue;
                     }
 
@@ -311,40 +312,48 @@ public class SSATransformer {
      * limitation is a separate class of defects, unrelated to dead
      * loop-carried PHIs; here we merely do not stand in its way.</p>
      */
-    private Map<BasicBlock, Set<SlotKey>> computeLiveInForPhiInsertion(Function function) {
-        Map<BasicBlock, Set<SlotKey>> use = new HashMap<>();
-        Map<BasicBlock, Set<SlotKey>> def = new HashMap<>();
+    private Map<BasicBlock, long[]> computeLiveInForPhiInsertion(Function function) {
+        List<BasicBlock> blocks = function.getBlocks();
+        int n = blocks.size();
 
-        for (BasicBlock block : function.getBlocks()) {
-            Set<SlotKey> blockUse = new HashSet<>();
-            Set<SlotKey> blockDef = new HashSet<>();
-
+        int maxSlot = 0;
+        for (BasicBlock block : blocks) {
             for (Instruction inst : block.getInstructions()) {
                 Opcode op = inst.getOpcode();
-                if (op == Opcode.LOAD) {
-                    int idx = inst.getLocalIndex();
-                    if (idx < 0) continue;
-                    if (unsafeLocals.contains(idx)) continue;
-                    Type lt = (inst.getResult() != null)
-                        ? inst.getResult().getType()
-                        : Type.UNKNOWN;
-                    SlotKey key = new SlotKey(idx, typeBucket(lt));
-                    if (!blockDef.contains(key)) {
-                        blockUse.add(key);
-                    }
-                } else if (op == Opcode.STORE) {
-                    int idx = inst.getLocalIndex();
-                    if (idx < 0) continue;
-                    if (unsafeLocals.contains(idx)) continue;
-                    Type dt = (inst.getResult() != null)
-                        ? inst.getResult().getType()
-                        : Type.UNKNOWN;
-                    SlotKey key = new SlotKey(idx, typeBucket(dt));
-                    blockDef.add(key);
+                if ((op == Opcode.LOAD || op == Opcode.STORE) && inst.getLocalIndex() > maxSlot) {
+                    maxSlot = inst.getLocalIndex();
                 }
             }
-            use.put(block, blockUse);
-            def.put(block, blockDef);
+        }
+        for (Parameter p : function.getParameters()) {
+            if (p.getIndex() > maxSlot) maxSlot = p.getIndex();
+        }
+        // One bit per (slot, bucket): bit = slot * 8 + bucket.
+        final int words = (((maxSlot + 1) << 3) + 63) >>> 6;
+
+        Map<BasicBlock, Integer> index = new HashMap<>(n * 2);
+        for (int i = 0; i < n; i++) index.put(blocks.get(i), i);
+
+        long[][] use = new long[n][words];
+        long[][] def = new long[n][words];
+        for (int i = 0; i < n; i++) {
+            long[] u = use[i];
+            long[] d = def[i];
+            for (Instruction inst : blocks.get(i).getInstructions()) {
+                Opcode op = inst.getOpcode();
+                if (op != Opcode.LOAD && op != Opcode.STORE) continue;
+                int idx = inst.getLocalIndex();
+                if (idx < 0) continue;
+                if (unsafeLocals.contains(idx)) continue;
+                Type t = (inst.getResult() != null) ? inst.getResult().getType() : Type.UNKNOWN;
+                int bit = (idx << 3) | typeBucket(t);
+                long mask = 1L << (bit & 63);
+                if (op == Opcode.LOAD) {
+                    if ((d[bit >>> 6] & mask) == 0) u[bit >>> 6] |= mask;
+                } else {
+                    d[bit >>> 6] |= mask;
+                }
+            }
         }
 
         // Parameters are defined in the entry. This is part of the JVM
@@ -352,53 +361,64 @@ public class SSATransformer {
         // entry, and it does not need to be "carried over" from the
         // predecessors (the entry has none).
         BasicBlock entry = function.getEntryBlock();
-        if (entry != null) {
-            Set<SlotKey> entryDef = def.computeIfAbsent(entry, k -> new HashSet<>());
+        Integer entryIdx = entry != null ? index.get(entry) : null;
+        if (entryIdx != null) {
+            long[] d = def[entryIdx];
             for (Parameter p : function.getParameters()) {
-                if (unsafeLocals.contains(p.getIndex())) continue;
-                entryDef.add(new SlotKey(p.getIndex(), typeBucket(p.getType())));
+                // A negative slot is never loaded, so it cannot affect liveness.
+                if (p.getIndex() < 0 || unsafeLocals.contains(p.getIndex())) continue;
+                int bit = (p.getIndex() << 3) | typeBucket(p.getType());
+                d[bit >>> 6] |= 1L << (bit & 63);
             }
         }
 
-        // Backward dataflow until a fixed point is reached.
-        Map<BasicBlock, Set<SlotKey>> liveIn = new HashMap<>();
-        Map<BasicBlock, Set<SlotKey>> liveOut = new HashMap<>();
-        for (BasicBlock block : function.getBlocks()) {
-            liveIn.put(block, new HashSet<>());
-            liveOut.put(block, new HashSet<>());
+        int[][] succs = new int[n][];
+        for (int i = 0; i < n; i++) {
+            List<BasicBlock> ss = blocks.get(i).getSuccessors();
+            int[] si = new int[ss.size()];
+            int k = 0;
+            for (BasicBlock succ : ss) {
+                Integer j = index.get(succ);
+                if (j != null) si[k++] = j;
+            }
+            succs[i] = k == si.length ? si : Arrays.copyOf(si, k);
         }
 
+        // Backward dataflow until a fixed point is reached. Live sets only
+        // grow, so OR-ing into the previous value equals recomputing it.
+        long[][] liveIn = new long[n][words];
+        long[][] liveOut = new long[n][words];
         boolean changed = true;
         while (changed) {
             changed = false;
-            for (BasicBlock block : function.getBlocks()) {
-                Set<SlotKey> newLiveOut = new HashSet<>();
-                for (BasicBlock succ : block.getSuccessors()) {
-                    Set<SlotKey> succLiveIn = liveIn.get(succ);
-                    if (succLiveIn != null) {
-                        newLiveOut.addAll(succLiveIn);
+            for (int i = n - 1; i >= 0; i--) {
+                long[] out = liveOut[i];
+                for (int j : succs[i]) {
+                    long[] sIn = liveIn[j];
+                    for (int w = 0; w < words; w++) out[w] |= sIn[w];
+                }
+                long[] in = liveIn[i];
+                long[] u = use[i];
+                long[] d = def[i];
+                for (int w = 0; w < words; w++) {
+                    long next = in[w] | u[w] | (out[w] & ~d[w]);
+                    if (next != in[w]) {
+                        in[w] = next;
+                        changed = true;
                     }
-                }
-                if (!newLiveOut.equals(liveOut.get(block))) {
-                    liveOut.put(block, newLiveOut);
-                    changed = true;
-                }
-
-                Set<SlotKey> newLiveIn = new HashSet<>(
-                    use.getOrDefault(block, Collections.emptySet()));
-                Set<SlotKey> liveOutMinusDef = new HashSet<>(newLiveOut);
-                liveOutMinusDef.removeAll(
-                    def.getOrDefault(block, Collections.emptySet()));
-                newLiveIn.addAll(liveOutMinusDef);
-
-                if (!newLiveIn.equals(liveIn.get(block))) {
-                    liveIn.put(block, newLiveIn);
-                    changed = true;
                 }
             }
         }
 
-        return liveIn;
+        Map<BasicBlock, long[]> result = new HashMap<>(n * 2);
+        for (int i = 0; i < n; i++) result.put(blocks.get(i), liveIn[i]);
+        return result;
+    }
+
+    private static boolean isLiveIn(long[] liveIn, int slot, int bucket) {
+        int bit = (slot << 3) | bucket;
+        int w = bit >>> 6;
+        return w < liveIn.length && (liveIn[w] & (1L << (bit & 63))) != 0;
     }
 
     /**

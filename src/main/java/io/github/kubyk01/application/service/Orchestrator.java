@@ -372,6 +372,7 @@ public class Orchestrator implements OrchestratorPort {
         DestructorInserter inserter = new DestructorInserter(module, resolver, lifetimeResult,
                 aliasResult.getAllocationSiteToValue(), aliasResult, escapeResult);
         inserter.setCoAllocatedFields(coAllocatedFields);
+        inserter.setScheduler(scheduler);
         inserter.insert();
 
         System.out.println("\n--- Running Optimizations ---");
@@ -381,12 +382,13 @@ public class Orchestrator implements OrchestratorPort {
         optimizer.setEnableDestructorSimplification(true);
         optimizer.setEnableDestructorInlining(true);
         optimizer.setEnableDeadDestructorElimination(true);
+        optimizer.setScheduler(scheduler);
         optimizer.optimize();
 
         // --- 9. Post-analysis IR passes -----------------------------------
         analysis.registerClassLiterals(module);
-        OutOfSsaPass.transform(module);
-        LocalSlotWidthValidator.validate(module);
+        OutOfSsaPass.transform(module, scheduler);
+        LocalSlotWidthValidator.validate(module, scheduler);
 
         // --- 10. LLVM IR generation ---------------------------------------
         System.out.println("\n--- Generating LLVM IR ---");

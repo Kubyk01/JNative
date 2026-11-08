@@ -726,13 +726,14 @@ public class LlvmGenerator implements LlvmGeneratorPort {
                                 Map<String, GlobalDecl> knownGlobals,
                                 Module module) {
         Set<String> used = collectUsedSymbols(bodyContent);
-        String adapters = buildJniAliasAdapters(used, collectLocalDefinitions(bodyContent), module);
+        Set<String> definedHere = collectLocalDefinitions(bodyContent);
+        String adapters = buildJniAliasAdapters(used, definedHere, module);
         if (!adapters.isEmpty()) {
             bodyContent = bodyContent + "\n" + adapters;
             used = collectUsedSymbols(bodyContent);
+            definedHere = collectLocalDefinitions(bodyContent);
         }
 
-        Set<String> definedHere = collectLocalDefinitions(bodyContent);
         StringBuilder sb = new StringBuilder(adapters);
         List<String> sorted = new ArrayList<>(used);
         Collections.sort(sorted);

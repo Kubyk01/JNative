@@ -288,6 +288,7 @@ public class Analyzer {
         Map<String, Set<String>> fieldWriteCache = new ConcurrentHashMap<>();
         Map<String, Set<String>> fieldReadCache  = new ConcurrentHashMap<>();
 
+        prewarmClinitCaches(functionsSnapshot, triggerCache, fieldWriteCache, fieldReadCache);
         ClinitWalkContext ctx = new ClinitWalkContext(module, callGraph, clinitNames,
             triggerCache, fieldWriteCache, fieldReadCache);
 
@@ -406,20 +407,36 @@ public class Analyzer {
     private record ClinitWalk(Set<String> delta, Set<String> nested,
                               Set<String> writes, Set<String> reads) {}
 
-    /** Scans one reached function into the walk's result sets. */
+    /** Scans every function's triggers and static-field reads/writes once, in parallel. */
+    private void prewarmClinitCaches(List<Function> functions,
+                                     Map<String, Set<String>> triggerCache,
+                                     Map<String, Set<String>> fieldWriteCache,
+                                     Map<String, Set<String>> fieldReadCache) {
+        LlvmUtil.parallelMapOrdered(new ArrayList<>(functions), scheduler, f -> {
+            String name = f.getName();
+            if (f.getEntryBlock() == null) {
+                triggerCache.put(name, Set.of());
+                fieldWriteCache.put(name, Set.of());
+                fieldReadCache.put(name, Set.of());
+            } else {
+                triggerCache.put(name, scanTriggers(f));
+                fieldWriteCache.put(name, scanFieldWrites(f));
+                fieldReadCache.put(name, scanFieldReads(f));
+            }
+            return null;
+        });
+    }
+
+    /** Adds one reached function's cached facts to the walk's result sets. */
     private static void visitClinitNode(String cur, String className, ClinitWalkContext ctx,
                                         Set<String> delta, Set<String> writes, Set<String> reads) {
-        Function f = ctx.module().getFunction(cur);
-        if (f == null || f.getEntryBlock() == null) return;
-        Module module = ctx.module();
-        for (String t : ctx.triggerCache().computeIfAbsent(cur,
-                k -> scanTriggers(module.getFunction(k)))) {
+        Set<String> triggers = ctx.triggerCache().get(cur);
+        if (triggers == null) return;
+        for (String t : triggers) {
             if (!t.equals(className)) delta.add(t);
         }
-        writes.addAll(ctx.fieldWriteCache().computeIfAbsent(cur,
-            k -> scanFieldWrites(module.getFunction(k))));
-        reads.addAll(ctx.fieldReadCache().computeIfAbsent(cur,
-            k -> scanFieldReads(module.getFunction(k))));
+        writes.addAll(ctx.fieldWriteCache().get(cur));
+        reads.addAll(ctx.fieldReadCache().get(cur));
     }
 
     /** Depth-first walk on the calling thread; null when it visits more than CLINIT_WALK_CAP functions. */
