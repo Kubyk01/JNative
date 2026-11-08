@@ -334,11 +334,14 @@ public class SSATransformer {
         Map<BasicBlock, Integer> index = new HashMap<>(n * 2);
         for (int i = 0; i < n; i++) index.put(blocks.get(i), i);
 
-        long[][] use = new long[n][words];
-        long[][] def = new long[n][words];
+        // liveIn starts as the upward-exposed uses (live-in always contains
+        // them), so no separate use[] matrix is kept. def rows are allocated
+        // only for blocks that define something.
+        long[][] liveIn = new long[n][words];
+        long[][] def = new long[n][];
         for (int i = 0; i < n; i++) {
-            long[] u = use[i];
-            long[] d = def[i];
+            long[] u = liveIn[i];
+            long[] d = null;
             for (Instruction inst : blocks.get(i).getInstructions()) {
                 Opcode op = inst.getOpcode();
                 if (op != Opcode.LOAD && op != Opcode.STORE) continue;
@@ -349,11 +352,13 @@ public class SSATransformer {
                 int bit = (idx << 3) | typeBucket(t);
                 long mask = 1L << (bit & 63);
                 if (op == Opcode.LOAD) {
-                    if ((d[bit >>> 6] & mask) == 0) u[bit >>> 6] |= mask;
+                    if (d == null || (d[bit >>> 6] & mask) == 0) u[bit >>> 6] |= mask;
                 } else {
+                    if (d == null) d = new long[words];
                     d[bit >>> 6] |= mask;
                 }
             }
+            def[i] = d;
         }
 
         // Parameters are defined in the entry. This is part of the JVM
@@ -363,6 +368,7 @@ public class SSATransformer {
         BasicBlock entry = function.getEntryBlock();
         Integer entryIdx = entry != null ? index.get(entry) : null;
         if (entryIdx != null) {
+            if (def[entryIdx] == null) def[entryIdx] = new long[words];
             long[] d = def[entryIdx];
             for (Parameter p : function.getParameters()) {
                 // A negative slot is never loaded, so it cannot affect liveness.
@@ -371,6 +377,8 @@ public class SSATransformer {
                 d[bit >>> 6] |= 1L << (bit & 63);
             }
         }
+        long[] noDefs = new long[words];
+        for (int i = 0; i < n; i++) if (def[i] == null) def[i] = noDefs;
 
         int[][] succs = new int[n][];
         for (int i = 0; i < n; i++) {
@@ -386,22 +394,21 @@ public class SSATransformer {
 
         // Backward dataflow until a fixed point is reached. Live sets only
         // grow, so OR-ing into the previous value equals recomputing it.
-        long[][] liveIn = new long[n][words];
-        long[][] liveOut = new long[n][words];
+        // liveOut is not needed afterwards, so it lives in one scratch row.
+        long[] out = new long[words];
         boolean changed = true;
         while (changed) {
             changed = false;
             for (int i = n - 1; i >= 0; i--) {
-                long[] out = liveOut[i];
+                Arrays.fill(out, 0L);
                 for (int j : succs[i]) {
                     long[] sIn = liveIn[j];
                     for (int w = 0; w < words; w++) out[w] |= sIn[w];
                 }
                 long[] in = liveIn[i];
-                long[] u = use[i];
                 long[] d = def[i];
                 for (int w = 0; w < words; w++) {
-                    long next = in[w] | u[w] | (out[w] & ~d[w]);
+                    long next = in[w] | (out[w] & ~d[w]);
                     if (next != in[w]) {
                         in[w] = next;
                         changed = true;

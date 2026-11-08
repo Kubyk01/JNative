@@ -76,10 +76,21 @@ public class PointsToGraph {
         if (chunk == null) return null;
         FieldCell[] cells = chunk.get(siteId & CHUNK_MASK);
         if (cells == null) return null;
-        for (FieldCell c : cells) {
-            if (c.fieldId() == fieldId) return c;
+        int i = indexOf(cells, fieldId);
+        return i >= 0 ? cells[i] : null;
+    }
+
+    /** Binary search: cells are kept sorted by fieldId (wide sites such as statics have thousands). */
+    private static int indexOf(FieldCell[] cells, int fieldId) {
+        int lo = 0, hi = cells.length - 1;
+        while (lo <= hi) {
+            int mid = (lo + hi) >>> 1;
+            int id = cells[mid].fieldId();
+            if (id < fieldId) lo = mid + 1;
+            else if (id > fieldId) hi = mid - 1;
+            else return mid;
         }
-        return null;
+        return -(lo + 1);
     }
 
     public FieldCell fieldCell(int siteId, int fieldId, String field) {
@@ -95,13 +106,14 @@ public class PointsToGraph {
         while (true) {
             FieldCell[] cells = chunk.get(slot);
             if (cells == null) cells = NO_CELLS;
-            for (FieldCell c : cells) {
-                if (c.fieldId() == fieldId) return c;
-            }
+            int at = indexOf(cells, fieldId);
+            if (at >= 0) return cells[at];
+            at = -at - 1;
             if (created == null) created = new FieldCell(fieldId, field);
             FieldCell[] grown = new FieldCell[cells.length + 1];
-            System.arraycopy(cells, 0, grown, 0, cells.length);
-            grown[cells.length] = created;
+            System.arraycopy(cells, 0, grown, 0, at);
+            grown[at] = created;
+            System.arraycopy(cells, at, grown, at + 1, cells.length - at);
             if (chunk.compareAndSet(slot, cells == NO_CELLS ? null : cells, grown)) return created;
         }
     }
@@ -124,6 +136,14 @@ public class PointsToGraph {
 
     public boolean fieldContainsUnknown(AllocationSite site, String field) {
         return getFieldPointsTo(site, field).containsUnknown();
+    }
+
+    /** The site's field cells sorted by fieldId, without copying; callers must not modify the array. */
+    public FieldCell[] fieldCells(int siteId) {
+        AtomicReferenceArray<FieldCell[]> chunk = siteCells.get(siteId >>> CHUNK_BITS);
+        if (chunk == null) return NO_CELLS;
+        FieldCell[] cells = chunk.get(siteId & CHUNK_MASK);
+        return cells == null ? NO_CELLS : cells;
     }
 
     public Map<String, PointsToSet> getFieldPointsToMap(AllocationSite site) {

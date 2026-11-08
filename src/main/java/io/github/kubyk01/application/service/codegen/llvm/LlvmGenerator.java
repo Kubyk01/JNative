@@ -196,6 +196,8 @@ public class LlvmGenerator implements LlvmGeneratorPort {
         preludeDefs.putAll(parseSingleLineDefinitions(extraStructsText));
         preludeDefs.putAll(parseSingleLineDefinitions(structDefs));
         preludeDefs.putAll(parseSingleLineDefinitions(LlvmRuntime.getDeclarations()));
+        RegionSet preludeKeys = new RegionSet(preludeDefs.size());
+        for (String k : preludeDefs.keySet()) preludeKeys.add(k);
 
         // ---- 1. Emit EVERY function body, grouped by owner class. The
         //         bodies are accumulated in memory rather than streamed,
@@ -227,6 +229,7 @@ public class LlvmGenerator implements LlvmGeneratorPort {
                 moduleBodies.append(body);
             }
         }
+        bodies = null; // the text now lives in classBodies/moduleBodies only
 
         // ---- 2. Deferred strings are now fully known. Collect them. ----
         String deferred = globalEmitter.generateDeferredStringConstants();
@@ -302,14 +305,9 @@ public class LlvmGenerator implements LlvmGeneratorPort {
             module);
 
         String modulePrelude = buildFilteredPrelude(
-            moduleTail + "\n" + moduleExterns, preludeDefs);
+            moduleTail, moduleExterns, preludeDefs, preludeKeys);
 
-        String moduleSb = modulePrelude
-            + moduleExterns
-            + moduleTail;
-
-        Path modulePath = outputDir.resolve("_module.ll");
-        Files.writeString(modulePath, moduleSb, StandardCharsets.UTF_8);
+        writeLl(outputDir.resolve("_module.ll"), modulePrelude, moduleExterns, moduleTail);
 
         // ---- 6. Write one .ll file per class. ----
         // Each file is independent: it reads only the immutable emission
@@ -317,16 +315,19 @@ public class LlvmGenerator implements LlvmGeneratorPort {
         // keeps the single-threaded tail of the compiler short.
         LlvmUtil.parallelMapOrdered(new ArrayList<>(classBodies.entrySet()), scheduler, e -> {
             String className = e.getKey();
-            String body = e.getValue().toString();
+            StringBuilder bodyBuf = e.getValue();
+            String body = bodyBuf.toString();
+            bodyBuf.setLength(0); // drop the second copy of this class's text now
+            bodyBuf.trimToSize();
 
             String externs = buildExterns(body, knownGlobals, module);
 
-            String prelude = buildFilteredPrelude(body + "\n" + externs, preludeDefs);
+            String prelude = buildFilteredPrelude(body, externs, preludeDefs, preludeKeys);
 
             try {
                 Path out = outputDir.resolve(className + ".ll");
                 if (out.getParent() != null) Files.createDirectories(out.getParent());
-                Files.writeString(out, prelude + externs + body, StandardCharsets.UTF_8);
+                writeLl(out, prelude, externs, body);
             } catch (IOException ex) {
                 throw new java.io.UncheckedIOException(ex);
             }
@@ -356,19 +357,23 @@ public class LlvmGenerator implements LlvmGeneratorPort {
      * </ol>
      */
     private String buildFilteredPrelude(String bodyContent,
-                                        Map<String, String> allDefs) {
+                                        String externs,
+                                        Map<String, String> allDefs,
+                                        RegionSet defKeys) {
 
-        // Transitive closure of the set of used names.
+        // Transitive closure of the set of used names. The two texts are
+        // scanned separately instead of concatenating a copy of the body.
         Set<String> needed = new LinkedHashSet<>();
         Deque<String> worklist = new ArrayDeque<>();
 
-        seedFilter(needed, worklist, allDefs, bodyContent);
+        seedFilter(needed, worklist, defKeys, bodyContent);
+        seedFilter(needed, worklist, defKeys, externs);
 
         while (!worklist.isEmpty()) {
             String name = worklist.poll();
             String def = allDefs.get(name);
             if (def == null) continue;
-            seedFilter(needed, worklist, allDefs, def);
+            seedFilter(needed, worklist, defKeys, def);
         }
 
         StringBuilder sb = new StringBuilder();
@@ -442,7 +447,7 @@ public class LlvmGenerator implements LlvmGeneratorPort {
      */
     private static void seedFilter(Set<String> needed,
                                    Deque<String> worklist,
-                                   Map<String, String> allDefs,
+                                   RegionSet defKeys,
                                    String text) {
         if (text == null || text.isEmpty()) return;
 
@@ -467,6 +472,7 @@ public class LlvmGenerator implements LlvmGeneratorPort {
             if (c == '%' || c == '@') {
                 int start = i;
                 int j = i + 1;
+                int h = c; // String.hashCode polynomial over the token, sigil included
                 while (j < n) {
                     char d = text.charAt(j);
                     boolean ident =
@@ -475,11 +481,12 @@ public class LlvmGenerator implements LlvmGeneratorPort {
                         || (d >= '0' && d <= '9')
                         || d == '_' || d == '.' || d == '$' || d == '-';
                     if (!ident) break;
+                    h = 31 * h + d;
                     j++;
                 }
                 if (j > start + 1) {
-                    String key = text.substring(start, j);
-                    if (allDefs.containsKey(key) && needed.add(key)) {
+                    String key = defKeys.find(text, start, j, h); // no substring per token
+                    if (key != null && needed.add(key)) {
                         worklist.add(key);
                     }
                 }
@@ -715,7 +722,7 @@ public class LlvmGenerator implements LlvmGeneratorPort {
      * </pre>
      *
      * <p>The character set below matches the one used by
-     * {@link #seedFilter(Set, Deque, Map, String)} and by every symbol
+     * {@link #seedFilter(Set, Deque, RegionSet, String)} and by every symbol
      * that {@code LlvmRuntime.mangleMethod} actually produces.</p>
      *
      * <p>The body of a typical class references a few dozen globals, so the
@@ -725,19 +732,19 @@ public class LlvmGenerator implements LlvmGeneratorPort {
     private String buildExterns(String bodyContent,
                                 Map<String, GlobalDecl> knownGlobals,
                                 Module module) {
-        Set<String> used = collectUsedSymbols(bodyContent);
+        List<String> used = collectUsedSymbols(bodyContent);
         Set<String> definedHere = collectLocalDefinitions(bodyContent);
         String adapters = buildJniAliasAdapters(used, definedHere, module);
         if (!adapters.isEmpty()) {
-            bodyContent = bodyContent + "\n" + adapters;
-            used = collectUsedSymbols(bodyContent);
-            definedHere = collectLocalDefinitions(bodyContent);
+            // Only the adapter text is new; scan it instead of the whole body again.
+            java.util.TreeSet<String> all = new java.util.TreeSet<>(used);
+            all.addAll(collectUsedSymbols(adapters));
+            used = new ArrayList<>(all);
+            definedHere.addAll(collectLocalDefinitions(adapters));
         }
 
         StringBuilder sb = new StringBuilder(adapters);
-        List<String> sorted = new ArrayList<>(used);
-        Collections.sort(sorted);
-        for (String name : sorted) {
+        for (String name : used) {
             if (name.startsWith("llvm.")) continue;
             if (definedHere.contains(name)) continue;
             GlobalDecl d = knownGlobals.get(name);
@@ -754,7 +761,7 @@ public class LlvmGenerator implements LlvmGeneratorPort {
             Function func = module.getFunction(name);
             if (func != null) {
                 String stub = func.getEntryBlock() == null && name.startsWith("__jnative_fn_")
-                    ? weakNativeStub(name, bodyContent)
+                    ? weakNativeStub(name, bodyContent, adapters)
                     : null;
                 sb.append(stub != null ? stub : emitDeclaration(func));
                 continue;
@@ -764,18 +771,20 @@ public class LlvmGenerator implements LlvmGeneratorPort {
                 continue;
             }
             if (name.startsWith("__jnative_fn_")) {
-                String stub = weakNativeStub(name, bodyContent);
+                String stub = weakNativeStub(name, bodyContent, adapters);
                 if (stub != null) sb.append(stub);
             }
         }
         return sb.toString();
     }
 
-    private static Set<String> collectUsedSymbols(String bodyContent) {
-        Set<String> used = new HashSet<>();
+    /** Unique {@code @symbol} names in the text, sorted. */
+    private static List<String> collectUsedSymbols(String bodyContent) {
+        RegionSet used = new RegionSet(256);
         int i = 0, n = bodyContent.length();
-        while ((i = bodyContent.indexOf("@", i)) >= 0) {
+        while ((i = bodyContent.indexOf('@', i)) >= 0) {
             int j = i + 1;
+            int h = 0;
             while (j < n) {
                 char c = bodyContent.charAt(j);
                 // a-zA-Z0-9_ . $ - — the exact set LLVM accepts in
@@ -784,23 +793,24 @@ public class LlvmGenerator implements LlvmGeneratorPort {
                 if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
                     || (c >= '0' && c <= '9') || c == '_' || c == '.'
                     || c == '$' || c == '-') {
+                    h = 31 * h + c;
                     j++;
                 } else {
                     break;
                 }
             }
-            if (j > i + 1) used.add(bodyContent.substring(i + 1, j));
+            if (j > i + 1) used.addRegion(bodyContent, i + 1, j, h); // allocates only first sighting
             i = j;
         }
 
-        return used;
+        List<String> out = used.toList();
+        Collections.sort(out);
+        return out;
     }
 
-    private String buildJniAliasAdapters(Set<String> used, Set<String> definedHere, Module module) {
+    private String buildJniAliasAdapters(List<String> sortedUsed, Set<String> definedHere, Module module) {
         StringBuilder sb = new StringBuilder();
-        List<String> sorted = new ArrayList<>(used);
-        Collections.sort(sorted);
-        for (String name : sorted) {
+        for (String name : sortedUsed) {
             if (definedHere.contains(name)) continue;
             Function func = module.getFunction(name);
             if (func == null || !func.isJniNative() || func.getJniMethodName() == null) continue;
@@ -861,6 +871,20 @@ public class LlvmGenerator implements LlvmGeneratorPort {
             i = eol + 1;
         }
         return out;
+    }
+
+    /** Stub from the first call site in {@code body}, else in {@code extra} (the two were once one concatenated string). */
+    private static String weakNativeStub(String name, String body, String extra) {
+        String stub = weakNativeStub(name, body);
+        return stub != null || extra.isEmpty() ? stub : weakNativeStub(name, extra);
+    }
+
+    private static void writeLl(Path out, String prelude, String externs, String body) throws IOException {
+        try (var w = Files.newBufferedWriter(out, StandardCharsets.UTF_8)) {
+            w.write(prelude);
+            w.write(externs);
+            w.write(body);
+        }
     }
 
     private static String weakNativeStub(String name, String body) {
