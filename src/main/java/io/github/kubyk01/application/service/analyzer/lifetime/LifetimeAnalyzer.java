@@ -4,6 +4,7 @@ import io.github.kubyk01.application.service.analyzer.ssa.DominatorTree;
 import io.github.kubyk01.domain.analyzer.aliasanalysis.AliasAnalysisResult;
 import io.github.kubyk01.domain.analyzer.aliasanalysis.AllocationSite;
 import io.github.kubyk01.domain.analyzer.aliasanalysis.FunctionSummary;
+import io.github.kubyk01.domain.analyzer.aliasanalysis.PointsToSet;
 import io.github.kubyk01.domain.analyzer.escapeanalysis.EscapeAnalysisResult;
 import io.github.kubyk01.domain.analyzer.escapeanalysis.EscapeStatus;
 import io.github.kubyk01.domain.ir.*;
@@ -18,9 +19,12 @@ import reactor.core.scheduler.Schedulers;
 
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
 
 @Slf4j
 public class LifetimeAnalyzer {
+
+    private static final int PROGRESS_EVERY = 20_000;
 
     private final Module module;
     private final AliasAnalysisResult aliasResult;
@@ -49,12 +53,14 @@ public class LifetimeAnalyzer {
         AllocationSiteCollector collector =
                 new AllocationSiteCollector(module, aliasResult, scheduler);
         List<AllocationSite> allSites = collector.collect();
+        System.out.println("Lifetime: " + allSites.size() + " allocation sites");
 
         // -------- 2. Cyclic reference detection --------
         CyclicReferenceDetector cyclicDetector =
                 new CyclicReferenceDetector(aliasResult.getGraph(), allSites);
         Set<AllocationSite> cyclicSites = cyclicDetector.detect();
         result.getUnresolved().addAll(cyclicSites);
+        System.out.println("Lifetime: " + cyclicSites.size() + " cyclic site(s)");
 
         // -------- 3. Liveness (now internally parallel) --------
         LivenessAnalyzer livenessAnalyzer =
@@ -62,7 +68,7 @@ public class LifetimeAnalyzer {
         livenessAnalyzer.setScheduler(scheduler);
         livenessAnalyzer.computeLiveSets(allSites);
 
-        // -------- 3b. Publish live-out per block -------------------------
+        // -------- 3b. Publish live-out per block (read-only views) --------
         Map<BasicBlock, Set<AllocationSite>> liveOutMap = livenessAnalyzer.getLiveOutMap();
         result.setLiveOut(liveOutMap != null ? liveOutMap : Map.of());
 
@@ -87,57 +93,80 @@ public class LifetimeAnalyzer {
                 .sequential()
                 .then()
         );
+        System.out.println("Lifetime: dominator trees for " + live.size() + " functions");
 
-        // -------- 5. Per-site analysis, in parallel --------
+        // -------- 5. Per-site analysis, in parallel over functions --------
         //
-        // Each site writes to its own entry in the destination maps and
-        // reads only from frozen aliasResult / escapeResult / liveness
-        // and the precomputed dominator/loop structures. Independent
-        // across sites.
+        // Sites are grouped by their allocating function so that the
+        // function is scanned once for aliases and once for last uses,
+        // instead of once per site. Each group reads only frozen
+        // aliasResult / escapeResult / liveness and the precomputed
+        // dominator/loop structures, so groups are independent.
         Set<AllocationSite> skip = result.getUnresolved();
 
-        List<AllocationSite> candidates = new ArrayList<>(allSites.size());
+        Map<String, List<AllocationSite>> byFunction = new HashMap<>();
         for (AllocationSite site : allSites) {
             if (skip.contains(site)) continue;
-            candidates.add(site);
+            byFunction.computeIfAbsent(site.getMethodName(), k -> new ArrayList<>()).add(site);
         }
+        List<List<AllocationSite>> groups = new ArrayList<>(byFunction.values());
 
         // Each worker accumulates its own per-site results, then the
         // main thread merges them sequentially. That keeps the result
         // maps as plain HashMaps (no concurrency concerns) while still
         // running the analysis itself in parallel.
-        List<SiteResult> siteResults = LlvmUtil.awaitFlux(
-                Flux.fromIterable(candidates)
+        int totalGroups = groups.size();
+        AtomicInteger doneGroups = new AtomicInteger();
+        List<List<SiteResult>> groupResults = LlvmUtil.awaitFlux(
+                Flux.fromIterable(groups)
                         .parallel()
                         .runOn(scheduler)
-                        .map(site -> computeSite(site, domTrees, loopHeaders,
-                                livenessAnalyzer, siteToValue))
+                        .map(group -> {
+                            List<SiteResult> r = computeFunctionSites(group, domTrees,
+                                    loopHeaders, livenessAnalyzer, siteToValue);
+                            int n = doneGroups.incrementAndGet();
+                            if (n % PROGRESS_EVERY == 0) {
+                                System.out.println("Lifetime: per-site analysis " + n + "/"
+                                        + totalGroups + " functions");
+                            }
+                            return r;
+                        })
                         .sequential()
         );
 
-        if (siteResults != null) {
-            for (SiteResult sr : siteResults) {
-                if (sr.unresolved()) {
-                    result.getUnresolved().add(sr.site());
-                } else {
-                    for (DestructionPoint point : sr.points()) {
-                        result.getDestructionPoints()
-                                .computeIfAbsent(sr.site(), k -> new HashSet<>())
-                                .add(point);
+        if (groupResults != null) {
+            for (List<SiteResult> srs : groupResults) {
+                for (SiteResult sr : srs) {
+                    if (sr.unresolved()) {
+                        result.getUnresolved().add(sr.site());
+                    } else {
+                        for (DestructionPoint point : sr.points()) {
+                            result.getDestructionPoints()
+                                    .computeIfAbsent(sr.site(), k -> new HashSet<>())
+                                    .add(point);
+                        }
                     }
                 }
             }
         }
+        System.out.println("Lifetime: done, " + result.getDestructionPoints().size()
+                + " site(s) with destruction points, " + result.getUnresolved().size()
+                + " unresolved");
 
         return result;
     }
 
-    private SiteResult computeSite(AllocationSite site,
-                                   Map<Function, DominatorTree> domTrees,
-                                   Map<Function, Map<BasicBlock, Set<BasicBlock>>> loopHeaders,
-                                   LivenessAnalyzer livenessAnalyzer,
-                                   Map<AllocationSite, Value> siteToValue) {
-        EscapeStatus status = escapeResult.getSiteStatus(site);
+    /**
+     * Runs {@link #computeSite} for every site allocated in one function.
+     * All sites in {@code group} share the same method name.
+     */
+    private List<SiteResult> computeFunctionSites(List<AllocationSite> group,
+                                                  Map<Function, DominatorTree> domTrees,
+                                                  Map<Function, Map<BasicBlock, Set<BasicBlock>>> loopHeaders,
+                                                  LivenessAnalyzer livenessAnalyzer,
+                                                  Map<AllocationSite, Value> siteToValue) {
+        List<SiteResult> out = new ArrayList<>(group.size());
+        List<AllocationSite> pending = new ArrayList<>(group.size());
 
         // GLOBAL / THREAD / RETURN: object outlives the frame, so no per-use
         // destruction point is legal.
@@ -150,32 +179,61 @@ public class LifetimeAnalyzer {
         //
         // STACK: skipped — materialised via alloca, released by frame teardown.
         // UNKNOWN: treated conservatively as freeable.
-        if (status == EscapeStatus.GLOBAL
-                || status == EscapeStatus.THREAD
-                || status == EscapeStatus.RETURN) {
-            return new SiteResult(site, List.of(), false);
+        for (AllocationSite site : group) {
+            EscapeStatus status = escapeResult.getSiteStatus(site);
+            if (status == EscapeStatus.GLOBAL
+                    || status == EscapeStatus.THREAD
+                    || status == EscapeStatus.RETURN) {
+                out.add(new SiteResult(site, List.of(), false));
+            } else {
+                pending.add(site);
+            }
         }
+        if (pending.isEmpty()) return out;
 
-        Function func = module.getFunction(site.getMethodName());
-        if (func == null || func.getEntryBlock() == null) {
-            return new SiteResult(site, List.of(), false);
+        Function func = module.getFunction(group.getFirst().getMethodName());
+        DominatorTree dom = (func == null || func.getEntryBlock() == null)
+                ? null : domTrees.get(func);
+        if (dom == null) {
+            for (AllocationSite site : pending) out.add(new SiteResult(site, List.of(), false));
+            return out;
         }
-
-        DominatorTree dom = domTrees.get(func);
-        if (dom == null) return new SiteResult(site, List.of(), false);
-
         Map<BasicBlock, Set<BasicBlock>> loops = loopHeaders.get(func);
 
-        Value allocVal = siteToValue.get(site);
-        if (allocVal == null) return new SiteResult(site, List.of(), false);
+        Map<AllocationSite, Value> allocVals = new HashMap<>();
+        List<AllocationSite> withValue = new ArrayList<>(pending.size());
+        for (AllocationSite site : pending) {
+            Value allocVal = siteToValue.get(site);
+            if (allocVal == null) {
+                out.add(new SiteResult(site, List.of(), false));
+            } else {
+                allocVals.put(site, allocVal);
+                withValue.add(site);
+            }
+        }
+        if (withValue.isEmpty()) return out;
 
-        // Any value that may point to the site is a legal "root" for the
-        // destructor call; pick the last syntactic use of each.
-        Set<Value> roots = collectAliases(site, func, allocVal);
-
+        Map<AllocationSite, Set<Value>> aliases = collectAliases(withValue, func, allocVals);
         Map<Value, List<LivenessAnalyzer.ValueLastUse>> valueLastUses =
                 livenessAnalyzer.computeValueLastUses(func);
 
+        for (AllocationSite site : withValue) {
+            out.add(computeSite(site, func, dom, loops, allocVals.get(site),
+                    aliases.get(site), valueLastUses, livenessAnalyzer));
+        }
+        return out;
+    }
+
+    private SiteResult computeSite(AllocationSite site,
+                                   Function func,
+                                   DominatorTree dom,
+                                   Map<BasicBlock, Set<BasicBlock>> loops,
+                                   Value allocVal,
+                                   Set<Value> roots,
+                                   Map<Value, List<LivenessAnalyzer.ValueLastUse>> valueLastUses,
+                                   LivenessAnalyzer livenessAnalyzer) {
+        // Any value that may point to the site is a legal "root" for the
+        // destructor call (roots); pick the last syntactic use of each.
         List<DestructionPoint> points = new ArrayList<>();
         for (Value root : roots) {
             List<LivenessAnalyzer.ValueLastUse> uses = valueLastUses.get(root);
@@ -359,44 +417,61 @@ public class LifetimeAnalyzer {
     }
 
     /**
-     * All IR values in {@code func} whose points-to set contains
-     * {@code site}: the allocation itself, any aliasing temporary, and any
-     * parameter or field read that may refer to it.
+     * For each site in {@code sites} (all allocated in {@code func}): the IR
+     * values of {@code func} whose points-to set contains the site — the
+     * allocation itself first, then every aliasing temporary, operand,
+     * terminator operand and parameter in scan order. One scan of the
+     * function serves all its sites; per site, the order of values is the
+     * same as scanning the function for that site alone.
      */
-    private Set<Value> collectAliases(AllocationSite site,
-                                      Function func,
-                                      Value allocVal) {
-        Set<Value> aliases = new LinkedHashSet<>();
-        aliases.add(allocVal);
+    private Map<AllocationSite, Set<Value>> collectAliases(List<AllocationSite> sites,
+                                                           Function func,
+                                                           Map<AllocationSite, Value> allocVals) {
+        int k = sites.size();
+        AllocationSite[] byIndex = sites.toArray(new AllocationSite[0]);
+        Arrays.sort(byIndex, Comparator.comparingInt(AllocationSite::getId));
+        int[] ids = new int[k];
+        List<Set<Value>> sets = new ArrayList<>(k);
+        for (int i = 0; i < k; i++) {
+            ids[i] = byIndex[i].getId();
+            Set<Value> aliases = new LinkedHashSet<>();
+            aliases.add(allocVals.get(byIndex[i]));
+            sets.add(aliases);
+        }
+
         for (BasicBlock block : func.getBlocks()) {
             for (Instruction inst : block.getInstructions()) {
-                Value result = inst.getResult();
-                if (result != null && pointsToSite(result, site)) {
-                    aliases.add(result);
-                }
-                for (Value op : inst.getOperands()) {
-                    if (op != null && pointsToSite(op, site)) {
-                        aliases.add(op);
-                    }
-                }
+                addAlias(inst.getResult(), ids, sets);
+                for (Value op : inst.getOperands()) addAlias(op, ids, sets);
             }
             Terminator term = block.getTerminator();
             if (term != null) {
-                for (Value op : terminatorOperands(term)) {
-                    if (op != null && pointsToSite(op, site)) {
-                        aliases.add(op);
-                    }
-                }
+                for (Value op : terminatorOperands(term)) addAlias(op, ids, sets);
             }
         }
-        for (Parameter p : func.getParameters()) {
-            if (pointsToSite(p, site)) aliases.add(p);
-        }
-        return aliases;
+        for (Parameter p : func.getParameters()) addAlias(p, ids, sets);
+
+        Map<AllocationSite, Set<Value>> out = new HashMap<>(k * 2);
+        for (int i = 0; i < k; i++) out.put(byIndex[i], sets.get(i));
+        return out;
     }
 
-    private boolean pointsToSite(Value v, AllocationSite site) {
-        return aliasResult.getPointsTo(v).getSites().contains(site);
+    /** Adds {@code v} to the alias set of every site in {@code ids} (sorted) that it may point to. */
+    private void addAlias(Value v, int[] ids, List<Set<Value>> sets) {
+        if (v == null) return;
+        PointsToSet pts = aliasResult.getPointsTo(v);
+        if (pts.isEmpty()) return;
+        // Walk the smaller side: the function's sites or the value's points-to set.
+        if (pts.size() <= ids.length) {
+            for (int id : pts.rawIds()) {
+                int i = Arrays.binarySearch(ids, id);
+                if (i >= 0) sets.get(i).add(v);
+            }
+        } else {
+            for (int i = 0; i < ids.length; i++) {
+                if (pts.containsId(ids[i])) sets.get(i).add(v);
+            }
+        }
     }
 
     private List<Value> terminatorOperands(Terminator term) {

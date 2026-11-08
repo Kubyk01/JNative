@@ -288,75 +288,43 @@ public class Analyzer {
         Map<String, Set<String>> fieldWriteCache = new ConcurrentHashMap<>();
         Map<String, Set<String>> fieldReadCache  = new ConcurrentHashMap<>();
 
+        ClinitWalkContext ctx = new ClinitWalkContext(module, callGraph, clinitNames,
+            triggerCache, fieldWriteCache, fieldReadCache);
+
+        // Small walks run one <clinit> per worker. A walk that grows past
+        // CLINIT_WALK_CAP is abandoned and redone below with the frontier
+        // spread over all workers, so a few huge call graphs do not leave
+        // one thread working while the rest idle.
+        Set<Function> bigClinits = ConcurrentHashMap.newKeySet();
         LlvmUtil.awaitMono(Flux.fromIterable(clinitFunctions)
             .parallel()
             .runOn(scheduler)
             .doOnNext(clinit -> {
                 String className = clinitNameToClassName.get(clinit.getName());
                 if (className == null) return;
-
-                Set<String> visited = new HashSet<>();
-                Set<String> nested  = new LinkedHashSet<>();
-                Set<String> delta   = new HashSet<>();
-                Deque<String> worklist = new ArrayDeque<>();
-
-                visited.add(clinit.getName());
-                worklist.push(clinit.getName());
-
-                while (!worklist.isEmpty()) {
-                    String cur = worklist.pop();
-                    Function f = module.getFunction(cur);
-                    if (f != null && f.getEntryBlock() != null) {
-                        Set<String> trig = triggerCache.computeIfAbsent(cur,
-                            k -> scanTriggers(module.getFunction(k)));
-                        for (String t : trig) if (!t.equals(className)) delta.add(t);
-
-                        for (String fld : fieldWriteCache.computeIfAbsent(cur,
-                            k -> scanFieldWrites(module.getFunction(k)))) {
-                            fieldWriters.computeIfAbsent(fld, k -> ConcurrentHashMap.newKeySet())
-                                .add(className);
-                        }
-                        for (String fld : fieldReadCache.computeIfAbsent(cur,
-                            k -> scanFieldReads(module.getFunction(k)))) {
-                            fieldReaders.computeIfAbsent(fld, k -> ConcurrentHashMap.newKeySet())
-                                .add(className);
-                        }
-                    }
-
-                    Set<String> callees = callGraph.get(cur);
-                    if (callees == null) continue;
-                    for (String callee : callees) {
-                        if (clinitNames.contains(callee)) { nested.add(callee); continue; }
-                        if (visited.add(callee)) worklist.push(callee);
-                    }
+                ClinitWalk walk = walkClinitSequential(clinit.getName(), className, ctx);
+                if (walk == null) {
+                    bigClinits.add(clinit);
+                    return;
                 }
-
-                ClassNode cn = resolver.getClassNode(className);
-                Set<String> supVisited = new HashSet<>();
-                while (cn != null && cn.getSuperName() != null
-                    && !cn.getSuperName().equals(cn.getName())
-                    && supVisited.add(cn.getSuperName())) {
-                    String sup = cn.getSuperName();
-                    if ("java/lang/Object".equals(sup)) break;
-                    delta.add(sup);
-                    cn = resolver.getClassNode(sup);
-                }
-                for (String nc : nested) {
-                    String ncls = clinitNameToClassName.get(nc);
-                    if (ncls != null && !ncls.equals(className)) delta.add(ncls);
-                }
-
-                nestedClinits.put(clinit.getName(), nested);
-                if (!delta.isEmpty()) {
-                    classDepDeltas.compute(className, (k, e) -> {
-                        if (e == null) return delta;
-                        e.addAll(delta);
-                        return e;
-                    });
-                }
+                publishClinitWalk(clinit.getName(), className, walk, resolver,
+                    clinitNameToClassName, nestedClinits, classDepDeltas,
+                    fieldWriters, fieldReaders);
             })
             .sequential()
             .then());
+
+        if (!bigClinits.isEmpty()) {
+            System.out.println("Lazy <clinit>: " + bigClinits.size()
+                + " large call graph(s), walking each with all workers");
+            for (Function clinit : bigClinits) {
+                String className = clinitNameToClassName.get(clinit.getName());
+                ClinitWalk walk = walkClinitParallel(clinit.getName(), className, ctx);
+                publishClinitWalk(clinit.getName(), className, walk, resolver,
+                    clinitNameToClassName, nestedClinits, classDepDeltas,
+                    fieldWriters, fieldReaders);
+            }
+        }
 
         Map<String, Set<String>> classDeps = new LinkedHashMap<>();
         for (String cls : allWithClinit) classDeps.put(cls, new LinkedHashSet<>());
@@ -413,6 +381,145 @@ public class Analyzer {
             String wrapperName = "fn___lazy_clinit_run_" + sanitizeForWrapper(cls);
             Function wrapper = module.getFunction(wrapperName);
             if (wrapper != null) clinitWrappers.put(clinitName, wrapper.getName());
+        }
+    }
+
+    // ------------------------------------------------------------------
+    //  <clinit> call-graph walks
+    // ------------------------------------------------------------------
+
+    /** Visited-function count after which a sequential <clinit> walk is redone in parallel. */
+    private static final int CLINIT_WALK_CAP = 20_000;
+
+    private record ClinitWalkContext(Module module,
+                                     Map<String, Set<String>> callGraph,
+                                     Set<String> clinitNames,
+                                     Map<String, Set<String>> triggerCache,
+                                     Map<String, Set<String>> fieldWriteCache,
+                                     Map<String, Set<String>> fieldReadCache) {}
+
+    /**
+     * What one <clinit> reaches through direct calls, not entering other
+     * <clinit>s: trigger classes (minus its own class), nested <clinit>s,
+     * static fields written and read.
+     */
+    private record ClinitWalk(Set<String> delta, Set<String> nested,
+                              Set<String> writes, Set<String> reads) {}
+
+    /** Scans one reached function into the walk's result sets. */
+    private static void visitClinitNode(String cur, String className, ClinitWalkContext ctx,
+                                        Set<String> delta, Set<String> writes, Set<String> reads) {
+        Function f = ctx.module().getFunction(cur);
+        if (f == null || f.getEntryBlock() == null) return;
+        Module module = ctx.module();
+        for (String t : ctx.triggerCache().computeIfAbsent(cur,
+                k -> scanTriggers(module.getFunction(k)))) {
+            if (!t.equals(className)) delta.add(t);
+        }
+        writes.addAll(ctx.fieldWriteCache().computeIfAbsent(cur,
+            k -> scanFieldWrites(module.getFunction(k))));
+        reads.addAll(ctx.fieldReadCache().computeIfAbsent(cur,
+            k -> scanFieldReads(module.getFunction(k))));
+    }
+
+    /** Depth-first walk on the calling thread; null when it visits more than CLINIT_WALK_CAP functions. */
+    private static ClinitWalk walkClinitSequential(String clinitName, String className,
+                                                   ClinitWalkContext ctx) {
+        Set<String> visited = new HashSet<>();
+        Set<String> nested = new HashSet<>();
+        Set<String> delta = new HashSet<>();
+        Set<String> writes = new HashSet<>();
+        Set<String> reads = new HashSet<>();
+        Deque<String> worklist = new ArrayDeque<>();
+        visited.add(clinitName);
+        worklist.push(clinitName);
+        while (!worklist.isEmpty()) {
+            if (visited.size() > CLINIT_WALK_CAP) return null;
+            String cur = worklist.pop();
+            visitClinitNode(cur, className, ctx, delta, writes, reads);
+            Set<String> callees = ctx.callGraph().get(cur);
+            if (callees == null) continue;
+            for (String callee : callees) {
+                if (ctx.clinitNames().contains(callee)) { nested.add(callee); continue; }
+                if (visited.add(callee)) worklist.push(callee);
+            }
+        }
+        return new ClinitWalk(delta, nested, writes, reads);
+    }
+
+    /** Level-synchronous breadth-first walk with each frontier split across all workers. */
+    private ClinitWalk walkClinitParallel(String clinitName, String className,
+                                          ClinitWalkContext ctx) {
+        Set<String> visited = ConcurrentHashMap.newKeySet();
+        Set<String> nested = ConcurrentHashMap.newKeySet();
+        Set<String> delta = ConcurrentHashMap.newKeySet();
+        Set<String> writes = ConcurrentHashMap.newKeySet();
+        Set<String> reads = ConcurrentHashMap.newKeySet();
+        visited.add(clinitName);
+        List<String> frontier = List.of(clinitName);
+        int chunks = Math.max(1, parallelism * 4);
+        while (!frontier.isEmpty()) {
+            Queue<String> next = new java.util.concurrent.ConcurrentLinkedQueue<>();
+            List<String> level = frontier;
+            int chunkSize = Math.max(64, (level.size() + chunks - 1) / chunks);
+            List<List<String>> parts = new ArrayList<>();
+            for (int i = 0; i < level.size(); i += chunkSize) {
+                parts.add(level.subList(i, Math.min(level.size(), i + chunkSize)));
+            }
+            forEachParallel(parts, part -> {
+                for (String cur : part) {
+                    visitClinitNode(cur, className, ctx, delta, writes, reads);
+                    Set<String> callees = ctx.callGraph().get(cur);
+                    if (callees == null) continue;
+                    for (String callee : callees) {
+                        if (ctx.clinitNames().contains(callee)) { nested.add(callee); continue; }
+                        if (visited.add(callee)) next.add(callee);
+                    }
+                }
+            });
+            frontier = new ArrayList<>(next);
+        }
+        return new ClinitWalk(delta, nested, writes, reads);
+    }
+
+    /** Folds one walk into the shared maps and adds superclass and nested-<clinit> dependencies. */
+    private static void publishClinitWalk(String clinitName, String className, ClinitWalk walk,
+                                          DependencyResolver resolver,
+                                          Map<String, String> clinitNameToClassName,
+                                          Map<String, Set<String>> nestedClinits,
+                                          Map<String, Set<String>> classDepDeltas,
+                                          Map<String, Set<String>> fieldWriters,
+                                          Map<String, Set<String>> fieldReaders) {
+        for (String fld : walk.writes()) {
+            fieldWriters.computeIfAbsent(fld, k -> ConcurrentHashMap.newKeySet()).add(className);
+        }
+        for (String fld : walk.reads()) {
+            fieldReaders.computeIfAbsent(fld, k -> ConcurrentHashMap.newKeySet()).add(className);
+        }
+
+        Set<String> delta = new HashSet<>(walk.delta());
+        ClassNode cn = resolver.getClassNode(className);
+        Set<String> supVisited = new HashSet<>();
+        while (cn != null && cn.getSuperName() != null
+            && !cn.getSuperName().equals(cn.getName())
+            && supVisited.add(cn.getSuperName())) {
+            String sup = cn.getSuperName();
+            if ("java/lang/Object".equals(sup)) break;
+            delta.add(sup);
+            cn = resolver.getClassNode(sup);
+        }
+        for (String nc : walk.nested()) {
+            String ncls = clinitNameToClassName.get(nc);
+            if (ncls != null && !ncls.equals(className)) delta.add(ncls);
+        }
+
+        nestedClinits.put(clinitName, walk.nested());
+        if (!delta.isEmpty()) {
+            classDepDeltas.compute(className, (k, e) -> {
+                if (e == null) return delta;
+                e.addAll(delta);
+                return e;
+            });
         }
     }
 

@@ -625,7 +625,7 @@ public class LlvmFunctionEmitter {
 
             if (isReturn || (hasOutsideNormalSucc && !hasInsideNormalSucc)) {
                 sb.repeat("  call void @__jnative_pop_catch()\n", ranges.size());
-            } else if (hasOutsideNormalSucc && hasInsideNormalSucc) {
+            } else if (hasOutsideNormalSucc) {
                 Map<BasicBlock, BasicBlock> redirects = blockExitRedirects.get(block);
                 if (redirects != null && !redirects.isEmpty()) {
                     targetRedirects = new HashMap<>();
@@ -4147,12 +4147,23 @@ public class LlvmFunctionEmitter {
         };
     }
 
+    private static final java.util.Map<String, Boolean> JNATIVE_FILE_CACHE =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
     private boolean isJNativeSymbolBackedByCFile(String symbol) {
+        Function f = module.getFunction(symbol);
+        String owner = f != null ? f.getOwnerClass() : null;
+        if (owner != null && symbol.startsWith(
+                "__jnative_fn_" + LlvmTypeMapper.sanitizeIdentifier(owner) + "_")) {
+            return JNATIVE_FILE_CACHE.computeIfAbsent(owner,
+                    LlvmFunctionEmitter::hasJNativeCFilesForOwner);
+        }
         for (String cls : resolver.getClassMap().keySet()) {
             String mangledClass = LlvmTypeMapper.sanitizeIdentifier(cls);
             String prefix = "__jnative_fn_" + mangledClass + "_";
             if (symbol.startsWith(prefix)) {
-                return hasJNativeCFilesForOwner(cls);
+                return JNATIVE_FILE_CACHE.computeIfAbsent(cls,
+                        LlvmFunctionEmitter::hasJNativeCFilesForOwner);
             }
         }
         return false;

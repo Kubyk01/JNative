@@ -751,16 +751,10 @@ public class DependencyResolver {
             // concurrent subclass-closure traversal in another thread
             // observes a consistent, non-throwing iteration.
             if (classNode.getSuperName() != null) {
-                subclasses
-                        .computeIfAbsent(classNode.getSuperName(),
-                                k -> ConcurrentHashMap.newKeySet())
-                        .add(name);
+                indexSubtype(classNode.getSuperName(), name);
             }
             for (String iface : classNode.getInterfaces()) {
-                subclasses
-                        .computeIfAbsent(iface,
-                                k -> ConcurrentHashMap.newKeySet())
-                        .add(name);
+                indexSubtype(iface, name);
             }
         } catch (Exception e) {
             System.err.println("ERROR in parseClassStream: " + e.getMessage());
@@ -775,16 +769,10 @@ public class DependencyResolver {
             if (isArrayTypeName(cn.getName())) continue;
 
             if (cn.getSuperName() != null) {
-                subclasses
-                        .computeIfAbsent(cn.getSuperName(),
-                                k -> ConcurrentHashMap.newKeySet())
-                        .add(cn.getName());
+                indexSubtype(cn.getSuperName(), cn.getName());
             }
             for (String iface : cn.getInterfaces()) {
-                subclasses
-                        .computeIfAbsent(iface,
-                                k -> ConcurrentHashMap.newKeySet())
-                        .add(cn.getName());
+                indexSubtype(iface, cn.getName());
             }
         }
     }
@@ -913,17 +901,11 @@ public class DependencyResolver {
 
         // Defensive guard against array descriptors.
         if (!isArrayTypeName(name) && classNode.getSuperName() != null) {
-            subclasses
-                    .computeIfAbsent(classNode.getSuperName(),
-                            k -> ConcurrentHashMap.newKeySet())
-                    .add(name);
+            indexSubtype(classNode.getSuperName(), name);
         }
         if (!isArrayTypeName(name)) {
             for (String iface : classNode.getInterfaces()) {
-                subclasses
-                        .computeIfAbsent(iface,
-                                k -> ConcurrentHashMap.newKeySet())
-                        .add(name);
+                indexSubtype(iface, name);
             }
         }
     }
@@ -1027,10 +1009,28 @@ public class DependencyResolver {
         return classBytes.get(internalName);
     }
 
+    private record SubclassClosure(long version, Set<String> classes) {}
+
+    private final Map<String, SubclassClosure> subclassClosureCache = new ConcurrentHashMap<>();
+    private final java.util.concurrent.atomic.AtomicLong subclassIndexVersion =
+            new java.util.concurrent.atomic.AtomicLong();
+
+    private void indexSubtype(String parent, String child) {
+        if (subclasses.computeIfAbsent(parent, k -> ConcurrentHashMap.newKeySet()).add(child)) {
+            subclassIndexVersion.incrementAndGet();
+        }
+    }
+
+    /** Transitive subtypes of {@code className}; read-only, cached until the subtype index changes. */
     public Set<String> getSubclasses(String className) {
+        long version = subclassIndexVersion.get();
+        SubclassClosure cached = subclassClosureCache.get(className);
+        if (cached != null && cached.version() == version) return cached.classes();
         Set<String> result = new HashSet<>();
         collectSubclasses(className, result);
-        return result;
+        Set<String> classes = Collections.unmodifiableSet(result);
+        subclassClosureCache.put(className, new SubclassClosure(version, classes));
+        return classes;
     }
 
     private void collectSubclasses(String className, Set<String> accumulator) {

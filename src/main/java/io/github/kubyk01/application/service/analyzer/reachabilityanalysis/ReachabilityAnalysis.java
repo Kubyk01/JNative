@@ -37,6 +37,8 @@ import reactor.core.scheduler.Schedulers;
 
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 @Slf4j
 @RequiredArgsConstructor
@@ -50,7 +52,7 @@ public class ReachabilityAnalysis {
      * {@link Schedulers#single()} so the class stays usable from unit
      * tests that never touch the reactor runtime.
      */
-    private Scheduler scheduler = Schedulers.single();
+    private volatile Scheduler scheduler = Schedulers.single();
 
     public void setScheduler(Scheduler scheduler) {
         if (scheduler != null) {
@@ -59,27 +61,27 @@ public class ReachabilityAnalysis {
     }
 
     @Getter
-    private final Set<String> reachableClasses = new HashSet<>();
+    private final Set<String> reachableClasses = ConcurrentHashMap.newKeySet();
 
-    private final Set<String> userReachedClasses = new HashSet<>();
+    private final Set<String> userReachedClasses = ConcurrentHashMap.newKeySet();
 
-    private final Set<String> clinitProcessed = new HashSet<>();
+    private final Set<String> clinitProcessed = ConcurrentHashMap.newKeySet();
 
     @Getter
-    private final Set<MethodReference> reachableMethods = new HashSet<>();
+    private final Set<MethodReference> reachableMethods = ConcurrentHashMap.newKeySet();
 
     @Getter
     private final ReflectInfo reflectInfo = new ReflectInfo();
 
-    private final Deque<MethodReference> worklist = new ArrayDeque<>();
+    private final ConcurrentLinkedQueue<MethodReference> worklist = new ConcurrentLinkedQueue<>();
 
-    private final Set<MethodReference> userReachableMethods = new HashSet<>();
-
-    @Getter
-    private final Map<MethodReference, Set<MethodReference>> callGraph = new HashMap<>();
+    private final Set<MethodReference> userReachableMethods = ConcurrentHashMap.newKeySet();
 
     @Getter
-    private final Set<String> instantiatedClasses = new HashSet<>();
+    private final Map<MethodReference, Set<MethodReference>> callGraph = new ConcurrentHashMap<>();
+
+    @Getter
+    private final Set<String> instantiatedClasses = ConcurrentHashMap.newKeySet();
 
     /**
      * All virtual/interface dispatch sites observed during analysis,
@@ -98,21 +100,21 @@ public class ReachabilityAnalysis {
      * every instantiation has been recorded. See
      * {@link #resolveVirtualDispatchFixedPoint()}.</p>
      */
-    private final Set<String> virtualDispatchSites = new LinkedHashSet<>();
+    private final Set<String> virtualDispatchSites = ConcurrentHashMap.newKeySet();
 
     /**
      * Methods whose bytecode has already been scanned for virtual-dispatch
      * sites during the post-drain fixed-point pass. Each method is scanned
      * exactly once, so the loop terminates.
      */
-    private final Set<MethodReference> dispatchScanDone = new HashSet<>();
+    private final Set<MethodReference> dispatchScanDone = ConcurrentHashMap.newKeySet();
 
     /**
      * Classes for which the enum-method-forcing rule has already run.
      * Keeps the check a one-time operation per class even when
      * {@code addClassWithInit} is called repeatedly for the same class.
      */
-    private final Set<String> enumMethodsProcessed = new HashSet<>();
+    private final Set<String> enumMethodsProcessed = ConcurrentHashMap.newKeySet();
 
     public void addInstantiatedClass(String className, boolean fromUser) {
         if (className == null || className.isEmpty()) return;
@@ -893,9 +895,19 @@ public class ReachabilityAnalysis {
     }
 
     private void drainWorklist() {
-        while (!worklist.isEmpty()) {
-            MethodReference current = worklist.poll();
-            processMethod(current);
+        while (true) {
+            List<MethodReference> batch = new ArrayList<>();
+            MethodReference ref;
+            while ((ref = worklist.poll()) != null) batch.add(ref);
+            if (batch.isEmpty()) return;
+            if (batch.size() == 1) {
+                processMethod(batch.getFirst());
+            } else {
+                LlvmUtil.parallelMapOrdered(batch, scheduler, m -> {
+                    processMethod(m);
+                    return null;
+                });
+            }
         }
     }
 
@@ -949,23 +961,26 @@ public class ReachabilityAnalysis {
         while (pass++ < MAX_PASSES) {
             // Step 1: scan bytecode of every method not yet scanned for
             // virtual-dispatch sites. Methods are scanned exactly once.
-            boolean scannedAny = false;
-            for (MethodReference ref : new ArrayList<>(reachableMethods)) {
-                if (!dispatchScanDone.add(ref)) continue;
-                collectDispatchSitesFromMethod(ref);
-                scannedAny = true;
+            List<MethodReference> toScan = new ArrayList<>();
+            for (MethodReference ref : reachableMethods) {
+                if (dispatchScanDone.add(ref)) toScan.add(ref);
             }
+            LlvmUtil.parallelMapOrdered(toScan, scheduler, ref -> {
+                collectDispatchSitesFromMethod(ref);
+                return null;
+            });
+            boolean scannedAny = !toScan.isEmpty();
 
             // Step 2: re-resolve every known site against the current
             // class map and instantiation set. Any concrete override that
             // has become visible since the previous pass is added to the
             // worklist.
-            boolean addedAny = false;
-            for (String site : virtualDispatchSites) {
-                if (resolveVirtualDispatchSite(site)) {
-                    addedAny = true;
-                }
-            }
+            AtomicBoolean addedAnySite = new AtomicBoolean(false);
+            LlvmUtil.parallelMapOrdered(new ArrayList<>(virtualDispatchSites), scheduler, site -> {
+                if (resolveVirtualDispatchSite(site)) addedAnySite.set(true);
+                return null;
+            });
+            boolean addedAny = addedAnySite.get();
 
             // Step 3: drain the worklist. Newly added methods will have
             // their own bytecode scanned in the next iteration.
@@ -1604,20 +1619,19 @@ public class ReachabilityAnalysis {
 
     void addMethod(MethodReference ref, boolean isUser) {
         if (reachableMethods.add(ref)) {
-            worklist.add(ref);
             if (isUser) {
                 userReachableMethods.add(ref);
             }
+            worklist.add(ref);
             addClass(ref.getOwner(), isUser);
-        } else if (isUser && !userReachableMethods.contains(ref)) {
-            userReachableMethods.add(ref);
+        } else if (isUser && userReachableMethods.add(ref)) {
             addClass(ref.getOwner(), true);
         }
     }
 
     void addMethodWithContext(MethodReference ref, boolean isUser, MethodReference caller) {
         if (caller != null) {
-            callGraph.computeIfAbsent(caller, k -> new HashSet<>()).add(ref);
+            callGraph.computeIfAbsent(caller, k -> ConcurrentHashMap.newKeySet()).add(ref);
         }
         addMethod(ref, isUser);
     }
