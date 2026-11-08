@@ -1599,12 +1599,16 @@ public class Compiler implements CompilerPort {
                 if (e.isDirectory() || !n.endsWith(suffix)) continue;
                 if (!n.contains("native/") && !n.contains("natives/")) continue;
                 if (!matchesTargetArch(n, target)) continue;
+                if (!matchesTargetOs(n, target)) continue;
                 String base = n.substring(n.lastIndexOf('/') + 1);
                 Path dest = extractDir.resolve(base);
                 if (Files.exists(dest)) continue;
+                byte[] bytes;
                 try (InputStream is = jf.getInputStream(e)) {
-                    Files.copy(is, dest, StandardCopyOption.REPLACE_EXISTING);
+                    bytes = is.readAllBytes();
                 }
+                if (!elfMatchesTarget(bytes, target)) continue;
+                Files.write(dest, bytes);
                 out.add(dest);
                 log.info("Extracted native library {} from {}", base, jar.getFileName());
             }
@@ -1622,6 +1626,113 @@ public class Compiler implements CompilerPort {
             "s390x", List.of("s390x"),
             "riscv64", List.of("riscv64"),
             "loongarch64", List.of("loongarch64"));
+
+    private static final Map<String, List<String>> OS_ALIASES = Map.of(
+            "linux", List.of("linux"),
+            "android", List.of("android"),
+            "darwin", List.of("darwin", "mac", "macos", "macosx", "osx"),
+            "windows", List.of("windows", "win", "win32", "win64", "mingw"),
+            "freebsd", List.of("freebsd"),
+            "openbsd", List.of("openbsd"),
+            "netbsd", List.of("netbsd"),
+            "sunos", List.of("sunos", "solaris"),
+            "aix", List.of("aix"));
+
+    private static String targetOs(TargetPlatform target) {
+        String t = target.triple().toLowerCase(Locale.ROOT);
+        if (t.contains("android")) return "android";
+        if (t.contains("linux")) return "linux";
+        if (target.isDarwin() || t.contains("darwin") || t.contains("macos") || t.contains("apple")) return "darwin";
+        if (target.isWindows() || t.contains("windows") || t.contains("mingw") || t.contains("msvc")) return "windows";
+        if (t.contains("freebsd")) return "freebsd";
+        if (t.contains("openbsd")) return "openbsd";
+        if (t.contains("netbsd")) return "netbsd";
+        if (t.contains("solaris") || t.contains("sunos")) return "sunos";
+        if (t.contains("aix")) return "aix";
+        return null;
+    }
+
+    private static boolean matchesTargetOs(String entry, TargetPlatform target) {
+        String os = targetOs(target);
+        if (os == null) return true;
+        String[] tokens = entry.toLowerCase(Locale.ROOT).split("[/\\\\.\\-_]");
+        boolean sawOs = false;
+        for (Map.Entry<String, List<String>> o : OS_ALIASES.entrySet()) {
+            for (String alias : o.getValue()) {
+                for (String t : tokens) {
+                    if (!t.equals(alias)) continue;
+                    if (o.getKey().equals(os)) {
+                        if (!os.equals("linux") || !containsToken(tokens, OS_ALIASES.get("android"))) return true;
+                    }
+                    sawOs = true;
+                }
+            }
+        }
+        return !sawOs;
+    }
+
+    private static boolean containsToken(String[] tokens, List<String> aliases) {
+        for (String t : tokens) {
+            if (aliases.contains(t)) return true;
+        }
+        return false;
+    }
+
+    private record ElfArch(int elfClass, int elfData, int machine) {}
+
+    private static final Map<String, ElfArch> ELF_ARCHES = Map.of(
+            "x86_64", new ElfArch(2, 1, 62),
+            "aarch64", new ElfArch(2, 1, 183),
+            "i686", new ElfArch(1, 1, 3),
+            "arm", new ElfArch(1, 1, 40),
+            "ppc64le", new ElfArch(2, 1, 21),
+            "ppc64", new ElfArch(2, 2, 21),
+            "s390x", new ElfArch(2, 2, 22),
+            "riscv64", new ElfArch(2, 1, 243),
+            "loongarch64", new ElfArch(2, 1, 258));
+
+    private static String targetArch(TargetPlatform target) {
+        String arch = target.triple().split("-")[0].toLowerCase(Locale.ROOT);
+        if (arch.matches("i[3-6]86")) return "i686";
+        if (arch.equals("arm64")) return "aarch64";
+        if (arch.equals("amd64")) return "x86_64";
+        if (arch.startsWith("arm")) return "arm";
+        if (arch.equals("powerpc64le")) return "ppc64le";
+        if (arch.equals("powerpc64")) return "ppc64";
+        return arch;
+    }
+
+    private static boolean elfMatchesTarget(byte[] bytes, TargetPlatform target) {
+        if (bytes.length < 20 || bytes[0] != 0x7f || bytes[1] != 'E' || bytes[2] != 'L' || bytes[3] != 'F') {
+            return true;
+        }
+        int elfClass = bytes[4] & 0xff;
+        int elfData = bytes[5] & 0xff;
+        int osAbi = bytes[7] & 0xff;
+        int machine = elfData == 2
+                ? ((bytes[18] & 0xff) << 8) | (bytes[19] & 0xff)
+                : ((bytes[19] & 0xff) << 8) | (bytes[18] & 0xff);
+
+        ElfArch expected = ELF_ARCHES.get(targetArch(target));
+        if (expected != null
+                && (elfClass != expected.elfClass()
+                || elfData != expected.elfData()
+                || machine != expected.machine())) {
+            return false;
+        }
+
+        String os = targetOs(target);
+        if (os == null) return true;
+        return switch (os) {
+            case "linux", "android" -> osAbi == 0 || osAbi == 3;
+            case "freebsd" -> osAbi == 0 || osAbi == 9;
+            case "netbsd" -> osAbi == 0 || osAbi == 2;
+            case "openbsd" -> osAbi == 0 || osAbi == 12;
+            case "sunos" -> osAbi == 0 || osAbi == 6;
+            case "aix" -> osAbi == 0 || osAbi == 7;
+            default -> true;
+        };
+    }
 
     private static boolean matchesTargetArch(String entry, TargetPlatform target) {
         String arch = target.triple().split("-")[0].toLowerCase(Locale.ROOT);

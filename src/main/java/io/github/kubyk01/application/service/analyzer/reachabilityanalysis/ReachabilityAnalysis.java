@@ -1617,6 +1617,15 @@ public class ReachabilityAnalysis {
         addClassWithInit(className, fromUser);
     }
 
+    public void triggerStaticFieldClinit(String owner, String fieldName, boolean fromUser) {
+        FieldNode field = resolver.getField(owner, fieldName);
+        String declaring = field != null && field.getOwner() != null && !field.getOwner().isEmpty()
+            ? field.getOwner()
+            : owner;
+        if (!declaring.equals(owner)) addClass(owner, fromUser);
+        addClassWithInit(declaring, fromUser);
+    }
+
     void addMethod(MethodReference ref, boolean isUser) {
         if (reachableMethods.add(ref)) {
             if (isUser) {

@@ -280,7 +280,7 @@ public class MethodBytecodeVisitor extends ClassVisitor {
         @Override
         public void visitFieldInsn(int opcode, String owner, String name, String descriptor) {
             if (opcode == Opcodes.GETSTATIC || opcode == Opcodes.PUTSTATIC) {
-                analysis.triggerClinit(owner, reachableFromUser);
+                analysis.triggerStaticFieldClinit(owner, name, reachableFromUser);
             }
             simulator.visitFieldInsn(opcode, owner, name, descriptor);
             super.visitFieldInsn(opcode, owner, name, descriptor);
@@ -1843,10 +1843,6 @@ public class MethodBytecodeVisitor extends ClassVisitor {
                 || "Ljava/lang/reflect/Field;".equals(descriptor)
                 || "Ljava/lang/reflect/Constructor;".equals(descriptor)
                 || "Ljava/lang/Class;".equals(descriptor);
-        }
-
-        void visitMethodInsn(int opcode, String desc) {
-            visitMethodInsn(opcode, desc, null);
         }
 
         void visitMethodInsn(int opcode, String desc, TypedValue overrideResult) {

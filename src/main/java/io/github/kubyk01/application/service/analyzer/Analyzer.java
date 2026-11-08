@@ -712,7 +712,7 @@ public class Analyzer {
                     cn = resolver.getClassNode(owner);
                     if (cn == null) continue;
                 }
-                if (cn.isExternal() || cn.isInterface()) continue;
+                if (cn.isExternal()) continue;
 
                 boolean declaresClinit = false;
                 for (MethodNode mn : cn.getMethods()) {
@@ -750,12 +750,12 @@ public class Analyzer {
             Set<String> referenced = collectTriggeredOwners(module, resolver);
             for (String owner : referenced) {
                 ClassNode cn = resolver.getClassNode(owner);
-                if (cn == null || cn.isExternal() || cn.isInterface()) continue;
+                if (cn == null || cn.isExternal()) continue;
 
                 if (resolver.getClassBytes(owner) == null) {
                     resolver.reloadSystemClass(owner);
                     cn = resolver.getClassNode(owner);
-                    if (cn == null || cn.isExternal() || cn.isInterface()) continue;
+                    if (cn == null || cn.isExternal()) continue;
                 }
                 boolean declaresClinit = false;
                 for (MethodNode mn : cn.getMethods()) {
