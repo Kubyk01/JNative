@@ -434,48 +434,34 @@ public class LlvmFunctionEmitter {
 
     private Set<Value> computeTryCrossingValues(Function func) {
         Set<Value> result = new HashSet<>();
-        List<TryCatchRange> ranges = func.getTryCatchRanges();
-        if (ranges == null || ranges.isEmpty()) return result;
-
-        Map<String, BasicBlock> byLabel = new HashMap<>();
-        for (BasicBlock b : func.getBlocks()) {
-            byLabel.put(b.getLabel(), b);
-        }
+        if (handlerBlockByRange.isEmpty()) return result;
 
         BasicBlock entry = func.getEntryBlock();
         boolean entryHasBodyLabel = Boolean.TRUE.equals(tryRegionEntry.get(entry));
 
-        for (TryCatchRange range : ranges) {
-            BasicBlock handler = byLabel.get("L" + range.handler);
-            if (handler == null) continue;
-
-            Set<BasicBlock> bodySet = new HashSet<>();
-            for (Map.Entry<BasicBlock, List<TryCatchRange>> e : blockToTryRanges.entrySet()) {
-                if (e.getValue().contains(range)) bodySet.add(e.getKey());
-            }
-            if (bodySet.isEmpty()) continue;
-
+        Set<BasicBlock> handlers = new LinkedHashSet<>(handlerBlockByRange.values());
+        for (BasicBlock handler : handlers) {
             Set<BasicBlock> catchReachable = new HashSet<>();
             Deque<BasicBlock> worklist = new ArrayDeque<>();
             worklist.add(handler);
             while (!worklist.isEmpty()) {
                 BasicBlock cur = worklist.poll();
                 if (!catchReachable.add(cur)) continue;
-                for (BasicBlock succ : cur.getSuccessors()) {
+                for (BasicBlock succ : successorsOf(cur)) {
                     if (!catchReachable.contains(succ)) worklist.add(succ);
                 }
             }
 
-            for (BasicBlock B : catchReachable) {
-                for (Instruction inst : B.getInstructions()) {
+            for (BasicBlock useBlock : catchReachable) {
+                for (Instruction inst : useBlock.getInstructions()) {
                     for (Value op : inst.getOperands()) {
-                        addIfCrossing(result, op, B, bodySet, entry, entryHasBodyLabel);
+                        addIfCrossing(result, op, useBlock, catchReachable, entry, entryHasBodyLabel);
                     }
                 }
-                Terminator term = B.getTerminator();
+                Terminator term = useBlock.getTerminator();
                 if (term != null) {
                     for (Value op : terminatorOperands(term)) {
-                        addIfCrossing(result, op, B, bodySet, entry, entryHasBodyLabel);
+                        addIfCrossing(result, op, useBlock, catchReachable, entry, entryHasBodyLabel);
                     }
                 }
             }
@@ -483,12 +469,12 @@ public class LlvmFunctionEmitter {
         return result;
     }
 
-    private static void addIfCrossing(Set<Value> result,
-                                      Value op,
-                                      BasicBlock useBlock,
-                                      Set<BasicBlock> bodyBlocks,
-                                      BasicBlock entry,
-                                      boolean entryHasBodyLabel) {
+    private void addIfCrossing(Set<Value> result,
+                               Value op,
+                               BasicBlock useBlock,
+                               Set<BasicBlock> catchReachable,
+                               BasicBlock entry,
+                               boolean entryHasBodyLabel) {
         if (!(op instanceof Temporary t)) return;
         Instruction def = t.getDefiningInstruction();
         if (def == null) return;
@@ -496,7 +482,9 @@ public class LlvmFunctionEmitter {
         if (defBlock == null) return;
         if (defBlock == useBlock) return;
         if (defBlock == entry && !entryHasBodyLabel) return;
-        if (!bodyBlocks.contains(defBlock)) return;
+        boolean definedOnProtectedPath = !catchReachable.contains(defBlock)
+                || blockToTryRanges.containsKey(defBlock);
+        if (!definedOnProtectedPath) return;
         result.add(op);
     }
 
@@ -2417,7 +2405,7 @@ public class LlvmFunctionEmitter {
                     retLabel = llvmLabel(rb);
                 }
                 String fn = inst.getParent() != null && inst.getParent().getFunction() != null
-                        ? LlvmRuntime.mangleFunction(inst.getParent().getFunction().getName())
+                        ? inst.getParent().getFunction().getName()
                         : "";
                 sb.append("  ").append(resultName)
                         .append(" = bitcast i8* blockaddress(@").append(fn)
@@ -2731,23 +2719,37 @@ public class LlvmFunctionEmitter {
                 && !valueSlots.containsKey(inst.getResult())) {
 
             resultName = valueMapper.getValue(inst.getResult());
-            String needle = "  " + resultName + " = ";
-            boolean resultActuallyDefined = resultName != null
-                    && sb.toString().contains(needle);
+            Type resType = inst.getResult().getType();
+            String resLlvm = LlvmTypeMapper.toLlvmType(resType);
 
-            if (resultActuallyDefined) {
-                Type resType = inst.getResult().getType();
-                String resLlvm = LlvmTypeMapper.toLlvmType(resType);
+            if (resultName != null && !"void".equals(resLlvm) && !endsWithTerminator(sb)) {
+                String spilled = "null".equals(resultName) && !resLlvm.endsWith("*")
+                        ? getDefaultValue(resType)
+                        : resultName;
                 String slot = newAux("try_slot");
                 pendingSlotDeclarations.add(
                         "  " + slot + " = alloca " + resLlvm + ", align 8\n");
-                sb.append("  store ").append(resLlvm).append(" ").append(resultName)
+                sb.append("  store ").append(resLlvm).append(" ").append(spilled)
                         .append(", ").append(resLlvm).append("* ").append(slot).append("\n");
                 valueSlots.put(inst.getResult(), slot);
             }
         }
 
         return sb.toString();
+    }
+
+    private static boolean endsWithTerminator(StringBuilder sb) {
+        int end = sb.length();
+        while (end > 0 && sb.charAt(end - 1) == '\n') end--;
+        if (end == 0) return false;
+        int start = sb.lastIndexOf("\n", end - 1) + 1;
+        String line = sb.substring(start, end).trim();
+        return line.startsWith("unreachable")
+                || line.startsWith("ret ") || line.equals("ret void")
+                || line.startsWith("br ")
+                || line.startsWith("switch ")
+                || line.startsWith("indirectbr ")
+                || line.startsWith("resume ");
     }
 
     private static BasicBlock getBasicBlock(Instruction inst) {

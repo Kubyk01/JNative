@@ -214,6 +214,11 @@ public class DestructorInserter {
      */
     private int splitId = 0;
 
+    private static String baseLabel(String label) {
+        int i = label.indexOf("_rel_");
+        return i < 0 ? label : label.substring(0, i);
+    }
+
     /**
      * Instruments every PUT_FIELD that stores a reference-typed value into a
      * reference-typed field, whose previous value is provably dead, with a
@@ -641,7 +646,7 @@ public class DestructorInserter {
 
         // ---- 1. Split: move [instIdx, end) to a new tail block ----
         BasicBlock tail = new BasicBlock(
-            block.getLabel() + "_rel_tail_" + (++splitId));
+            baseLabel(block.getLabel()) + "_rel_tail_" + (++splitId));
         func.addBlock(tail);
 
         List<Instruction> moved = new ArrayList<>(insts.subList(instIdx, insts.size()));
@@ -779,7 +784,7 @@ public class DestructorInserter {
 
         // ---- 6. Dispatch block ----
         BasicBlock dispatch = new BasicBlock(
-            block.getLabel() + "_rel_dispatch_" + (++splitId));
+            baseLabel(block.getLabel()) + "_rel_dispatch_" + (++splitId));
         func.addBlock(dispatch);
         block.setTerminator(new CondBranchTerminator(skipResult, tail, dispatch));
 
@@ -819,7 +824,7 @@ public class DestructorInserter {
             current.addInstruction(isT);
 
             BasicBlock freeBlock = new BasicBlock(
-                current.getLabel() + "_rel_free_" + (++splitId));
+                baseLabel(current.getLabel()) + "_rel_free_" + (++splitId));
             func.addBlock(freeBlock);
 
             BasicBlock next;
@@ -827,7 +832,7 @@ public class DestructorInserter {
                 next = tail;
             } else {
                 next = new BasicBlock(
-                    current.getLabel() + "_rel_next_" + (++splitId));
+                    baseLabel(current.getLabel()) + "_rel_next_" + (++splitId));
                 func.addBlock(next);
             }
 
