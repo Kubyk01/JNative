@@ -199,11 +199,9 @@ public class LlvmGenerator implements LlvmGeneratorPort {
         RegionSet preludeKeys = new RegionSet(preludeDefs.size());
         for (String k : preludeDefs.keySet()) preludeKeys.add(k);
 
-        // ---- 1. Emit EVERY function body, grouped by owner class. The
-        //         bodies are accumulated in memory rather than streamed,
-        //         because the deferred strings they register are only known
-        //         once emission is finished. (Typically tens-to-hundreds of
-        //         MB, which fits the heap.) ----
+        // ---- 1. Emit EVERY function body, grouped by owner class. Bodies
+        //         are emitted in batches and spooled to one file per class,
+        //         so the heap never holds the whole program's IR text. ----
         List<Function> toEmit = new ArrayList<>();
         for (Function f : module.getFunctions()) {
             if (f.getEntryBlock() != null) toEmit.add(f);
@@ -211,25 +209,42 @@ public class LlvmGenerator implements LlvmGeneratorPort {
         toEmit.sort(Comparator.comparing(f ->
             f.getOwnerClass() == null ? "" : f.getOwnerClass()));
 
-        List<String> bodies = LlvmUtil.parallelMapOrdered(toEmit, scheduler, func -> {
-            LlvmFunctionEmitter emitter = new LlvmFunctionEmitter(
-                module, globalEmitter, polymorphicResolverRef, resolver);
-            return emitter.emitFunction(func);
-        });
+        Path spoolDir = outputDir.resolve(".jnative-spool");
+        deleteTree(spoolDir);
+        Files.createDirectories(spoolDir);
+        Path moduleSpool = spoolDir.resolve(".module.body");
+        Map<String, Path> classSpools = new LinkedHashMap<>();
 
-        Map<String, StringBuilder> classBodies = new LinkedHashMap<>();
-        StringBuilder moduleBodies = new StringBuilder();
-        for (int i = 0; i < toEmit.size(); i++) {
-            Function func = toEmit.get(i);
-            String body = bodies.get(i);
-            String owner = func.getOwnerClass();
-            if (owner != null && !owner.isEmpty()) {
-                classBodies.computeIfAbsent(owner, k -> new StringBuilder()).append(body);
-            } else {
-                moduleBodies.append(body);
+        String openOwner = null;
+        java.io.Writer openWriter = null;
+        try {
+            for (int from = 0; from < toEmit.size(); from += EMIT_BATCH) {
+                List<Function> batch = new ArrayList<>(
+                    toEmit.subList(from, Math.min(toEmit.size(), from + EMIT_BATCH)));
+                List<String> bodies = LlvmUtil.parallelMapOrdered(batch, scheduler, func -> {
+                    LlvmFunctionEmitter emitter = new LlvmFunctionEmitter(
+                        module, globalEmitter, polymorphicResolverRef, resolver);
+                    return emitter.emitFunction(func);
+                });
+                for (int i = 0; i < batch.size(); i++) {
+                    String owner = batch.get(i).getOwnerClass();
+                    String key = owner == null ? "" : owner;
+                    if (!key.equals(openOwner)) {
+                        if (openWriter != null) openWriter.close();
+                        openWriter = null;
+                        Path spool = key.isEmpty()
+                            ? moduleSpool
+                            : classSpools.computeIfAbsent(key, k -> spoolPath(spoolDir, k));
+                        openWriter = openSpool(spool);
+                        openOwner = key;
+                    }
+                    openWriter.write(bodies.get(i));
+                    bodies.set(i, null);
+                }
             }
+        } finally {
+            if (openWriter != null) openWriter.close();
         }
-        bodies = null; // the text now lives in classBodies/moduleBodies only
 
         // ---- 2. Deferred strings are now fully known. Collect them. ----
         String deferred = globalEmitter.generateDeferredStringConstants();
@@ -273,8 +288,11 @@ public class LlvmGenerator implements LlvmGeneratorPort {
                 }
                 moduleDecls.append(emitDeclaration(func));
                 if (func.getName().startsWith("__jnative_fn_java_lang_invoke_MethodHandle_invoke")) {
-                    classBodies.computeIfAbsent("java/lang/invoke/MethodHandle", k -> new StringBuilder())
-                        .append(emitWeakDefaultDefinition(func));
+                    Path spool = classSpools.computeIfAbsent(
+                        "java/lang/invoke/MethodHandle", k -> spoolPath(spoolDir, k));
+                    try (java.io.Writer w = openSpool(spool)) {
+                        w.write(emitWeakDefaultDefinition(func));
+                    }
                 }
             }
         }
@@ -290,6 +308,10 @@ public class LlvmGenerator implements LlvmGeneratorPort {
         // not double-count it.
         String runInit = generateRunAllInitializers();
         String main = generateMain();
+        String moduleBodies = Files.exists(moduleSpool)
+            ? Files.readString(moduleSpool, StandardCharsets.UTF_8)
+            : "";
+        Files.deleteIfExists(moduleSpool);
 
         String moduleTail = globalDefs
             + "\n" + lambdaVts
@@ -313,26 +335,48 @@ public class LlvmGenerator implements LlvmGeneratorPort {
         // Each file is independent: it reads only the immutable emission
         // results and the module. Building and writing them in parallel
         // keeps the single-threaded tail of the compiler short.
-        LlvmUtil.parallelMapOrdered(new ArrayList<>(classBodies.entrySet()), scheduler, e -> {
+        LlvmUtil.parallelMapOrdered(new ArrayList<>(classSpools.entrySet()), scheduler, e -> {
             String className = e.getKey();
-            StringBuilder bodyBuf = e.getValue();
-            String body = bodyBuf.toString();
-            bodyBuf.setLength(0); // drop the second copy of this class's text now
-            bodyBuf.trimToSize();
-
-            String externs = buildExterns(body, knownGlobals, module);
-
-            String prelude = buildFilteredPrelude(body, externs, preludeDefs, preludeKeys);
-
             try {
+                String body = Files.readString(e.getValue(), StandardCharsets.UTF_8);
+
+                String externs = buildExterns(body, knownGlobals, module);
+
+                String prelude = buildFilteredPrelude(body, externs, preludeDefs, preludeKeys);
+
                 Path out = outputDir.resolve(className + ".ll");
                 if (out.getParent() != null) Files.createDirectories(out.getParent());
                 writeLl(out, prelude, externs, body);
+                Files.deleteIfExists(e.getValue());
             } catch (IOException ex) {
                 throw new java.io.UncheckedIOException(ex);
             }
             return className;
         });
+        deleteTree(spoolDir);
+    }
+
+    private static final int EMIT_BATCH = 4096;
+
+    private static Path spoolPath(Path spoolDir, String className) {
+        return spoolDir.resolve(className + ".body");
+    }
+
+    private static java.io.Writer openSpool(Path spool) throws IOException {
+        if (spool.getParent() != null) Files.createDirectories(spool.getParent());
+        return Files.newBufferedWriter(spool, StandardCharsets.UTF_8,
+            java.nio.file.StandardOpenOption.CREATE,
+            java.nio.file.StandardOpenOption.WRITE,
+            java.nio.file.StandardOpenOption.APPEND);
+    }
+
+    private static void deleteTree(Path root) throws IOException {
+        if (!Files.exists(root)) return;
+        List<Path> paths;
+        try (java.util.stream.Stream<Path> walk = Files.walk(root)) {
+            paths = walk.sorted(Comparator.reverseOrder()).toList();
+        }
+        for (Path p : paths) Files.deleteIfExists(p);
     }
 
     /**

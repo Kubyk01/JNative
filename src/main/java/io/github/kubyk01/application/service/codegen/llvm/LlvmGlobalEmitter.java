@@ -1931,6 +1931,8 @@ public class LlvmGlobalEmitter {
             ClassNode superNode = resolver.getClassNode(cls.getSuperName());
             if (superNode != null && !superNode.isExternal()) {
                 result.addAll(collectInstanceFields(superNode));
+            } else {
+                result.addAll(phantomFields().getOrDefault(cls.getSuperName(), List.of()));
             }
         }
         for (FieldNode f : cls.getFields()) {
@@ -1939,6 +1941,108 @@ public class LlvmGlobalEmitter {
             }
         }
         return result;
+    }
+
+    private volatile Map<String, List<FieldNode>> phantomFields;
+    private final Set<FieldNode> phantomNodes = Collections.newSetFromMap(new IdentityHashMap<>());
+
+    private Map<String, List<FieldNode>> phantomFields() {
+        Map<String, List<FieldNode>> p = phantomFields;
+        if (p != null) return p;
+        synchronized (this) {
+            if (phantomFields == null) phantomFields = collectPhantomFields();
+            return phantomFields;
+        }
+    }
+
+    private Map<String, List<FieldNode>> collectPhantomFields() {
+        Map<String, Set<String>> names = new TreeMap<>();
+        for (Function function : module.getFunctions()) {
+            for (BasicBlock block : function.getBlocks()) {
+                for (Instruction inst : block.getInstructions()) {
+                    Opcode op = inst.getOpcode();
+                    String owner;
+                    String field;
+                    if (op == Opcode.GET_FIELD || op == Opcode.PUT_FIELD) {
+                        if (inst.getOperands().size() < 2
+                            || !(inst.getOperands().get(1) instanceof Constant c)
+                            || !c.getType().isReference()) continue;
+                        String full = extractFieldName(inst);
+                        int dot = full.lastIndexOf('.');
+                        if (dot > 0) {
+                            owner = full.substring(0, dot);
+                            field = full.substring(dot + 1);
+                        } else {
+                            Value base = inst.getOperands().getFirst();
+                            if (base == null || base.getType() == null) continue;
+                            owner = LlvmUtil.extractClassName(base);
+                            field = full;
+                        }
+                    } else if (op == Opcode.VIRTUAL_CALL) {
+                        VarHandleTargetResolver.Target vh = getVarHandleTargets().resolveCallSite(inst);
+                        if (vh == null || vh.kind() != VarHandleTargetResolver.Kind.INSTANCE_FIELD) continue;
+                        owner = vh.owner();
+                        field = vh.fieldName();
+                    } else {
+                        continue;
+                    }
+                    if (owner == null || field == null || field.isEmpty()
+                        || LlvmTypeMapper.LAZY_CLINIT_FLAG_FIELD.equals(field)) continue;
+                    String host = unresolvedFieldHost(owner, field);
+                    if (host != null) names.computeIfAbsent(host, k -> new TreeSet<>()).add(field);
+                }
+            }
+        }
+        Map<String, List<FieldNode>> out = new HashMap<>();
+        Type slotType = Type.reference("java/lang/Object");
+        for (Map.Entry<String, Set<String>> e : names.entrySet()) {
+            List<FieldNode> list = new ArrayList<>(e.getValue().size());
+            for (String name : e.getValue()) {
+                FieldNode fn = FieldNode.builder()
+                    .name(name)
+                    .descriptor("Ljava/lang/Object;")
+                    .type(slotType)
+                    .access(Opcodes.ACC_PRIVATE | Opcodes.ACC_SYNTHETIC)
+                    .owner(e.getKey())
+                    .build();
+                list.add(fn);
+                phantomNodes.add(fn);
+            }
+            out.put(e.getKey(), List.copyOf(list));
+        }
+        return out;
+    }
+
+    private String unresolvedFieldHost(String owner, String field) {
+        if ("java/lang/Class".equals(owner) || "java/lang/Object".equals(owner)) return null;
+        ClassNode cn = resolver.getClassNode(owner);
+        if (cn == null || cn.isInterface()) return null;
+        if (cn.isExternal()) return owner.startsWith("[") ? null : owner;
+        Set<String> seen = new HashSet<>();
+        while (seen.add(cn.getName())) {
+            for (FieldNode f : cn.getFields()) {
+                if ((f.getAccess() & Opcodes.ACC_STATIC) == 0 && f.getName().equals(field)) return null;
+            }
+            String sup = cn.getSuperName();
+            if (sup == null || sup.equals("java/lang/Object") || sup.equals(cn.getName())) return null;
+            ClassNode next = resolver.getClassNode(sup);
+            if (next == null || next.isExternal()) return sup;
+            cn = next;
+        }
+        return null;
+    }
+
+    private int phantomFieldOffset(String className, String fieldName) {
+        List<FieldNode> fields = phantomFields().get(className);
+        if (fields == null) return -1;
+        int offset = OBJECT_HEADER_SIZE;
+        for (FieldNode f : fields) {
+            int align = fieldAlignment(f.getType());
+            offset = (offset + align - 1) & -align;
+            if (f.getName().equals(fieldName)) return offset;
+            offset += fieldSize(f.getType());
+        }
+        return -1;
     }
 
     // =========================================================================
@@ -2736,8 +2840,10 @@ public class LlvmGlobalEmitter {
                 "Cannot resolve class for field offset: " + className + "." + fieldName);
         }
         if (cls.isExternal()) {
-            fieldOffsets.put(key, OBJECT_HEADER_SIZE);
-            return OBJECT_HEADER_SIZE;
+            int phantom = phantomFieldOffset(className, fieldName);
+            int offset = phantom >= 0 ? phantom : OBJECT_HEADER_SIZE;
+            fieldOffsets.put(key, offset);
+            return offset;
         }
 
         List<FieldNode> allFields = collectInstanceFields(cls);
@@ -3047,6 +3153,7 @@ public class LlvmGlobalEmitter {
                     Map<String, FieldNode> mostDerivedByName = new LinkedHashMap<>();
                     for (FieldNode f : collectInstanceFields(classNode)) {
                         if ((f.getAccess() & Opcodes.ACC_STATIC) != 0) continue;
+                        if (phantomNodes.contains(f)) continue;
                         mostDerivedByName.put(f.getName(), f);
                     }
                     for (FieldNode f : mostDerivedByName.values()) {
