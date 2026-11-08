@@ -152,6 +152,7 @@ public class LlvmRuntime {
             declare void @__jnative_push_catch(i8*, i8**)
             declare void @__jnative_pop_catch()
             declare void @__jnative_throw_exception(i8*)
+            declare i8* @__jnative_construct_exception(i8*, i8*)
             declare i8* @__jnative_get_exception_object()
             declare i1 @__jnative_catch_matches(i8*, i8**)
 

@@ -51,7 +51,6 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static io.github.kubyk01.util.LlvmUtil.isAllocation;
-import static io.github.kubyk01.util.LlvmUtil.isSystemClassName;
 
 @Slf4j
 public class Analyzer {
@@ -1486,7 +1485,7 @@ public class Analyzer {
         Deque<Function> work = new ArrayDeque<>();
 
         for (Function f : module.getFunctions()) {
-            if (f.getEntryBlock() == null || isSystemClassName(f.getOwnerClass())) continue;
+            if (f.getEntryBlock() == null) continue;
             for (BasicBlock b : f.getBlocks()) {
                 for (Instruction inst : b.getInstructions()) {
                     Opcode op = inst.getOpcode();
@@ -1495,7 +1494,7 @@ public class Analyzer {
                     for (int k = 0; k < Math.min(2, inst.getOperands().size()); k++) {
                         Function target = resolveCallTarget(module, extractCalleeConstant(inst, k));
                         if (target == null) continue;
-                        if (target.isJniNative() && !isSystemClassName(target.getOwnerClass())) {
+                        if (target.isJniNative() && target.getEntryBlock() == null) {
                             if (tainted.add(f)) work.add(f);
                         } else {
                             callers.computeIfAbsent(target, x -> new HashSet<>()).add(f);
@@ -1514,7 +1513,7 @@ public class Analyzer {
 
         Set<String> result = new LinkedHashSet<>();
         for (Function c : clinitOrder) {
-            if (!isSystemClassName(c.getOwnerClass()) && tainted.contains(c)) result.add(c.getName());
+            if (tainted.contains(c)) result.add(c.getName());
         }
         if (!result.isEmpty()) {
             System.out.println("Deferring " + result.size()

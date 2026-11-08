@@ -171,7 +171,10 @@ public class CLI implements Runnable {
                 Manifest manifest = jar.getManifest();
                 if (manifest != null) {
                     Attributes mainAttrs = manifest.getMainAttributes();
-                    String mainClass = mainAttrs.getValue("Main-Class");
+                    String mainClass = mainAttrs.getValue("Start-Class");
+                    if (mainClass == null || mainClass.isEmpty()) {
+                        mainClass = mainAttrs.getValue("Main-Class");
+                    }
                     if (mainClass != null && !mainClass.isEmpty()) {
                         entryClass = mainClass.replace('.', '/');
                     }

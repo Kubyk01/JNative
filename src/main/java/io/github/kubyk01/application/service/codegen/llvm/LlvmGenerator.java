@@ -918,6 +918,29 @@ public class LlvmGenerator implements LlvmGeneratorPort {
     }
 
     /** Stub from the first call site in {@code body}, else in {@code extra} (the two were once one concatenated string). */
+    private static List<String> lambdaMarkerInterfaces(InvokeDynamicInfo info) {
+        List<String> out = new ArrayList<>();
+        Handle bsm = info.bootstrapMethod();
+        if (bsm == null || !"altMetafactory".equals(bsm.getName())) return out;
+        Object[] args = info.bootstrapArgs();
+        if (args == null || args.length < 4 || !(args[3] instanceof Integer flags)) return out;
+        int i = 4;
+        if ((flags & java.lang.invoke.LambdaMetafactory.FLAG_MARKERS) != 0
+                && i < args.length && args[i] instanceof Integer count) {
+            i++;
+            for (int k = 0; k < count && i < args.length; k++, i++) {
+                if (args[i] instanceof org.objectweb.asm.Type t
+                        && t.getSort() == org.objectweb.asm.Type.OBJECT) {
+                    out.add(t.getInternalName());
+                }
+            }
+        }
+        if ((flags & java.lang.invoke.LambdaMetafactory.FLAG_SERIALIZABLE) != 0) {
+            out.add("java/io/Serializable");
+        }
+        return out;
+    }
+
     private static String weakNativeStub(String name, String body, String extra) {
         String stub = weakNativeStub(name, body);
         return stub != null || extra.isEmpty() ? stub : weakNativeStub(name, extra);
@@ -1851,7 +1874,8 @@ public class LlvmGenerator implements LlvmGeneratorPort {
             builder.createFunction(adaptorName, retType, allParamTypes);
 
         globalEmitter.registerLambdaClass(
-            lambdaId, samInterface, samSig, adaptorName, call.getCapturedTypes());
+            lambdaId, samInterface, samSig, adaptorName, call.getCapturedTypes(),
+            lambdaMarkerInterfaces(info));
 
         builder.createBlock(adaptorName + "_entry");
         BasicBlock entry = builder.currentBlock();

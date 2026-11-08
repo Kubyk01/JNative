@@ -79,6 +79,13 @@ void* __jnative_fn_jdk_internal_loader_NativeLibraries_findBuiltinLib__Ljava_lan
     }
     if (n == 0) return NULL;
 
+#if !defined(_WIN32)
+    if (n > 3 && strncmp(base, "lib", 3) == 0) {
+        memmove(base, base + 3, n - 3 + 1);
+        n -= 3;
+    }
+#endif
+
     static const char* const builtins[] = {
         "java", "net", "nio", "zip", "jimage",
         "extnet", "verify", "unpack", "syslookup",

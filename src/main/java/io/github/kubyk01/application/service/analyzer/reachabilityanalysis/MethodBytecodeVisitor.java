@@ -980,6 +980,7 @@ public class MethodBytecodeVisitor extends ClassVisitor {
                     if (targetClass == null
                         && receiver.getType().isReference()
                         && "java/lang/Class".equals(receiver.getType().getClassName())) {
+                        analysis.addOpaqueReflectiveMethodName(methodName);
                         return null;
                     }
                 }
@@ -1138,6 +1139,7 @@ public class MethodBytecodeVisitor extends ClassVisitor {
             }
             if (owner.equals("java/lang/reflect/Method") && mName.equals("invoke")
                 && mDesc.equals("(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;")) {
+                analysis.enableReflectiveInvoke();
                 for (String cls : reachableClasses) {
                     ReflectClassInfo info = reflectInfo.getOrCreateClassInfo(cls);
                     for (MethodReference method : info.getMethods()) {
@@ -1164,6 +1166,7 @@ public class MethodBytecodeVisitor extends ClassVisitor {
                     targetClass = resolveClassNameFromValue(receiver);
                 }
                 if (targetClass == null) {
+                    analysis.enableOpaqueNewInstance(reachableFromUser);
                     targetClass = lastLoadedClass;
                 }
                 if (targetClass != null) {

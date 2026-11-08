@@ -122,10 +122,104 @@ public class ReachabilityAnalysis {
         addClassWithInit(className, fromUser);
     }
 
+    private final AtomicBoolean opaqueNewInstance = new AtomicBoolean();
+
+    private final Set<String> opaqueNewInstanceDone = ConcurrentHashMap.newKeySet();
+
+    private final AtomicBoolean reflectiveInvoke = new AtomicBoolean();
+
     public void addClassLiteral(String className, boolean fromUser) {
         if (className == null || className.isEmpty()) return;
-        reflectInfo.getOrCreateClassInfo(className);
+        registerDeclaredMethods(reflectInfo.getOrCreateClassInfo(className));
         addClass(className, fromUser);
+        if (opaqueNewInstance.get()) registerNewInstanceTarget(className, fromUser);
+    }
+
+    public void enableReflectiveInvoke() {
+        reflectiveInvoke.set(true);
+    }
+
+    private void registerDeclaredMethods(ReflectClassInfo info) {
+        String className = info.getClassName();
+        if (className.charAt(0) == '[' || LlvmUtil.isSystemClassName(className)) return;
+        ClassNode classNode = resolver.getClassNode(className);
+        if (classNode == null || classNode.isExternal() || classNode.getMethods() == null) return;
+        for (MethodNode m : classNode.getMethods()) {
+            if (m.getName().equals("<init>") || m.getName().equals("<clinit>")) continue;
+            info.addMethod(new MethodReference(className, m.getName(), m.getDescriptor()));
+        }
+    }
+
+    private final List<String> opaqueMethodNames = new java.util.concurrent.CopyOnWriteArrayList<>();
+
+    private final Map<String, Integer> opaqueMethodNamesScanned = new ConcurrentHashMap<>();
+
+    public void addOpaqueReflectiveMethodName(String methodName) {
+        if (methodName == null || methodName.isEmpty() || opaqueMethodNames.contains(methodName)) return;
+        synchronized (opaqueMethodNames) {
+            if (!opaqueMethodNames.contains(methodName)) opaqueMethodNames.add(methodName);
+        }
+    }
+
+    private boolean addOpaqueReflectiveMethods() {
+        List<String> names = List.copyOf(opaqueMethodNames);
+        if (names.isEmpty()) return false;
+        boolean added = false;
+        for (String className : new ArrayList<>(reachableClasses)) {
+            int from = opaqueMethodNamesScanned.getOrDefault(className, 0);
+            if (from >= names.size()) continue;
+            opaqueMethodNamesScanned.put(className, names.size());
+            if (className.charAt(0) == '[' || resolver.isMissingClass(className)) continue;
+            ClassNode classNode = resolver.getClassNode(className);
+            if (classNode == null || classNode.getMethods() == null) continue;
+            Set<String> wanted = new HashSet<>(names.subList(from, names.size()));
+            for (MethodNode m : classNode.getMethods()) {
+                if (!wanted.contains(m.getName())) continue;
+                MethodReference ref = new MethodReference(className, m.getName(), m.getDescriptor());
+                reflectInfo.addMethod(className, ref);
+                if (!reachableMethods.contains(ref)) {
+                    addMethod(ref, true);
+                    added = true;
+                }
+            }
+        }
+        return added;
+    }
+
+    private boolean addReflectedMethods() {
+        if (!reflectiveInvoke.get()) return false;
+        boolean added = false;
+        for (ReflectClassInfo info : new ArrayList<>(reflectInfo.getClassInfoMap().values())) {
+            for (MethodReference m : new ArrayList<>(info.getMethods())) {
+                if (!reachableMethods.contains(m)) {
+                    addMethod(m, true);
+                    added = true;
+                }
+            }
+        }
+        return added;
+    }
+
+    public void enableOpaqueNewInstance(boolean fromUser) {
+        if (!opaqueNewInstance.compareAndSet(false, true)) return;
+        for (String className : new ArrayList<>(reflectInfo.getAllClasses())) {
+            registerNewInstanceTarget(className, fromUser);
+        }
+    }
+
+    private void registerNewInstanceTarget(String className, boolean fromUser) {
+        if (className.charAt(0) == '[' || !opaqueNewInstanceDone.add(className)) return;
+        ClassNode classNode = resolver.getClassNode(className);
+        if (classNode == null || classNode.isExternal() || classNode.isInterface()) return;
+        if ((classNode.getAccess() & Opcodes.ACC_ABSTRACT) != 0 || classNode.getMethods() == null) return;
+        for (MethodNode m : classNode.getMethods()) {
+            if (m.getName().equals("<init>") && m.getDescriptor().equals("()V")) {
+                MethodReference ref = new MethodReference(className, "<init>", "()V");
+                reflectInfo.addConstructor(className, ref);
+                addMethod(ref, fromUser);
+                addInstantiatedClass(className, fromUser);
+            }
+        }
     }
 
     public void registerClassLiterals(Module module) {
@@ -154,7 +248,8 @@ public class ReachabilityAnalysis {
         if (!"java/lang/Class".equals(c.getType().getClassName())) return;
         Object val = c.getValue();
         if (!(val instanceof String name) || name.isEmpty()) return;
-        addClassLiteral(name, false);
+        reflectInfo.getOrCreateClassInfo(name);
+        addClass(name, false);
     }
 
     private static List<Value> terminatorOperandsOf(Terminator term) {
@@ -649,6 +744,26 @@ public class ReachabilityAnalysis {
      * worklist has not been seeded with the entry point and driving the
      * fixed point would discard the entry.</p>
      */
+    public void addReflectivelyInstantiatedClass(String className) {
+        if (className == null || className.isEmpty()) return;
+        ClassNode classNode = resolver.getClassNode(className);
+        if (classNode == null || classNode.isExternal() || classNode.isInterface()) return;
+        addInstantiatedClass(className, true);
+        ReflectClassInfo info = reflectInfo.getOrCreateClassInfo(className);
+        registerDeclaredMethods(info);
+        info.setSuperName(classNode.getSuperName());
+        info.getInterfaces().addAll(classNode.getInterfaces());
+        for (MethodNode m : classNode.getMethods()) {
+            if (m.getName().equals("<init>") && m.getDescriptor().equals("()V")) {
+                MethodReference ref = new MethodReference(className, "<init>", "()V");
+                info.addConstructor(ref);
+                addMethod(ref, true);
+            }
+        }
+        drainWorklist();
+        resolveVirtualDispatchFixedPoint();
+    }
+
     public void addExtraReachableMethod(MethodReference ref) {
         if (ref == null) return;
         if (reachableMethods.contains(ref)) return;
@@ -980,7 +1095,7 @@ public class ReachabilityAnalysis {
                 if (resolveVirtualDispatchSite(site)) addedAnySite.set(true);
                 return null;
             });
-            boolean addedAny = addedAnySite.get();
+            boolean addedAny = addedAnySite.get() | addOpaqueReflectiveMethods() | addReflectedMethods();
 
             // Step 3: drain the worklist. Newly added methods will have
             // their own bytecode scanned in the next iteration.

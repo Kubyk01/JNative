@@ -106,6 +106,37 @@ public class DependencyResolver {
 
     private final List<Path> scannedJars = new java.util.concurrent.CopyOnWriteArrayList<>();
 
+    private static final String SERVICES_PREFIX = "META-INF/services/";
+
+    private final Map<String, Set<String>> serviceProviders = new ConcurrentHashMap<>();
+
+    public Map<String, List<String>> getServiceProviders() {
+        Map<String, List<String>> out = new LinkedHashMap<>();
+        for (Map.Entry<String, Set<String>> e : new TreeMap<>(serviceProviders).entrySet()) {
+            synchronized (e.getValue()) {
+                out.put(e.getKey(), List.copyOf(e.getValue()));
+            }
+        }
+        return out;
+    }
+
+    private void addServiceFile(String entryName, byte[] content) {
+        String service = entryName.substring(SERVICES_PREFIX.length());
+        if (service.isEmpty() || service.indexOf('/') >= 0) return;
+        Set<String> providers = serviceProviders.computeIfAbsent(service,
+                k -> Collections.synchronizedSet(new LinkedHashSet<>()));
+        for (String line : new String(content, java.nio.charset.StandardCharsets.UTF_8).split("\\R")) {
+            int hash = line.indexOf('#');
+            String name = (hash >= 0 ? line.substring(0, hash) : line).trim();
+            if (!name.isEmpty()) providers.add(name);
+        }
+    }
+
+    private byte[] transformClass(byte[] bytes) {
+        if (!ServiceLoaderRewriter.ITERATOR.equals(new ClassReader(bytes).getClassName())) return bytes;
+        return ServiceLoaderRewriter.rewrite(bytes, getServiceProviders());
+    }
+
     public List<Path> getScannedJars() {
         return List.copyOf(scannedJars);
     }
@@ -455,6 +486,12 @@ public class DependencyResolver {
                     .filter(p -> p.toString().endsWith(".json")
                             && p.toString().contains(NATIVE_IMAGE_METADATA_PREFIX))
                     .forEach(this::parseMetadataFile);
+            try (var files = Files.walk(path)) {
+                for (Path file : (Iterable<Path>) files.filter(Files::isRegularFile)::iterator) {
+                    String rel = path.relativize(file).toString().replace('\\', '/');
+                    if (rel.startsWith(SERVICES_PREFIX)) addServiceFile(rel, Files.readAllBytes(file));
+                }
+            }
         } else if (path.toString().endsWith(".jar")) {
             // Load the input jar's classes first (as before), so the class map is
             // fully populated before any dependency detection runs.
@@ -519,6 +556,15 @@ public class DependencyResolver {
 
                 if (name.endsWith(".jar")) {
                     indexNestedJar(jar, jarPath, entry);
+                    continue;
+                }
+
+                int services = name.indexOf(SERVICES_PREFIX);
+                if (!entry.isDirectory() && (services == 0
+                        || (services > 0 && name.startsWith("classes/", services - "classes/".length())))) {
+                    try (InputStream is = jar.getInputStream(entry)) {
+                        addServiceFile(name.substring(services), is.readAllBytes());
+                    }
                     continue;
                 }
 
@@ -596,6 +642,8 @@ public class DependencyResolver {
                 } else if (entryName.startsWith(NATIVE_IMAGE_METADATA_PREFIX)
                         && entryName.endsWith(".json")) {
                     parseMetadataStream(zis, nestedName + "!/" + entryName);
+                } else if (entryName.startsWith(SERVICES_PREFIX) && !entry.isDirectory()) {
+                    addServiceFile(entryName, zis.readAllBytes());
                 }
 
                 zis.closeEntry();
@@ -653,7 +701,7 @@ public class DependencyResolver {
 
     private void parseClassStream(InputStream is) throws IOException {
         try {
-            byte[] bytes = is.readAllBytes();
+            byte[] bytes = transformClass(is.readAllBytes());
             ClassReader reader = new ClassReader(bytes);
 
             ClassNode.ClassNodeBuilder builder = ClassNode.builder();
@@ -777,6 +825,12 @@ public class DependencyResolver {
         }
     }
 
+    public boolean isMissingClass(String internalName) {
+        if (internalName == null || internalName.isEmpty() || isArrayTypeName(internalName)) return false;
+        getClassNode(internalName);
+        return missingClasses.contains(internalName);
+    }
+
     public ClassNode getClassNode(String internalName) {
     // Array types have no class file: return a synthetic ClassNode.
         if (isArrayTypeName(internalName)) {
@@ -809,7 +863,8 @@ public class DependencyResolver {
         return previous != null ? previous : stub;
     }
 
-    private void parseClassBytes(String internalName, byte[] bytes) throws IOException {
+    private void parseClassBytes(String internalName, byte[] original) throws IOException {
+        byte[] bytes = transformClass(original);
         ClassReader reader = new ClassReader(bytes);
         ClassNode.ClassNodeBuilder builder = ClassNode.builder();
         final String[] currentClassName = {null};

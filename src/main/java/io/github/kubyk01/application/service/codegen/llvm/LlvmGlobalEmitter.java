@@ -912,6 +912,19 @@ public class LlvmGlobalEmitter {
         sb.append("@JNATIVE_CTOR_EXC_TYPES_OFFSET        = constant i32 ").append(ctorExc).append("\n");
         sb.append("@JNATIVE_CTOR_MODIFIERS_OFFSET        = constant i32 ").append(ctorMods).append("\n");
         sb.append("@JNATIVE_CTOR_ROOT_OFFSET             = constant i32 ").append(ctorRoot).append("\n\n");
+
+        sb.append("@JNATIVE_SFI_MEMBERNAME_OFFSET    = constant i32 ")
+          .append(safeGlobalFieldOffsetAllowMissing("java/lang/StackFrameInfo", "memberName")).append("\n");
+        sb.append("@JNATIVE_SFI_BCI_OFFSET           = constant i32 ")
+          .append(safeGlobalFieldOffsetAllowMissing("java/lang/StackFrameInfo", "bci")).append("\n");
+        sb.append("@JNATIVE_MEMBERNAME_CLAZZ_OFFSET  = constant i32 ")
+          .append(safeGlobalFieldOffsetAllowMissing("java/lang/invoke/MemberName", "clazz")).append("\n");
+        sb.append("@JNATIVE_MEMBERNAME_NAME_OFFSET   = constant i32 ")
+          .append(safeGlobalFieldOffsetAllowMissing("java/lang/invoke/MemberName", "name")).append("\n");
+        sb.append("@JNATIVE_MEMBERNAME_TYPE_OFFSET   = constant i32 ")
+          .append(safeGlobalFieldOffsetAllowMissing("java/lang/invoke/MemberName", "type")).append("\n");
+        sb.append("@JNATIVE_MEMBERNAME_FLAGS_OFFSET  = constant i32 ")
+          .append(safeGlobalFieldOffsetAllowMissing("java/lang/invoke/MemberName", "flags")).append("\n\n");
         return sb.toString();
     }
 
@@ -1559,7 +1572,8 @@ public class LlvmGlobalEmitter {
                                       String samInterface,
                                       String samSig,
                                       String adaptorName,
-                                      List<Type> capturedTypes) {
+                                      List<Type> capturedTypes,
+                                      List<String> markerInterfaces) {
         prepareLayouts();
 
         if (samInterface == null
@@ -1600,6 +1614,13 @@ public class LlvmGlobalEmitter {
              */
             LinkedHashSet<String> superIfaces = new LinkedHashSet<>();
             collectLambdaSuperInterfaces(samInterface, superIfaces);
+            if (markerInterfaces != null) {
+                for (String marker : markerInterfaces) {
+                    ClassNode markerNode = resolver.getClassNode(marker);
+                    if (markerNode == null || !markerNode.isInterface()) continue;
+                    collectLambdaSuperInterfaces(marker, superIfaces);
+                }
+            }
             List<String> superIfacesList = new ArrayList<>(superIfaces);
 
             /*
@@ -2968,6 +2989,20 @@ public class LlvmGlobalEmitter {
     //  Reflection data
     // =========================================================================
 
+    private void addDeclaredMethodMetadata(ReflectClassInfo info) {
+        ClassNode cn = resolver.getClassNode(info.getClassName());
+        if (cn == null || cn.isExternal() || cn.getMethods() == null) return;
+        Set<String> present = new HashSet<>();
+        for (MethodReference m : info.getMethods()) present.add(m.getName() + m.getDescriptor());
+        for (MethodNode mn : cn.getMethods()) {
+            if (mn.getName().equals("<init>") || mn.getName().equals("<clinit>")) continue;
+            if (mn.getDescriptor() == null || mn.getDescriptor().isEmpty()) continue;
+            if (present.add(mn.getName() + mn.getDescriptor())) {
+                info.addMethod(new MethodReference(info.getClassName(), mn.getName(), mn.getDescriptor()));
+            }
+        }
+    }
+
     private String generateReflectionData() {
         StringBuilder sb = new StringBuilder();
         StringBuilder strConsts = new StringBuilder();
@@ -2994,6 +3029,7 @@ public class LlvmGlobalEmitter {
                 emitClasses.add(cls);
             }
             for (ReflectClassInfo info : reflectInfo.getClassInfoMap().values()) {
+                addDeclaredMethodMetadata(info);
                 for (MethodReference method : info.getMethods()) {
                     addReflectionDescriptorTypes(emitClasses, method.getDescriptor());
                 }
@@ -3740,12 +3776,24 @@ public class LlvmGlobalEmitter {
             sb.append("@jnative_function_index = global [1 x %JNativeFunctionEntry] [")
               .append("%JNativeFunctionEntry { i8* null, i8* null, %ReflectionClass* null }]\n");
             sb.append("@jnative_function_index_size = constant i64 0\n");
+            sb.append("@jnative_function_info = constant [1 x { i8*, i8*, i32 }] [")
+              .append("{ i8*, i8*, i32 } { i8* null, i8* null, i32 0 }]\n");
             return sb.toString();
         }
 
         StringBuilder strConsts = new StringBuilder();
         List<String> lines = new ArrayList<>(allFuncs.size());
+        List<String> infoLines = new ArrayList<>(allFuncs.size());
+        Map<String, Map<String, MethodNode>> methodsByMangled = new HashMap<>();
         for (Function f : allFuncs) {
+            MethodNode mn = methodForFunction(f, methodsByMangled);
+            if (mn != null) {
+                infoLines.add("  { i8*, i8*, i32 } { i8* " + ensureStringConstantPtr(strConsts, mn.getName())
+                              + ", i8* " + ensureStringConstantPtr(strConsts, mn.getDescriptor())
+                              + ", i32 " + mn.getAccess() + " }");
+            } else {
+                infoLines.add("  { i8*, i8*, i32 } { i8* null, i8* null, i32 0 }");
+            }
             String name = f.getName();
             String fnPtrTy = llvmFunctionPointerType(f);
             String namePtr = ensureStringConstantPtr(strConsts, name);
@@ -3770,8 +3818,30 @@ public class LlvmGlobalEmitter {
         sb.append("@jnative_function_index_size = constant i64 ")
           .append(allFuncs.size()).append("\n\n");
 
+        sb.append("@jnative_function_info = constant [")
+          .append(allFuncs.size())
+          .append(" x { i8*, i8*, i32 }] [\n");
+        sb.append(String.join(",\n", infoLines));
+        sb.append("\n]\n\n");
+
         sb.append(strConsts);
         return sb.toString();
+    }
+
+    private MethodNode methodForFunction(Function f, Map<String, Map<String, MethodNode>> cache) {
+        String owner = f.getOwnerClass();
+        if (owner == null || owner.isEmpty()) return null;
+        Map<String, MethodNode> byMangled = cache.computeIfAbsent(owner, k -> {
+            Map<String, MethodNode> m = new HashMap<>();
+            ClassNode cn = resolver.getClassNode(k);
+            if (cn != null && cn.getMethods() != null) {
+                for (MethodNode mn : cn.getMethods()) {
+                    m.putIfAbsent(LlvmRuntime.mangleMethod(k, mn.getName(), mn.getDescriptor()), mn);
+                }
+            }
+            return m;
+        });
+        return byMangled.get(f.getName());
     }
 
     /**

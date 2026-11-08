@@ -692,6 +692,44 @@ public class LlvmFunctionEmitter {
         return "lbl_" + prefix + "_" + (labelCounter++);
     }
 
+    private static String calleeOwner(String calleeName) {
+        if (calleeName == null) return null;
+        int dot = calleeName.indexOf('.');
+        int paren = calleeName.indexOf('(');
+        return dot > 0 && (paren < 0 || dot < paren) ? calleeName.substring(0, dot) : null;
+    }
+
+    private String missingClassIn(String owner) {
+        if (owner == null || owner.isEmpty() || owner.charAt(0) == '[') return null;
+        Deque<String> work = new ArrayDeque<>();
+        Set<String> seen = new HashSet<>();
+        work.push(owner);
+        while (!work.isEmpty()) {
+            String c = work.pop();
+            if (!seen.add(c)) continue;
+            if (resolver.isMissingClass(c)) return c;
+            ClassNode cn = resolver.getClassNode(c);
+            if (cn == null) return c;
+            if (cn.getSuperName() != null) work.push(cn.getSuperName());
+            if (cn.getInterfaces() != null) {
+                for (String iface : cn.getInterfaces()) work.push(iface);
+            }
+        }
+        return null;
+    }
+
+    private boolean emitMissingClassThrow(StringBuilder sb, String owner) {
+        String missing = missingClassIn(owner);
+        if (missing == null) return false;
+        String exc = newAux("ncdfe");
+        sb.append("  ").append(exc).append(" = call i8* @__jnative_construct_exception(i8* ")
+                .append(stringRef("vtable_java_lang_NoClassDefFoundError")).append(", i8* ")
+                .append(stringRef(missing)).append(")\n");
+        sb.append("  call void @__jnative_throw_exception(i8* ").append(exc).append(")\n");
+        sb.append("  unreachable\n");
+        return true;
+    }
+
     private String stringRef(String s) {
         if (s == null || s.isEmpty()) {
             return "null";
@@ -1535,15 +1573,17 @@ public class LlvmFunctionEmitter {
                         break;
                     }
 
-                    String diag = "unresolved call target '" + directMangled
-                            + "' (original: " + owner + "." + methodName + methodDesc
-                            + ") — the method is referenced by reachable bytecode "
-                            + "but has no body in the module. "
-                            + "This is a reachability-analysis gap.";
-                    String msgRef = stringRef(diag);
-                    sb.append("  call void @__jnative_unresolved_slot(i8* ")
-                            .append(msgRef).append(")\n");
-                    sb.append("  unreachable\n");
+                    if (!emitMissingClassThrow(sb, owner)) {
+                        String diag = "unresolved call target '" + directMangled
+                                + "' (original: " + owner + "." + methodName + methodDesc
+                                + ") — the method is referenced by reachable bytecode "
+                                + "but has no body in the module. "
+                                + "This is a reachability-analysis gap.";
+                        String msgRef = stringRef(diag);
+                        sb.append("  call void @__jnative_unresolved_slot(i8* ")
+                                .append(msgRef).append(")\n");
+                        sb.append("  unreachable\n");
+                    }
                     if (inst.getResult() != null) {
                         valueMapper.setValue(inst.getResult(),
                                 getDefaultValue(inst.getResult().getType()));
@@ -1848,14 +1888,16 @@ public class LlvmFunctionEmitter {
                 }
 
                 if (!isCallableSymbolDefined(mangledCallee)) {
-                    String diag = "unresolved call target '" + mangledCallee
-                            + "' (original: " + calleeName + ") — the method is referenced "
-                            + "by reachable bytecode but was never translated into the module. "
-                            + "This is almost always a reachability-analysis gap.";
-                    String msgRef = stringRef(diag);
-                    sb.append("  call void @__jnative_unresolved_slot(i8* ")
-                            .append(msgRef).append(")\n");
-                    sb.append("  unreachable\n");
+                    if (!emitMissingClassThrow(sb, calleeOwner(calleeName))) {
+                        String diag = "unresolved call target '" + mangledCallee
+                                + "' (original: " + calleeName + ") — the method is referenced "
+                                + "by reachable bytecode but was never translated into the module. "
+                                + "This is almost always a reachability-analysis gap.";
+                        String msgRef = stringRef(diag);
+                        sb.append("  call void @__jnative_unresolved_slot(i8* ")
+                                .append(msgRef).append(")\n");
+                        sb.append("  unreachable\n");
+                    }
                     if (inst.getResult() != null) {
                         valueMapper.setValue(inst.getResult(),
                                 getDefaultValue(inst.getResult().getType()));
@@ -2071,14 +2113,16 @@ public class LlvmFunctionEmitter {
                 }
 
                 if (!isCallableSymbolDefined(mangledCallee)) {
-                    String diag = "unresolved call target '" + mangledCallee
-                            + "' (original: " + calleeName + ") — the method is referenced "
-                            + "by reachable bytecode but was never translated into the module. "
-                            + "This is almost always a reachability-analysis gap.";
-                    String msgRef = stringRef(diag);
-                    sb.append("  call void @__jnative_unresolved_slot(i8* ")
-                            .append(msgRef).append(")\n");
-                    sb.append("  unreachable\n");
+                    if (!emitMissingClassThrow(sb, calleeOwner(calleeName))) {
+                        String diag = "unresolved call target '" + mangledCallee
+                                + "' (original: " + calleeName + ") — the method is referenced "
+                                + "by reachable bytecode but was never translated into the module. "
+                                + "This is almost always a reachability-analysis gap.";
+                        String msgRef = stringRef(diag);
+                        sb.append("  call void @__jnative_unresolved_slot(i8* ")
+                                .append(msgRef).append(")\n");
+                        sb.append("  unreachable\n");
+                    }
                     if (inst.getResult() != null) {
                         valueMapper.setValue(inst.getResult(),
                                 getDefaultValue(inst.getResult().getType()));

@@ -145,6 +145,9 @@ public class Orchestrator implements OrchestratorPort {
         forceResourceStreamMethods(analysis);
         forcePerfMethods(analysis);
         forceReflectionInvokeMethods(analysis);
+        forceStackWalkMethods(analysis);
+        forceLoggingConfigClasses(analysis);
+        forceServiceProviders(analysis, resolver);
 
         // ------------------------------------------------------------------
         // Superclass-<clinit> closure.
@@ -595,8 +598,56 @@ public class Orchestrator implements OrchestratorPort {
                 box[0], "valueOf", "(" + box[1] + ")L" + box[0] + ";"));
         }
         analysis.addInstantiatedClass("java/lang/reflect/InvocationTargetException", false);
+        analysis.addInstantiatedClass("java/lang/NoClassDefFoundError", false);
         analysis.addExtraReachableMethod(new MethodReference(
             "java/lang/reflect/InvocationTargetException", "<init>", "(Ljava/lang/Throwable;)V"));
+    }
+
+    private void forceLoggingConfigClasses(ReachabilityAnalysis analysis) {
+        if (!analysis.getReachableClasses().contains("java/util/logging/LogManager")) return;
+        String javaHome = System.getProperty("java.home");
+        if (javaHome == null || javaHome.isEmpty()) return;
+        java.nio.file.Path config = java.nio.file.Path.of(javaHome, "conf", "logging.properties");
+        if (!java.nio.file.Files.isRegularFile(config)) return;
+        java.util.Properties props = new java.util.Properties();
+        try (java.io.InputStream in = java.nio.file.Files.newInputStream(config)) {
+            props.load(in);
+        } catch (java.io.IOException e) {
+            log.warn("Cannot read {}: {}", config, e.getMessage());
+            return;
+        }
+        for (String key : props.stringPropertyNames()) {
+            boolean classList = key.equals("handlers") || key.endsWith(".handlers") || key.equals("config");
+            boolean singleClass = key.endsWith(".formatter") || key.endsWith(".filter");
+            if (!classList && !singleClass) continue;
+            for (String name : props.getProperty(key).trim().split("[\\s,]+")) {
+                if (name.isEmpty()) continue;
+                analysis.addReflectivelyInstantiatedClass(name.replace('.', '/'));
+            }
+        }
+    }
+
+    private void forceServiceProviders(ReachabilityAnalysis analysis, DependencyResolver resolver) {
+        Map<String, List<String>> services = resolver.getServiceProviders();
+        Set<String> done = new HashSet<>();
+        boolean added = true;
+        while (added && analysis.getReachableClasses().contains("java/util/ServiceLoader")) {
+            added = false;
+            for (Map.Entry<String, List<String>> e : services.entrySet()) {
+                if (!analysis.getReachableClasses().contains(e.getKey().replace('.', '/'))) continue;
+                for (String provider : e.getValue()) {
+                    if (done.add(provider)) {
+                        analysis.addReflectivelyInstantiatedClass(provider.replace('.', '/'));
+                        added = true;
+                    }
+                }
+            }
+        }
+    }
+
+    private void forceStackWalkMethods(ReachabilityAnalysis analysis) {
+        analysis.addExtraReachableMethod(new MethodReference(
+            "java/lang/StackStreamFactory$AbstractStackWalker", "doStackWalk", "(JIIII)Ljava/lang/Object;"));
     }
 
     private void forceResourceStreamMethods(ReachabilityAnalysis analysis) {

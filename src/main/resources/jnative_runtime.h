@@ -567,6 +567,9 @@ extern const int32_t JNATIVE_CTOR_ROOT_OFFSET;
 
 extern ReflectionClass* reflect_all_classes[];
 
+extern void __jnative_thread_counts(int32_t* live_out, int32_t* daemon_out,
+                                    int64_t* started_out, int32_t* peak_out);
+
 extern SymbolClassEntry jnative_symbol_class_map[]        JNATIVE_WEAK;
 extern const int64_t    jnative_symbol_class_map_size     JNATIVE_WEAK;
 

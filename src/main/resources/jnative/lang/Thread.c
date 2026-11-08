@@ -406,6 +406,30 @@ static ThreadState* ensure_main_thread(void) {
     return s;
 }
 
+static int32_t peak_live_threads = 0;
+
+void __jnative_thread_counts(int32_t* live_out, int32_t* daemon_out,
+                             int64_t* started_out, int32_t* peak_out) {
+    jn_mutex_lock(&thread_table_lock);
+    int32_t live = 0;
+    int32_t daemon = 0;
+    int64_t started = 0;
+    for (ThreadState* s = thread_table; s; s = s->next) {
+        if (!s->started) continue;
+        started++;
+        if (s->finished) continue;
+        live++;
+        if (s->is_daemon) daemon++;
+    }
+    if (live > peak_live_threads) peak_live_threads = live;
+    int32_t peak = peak_live_threads;
+    jn_mutex_unlock(&thread_table_lock);
+    if (live_out != NULL) *live_out = live;
+    if (daemon_out != NULL) *daemon_out = daemon;
+    if (started_out != NULL) *started_out = started;
+    if (peak_out != NULL) *peak_out = peak;
+}
+
 typedef struct StartArgs {
     ThreadState* state;
     void* runnable;
@@ -428,6 +452,8 @@ static void* thread_entry(void* arg) {
     s->running = 1;
     jn_cond_broadcast(&s->cond);
     jn_mutex_unlock(&s->mutex);
+
+    __jnative_thread_counts(NULL, NULL, NULL, NULL);
 
     if (runnable) {
         extern void __jnative_invoke_runnable(void* runnable);

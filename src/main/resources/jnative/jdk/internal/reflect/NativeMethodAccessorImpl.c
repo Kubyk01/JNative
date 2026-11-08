@@ -456,8 +456,11 @@ void* __jnative_fn_jdk_internal_reflect_NativeMethodAccessorImpl_invoke0__Ljava_
         m = lookup_reflection_method((ReflectionClass*)clazz, name, descriptor);
     }
     if (m == NULL || m->adaptor == NULL) {
-        reflect_throw("vtable_java_lang_InternalError",
-                      "no reflective entry point for method");
+        char msg[1400];
+        const char* cname = ((ReflectionClass*)clazz)->cname;
+        snprintf(msg, sizeof(msg), "no reflective entry point for method %s.%s%s",
+                 cname != NULL ? cname : "?", name, descriptor);
+        reflect_throw("vtable_java_lang_InternalError", msg);
     }
 
     void** args = reflect_prepare_args(parameter_types_array, args_array);
