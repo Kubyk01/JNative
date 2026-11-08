@@ -26,7 +26,7 @@ public final class FieldCell {
 
     private final int fieldId;
     private final String field;
-    private final PointsToSet pts = PointsToSet.EMPTY;
+    private volatile PointsToSet pts = PointsToSet.EMPTY;
     private volatile long version;
     private volatile Object readers;
 
