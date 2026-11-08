@@ -3,189 +3,158 @@ package io.github.kubyk01.domain.analyzer.aliasanalysis;
 import java.util.AbstractSet;
 import java.util.Arrays;
 import java.util.Collection;
-import java.util.Collections;
 import java.util.Iterator;
+import java.util.NoSuchElementException;
 import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicReference;
 
 public final class PointsToSet extends AbstractSet<AllocationSite> {
 
-    private static final int SMALL_MAX = 12;
+    private static final int[] NO_IDS = new int[0];
 
-    public static final PointsToSet EMPTY = new PointsToSet(true);
+    public static final PointsToSet EMPTY = new PointsToSet(NO_IDS);
 
-    private final boolean immutable;
-    private final AtomicReference<Object> state;
+    private final int[] ids;
+    private int hash;
 
-    private PointsToSet(boolean immutable) {
-        this.immutable = immutable;
-        this.state = new AtomicReference<>(null);
+    private PointsToSet(int[] ids) {
+        this.ids = ids;
     }
 
-    public static PointsToSet shared() { return new PointsToSet(false); }
-    public static PointsToSet local()  { return new PointsToSet(false); }
-    public static PointsToSet empty()  { return EMPTY; }
+    public static PointsToSet empty() { return EMPTY; }
+
+    public static PointsToSet ofSortedUnique(int[] ids) {
+        return ids.length == 0 ? EMPTY : new PointsToSet(ids);
+    }
+
+    public static PointsToSet copyOf(Collection<AllocationSite> sites) {
+        if (sites == null || sites.isEmpty()) return EMPTY;
+        if (sites instanceof PointsToSet pts) return pts;
+        int[] a = new int[sites.size()];
+        int n = 0;
+        for (AllocationSite s : sites) a[n++] = s.getId();
+        Arrays.sort(a, 0, n);
+        int w = 0;
+        for (int i = 0; i < n; i++) {
+            if (w == 0 || a[w - 1] != a[i]) a[w++] = a[i];
+        }
+        if (w == 1) return AllocationSite.byId(a[0]).singleton();
+        return new PointsToSet(w == a.length ? a : Arrays.copyOf(a, w));
+    }
+
+    public int[] rawIds() { return ids; }
 
     @Override
-    public int size() {
-        Object cur = state.get();
-        if (cur == null) return 0;
-        if (cur instanceof AllocationSite[] arr) return arr.length;
-        return ((ConcurrentHashMap.KeySetView<?, ?>) cur).size();
-    }
+    public int size() { return ids.length; }
 
     @Override
-    public boolean isEmpty() {
-        Object cur = state.get();
-        if (cur == null) return true;
-        if (cur instanceof AllocationSite[] arr) return arr.length == 0;
-        return ((ConcurrentHashMap.KeySetView<?, ?>) cur).isEmpty();
-    }
+    public boolean isEmpty() { return ids.length == 0; }
 
     @Override
     public boolean contains(Object o) {
-        if (!(o instanceof AllocationSite site)) return false;
-        Object cur = state.get();
-        if (cur == null) return false;
-        if (cur instanceof AllocationSite[] arr) {
-            for (AllocationSite a : arr) {
-                if (a == site || a.equals(site)) return true;
+        return o instanceof AllocationSite site && containsId(site.getId());
+    }
+
+    public boolean containsId(int id) {
+        int[] a = ids;
+        int n = a.length;
+        if (n <= 8) {
+            for (int v : a) {
+                if (v == id) return true;
+                if (v > id) return false;
             }
             return false;
         }
-        return view(cur).contains(site);
+        return Arrays.binarySearch(a, id) >= 0;
     }
 
-    public boolean containsUnknown() { return contains(AllocationSite.UNKNOWN); }
-
-    @Override
-    public boolean add(AllocationSite site) {
-        if (immutable) throw new UnsupportedOperationException("immutable PointsToSet");
-        while (true) {
-            Object cur = state.get();
-
-            if (cur == null) {
-                if (state.compareAndSet(null, new AllocationSite[] { site })) return true;
-                continue;
-            }
-
-            if (cur instanceof AllocationSite[] arr) {
-                for (AllocationSite a : arr) {
-                    if (a == site || a.equals(site)) return false;
-                }
-                int n = arr.length;
-                if (n < SMALL_MAX) {
-                    AllocationSite[] next = new AllocationSite[n + 1];
-                    System.arraycopy(arr, 0, next, 0, n);
-                    next[n] = site;
-                    if (state.compareAndSet(arr, next)) return true;
-                    continue;
-                }
-                ConcurrentHashMap.KeySetView<AllocationSite, Boolean> v =
-                    ConcurrentHashMap.newKeySet(n * 2);
-                Collections.addAll(v, arr);
-                v.add(site);
-                if (state.compareAndSet(arr, v)) return true;
-                continue;
-            }
-
-            return view(cur).add(site);
-        }
-    }
-
-    @Override
-    public boolean addAll(Collection<? extends AllocationSite> c) {
-        if (immutable) throw new UnsupportedOperationException("immutable PointsToSet");
-        if (c == this || c.isEmpty()) return false;
-
-        if (c instanceof PointsToSet pts) return addAllFromPointsToSet(pts);
-
-        boolean changed = false;
-        for (AllocationSite s : c) {
-            if (add(s)) changed = true;
-        }
-        return changed;
-    }
-
-    private boolean addAllFromPointsToSet(PointsToSet other) {
-        Object otherState = other.state.get();
-        if (otherState == null) return false;
-
-        if (otherState instanceof AllocationSite[] otherArr) {
-            boolean changed = false;
-            for (AllocationSite s : otherArr) {
-                if (add(s)) changed = true;
-            }
-            return changed;
-        }
-
-        ConcurrentHashMap.KeySetView<AllocationSite, Boolean> otherView = view(otherState);
-
-        while (true) {
-            Object cur = state.get();
-            if (cur instanceof ConcurrentHashMap.KeySetView) {
-                ConcurrentHashMap.KeySetView<AllocationSite, Boolean> v = view(cur);
-                boolean changed = false;
-                for (AllocationSite s : otherView) {
-                    if (v.add(s)) changed = true;
-                }
-                return changed;
-            }
-
-            ConcurrentHashMap.KeySetView<AllocationSite, Boolean> newView =
-                ConcurrentHashMap.newKeySet(Math.max(8, otherView.size() + 4));
-            if (cur instanceof AllocationSite[] arr) {
-                Collections.addAll(newView, arr);
-            }
-            if (state.compareAndSet(cur, newView)) {
-                boolean changed = false;
-                for (AllocationSite s : otherView) {
-                    if (newView.add(s)) changed = true;
-                }
-                return changed;
-            }
-        }
-    }
-
-    @SuppressWarnings("unchecked")
-    private static ConcurrentHashMap.KeySetView<AllocationSite, Boolean> view(Object o) {
-        return (ConcurrentHashMap.KeySetView<AllocationSite, Boolean>) o;
-    }
+    public boolean containsUnknown() { return containsId(AllocationSite.UNKNOWN.getId()); }
 
     @Override
     public Iterator<AllocationSite> iterator() {
-        Object cur = state.get();
-        if (cur == null) return Collections.emptyIterator();
-        if (cur instanceof AllocationSite[] arr) return Arrays.asList(arr).iterator();
-        return view(cur).iterator();
+        int[] a = ids;
+        return new Iterator<>() {
+            private int i;
+
+            @Override
+            public boolean hasNext() { return i < a.length; }
+
+            @Override
+            public AllocationSite next() {
+                if (i >= a.length) throw new NoSuchElementException();
+                return AllocationSite.byId(a[i++]);
+            }
+        };
     }
 
-    public PointsToSet copy() {
-        Object cur = state.get();
-        if (cur == null) return EMPTY;
-        PointsToSet c = new PointsToSet(false);
-        if (cur instanceof AllocationSite[] arr) {
-            c.state.set(Arrays.copyOf(arr, arr.length));
-        } else {
-            ConcurrentHashMap.KeySetView<AllocationSite, Boolean> v = view(cur);
-            ConcurrentHashMap.KeySetView<AllocationSite, Boolean> copyView =
-                ConcurrentHashMap.newKeySet(v.size() * 2);
-            copyView.addAll(v);
-            c.state.set(copyView);
-        }
-        return c;
-    }
+    public PointsToSet copy() { return this; }
 
     public boolean intersects(PointsToSet other) {
         if (other == null || isEmpty() || other.isEmpty()) return false;
-        if (size() > other.size()) {
-            for (AllocationSite s : other) if (contains(s)) return true;
-        } else {
-            for (AllocationSite s : this) if (other.contains(s)) return true;
+        if (other == this) return true;
+        int[] a = ids, b = other.ids;
+        int i = 0, j = 0;
+        while (i < a.length && j < b.length) {
+            int x = a[i], y = b[j];
+            if (x == y) return true;
+            if (x < y) i++; else j++;
         }
         return false;
     }
 
+    public static PointsToSet union(PointsToSet a, PointsToSet b) {
+        if (a == b || b == null || b.isEmpty()) return a == null ? EMPTY : a;
+        if (a == null || a.isEmpty()) return b;
+        int[] x = a.ids, y = b.ids;
+        int nx = x.length, ny = y.length;
+        if (x[nx - 1] < y[0]) return new PointsToSet(concat(x, y));
+        if (y[ny - 1] < x[0]) return new PointsToSet(concat(y, x));
+        int i = 0, j = 0, n = 0;
+        while (i < nx && j < ny) {
+            int u = x[i], v = y[j];
+            if (u == v) { i++; j++; }
+            else if (u < v) i++;
+            else j++;
+            n++;
+        }
+        n += (nx - i) + (ny - j);
+        if (n == nx) return a;
+        if (n == ny) return b;
+        int[] out = new int[n];
+        i = 0; j = 0;
+        int k = 0;
+        while (i < nx && j < ny) {
+            int u = x[i], v = y[j];
+            if (u == v) { out[k++] = u; i++; j++; }
+            else if (u < v) out[k++] = x[i++];
+            else out[k++] = y[j++];
+        }
+        while (i < nx) out[k++] = x[i++];
+        while (j < ny) out[k++] = y[j++];
+        return new PointsToSet(out);
+    }
+
+    private static int[] concat(int[] lo, int[] hi) {
+        int[] out = Arrays.copyOf(lo, lo.length + hi.length);
+        System.arraycopy(hi, 0, out, lo.length, hi.length);
+        return out;
+    }
+
     public Set<AllocationSite> getSites() { return this; }
+
+    @Override
+    public boolean equals(Object o) {
+        if (o == this) return true;
+        if (o instanceof PointsToSet other) return Arrays.equals(ids, other.ids);
+        return super.equals(o);
+    }
+
+    @Override
+    public int hashCode() {
+        int h = hash;
+        if (h == 0 && ids.length != 0) {
+            for (int id : ids) h += AllocationSite.byId(id).hashCode();
+            hash = h;
+        }
+        return h;
+    }
 }

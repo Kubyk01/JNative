@@ -66,6 +66,9 @@ public class Analyzer {
     private final Set<String> deferredClinits = new LinkedHashSet<>();
 
     @Setter
+    private int parallelism = Runtime.getRuntime().availableProcessors();
+
+    @Setter
     private BytecodeToIr translator;
 
     @Setter
@@ -138,7 +141,7 @@ public class Analyzer {
             clinitsToInstrument, clinitWrappers,
             deferredClinits);
 
-        AliasAnalysisResult aliasResult = new AliasAnalyzer(module, scheduler).analyze();
+        AliasAnalysisResult aliasResult = new AliasAnalyzer(module, scheduler, parallelism).analyze();
         if (showAlias) {
             System.out.println("\n--- Alias Analysis ---");
             System.out.println("Alias analysis complete.");

@@ -352,6 +352,7 @@ public class Orchestrator implements OrchestratorPort {
         // --- 7. Analysis pipeline -----------------------------------------
         Analyzer analyzer = new Analyzer();
         analyzer.setScheduler(scheduler);
+        analyzer.setParallelism(effectiveCores);
         analyzer.setTranslator(translator);
         analyzer.setReflectInfo(analysis.getReflectInfo());
         AnalyzerResult analysisResult = analyzer.analyze(
