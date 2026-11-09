@@ -90,7 +90,7 @@ public class MethodTranslator extends MethodVisitor {
      *  without going through
      * . For a try-range inside a loop
      *  that is not the whole-method approximation: the only path from
-     *
+     * <p>
      *  to
      *  in the CFG runs around the entire
      *  loop, so the BFS pulls in the loop header, the loop tail and every
@@ -99,17 +99,17 @@ public class MethodTranslator extends MethodVisitor {
      *  pattern in
      *  —
      *  that produces false exceptional edges such as
-     *
+     * <p>
      * , which in turn make the handler's
      *  reads appear live in the loop header and create PHI nodes whose
      *  preheader operand has never been assigned. The PHI's incoming
      *  value on the preheader edge does not exist in the JVM verifier's
      *  model (the slot is not definitely assigned on that path), and
-     *
+     * <p>
      *  correctly refuses to invent
      *  one: it emits
      * , which
-     *
+     * <p>
      *  then rejects.</p>
      *  <p>The bytecode-interval formulation is the semantics the JVM
      *  specification uses: the protected range of a try-catch entry is a
@@ -497,6 +497,8 @@ public class MethodTranslator extends MethodVisitor {
             case Opcodes.MONITOREXIT:
                 handlers.monitorExit();
                 break;
+            case Opcodes.NOP:
+                break;
 
             default:
                 log.warn("Unhandled insn opcode: {}", opcode);
@@ -605,13 +607,13 @@ public class MethodTranslator extends MethodVisitor {
         recordBlockOffset();
         switch (opcode) {
             case Opcodes.GETFIELD:
-                handlers.getField(owner, name);
+                handlers.getField(owner, name, desc);
                 break;
             case Opcodes.PUTFIELD:
                 handlers.putField(owner, name);
                 break;
             case Opcodes.GETSTATIC:
-                handlers.getStatic(owner, name);
+                handlers.getStatic(owner, name, desc);
                 break;
             case Opcodes.PUTSTATIC:
                 handlers.putStatic(owner, name);

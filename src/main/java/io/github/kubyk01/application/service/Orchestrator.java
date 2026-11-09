@@ -138,6 +138,10 @@ public class Orchestrator implements OrchestratorPort {
         analysis.setScheduler(scheduler);
         analysis.applyMetadata(resolver.getMetadata());
         analysis.analyzeFromEntry(entryClass, entryMethod, entryDescriptor);
+        Set<String> reachableFromEntry = new HashSet<>(analysis.getReachableClasses());
+        analysis.addAllApplicationClasses();
+        Set<String> lazyOnlyClasses = new HashSet<>(analysis.getReachableClasses());
+        lazyOnlyClasses.removeAll(reachableFromEntry);
 
         // The native Class.getResourceAsStream override builds a
         // ByteArrayInputStream from C, so the ordinary bytecode closure never
@@ -361,6 +365,7 @@ public class Orchestrator implements OrchestratorPort {
         analyzer.setParallelism(effectiveCores);
         analyzer.setTranslator(translator);
         analyzer.setReflectInfo(analysis.getReflectInfo());
+        analyzer.setLazyOnlyClasses(lazyOnlyClasses);
         AnalyzerResult analysisResult = analyzer.analyze(
                 module, resolver,
                 entryClass, entryMethod, entryDescriptor,

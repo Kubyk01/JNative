@@ -1052,22 +1052,44 @@ public class DestructorInserter {
         return ownsEverythingDestroyed(baseSites, fieldKey, fieldSites, liveOutSet);
     }
 
-    private Map<Integer, List<Long>> inboundEdges;
+    private int[] inboundStart;
+    private int[] inboundSrc;
+    private int[] inboundField;
 
-    private Map<Integer, List<Long>> inboundEdges() {
-        if (inboundEdges != null) return inboundEdges;
+    private void buildInboundEdges() {
+        if (inboundStart != null) return;
         PointsToGraph graph = aliasResult.getGraph();
-        Map<Integer, List<Long>> edges = new HashMap<>();
-        for (int src = 0, n = AllocationSite.count(); src < n; src++) {
+        int n = AllocationSite.count();
+        int unknownId = AllocationSite.UNKNOWN.getId();
+        boolean[] destructible = new boolean[n];
+        for (int id = 0; id < n; id++) {
+            destructible[id] = id != unknownId && isManagedType(AllocationSite.byId(id).getType());
+        }
+        int[] start = new int[n + 1];
+        for (int src = 0; src < n; src++) {
             for (FieldCell cell : graph.fieldCells(src)) {
-                long edge = ((long) src << 32) | (cell.fieldId() & 0xffffffffL);
                 for (int dst : cell.get().rawIds()) {
-                    edges.computeIfAbsent(dst, k -> new ArrayList<>()).add(edge);
+                    if (destructible[dst]) start[dst + 1]++;
                 }
             }
         }
-        inboundEdges = edges;
-        return edges;
+        for (int i = 0; i < n; i++) start[i + 1] += start[i];
+        int[] next = Arrays.copyOf(start, n);
+        int[] sources = new int[start[n]];
+        int[] fields = new int[start[n]];
+        for (int src = 0; src < n; src++) {
+            for (FieldCell cell : graph.fieldCells(src)) {
+                for (int dst : cell.get().rawIds()) {
+                    if (!destructible[dst]) continue;
+                    int at = next[dst]++;
+                    sources[at] = src;
+                    fields[at] = cell.fieldId();
+                }
+            }
+        }
+        inboundSrc = sources;
+        inboundField = fields;
+        inboundStart = start;
     }
 
     private boolean ownsEverythingDestroyed(PointsToSet baseSites,
@@ -1092,14 +1114,16 @@ public class DestructorInserter {
             }
         }
 
+        buildInboundEdges();
         int ownerFieldId = graph.findFieldId(fieldKey);
         for (int id : destroyed) {
             AllocationSite site = AllocationSite.byId(id);
             if (staticFieldSites.contains(site) || liveOutSet.contains(site)) return false;
-            for (long edge : inboundEdges().getOrDefault(id, List.of())) {
-                int src = (int) (edge >>> 32);
+            if (id + 1 >= inboundStart.length) return false;
+            for (int e = inboundStart[id]; e < inboundStart[id + 1]; e++) {
+                int src = inboundSrc[e];
                 if (destroyed.contains(src)) continue;
-                if ((int) edge == ownerFieldId && baseSites.containsId(src) && roots.containsId(id)) continue;
+                if (inboundField[e] == ownerFieldId && baseSites.containsId(src) && roots.containsId(id)) continue;
                 return false;
             }
         }

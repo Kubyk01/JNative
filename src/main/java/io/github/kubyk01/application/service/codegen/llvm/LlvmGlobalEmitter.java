@@ -2073,6 +2073,7 @@ public class LlvmGlobalEmitter {
     private final Set<String> staticFieldStringConstants = new LinkedHashSet<>();
 
     private String generateStaticFields() {
+        Map<String, Type> usedFieldTypes = new HashMap<>();
         Set<String> allFields = new TreeSet<>(aliasResult.getGraph()
                 .getStaticFieldPointsToMap().keySet());
         if (reflectInfo != null) {
@@ -2097,6 +2098,10 @@ public class LlvmGlobalEmitter {
                         continue;
                     }
                     allFields.add(fullName);
+                    Type usedType = op == Opcode.GET_STATIC
+                        ? (inst.getResult() != null ? inst.getResult().getType() : null)
+                        : (inst.getOperands().size() > 1 ? inst.getOperands().get(1).getType() : null);
+                    if (usedType != null && !usedType.isUnknown()) usedFieldTypes.putIfAbsent(fullName, usedType);
                 }
             }
         }
@@ -2164,7 +2169,7 @@ public class LlvmGlobalEmitter {
             }
 
             Type fieldType = getFieldType(owner, fieldName);
-            if (fieldType == null) fieldType = Type.UNKNOWN;
+            if (fieldType == null) fieldType = usedFieldTypes.getOrDefault(fullName, Type.UNKNOWN);
             String llvmType = LlvmTypeMapper.toLlvmType(fieldType);
 
             String init = staticFieldInitializer(owner, fieldName, fieldType, llvmType);

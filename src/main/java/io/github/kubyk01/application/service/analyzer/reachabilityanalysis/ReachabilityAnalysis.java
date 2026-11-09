@@ -764,6 +764,27 @@ public class ReachabilityAnalysis {
         resolveVirtualDispatchFixedPoint();
     }
 
+    public void addAllApplicationClasses() {
+        resolver.loadAllNestedClasses();
+        for (String className : new ArrayList<>(resolver.getAllClasses())) {
+            if (LlvmUtil.isSystemClassName(className)) continue;
+            ClassNode cn = resolver.getClassNode(className);
+            if (cn == null || cn.isExternal()) continue;
+            if (cn.isInterface() || (cn.getAccess() & Opcodes.ACC_ABSTRACT) != 0) {
+                addClassWithInit(className, true);
+            } else {
+                addInstantiatedClass(className, true);
+            }
+            for (MethodNode m : cn.getMethods()) {
+                if (!m.isAbstract()) {
+                    addMethod(new MethodReference(className, m.getName(), m.getDescriptor()), true);
+                }
+            }
+        }
+        drainWorklist();
+        resolveVirtualDispatchFixedPoint();
+    }
+
     public void addExtraReachableMethod(MethodReference ref) {
         if (ref == null) return;
         if (reachableMethods.contains(ref)) return;

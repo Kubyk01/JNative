@@ -30,6 +30,9 @@ import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Schedulers;
 import java.util.stream.Collectors;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
@@ -685,6 +688,55 @@ public class DependencyResolver {
             }
         } catch (IOException e) {
             log.warn("Failed to index nested jar {}: {}", nestedName, e.getMessage());
+        }
+    }
+
+    public void loadAllNestedClasses() {
+        Map<Path, Map<String, Map<String, String>>> byJar = new HashMap<>();
+        for (Map.Entry<String, NestedClassRef> e : nestedClassIndex.entrySet()) {
+            String name = e.getKey();
+            if (name.startsWith("META-INF/") || name.endsWith("module-info") || name.endsWith("package-info")) {
+                continue;
+            }
+            NestedClassRef ref = e.getValue();
+            byJar.computeIfAbsent(ref.outerJar(), k -> new HashMap<>())
+                 .computeIfAbsent(ref.nestedJarEntryName(), k -> new HashMap<>())
+                 .put(ref.classEntryName(), name);
+        }
+        Flux.fromIterable(byJar.entrySet())
+            .flatMapIterable(outer -> outer.getValue().entrySet().stream()
+                .map(nested -> Map.entry(outer.getKey(), nested))
+                .toList())
+            .flatMap(job -> Mono.fromRunnable(() -> loadNestedJar(job.getKey(), job.getValue().getKey(), job.getValue().getValue()))
+                .subscribeOn(Schedulers.boundedElastic()))
+            .then()
+            .block();
+    }
+
+    private void loadNestedJar(Path outerJar, String nestedJarName, Map<String, String> classesByEntry) {
+        try (JarFile outer = new JarFile(outerJar.toFile())) {
+            JarEntry nestedEntry = outer.getJarEntry(nestedJarName);
+            if (nestedEntry == null) return;
+            try (InputStream is = outer.getInputStream(nestedEntry);
+                 ZipInputStream zis = new ZipInputStream(is)) {
+                ZipEntry entry;
+                while ((entry = zis.getNextEntry()) != null) {
+                    String internalName = classesByEntry.get(entry.getName());
+                    if (internalName != null && nestedClassIndex.remove(internalName) != null
+                            && !classMap.containsKey(internalName)) {
+                        try {
+                            parseClassBytes(internalName, zis.readAllBytes());
+                            loadedClasses.add(internalName);
+                        } catch (IOException | RuntimeException ex) {
+                            log.warn("Failed to parse class {} from nested jar: {}",
+                                    internalName, ex.getMessage());
+                        }
+                    }
+                    zis.closeEntry();
+                }
+            }
+        } catch (IOException e) {
+            log.warn("Failed to read nested jar {} of {}: {}", nestedJarName, outerJar, e.getMessage());
         }
     }
 

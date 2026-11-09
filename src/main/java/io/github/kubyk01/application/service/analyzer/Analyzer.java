@@ -72,6 +72,9 @@ public class Analyzer {
     @Setter
     private ReflectInfo reflectInfo;
 
+    @Setter
+    private Set<String> lazyOnlyClasses = Set.of();
+
     public AnalyzerResult analyze(Module module,
                                   DependencyResolver resolver,
                                   String entryClass,
@@ -266,9 +269,18 @@ public class Analyzer {
             }
         }
 
-        Map<String, Set<String>> classDepDeltas = new ConcurrentHashMap<>();
-        Map<String, Set<String>> fieldWriters   = new ConcurrentHashMap<>();
-        Map<String, Set<String>> fieldReaders   = new ConcurrentHashMap<>();
+        List<String> nodes = new ArrayList<>(allWithClinit);
+        Collections.sort(nodes);
+        Map<String, Integer> nodeId = new HashMap<>(nodes.size() * 2);
+        for (int i = 0; i < nodes.size(); i++) nodeId.put(nodes.get(i), i);
+        int[] graphClassToNode = new int[g.classes().size()];
+        for (int i = 0; i < graphClassToNode.length; i++) {
+            graphClassToNode[i] = nodeId.getOrDefault(g.classes().get(i), -1);
+        }
+        IntArrayList[] edges = new IntArrayList[nodes.size()];
+        for (int i = 0; i < edges.length; i++) edges[i] = new IntArrayList();
+        IntArrayList[] fieldWriters = new IntArrayList[g.fields().size()];
+        IntArrayList[] fieldReaders = new IntArrayList[g.fields().size()];
 
         boolean[] cut = new boolean[g.live().size()];
         List<Integer> roots = new ArrayList<>();
@@ -280,53 +292,59 @@ public class Analyzer {
         }
         InitFacts[] facts = closeOverInitializers(g, cut, roots);
         for (int idx : roots) {
-            String clinitName = g.live().get(idx).getName();
-            String className = clinitNameToClassName.get(clinitName);
+            String className = clinitNameToClassName.get(g.live().get(idx).getName());
+            int self = nodeId.get(className);
             InitFacts f = facts[idx];
-            Set<String> delta = bitNames(f.trig(), g.classes());
-            delta.remove(className);
-            Set<String> nested = new HashSet<>();
-            for (int n : f.nested()) nested.add(g.live().get(n).getName());
-            publishClinitWalk(className,
-                new ClinitWalk(delta, nested, bitNames(f.writes(), g.fields()), bitNames(f.reads(), g.fields())),
-                resolver, clinitNameToClassName, classDepDeltas, fieldWriters, fieldReaders);
+            IntArrayList out = edges[self];
+            forEachBit(f.trig(), c -> {
+                int dep = graphClassToNode[c];
+                if (dep >= 0 && dep != self) out.add(dep);
+            });
+            ClassNode cn = resolver.getClassNode(className);
+            Set<String> supVisited = new HashSet<>();
+            while (cn != null && cn.getSuperName() != null
+                && !cn.getSuperName().equals(cn.getName())
+                && !"java/lang/Object".equals(cn.getSuperName())
+                && supVisited.add(cn.getSuperName())) {
+                Integer sup = nodeId.get(cn.getSuperName());
+                if (sup != null) out.add(sup);
+                cn = resolver.getClassNode(cn.getSuperName());
+            }
+            for (int n : f.nested()) {
+                Integer nested = nodeId.get(clinitNameToClassName.get(g.live().get(n).getName()));
+                if (nested != null && nested != self) out.add(nested);
+            }
+            forEachBit(f.writes(), fld -> {
+                if (fieldWriters[fld] == null) fieldWriters[fld] = new IntArrayList();
+                fieldWriters[fld].add(self);
+            });
+            forEachBit(f.reads(), fld -> {
+                if (fieldReaders[fld] == null) fieldReaders[fld] = new IntArrayList();
+                fieldReaders[fld].add(self);
+            });
         }
 
-        Map<String, Set<String>> classDeps = new LinkedHashMap<>();
-        for (String cls : allWithClinit) classDeps.put(cls, new LinkedHashSet<>());
-
-        for (Map.Entry<String, Set<String>> entry : classDepDeltas.entrySet()) {
-            Set<String> deps = classDeps.get(entry.getKey());
-            if (deps == null) continue;
-            List<String> sorted = new ArrayList<>(entry.getValue());
-            Collections.sort(sorted);
-            deps.addAll(sorted);
-        }
-
-        for (Map.Entry<String, Set<String>> entry : fieldReaders.entrySet()) {
-            Set<String> writers = fieldWriters.get(entry.getKey());
-            if (writers == null || writers.isEmpty()) continue;
-            for (String reader : entry.getValue()) {
-                if (writers.contains(reader)) continue;
-                Set<String> readerDeps = classDeps.get(reader);
-                if (readerDeps == null) continue;
-                for (String writer : writers) {
-                    if (!reader.equals(writer)) readerDeps.add(writer);
-                }
+        for (int fld = 0; fld < fieldReaders.length; fld++) {
+            if (fieldReaders[fld] == null || fieldWriters[fld] == null) continue;
+            fieldWriters[fld].sortUnique();
+            int[] writers = fieldWriters[fld].toArray();
+            fieldReaders[fld].sortUnique();
+            for (int r = 0; r < fieldReaders[fld].size(); r++) {
+                int reader = fieldReaders[fld].get(r);
+                if (Arrays.binarySearch(writers, reader) >= 0) continue;
+                for (int writer : writers) edges[reader].add(writer);
             }
         }
 
-        List<Set<String>> sccs = LazyClinitInstrumenter.stronglyConnectedComponents(classDeps);
+        int[][] adjacency = new int[nodes.size()][];
+        for (int i = 0; i < adjacency.length; i++) {
+            edges[i].sortUnique();
+            adjacency[i] = edges[i].toArray();
+            edges[i] = null;
+        }
+
         Set<String> cyclicClasses = new LinkedHashSet<>();
-        for (Set<String> scc : sccs) {
-            if (scc.size() > 1) {
-                cyclicClasses.addAll(scc);
-            } else {
-                String c = scc.iterator().next();
-                Set<String> deps = classDeps.get(c);
-                if (deps != null && deps.contains(c)) cyclicClasses.add(c);
-            }
-        }
+        for (int i : cyclicNodes(adjacency)) cyclicClasses.add(nodes.get(i));
         cyclicClasses.addAll(forcedClasses);
         if (cyclicClasses.isEmpty()) return;
 
@@ -373,10 +391,6 @@ public class Analyzer {
      * must not be mutated; {@code nested} holds function indices.
      */
     private record InitFacts(long[] trig, long[] reads, long[] writes, int[] nested) {}
-
-    /** What one <clinit> reaches, by name: trigger classes (minus its own), nested <clinit>s, fields. */
-    private record ClinitWalk(Set<String> delta, Set<String> nested,
-                              Set<String> writes, Set<String> reads) {}
 
     private static final int[] NO_TARGETS = new int[0];
 
@@ -457,14 +471,67 @@ public class Analyzer {
         return out;
     }
 
-    private static Set<String> bitNames(long[] bits, List<String> names) {
-        Set<String> out = new HashSet<>();
+    private static void forEachBit(long[] bits, java.util.function.IntConsumer action) {
         for (int w = 0; w < bits.length; w++) {
             for (long word = bits[w]; word != 0; word &= word - 1) {
-                out.add(names.get((w << 6) + Long.numberOfTrailingZeros(word)));
+                action.accept((w << 6) + Long.numberOfTrailingZeros(word));
             }
         }
-        return out;
+    }
+
+    private static List<Integer> cyclicNodes(int[][] adjacency) {
+        int n = adjacency.length;
+        int[] index = new int[n];
+        int[] low = new int[n];
+        int[] edgePos = new int[n];
+        boolean[] onStack = new boolean[n];
+        Arrays.fill(index, -1);
+        int[] callStack = new int[n];
+        int[] sccStack = new int[n];
+        int sccTop = 0;
+        int counter = 0;
+        List<Integer> cyclic = new ArrayList<>();
+        for (int start = 0; start < n; start++) {
+            if (index[start] >= 0) continue;
+            int callTop = 0;
+            callStack[callTop++] = start;
+            index[start] = low[start] = counter++;
+            sccStack[sccTop++] = start;
+            onStack[start] = true;
+            while (callTop > 0) {
+                int u = callStack[callTop - 1];
+                if (edgePos[u] < adjacency[u].length) {
+                    int v = adjacency[u][edgePos[u]++];
+                    if (index[v] < 0) {
+                        index[v] = low[v] = counter++;
+                        sccStack[sccTop++] = v;
+                        onStack[v] = true;
+                        callStack[callTop++] = v;
+                    } else if (onStack[v]) {
+                        low[u] = Math.min(low[u], index[v]);
+                    }
+                    continue;
+                }
+                callTop--;
+                if (callTop > 0) {
+                    int parent = callStack[callTop - 1];
+                    low[parent] = Math.min(low[parent], low[u]);
+                }
+                if (low[u] != index[u]) continue;
+                int first = sccTop;
+                int v;
+                do {
+                    v = sccStack[--sccTop];
+                    onStack[v] = false;
+                } while (v != u);
+                boolean selfLoop = Arrays.binarySearch(adjacency[u], u) >= 0;
+                if (first - sccTop > 1 || selfLoop) {
+                    for (int i = sccTop; i < first; i++) cyclic.add(sccStack[i]);
+                }
+            }
+        }
+        Collections.sort(cyclic);
+        return cyclic;
     }
 
     /**
@@ -632,45 +699,6 @@ public class Analyzer {
                 if ((a[i] & ~b[i]) != 0) return false;
             }
             return true;
-        }
-    }
-
-    /** Folds one walk into the shared maps and adds superclass and nested-<clinit> dependencies. */
-    private static void publishClinitWalk(String className, ClinitWalk walk,
-                                          DependencyResolver resolver,
-                                          Map<String, String> clinitNameToClassName,
-                                          Map<String, Set<String>> classDepDeltas,
-                                          Map<String, Set<String>> fieldWriters,
-                                          Map<String, Set<String>> fieldReaders) {
-        for (String fld : walk.writes()) {
-            fieldWriters.computeIfAbsent(fld, k -> ConcurrentHashMap.newKeySet()).add(className);
-        }
-        for (String fld : walk.reads()) {
-            fieldReaders.computeIfAbsent(fld, k -> ConcurrentHashMap.newKeySet()).add(className);
-        }
-
-        Set<String> delta = walk.delta(); // fresh mutable set owned by this walk
-        ClassNode cn = resolver.getClassNode(className);
-        Set<String> supVisited = new HashSet<>();
-        while (cn != null && cn.getSuperName() != null
-            && !cn.getSuperName().equals(cn.getName())
-            && supVisited.add(cn.getSuperName())) {
-            String sup = cn.getSuperName();
-            if ("java/lang/Object".equals(sup)) break;
-            delta.add(sup);
-            cn = resolver.getClassNode(sup);
-        }
-        for (String nc : walk.nested()) {
-            String ncls = clinitNameToClassName.get(nc);
-            if (ncls != null && !ncls.equals(className)) delta.add(ncls);
-        }
-
-        if (!delta.isEmpty()) {
-            classDepDeltas.compute(className, (k, e) -> {
-                if (e == null) return delta;
-                e.addAll(delta);
-                return e;
-            });
         }
     }
 
@@ -1260,6 +1288,9 @@ public class Analyzer {
             initReadBits, initWriteBits, funcIndex, fieldIdMap, fieldWords);
         deferred.addAll(computeJniDependentClinits(module, clinitOrder));
         deferred.addAll(computeMissingClassClinits(clinitOrder, resolver));
+        for (Function clinit : clinitOrder) {
+            if (lazyOnlyClasses.contains(clinit.getOwnerClass())) deferred.add(clinit.getName());
+        }
 
         if (!deferred.isEmpty()) {
             this.deferredClinits.addAll(deferred);
