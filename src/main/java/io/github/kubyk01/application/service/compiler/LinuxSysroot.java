@@ -159,6 +159,12 @@ final class LinuxSysroot {
 
     /** Minimal ustar/GNU/pax reader: regular files, directories, symlinks and hardlinks. */
     static void extractTar(InputStream in, Path dest, Map<Path, String> symlinks) throws IOException {
+        extractTar(in, dest, symlinks, name -> true);
+    }
+
+    /** Like above, but entries whose archive path fails {@code keep} are skipped. */
+    static void extractTar(InputStream in, Path dest, Map<Path, String> symlinks,
+                           java.util.function.Predicate<String> keep) throws IOException {
         byte[] hdr = new byte[512];
         String longName = null, longLink = null;
         while (readFully(in, hdr)) {
@@ -185,6 +191,10 @@ final class LinuxSysroot {
                 continue;
             }
 
+            if (!keep.test(stripDot(name))) {
+                skip(in, size + pad(size));
+                continue;
+            }
             Path out = safeResolve(dest, name);
             switch (type) {
                 case '5' -> Files.createDirectories(out);
@@ -258,7 +268,7 @@ final class LinuxSysroot {
 
     // ------------------------------------------------------------------ helpers
 
-    private static Path safeResolve(Path root, String name) throws IOException {
+    static Path safeResolve(Path root, String name) throws IOException {
         Path p = root.resolve(stripDot(name)).normalize();
         if (!p.startsWith(root)) throw new IOException("Archive entry escapes sysroot: " + name);
         return p;
