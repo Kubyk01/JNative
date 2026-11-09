@@ -149,6 +149,7 @@ public class LlvmRuntime {
             declare void @__jnative_monitor_enter(i8*)
             declare void @__jnative_monitor_exit(i8*)
             declare i1 @__jnative_instanceof(i8*, i8**)
+            declare i1 @__jnative_array_instanceof(i8*, i8*)
             declare void @__jnative_push_catch(i8*, i8**)
             declare void @__jnative_pop_catch()
             declare void @__jnative_throw_exception(i8*)

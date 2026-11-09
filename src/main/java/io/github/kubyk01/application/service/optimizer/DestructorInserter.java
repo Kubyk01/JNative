@@ -4,6 +4,8 @@ import io.github.kubyk01.application.service.analyzer.dependencyresolver.Depende
 import io.github.kubyk01.application.service.analyzer.ssa.DominatorTree;
 import io.github.kubyk01.domain.analyzer.aliasanalysis.AliasAnalysisResult;
 import io.github.kubyk01.domain.analyzer.aliasanalysis.AllocationSite;
+import io.github.kubyk01.domain.analyzer.aliasanalysis.FieldCell;
+import io.github.kubyk01.domain.analyzer.aliasanalysis.PointsToGraph;
 import io.github.kubyk01.domain.analyzer.aliasanalysis.PointsToSet;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.ClassNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.FieldNode;
@@ -1047,6 +1049,60 @@ public class DestructorInserter {
             }
         }
 
+        return ownsEverythingDestroyed(baseSites, fieldKey, fieldSites, liveOutSet);
+    }
+
+    private Map<Integer, List<Long>> inboundEdges;
+
+    private Map<Integer, List<Long>> inboundEdges() {
+        if (inboundEdges != null) return inboundEdges;
+        PointsToGraph graph = aliasResult.getGraph();
+        Map<Integer, List<Long>> edges = new HashMap<>();
+        for (int src = 0, n = AllocationSite.count(); src < n; src++) {
+            for (FieldCell cell : graph.fieldCells(src)) {
+                long edge = ((long) src << 32) | (cell.fieldId() & 0xffffffffL);
+                for (int dst : cell.get().rawIds()) {
+                    edges.computeIfAbsent(dst, k -> new ArrayList<>()).add(edge);
+                }
+            }
+        }
+        inboundEdges = edges;
+        return edges;
+    }
+
+    private boolean ownsEverythingDestroyed(PointsToSet baseSites,
+                                            String fieldKey,
+                                            PointsToSet roots,
+                                            Set<AllocationSite> liveOutSet) {
+        PointsToGraph graph = aliasResult.getGraph();
+        Set<Integer> destroyed = new HashSet<>();
+        Deque<Integer> work = new ArrayDeque<>();
+        for (int id : roots.rawIds()) {
+            if (destroyed.add(id)) work.add(id);
+        }
+        while (!work.isEmpty()) {
+            for (FieldCell cell : graph.fieldCells(work.poll())) {
+                PointsToSet pts = cell.get();
+                if (pts.containsUnknown()) return false;
+                for (int child : pts.rawIds()) {
+                    if (isManagedType(AllocationSite.byId(child).getType()) && destroyed.add(child)) {
+                        work.add(child);
+                    }
+                }
+            }
+        }
+
+        int ownerFieldId = graph.findFieldId(fieldKey);
+        for (int id : destroyed) {
+            AllocationSite site = AllocationSite.byId(id);
+            if (staticFieldSites.contains(site) || liveOutSet.contains(site)) return false;
+            for (long edge : inboundEdges().getOrDefault(id, List.of())) {
+                int src = (int) (edge >>> 32);
+                if (destroyed.contains(src)) continue;
+                if ((int) edge == ownerFieldId && baseSites.containsId(src) && roots.containsId(id)) continue;
+                return false;
+            }
+        }
         return true;
     }
 

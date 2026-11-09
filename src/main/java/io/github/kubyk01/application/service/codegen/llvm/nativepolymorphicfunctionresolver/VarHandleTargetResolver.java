@@ -18,9 +18,11 @@ import org.objectweb.asm.Opcodes;
 import java.util.ArrayDeque;
 import java.util.Deque;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 public class VarHandleTargetResolver {
@@ -59,22 +61,30 @@ public class VarHandleTargetResolver {
                 || !c.getValue().toString().startsWith(VAR_HANDLE + ".")) {
             return null;
         }
-        Value receiver = call.getOperands().getFirst();
-        for (int depth = 0; depth < 8 && receiver instanceof Temporary t; depth++) {
-            Instruction def = t.getDefiningInstruction();
-            if (def == null) return null;
-            if (def.getOpcode() == Opcode.GET_STATIC) {
-                String full = LlvmUtil.extractFieldName(def);
-                int dot = full.lastIndexOf('.');
-                return dot > 0 ? resolve(full.substring(0, dot), full.substring(dot + 1)) : null;
-            }
-            if ((def.getOpcode() != Opcode.CHECKCAST && def.getOpcode() != Opcode.CAST)
-                    || def.getOperands().isEmpty()) {
-                return null;
-            }
-            receiver = def.getOperands().getFirst();
+        return resolveReceiver(call.getOperands().getFirst(), 0, new HashSet<>());
+    }
+
+    private Target resolveReceiver(Value receiver, int depth, Set<Instruction> visited) {
+        if (depth >= 16 || !(receiver instanceof Temporary t)) return null;
+        Instruction def = t.getDefiningInstruction();
+        if (def == null || !visited.add(def)) return null;
+        if (def.getOpcode() == Opcode.GET_STATIC) {
+            String full = LlvmUtil.extractFieldName(def);
+            int dot = full.lastIndexOf('.');
+            return dot > 0 ? resolve(full.substring(0, dot), full.substring(dot + 1)) : null;
         }
-        return null;
+        if (def.getOperands().isEmpty()) return null;
+        if (def.getOpcode() == Opcode.CHECKCAST || def.getOpcode() == Opcode.CAST) {
+            return resolveReceiver(def.getOperands().getFirst(), depth + 1, visited);
+        }
+        if (def.getOpcode() != Opcode.PHI) return null;
+        Target common = null;
+        for (Value incoming : def.getOperands()) {
+            Target target = resolveReceiver(incoming, depth + 1, new HashSet<>(visited));
+            if (target == null || (common != null && !common.equals(target))) return null;
+            common = target;
+        }
+        return common;
     }
 
     private Target compute(String holderClass, String handleField) {
@@ -241,8 +251,8 @@ public class VarHandleTargetResolver {
                     Object type = pop();
                     Object field = pop();
                     Object lookup = pop();
-                    push(lookup instanceof LookupIn l
-                            ? fieldTarget(Kind.INSTANCE_FIELD, Type.reference(l.lookupClass()), field, type)
+                    push(lookup instanceof LookupIn(String lookupClass)
+                            ? fieldTarget(Kind.INSTANCE_FIELD, Type.reference(lookupClass), field, type)
                             : UNKNOWN);
                     return;
                 }

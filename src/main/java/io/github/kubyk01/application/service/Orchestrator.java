@@ -703,6 +703,10 @@ public class Orchestrator implements OrchestratorPort {
         analysis.addExtraReachableMethod(new MethodReference(
             "java/nio/HeapByteBuffer", "putLong",
             "(IJ)Ljava/nio/ByteBuffer;"));
+
+        analysis.addExtraReachableMethod(new MethodReference(
+            "java/lang/ClassLoader", "getSystemClassLoader",
+            "()Ljava/lang/ClassLoader;"));
     }
 
     // =====================================================================

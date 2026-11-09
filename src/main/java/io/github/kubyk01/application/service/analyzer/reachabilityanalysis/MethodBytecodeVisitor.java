@@ -469,6 +469,9 @@ public class MethodBytecodeVisitor extends ClassVisitor {
                         implHandle.getName(),
                         implHandle.getDesc()
                     );
+                    if (implHandle.getTag() == Opcodes.H_NEWINVOKESPECIAL) {
+                        analysis.addInstantiatedClass(implHandle.getOwner(), reachableFromUser);
+                    }
                     addMethodWithContext(implRef, reachableFromUser);
                 }
             }

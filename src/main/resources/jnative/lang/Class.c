@@ -765,6 +765,44 @@ int __jnative_fn_java_lang_Class_isAssignableFrom__Ljava_lang_Class__Z(void* thi
     return 0;
 }
 
+static int array_descriptor_assignable(const char* src, const char* dst) {
+    if (strcmp(src, dst) == 0) return 1;
+    if (src[0] == '[' && dst[0] == '[') return array_descriptor_assignable(src + 1, dst + 1);
+    if (dst[0] != 'L') return 0;
+    if (strcmp(dst, "Ljava/lang/Object;") == 0) return src[0] == 'L' || src[0] == '[';
+    if (src[0] == '[') {
+        return strcmp(dst, "Ljava/lang/Cloneable;") == 0
+            || strcmp(dst, "Ljava/io/Serializable;") == 0;
+    }
+    if (src[0] != 'L') return 0;
+    char src_name[512];
+    char dst_name[512];
+    size_t src_len = strlen(src);
+    size_t dst_len = strlen(dst);
+    if (src_len < 3 || dst_len < 3 || src_len - 2 >= sizeof(src_name)
+        || dst_len - 2 >= sizeof(dst_name)) {
+        return 1;
+    }
+    memcpy(src_name, src + 1, src_len - 2);
+    src_name[src_len - 2] = '\0';
+    memcpy(dst_name, dst + 1, dst_len - 2);
+    dst_name[dst_len - 2] = '\0';
+    struct ReflectionClass* src_cls = find_registered_class(src_name);
+    struct ReflectionClass* dst_cls = find_registered_class(dst_name);
+    if (src_cls == NULL || dst_cls == NULL) return 1;
+    return __jnative_fn_java_lang_Class_isAssignableFrom__Ljava_lang_Class__Z(dst_cls, src_cls);
+}
+
+int __jnative_array_instanceof(void* obj, const char* type_name) {
+    if (obj == NULL) return 0;
+    void* klass = *(void**)obj;
+    if (klass == NULL || type_name == NULL) return 1;
+    if (!__jnative_is_class_mirror(klass)) return 0;
+    const char* cname = ((struct ReflectionClass*)klass)->cname;
+    if (cname == NULL || cname[0] != '[') return 0;
+    return array_descriptor_assignable(cname, type_name);
+}
+
 void* __jnative_fn_java_lang_Class_getDeclaringClass0___Ljava_lang_Class_(void* this_cls) {
     if (this_cls == NULL) return NULL;
     struct ReflectionClass* cls = (struct ReflectionClass*)this_cls;
@@ -830,7 +868,7 @@ void* __jnative_fn_java_lang_Class_getPrimitiveClass__Ljava_lang_String__Ljava_l
 {
     if (name_str == NULL) return NULL;
     int32_t len = 0;
-    const char* name = __jnative_read_string_bytes(name_str, &len);
+    const char* name = __jnative_read_string_cstr(name_str, &len);
     (void)len;
     return (void*)find_registered_class(name);
 }
@@ -891,7 +929,7 @@ void* __jnative_fn_java_lang_Class_forName0__Ljava_lang_String_ZLjava_lang_Class
     }
 
     int32_t len = 0;
-    const char* name = __jnative_read_string_bytes(name_str, &len);
+    const char* name = __jnative_read_string_cstr(name_str, &len);
     if (name == NULL || len <= 0) {
         __jnative_throw_exception(make_class_not_found_exception(name, len));
         return NULL;
@@ -929,8 +967,25 @@ void* __jnative_fn_java_lang_Class_getInterfaces0____Ljava_lang_Class_(void* thi
     return make_class_array(cls->interfaces);
 }
 
+typedef struct {
+    ReflectionClass* cls;
+    const char*      signature;
+} JNativeClassSignatureEntry;
+
+extern const JNativeClassSignatureEntry jnative_class_signatures[] JNATIVE_WEAK;
+extern const int64_t jnative_class_signatures_size JNATIVE_WEAK;
+
 void* __jnative_fn_java_lang_Class_getGenericSignature0___Ljava_lang_String_(void* this_cls) {
-    (void)this_cls;
+    if (this_cls == NULL || jnative_class_signatures == NULL
+        || &jnative_class_signatures_size == NULL) {
+        return NULL;
+    }
+    for (int64_t i = 0; i < jnative_class_signatures_size; i++) {
+        if (jnative_class_signatures[i].cls == this_cls) {
+            const char* sig = jnative_class_signatures[i].signature;
+            return __jnative_make_string_obj(sig, (int32_t)strlen(sig));
+        }
+    }
     return NULL;
 }
 
@@ -1166,6 +1221,28 @@ void* __jnative_override_Class_getResourceAsStream(void* this_class,
     }
 
     return __jnative_make_byte_array_input_stream(bytes);
+}
+
+extern void* fn_java_lang_ClassLoader_getSystemClassLoader___Ljava_lang_ClassLoader_(void) JNATIVE_WEAK;
+
+void* __jnative_override_java_lang_Class_getClassLoader(void* self) {
+    if (self == NULL) {
+        __jnative_throw_null_pointer_exception_ctx(
+            "__jnative_override_java_lang_Class_getClassLoader", "self");
+    }
+    ReflectionClass* cls = (ReflectionClass*)self;
+    if (cls->class_loader != NULL) return cls->class_loader;
+    const char* name = cls->cname;
+    if (name == NULL || name[0] == '[' || cls->primitive != NULL) return NULL;
+    static const char* const boot_prefixes[] = {
+        "java/", "javax/", "jdk/", "sun/", "com/sun/", NULL
+    };
+    for (int i = 0; boot_prefixes[i] != NULL; i++) {
+        if (strncmp(name, boot_prefixes[i], strlen(boot_prefixes[i])) == 0) return NULL;
+    }
+    if (fn_java_lang_ClassLoader_getSystemClassLoader___Ljava_lang_ClassLoader_ == NULL) return NULL;
+    run_lazy_clinit_if_present(jnative_class_by_name("java/lang/ClassLoader"));
+    return fn_java_lang_ClassLoader_getSystemClassLoader___Ljava_lang_ClassLoader_();
 }
 typedef struct {
     ReflectionClass* cls;

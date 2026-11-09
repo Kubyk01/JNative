@@ -3733,6 +3733,7 @@ public class LlvmGlobalEmitter {
 
         sb.append(generateSymbolClassMap(strConsts, classVarNames));
         sb.append(generateClassFileVersionMap(classVarNames));
+        sb.append(generateClassSignatureMap(strConsts, classVarNames));
         sb.append(generateCallerSensitiveSymbols(strConsts));
         sb.append(generateClassIntConstants(strConsts,
             "jnative_systemprops_raw_constants", "jdk/internal/util/SystemProps$Raw"));
@@ -4087,6 +4088,32 @@ public class LlvmGlobalEmitter {
         sb.append("]\n");
         sb.append("@jnative_class_file_versions_size = constant i64 ")
             .append(versions.size()).append("\n");
+        return sb.toString();
+    }
+
+    private String generateClassSignatureMap(StringBuilder strConsts, Map<String, String> classVarNames) {
+        TreeMap<String, String> signatures = new TreeMap<>();
+        for (ClassNode cn : resolver.getClassMap().values()) {
+            String className = cn.getName();
+            if (className == null || cn.getSignature() == null) continue;
+            if (classVarNames.containsKey(className)) {
+                signatures.put(className, cn.getSignature());
+            }
+        }
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("@jnative_class_signatures = constant [")
+            .append(signatures.size() + 1)
+            .append(" x { %ReflectionClass*, i8* }] [\n");
+        for (Map.Entry<String, String> e : signatures.entrySet()) {
+            sb.append("  { %ReflectionClass*, i8* } { %ReflectionClass* ")
+                .append(classVarNames.get(e.getKey()))
+                .append(", i8* ").append(ensureStringConstantPtr(strConsts, e.getValue())).append(" },\n");
+        }
+        sb.append("  { %ReflectionClass*, i8* } { %ReflectionClass* null, i8* null }\n");
+        sb.append("]\n");
+        sb.append("@jnative_class_signatures_size = constant i64 ")
+            .append(signatures.size()).append("\n");
         return sb.toString();
     }
 

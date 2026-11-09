@@ -9,6 +9,7 @@ import io.github.kubyk01.domain.analyzer.reachability.ReachabilityMetadata;
 import io.github.kubyk01.domain.ir.Type;
 import lombok.Getter;
 import lombok.RequiredArgsConstructor;
+import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
 import org.objectweb.asm.AnnotationVisitor;
 import org.objectweb.asm.ClassReader;
@@ -94,12 +95,9 @@ public class DependencyResolver {
 
     private FileSystem jrtFileSystem;
 
+    @Setter
     private Path targetJavaHome;
     private Set<String> targetModules; // lazily listed from the target image
-
-    public void setTargetJavaHome(Path targetJavaHome) {
-        this.targetJavaHome = targetJavaHome;
-    }
 
     /**
      * Absolute path of the top-level input archive, if {@link #scan(Path)}
@@ -758,6 +756,7 @@ public class DependencyResolver {
                                 .interfaces(interfaces != null ? Arrays.asList(interfaces) : Collections.emptyList())
                                 .access(access)
                                 .classFileVersion(version)
+                                .signature(signature)
                                 .isInterface((access & Opcodes.ACC_INTERFACE) != 0)
                                 .isExternal(false);
                     }
@@ -920,6 +919,7 @@ public class DependencyResolver {
                             .interfaces(interfaces != null ? Arrays.asList(interfaces) : Collections.emptyList())
                             .access(access)
                             .classFileVersion(version)
+                            .signature(signature)
                             .isInterface((access & Opcodes.ACC_INTERFACE) != 0)
                             .isExternal(false);
                 }

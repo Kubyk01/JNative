@@ -2481,8 +2481,8 @@ public class LlvmFunctionEmitter {
                 String objRef = getPointerOperand(sb, obj);
 
                 if (typeName != null && typeName.startsWith("[")) {
-                    sb.append("  ").append(resultName).append(" = icmp ne i8* ")
-                            .append(objRef).append(", null\n");
+                    sb.append("  ").append(resultName).append(" = call i1 @__jnative_array_instanceof(i8* ")
+                            .append(objRef).append(", i8* ").append(stringRef(typeName)).append(")\n");
                     break;
                 }
 
