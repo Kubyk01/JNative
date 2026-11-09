@@ -2,6 +2,7 @@ package io.github.kubyk01.application.service.codegen.llvm.nativepolymorphicfunc
 
 import io.github.kubyk01.application.service.analyzer.dependencyresolver.DependencyResolver;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.FieldNode;
+import io.github.kubyk01.domain.ir.BasicBlock;
 import io.github.kubyk01.domain.ir.Constant;
 import io.github.kubyk01.domain.ir.Instruction;
 import io.github.kubyk01.domain.ir.Opcode;
@@ -16,9 +17,11 @@ import org.objectweb.asm.MethodVisitor;
 import org.objectweb.asm.Opcodes;
 
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
@@ -65,7 +68,7 @@ public class VarHandleTargetResolver {
     }
 
     private Target resolveReceiver(Value receiver, int depth, Set<Instruction> visited) {
-        if (depth >= 16 || !(receiver instanceof Temporary t)) return null;
+        if (depth >= 64 || !(receiver instanceof Temporary t)) return null;
         Instruction def = t.getDefiningInstruction();
         if (def == null || !visited.add(def)) return null;
         if (def.getOpcode() == Opcode.GET_STATIC) {
@@ -73,13 +76,36 @@ public class VarHandleTargetResolver {
             int dot = full.lastIndexOf('.');
             return dot > 0 ? resolve(full.substring(0, dot), full.substring(dot + 1)) : null;
         }
+        if (def.getOpcode() == Opcode.LOAD) {
+            return resolveLocalSlot(def, depth, visited);
+        }
         if (def.getOperands().isEmpty()) return null;
-        if (def.getOpcode() == Opcode.CHECKCAST || def.getOpcode() == Opcode.CAST) {
+        if (def.getOpcode() == Opcode.CHECKCAST || def.getOpcode() == Opcode.CAST
+                || def.getOpcode() == Opcode.STORE) {
             return resolveReceiver(def.getOperands().getFirst(), depth + 1, visited);
         }
         if (def.getOpcode() != Opcode.PHI) return null;
+        return resolveAll(def.getOperands(), depth, visited);
+    }
+
+    private Target resolveLocalSlot(Instruction load, int depth, Set<Instruction> visited) {
+        if (load.getParent() == null || load.getParent().getFunction() == null) return null;
+        List<Value> stored = new ArrayList<>();
+        for (BasicBlock block : load.getParent().getFunction().getBlocks()) {
+            for (Instruction inst : block.getInstructions()) {
+                if (inst.getOpcode() == Opcode.STORE
+                        && inst.getLocalIndex() == load.getLocalIndex()
+                        && !inst.getOperands().isEmpty()) {
+                    stored.add(inst.getOperands().getFirst());
+                }
+            }
+        }
+        return resolveAll(stored, depth, visited);
+    }
+
+    private Target resolveAll(List<Value> values, int depth, Set<Instruction> visited) {
         Target common = null;
-        for (Value incoming : def.getOperands()) {
+        for (Value incoming : values) {
             Target target = resolveReceiver(incoming, depth + 1, new HashSet<>(visited));
             if (target == null || (common != null && !common.equals(target))) return null;
             common = target;
