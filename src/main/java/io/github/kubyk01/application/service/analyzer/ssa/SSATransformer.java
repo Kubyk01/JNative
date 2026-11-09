@@ -122,6 +122,38 @@ public class SSATransformer {
         optimizePhis(function);
         cleanupPhis(function);
         cleanupNops(function);
+        retypeReferencePhis(function);
+    }
+
+    private void retypeReferencePhis(Function function) {
+        List<Instruction> phis = new ArrayList<>();
+        for (BasicBlock block : function.getBlocks()) {
+            for (Instruction inst : block.getInstructions()) {
+                if (inst.getOpcode() == Opcode.PHI
+                    && inst.getResult() != null
+                    && typeBucket(inst.getResult().getType()) == BUCKET_REF) {
+                    phis.add(inst);
+                }
+            }
+        }
+        Type object = Type.reference("java/lang/Object");
+        boolean changed = true;
+        for (int round = 0; changed && round < 64; round++) {
+            changed = false;
+            for (Instruction phi : phis) {
+                Type joined = null;
+                for (Value incoming : phi.getOperands()) {
+                    if (incoming == null || incoming == phi.getResult()) continue;
+                    Type t = incoming.getType();
+                    if (t == null || t.isNull() || t.isUnknown()) continue;
+                    joined = joined == null || joined.equals(t) ? t : object;
+                }
+                if (joined != null && !joined.equals(phi.getResult().getType())) {
+                    phi.getResult().setType(joined);
+                    changed = true;
+                }
+            }
+        }
     }
 
     // ------------------------------------------------------------------
