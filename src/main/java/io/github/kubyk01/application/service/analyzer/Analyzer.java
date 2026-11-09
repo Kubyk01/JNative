@@ -1259,6 +1259,7 @@ public class Analyzer {
             clinitOrder, phaseOrder, afterMap,
             initReadBits, initWriteBits, funcIndex, fieldIdMap, fieldWords);
         deferred.addAll(computeJniDependentClinits(module, clinitOrder));
+        deferred.addAll(computeMissingClassClinits(clinitOrder, resolver));
 
         if (!deferred.isEmpty()) {
             this.deferredClinits.addAll(deferred);
@@ -1518,6 +1519,49 @@ public class Analyzer {
         if (!result.isEmpty()) {
             System.out.println("Deferring " + result.size()
                 + " <clinit>(s) that call JNI natives to lazy initialization.");
+        }
+        return result;
+    }
+
+    /**
+     * A <clinit> that directly uses a class absent from the classpath (e.g. Spring's
+     * CoroutinesUtils -> kotlin.jvm.JvmClassMappingKt) throws NoClassDefFoundError when it
+     * runs. The JVM only runs it on first use of its class (guarded by KotlinDetector etc.),
+     * so it must stay lazy instead of running eagerly at startup.
+     */
+    private static Set<String> computeMissingClassClinits(List<Function> clinitOrder,
+                                                          DependencyResolver resolver) {
+        Set<String> result = new LinkedHashSet<>();
+        for (Function c : clinitOrder) {
+            if (c.getEntryBlock() == null) continue;
+            scan:
+            for (BasicBlock b : c.getBlocks()) {
+                for (Instruction inst : b.getInstructions()) {
+                    Opcode op = inst.getOpcode();
+                    List<String> owners = new ArrayList<>(3);
+                    owners.add(extractTriggerOwner(inst));
+                    if (op == Opcode.CALL || op == Opcode.STATIC_CALL || op == Opcode.SPECIAL_CALL
+                        || op == Opcode.VIRTUAL_CALL || op == Opcode.INTERFACE_CALL) {
+                        for (int k = 0; k < 2; k++) {
+                            String callee = extractCalleeConstant(inst, k);
+                            int paren = callee == null ? -1 : callee.indexOf('(');
+                            int dot = callee == null ? -1 : callee.indexOf('.');
+                            if (dot > 0 && (paren < 0 || dot < paren)) owners.add(callee.substring(0, dot));
+                        }
+                    }
+                    for (String owner : owners) {
+                        if (owner == null || owner.isEmpty() || owner.charAt(0) == '[') continue;
+                        if (resolver.isMissingClass(owner)) {
+                            result.add(c.getName());
+                            break scan;
+                        }
+                    }
+                }
+            }
+        }
+        if (!result.isEmpty()) {
+            System.out.println("Deferring " + result.size()
+                + " <clinit>(s) that use classes missing from the classpath to lazy initialization.");
         }
         return result;
     }

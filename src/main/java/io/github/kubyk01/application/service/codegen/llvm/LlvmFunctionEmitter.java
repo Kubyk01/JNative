@@ -4204,15 +4204,17 @@ public class LlvmFunctionEmitter {
             return JNATIVE_FILE_CACHE.computeIfAbsent(owner,
                     LlvmFunctionEmitter::hasJNativeCFilesForOwner);
         }
+        // Most specific owner wins: HashMap order made e.g. a shorter unrelated prefix
+        // shadow java/lang/System for __jnative_fn_java_lang_System_arraycopy__byte_bytes.
+        String best = null;
         for (String cls : resolver.getClassMap().keySet()) {
-            String mangledClass = LlvmTypeMapper.sanitizeIdentifier(cls);
-            String prefix = "__jnative_fn_" + mangledClass + "_";
-            if (symbol.startsWith(prefix)) {
-                return JNATIVE_FILE_CACHE.computeIfAbsent(cls,
-                        LlvmFunctionEmitter::hasJNativeCFilesForOwner);
+            String prefix = "__jnative_fn_" + LlvmTypeMapper.sanitizeIdentifier(cls) + "_";
+            if (symbol.startsWith(prefix) && (best == null || cls.length() > best.length())) {
+                best = cls;
             }
         }
-        return false;
+        return best != null && JNATIVE_FILE_CACHE.computeIfAbsent(best,
+                LlvmFunctionEmitter::hasJNativeCFilesForOwner);
     }
 
     private static boolean hasJNativeCFilesForOwner(String internalName) {
