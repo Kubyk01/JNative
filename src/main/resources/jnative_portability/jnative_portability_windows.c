@@ -122,9 +122,13 @@ int   jn_tls_set(jn_tls_key_t k, void* v){ return FlsSetValue(k, v) ? 0 : -1; }
  *  Dynamic symbol resolution
  * ================================================================== */
 
+void* __jnative_self_symbol(const char* name); /* generated per build */
+
 void* jn_lib_sym_self(const char* name) {
+    void* p = __jnative_self_symbol(name);
+    if (p) return p;
     HMODULE h = GetModuleHandleA(NULL);
-    void* p = (void*)GetProcAddress(h, name);
+    p = (void*)GetProcAddress(h, name);
     if (p) return p;
 
     /* Fallback: search every loaded module. Needed for symbols that the

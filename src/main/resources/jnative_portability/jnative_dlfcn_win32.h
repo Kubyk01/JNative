@@ -29,8 +29,17 @@ static inline void* dlopen(const char* filename, int flags) {
     return (void*)LoadLibraryA(filename);
 }
 
+/* Generated per build (Compiler.writeWindowsSymbolTable): the image's own lookup
+ * table, since a PE export table is capped at 65535 entries. */
+void* __jnative_self_symbol(const char* name);
+
 static inline void* dlsym(void* handle, const char* symbol) {
-    if (handle == NULL) handle = (void*)GetModuleHandleA(NULL);
+    HMODULE self = GetModuleHandleA(NULL);
+    if (handle == NULL || (HMODULE)handle == self) {
+        void* p = __jnative_self_symbol(symbol);
+        if (p) return p;
+        handle = (void*)self;
+    }
     return (void*)GetProcAddress((HMODULE)handle, symbol);
 }
 

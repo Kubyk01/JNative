@@ -206,6 +206,11 @@ public class Compiler implements CompilerPort {
             Path bundledLibsSource = writeBundledLibrariesSource(tempDir, nativeLibs);
             tasks.add(new CompileTask(bundledLibsSource, cDir.resolve("jnative_bundled_libs.o"), false));
 
+            if (target.isWindows()) {
+                Path symtab = writeWindowsSymbolTable(module, llPaths, tempDir, target);
+                tasks.add(new CompileTask(symtab, cDir.resolve("jnative_self_symbols.o"), false));
+            }
+
             int irIndex = 0;
             for (Path ll : llPaths) {
                 String base = sanitizeForObjName(ll.getFileName().toString());
@@ -247,11 +252,6 @@ public class Compiler implements CompilerPort {
             // -L<gcc-runtime-dir> explicitly for every directory that
             // contains libgcc.a. See findGccRuntimeLibDirs below.
             // ------------------------------------------------------------------
-            Path defFile = null;
-            if (target.isWindows()) {
-                defFile = generateWindowsExportDef(module, llPaths, tempDir);
-            }
-
             List<String> linkCmd = new ArrayList<>();
             linkCmd.add(compiler);
 
@@ -276,6 +276,9 @@ public class Compiler implements CompilerPort {
                 }
                 linkCmd.add("-fuse-ld=lld");
                 linkCmd.add("-flto-jobs=" + effectiveCores);
+                // MSVC-mode lld-link reports a symbol made weak in several objects as duplicate
+                // (MinGW mode allows it); the runtime relies on ELF-style weak, so allow it.
+                linkCmd.add("-Wl,-lld-allow-duplicate-weak");
             } else {
                 // Windows doesn't append .exe to a name that already has an extension (".lld").
                 if (!isAvailable(TargetPlatform.detectFromBuildHost().isWindows() ? "ld.lld.exe" : "ld.lld")) {
@@ -334,7 +337,7 @@ public class Compiler implements CompilerPort {
             linkCmd.add("-o");
             linkCmd.add(exePath.toString());
 
-            appendLinkerLibraries(linkCmd, target, defFile);
+            appendLinkerLibraries(linkCmd, target);
 
             // ------------------------------------------------------------------
             // 6. Native library discovery and bundling.
@@ -1311,9 +1314,15 @@ public class Compiler implements CompilerPort {
     //  Windows export table
     // =====================================================================
 
-    private static Path generateWindowsExportDef(Module module,
-                                                 List<Path> llPaths,
-                                                 Path tempDir) throws IOException {
+    /**
+     * The C runtime looks symbols up by name (dlsym/GetProcAddress on itself). A PE export
+     * table holds at most 65535 entries, so instead of exporting them this writes a sorted
+     * name -> address table that jnative_dlfcn_win32.h / jn_lib_sym_self search first.
+     */
+    private static Path writeWindowsSymbolTable(Module module,
+                                                List<Path> llPaths,
+                                                Path tempDir,
+                                                TargetPlatform target) throws IOException {
         Set<String> exports = new TreeSet<>();
 
         // ------------------------------------------------------------------
@@ -1353,7 +1362,7 @@ public class Compiler implements CompilerPort {
             if (!line.startsWith("@")) continue;
             int eq = line.indexOf(" = ");
             if (eq <= 0) continue;
-            String lhs = line.substring(1, eq).trim();
+            String lhs = line.substring(1, eq).trim().replace("\"", "");
             String rhs = line.substring(eq + 3).trim();
             if (rhs.startsWith("external ") || rhs.startsWith("declare ")) continue;
             definedGlobals.add(lhs);
@@ -1420,17 +1429,37 @@ public class Compiler implements CompilerPort {
         }
 
         // ------------------------------------------------------------------
-        // 6. Write the .def file.
+        // 6. Write the table. TreeSet order == strcmp order (names are ASCII),
+        //    so the runtime can bsearch it. Asm labels give the exact symbol
+        //    name; 32-bit x86 Windows prefixes C symbols with '_'.
         // ------------------------------------------------------------------
-        Path defFile = tempDir.resolve("exports.def");
-        StringBuilder sb = new StringBuilder("EXPORTS\n");
+        String prefix = target.triple().matches("i[3-6]86-.*") ? "_" : "";
+        StringBuilder sb = new StringBuilder(
+                "#include <stdlib.h>\n#include <string.h>\n"
+                + "typedef struct { const char* n; const void* a; } JnSelfSym;\n");
+        int i = 0;
         for (String sym : exports) {
-            sb.append("    ").append(sym).append("\n");
+            sb.append(definedFunctions.contains(sym) ? "extern void s" + i + "(void)" : "extern char s" + i)
+              .append(" __asm__(\"").append(prefix).append(sym).append("\");\n");
+            i++;
         }
-        Files.writeString(defFile, sb.toString());
+        sb.append("static const JnSelfSym jn_self_syms[] = {\n");
+        i = 0;
+        for (String sym : exports) {
+            sb.append("    {\"").append(sym).append("\", (const void*)&s").append(i++).append("},\n");
+        }
+        sb.append("    {0, 0}\n};\n")
+          .append("static int jn_self_cmp(const void* k, const void* e) {\n")
+          .append("    return strcmp((const char*)k, ((const JnSelfSym*)e)->n);\n}\n")
+          .append("void* __jnative_self_symbol(const char* name) {\n")
+          .append("    const JnSelfSym* s = (const JnSelfSym*)bsearch(name, jn_self_syms, ")
+          .append(exports.size()).append(", sizeof(JnSelfSym), jn_self_cmp);\n")
+          .append("    return s ? (void*)s->a : NULL;\n}\n");
 
-        System.out.println("Windows export table: " + exports.size() + " symbol(s)");
-        return defFile;
+        Path src = tempDir.resolve("jnative_self_symbols.c");
+        Files.writeString(src, sb.toString());
+        System.out.println("Windows self-symbol table: " + exports.size() + " symbol(s)");
+        return src;
     }
 
     /**
@@ -1542,14 +1571,10 @@ public class Compiler implements CompilerPort {
     // =====================================================================
 
     private static void appendLinkerLibraries(List<String> linkCmd,
-                                              TargetPlatform target,
-                                              Path defFile) {
+                                              TargetPlatform target) {
         if (target.isWindows()
                 && target.triple().toLowerCase(Locale.ROOT).contains("-msvc")) {
             linkCmd.add("-Wl,/subsystem:console");
-            if (defFile != null) {
-                linkCmd.add("-Wl,/def:" + defFile.toAbsolutePath());
-            }
             linkCmd.add("-Wl,/opt:ref");
             linkCmd.add("-ldbghelp");
             linkCmd.add("-lws2_32");
@@ -1563,9 +1588,6 @@ public class Compiler implements CompilerPort {
             linkCmd.add("-mconsole");
             linkCmd.add("-Wl,--subsystem,console");
             linkCmd.add("-static-libgcc");
-            if (defFile != null) {
-                linkCmd.add(defFile.toString());
-            }
             linkCmd.add("-Wl,--gc-sections");
             linkCmd.add("-lm");
             linkCmd.add("-Wl,-Bstatic");
