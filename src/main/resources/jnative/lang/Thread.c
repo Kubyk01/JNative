@@ -850,7 +850,13 @@ int __jnative_fn_java_lang_Thread_holdsLock__Ljava_lang_Object__Z(void* obj) {
 }
 
 void __jnative_fn_java_lang_Thread_onSpinWait___V(void) {
+#if defined(__x86_64__) || defined(__i386__)
     __asm__ __volatile__("pause" ::: "memory");
+#elif defined(__aarch64__) || defined(__arm__)
+    __asm__ __volatile__("yield" ::: "memory");
+#else
+    __asm__ __volatile__("" ::: "memory"); /* no spin hint: compiler barrier only */
+#endif
 }
 
 void __jnative_fn_java_lang_Thread_exit__V(void* this_thread) {

@@ -94,6 +94,13 @@ public class DependencyResolver {
 
     private FileSystem jrtFileSystem;
 
+    private Path targetJavaHome;
+    private Set<String> targetModules; // lazily listed from the target image
+
+    public void setTargetJavaHome(Path targetJavaHome) {
+        this.targetJavaHome = targetJavaHome;
+    }
+
     /**
      * Absolute path of the top-level input archive, if {@link #scan(Path)}
      * was given a Spring Boot fat jar. Used by {@link #loadFromNestedJarIndex}
@@ -244,14 +251,16 @@ public class DependencyResolver {
             }
         }
 
-        try (InputStream is = ClassLoader.getSystemResourceAsStream(internalName + ".class")) {
-            if (is != null) {
-                bytes = is.readAllBytes();
-                log.debug("Loaded system class {} via ClassLoader", internalName);
+        if (targetJavaHome == null) {
+            try (InputStream is = ClassLoader.getSystemResourceAsStream(internalName + ".class")) {
+                if (is != null) {
+                    bytes = is.readAllBytes();
+                    log.debug("Loaded system class {} via ClassLoader", internalName);
+                }
+            } catch (IOException e) {
+                log.debug("Failed to load system class {} via ClassLoader: {}",
+                        internalName, e.getMessage());
             }
-        } catch (IOException e) {
-            log.debug("Failed to load system class {} via ClassLoader: {}",
-                    internalName, e.getMessage());
         }
 
         if (bytes == null) {
@@ -269,6 +278,16 @@ public class DependencyResolver {
             }
         }
 
+        if (targetJavaHome != null) {
+            // Not in the target JDK: the class doesn't exist on the target OS.
+            missingClasses.add(internalName);
+            classMap.putIfAbsent(internalName, ClassNode.builder()
+                    .name(internalName)
+                    .superName("java/lang/Object")
+                    .isExternal(true)
+                    .build());
+            return;
+        }
         loadClassViaReflection(internalName);
     }
 
@@ -390,8 +409,20 @@ public class DependencyResolver {
             if (fs == null) return null;
 
             Set<String> moduleNames = new HashSet<>();
-            for (Module module : ModuleLayer.boot().modules()) {
-                moduleNames.add(module.getName());
+            if (targetJavaHome != null) {
+                // The target image's module set, not the host's (e.g. jdk.crypto.mscapi is Windows-only).
+                if (targetModules == null) {
+                    Set<String> names = new HashSet<>();
+                    try (var dirs = Files.list(fs.getPath("/modules"))) {
+                        dirs.forEach(d -> names.add(d.getFileName().toString()));
+                    }
+                    targetModules = names;
+                }
+                moduleNames.addAll(targetModules);
+            } else {
+                for (Module module : ModuleLayer.boot().modules()) {
+                    moduleNames.add(module.getName());
+                }
             }
             if (!moduleNames.contains("java.base")) {
                 moduleNames.add("java.base");
@@ -421,6 +452,12 @@ public class DependencyResolver {
 
     private FileSystem getJrtFileSystem() throws IOException {
         if (jrtFileSystem != null && jrtFileSystem.isOpen()) {
+            return jrtFileSystem;
+        }
+        if (targetJavaHome != null) {
+            // jrt-fs.jar of the given java.home reads that JDK's lib/modules, whatever OS it was built for.
+            jrtFileSystem = FileSystems.newFileSystem(URI.create("jrt:/"),
+                    Map.of("java.home", targetJavaHome.toString()));
             return jrtFileSystem;
         }
         try {

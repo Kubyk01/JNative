@@ -117,7 +117,7 @@ public class Compiler implements CompilerPort {
             String compiler = detectCompiler(target);
 
             MsvcToolchain msvcToolchain = null;
-            String mingwSysroot = null;
+            String sysroot = null;
 
             if (target.isWindows()) {
                 boolean isMsvc = target.triple().toLowerCase(Locale.ROOT)
@@ -125,10 +125,13 @@ public class Compiler implements CompilerPort {
                 if (isMsvc) {
                     msvcToolchain = checkWindowsMsvcToolchain(target);
                 } else {
-                    mingwSysroot = resolveWindowsSysroot(target);
-                    System.out.println("MinGW-w64 sysroot: " + mingwSysroot);
-                    checkWindowsToolchain(target, compiler, mingwSysroot);
+                    sysroot = resolveWindowsSysroot(target);
+                    System.out.println("MinGW-w64 sysroot: " + sysroot);
+                    checkWindowsToolchain(target, compiler, sysroot);
                 }
+            } else {
+                sysroot = resolveUnixSysroot(target);
+                if (sysroot != null) System.out.println("Target sysroot: " + sysroot);
             }
 
             // ------------------------------------------------------------------
@@ -219,7 +222,7 @@ public class Compiler implements CompilerPort {
                     + threadCount + " thread(s) (target " + target.triple() + ")...");
 
             compileAll(compiler, tasks, tempDir, threadCount, effectiveOptLevel,
-                    target, mingwSysroot, msvcToolchain);
+                    target, sysroot, msvcToolchain);
 
             // ------------------------------------------------------------------
             // 5. Link.
@@ -274,7 +277,8 @@ public class Compiler implements CompilerPort {
                 linkCmd.add("-fuse-ld=lld");
                 linkCmd.add("-flto-jobs=" + effectiveCores);
             } else {
-                if (!isAvailable("ld.lld")) {
+                // Windows doesn't append .exe to a name that already has an extension (".lld").
+                if (!isAvailable(TargetPlatform.detectFromBuildHost().isWindows() ? "ld.lld.exe" : "ld.lld")) {
                     throw new IllegalStateException(
                             "ThinLTO for target '" + target.triple() + "' requires the "
                                     + "LLVM linker 'ld.lld', but it was not found on PATH. "
@@ -313,7 +317,11 @@ public class Compiler implements CompilerPort {
                 linkCmd.add("-Wl,--thinlto-jobs=" + effectiveCores);
             }
 
-            appendWindowsSysrootToLinker(linkCmd, mingwSysroot, target);
+            if (target.isWindows()) {
+                appendWindowsSysrootToLinker(linkCmd, sysroot, target);
+            } else if (sysroot != null) {
+                linkCmd.add("--sysroot=" + sysroot);
+            }
 
             List<String> objectLines = new ArrayList<>(tasks.size());
             for (CompileTask task : tasks) {
@@ -675,7 +683,7 @@ public class Compiler implements CompilerPort {
 
     private static void checkWindowsToolchain(TargetPlatform target,
                                               String compiler,
-                                              String mingwSysroot) {
+                                              String sysroot) {
         if (!target.isWindows()) {
             return;
         }
@@ -692,8 +700,8 @@ public class Compiler implements CompilerPort {
             command.add("--target=" + target.triple());
         }
 
-        if (!isMsvc && mingwSysroot != null) {
-            command.add("--sysroot=" + mingwSysroot);
+        if (!isMsvc && sysroot != null) {
+            command.add("--sysroot=" + sysroot);
         }
 
         command.add("-fsyntax-only");
@@ -846,6 +854,28 @@ public class Compiler implements CompilerPort {
                             + String.join("\n  ", MINGW_ROOT_CANDIDATES_WINDOWS));
         }
         return sysroot;
+    }
+
+    /**
+     * Sysroot for Linux/macOS targets: JNATIVE_SYSROOT, or null for a native build
+     * (host toolchain). A cross-OS build has no target libc on the host, so for Linux
+     * one is downloaded once (see LinuxSysroot), like mingw-w64 serves Windows targets.
+     */
+    private static String resolveUnixSysroot(TargetPlatform target)
+            throws IOException, InterruptedException {
+        String env = System.getenv("JNATIVE_SYSROOT");
+        if (env != null && !env.isBlank()) {
+            if (!Files.isDirectory(Paths.get(env))) {
+                throw new IllegalStateException("JNATIVE_SYSROOT does not exist: " + env);
+            }
+            return env;
+        }
+        if (!target.isCrossOs()) return null;
+        if (target.isDarwin()) {
+            throw new IllegalStateException("Cross-compiling to '" + target.triple()
+                    + "' needs a macOS SDK; set JNATIVE_SYSROOT to its path.");
+        }
+        return LinuxSysroot.ensure(target);
     }
 
     private static String findMinGWSysroot() {
@@ -1055,13 +1085,13 @@ public class Compiler implements CompilerPort {
     private void compileAll(String compiler, List<CompileTask> tasks,
                             Path includeDir, int threadCount,
                             int optimizationLevel, TargetPlatform target,
-                            String mingwSysroot, MsvcToolchain msvcToolchain)
+                            String sysroot, MsvcToolchain msvcToolchain)
             throws IOException, InterruptedException {
 
         if (threadCount <= 1 || tasks.size() <= 1) {
             for (CompileTask task : tasks) {
                 compileOne(compiler, task, includeDir, optimizationLevel,
-                        target, mingwSysroot, msvcToolchain);
+                        target, sysroot, msvcToolchain);
             }
             return;
         }
@@ -1082,7 +1112,7 @@ public class Compiler implements CompilerPort {
                 while ((idx = nextTask.getAndIncrement()) < tasks.size()) {
                     try {
                         compileOne(compiler, tasks.get(idx), includeDir,
-                                optimizationLevel, target, mingwSysroot,
+                                optimizationLevel, target, sysroot,
                                 msvcToolchain);
                     } catch (Throwable t) {
                         failures.add(t);
@@ -1117,7 +1147,7 @@ public class Compiler implements CompilerPort {
 
     private void compileOne(String compiler, CompileTask task, Path includeDir,
                             int optimizationLevel, TargetPlatform target,
-                            String mingwSysroot, MsvcToolchain msvcToolchain)
+                            String sysroot, MsvcToolchain msvcToolchain)
             throws IOException, InterruptedException {
 
         Path parent = task.obj.getParent();
@@ -1164,7 +1194,7 @@ public class Compiler implements CompilerPort {
                 command.add("-D_CRT_NONSTDC_NO_DEPRECATE=1");
                 command.add("-D__USE_MINGW_ANSI_STDIO=1");
             } else {
-                appendWindowsSysrootToCompiler(command, mingwSysroot, task.isIr, target);
+                appendWindowsSysrootToCompiler(command, sysroot, task.isIr, target);
                 if (!isMinGwWrapper(compiler)) {
                     command.add("--target=" + target.triple());
                 }
@@ -1174,6 +1204,10 @@ public class Compiler implements CompilerPort {
                 command.add("-D_CRT_SECURE_NO_WARNINGS=1");
                 command.add("-D__USE_MINGW_ANSI_STDIO=1");
             }
+        } else {
+            // Without --target clang compiles the C runtime for the HOST (e.g. MSVC headers on Windows).
+            command.add("--target=" + target.triple());
+            if (sysroot != null) command.add("--sysroot=" + sysroot);
         }
 
         command.add(task.src.toString());

@@ -10,6 +10,7 @@ import io.github.kubyk01.application.service.codegen.NativeOverride;
 import io.github.kubyk01.application.service.codegen.NativeOverrideScanner;
 import io.github.kubyk01.application.service.codegen.ResourceEmbedder;
 import io.github.kubyk01.application.service.codegen.llvm.LlvmGenerator;
+import io.github.kubyk01.application.service.compiler.TargetJdk;
 import io.github.kubyk01.application.service.codegen.llvm.nativepolymorphicfunctionresolver.PolymorphicResolver;
 import io.github.kubyk01.application.service.optimizer.ArrayCoAllocator;
 import io.github.kubyk01.application.service.optimizer.DestructorInserter;
@@ -122,6 +123,8 @@ public class Orchestrator implements OrchestratorPort {
         // --- 1. Dependency resolution -------------------------------------
         DependencyResolver resolver = new DependencyResolver();
         try {
+            // Cross-OS build: compile the target OS's JDK class library, not the host's.
+            resolver.setTargetJavaHome(TargetJdk.ensure(targetPlatform));
             resolver.scan(path);
         } catch (IOException e) {
             log.error("Failed to scan path: {}", path, e);
