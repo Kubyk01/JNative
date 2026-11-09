@@ -19,6 +19,14 @@ int32_t __jnative_fn_java_lang_ref_Reference_refersTo0__Ljava_lang_Object__Z(
     return (*referent_slot(this_ref) == o) ? 1 : 0;
 }
 
+void* __jnative_fn_java_lang_ref_Reference_get0___Ljava_lang_Object_(void* this_ref) {
+    if (this_ref == NULL) {
+        __jnative_throw_null_pointer_exception();
+        return NULL;
+    }
+    return *referent_slot(this_ref);
+}
+
 void __jnative_fn_java_lang_ref_Reference_clear0___V(void* this_ref) {
     if (this_ref == NULL) {
         __jnative_throw_null_pointer_exception();

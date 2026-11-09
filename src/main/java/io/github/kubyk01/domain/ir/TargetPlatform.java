@@ -258,6 +258,11 @@ public final class TargetPlatform {
         return t.contains("-darwin") || t.contains("-apple-") || t.contains("-macosx");
     }
 
+    public boolean isCrossOs() {
+        TargetPlatform host = detectFromBuildHost();
+        return host.isWindows() != isWindows() || host.isDarwin() != isDarwin();
+    }
+
     public String nativeLibrarySuffix() {
         if (isWindows()) return ".dll";
         if (isDarwin())  return ".dylib";
