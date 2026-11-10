@@ -1165,8 +1165,8 @@ public class ReachabilityAnalysis {
      *       the call traps at run time.
      * </pre>
      *
-     * <p>The pass is a fixed point over the whole class map. Each pass walks
-     * every non-external, non-interface class in the class map, computes its
+     * <p>The pass is a fixed point over the instantiated classes. Each pass walks
+     * every instantiated, non-external, non-interface class, computes its
      * transitive interface closure, and for each interface method finds the
      * concrete implementation on the class through
      * {@link DependencyResolver#findMethodInHierarchy}. Every implementation
@@ -1187,12 +1187,7 @@ public class ReachabilityAnalysis {
         while (changed && pass++ < MAX_IMPLEMENTATION_PASSES) {
             changed = false;
 
-            // Snapshot the class map. It may grow during the parallel
-            // phase as new classes are force-loaded through
-            // resolver.getClassNode() -> loadSystemClass(); the snapshot
-            // is taken once so every worker sees the same starting set.
-            List<String> classNames =
-                new ArrayList<>(resolver.getClassMap().keySet());
+            List<String> classNames = new ArrayList<>(instantiatedClasses);
 
             // Parallel collection phase. Every worker walks its slice of
             // the class map and collects concrete implementations of

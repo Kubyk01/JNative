@@ -17,12 +17,18 @@ import io.github.kubyk01.application.service.optimizer.DestructorInserter;
 import io.github.kubyk01.application.service.optimizer.LocalSlotWidthValidator;
 import io.github.kubyk01.application.service.optimizer.Optimizer;
 import io.github.kubyk01.domain.analyzer.AnalyzerResult;
+import io.github.kubyk01.domain.analyzer.ClinitScheduleEntry;
 import io.github.kubyk01.domain.analyzer.aliasanalysis.AliasAnalysisResult;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.ClassNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.MethodReference;
 import io.github.kubyk01.domain.analyzer.escapeanalysis.EscapeAnalysisResult;
 import io.github.kubyk01.domain.analyzer.lifetime.LifetimeAnalysisResult;
+import io.github.kubyk01.domain.ir.BasicBlock;
+import io.github.kubyk01.domain.ir.Function;
+import io.github.kubyk01.domain.ir.Instruction;
 import io.github.kubyk01.domain.ir.Module;
+import io.github.kubyk01.domain.ir.Parameter;
+import io.github.kubyk01.domain.ir.Value;
 import io.github.kubyk01.domain.ir.TargetPlatform;
 import io.github.kubyk01.port.primary.OrchestratorPort;
 import io.github.kubyk01.port.secondary.CompilerPort;
@@ -401,6 +407,18 @@ public class Orchestrator implements OrchestratorPort {
         OutOfSsaPass.transform(module, scheduler);
         LocalSlotWidthValidator.validate(module, scheduler);
 
+        Set<String> pointsToStaticFields =
+                Set.copyOf(aliasResult.getGraph().getStaticFieldPointsToMap().keySet());
+        List<ClinitScheduleEntry> clinitSchedule = analysisResult.clinitSchedule();
+        Map<String, String> clinitWrappers = analysisResult.clinitWrappers();
+        analysisResult = null;
+        aliasResult = null;
+        escapeResult = null;
+        lifetimeResult = null;
+        inserter = null;
+        optimizer = null;
+        releasePointsTo(module);
+
         // --- 10. LLVM IR generation ---------------------------------------
         System.out.println("\n--- Generating LLVM IR ---");
 
@@ -437,12 +455,12 @@ public class Orchestrator implements OrchestratorPort {
         System.out.println("Embedding " + embedded.size()
             + " built-in resource(s) from java.base and JDK runtime data.");
 
-        LlvmGeneratorPort llvmGen = new LlvmGenerator(module, resolver, aliasResult,
+        LlvmGeneratorPort llvmGen = new LlvmGenerator(module, resolver, pointsToStaticFields,
                 entryClass, entryMethod, entryDescriptor, analysis.getReflectInfo(),
                 polymorphicResolver);
         llvmGen.setScheduler(scheduler);
-        llvmGen.setClinitSchedule(analysisResult.clinitSchedule());
-        llvmGen.setClinitWrappers(analysisResult.clinitWrappers());
+        llvmGen.setClinitSchedule(clinitSchedule);
+        llvmGen.setClinitWrappers(clinitWrappers);
         llvmGen.setEmbeddedResources(embedded);
         llvmGen.setTargetPlatform(targetPlatform);
 
@@ -810,6 +828,20 @@ public class Orchestrator implements OrchestratorPort {
      *                       is used as a fallback
      * @return the default executable path
      */
+    private static void releasePointsTo(Module module) {
+        for (Function function : module.getFunctions()) {
+            for (Parameter p : function.getParameters()) p.clearPointsTo();
+            for (BasicBlock block : function.getBlocks()) {
+                for (Instruction inst : block.getInstructions()) {
+                    if (inst.getResult() != null) inst.getResult().clearPointsTo();
+                    for (Value v : inst.getOperands()) {
+                        if (v != null) v.clearPointsTo();
+                    }
+                }
+            }
+        }
+    }
+
     private static Path defaultOutputPath(Path input, TargetPlatform targetPlatform) {
         Path fileNamePath = input.getFileName();
         String fileName = (fileNamePath != null) ? fileNamePath.toString() : "";

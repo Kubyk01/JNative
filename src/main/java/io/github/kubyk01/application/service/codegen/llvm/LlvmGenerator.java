@@ -4,7 +4,6 @@ import io.github.kubyk01.application.service.analyzer.dependencyresolver.Depende
 import io.github.kubyk01.application.service.analyzer.ssa.TypeResolver;
 import io.github.kubyk01.application.service.codegen.llvm.nativepolymorphicfunctionresolver.PolymorphicResolver;
 import io.github.kubyk01.domain.analyzer.ClinitScheduleEntry;
-import io.github.kubyk01.domain.analyzer.aliasanalysis.AliasAnalysisResult;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.ClassNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.FieldNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.FieldReference;
@@ -145,7 +144,7 @@ public class LlvmGenerator implements LlvmGeneratorPort {
     }
 
     public LlvmGenerator(Module module, DependencyResolver resolver,
-                         AliasAnalysisResult aliasResult,
+                         Set<String> pointsToStaticFields,
                          String entryClass, String entryMethod, String entryDescriptor,
                          ReflectInfo reflectInfo,
                          PolymorphicResolver polymorphicResolver) {
@@ -155,7 +154,7 @@ public class LlvmGenerator implements LlvmGeneratorPort {
         this.entryMethod = entryMethod;
         this.entryDescriptor = entryDescriptor;
         this.reflectInfo = reflectInfo;
-        this.globalEmitter = new LlvmGlobalEmitter(module, resolver, aliasResult, reflectInfo);
+        this.globalEmitter = new LlvmGlobalEmitter(module, resolver, pointsToStaticFields, reflectInfo);
         this.polymorphicResolverRef = polymorphicResolver;
     }
 
@@ -251,8 +250,11 @@ public class LlvmGenerator implements LlvmGeneratorPort {
 
         // ---- 3. knownGlobals = every definition that lives in _module.ll,
         //         deferred strings included. ----
-        Map<String, GlobalDecl> knownGlobals =
-            parseGlobalDecls(globalDefs + "\n" + lambdaVts + "\n" + deferred);
+        // Parsed one by one rather than concatenated: globalDefs is the
+        // largest string in the generator and a joined copy doubles it.
+        Map<String, GlobalDecl> knownGlobals = parseGlobalDecls(globalDefs);
+        knownGlobals.putAll(parseGlobalDecls(lambdaVts));
+        knownGlobals.putAll(parseGlobalDecls(deferred));
 
         // ---- 4. Functions without bodies: declarations for _module.ll. ----
         //         moduleAvailable = everything already defined OR declared in
@@ -320,6 +322,8 @@ public class LlvmGenerator implements LlvmGeneratorPort {
             + moduleDecls
             + runInit
             + main;
+        globalDefs = null;   // now duplicated inside moduleTail; let the GC take it
+        moduleBodies = null;
 
         String moduleExterns = buildExterns(
             moduleTail,
@@ -330,6 +334,18 @@ public class LlvmGenerator implements LlvmGeneratorPort {
             moduleTail, moduleExterns, preludeDefs, preludeKeys);
 
         writeLl(outputDir.resolve("_module.ll"), modulePrelude, moduleExterns, moduleTail);
+        moduleTail = null;
+
+        // Embedded resources get their own translation unit, streamed byte by
+        // byte: as IR text they are several times their raw size and holding
+        // them in globalDefs ran the heap out (OutOfMemoryError in
+        // generateGlobalDefinitions). Only C references these symbols.
+        try (var w = Files.newBufferedWriter(outputDir.resolve("_resources.ll"),
+                StandardCharsets.UTF_8)) {
+            w.write(targetPlatform.preamble());
+            w.write("%JNativeResourceEntry = type { i8*, i8*, i32 }\n");
+            globalEmitter.writeEmbeddedResources(w);
+        }
 
         // ---- 6. Write one .ll file per class. ----
         // Each file is independent: it reads only the immutable emission

@@ -646,9 +646,14 @@ public class InterproceduralPointsTo {
         SiteSetBuilder builder = null;
         try {
             for (int id : base.rawIds()) {
-                FieldCell c = graph.findFieldCell(id, fieldId);
-                if (c == null) continue;
-                PointsToSet s = c.get();
+                PointsToSet s;
+                if (id == unknownId) {
+                    s = unknownSet;
+                } else {
+                    FieldCell c = graph.findFieldCell(id, fieldId);
+                    if (c == null) continue;
+                    s = c.get();
+                }
                 if (s.isEmpty() || s == cur || s == single) continue;
                 if (single == null) {
                     single = s;
@@ -671,13 +676,10 @@ public class InterproceduralPointsTo {
     private void registerReaders(FnState f, PointsToSet base, PointsToSet prev, int fieldId, String field) {
         int[] now = base.rawIds();
         int capacity = states.length;
-        if (prev == null || prev.isEmpty()) {
-            for (int id : now) graph.fieldCell(id, fieldId, field).addReader(f.id, capacity);
-            return;
-        }
-        int[] old = prev.rawIds();
+        int[] old = prev == null ? NO_INTS : prev.rawIds();
         int j = 0;
         for (int id : now) {
+            if (id == unknownId) continue;
             while (j < old.length && old[j] < id) j++;
             if (j < old.length && old[j] == id) continue;
             graph.fieldCell(id, fieldId, field).addReader(f.id, capacity);
@@ -686,6 +688,7 @@ public class InterproceduralPointsTo {
 
     private boolean anyCellNewer(PointsToSet base, int fieldId, long since) {
         for (int id : base.rawIds()) {
+            if (id == unknownId) continue;
             FieldCell c = graph.findFieldCell(id, fieldId);
             if (c != null && c.version() > since) return true;
         }

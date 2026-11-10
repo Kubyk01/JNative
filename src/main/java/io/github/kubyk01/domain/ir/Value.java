@@ -32,6 +32,10 @@ public abstract class Value {
         return POINTS_TO.compareAndSet(this, expected, update);
     }
 
+    public void clearPointsTo() {
+        pointsTo = null;
+    }
+
     @Override
     public String toString() {
         return "v" + id + "(" + type + ")";

@@ -643,7 +643,7 @@ extern int __jnative_function_at_address(uintptr_t pc,
 
 /**
  * One entry of the built-in resource table emitted by
- * LlvmGlobalEmitter.generateEmbeddedResources().
+ * LlvmGlobalEmitter.writeEmbeddedResources() (_resources.ll).
  *
  * <p>Layout matches the emitted %JNativeResourceEntry:
  *   { path, data, size }

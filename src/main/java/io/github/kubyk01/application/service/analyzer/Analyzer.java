@@ -1865,34 +1865,59 @@ public class Analyzer {
                                       Set<Function> onStack,
                                       List<List<Function>> sccs,
                                       int[] counter) {
+        Deque<Function> callStack = new ArrayDeque<>();
+        Deque<Iterator<Function>> iterStack = new ArrayDeque<>();
+        enterNode(v, deps, index, lowlink, stack, onStack, counter, callStack, iterStack);
+
+        while (!callStack.isEmpty()) {
+            Function u = callStack.peek();
+            Iterator<Function> it = iterStack.peek();
+            if (it.hasNext()) {
+                Function w = it.next();
+                if (!index.containsKey(w)) {
+                    enterNode(w, deps, index, lowlink, stack, onStack, counter, callStack, iterStack);
+                } else if (onStack.contains(w)) {
+                    lowlink.put(u, Math.min(lowlink.get(u), index.get(w)));
+                }
+                continue;
+            }
+
+            callStack.pop();
+            iterStack.pop();
+            if (lowlink.get(u).equals(index.get(u))) {
+                List<Function> scc = new ArrayList<>();
+                Function w;
+                do {
+                    w = stack.pop();
+                    onStack.remove(w);
+                    scc.add(w);
+                } while (w != u);
+                sccs.add(scc);
+            }
+            Function parent = callStack.peek();
+            if (parent != null) {
+                lowlink.put(parent, Math.min(lowlink.get(parent), lowlink.get(u)));
+            }
+        }
+    }
+
+    private static void enterNode(Function v,
+                                  Map<Function, Set<Function>> deps,
+                                  Map<Function, Integer> index,
+                                  Map<Function, Integer> lowlink,
+                                  Deque<Function> stack,
+                                  Set<Function> onStack,
+                                  int[] counter,
+                                  Deque<Function> callStack,
+                                  Deque<Iterator<Function>> iterStack) {
         int idx = counter[0]++;
         index.put(v, idx);
         lowlink.put(v, idx);
         stack.push(v);
         onStack.add(v);
-
         Set<Function> successors = deps.get(v);
-        if (successors != null) {
-            for (Function w : successors) {
-                if (!index.containsKey(w)) {
-                    strongConnect(w, deps, index, lowlink, stack, onStack, sccs, counter);
-                    lowlink.put(v, Math.min(lowlink.get(v), lowlink.get(w)));
-                } else if (onStack.contains(w)) {
-                    lowlink.put(v, Math.min(lowlink.get(v), index.get(w)));
-                }
-            }
-        }
-
-        if (lowlink.get(v).equals(index.get(v))) {
-            List<Function> scc = new ArrayList<>();
-            Function w;
-            do {
-                w = stack.pop();
-                onStack.remove(w);
-                scc.add(w);
-            } while (w != v);
-            sccs.add(scc);
-        }
+        callStack.push(v);
+        iterStack.push(successors != null ? successors.iterator() : Collections.emptyIterator());
     }
 
     private static List<Function> tarjanLinearize(List<Function> nodes,

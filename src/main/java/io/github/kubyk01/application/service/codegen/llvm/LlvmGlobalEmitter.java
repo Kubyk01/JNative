@@ -3,7 +3,6 @@ package io.github.kubyk01.application.service.codegen.llvm;
 import io.github.kubyk01.application.service.analyzer.dependencyresolver.DependencyResolver;
 import io.github.kubyk01.application.service.analyzer.ssa.TypeResolver;
 import io.github.kubyk01.application.service.codegen.llvm.nativepolymorphicfunctionresolver.VarHandleTargetResolver;
-import io.github.kubyk01.domain.analyzer.aliasanalysis.AliasAnalysisResult;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.ClassNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.FieldNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.FieldReference;
@@ -202,7 +201,7 @@ public class LlvmGlobalEmitter {
 
     private final Module module;
     private final DependencyResolver resolver;
-    private final AliasAnalysisResult aliasResult;
+    private final Set<String> pointsToStaticFields;
     private final ReflectInfo reflectInfo;
 
     // -------------------------------------------------------------------------
@@ -308,7 +307,7 @@ public class LlvmGlobalEmitter {
      * stripped, {@code '/'}-separated, no leading package of the caller).
      *
      * <p>Registered through {@link #addEmbeddedResource} and emitted by
-     * {@link #generateEmbeddedResources()} as a {@code constant} table the
+     * {@link #writeEmbeddedResources} as a {@code constant} table the
      * C side indexes with {@code jnative_find_resource}.
      */
     private final Map<String, byte[]> embeddedResources = new LinkedHashMap<>();
@@ -822,7 +821,9 @@ public class LlvmGlobalEmitter {
             generateStringLiterals() +
             generateTypeInfo() +
             generateUnnamedModule() +
-            generateEmbeddedResources() +
+            // Embedded resources are NOT part of this text: they can be many
+            // MB of escaped bytes, so writeEmbeddedResources streams them to
+            // their own .ll file instead of holding them in the heap.
             generateReflectionData() +
             generateFunctionIndex() +
             // Runs last so that emittedRefClassNames (filled by
@@ -1042,24 +1043,23 @@ public class LlvmGlobalEmitter {
      * Emits every resource registered through {@link #addEmbeddedResource} as a
      * byte array plus one flat lookup table.
      *
-     * <p>The entry layout is {@code %JNativeResourceEntry} and is declared here
-     * rather than in {@link #generateReflectionData()} because this table is
-     * emitted before it. The C side walks the table with
+     * <p>Streamed into its own {@code _resources.ll}; the caller writes the
+     * target preamble and the {@code %JNativeResourceEntry} type first. The
+     * C side walks the table with
      * {@code jnative_find_resource} and needs no knowledge of LLVM globals.
      *
      * <p>Paths are sorted so the emitted IR is stable across runs regardless of
      * hash iteration order.
      */
-    private String generateEmbeddedResources() {
-        StringBuilder sb = new StringBuilder();
-        sb.append("\n; ----- Embedded resources -----\n");
+    public void writeEmbeddedResources(java.io.Writer w) throws java.io.IOException {
+        w.write("\n; ----- Embedded resources -----\n");
 
         if (embeddedResources.isEmpty()) {
-            sb.append("@jnative_builtin_resources = constant "
+            w.write("@jnative_builtin_resources = constant "
                 + "[1 x %JNativeResourceEntry] "
                 + "[%JNativeResourceEntry { i8* null, i8* null, i32 0 }]\n");
-            sb.append("@jnative_builtin_resources_count = constant i32 0\n\n");
-            return sb.toString();
+            w.write("@jnative_builtin_resources_count = constant i32 0\n\n");
+            return;
         }
 
         List<String> keys = new ArrayList<>(embeddedResources.keySet());
@@ -1070,59 +1070,53 @@ public class LlvmGlobalEmitter {
             String path = keys.get(i);
             byte[] data = embeddedResources.get(path);
 
-            String pathRef = emitResourceByteLiteral(sb, "__jnative_res_path_" + i,
+            String pathRef = writeResourceByteLiteral(w, "__jnative_res_path_" + i,
                 path.getBytes(StandardCharsets.UTF_8), 1);
-            String dataRef = emitResourceByteLiteral(sb, "__jnative_res_data_" + i,
+            String dataRef = writeResourceByteLiteral(w, "__jnative_res_data_" + i,
                 data, 0);
 
             entryRefs.add("%JNativeResourceEntry { i8* " + pathRef
                 + ", i8* " + dataRef + ", i32 " + data.length + " }");
         }
 
-        sb.append("@jnative_builtin_resources = constant [")
-            .append(entryRefs.size())
-            .append(" x %JNativeResourceEntry] [\n");
+        w.write("@jnative_builtin_resources = constant [" + entryRefs.size()
+            + " x %JNativeResourceEntry] [\n");
         for (int i = 0; i < entryRefs.size(); i++) {
-            if (i > 0) sb.append(",\n");
-            sb.append("  ").append(entryRefs.get(i));
+            if (i > 0) w.write(",\n");
+            w.write("  ");
+            w.write(entryRefs.get(i));
         }
-        sb.append("\n]\n");
-        sb.append("@jnative_builtin_resources_count = constant i32 ")
-            .append(entryRefs.size()).append("\n\n");
-        return sb.toString();
+        w.write("\n]\n");
+        w.write("@jnative_builtin_resources_count = constant i32 " + entryRefs.size() + "\n\n");
     }
 
+    private static final char[] HEX = "0123456789ABCDEF".toCharArray();
+
     /**
-     * Emits {@code bytes} as a {@code private constant [N x i8]} and returns a
+     * Writes {@code bytes} as a {@code constant [N x i8]} and returns a
      * {@code getelementptr} expression yielding a pointer to its first element.
+     * Bytes go straight to {@code w}; no escaped copy is built in the heap.
      *
      * <p>When {@code nulTerminate} is non-zero one {@code \00} byte is appended,
      * so the C side can use {@code strlen} on the path.
      */
-    private String emitResourceByteLiteral(StringBuilder sb, String baseName,
-                                           byte[] bytes, int nulTerminate) {
+    private static String writeResourceByteLiteral(java.io.Writer w, String baseName,
+                                                   byte[] bytes, int nulTerminate)
+            throws java.io.IOException {
         int total = bytes.length + nulTerminate;
-        StringBuilder esc = new StringBuilder();
+        w.write("@" + baseName + " = unnamed_addr constant [" + total + " x i8] c\"");
         for (byte b : bytes) {
             int v = b & 0xFF;
-            switch (v) {
-                case '\\' -> esc.append("\\5C");
-                case '"'  -> esc.append("\\22");
-                case '\n' -> esc.append("\\0A");
-                case '\r' -> esc.append("\\0D");
-                case '\t' -> esc.append("\\09");
-                default -> {
-                    if (v < 0x20 || v > 0x7E) esc.append(String.format("\\%02X", v));
-                    else esc.append((char) v);
-                }
+            if (v < 0x20 || v > 0x7E || v == '\\' || v == '"') {
+                w.write('\\');
+                w.write(HEX[v >>> 4]);
+                w.write(HEX[v & 0xF]);
+            } else {
+                w.write(v);
             }
         }
-        if (nulTerminate != 0) esc.append("\\00");
-
-        sb.append("@").append(baseName)
-            .append(" = unnamed_addr constant [")
-            .append(total).append(" x i8] c\"")
-            .append(esc).append("\", align 1\n");
+        if (nulTerminate != 0) w.write("\\00");
+        w.write("\", align 1\n");
         return "getelementptr inbounds ([" + total + " x i8], [" + total
             + " x i8]* @" + baseName + ", i32 0, i32 0)";
     }
@@ -2074,8 +2068,7 @@ public class LlvmGlobalEmitter {
 
     private String generateStaticFields() {
         Map<String, Type> usedFieldTypes = new HashMap<>();
-        Set<String> allFields = new TreeSet<>(aliasResult.getGraph()
-                .getStaticFieldPointsToMap().keySet());
+        Set<String> allFields = new TreeSet<>(pointsToStaticFields);
         if (reflectInfo != null) {
             allFields.addAll(reflectInfo.staticFieldKeys(resolver::getField));
         }
