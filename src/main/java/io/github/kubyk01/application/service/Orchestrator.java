@@ -158,7 +158,7 @@ public class Orchestrator implements OrchestratorPort {
         forceResourceStreamMethods(analysis);
         forcePerfMethods(analysis);
         forceReflectionInvokeMethods(analysis);
-        forceStackWalkMethods(analysis);
+        forceStackWalkMethods(analysis, resolver);
         forceLoggingConfigClasses(analysis);
         forceServiceProviders(analysis, resolver);
 
@@ -671,9 +671,27 @@ public class Orchestrator implements OrchestratorPort {
         }
     }
 
-    private void forceStackWalkMethods(ReachabilityAnalysis analysis) {
+    private void forceStackWalkMethods(ReachabilityAnalysis analysis, DependencyResolver resolver) {
         analysis.addExtraReachableMethod(new MethodReference(
             "java/lang/StackStreamFactory$AbstractStackWalker", "doStackWalk", "(JIIII)Ljava/lang/Object;"));
+        String rmn = "java/lang/invoke/ResolvedMethodName";
+        if (!analysis.getReachableClasses().contains("java/lang/StackFrameInfo")
+                || !isDeclaredClass(resolver, "java/lang/ClassFrameInfo")
+                || !isDeclaredClass(resolver, rmn)) {
+            return;
+        }
+        boolean hasDeclaringClass = resolver.getClassNode(rmn).getMethods().stream()
+            .anyMatch(m -> m.getName().equals("declaringClass")
+                && m.getDescriptor().equals("()Ljava/lang/Class;"));
+        if (!hasDeclaringClass) return;
+        analysis.addInstantiatedClass(rmn, false);
+        analysis.addExtraReachableMethod(new MethodReference(rmn, "declaringClass", "()Ljava/lang/Class;"));
+    }
+
+    private static boolean isDeclaredClass(DependencyResolver resolver, String name) {
+        if (resolver.isMissingClass(name)) return false;
+        ClassNode cn = resolver.getClassNode(name);
+        return cn != null && !cn.isExternal() && cn.getMethods() != null;
     }
 
     private void forceResourceStreamMethods(ReachabilityAnalysis analysis) {

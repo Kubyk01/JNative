@@ -107,7 +107,12 @@ void* __jnative_fn_jdk_internal_loader_NativeLibraries_findBuiltinLib__Ljava_lan
     if (!known) return NULL;
 
     char exe[PATH_MAX];
+#if defined(_WIN32)
+    DWORD wn = GetModuleFileNameA(NULL, exe, (DWORD)sizeof(exe));
+    long len = (wn > 0 && wn < sizeof(exe)) ? (long)wn : -1;
+#else
     long len = jn_readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+#endif
     if (len <= 0) return NULL;
     exe[len] = '\0';
 

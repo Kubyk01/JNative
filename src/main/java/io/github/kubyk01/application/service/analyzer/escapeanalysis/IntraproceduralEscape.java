@@ -19,6 +19,7 @@ import static io.github.kubyk01.util.LlvmUtil.extractFieldName;
 import static io.github.kubyk01.util.LlvmUtil.extractFieldOwnerAndName;
 import static io.github.kubyk01.util.LlvmUtil.getCallArguments;
 import static io.github.kubyk01.util.LlvmUtil.isAllocation;
+import static io.github.kubyk01.util.LlvmUtil.lambdaCaptures;
 
 /**
  * Per-function escape analysis over one function's allocation sites.
@@ -215,6 +216,8 @@ public class IntraproceduralEscape {
             case GET_STATIC   -> processGetStatic(inst);
             case CALL, VIRTUAL_CALL, INTERFACE_CALL, STATIC_CALL, SPECIAL_CALL ->
                     processCall(inst);
+            case INVOKEDYNAMIC -> lambdaCaptures(inst)
+                    .forEach(cap -> markEscaped(cap, EscapeStatus.GLOBAL));
             default -> { }
         }
     }

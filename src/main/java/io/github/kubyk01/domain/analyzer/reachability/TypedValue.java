@@ -18,11 +18,21 @@ public final class TypedValue {
     private final Type type;
     private final String className; // non-null only for reference types with known exact class
     private final Object value; // concrete constant value, if any
+    private final int paramIndex;
 
     private TypedValue(Type type, String className, Object value) {
+        this(type, className, value, -1);
+    }
+
+    private TypedValue(Type type, String className, Object value, int paramIndex) {
         this.type = type;
         this.className = className;
         this.value = value;
+        this.paramIndex = paramIndex;
+    }
+
+    public static TypedValue fromParameter(int index) {
+        return new TypedValue(Type.UNKNOWN, null, null, index);
     }
 
     public static TypedValue fromType(Type type) {
@@ -52,6 +62,7 @@ public final class TypedValue {
     public String toString() {
         if (value != null) return "const(" + value + ")";
         if (className != null) return "exact(" + className + ")";
+        if (paramIndex >= 0) return "param(" + paramIndex + ")";
         return type.toString();
     }
 }

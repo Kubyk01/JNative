@@ -915,17 +915,37 @@ public class LlvmGlobalEmitter {
         sb.append("@JNATIVE_CTOR_ROOT_OFFSET             = constant i32 ").append(ctorRoot).append("\n\n");
 
         sb.append("@JNATIVE_SFI_MEMBERNAME_OFFSET    = constant i32 ")
-          .append(safeGlobalFieldOffsetAllowMissing("java/lang/StackFrameInfo", "memberName")).append("\n");
+          .append(declaredFieldOffsetOrMissing("java/lang/StackFrameInfo", "memberName")).append("\n");
         sb.append("@JNATIVE_SFI_BCI_OFFSET           = constant i32 ")
-          .append(safeGlobalFieldOffsetAllowMissing("java/lang/StackFrameInfo", "bci")).append("\n");
+          .append(declaredFieldOffsetOrMissing("java/lang/StackFrameInfo", "bci")).append("\n");
         sb.append("@JNATIVE_MEMBERNAME_CLAZZ_OFFSET  = constant i32 ")
-          .append(safeGlobalFieldOffsetAllowMissing("java/lang/invoke/MemberName", "clazz")).append("\n");
+          .append(declaredFieldOffsetOrMissing("java/lang/invoke/MemberName", "clazz")).append("\n");
         sb.append("@JNATIVE_MEMBERNAME_NAME_OFFSET   = constant i32 ")
-          .append(safeGlobalFieldOffsetAllowMissing("java/lang/invoke/MemberName", "name")).append("\n");
+          .append(declaredFieldOffsetOrMissing("java/lang/invoke/MemberName", "name")).append("\n");
         sb.append("@JNATIVE_MEMBERNAME_TYPE_OFFSET   = constant i32 ")
-          .append(safeGlobalFieldOffsetAllowMissing("java/lang/invoke/MemberName", "type")).append("\n");
+          .append(declaredFieldOffsetOrMissing("java/lang/invoke/MemberName", "type")).append("\n");
         sb.append("@JNATIVE_MEMBERNAME_FLAGS_OFFSET  = constant i32 ")
-          .append(safeGlobalFieldOffsetAllowMissing("java/lang/invoke/MemberName", "flags")).append("\n\n");
+          .append(declaredFieldOffsetOrMissing("java/lang/invoke/MemberName", "flags")).append("\n");
+        sb.append("@JNATIVE_CFI_CLASS_OR_MEMBER_NAME_OFFSET = constant i32 ")
+          .append(declaredFieldOffsetOrMissing("java/lang/ClassFrameInfo", "classOrMemberName")).append("\n");
+        sb.append("@JNATIVE_CFI_FLAGS_OFFSET                = constant i32 ")
+          .append(declaredFieldOffsetOrMissing("java/lang/ClassFrameInfo", "flags")).append("\n");
+        sb.append("@JNATIVE_SFI_NAME_OFFSET                 = constant i32 ")
+          .append(declaredFieldOffsetOrMissing("java/lang/StackFrameInfo", "name")).append("\n");
+        sb.append("@JNATIVE_SFI_TYPE_OFFSET                 = constant i32 ")
+          .append(declaredFieldOffsetOrMissing("java/lang/StackFrameInfo", "type")).append("\n");
+        sb.append("@JNATIVE_RMN_VMHOLDER_OFFSET             = constant i32 ")
+          .append(declaredFieldOffsetOrMissing("java/lang/invoke/ResolvedMethodName", "vmholder")).append("\n");
+        sb.append("@JNATIVE_STE_DECLARING_CLASS_OBJECT_OFFSET = constant i32 ")
+          .append(declaredFieldOffsetOrMissing("java/lang/StackTraceElement", "declaringClassObject")).append("\n");
+        sb.append("@JNATIVE_STE_DECLARING_CLASS_OFFSET        = constant i32 ")
+          .append(declaredFieldOffsetOrMissing("java/lang/StackTraceElement", "declaringClass")).append("\n");
+        sb.append("@JNATIVE_STE_METHOD_NAME_OFFSET            = constant i32 ")
+          .append(declaredFieldOffsetOrMissing("java/lang/StackTraceElement", "methodName")).append("\n");
+        sb.append("@JNATIVE_STE_FILE_NAME_OFFSET              = constant i32 ")
+          .append(declaredFieldOffsetOrMissing("java/lang/StackTraceElement", "fileName")).append("\n");
+        sb.append("@JNATIVE_STE_LINE_NUMBER_OFFSET            = constant i32 ")
+          .append(declaredFieldOffsetOrMissing("java/lang/StackTraceElement", "lineNumber")).append("\n\n");
         return sb.toString();
     }
 
@@ -943,6 +963,13 @@ public class LlvmGlobalEmitter {
         } catch (Exception e) {
             return -1;
         }
+    }
+
+    private int declaredFieldOffsetOrMissing(String owner, String field) {
+        if (resolver.isMissingClass(owner)) return -1;
+        ClassNode cn = resolver.getClassNode(owner);
+        if (cn == null || cn.isExternal()) return -1;
+        return safeGlobalFieldOffsetAllowMissing(owner, field);
     }
     /**
      * Emits the shared java.lang.Module object pointed at by every

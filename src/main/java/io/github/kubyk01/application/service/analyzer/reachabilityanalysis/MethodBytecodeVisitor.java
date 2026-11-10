@@ -80,7 +80,7 @@ public class MethodBytecodeVisitor extends ClassVisitor {
     public MethodVisitor visitMethod(int access, String name, String descriptor,
                                      String signature, String[] exceptions) {
         if (name.equals(currentMethod.getName()) && descriptor.equals(currentMethod.getDescriptor())) {
-            return new MethodVisitorImpl();
+            return new MethodVisitorImpl((access & Opcodes.ACC_STATIC) != 0);
         }
         return null;
     }
@@ -219,13 +219,16 @@ public class MethodBytecodeVisitor extends ClassVisitor {
     private class MethodVisitorImpl extends MethodVisitor {
 
         private final TypeSimulator simulator = new TypeSimulator();
+        private final boolean isStatic;
 
-        public MethodVisitorImpl() {
+        public MethodVisitorImpl(boolean isStatic) {
             super(Opcodes.ASM9);
+            this.isStatic = isStatic;
         }
 
         @Override
         public void visitCode() {
+            simulator.seedClassParameters(isStatic, currentMethod.getDescriptor());
             super.visitCode();
         }
 
@@ -447,6 +450,7 @@ public class MethodBytecodeVisitor extends ClassVisitor {
                     }
                 }
                 // For INVOKESPECIAL we already added ownerRef above.
+                recordClassArguments(opcode, owner, mName, mDesc);
                 TypedValue overrideResult =
                     tryHandleExactReflectionAccessor(opcode, owner, mName, mDesc);
                 simulator.visitMethodInsn(opcode, mDesc, overrideResult);
@@ -1092,6 +1096,10 @@ public class MethodBytecodeVisitor extends ClassVisitor {
                 if (receiver != null) {
                     targetClass = resolveClassNameFromValue(receiver);
                 }
+                if (targetClass == null && receiver != null && receiver.getParamIndex() >= 0) {
+                    analysis.addConstructorLookupParam(currentMethod, receiver.getParamIndex());
+                    return null;
+                }
                 if (targetClass == null) {
                     targetClass = lastLoadedClass;
                 }
@@ -1484,6 +1492,40 @@ public class MethodBytecodeVisitor extends ClassVisitor {
             addClass(targetClass);
         }
 
+        private void recordClassArguments(int opcode, String owner, String mName, String mDesc) {
+            org.objectweb.asm.Type[] params = org.objectweb.asm.Type.getArgumentTypes(mDesc);
+            List<TypedValue> args = null;
+            String calleeOwner = null;
+            boolean ownerResolved = false;
+            for (int i = 0; i < params.length; i++) {
+                if (params[i].getSort() != org.objectweb.asm.Type.OBJECT
+                    || !"java/lang/Class".equals(params[i].getInternalName())) continue;
+                if (args == null) args = simulator.peekArguments(params.length);
+                TypedValue arg = args.get(i);
+                String cls = (arg.isConstant() && arg.getValue() instanceof String s && !s.isEmpty())
+                    ? s.replace('.', '/') : null;
+                if (cls == null && arg.getParamIndex() < 0) continue;
+                if (!ownerResolved) {
+                    calleeOwner = resolveCalleeOwner(opcode, owner, mName, mDesc);
+                    ownerResolved = true;
+                }
+                if (cls != null) {
+                    analysis.addClassArgument(calleeOwner, mName, mDesc, i, cls);
+                } else {
+                    analysis.addClassParameterForward(currentMethod, arg.getParamIndex(),
+                        calleeOwner, mName, mDesc, i);
+                }
+            }
+        }
+
+        private String resolveCalleeOwner(int opcode, String owner, String mName, String mDesc) {
+            if (opcode == Opcodes.INVOKEVIRTUAL || opcode == Opcodes.INVOKEINTERFACE) return null;
+            String[] foundOwner = new String[1];
+            MethodNode target = resolver.findMethodInHierarchy(owner, mName, mDesc, foundOwner);
+            return (target != null && foundOwner[0] != null && !foundOwner[0].isEmpty())
+                ? foundOwner[0] : owner;
+        }
+
         /**
          * Extracts an internal (slash-separated) class name from a
          * {@link TypedValue} produced by an {@code LDC} of a class
@@ -1663,6 +1705,29 @@ public class MethodBytecodeVisitor extends ClassVisitor {
         TypedValue peek() { return stack.isEmpty() ? TypedValue.UNKNOWN : stack.peek(); }
         void storeLocal(int idx, TypedValue tv) { locals.put(idx, tv); }
         TypedValue loadLocal(int idx) { return locals.getOrDefault(idx, TypedValue.UNKNOWN); }
+
+        void seedClassParameters(boolean isStatic, String desc) {
+            int slot = isStatic ? 0 : 1;
+            org.objectweb.asm.Type[] params = org.objectweb.asm.Type.getArgumentTypes(desc);
+            for (int i = 0; i < params.length; i++) {
+                if (params[i].getSort() == org.objectweb.asm.Type.OBJECT
+                    && "java/lang/Class".equals(params[i].getInternalName())) {
+                    locals.put(slot, TypedValue.fromParameter(i));
+                }
+                slot += params[i].getSize();
+            }
+        }
+
+        List<TypedValue> peekArguments(int n) {
+            List<TypedValue> out = new ArrayList<>(Collections.nCopies(n, TypedValue.UNKNOWN));
+            int idx = 0;
+            for (TypedValue tv : stack) {
+                if (idx >= n) break;
+                out.set(n - 1 - idx, tv);
+                idx++;
+            }
+            return out;
+        }
 
         void visitInsn(int opcode) {
             switch (opcode) {

@@ -22,6 +22,7 @@ import static io.github.kubyk01.util.LlvmUtil.extractFieldOwnerAndName;
 import static io.github.kubyk01.util.LlvmUtil.getCallArguments;
 import static io.github.kubyk01.util.LlvmUtil.isAllocation;
 import static io.github.kubyk01.util.LlvmUtil.isLazyClinitWrapper;
+import static io.github.kubyk01.util.LlvmUtil.lambdaCaptures;
 
 /**
  * Computes an EscapeSummary per function.
@@ -806,6 +807,21 @@ public class EscapeSummaryBuilder {
                 processCall(inst, paramAliases, paramsEscaped, paramsReturned,
                         paramsEscapedToStatic, flags, snapshot, paramEscapeEdges,
                         localPointsTo, localSiteContents);
+                break;
+            }
+
+            case INVOKEDYNAMIC: {
+                for (Value cap : lambdaCaptures(inst)) {
+                    Type t = cap == null ? null : cap.getType();
+                    if (cap instanceof Parameter p
+                            && (t == null || t.isReference() || t.isArray() || t.isUnknown())) {
+                        paramsEscaped.add(p.getOrdinal());
+                        addAliases(p.getOrdinal(), paramAliases, paramsEscaped);
+                        paramsEscapedToStatic.add(p.getOrdinal());
+                        addAliases(p.getOrdinal(), paramAliases, paramsEscapedToStatic);
+                        flags[1] = true;
+                    }
+                }
                 break;
             }
 

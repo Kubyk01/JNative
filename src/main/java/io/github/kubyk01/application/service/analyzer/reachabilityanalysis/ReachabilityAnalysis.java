@@ -161,6 +161,84 @@ public class ReachabilityAnalysis {
         }
     }
 
+    private final Object paramClassLock = new Object();
+    private final Map<String, Set<String>> paramClasses = new HashMap<>();
+    private final Map<String, Set<String>> paramForwards = new HashMap<>();
+    private final Set<String> ctorLookupParams = new HashSet<>();
+
+    private static String paramKey(String owner, String name, String desc, int index) {
+        return (owner == null ? "*" : owner) + "|" + name + "|" + desc + "#" + index;
+    }
+
+    public void addConstructorLookupParam(MethodReference method, int index) {
+        List<String> found = new ArrayList<>();
+        synchronized (paramClassLock) {
+            for (String key : List.of(
+                    paramKey(method.getOwner(), method.getName(), method.getDescriptor(), index),
+                    paramKey(null, method.getName(), method.getDescriptor(), index))) {
+                if (ctorLookupParams.add(key)) found.addAll(paramClasses.getOrDefault(key, Set.of()));
+            }
+        }
+        found.forEach(this::registerReflectiveConstructors);
+    }
+
+    public void addClassArgument(String owner, String name, String desc, int index, String className) {
+        List<String> found = new ArrayList<>();
+        synchronized (paramClassLock) {
+            propagateParamClass(paramKey(owner, name, desc, index), className, found);
+        }
+        found.forEach(this::registerReflectiveConstructors);
+    }
+
+    public void addClassParameterForward(MethodReference caller, int from,
+                                         String owner, String name, String desc, int index) {
+        String to = paramKey(owner, name, desc, index);
+        List<String> found = new ArrayList<>();
+        synchronized (paramClassLock) {
+            for (String key : List.of(
+                    paramKey(caller.getOwner(), caller.getName(), caller.getDescriptor(), from),
+                    paramKey(null, caller.getName(), caller.getDescriptor(), from))) {
+                if (key.equals(to) || !paramForwards.computeIfAbsent(key, k -> new HashSet<>()).add(to)) continue;
+                for (String cls : List.copyOf(paramClasses.getOrDefault(key, Set.of()))) {
+                    propagateParamClass(to, cls, found);
+                }
+            }
+        }
+        found.forEach(this::registerReflectiveConstructors);
+    }
+
+    private void propagateParamClass(String key, String className, List<String> found) {
+        Deque<String[]> work = new ArrayDeque<>();
+        work.add(new String[]{key, className});
+        while (!work.isEmpty()) {
+            String[] kv = work.poll();
+            if (!paramClasses.computeIfAbsent(kv[0], k -> new HashSet<>()).add(kv[1])) continue;
+            if (ctorLookupParams.contains(kv[0])) found.add(kv[1]);
+            for (String next : paramForwards.getOrDefault(kv[0], Set.of())) {
+                work.add(new String[]{next, kv[1]});
+            }
+        }
+    }
+
+    private void registerReflectiveConstructors(String className) {
+        if (className.isEmpty() || className.charAt(0) == '[') return;
+        ClassNode cn = resolver.getClassNode(className);
+        if (cn == null || cn.isExternal() || resolver.getClassBytes(className) == null) {
+            resolver.forceLoadSystemClass(className);
+            cn = resolver.getClassNode(className);
+        }
+        if (cn == null || cn.isExternal() || cn.getMethods() == null) return;
+        for (MethodNode m : cn.getMethods()) {
+            if (!m.getName().equals("<init>")) continue;
+            MethodReference ref = new MethodReference(className, "<init>", m.getDescriptor());
+            reflectInfo.addConstructor(className, ref);
+            addMethod(ref, true);
+        }
+        if (!cn.isInterface() && (cn.getAccess() & Opcodes.ACC_ABSTRACT) == 0) {
+            addInstantiatedClass(className, true);
+        }
+    }
+
     private boolean addOpaqueReflectiveMethods() {
         List<String> names = List.copyOf(opaqueMethodNames);
         if (names.isEmpty()) return false;
