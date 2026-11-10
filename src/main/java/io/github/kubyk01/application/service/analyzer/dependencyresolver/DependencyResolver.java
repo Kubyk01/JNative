@@ -587,6 +587,8 @@ public class DependencyResolver {
     private void scanJar(Path jarPath, boolean skipExisting) throws IOException {
         scannedJars.add(jarPath);
         try (JarFile jar = new JarFile(jarPath.toFile())) {
+            String location = jarPath.getFileName().toString();
+            byte[] manifest = readManifestBytes(jar);
             Enumeration<JarEntry> entries = jar.entries();
             while (entries.hasMoreElements()) {
                 JarEntry entry = entries.nextElement();
@@ -614,7 +616,9 @@ public class DependencyResolver {
                         }
                     }
                     try (InputStream is = jar.getInputStream(entry)) {
-                        parseClassStream(is);
+                        byte[] raw = is.readAllBytes();
+                        recordPackageSource(new ClassReader(raw).getClassName(), location, manifest);
+                        parseClassStream(new ByteArrayInputStream(raw));
                     }
                 }
 
@@ -664,6 +668,9 @@ public class DependencyResolver {
      */
     private void indexNestedJar(JarFile outerJar, Path outerJarPath, JarEntry nestedEntry) {
         String nestedName = nestedEntry.getName();
+        String location = outerJarPath.getFileName() + "!/" + nestedName;
+        List<String> nestedClasses = new ArrayList<>();
+        byte[] manifest = null;
         try (InputStream is = outerJar.getInputStream(nestedEntry);
              ZipInputStream zis = new ZipInputStream(is)) {
 
@@ -677,6 +684,9 @@ public class DependencyResolver {
                     nestedClassIndex.putIfAbsent(
                             internalName,
                             new NestedClassRef(outerJarPath, nestedName, entryName));
+                    nestedClasses.add(internalName);
+                } else if (entryName.equalsIgnoreCase(JarFile.MANIFEST_NAME)) {
+                    manifest = zis.readAllBytes();
                 } else if (entryName.startsWith(NATIVE_IMAGE_METADATA_PREFIX)
                         && entryName.endsWith(".json")) {
                     parseMetadataStream(zis, nestedName + "!/" + entryName);
@@ -688,6 +698,33 @@ public class DependencyResolver {
             }
         } catch (IOException e) {
             log.warn("Failed to index nested jar {}: {}", nestedName, e.getMessage());
+        }
+        for (String internalName : nestedClasses) {
+            recordPackageSource(internalName, location, manifest);
+        }
+    }
+
+    public record PackageSource(String location, byte[] manifest) {}
+
+    private final Map<String, PackageSource> packageSources = new ConcurrentHashMap<>();
+
+    public PackageSource getPackageSource(String internalPackage) {
+        return packageSources.get(internalPackage);
+    }
+
+    private void recordPackageSource(String internalClassName, String location, byte[] manifest) {
+        if (internalClassName == null) return;
+        int slash = internalClassName.lastIndexOf('/');
+        if (slash <= 0 || internalClassName.startsWith("META-INF/")) return;
+        packageSources.putIfAbsent(internalClassName.substring(0, slash),
+                new PackageSource(location, manifest));
+    }
+
+    private static byte[] readManifestBytes(JarFile jar) throws IOException {
+        JarEntry entry = jar.getJarEntry(JarFile.MANIFEST_NAME);
+        if (entry == null) return null;
+        try (InputStream is = jar.getInputStream(entry)) {
+            return is.readAllBytes();
         }
     }
 
@@ -1151,6 +1188,68 @@ public class DependencyResolver {
 
     public byte[] getClassBytes(String internalName) {
         return classBytes.get(internalName);
+    }
+
+    private final Map<String, Optional<String>> systemPackageModules = new ConcurrentHashMap<>();
+    private volatile Set<String> jdkNativeAccessModules;
+
+    public String systemModuleOfPackage(String internalPackage) {
+        if (internalPackage == null || internalPackage.isEmpty()) return null;
+        return systemPackageModules.computeIfAbsent(internalPackage, pkg -> {
+            try {
+                FileSystem fs = getJrtFileSystem();
+                if (fs == null) return Optional.empty();
+                Path dir = fs.getPath("/packages/" + pkg.replace('/', '.'));
+                if (!Files.isDirectory(dir)) return Optional.empty();
+                try (var entries = Files.list(dir)) {
+                    return entries.map(p -> p.getFileName().toString().replace("/", ""))
+                            .filter(s -> !s.isEmpty())
+                            .findFirst();
+                }
+            } catch (IOException | RuntimeException e) {
+                log.debug("Cannot map package {} to a system module: {}", pkg, e.getMessage());
+                return Optional.empty();
+            }
+        }).orElse(null);
+    }
+
+    public Set<String> jdkNativeAccessModules() {
+        Set<String> cached = jdkNativeAccessModules;
+        if (cached != null) return cached;
+        synchronized (this) {
+            if (jdkNativeAccessModules != null) return jdkNativeAccessModules;
+            Set<String> modules = new TreeSet<>();
+            modules.add("java.base");
+            String holder = "jdk/internal/module/ModuleLoaderMap$Modules";
+            getClassNode(holder);
+            byte[] bytes = getClassBytes(holder);
+            if (bytes != null) {
+                new ClassReader(bytes).accept(new ClassVisitor(Opcodes.ASM9) {
+                    @Override
+                    public MethodVisitor visitMethod(int access, String name, String descriptor,
+                                                     String signature, String[] exceptions) {
+                        if (!"<clinit>".equals(name)) return null;
+                        return new MethodVisitor(Opcodes.ASM9) {
+                            private final List<String> pending = new ArrayList<>();
+
+                            @Override
+                            public void visitLdcInsn(Object value) {
+                                if (value instanceof String s) pending.add(s);
+                            }
+
+                            @Override
+                            public void visitFieldInsn(int opcode, String owner, String field, String desc) {
+                                if (opcode != Opcodes.PUTSTATIC) return;
+                                if (field.equals("nativeAccessModules")) modules.addAll(pending);
+                                pending.clear();
+                            }
+                        };
+                    }
+                }, ClassReader.SKIP_DEBUG | ClassReader.SKIP_FRAMES);
+            }
+            jdkNativeAccessModules = Set.copyOf(modules);
+            return jdkNativeAccessModules;
+        }
     }
 
     private record SubclassClosure(long version, Set<String> classes) {}

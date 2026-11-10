@@ -517,3 +517,49 @@ int32_t __jnative_fn_jdk_internal_reflect_Reflection_areNestMates__Ljava_lang_Cl
     (void)member_class;
     return 1;
 }
+extern const char* jnative_native_access_packages[] JNATIVE_WEAK;
+extern const int64_t jnative_native_access_packages_size JNATIVE_WEAK;
+extern char jnative_unnamed_module;
+
+extern void fn_java_lang_Module_ensureNativeAccess__Ljava_lang_Class_Ljava_lang_String_Ljava_lang_Class_Z_V(
+        void* self, void* owner, void* method_name, void* current_class, _Bool jni) JNATIVE_WEAK;
+
+static int class_in_native_access_module(ReflectionClass* cls) {
+    if (cls == NULL || cls->cname == NULL) return 0;
+    if ((uintptr_t)&jnative_native_access_packages_size == 0) return 0;
+    if ((uintptr_t)jnative_native_access_packages == 0) return 0;
+    const char* slash = strrchr(cls->cname, '/');
+    if (slash == NULL) return 0;
+    size_t len = (size_t)(slash - cls->cname);
+    int64_t lo = 0;
+    int64_t hi = jnative_native_access_packages_size;
+    while (lo < hi) {
+        int64_t mid = lo + (hi - lo) / 2;
+        const char* pkg = jnative_native_access_packages[mid];
+        int cmp = strncmp(pkg, cls->cname, len);
+        if (cmp == 0) cmp = pkg[len] == '\0' ? 0 : 1;
+        if (cmp == 0) return 1;
+        if (cmp < 0) lo = mid + 1;
+        else         hi = mid;
+    }
+    return 0;
+}
+
+void __jnative_override_jdk_internal_reflect_Reflection_ensureNativeAccess__Ljava_lang_Class_Ljava_lang_Class_Ljava_lang_String_Z_V(
+        void* current_class, void* owner, void* method_name, int32_t jni)
+{
+    if (current_class != NULL && class_in_native_access_module((ReflectionClass*)current_class)) {
+        return;
+    }
+    if (fn_java_lang_Module_ensureNativeAccess__Ljava_lang_Class_Ljava_lang_String_Ljava_lang_Class_Z_V == NULL) {
+        __jnative_throw_exception(__jnative_construct_exception(
+            "vtable_java_lang_InternalError",
+            "Reflection.ensureNativeAccess: Module.ensureNativeAccess is not linked"));
+    }
+    void* module = current_class != NULL
+        ? ((ReflectionClass*)current_class)->module
+        : (void*)&jnative_unnamed_module;
+    if (module == NULL) return;
+    fn_java_lang_Module_ensureNativeAccess__Ljava_lang_Class_Ljava_lang_String_Ljava_lang_Class_Z_V(
+        module, owner, method_name, current_class, jni != 0);
+}

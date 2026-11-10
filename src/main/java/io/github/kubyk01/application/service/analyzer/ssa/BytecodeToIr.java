@@ -255,7 +255,8 @@ public class BytecodeToIr {
             if (!o.getClassName().equals(ref.getOwner()))       continue;
             if (!o.getMethodName().equals(ref.getName()))       continue;
             if (o.getDescriptor() != null
-                && !o.getDescriptor().equals(ref.getDescriptor())) continue;
+                && !LlvmRuntime.mangleMethod(ref.getOwner(), ref.getName(), o.getDescriptor())
+                    .equals(LlvmRuntime.mangleMethod(ref.getOwner(), ref.getName(), ref.getDescriptor()))) continue;
             return o;
         }
         return null;

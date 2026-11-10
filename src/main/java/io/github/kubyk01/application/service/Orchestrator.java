@@ -159,6 +159,8 @@ public class Orchestrator implements OrchestratorPort {
         forcePerfMethods(analysis);
         forceReflectionInvokeMethods(analysis);
         forceStackWalkMethods(analysis, resolver);
+        forceNativeAccessMethods(analysis, resolver);
+        forcePackageDefinitionMethods(analysis, resolver);
         forceLoggingConfigClasses(analysis);
         forceServiceProviders(analysis, resolver);
 
@@ -686,6 +688,42 @@ public class Orchestrator implements OrchestratorPort {
         if (!hasDeclaringClass) return;
         analysis.addInstantiatedClass(rmn, false);
         analysis.addExtraReachableMethod(new MethodReference(rmn, "declaringClass", "()Ljava/lang/Class;"));
+    }
+
+    private void forceNativeAccessMethods(ReachabilityAnalysis analysis, DependencyResolver resolver) {
+        String reflection = "jdk/internal/reflect/Reflection";
+        String module = "java/lang/Module";
+        String checkDesc = "(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/Class;Z)V";
+        if (!isDeclaredClass(resolver, reflection) || !isDeclaredClass(resolver, module)) return;
+        boolean overridden = resolver.getClassNode(reflection).getMethods().stream()
+            .anyMatch(m -> m.getName().equals("ensureNativeAccess")
+                && m.getDescriptor().equals("(Ljava/lang/Class;Ljava/lang/Class;Ljava/lang/String;Z)V"));
+        boolean target = resolver.getClassNode(module).getMethods().stream()
+            .anyMatch(m -> m.getName().equals("ensureNativeAccess") && m.getDescriptor().equals(checkDesc));
+        if (overridden && target) {
+            analysis.addExtraReachableMethod(new MethodReference(module, "ensureNativeAccess", checkDesc));
+        }
+    }
+
+    private void forcePackageDefinitionMethods(ReachabilityAnalysis analysis, DependencyResolver resolver) {
+        if (!analysis.getReachableClasses().contains("jdk/internal/loader/BootLoader")) return;
+        String[][] methods = {
+            {"jdk/internal/loader/ClassLoaders", "bootLoader", "()Ljdk/internal/loader/BuiltinClassLoader;"},
+            {"java/lang/ClassLoader", "getDefinedPackage", "(Ljava/lang/String;)Ljava/lang/Package;"},
+            {"jdk/internal/loader/BuiltinClassLoader", "defineOrCheckPackage",
+                "(Ljava/lang/String;Ljava/util/jar/Manifest;Ljava/net/URL;)Ljava/lang/Package;"},
+            {"java/util/jar/Manifest", "<init>", "(Ljava/io/InputStream;)V"}
+        };
+        for (String[] m : methods) {
+            if (!isDeclaredClass(resolver, m[0])) return;
+            boolean declared = resolver.getClassNode(m[0]).getMethods().stream()
+                .anyMatch(mn -> mn.getName().equals(m[1]) && mn.getDescriptor().equals(m[2]));
+            if (!declared) return;
+        }
+        analysis.addInstantiatedClass("java/util/jar/Manifest", false);
+        for (String[] m : methods) {
+            analysis.addExtraReachableMethod(new MethodReference(m[0], m[1], m[2]));
+        }
     }
 
     private static boolean isDeclaredClass(DependencyResolver resolver, String name) {

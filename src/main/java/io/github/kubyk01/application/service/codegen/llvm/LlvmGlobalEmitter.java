@@ -3760,6 +3760,8 @@ public class LlvmGlobalEmitter {
         sb.append(generateClassFileVersionMap(classVarNames));
         sb.append(generateClassSignatureMap(strConsts, classVarNames));
         sb.append(generateCallerSensitiveSymbols(strConsts));
+        sb.append(generateNativeAccessPackages(strConsts));
+        sb.append(generatePackageLocations(strConsts));
         sb.append(generateClassIntConstants(strConsts,
             "jnative_systemprops_raw_constants", "jdk/internal/util/SystemProps$Raw"));
 
@@ -4160,6 +4162,96 @@ public class LlvmGlobalEmitter {
         rows.forEach(sb::append);
         sb.append("  { i8*, i32 } zeroinitializer\n]\n");
         return sb.toString();
+    }
+
+    private String generateNativeAccessPackages(StringBuilder strConsts) {
+        Set<String> granted = resolver.jdkNativeAccessModules();
+        TreeSet<String> packages = new TreeSet<>();
+        for (String className : emittedRefClassNames) {
+            if (className.isEmpty() || className.charAt(0) == '[') continue;
+            int slash = className.lastIndexOf('/');
+            if (slash <= 0) continue;
+            String pkg = className.substring(0, slash);
+            if (packages.contains(pkg)) continue;
+            String moduleName = resolver.systemModuleOfPackage(pkg);
+            if (moduleName != null && granted.contains(moduleName)) packages.add(pkg);
+        }
+
+        StringBuilder sb = new StringBuilder("\n");
+        sb.append("@jnative_native_access_packages = constant [")
+            .append(packages.size() + 1).append(" x i8*] [\n");
+        for (String pkg : packages) {
+            sb.append("  i8* ").append(ensureStringConstantPtr(strConsts, pkg)).append(",\n");
+        }
+        sb.append("  i8* null\n]\n");
+        sb.append("@jnative_native_access_packages_size = constant i64 ")
+            .append(packages.size()).append("\n");
+        return sb.toString();
+    }
+
+    private String generatePackageLocations(StringBuilder strConsts) {
+        TreeSet<String> packages = new TreeSet<>();
+        for (String className : emittedRefClassNames) {
+            if (className.isEmpty() || className.charAt(0) == '[') continue;
+            int slash = className.lastIndexOf('/');
+            if (slash > 0) packages.add(className.substring(0, slash));
+        }
+
+        StringBuilder data = new StringBuilder();
+        Map<String, String> manifestGlobals = new HashMap<>();
+        List<String> rows = new ArrayList<>(packages.size());
+        for (String pkg : packages) {
+            String location;
+            byte[] manifest = null;
+            String moduleName = resolver.systemModuleOfPackage(pkg);
+            if (moduleName != null) {
+                location = "jrt:/" + moduleName;
+            } else {
+                DependencyResolver.PackageSource src = resolver.getPackageSource(pkg);
+                location = src != null ? src.location() : "";
+                manifest = src != null ? src.manifest() : null;
+            }
+            String manifestPtr = "i8* null";
+            int manifestLen = 0;
+            if (manifest != null && manifest.length > 0) {
+                byte[] bytes = manifest;
+                String global = manifestGlobals.computeIfAbsent(location, k -> {
+                    String name = "@jnative_package_manifest_" + manifestGlobals.size();
+                    data.append(name).append(" = private constant [").append(bytes.length)
+                        .append(" x i8] c\"").append(llvmByteString(bytes)).append("\"\n");
+                    return name;
+                });
+                manifestPtr = "i8* getelementptr inbounds ([" + manifest.length + " x i8], ["
+                    + manifest.length + " x i8]* " + global + ", i32 0, i32 0)";
+                manifestLen = manifest.length;
+            }
+            rows.add("  { i8*, i8*, i8*, i32 } { i8* " + ensureStringConstantPtr(strConsts, pkg)
+                + ", i8* " + ensureStringConstantPtr(strConsts, location)
+                + ", " + manifestPtr + ", i32 " + manifestLen + " }");
+        }
+
+        StringBuilder sb = new StringBuilder("\n");
+        sb.append(data);
+        sb.append("@jnative_package_locations = constant [").append(rows.size() + 1)
+            .append(" x { i8*, i8*, i8*, i32 }] [\n");
+        for (String row : rows) sb.append(row).append(",\n");
+        sb.append("  { i8*, i8*, i8*, i32 } zeroinitializer\n]\n");
+        sb.append("@jnative_package_locations_size = constant i64 ").append(rows.size()).append("\n");
+        return sb.toString();
+    }
+
+    private static String llvmByteString(byte[] bytes) {
+        StringBuilder out = new StringBuilder(bytes.length + 16);
+        for (byte b : bytes) {
+            int v = b & 0xFF;
+            if (v < 0x20 || v > 0x7E || v == '"' || v == '\\') {
+                out.append('\\').append(Character.toUpperCase(Character.forDigit(v >> 4, 16)))
+                   .append(Character.toUpperCase(Character.forDigit(v & 0xF, 16)));
+            } else {
+                out.append((char) v);
+            }
+        }
+        return out.toString();
     }
 
     private String generateCallerSensitiveSymbols(StringBuilder strConsts) {

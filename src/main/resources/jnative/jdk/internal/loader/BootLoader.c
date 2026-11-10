@@ -2,6 +2,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <setjmp.h>
 
 #include "jnative_runtime.h"
 
@@ -112,11 +113,101 @@ void* __jnative_fn_jdk_internal_loader_BootLoader_getSystemPackageNames____Ljava
  * by the ClassLoader hierarchy. It is read but not consulted — the answer
  * is the same for every package.
  */
+typedef struct {
+    const char*    package;
+    const char*    location;
+    const uint8_t* manifest;
+    int32_t        manifest_len;
+} JNativePackageLocation;
+
+extern const JNativePackageLocation jnative_package_locations[] JNATIVE_WEAK;
+extern const int64_t jnative_package_locations_size JNATIVE_WEAK;
+
+static const JNativePackageLocation* package_location(void* name_str) {
+    if (name_str == NULL) return NULL;
+    if ((uintptr_t)&jnative_package_locations_size == 0) return NULL;
+    if ((uintptr_t)jnative_package_locations == 0) return NULL;
+    char name[1024];
+    int32_t len = __jnative_read_string_into(name_str, name, (int32_t)sizeof(name));
+    if (len <= 0 || len >= (int32_t)sizeof(name)) return NULL;
+    name[len] = '\0';
+    for (int32_t i = 0; i < len; i++) {
+        if (name[i] == '.') name[i] = '/';
+    }
+    int64_t lo = 0;
+    int64_t hi = jnative_package_locations_size;
+    while (lo < hi) {
+        int64_t mid = lo + (hi - lo) / 2;
+        int cmp = strcmp(jnative_package_locations[mid].package, name);
+        if (cmp == 0) return &jnative_package_locations[mid];
+        if (cmp < 0) lo = mid + 1;
+        else         hi = mid;
+    }
+    return NULL;
+}
+
 void* __jnative_fn_jdk_internal_loader_BootLoader_getSystemPackageLocation__Ljava_lang_String__Ljava_lang_String_(
         void* name_str)
 {
-    (void)name_str;
-    return NULL;
+    const JNativePackageLocation* loc = package_location(name_str);
+    return loc != NULL ? jnative_string(loc->location) : NULL;
+}
+
+extern void* fn_jdk_internal_loader_ClassLoaders_bootLoader___Ljdk_internal_loader_BuiltinClassLoader_(void) JNATIVE_WEAK;
+extern void* fn_java_lang_ClassLoader_getDefinedPackage__Ljava_lang_String__Ljava_lang_Package_(
+        void* self, void* name) JNATIVE_WEAK;
+extern void* fn_jdk_internal_loader_BuiltinClassLoader_defineOrCheckPackage__Ljava_lang_String_Ljava_util_jar_Manifest_Ljava_net_URL__Ljava_lang_Package_(
+        void* self, void* pn, void* man, void* url) JNATIVE_WEAK;
+extern void fn_java_util_jar_Manifest__init___Ljava_io_InputStream__V(void* self, void* in) JNATIVE_WEAK;
+extern char __type_info_java_io_IOException JNATIVE_WEAK;
+
+JNATIVE_NORETURN static void boot_loader_internal_error(const char* msg) {
+    __jnative_throw_exception(__jnative_construct_exception("vtable_java_lang_InternalError", msg));
+}
+
+static void* package_manifest(const JNativePackageLocation* loc) {
+    if (loc->manifest == NULL || loc->manifest_len <= 0) return NULL;
+    ReflectionClass* cls = jnative_class_by_name("java/util/jar/Manifest");
+    void* manifest = cls != NULL ? jnative_alloc_object(cls) : NULL;
+    if (manifest == NULL) boot_loader_internal_error("BootLoader: java.util.jar.Manifest is not in the image");
+    void* bytes = jnative_byte_array(loc->manifest, loc->manifest_len);
+    if (bytes == NULL) __jnative_throw_out_of_memory_error_ctx("BootLoader package manifest");
+    void* in = __jnative_make_byte_array_input_stream(bytes);
+    if (in == NULL) boot_loader_internal_error("BootLoader: cannot open package manifest");
+
+    jmp_buf jb;
+    if (setjmp(jb) == 0) {
+        __jnative_push_catch(&jb, NULL);
+        fn_java_util_jar_Manifest__init___Ljava_io_InputStream__V(manifest, in);
+        __jnative_pop_catch();
+        return manifest;
+    }
+    __jnative_pop_catch();
+    void* exc = __jnative_get_exception_object();
+    if ((uintptr_t)&__type_info_java_io_IOException != 0
+        && __jnative_catch_matches(exc, &__type_info_java_io_IOException)) {
+        return NULL;
+    }
+    __jnative_throw_exception(exc);
+}
+
+void* __jnative_override_jdk_internal_loader_BootLoader_getDefinedPackage(void* pn)
+{
+    if (pn == NULL) __jnative_throw_null_pointer_exception();
+    if (fn_jdk_internal_loader_ClassLoaders_bootLoader___Ljdk_internal_loader_BuiltinClassLoader_ == NULL
+        || fn_java_lang_ClassLoader_getDefinedPackage__Ljava_lang_String__Ljava_lang_Package_ == NULL
+        || fn_jdk_internal_loader_BuiltinClassLoader_defineOrCheckPackage__Ljava_lang_String_Ljava_util_jar_Manifest_Ljava_net_URL__Ljava_lang_Package_ == NULL
+        || fn_java_util_jar_Manifest__init___Ljava_io_InputStream__V == NULL) {
+        boot_loader_internal_error("BootLoader.getDefinedPackage: package definition is not linked");
+    }
+    void* loader = fn_jdk_internal_loader_ClassLoaders_bootLoader___Ljdk_internal_loader_BuiltinClassLoader_();
+    if (loader == NULL) return NULL;
+    void* pkg = fn_java_lang_ClassLoader_getDefinedPackage__Ljava_lang_String__Ljava_lang_Package_(loader, pn);
+    if (pkg != NULL) return pkg;
+    const JNativePackageLocation* loc = package_location(pn);
+    if (loc == NULL) return NULL;
+    return fn_jdk_internal_loader_BuiltinClassLoader_defineOrCheckPackage__Ljava_lang_String_Ljava_util_jar_Manifest_Ljava_net_URL__Ljava_lang_Package_(
+        loader, pn, package_manifest(loc), NULL);
 }
 
 void __jnative_fn_jdk_internal_loader_BootLoader_setBootLoaderUnnamedModule0__Ljava_lang_Module__V(void* module)
