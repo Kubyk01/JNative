@@ -24,6 +24,7 @@
 
 #include "jnative_runtime.h"
 
+#define IOS_EOF         (-1)
 #define IOS_UNAVAILABLE (-2)
 #define IOS_INTERRUPTED (-3)
 
@@ -34,7 +35,6 @@
 #include <string.h>
 #include <errno.h>
 
-#define IOS_EOF              (-1)
 #define IOS_THROWN           (-5)
 #define IOS_UNSUPPORTED_CASE (-6)
 
@@ -656,6 +656,7 @@ int32_t __jnative_fn_sun_nio_ch_FileDispatcherImpl_read0__Ljava_io_FileDescripto
         if (fdi_is_would_block(fdi_errno())) return IOS_UNAVAILABLE;
         fdi_throw_io("read0 failed");
     }
+    if (n == 0) return IOS_EOF;
     return (int32_t)n;
 }
 
@@ -694,6 +695,7 @@ int32_t __jnative_fn_sun_nio_ch_FileDispatcherImpl_pread0__Ljava_io_FileDescript
         if (fdi_is_would_block(fdi_errno())) return IOS_UNAVAILABLE;
         fdi_throw_io("pread0 failed");
     }
+    if (n == 0) return IOS_EOF;
     return (int32_t)n;
 }
 
@@ -728,6 +730,7 @@ int64_t __jnative_fn_sun_nio_ch_FileDispatcherImpl_readv0__Ljava_io_FileDescript
         if (fdi_is_interrupted(errno)) return (int64_t)IOS_INTERRUPTED;
         fdi_throw_io("readv failed");
     }
+    if (n == 0) return (int64_t)IOS_EOF;
     return (int64_t)n;
 }
 int64_t __jnative_fn_sun_nio_ch_FileDispatcherImpl_writev0__Ljava_io_FileDescriptor_JI_J(
@@ -750,7 +753,7 @@ int64_t __jnative_fn_sun_nio_ch_FileDispatcherImpl_seek0__Ljava_io_FileDescripto
         void* fdo, int64_t offset)
 {
     int fd = fdi_fdval(fdo);
-    int64_t p = fdi_lseek(fd, offset, SEEK_SET);
+    int64_t p = offset < 0 ? fdi_lseek(fd, 0, SEEK_CUR) : fdi_lseek(fd, offset, SEEK_SET);
     if (p < 0) fdi_throw_io("lseek failed");
     return p;
 }

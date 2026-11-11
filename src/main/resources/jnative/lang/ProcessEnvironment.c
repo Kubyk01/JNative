@@ -28,8 +28,8 @@ static void* pe_make_string(const WCHAR* w, int32_t n)
         if (latin1) {
             d[i] = (uint8_t)w[i];
         } else {
-            d[i * 2] = (uint8_t)(w[i] >> 8);
-            d[i * 2 + 1] = (uint8_t)(w[i] & 0xFF);
+            d[i * 2] = (uint8_t)(w[i] & 0xFF);
+            d[i * 2 + 1] = (uint8_t)(w[i] >> 8);
         }
     }
     d[bytes] = 0;

@@ -165,6 +165,83 @@ static const char* resolve_library_path(char* buf, size_t bufsz) {
     return buf;
 }
 
+static int resolve_exe_path(char* buf, size_t bufsz) {
+#if defined(_WIN32)
+    wchar_t wbuf[PATH_MAX];
+    DWORD n = GetModuleFileNameW(NULL, wbuf, PATH_MAX);
+    if (n == 0 || n >= PATH_MAX) return 0;
+    int u = WideCharToMultiByte(CP_UTF8, 0, wbuf, (int)n, buf, (int)bufsz - 1, NULL, NULL);
+    if (u <= 0) return 0;
+    buf[u] = '\0';
+    return 1;
+#elif defined(__APPLE__)
+    extern int _NSGetExecutablePath(char* buf, uint32_t* size);
+    uint32_t size = (uint32_t)bufsz;
+    return _NSGetExecutablePath(buf, &size) == 0;
+#else
+    long n = jn_readlink("/proc/self/exe", buf, bufsz - 1);
+    if (n <= 0) return 0;
+    buf[n] = '\0';
+    return 1;
+#endif
+}
+
+static FILE* open_utf8(const char* path) {
+#if defined(_WIN32)
+    wchar_t wpath[PATH_MAX];
+    if (MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, PATH_MAX) <= 0) return NULL;
+    return _wfopen(wpath, L"rb");
+#else
+    return fopen(path, "rb");
+#endif
+}
+
+static char* resolve_class_path(void) {
+#if defined(_WIN32)
+    const char sep = ';';
+    const char dirsep = '\\';
+#else
+    const char sep = ':';
+    const char dirsep = '/';
+#endif
+    char base[PATH_MAX];
+    if (!resolve_exe_path(base, sizeof(base) - 32)) return NULL;
+    strcat(base, ".classpath");
+    size_t base_len = strlen(base);
+    char list_path[PATH_MAX];
+    snprintf(list_path, sizeof(list_path), "%s%cclasspath", base, dirsep);
+    FILE* f = open_utf8(list_path);
+    if (f == NULL) return NULL;
+
+    size_t cap = 4096, pos = 0;
+    char* out = (char*)malloc(cap);
+    if (out == NULL) { fclose(f); return NULL; }
+    out[0] = '\0';
+    char line[PATH_MAX];
+    while (fgets(line, sizeof(line), f) != NULL) {
+        size_t n = strcspn(line, "\r\n");
+        line[n] = '\0';
+        if (n == 0) continue;
+        size_t need = pos + 1 + base_len + 1 + n + 1;
+        if (need > cap) {
+            while (cap < need) cap *= 2;
+            char* nb = (char*)realloc(out, cap);
+            if (nb == NULL) { free(out); fclose(f); return NULL; }
+            out = nb;
+        }
+        if (pos > 0) out[pos++] = sep;
+        memcpy(out + pos, base, base_len);
+        pos += base_len;
+        out[pos++] = dirsep;
+        memcpy(out + pos, line, n);
+        pos += n;
+        out[pos] = '\0';
+    }
+    fclose(f);
+    if (pos == 0) { free(out); return NULL; }
+    return out;
+}
+
 static const char* resolve_tmpdir(char* buf, size_t bufsz) {
     if (bufsz == 0) return "/tmp";
 
@@ -434,14 +511,21 @@ void* __jnative_fn_jdk_internal_util_SystemProps_Raw_cmdProperties___Ljava_util_
                   "jdk.reflect.useNativeAccessorOnly", "true");
     cmd_props_put(table, table_size, node_vtable,
                   "jdk.reflect.useDirectMethodHandle", "methods");
+    int32_t cmd_count = 5;
+    char* class_path = resolve_class_path();
+    if (class_path != NULL) {
+        cmd_props_put(table, table_size, node_vtable, "java.class.path", class_path);
+        free(class_path);
+        cmd_count++;
+    }
 
     *(void**)((char*)map + 8)  = NULL;
     *(void**)((char*)map + 16) = NULL;
 
     *(void**)((char*)map + HASHMAP_TABLE_OFF)      = table;
     *(void**)((char*)map + HASHMAP_ENTRYSET_OFF)   = NULL;
-    *(int32_t*)((char*)map + HASHMAP_SIZE_OFF)     = 5;
-    *(int32_t*)((char*)map + HASHMAP_MODCOUNT_OFF) = 5;
+    *(int32_t*)((char*)map + HASHMAP_SIZE_OFF)     = cmd_count;
+    *(int32_t*)((char*)map + HASHMAP_MODCOUNT_OFF) = cmd_count;
     *(int32_t*)((char*)map + HASHMAP_THRESHOLD_OFF)= 12;
     *(float*)((char*)map + HASHMAP_LOADFACTOR_OFF) = 0.75f;
 
@@ -740,6 +824,12 @@ void* __jnative_make_bootstrap_props(
     JNATIVE_INSERT("jdk.module.upgrade.path",    "");
     JNATIVE_INSERT("jdk.module.main",            "");
     JNATIVE_INSERT("jdk.module.main.class",      "");
+
+    char* class_path = resolve_class_path();
+    if (class_path != NULL) {
+        JNATIVE_INSERT("java.class.path", class_path);
+        free(class_path);
+    }
 
 #undef JNATIVE_INSERT
 

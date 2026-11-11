@@ -311,6 +311,14 @@ static void* create_thread_object(void) {
     return t;
 }
 
+/* Thread.isAlive() is Java code reading `eetop != 0`, so the runtime must
+ * keep that field non-zero for the thread's whole life. */
+static void set_eetop(void* java_thread, int64_t v) {
+    if (java_thread && THREAD_EETOP_OFFSET >= 0) {
+        *(int64_t*)((char*)java_thread + THREAD_EETOP_OFFSET) = v;
+    }
+}
+
 static ThreadState* find_thread_state(void* java_thread) {
     if (!java_thread) return NULL;
     jn_mutex_lock(&thread_table_lock);
@@ -393,6 +401,7 @@ static ThreadState* ensure_main_thread(void) {
     s->running = 1;
     s->started = 1;
     s->priority = 5;
+    set_eetop(s->java_thread, 1);
     if (THREAD_TID_OFFSET >= 0) {
         s->tid = *(int64_t*)((char*)s->java_thread + THREAD_TID_OFFSET);
     }
@@ -435,6 +444,7 @@ typedef struct StartArgs {
     void* runnable;
 } StartArgs;
 
+
 /*
  * pthread entry point. Publishes the ThreadState into the thread-local slot,
  * marks the thread running, invokes the Java-level Runnable, and on return
@@ -459,6 +469,15 @@ static void* thread_entry(void* arg) {
         extern void __jnative_invoke_runnable(void* runnable);
         __jnative_invoke_runnable(runnable);
     }
+
+    /* Same as HotSpot's ensure_join: Thread.join() does
+     * synchronized(this){ while(isAlive()) wait(); }, so clear eetop and
+     * notify under the Thread's monitor to avoid a lost wakeup. */
+    extern void __jnative_fn_java_lang_Object_notifyAll___V(void* obj);
+    __jnative_monitor_enter(s->java_thread);
+    set_eetop(s->java_thread, 0);
+    __jnative_fn_java_lang_Object_notifyAll___V(s->java_thread);
+    __jnative_monitor_exit(s->java_thread);
 
     jn_mutex_lock(&s->mutex);
     s->running = 0;
@@ -607,6 +626,7 @@ void __jnative_fn_java_lang_Thread_start__V(void* this_thread) {
         return;
     }
     s->started = 1;
+    set_eetop(this_thread, 1);
     jn_mutex_unlock(&s->mutex);
 
     StartArgs* sa = malloc(sizeof(StartArgs));
@@ -626,6 +646,7 @@ void __jnative_fn_java_lang_Thread_start__V(void* this_thread) {
     pthread_attr_destroy(&attr);
     if (rc != 0) {
         free(sa);
+        set_eetop(this_thread, 0);
         __jnative_throw_exception(NULL);
     }
 }

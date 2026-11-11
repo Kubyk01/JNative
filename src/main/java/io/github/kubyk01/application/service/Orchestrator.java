@@ -10,6 +10,8 @@ import io.github.kubyk01.application.service.codegen.NativeOverride;
 import io.github.kubyk01.application.service.codegen.NativeOverrideScanner;
 import io.github.kubyk01.application.service.codegen.ResourceEmbedder;
 import io.github.kubyk01.application.service.codegen.llvm.LlvmGenerator;
+import io.github.kubyk01.application.service.analyzer.reachabilityanalysis.annotation.cglib.CglibPregenerator;
+import io.github.kubyk01.application.service.compiler.ClasspathExporter;
 import io.github.kubyk01.application.service.compiler.TargetJdk;
 import io.github.kubyk01.application.service.codegen.llvm.nativepolymorphicfunctionresolver.PolymorphicResolver;
 import io.github.kubyk01.application.service.optimizer.ArrayCoAllocator;
@@ -146,6 +148,25 @@ public class Orchestrator implements OrchestratorPort {
         analysis.analyzeFromEntry(entryClass, entryMethod, entryDescriptor);
         Set<String> reachableFromEntry = new HashSet<>(analysis.getReachableClasses());
         analysis.addAllApplicationClasses();
+        if (!noCompile && Files.isRegularFile(path)) {
+            Path exePath = outputFile != null ? Paths.get(outputFile) : defaultOutputPath(path, targetPlatform);
+            try {
+                Path classpathDir = ClasspathExporter.export(path, resolver.getScannedJars(), exePath);
+                System.out.println("Runtime classpath exported: " + classpathDir.toAbsolutePath());
+                List<Path> runtimeClasspath = new ArrayList<>();
+                for (String entry : Files.readAllLines(classpathDir.resolve("classpath"))) {
+                    if (!entry.isBlank()) runtimeClasspath.add(classpathDir.resolve(entry.trim()));
+                }
+                Map<String, byte[]> cglibClasses =
+                    CglibPregenerator.generate(runtimeClasspath, analysis.annotatedApplicationClasses());
+                if (!cglibClasses.isEmpty()) {
+                    System.out.println("Pre-generated " + cglibClasses.size() + " CGLIB class(es)");
+                    analysis.addGeneratedClasses(cglibClasses);
+                }
+            } catch (IOException e) {
+                log.error("Failed to export runtime classpath", e);
+            }
+        }
         Set<String> lazyOnlyClasses = new HashSet<>(analysis.getReachableClasses());
         lazyOnlyClasses.removeAll(reachableFromEntry);
 
@@ -413,12 +434,6 @@ public class Orchestrator implements OrchestratorPort {
                 Set.copyOf(aliasResult.getGraph().getStaticFieldPointsToMap().keySet());
         List<ClinitScheduleEntry> clinitSchedule = analysisResult.clinitSchedule();
         Map<String, String> clinitWrappers = analysisResult.clinitWrappers();
-        analysisResult = null;
-        aliasResult = null;
-        escapeResult = null;
-        lifetimeResult = null;
-        inserter = null;
-        optimizer = null;
         releasePointsTo(module);
 
         // --- 10. LLVM IR generation ---------------------------------------

@@ -32,6 +32,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 import static io.github.kubyk01.util.LlvmUtil.extractCalleeName;
 
@@ -41,6 +42,7 @@ public class BytecodeToIr {
     private final DependencyResolver resolver;
     private final ReachabilityAnalysis reachability;
     private final IrBuilder builder = new IrBuilder();
+    private final Map<String, Map<String, Set<Integer>>> deadCodeMethods = new ConcurrentHashMap<>();
 
     private Scheduler scheduler = Schedulers.single();
 
@@ -492,12 +494,16 @@ public class BytecodeToIr {
                 }
             };
 
+            byte[] classBytes = bytes;
+            Set<Integer> liveLabels = deadCodeMethods
+                .computeIfAbsent(owner, k -> DeadCodeFilter.scan(classBytes))
+                .get(name + desc);
             reader.accept(new ClassVisitor(Opcodes.ASM9) {
                 @Override
                 public MethodVisitor visitMethod(int access, String mName, String mDesc,
                                                  String signature, String[] exceptions) {
                     if (mName.equals(name) && mDesc.equals(desc)) {
-                        return translator;
+                        return DeadCodeFilter.wrap(translator, liveLabels);
                     }
                     return null;
                 }

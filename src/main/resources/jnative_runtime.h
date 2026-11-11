@@ -552,6 +552,12 @@ extern const int32_t JNATIVE_CTOR_PARAM_TYPES_OFFSET;
 extern const int32_t JNATIVE_CTOR_EXC_TYPES_OFFSET;
 extern const int32_t JNATIVE_CTOR_MODIFIERS_OFFSET;
 extern const int32_t JNATIVE_CTOR_ROOT_OFFSET;
+extern const int32_t JNATIVE_FIELD_ANNOTATIONS_OFFSET;
+extern const int32_t JNATIVE_METHOD_ANNOTATIONS_OFFSET;
+extern const int32_t JNATIVE_METHOD_PARAM_ANNOTATIONS_OFFSET;
+extern const int32_t JNATIVE_METHOD_ANNOTATION_DEFAULT_OFFSET;
+extern const int32_t JNATIVE_CTOR_ANNOTATIONS_OFFSET;
+extern const int32_t JNATIVE_CTOR_PARAM_ANNOTATIONS_OFFSET;
 
 /* JVM access-flag bits used by the reflection filter paths. */
 #ifndef JNATIVE_ACC_PUBLIC
@@ -713,6 +719,35 @@ extern int32_t __jnative_read_string_into(void* s, char* out, int32_t out_cap);
 extern const char* __jnative_read_string_cstr(void* s, int32_t* out_len);
 
 extern void* __jnative_make_string_obj(const char* bytes, int32_t len);
+extern void* __jnative_make_string_mutf8(const uint8_t* bytes, int32_t len);
+
+typedef struct {
+    const char*    name;
+    const char*    descriptor;
+    const uint8_t* annotations;
+    int32_t        annotations_len;
+    const uint8_t* parameter_annotations;
+    int32_t        parameter_annotations_len;
+    const uint8_t* annotation_default;
+    int32_t        annotation_default_len;
+} JNativeAnnotationMember;
+
+typedef struct {
+    ReflectionClass*               cls;
+    const uint8_t*                 constant_pool;
+    int32_t                        constant_pool_len;
+    int32_t                        constant_pool_count;
+    const uint8_t*                 annotations;
+    int32_t                        annotations_len;
+    const JNativeAnnotationMember* members;
+    int32_t                        member_count;
+} JNativeAnnotationClass;
+
+extern const JNativeAnnotationClass* jnative_annotation_class(const ReflectionClass* cls);
+extern const JNativeAnnotationMember* jnative_annotation_member(const ReflectionClass* cls,
+                                                                const char* name, const char* descriptor);
+extern const uint8_t* jnative_constant_pool_entry(const ReflectionClass* cls, int32_t index, uint8_t* tag);
+extern void* jnative_annotation_bytes(const uint8_t* data, int32_t len);
 extern const char* __jnative_read_string_bytes(void* s, int32_t* out_len);
 extern void* __jnative_string_intern(void* this_str);
 
@@ -1190,6 +1225,7 @@ extern const int32_t THREAD_HOLDER_OFFSET;
 extern const int32_t THREAD_TID_OFFSET;
 extern const int32_t THREAD_NAME_OFFSET;
 extern const int32_t THREAD_INTERRUPTLOCK_OFFSET;
+extern const int32_t THREAD_EETOP_OFFSET;
 extern const int32_t FH_OBJECT_SIZE;
 extern const int32_t FH_GROUP_OFFSET;
 extern const int32_t FH_PRIORITY_OFFSET;

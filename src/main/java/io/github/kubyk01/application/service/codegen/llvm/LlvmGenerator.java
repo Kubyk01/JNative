@@ -322,8 +322,7 @@ public class LlvmGenerator implements LlvmGeneratorPort {
             + moduleDecls
             + runInit
             + main;
-        globalDefs = null;   // now duplicated inside moduleTail; let the GC take it
-        moduleBodies = null;
+        // now duplicated inside moduleTail; let the GC take it
 
         String moduleExterns = buildExterns(
             moduleTail,
@@ -334,12 +333,7 @@ public class LlvmGenerator implements LlvmGeneratorPort {
             moduleTail, moduleExterns, preludeDefs, preludeKeys);
 
         writeLl(outputDir.resolve("_module.ll"), modulePrelude, moduleExterns, moduleTail);
-        moduleTail = null;
 
-        // Embedded resources get their own translation unit, streamed byte by
-        // byte: as IR text they are several times their raw size and holding
-        // them in globalDefs ran the heap out (OutOfMemoryError in
-        // generateGlobalDefinitions). Only C references these symbols.
         try (var w = Files.newBufferedWriter(outputDir.resolve("_resources.ll"),
                 StandardCharsets.UTF_8)) {
             w.write(targetPlatform.preamble());
@@ -1985,6 +1979,13 @@ public class LlvmGenerator implements LlvmGeneratorPort {
             callArgs.add(new Constant(Type.NULL, null));
         }
 
+        /* JLS §15.13.3: SAM slots are erased (Object) while the target may
+         * take primitives, so box/unbox every non-receiver argument. */
+        int firstImplArg = isStatic ? 0 : 1;
+        for (int i = firstImplArg; i < callArgs.size(); i++) {
+            callArgs.set(i, adaptValue(builder, callArgs.get(i), implParamTypes.get(i - firstImplArg)));
+        }
+
         String calleeName = implOwner + "." + implName + implDesc;
 
         if (callOpcode == Opcode.INTERFACE_CALL) {
@@ -2016,16 +2017,43 @@ public class LlvmGenerator implements LlvmGeneratorPort {
             }
         }
 
-        if (!retType.isVoid()) {
-            Temporary result = builder.newTemporary(retType);
+        /* The call result carries the target's own return type; the SAM's
+         * erased return type is reached by boxing/unboxing afterwards. */
+        Type implRet = TypeResolver.descToReturnType(implDesc);
+        if (!retType.isVoid() && !implRet.isVoid()) {
+            Temporary result = builder.newTemporary(implRet);
             callInst.setResult(result);
             result.setDefiningInstruction(callInst);
             entry.addInstruction(callInst);
-            builder.createReturn(result);
+            builder.createReturn(adaptValue(builder, result, retType));
         } else {
             entry.addInstruction(callInst);
-            builder.createReturn(null);
+            builder.createReturn(retType.isVoid() ? null : new Constant(Type.NULL, null));
         }
+    }
+
+    /**
+     * Boxes a primitive {@code v} when {@code to} is a reference, unboxes a
+     * reference {@code v} when {@code to} is primitive, otherwise returns
+     * {@code v} unchanged. The boxing methods are made reachable by
+     * {@code MethodBytecodeVisitor.addMethodRefBoxing}.
+     */
+    private Value adaptValue(IrBuilder builder, Value v, Type to) {
+        Type from = v.getType();
+        if (from.isPrimitive() && !to.isPrimitive()) {
+            String w = TypeResolver.wrapperClassOf(TypeResolver.primitiveDescriptor(from));
+            String callee = w + ".valueOf(" + TypeResolver.primitiveDescriptor(from) + ")L" + w + ";";
+            return builder.addInstruction(Opcode.STATIC_CALL, Type.reference(w),
+                new Constant(Type.reference(callee), callee), v).getResult();
+        }
+        if (to.isPrimitive() && (from.isReference() || from.isUnknown())) {
+            String w = TypeResolver.wrapperClassOf(TypeResolver.primitiveDescriptor(to));
+            String callee = w + "." + to + "Value()" + TypeResolver.primitiveDescriptor(to);
+            globalEmitter.ensureClassLayoutBuilt(w);
+            return builder.addInstruction(Opcode.VIRTUAL_CALL, to,
+                v, new Constant(Type.reference(callee), callee)).getResult();
+        }
+        return v;
     }
 
     /**

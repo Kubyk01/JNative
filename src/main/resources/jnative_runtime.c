@@ -2083,49 +2083,233 @@ void* __jnative_new_instance(ReflectionConstructor* ctor, void** args) {
 
 extern JNativeVTable vtable_java_lang_String;
 
+static int32_t jn_utf8_decode(const uint8_t* in, int32_t n, uint16_t* out) {
+    int32_t r = 0, w = 0;
+    while (r < n) {
+        uint32_t b = in[r];
+        uint32_t cp;
+        int32_t need;
+        uint32_t min;
+        if (b < 0x80) { out[w++] = (uint16_t)b; r++; continue; }
+        else if ((b & 0xE0) == 0xC0) { cp = b & 0x1F; need = 1; min = 0x80; }
+        else if ((b & 0xF0) == 0xE0) { cp = b & 0x0F; need = 2; min = 0x800; }
+        else if ((b & 0xF8) == 0xF0) { cp = b & 0x07; need = 3; min = 0x10000; }
+        else { out[w++] = 0xFFFD; r++; continue; }
+        int32_t k = 1;
+        while (k <= need && r + k < n && (in[r + k] & 0xC0) == 0x80) {
+            cp = (cp << 6) | (in[r + k] & 0x3F);
+            k++;
+        }
+        if (k <= need || cp < min || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) {
+            out[w++] = 0xFFFD;
+            r += k;
+            continue;
+        }
+        r += k;
+        if (cp >= 0x10000) {
+            cp -= 0x10000;
+            out[w++] = (uint16_t)(0xD800 | (cp >> 10));
+            out[w++] = (uint16_t)(0xDC00 | (cp & 0x3FF));
+        } else {
+            out[w++] = (uint16_t)cp;
+        }
+    }
+    return w;
+}
+
+static void* jn_make_string(const char* bytes, int32_t len, uint16_t* units, int32_t nunits);
+
 void* __jnative_make_string_obj(const char* bytes, int32_t len) {
     if (len < 0) len = 0;
+    if (bytes == NULL) len = 0;
+    for (int32_t i = 0; i < len; i++) {
+        if ((uint8_t)bytes[i] & 0x80) {
+            uint16_t* units = (uint16_t*)malloc((size_t)len * sizeof(uint16_t));
+            if (units == NULL)
+                __jnative_throw_out_of_memory_error_ctx("__jnative_make_string_obj");
+            int32_t nunits = jn_utf8_decode((const uint8_t*)bytes, len, units);
+            return jn_make_string(NULL, 0, units, nunits);
+        }
+    }
+    return jn_make_string(bytes, len, NULL, 0);
+}
+
+void* __jnative_make_string_mutf8(const uint8_t* bytes, int32_t len) {
+    if (bytes == NULL || len <= 0) return jn_make_string(NULL, 0, NULL, 0);
+    uint16_t* units = (uint16_t*)malloc((size_t)len * sizeof(uint16_t));
+    if (units == NULL)
+        __jnative_throw_out_of_memory_error_ctx("__jnative_make_string_mutf8");
+    int32_t n = 0;
+    for (int32_t i = 0; i < len; ) {
+        uint8_t c = bytes[i];
+        if (c < 0x80) {
+            units[n++] = c;
+            i++;
+        } else if ((c & 0xE0) == 0xC0 && i + 1 < len) {
+            units[n++] = (uint16_t)(((c & 0x1F) << 6) | (bytes[i + 1] & 0x3F));
+            i += 2;
+        } else if ((c & 0xF0) == 0xE0 && i + 2 < len) {
+            units[n++] = (uint16_t)(((c & 0x0F) << 12) | ((bytes[i + 1] & 0x3F) << 6) | (bytes[i + 2] & 0x3F));
+            i += 3;
+        } else {
+            units[n++] = 0xFFFD;
+            i++;
+        }
+    }
+    return jn_make_string(NULL, 0, units, n);
+}
+
+static void* jn_make_string(const char* bytes, int32_t len, uint16_t* units, int32_t nunits) {
+    uint8_t coder = 0;
+    int32_t blen = len;
+    if (units != NULL) {
+        for (int32_t j = 0; j < nunits; j++) {
+            if (units[j] > 0xFF) { coder = 1; break; }
+        }
+        blen = nunits << coder;
+    }
     ReflectionClass* ba_cls = jnative_get_byte_array_class();
     void* value = jnative_array_alloc_with_class(
-        ba_cls, len + 1, JNATIVE_ELEM_SIZE_BYTE);
-    if (value == NULL)
-        __jnative_throw_out_of_memory_error_ctx("__jnative_make_string_obj");
-    *(int32_t*)((char*)value + JAVA_ARR_LENGTH_OFFSET) = len;
-    if (len > 0 && bytes != NULL) {
-        memcpy((char*)value + JAVA_ARR_HDR, bytes, (size_t)len);
+        ba_cls, blen + 1, JNATIVE_ELEM_SIZE_BYTE);
+    if (value == NULL) {
+        free(units);
+        __jnative_throw_out_of_memory_error_ctx("jn_make_string");
     }
-    ((char*)value)[JAVA_ARR_HDR + len] = '\0';
+    *(int32_t*)((char*)value + JAVA_ARR_LENGTH_OFFSET) = blen;
+    uint8_t* payload = (uint8_t*)value + JAVA_ARR_HDR;
+    if (units == NULL) {
+        if (len > 0) memcpy(payload, bytes, (size_t)len);
+    } else if (coder == 0) {
+        for (int32_t j = 0; j < nunits; j++) payload[j] = (uint8_t)units[j];
+    } else {
+        for (int32_t j = 0; j < nunits; j++) {
+            payload[j * 2]     = (uint8_t)(units[j] & 0xFF);
+            payload[j * 2 + 1] = (uint8_t)(units[j] >> 8);
+        }
+    }
+    free(units);
+    payload[blen] = 0;
 
     void* s = calloc(1, 32);
     if (s == NULL)
         __jnative_throw_out_of_memory_error_ctx("__jnative_make_string_obj");
     *(void**)((char*)s + 0)    = (void*)&vtable_java_lang_String;
     *(void**)((char*)s + 8)    = value;
-    *(uint8_t*)((char*)s + 16) = 0;
+    *(uint8_t*)((char*)s + 16) = coder;
     *(int32_t*)((char*)s + 20) = 0;
     *(uint8_t*)((char*)s + 24) = 0;
     return s;
 }
 
+#define JN_UTF8_RING 8
+
+typedef struct { char* buf[JN_UTF8_RING]; size_t cap[JN_UTF8_RING]; int next; } JnUtf8Ring;
+
+static jn_tls_key_t jn_utf8_ring_key;
+static jn_once_t jn_utf8_ring_once = JN_ONCE_INIT;
+
+static void jn_utf8_ring_destroy(void* p) {
+    if (p == NULL) return;
+    JnUtf8Ring* r = (JnUtf8Ring*)p;
+    for (int i = 0; i < JN_UTF8_RING; i++) free(r->buf[i]);
+    free(r);
+}
+
+static void jn_utf8_ring_init(void) {
+    jn_tls_key_create(&jn_utf8_ring_key, jn_utf8_ring_destroy);
+}
+
+static int32_t jn_string_to_utf8(const uint8_t* src, int32_t blen, uint8_t coder, char* out) {
+    int32_t w = 0;
+    if (coder == 0) {
+        for (int32_t i = 0; i < blen; i++) {
+            uint8_t c = src[i];
+            if (c < 0x80) {
+                out[w++] = (char)c;
+            } else {
+                out[w++] = (char)(0xC0 | (c >> 6));
+                out[w++] = (char)(0x80 | (c & 0x3F));
+            }
+        }
+        return w;
+    }
+    int32_t n = blen / 2;
+    for (int32_t i = 0; i < n; i++) {
+        uint32_t c = (uint32_t)src[i * 2] | ((uint32_t)src[i * 2 + 1] << 8);
+        if (c >= 0xD800 && c <= 0xDBFF && i + 1 < n) {
+            uint32_t d = (uint32_t)src[i * 2 + 2] | ((uint32_t)src[i * 2 + 3] << 8);
+            if (d >= 0xDC00 && d <= 0xDFFF) {
+                uint32_t cp = 0x10000 + ((c - 0xD800) << 10) + (d - 0xDC00);
+                out[w++] = (char)(0xF0 | (cp >> 18));
+                out[w++] = (char)(0x80 | ((cp >> 12) & 0x3F));
+                out[w++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+                out[w++] = (char)(0x80 | (cp & 0x3F));
+                i++;
+                continue;
+            }
+        }
+        if (c >= 0xD800 && c <= 0xDFFF) {
+            out[w++] = '?';
+        } else if (c < 0x80) {
+            out[w++] = (char)c;
+        } else if (c < 0x800) {
+            out[w++] = (char)(0xC0 | (c >> 6));
+            out[w++] = (char)(0x80 | (c & 0x3F));
+        } else {
+            out[w++] = (char)(0xE0 | (c >> 12));
+            out[w++] = (char)(0x80 | ((c >> 6) & 0x3F));
+            out[w++] = (char)(0x80 | (c & 0x3F));
+        }
+    }
+    return w;
+}
+
 const char* __jnative_read_string_bytes(void* s, int32_t* out_len) {
-    if (s == NULL) { if (out_len) *out_len = 0; return ""; }
+    if (out_len) *out_len = 0;
+    if (s == NULL) return "";
     void* value = *(void**)((char*)s + 8);
-    if (value == NULL) { if (out_len) *out_len = 0; return ""; }
-    if (out_len)
-        *out_len = *(int32_t*)((char*)value + JAVA_ARR_LENGTH_OFFSET);
-    return (const char*)value + JAVA_ARR_HDR;
+    if (value == NULL) return "";
+    int32_t blen = *(int32_t*)((char*)value + JAVA_ARR_LENGTH_OFFSET);
+    if (blen < 0) blen = 0;
+    uint8_t coder = *(uint8_t*)((char*)s + 16);
+    const uint8_t* src = (const uint8_t*)value + JAVA_ARR_HDR;
+    int ascii = (coder == 0);
+    for (int32_t i = 0; ascii && i < blen; i++) {
+        if (src[i] & 0x80) ascii = 0;
+    }
+    if (ascii) {
+        if (out_len) *out_len = blen;
+        return (const char*)src;
+    }
+    jn_once(&jn_utf8_ring_once, jn_utf8_ring_init);
+    JnUtf8Ring* ring = (JnUtf8Ring*)jn_tls_get(jn_utf8_ring_key);
+    if (ring == NULL) {
+        ring = (JnUtf8Ring*)calloc(1, sizeof(JnUtf8Ring));
+        if (ring == NULL) return "";
+        jn_tls_set(jn_utf8_ring_key, ring);
+    }
+    int slot = ring->next;
+    ring->next = (slot + 1) % JN_UTF8_RING;
+    size_t need = (size_t)blen * 2 + 1;
+    if (ring->cap[slot] < need) {
+        char* nb = (char*)realloc(ring->buf[slot], need);
+        if (nb == NULL) return "";
+        ring->buf[slot] = nb;
+        ring->cap[slot] = need;
+    }
+    int32_t n = jn_string_to_utf8(src, blen, coder, ring->buf[slot]);
+    ring->buf[slot][n] = '\0';
+    if (out_len) *out_len = n;
+    return ring->buf[slot];
 }
 
 int32_t __jnative_read_string_into(void* s, char* out, int32_t out_cap) {
     if (out == NULL || out_cap <= 0) return -1;
     out[0] = '\0';
     if (s == NULL) return -1;
-    void* value = *(void**)((char*)s + 8);
-    if (value == NULL) return 0;
-    int32_t len = *(int32_t*)((char*)value + JAVA_ARR_LENGTH_OFFSET);
-    if (len < 0) return -1;
+    int32_t len = 0;
+    const char* src = __jnative_read_string_bytes(s, &len);
     if (len >= out_cap) return -1;
-    const char* src = (const char*)value + JAVA_ARR_HDR;
     if (len > 0) memcpy(out, src, (size_t)len);
     out[len] = '\0';
     return len;
@@ -2151,10 +2335,8 @@ static void tls_cstr_key_init(void) {
 const char* __jnative_read_string_cstr(void* s, int32_t* out_len) {
     if (out_len != NULL) *out_len = 0;
     if (s == NULL) return "";
-    void* value = *(void**)((char*)s + 8);
-    if (value == NULL) return "";
-    int32_t len = *(int32_t*)((char*)value + JAVA_ARR_LENGTH_OFFSET);
-    if (len < 0) len = 0;
+    int32_t len = 0;
+    const char* src = __jnative_read_string_bytes(s, &len);
     jn_once(&tls_cstr_key_once, tls_cstr_key_init);
     TlsCstrBuf* tls = (TlsCstrBuf*)jn_tls_get(tls_cstr_key);
     if (tls == NULL) {
@@ -2171,7 +2353,6 @@ const char* __jnative_read_string_cstr(void* s, int32_t* out_len) {
         tls->buf = nb;
         tls->cap = new_cap;
     }
-    const char* src = (const char*)value + JAVA_ARR_HDR;
     if (len > 0) memcpy(tls->buf, src, (size_t)len);
     tls->buf[len] = '\0';
     if (out_len != NULL) *out_len = len;
@@ -2190,7 +2371,7 @@ typedef struct JNativeInternEntry {
     struct JNativeInternEntry* next;
 } JNativeInternEntry;
 
-#define JNATIVE_INTERN_BUCKETS 4096
+#define JNATIVE_INTERN_BUCKETS 65536
 static JNativeInternEntry* __jnative_intern_table[JNATIVE_INTERN_BUCKETS];
 static jn_mutex_t __jnative_intern_lock = JN_MUTEX_INITIALIZER;
 
@@ -2283,16 +2464,24 @@ void* __jnative_value_to_string_object(void* obj) {
     return toString(obj);
 }
 
+static jn_once_t __jnative_intern_literals_once = JN_ONCE_INIT;
+
+static void __jnative_intern_literals_init(void) {
+    for (int32_t i = __jnative_literal_pool_size - 1; i >= 0; i--) {
+        void* lit = __jnative_literal_pool[i];
+        if (lit == NULL) continue;
+        uint32_t bucket = __jnative_string_hash(lit) % JNATIVE_INTERN_BUCKETS;
+        JNativeInternEntry* ne = malloc(sizeof(JNativeInternEntry));
+        if (ne == NULL) continue;
+        ne->str = lit;
+        ne->next = __jnative_intern_table[bucket];
+        __jnative_intern_table[bucket] = ne;
+    }
+}
+
 void* __jnative_string_intern(void* this_str) {
     if (this_str == NULL) return NULL;
-    if (__jnative_literal_pool_size > 0) {
-        for (int32_t i = 0; i < __jnative_literal_pool_size; i++) {
-            if (__jnative_literal_pool[i] != NULL
-                && __jnative_string_eq(this_str, __jnative_literal_pool[i])) {
-                return __jnative_literal_pool[i];
-            }
-        }
-    }
+    jn_once(&__jnative_intern_literals_once, __jnative_intern_literals_init);
     uint32_t h = __jnative_string_hash(this_str);
     uint32_t bucket = h % JNATIVE_INTERN_BUCKETS;
     jn_mutex_lock(&__jnative_intern_lock);
@@ -2340,6 +2529,112 @@ void __jnative_debug_clinit(const char* name) {
     if (!enabled) return;
     fprintf(stderr, "[clinit] %s\n", name);
     fflush(stderr);
+}
+
+extern const JNativeAnnotationClass jnative_annotation_classes[] JNATIVE_WEAK;
+extern const int64_t jnative_annotation_classes_size JNATIVE_WEAK;
+
+static const JNativeAnnotationClass** jn_annot_table;
+static size_t jn_annot_mask;
+static int32_t** jn_annot_cp_offsets;
+static jn_once_t jn_annot_once = JN_ONCE_INIT;
+static jn_mutex_t jn_annot_cp_lock = JN_MUTEX_INITIALIZER;
+
+static size_t jn_annot_hash(const void* p) {
+    uintptr_t v = (uintptr_t)p;
+    v ^= v >> 17;
+    v *= (uintptr_t)0x9E3779B97F4A7C15ull;
+    return (size_t)(v ^ (v >> 29));
+}
+
+static void jn_annot_init(void) {
+    if ((uintptr_t)&jnative_annotation_classes_size == 0) return;
+    int64_t n = jnative_annotation_classes_size;
+    if (n <= 0) return;
+    size_t cap = 16;
+    while (cap < (size_t)n * 2) cap <<= 1;
+    const JNativeAnnotationClass** table =
+        (const JNativeAnnotationClass**)calloc(cap, sizeof(*table));
+    int32_t** offsets = (int32_t**)calloc((size_t)n, sizeof(int32_t*));
+    if (table == NULL || offsets == NULL) { free(table); free(offsets); return; }
+    for (int64_t i = 0; i < n; i++) {
+        const JNativeAnnotationClass* e = &jnative_annotation_classes[i];
+        if (e->cls == NULL) continue;
+        size_t h = jn_annot_hash(e->cls) & (cap - 1);
+        while (table[h] != NULL) h = (h + 1) & (cap - 1);
+        table[h] = e;
+    }
+    jn_annot_cp_offsets = offsets;
+    jn_annot_mask = cap - 1;
+    jn_annot_table = table;
+}
+
+const JNativeAnnotationClass* jnative_annotation_class(const ReflectionClass* cls) {
+    if (cls == NULL) return NULL;
+    jn_once(&jn_annot_once, jn_annot_init);
+    if (jn_annot_table == NULL) return NULL;
+    size_t h = jn_annot_hash(cls) & jn_annot_mask;
+    while (jn_annot_table[h] != NULL) {
+        if (jn_annot_table[h]->cls == cls) return jn_annot_table[h];
+        h = (h + 1) & jn_annot_mask;
+    }
+    return NULL;
+}
+
+const JNativeAnnotationMember* jnative_annotation_member(const ReflectionClass* cls,
+                                                         const char* name, const char* descriptor) {
+    const JNativeAnnotationClass* e = jnative_annotation_class(cls);
+    if (e == NULL || name == NULL || descriptor == NULL) return NULL;
+    for (int32_t i = 0; i < e->member_count; i++) {
+        const JNativeAnnotationMember* m = &e->members[i];
+        if (strcmp(m->name, name) == 0 && strcmp(m->descriptor, descriptor) == 0) return m;
+    }
+    return NULL;
+}
+
+static int32_t* jn_annot_build_offsets(const JNativeAnnotationClass* e) {
+    int32_t* off = (int32_t*)calloc((size_t)(e->constant_pool_count > 0 ? e->constant_pool_count : 1),
+                                    sizeof(int32_t));
+    if (off == NULL) return NULL;
+    const uint8_t* cp = e->constant_pool;
+    int32_t pos = 0;
+    for (int32_t i = 1; i < e->constant_pool_count && pos < e->constant_pool_len; i++) {
+        off[i] = pos;
+        uint8_t tag = cp[pos];
+        switch (tag) {
+            case 1:  pos += 3 + ((cp[pos + 1] << 8) | cp[pos + 2]); break;
+            case 3: case 4: case 9: case 10: case 11: case 12: case 17: case 18: pos += 5; break;
+            case 5: case 6: pos += 9; i++; if (i < e->constant_pool_count) off[i] = -1; break;
+            case 7: case 8: case 16: case 19: case 20: pos += 3; break;
+            case 15: pos += 4; break;
+            default: free(off); return NULL;
+        }
+    }
+    return off;
+}
+
+const uint8_t* jnative_constant_pool_entry(const ReflectionClass* cls, int32_t index, uint8_t* tag) {
+    const JNativeAnnotationClass* e = jnative_annotation_class(cls);
+    if (e == NULL || index <= 0 || index >= e->constant_pool_count) return NULL;
+    size_t slot = (size_t)(e - jnative_annotation_classes);
+    jn_mutex_lock(&jn_annot_cp_lock);
+    int32_t* off = jn_annot_cp_offsets[slot];
+    if (off == NULL) {
+        off = jn_annot_build_offsets(e);
+        jn_annot_cp_offsets[slot] = off;
+    }
+    jn_mutex_unlock(&jn_annot_cp_lock);
+    if (off == NULL || off[index] < 0) return NULL;
+    const uint8_t* p = e->constant_pool + off[index];
+    if (tag != NULL) *tag = p[0];
+    return p + 1;
+}
+
+void* jnative_annotation_bytes(const uint8_t* data, int32_t len) {
+    if (data == NULL || len <= 0) return NULL;
+    void* arr = jnative_byte_array(data, len);
+    if (arr == NULL) __jnative_throw_out_of_memory_error_ctx("annotation bytes");
+    return arr;
 }
 
 const JNativeResourceEntry* jnative_find_resource(const char* path,

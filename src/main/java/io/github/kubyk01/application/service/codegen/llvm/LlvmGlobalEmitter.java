@@ -1,5 +1,7 @@
 package io.github.kubyk01.application.service.codegen.llvm;
 
+import io.github.kubyk01.application.service.analyzer.reachabilityanalysis.annotation.ClassFileAnnotations;
+
 import io.github.kubyk01.application.service.analyzer.dependencyresolver.DependencyResolver;
 import io.github.kubyk01.application.service.analyzer.ssa.TypeResolver;
 import io.github.kubyk01.application.service.codegen.llvm.nativepolymorphicfunctionresolver.VarHandleTargetResolver;
@@ -30,6 +32,8 @@ import io.github.kubyk01.domain.ir.Value;
 import io.github.kubyk01.util.LlvmUtil;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.objectweb.asm.ClassReader;
+import org.objectweb.asm.ClassVisitor;
 import org.objectweb.asm.Opcodes;
 
 import java.util.*;
@@ -846,6 +850,7 @@ public class LlvmGlobalEmitter {
         int threadTid = safeGlobalFieldOffset("java/lang/Thread", "tid");
         int threadName = safeGlobalFieldOffset("java/lang/Thread", "name");
         int threadInterruptLock = safeGlobalFieldOffsetAllowMissing("java/lang/Thread", "interruptLock");
+        int threadEetop = safeGlobalFieldOffsetAllowMissing("java/lang/Thread", "eetop");
 
         int fhSize = computeObjectSize("java/lang/Thread$FieldHolder");
         int fhGroup = safeGlobalFieldOffset("java/lang/Thread$FieldHolder", "group");
@@ -863,6 +868,7 @@ public class LlvmGlobalEmitter {
         sb.append("@THREAD_TID_OFFSET           = constant i32 ").append(threadTid).append("\n");
         sb.append("@THREAD_NAME_OFFSET          = constant i32 ").append(threadName).append("\n");
         sb.append("@THREAD_INTERRUPTLOCK_OFFSET = constant i32 ").append(threadInterruptLock).append("\n");
+        sb.append("@THREAD_EETOP_OFFSET         = constant i32 ").append(threadEetop).append("\n");
         sb.append("@FH_OBJECT_SIZE              = constant i32 ").append(fhSize).append("\n");
         sb.append("@FH_GROUP_OFFSET             = constant i32 ").append(fhGroup).append("\n");
         sb.append("@FH_PRIORITY_OFFSET          = constant i32 ").append(fhPriority).append("\n");
@@ -912,7 +918,19 @@ public class LlvmGlobalEmitter {
         sb.append("@JNATIVE_CTOR_PARAM_TYPES_OFFSET      = constant i32 ").append(ctorParams).append("\n");
         sb.append("@JNATIVE_CTOR_EXC_TYPES_OFFSET        = constant i32 ").append(ctorExc).append("\n");
         sb.append("@JNATIVE_CTOR_MODIFIERS_OFFSET        = constant i32 ").append(ctorMods).append("\n");
-        sb.append("@JNATIVE_CTOR_ROOT_OFFSET             = constant i32 ").append(ctorRoot).append("\n\n");
+        sb.append("@JNATIVE_CTOR_ROOT_OFFSET             = constant i32 ").append(ctorRoot).append("\n");
+        sb.append("@JNATIVE_FIELD_ANNOTATIONS_OFFSET       = constant i32 ")
+            .append(safeGlobalFieldOffsetAllowMissing("java/lang/reflect/Field", "annotations")).append("\n");
+        sb.append("@JNATIVE_METHOD_ANNOTATIONS_OFFSET      = constant i32 ")
+            .append(safeGlobalFieldOffsetAllowMissing("java/lang/reflect/Method", "annotations")).append("\n");
+        sb.append("@JNATIVE_METHOD_PARAM_ANNOTATIONS_OFFSET = constant i32 ")
+            .append(safeGlobalFieldOffsetAllowMissing("java/lang/reflect/Method", "parameterAnnotations")).append("\n");
+        sb.append("@JNATIVE_METHOD_ANNOTATION_DEFAULT_OFFSET = constant i32 ")
+            .append(safeGlobalFieldOffsetAllowMissing("java/lang/reflect/Method", "annotationDefault")).append("\n");
+        sb.append("@JNATIVE_CTOR_ANNOTATIONS_OFFSET        = constant i32 ")
+            .append(safeGlobalFieldOffsetAllowMissing("java/lang/reflect/Constructor", "annotations")).append("\n");
+        sb.append("@JNATIVE_CTOR_PARAM_ANNOTATIONS_OFFSET  = constant i32 ")
+            .append(safeGlobalFieldOffsetAllowMissing("java/lang/reflect/Constructor", "parameterAnnotations")).append("\n\n");
 
         sb.append("@JNATIVE_SFI_MEMBERNAME_OFFSET    = constant i32 ")
           .append(declaredFieldOffsetOrMissing("java/lang/StackFrameInfo", "memberName")).append("\n");
@@ -2431,7 +2449,7 @@ public class LlvmGlobalEmitter {
      * <p>
      * Encoding follows the compact-string contract:
      *   coder == 0: LATIN1, one byte per char (all chars <= U+00FF).
-     *   coder == 1: UTF-16BE, two bytes per char (otherwise).
+     *   coder == 1: UTF-16LE, two bytes per char (otherwise).
      * The length word is the byte count; String.length() recovers the char
      * count via `value.length >> coder`.
      * <p>
@@ -2493,8 +2511,9 @@ public class LlvmGlobalEmitter {
              * same representation java.lang.String uses internally when
              * String.COMPACT_STRINGS is true.
              *
-             * Every other string is encoded as UTF-16BE: two bytes per
-             * character code unit, high byte first. This is the same
+             * Every other string is encoded as UTF-16LE: two bytes per
+             * character code unit, low byte first, matching
+             * StringUTF16.isBigEndian() on every supported target. This is the same
              * representation java.lang.String uses internally when the
              * compact-string optimisation is not in effect.
              */
@@ -2525,7 +2544,7 @@ public class LlvmGlobalEmitter {
                 lengthField = charCount;
             } else {
                 /*
-                 * UTF-16BE form. Two bytes per character code unit, high
+                 * UTF-16LE form. Two bytes per character code unit, low
                  * byte first. Surrogate pairs are emitted as two
                  * consecutive code units, exactly as they appear in the
                  * Java String.
@@ -2539,8 +2558,8 @@ public class LlvmGlobalEmitter {
                 bytes = new byte[charCount * 2];
                 for (int i = 0; i < charCount; i++) {
                     char ch = s.charAt(i);
-                    bytes[i * 2]     = (byte) (ch >>> 8);
-                    bytes[i * 2 + 1] = (byte) (ch & 0xFF);
+                    bytes[i * 2]     = (byte) (ch & 0xFF);
+                    bytes[i * 2 + 1] = (byte) (ch >>> 8);
                 }
                 coder = 1;
                 lengthField = charCount * 2;
@@ -3760,6 +3779,8 @@ public class LlvmGlobalEmitter {
         sb.append(generateClassFileVersionMap(classVarNames));
         sb.append(generateClassSignatureMap(strConsts, classVarNames));
         sb.append(generateCallerSensitiveSymbols(strConsts));
+        sb.append(generateAnnotationTable(strConsts, classVarNames));
+        sb.append(generateNestedClassTable(classVarNames));
         sb.append(generateNativeAccessPackages(strConsts));
         sb.append(generatePackageLocations(strConsts));
         sb.append(generateClassIntConstants(strConsts,
@@ -4142,6 +4163,107 @@ public class LlvmGlobalEmitter {
         sb.append("@jnative_class_signatures_size = constant i64 ")
             .append(signatures.size()).append("\n");
         return sb.toString();
+    }
+
+    private String generateAnnotationTable(StringBuilder strConsts, Map<String, String> classVarNames) {
+        StringBuilder data = new StringBuilder();
+        List<String> rows = new ArrayList<>();
+        int blob = 0;
+        for (String className : new TreeSet<>(classVarNames.keySet())) {
+            byte[] bytes = resolver.getClassBytes(className);
+            if (bytes == null) continue;
+            ClassFileAnnotations annotations = ClassFileAnnotations.parse(bytes);
+            if (annotations == null || annotations.isEmpty()) continue;
+            int id = rows.size();
+            String cp = annotationBlob(data, "@__jnative_annot_cp_" + id, annotations.getConstantPool());
+            String classAnns = annotationBlob(data, "@__jnative_annot_c_" + id, annotations.getClassAnnotations());
+            List<String> memberRows = new ArrayList<>();
+            for (ClassFileAnnotations.Member m : annotations.getMembers()) {
+                String anns = annotationBlob(data, "@__jnative_annot_b_" + blob++, m.annotations());
+                String params = annotationBlob(data, "@__jnative_annot_b_" + blob++, m.parameterAnnotations());
+                String dflt = annotationBlob(data, "@__jnative_annot_b_" + blob++, m.annotationDefault());
+                memberRows.add("  { i8*, i8*, i8*, i32, i8*, i32, i8*, i32 } { i8* "
+                    + ensureStringConstantPtr(strConsts, m.name()) + ", i8* "
+                    + ensureStringConstantPtr(strConsts, m.descriptor()) + ", "
+                    + anns + ", " + params + ", " + dflt + " }");
+            }
+            String membersPtr = "i8* null";
+            if (!memberRows.isEmpty()) {
+                String membersVar = "@__jnative_annot_m_" + id;
+                String arrayType = "[" + memberRows.size() + " x { i8*, i8*, i8*, i32, i8*, i32, i8*, i32 }]";
+                data.append(membersVar).append(" = private constant ").append(arrayType).append(" [\n")
+                    .append(String.join(",\n", memberRows)).append("\n]\n");
+                membersPtr = "i8* bitcast (" + arrayType + "* " + membersVar + " to i8*)";
+            }
+            rows.add("  { %ReflectionClass*, i8*, i32, i32, i8*, i32, i8*, i32 } { %ReflectionClass* "
+                + classVarNames.get(className) + ", " + cp + ", i32 " + annotations.getConstantPoolCount()
+                + ", " + classAnns + ", " + membersPtr + ", i32 " + memberRows.size() + " }");
+        }
+        StringBuilder sb = new StringBuilder(data);
+        sb.append("@jnative_annotation_classes = constant [").append(rows.size() + 1)
+            .append(" x { %ReflectionClass*, i8*, i32, i32, i8*, i32, i8*, i32 }] [\n");
+        for (String row : rows) sb.append(row).append(",\n");
+        sb.append("  { %ReflectionClass*, i8*, i32, i32, i8*, i32, i8*, i32 } zeroinitializer\n]\n");
+        sb.append("@jnative_annotation_classes_size = constant i64 ").append(rows.size()).append("\n");
+        return sb.toString();
+    }
+
+    private String generateNestedClassTable(Map<String, String> classVarNames) {
+        Map<String, String> declaring = new TreeMap<>();
+        Map<String, Set<String>> members = new TreeMap<>();
+        for (String className : new TreeSet<>(classVarNames.keySet())) {
+            byte[] bytes = resolver.getClassBytes(className);
+            if (bytes == null) continue;
+            new ClassReader(bytes).accept(new ClassVisitor(Opcodes.ASM9) {
+                @Override
+                public void visitInnerClass(String name, String outerName, String innerName, int access) {
+                    if (outerName == null || innerName == null) return;
+                    if (!classVarNames.containsKey(name) || !classVarNames.containsKey(outerName)) return;
+                    if (name.equals(className)) declaring.put(name, outerName);
+                    if (outerName.equals(className)) members.computeIfAbsent(className, k -> new TreeSet<>()).add(name);
+                }
+            }, ClassReader.SKIP_CODE | ClassReader.SKIP_DEBUG | ClassReader.SKIP_FRAMES);
+        }
+        Set<String> classes = new TreeSet<>(declaring.keySet());
+        classes.addAll(members.keySet());
+        StringBuilder data = new StringBuilder();
+        List<String> rows = new ArrayList<>();
+        for (String className : classes) {
+            String declaringRef = declaring.containsKey(className)
+                ? "%ReflectionClass* " + classVarNames.get(declaring.get(className))
+                : "%ReflectionClass* null";
+            Set<String> list = members.getOrDefault(className, Set.of());
+            String membersRef = "%ReflectionClass** null";
+            if (!list.isEmpty()) {
+                String var = "@__jnative_nested_" + rows.size();
+                String type = "[" + (list.size() + 1) + " x %ReflectionClass*]";
+                List<String> ptrs = new ArrayList<>();
+                for (String m : list) ptrs.add("%ReflectionClass* " + classVarNames.get(m));
+                ptrs.add("%ReflectionClass* null");
+                data.append(var).append(" = private constant ").append(type).append(" [")
+                    .append(String.join(", ", ptrs)).append("]\n");
+                membersRef = "%ReflectionClass** getelementptr inbounds (" + type + ", " + type + "* " + var
+                    + ", i32 0, i32 0)";
+            }
+            rows.add("  { %ReflectionClass*, %ReflectionClass*, %ReflectionClass**, i32 } { %ReflectionClass* "
+                + classVarNames.get(className) + ", " + declaringRef + ", " + membersRef + ", i32 " + list.size() + " }");
+        }
+        StringBuilder sb = new StringBuilder(data);
+        sb.append("@jnative_nested_classes = constant [").append(rows.size() + 1)
+            .append(" x { %ReflectionClass*, %ReflectionClass*, %ReflectionClass**, i32 }] [\n");
+        for (String row : rows) sb.append(row).append(",\n");
+        sb.append("  { %ReflectionClass*, %ReflectionClass*, %ReflectionClass**, i32 } zeroinitializer\n]\n");
+        sb.append("@jnative_nested_classes_size = constant i64 ").append(rows.size()).append("\n");
+        return sb.toString();
+    }
+
+    private static String annotationBlob(StringBuilder data, String name, byte[] bytes) {
+        if (bytes == null) return "i8* null, i32 0";
+        if (bytes.length == 0) return "i8* null, i32 0";
+        data.append(name).append(" = private unnamed_addr constant [").append(bytes.length)
+            .append(" x i8] c\"").append(llvmByteString(bytes)).append("\"\n");
+        return "i8* getelementptr inbounds ([" + bytes.length + " x i8], [" + bytes.length + " x i8]* "
+            + name + ", i32 0, i32 0), i32 " + bytes.length;
     }
 
     private String generateClassIntConstants(StringBuilder strConsts, String symbol, String className) {

@@ -258,8 +258,8 @@ static jstring string_from_utf16(const jchar* chars, jsize len) {
         if (value == NULL) { __jnative_throw_out_of_memory_error_ctx("NewString"); }
         *(int32_t*)((char*)value + JAVA_ARR_LENGTH_OFFSET) = len * 2;
         for (jsize i = 0; i < len; i++) {
-            ((uint8_t*)value)[JAVA_ARR_HDR + i * 2]     = (uint8_t)(chars[i] >> 8);
-            ((uint8_t*)value)[JAVA_ARR_HDR + i * 2 + 1] = (uint8_t)(chars[i] & 0xFF);
+            ((uint8_t*)value)[JAVA_ARR_HDR + i * 2]     = (uint8_t)(chars[i] & 0xFF);
+            ((uint8_t*)value)[JAVA_ARR_HDR + i * 2 + 1] = (uint8_t)(chars[i] >> 8);
         }
         ((uint8_t*)value)[JAVA_ARR_HDR + len * 2]     = 0;
         ((uint8_t*)value)[JAVA_ARR_HDR + len * 2 + 1] = 0;
@@ -293,8 +293,8 @@ static jchar* string_to_utf16(jstring s, jsize* out_len) {
         jchar* buf = (jchar*)malloc((size_t)char_len * sizeof(jchar));
         if (buf == NULL) { __jnative_throw_out_of_memory_error_ctx("GetStringChars"); }
         for (int32_t i = 0; i < char_len; i++) {
-            buf[i] = ((uint16_t)((uint8_t*)v)[JAVA_ARR_HDR + i * 2] << 8)
-                   | ((uint16_t)((uint8_t*)v)[JAVA_ARR_HDR + i * 2 + 1]);
+            buf[i] = ((uint16_t)((uint8_t*)v)[JAVA_ARR_HDR + i * 2])
+                   | ((uint16_t)((uint8_t*)v)[JAVA_ARR_HDR + i * 2 + 1] << 8);
         }
         *out_len = char_len;
         return buf;

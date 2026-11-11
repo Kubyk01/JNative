@@ -1,5 +1,7 @@
 package io.github.kubyk01.application.service.analyzer.reachabilityanalysis;
 
+import io.github.kubyk01.application.service.analyzer.reachabilityanalysis.annotation.ClassFileAnnotations;
+import io.github.kubyk01.application.service.analyzer.reachabilityanalysis.annotation.ProxyClassGenerator;
 import io.github.kubyk01.application.service.analyzer.dependencyresolver.DependencyResolver;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.ClassNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.FieldNode;
@@ -264,6 +266,119 @@ public class ReachabilityAnalysis {
         return added;
     }
 
+    private final Set<String> annotationScanned = new HashSet<>();
+    private final Set<String> annotationTypesSeen = new HashSet<>();
+    private final Set<String> proxyClassesAdded = new HashSet<>();
+    private boolean annotationSupportSeeded;
+
+    private boolean addAnnotationClosure() {
+        boolean added = false;
+        for (String cls : new ArrayList<>(reachableClasses)) {
+            if (cls.isEmpty() || cls.charAt(0) == '[' || !annotationScanned.add(cls)) continue;
+            byte[] bytes = resolver.getClassBytes(cls);
+            if (bytes == null) continue;
+            ClassFileAnnotations annotations = ClassFileAnnotations.parse(bytes);
+            if (annotations == null || annotations.isEmpty()) continue;
+            for (String desc : annotations.getReferencedTypes()) {
+                added |= addAnnotationReferencedType(desc);
+            }
+        }
+        return added;
+    }
+
+    private boolean addAnnotationReferencedType(String desc) {
+        org.objectweb.asm.Type type;
+        try {
+            type = org.objectweb.asm.Type.getType(desc);
+        } catch (IllegalArgumentException e) {
+            return false;
+        }
+        if (type.getSort() == org.objectweb.asm.Type.ARRAY) type = type.getElementType();
+        if (type.getSort() != org.objectweb.asm.Type.OBJECT) return false;
+        String name = type.getInternalName();
+        if (!annotationTypesSeen.add(name)) return false;
+        ClassNode cn = resolver.getClassNode(name);
+        if (cn == null || cn.isExternal()) return false;
+        addClassWithInit(name, true);
+        reflectInfo.getOrCreateClassInfo(name);
+        if ((cn.getAccess() & Opcodes.ACC_ANNOTATION) != 0) {
+            seedAnnotationSupport();
+            applyReflectEntry(reflectEntry(name, true, false, Set.of()));
+            addProxyClass(List.of(name));
+        }
+        return true;
+    }
+
+    private void seedAnnotationSupport() {
+        if (annotationSupportSeeded) return;
+        annotationSupportSeeded = true;
+        applyReflectEntry(reflectEntry("java/lang/annotation/Annotation", true, false, Set.of()));
+        applyReflectEntry(reflectEntry("java/lang/Object", false, false,
+            Set.of("hashCode()", "equals(java.lang.Object)", "toString()")));
+    }
+
+    private void addProxyClass(List<String> interfaces) {
+        String proxyName = ProxyClassGenerator.proxyInternalName(interfaces);
+        if (!proxyClassesAdded.add(proxyName)) return;
+        ProxyClassGenerator.GeneratedProxy proxy;
+        try {
+            proxy = ProxyClassGenerator.generate(interfaces, resolver);
+        } catch (RuntimeException e) {
+            log.warn("Cannot generate proxy class for {}: {}", interfaces, e.getMessage());
+            return;
+        }
+        resolver.defineSyntheticClass(proxy.internalName(), proxy.bytes());
+        for (String iface : proxy.interfaceClosure()) {
+            applyReflectEntry(reflectEntry(iface, true, false, Set.of()));
+        }
+        seedAnnotationSupport();
+        applyReflectEntry(reflectEntry(proxy.internalName(), true, true, Set.of()));
+    }
+
+    private static ReachabilityMetadata.ReflectClass reflectEntry(String internalName, boolean allMethods,
+                                                                  boolean allConstructors, Set<String> methods) {
+        return ReachabilityMetadata.ReflectClass.builder()
+            .name(internalName)
+            .methods(new HashSet<>(methods))
+            .fields(new HashSet<>())
+            .constructors(new HashSet<>())
+            .allDeclaredMethods(allMethods)
+            .allDeclaredConstructors(allConstructors)
+            .build();
+    }
+
+    public List<String> annotatedApplicationClasses() {
+        List<String> out = new ArrayList<>();
+        for (String className : new TreeSet<>(resolver.getAllClasses())) {
+            if (LlvmUtil.isSystemClassName(className)) continue;
+            byte[] bytes = resolver.getClassBytes(className);
+            if (bytes == null) continue;
+            ClassFileAnnotations annotations = ClassFileAnnotations.parse(bytes);
+            if (annotations != null && annotations.getClassAnnotations() != null) out.add(className);
+        }
+        return out;
+    }
+
+    public void addGeneratedClasses(Map<String, byte[]> classes) {
+        if (classes.isEmpty()) return;
+        for (Map.Entry<String, byte[]> e : classes.entrySet()) {
+            resolver.defineSyntheticClass(e.getKey(), e.getValue());
+        }
+        for (String className : classes.keySet()) {
+            applyReflectEntry(ReachabilityMetadata.ReflectClass.builder()
+                .name(className)
+                .methods(new HashSet<>())
+                .fields(new HashSet<>())
+                .constructors(new HashSet<>())
+                .allDeclaredMethods(true)
+                .allDeclaredFields(true)
+                .allDeclaredConstructors(true)
+                .build());
+        }
+        drainWorklist();
+        resolveVirtualDispatchFixedPoint();
+    }
+
     private boolean addReflectedMethods() {
         if (!reflectiveInvoke.get()) return false;
         boolean added = false;
@@ -456,6 +571,9 @@ public class ReachabilityAnalysis {
 
         // Proxy interfaces — unconditional.
         for (ReachabilityMetadata.ProxyInterface pi : metadata.getProxyInterfaces()) {
+            List<String> proxyInterfaces = new ArrayList<>();
+            for (String iface : pi.getInterfaces()) proxyInterfaces.add(iface.replace('.', '/'));
+            if (!proxyInterfaces.isEmpty()) addProxyClass(proxyInterfaces);
             for (String iface : pi.getInterfaces()) {
                 String className = iface.replace('.', '/');
                 addClassWithInit(className, true);
@@ -1194,7 +1312,7 @@ public class ReachabilityAnalysis {
                 if (resolveVirtualDispatchSite(site)) addedAnySite.set(true);
                 return null;
             });
-            boolean addedAny = addedAnySite.get() | addOpaqueReflectiveMethods() | addReflectedMethods();
+            boolean addedAny = addedAnySite.get() | addOpaqueReflectiveMethods() | addReflectedMethods() | addAnnotationClosure();
 
             // Step 3: drain the worklist. Newly added methods will have
             // their own bytecode scanned in the next iteration.

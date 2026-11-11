@@ -20,6 +20,7 @@ import org.objectweb.asm.Opcodes;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.io.InputStream;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
@@ -141,8 +142,19 @@ public class DependencyResolver {
     }
 
     private byte[] transformClass(byte[] bytes) {
-        if (!ServiceLoaderRewriter.ITERATOR.equals(new ClassReader(bytes).getClassName())) return bytes;
+        String className = new ClassReader(bytes).getClassName();
+        if (ProxyRewriter.PROXY.equals(className)) return ProxyRewriter.rewrite(bytes);
+        if (!ServiceLoaderRewriter.ITERATOR.equals(className)) return bytes;
         return ServiceLoaderRewriter.rewrite(bytes, getServiceProviders());
+    }
+
+    public synchronized void defineSyntheticClass(String internalName, byte[] bytes) {
+        if (classBytes.containsKey(internalName)) return;
+        try {
+            parseClassBytes(internalName, bytes);
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
     }
 
     public List<Path> getScannedJars() {
@@ -515,6 +527,10 @@ public class DependencyResolver {
 
     public void scan(Path path) throws IOException {
         this.inputArchive = path;
+        try (InputStream builtin = DependencyResolver.class.getResourceAsStream(
+                "/jnative-metadata/jdk-reflect-config.json")) {
+            if (builtin != null) parseMetadataStream(builtin, "jdk-reflect-config.json");
+        }
 
         if (Files.isDirectory(path)) {
             Files.walk(path)

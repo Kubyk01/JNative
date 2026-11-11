@@ -477,9 +477,44 @@ public class MethodBytecodeVisitor extends ClassVisitor {
                         analysis.addInstantiatedClass(implHandle.getOwner(), reachableFromUser);
                     }
                     addMethodWithContext(implRef, reachableFromUser);
+                    if (bsmArgs[0] instanceof org.objectweb.asm.Type sam
+                            && sam.getSort() == org.objectweb.asm.Type.METHOD) {
+                        addMethodRefBoxing(sam, implHandle.getDesc());
+                    }
                 }
             }
             super.visitInvokeDynamicInsn(name, desc, bsm, bsmArgs);
+        }
+
+        /*
+         * A method reference adapts primitives to the SAM's erased slots via
+         * Integer.valueOf / intValue (JLS §15.13.3). LlvmGenerator.createLambdaAdaptor
+         * emits those calls, so they must be reachable. SAM args align with the tail
+         * of the implementation's parameters (captures/receiver come first).
+         */
+        private void addMethodRefBoxing(org.objectweb.asm.Type sam, String implDesc) {
+            org.objectweb.asm.Type[] samArgs = sam.getArgumentTypes();
+            org.objectweb.asm.Type[] implArgs = org.objectweb.asm.Type.getArgumentTypes(implDesc);
+            for (int k = 1; k <= Math.min(samArgs.length, implArgs.length); k++) {
+                addBoxingBetween(samArgs[samArgs.length - k], implArgs[implArgs.length - k]);
+            }
+            addBoxingBetween(org.objectweb.asm.Type.getReturnType(implDesc), sam.getReturnType());
+        }
+
+        private void addBoxingBetween(org.objectweb.asm.Type from, org.objectweb.asm.Type to) {
+            boolean fromPrim = from.getSort() >= org.objectweb.asm.Type.BOOLEAN
+                    && from.getSort() <= org.objectweb.asm.Type.DOUBLE;
+            boolean toPrim = to.getSort() >= org.objectweb.asm.Type.BOOLEAN
+                    && to.getSort() <= org.objectweb.asm.Type.DOUBLE;
+            if (fromPrim && to.getSort() == org.objectweb.asm.Type.OBJECT) {
+                String w = TypeResolver.wrapperClassOf(from.getDescriptor());
+                addMethodWithContext(new MethodReference(
+                        w, "valueOf", "(" + from.getDescriptor() + ")L" + w + ";"), reachableFromUser);
+            } else if (toPrim && from.getSort() == org.objectweb.asm.Type.OBJECT) {
+                String w = TypeResolver.wrapperClassOf(to.getDescriptor());
+                addMethodWithContext(new MethodReference(
+                        w, to.getClassName() + "Value", "()" + to.getDescriptor()), reachableFromUser);
+            }
         }
 
         @Override

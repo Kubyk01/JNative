@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "jnative_platform.h"
+#include "jnative_portability.h"
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
@@ -336,7 +337,7 @@ static void* create_field_mirror(ReflectionClass* declaring_cls,
 
     const char* name = (const char*)rf->name;
     void* name_str = (name != NULL)
-        ? __jnative_make_string_obj(name, (int32_t)strlen(name))
+        ? __jnative_string_intern(__jnative_make_string_obj(name, (int32_t)strlen(name)))
         : NULL;
 
     const char* desc = (const char*)rf->descriptor;
@@ -353,6 +354,12 @@ static void* create_field_mirror(ReflectionClass* declaring_cls,
     *(void**)((char*)field + JNATIVE_FIELD_NAME_OFFSET)        = name_str;
     *(void**)((char*)field + JNATIVE_FIELD_TYPE_OFFSET)        = type_cls;
     *(int32_t*)((char*)field + JNATIVE_FIELD_MODIFIERS_OFFSET) = rf->modifiers;
+
+    const JNativeAnnotationMember* am = jnative_annotation_member(declaring_cls, name, desc);
+    if (am != NULL && JNATIVE_FIELD_ANNOTATIONS_OFFSET > 0) {
+        *(void**)((char*)field + JNATIVE_FIELD_ANNOTATIONS_OFFSET) =
+            jnative_annotation_bytes(am->annotations, am->annotations_len);
+    }
 
     return field;
 }
@@ -477,7 +484,7 @@ static void* create_method_mirror(ReflectionClass* declaring_cls,
     const char* name = (const char*)rm->name;
     const char* desc = (const char*)rm->descriptor;
     void* name_str = (name != NULL)
-        ? __jnative_make_string_obj(name, (int32_t)strlen(name))
+        ? __jnative_string_intern(__jnative_make_string_obj(name, (int32_t)strlen(name)))
         : NULL;
 
     ReflectionClass* return_type = NULL;
@@ -501,6 +508,19 @@ static void* create_method_mirror(ReflectionClass* declaring_cls,
     *(void**)((char*)method + JNATIVE_METHOD_PARAM_TYPES_OFFSET) = param_types;
     *(void**)((char*)method + JNATIVE_METHOD_EXC_TYPES_OFFSET)   = exc_types;
     *(int32_t*)((char*)method + JNATIVE_METHOD_MODIFIERS_OFFSET) = rm->modifiers;
+
+    const JNativeAnnotationMember* am = jnative_annotation_member(declaring_cls, name, desc);
+    if (am != NULL) {
+        if (JNATIVE_METHOD_ANNOTATIONS_OFFSET > 0)
+            *(void**)((char*)method + JNATIVE_METHOD_ANNOTATIONS_OFFSET) =
+                jnative_annotation_bytes(am->annotations, am->annotations_len);
+        if (JNATIVE_METHOD_PARAM_ANNOTATIONS_OFFSET > 0)
+            *(void**)((char*)method + JNATIVE_METHOD_PARAM_ANNOTATIONS_OFFSET) =
+                jnative_annotation_bytes(am->parameter_annotations, am->parameter_annotations_len);
+        if (JNATIVE_METHOD_ANNOTATION_DEFAULT_OFFSET > 0)
+            *(void**)((char*)method + JNATIVE_METHOD_ANNOTATION_DEFAULT_OFFSET) =
+                jnative_annotation_bytes(am->annotation_default, am->annotation_default_len);
+    }
 
     /*
      * root MUST be NULL for the mirror to be a valid "original" Method.
@@ -576,6 +596,16 @@ static void* create_constructor_mirror(ReflectionClass* declaring_cls,
     *(void**)((char*)ctor + JNATIVE_CTOR_PARAM_TYPES_OFFSET) = param_types;
     *(void**)((char*)ctor + JNATIVE_CTOR_EXC_TYPES_OFFSET)   = exc_types;
     *(int32_t*)((char*)ctor + JNATIVE_CTOR_MODIFIERS_OFFSET) = rc_ctor->modifiers;
+
+    const JNativeAnnotationMember* am = jnative_annotation_member(declaring_cls, "<init>", desc);
+    if (am != NULL) {
+        if (JNATIVE_CTOR_ANNOTATIONS_OFFSET > 0)
+            *(void**)((char*)ctor + JNATIVE_CTOR_ANNOTATIONS_OFFSET) =
+                jnative_annotation_bytes(am->annotations, am->annotations_len);
+        if (JNATIVE_CTOR_PARAM_ANNOTATIONS_OFFSET > 0)
+            *(void**)((char*)ctor + JNATIVE_CTOR_PARAM_ANNOTATIONS_OFFSET) =
+                jnative_annotation_bytes(am->parameter_annotations, am->parameter_annotations_len);
+    }
 
     if (jnative_root_offset_is_sane(JNATIVE_CTOR_ROOT_OFFSET)) {
         *(void**)((char*)ctor + JNATIVE_CTOR_ROOT_OFFSET) = NULL;
@@ -750,12 +780,28 @@ void* __jnative_fn_java_lang_Class_getEnclosingMethod0____Ljava_lang_Object_(voi
     return NULL;
 }
 
+static int array_descriptor_assignable(const char* src, const char* dst);
+
+static int class_descriptor(const struct ReflectionClass* cls, char* buf, size_t cap) {
+    const char* name = cls->cname;
+    if (name == NULL) return 0;
+    if (name[0] == '[') return snprintf(buf, cap, "%s", name) < (int)cap;
+    if (cls->primitive != NULL) return 0;
+    return snprintf(buf, cap, "L%s;", name) < (int)cap;
+}
+
 int __jnative_fn_java_lang_Class_isAssignableFrom__Ljava_lang_Class__Z(void* this_cls, void* other_cls) {
     if (this_cls == NULL || other_cls == NULL) return 0;
     if (this_cls == other_cls) return 1;
 
     struct ReflectionClass* target = (struct ReflectionClass*)this_cls;
     struct ReflectionClass* cur    = (struct ReflectionClass*)other_cls;
+
+    if (cur->cname != NULL && cur->cname[0] == '[') {
+        char dst[1024];
+        if (!class_descriptor(target, dst, sizeof(dst))) return 0;
+        return array_descriptor_assignable(cur->cname, dst);
+    }
 
     while (cur) {
         if (cur == target) return 1;
@@ -803,36 +849,83 @@ int __jnative_array_instanceof(void* obj, const char* type_name) {
     return array_descriptor_assignable(cname, type_name);
 }
 
-void* __jnative_fn_java_lang_Class_getDeclaringClass0___Ljava_lang_Class_(void* this_cls) {
-    if (this_cls == NULL) return NULL;
-    struct ReflectionClass* cls = (struct ReflectionClass*)this_cls;
-    const char* name = cls->cname;
-    if (name == NULL) return NULL;
+typedef struct {
+    ReflectionClass*  cls;
+    ReflectionClass*  declaring;
+    ReflectionClass** members;
+    int32_t           member_count;
+} JNativeNestedClassEntry;
 
-    const char* last_dollar = strrchr(name, '$');
-    if (last_dollar == NULL || last_dollar == name || last_dollar[1] == '\0') {
-        return NULL;
+extern const JNativeNestedClassEntry jnative_nested_classes[] JNATIVE_WEAK;
+extern const int64_t jnative_nested_classes_size JNATIVE_WEAK;
+
+static const JNativeNestedClassEntry** nested_table;
+static size_t nested_mask;
+static jn_once_t nested_once = JN_ONCE_INIT;
+
+static size_t nested_hash(const void* p) {
+    uintptr_t v = (uintptr_t)p;
+    v ^= v >> 17;
+    v *= (uintptr_t)0x9E3779B97F4A7C15ull;
+    return (size_t)(v ^ (v >> 29));
+}
+
+static void nested_init(void) {
+    if ((uintptr_t)&jnative_nested_classes_size == 0) return;
+    int64_t n = jnative_nested_classes_size;
+    if (n <= 0) return;
+    size_t cap = 16;
+    while (cap < (size_t)n * 2) cap <<= 1;
+    const JNativeNestedClassEntry** table = calloc(cap, sizeof(*table));
+    if (table == NULL) return;
+    for (int64_t i = 0; i < n; i++) {
+        size_t h = nested_hash(jnative_nested_classes[i].cls) & (cap - 1);
+        while (table[h] != NULL) h = (h + 1) & (cap - 1);
+        table[h] = &jnative_nested_classes[i];
     }
+    nested_mask = cap - 1;
+    nested_table = table;
+}
 
-    size_t outer_len = (size_t)(last_dollar - name);
-    char outer[512];
-    if (outer_len >= sizeof(outer)) return NULL;
-    memcpy(outer, name, outer_len);
-    outer[outer_len] = '\0';
+static const JNativeNestedClassEntry* find_nested_entry(const void* cls) {
+    if (cls == NULL) return NULL;
+    jn_once(&nested_once, nested_init);
+    if (nested_table == NULL) return NULL;
+    size_t h = nested_hash(cls) & nested_mask;
+    while (nested_table[h] != NULL) {
+        if (nested_table[h]->cls == cls) return nested_table[h];
+        h = (h + 1) & nested_mask;
+    }
+    return NULL;
+}
 
-    return (void*)find_registered_class(outer);
+void* __jnative_fn_java_lang_Class_getDeclaringClass0___Ljava_lang_Class_(void* this_cls) {
+    const JNativeNestedClassEntry* e = find_nested_entry(this_cls);
+    return e != NULL ? (void*)e->declaring : NULL;
+}
+
+void* __jnative_fn_java_lang_Class_getDeclaredClasses0____Ljava_lang_Class_(void* this_cls) {
+    if (this_cls == NULL) __jnative_throw_null_pointer_exception();
+    const JNativeNestedClassEntry* e = find_nested_entry(this_cls);
+    int32_t n = e != NULL ? e->member_count : 0;
+    void* array = jnative_ref_array_of_class(n > 0 ? (void**)e->members : NULL, n, "[Ljava/lang/Class;");
+    if (array == NULL) __jnative_throw_out_of_memory_error_ctx("Class.getDeclaredClasses0");
+    return array;
 }
 
 void* __jnative_fn_java_lang_Class_getConstantPool___Ljdk_internal_reflect_ConstantPool_(void* this_cls) {
     if (this_cls == NULL) return NULL;
     struct ReflectionClass* cp_cls = find_registered_class("jdk/internal/reflect/ConstantPool");
     if (!cp_cls) return NULL;
-    return allocate_reflection_object(cp_cls);
+    void* cp = allocate_reflection_object(cp_cls);
+    if (cp != NULL) *(void**)((char*)cp + 8) = this_cls;
+    return cp;
 }
 
 void* __jnative_fn_java_lang_Class_getRawAnnotations____B(void* this_cls) {
-    (void)this_cls;
-    return NULL;
+    const JNativeAnnotationClass* e = jnative_annotation_class((ReflectionClass*)this_cls);
+    if (e == NULL) return NULL;
+    return jnative_annotation_bytes(e->annotations, e->annotations_len);
 }
 
 void* __jnative_fn_java_lang_Class_getRawTypeAnnotations____B(void* this_cls) {
@@ -858,6 +951,14 @@ int __jnative_fn_java_lang_Class_isHidden___Z(void* this_cls) {
 int __jnative_fn_java_lang_Class_isInstance__Ljava_lang_Object__Z(void* this_cls, void* obj) {
     if (this_cls == NULL || obj == NULL) return 0;
     struct ReflectionClass* cls = (struct ReflectionClass*)this_cls;
+    void* header = *(void**)obj;
+    if (header != NULL && __jnative_is_class_mirror(header)) {
+        const char* src = ((struct ReflectionClass*)header)->cname;
+        char dst[1024];
+        if (src == NULL || src[0] != '[' || !class_descriptor(cls, dst, sizeof(dst))) return 0;
+        return array_descriptor_assignable(src, dst);
+    }
+    if (cls->cname != NULL && cls->cname[0] == '[') return 0;
     void** type_info = lookup_type_info(cls);
     if (!type_info) return 0;
     return __jnative_instanceof(obj, type_info);
