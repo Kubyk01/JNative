@@ -322,7 +322,8 @@ public class LlvmGenerator implements LlvmGeneratorPort {
             + moduleDecls
             + runInit
             + main;
-        // now duplicated inside moduleTail; let the GC take it
+        globalDefs = null;   // now duplicated inside moduleTail; let the GC take it
+        moduleBodies = null;
 
         String moduleExterns = buildExterns(
             moduleTail,
@@ -333,7 +334,12 @@ public class LlvmGenerator implements LlvmGeneratorPort {
             moduleTail, moduleExterns, preludeDefs, preludeKeys);
 
         writeLl(outputDir.resolve("_module.ll"), modulePrelude, moduleExterns, moduleTail);
+        moduleTail = null;
 
+        // Embedded resources get their own translation unit, streamed byte by
+        // byte: as IR text they are several times their raw size and holding
+        // them in globalDefs ran the heap out (OutOfMemoryError in
+        // generateGlobalDefinitions). Only C references these symbols.
         try (var w = Files.newBufferedWriter(outputDir.resolve("_resources.ll"),
                 StandardCharsets.UTF_8)) {
             w.write(targetPlatform.preamble());

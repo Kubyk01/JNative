@@ -434,6 +434,12 @@ public class Orchestrator implements OrchestratorPort {
                 Set.copyOf(aliasResult.getGraph().getStaticFieldPointsToMap().keySet());
         List<ClinitScheduleEntry> clinitSchedule = analysisResult.clinitSchedule();
         Map<String, String> clinitWrappers = analysisResult.clinitWrappers();
+        analysisResult = null;
+        aliasResult = null;
+        escapeResult = null;
+        lifetimeResult = null;
+        inserter = null;
+        optimizer = null;
         releasePointsTo(module);
 
         // --- 10. LLVM IR generation ---------------------------------------

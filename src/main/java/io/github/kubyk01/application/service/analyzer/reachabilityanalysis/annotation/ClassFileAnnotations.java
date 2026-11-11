@@ -1,14 +1,11 @@
 package io.github.kubyk01.application.service.analyzer.reachabilityanalysis.annotation;
 
-import lombok.Getter;
-
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
-@Getter
 public final class ClassFileAnnotations {
 
     public record Member(String name, String descriptor, byte[] annotations,
@@ -28,6 +25,12 @@ public final class ClassFileAnnotations {
         this.members = members;
         this.referencedTypes = referencedTypes;
     }
+
+    public byte[] getConstantPool() { return constantPool; }
+    public int getConstantPoolCount() { return constantPoolCount; }
+    public byte[] getClassAnnotations() { return classAnnotations; }
+    public List<Member> getMembers() { return members; }
+    public Set<String> getReferencedTypes() { return referencedTypes; }
 
     public boolean isEmpty() {
         return classAnnotations == null && members.isEmpty();

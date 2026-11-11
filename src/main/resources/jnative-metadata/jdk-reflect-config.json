@@ -1,0 +1,310 @@
+[
+  {
+    "condition": {
+      "typeReachable": "sun.util.locale.provider.LocaleProviderAdapter"
+    },
+    "name": "sun.util.cldr.CLDRLocaleProviderAdapter",
+    "allDeclaredConstructors": true
+  },
+  {
+    "condition": {
+      "typeReachable": "sun.util.locale.provider.LocaleProviderAdapter"
+    },
+    "name": "sun.util.locale.provider.JRELocaleProviderAdapter",
+    "allDeclaredConstructors": true
+  },
+  {
+    "condition": {
+      "typeReachable": "sun.util.locale.provider.LocaleProviderAdapter"
+    },
+    "name": "sun.util.locale.provider.FallbackLocaleProviderAdapter",
+    "allDeclaredConstructors": true
+  },
+  {
+    "condition": {
+      "typeReachable": "sun.util.locale.provider.LocaleProviderAdapter"
+    },
+    "name": "sun.util.locale.provider.SPILocaleProviderAdapter",
+    "allDeclaredConstructors": true
+  },
+  {
+    "condition": {
+      "typeReachable": "sun.util.resources.LocaleData"
+    },
+    "name": "sun.text.resources.BreakIteratorInfo",
+    "allDeclaredConstructors": true
+  },
+  {
+    "condition": {
+      "typeReachable": "sun.util.resources.LocaleData"
+    },
+    "name": "sun.text.resources.BreakIteratorInfoProvider",
+    "allDeclaredConstructors": true
+  },
+  {
+    "condition": {
+      "typeReachable": "sun.util.resources.LocaleData"
+    },
+    "name": "sun.text.resources.BreakIteratorResources",
+    "allDeclaredConstructors": true
+  },
+  {
+    "condition": {
+      "typeReachable": "sun.util.resources.LocaleData"
+    },
+    "name": "sun.text.resources.CollationData",
+    "allDeclaredConstructors": true
+  },
+  {
+    "condition": {
+      "typeReachable": "sun.util.resources.LocaleData"
+    },
+    "name": "sun.text.resources.CollationDataProvider",
+    "allDeclaredConstructors": true
+  },
+  {
+    "condition": {
+      "typeReachable": "sun.util.resources.LocaleData"
+    },
+    "name": "sun.text.resources.FormatData",
+    "allDeclaredConstructors": true
+  },
+  {
+    "condition": {
+      "typeReachable": "sun.util.resources.LocaleData"
+    },
+    "name": "sun.text.resources.FormatDataProvider",
+    "allDeclaredConstructors": true
+  },
+  {
+    "condition": {
+      "typeReachable": "sun.util.resources.LocaleData"
+    },
+    "name": "sun.text.resources.FormatData_en",
+    "allDeclaredConstructors": true
+  },
+  {
+    "condition": {
+      "typeReachable": "sun.util.resources.LocaleData"
+    },
+    "name": "sun.text.resources.FormatData_en_US",
+    "allDeclaredConstructors": true
+  },
+  {
+    "condition": {
+      "typeReachable": "sun.util.resources.LocaleData"
+    },
+    "name": "sun.text.resources.JavaTimeSupplementary",
+    "allDeclaredConstructors": true
+  },
+  {
+    "condition": {
+      "typeReachable": "sun.util.resources.LocaleData"
+    },
+    "name": "sun.text.resources.JavaTimeSupplementaryProvider",
+    "allDeclaredConstructors": true
+  },
+  {
+    "condition": {
+      "typeReachable": "sun.util.resources.LocaleData"
+    },
+    "name": "sun.text.resources.JavaTimeSupplementary_en",
+    "allDeclaredConstructors": true
+  },
+  {
+    "condition": {
+      "typeReachable": "sun.util.resources.LocaleData"
+    },
+    "name": "sun.text.resources.cldr.FormatData",
+    "allDeclaredConstructors": true
+  },
+  {
+    "condition": {
+      "typeReachable": "sun.util.resources.LocaleData"
+    },
+    "name": "sun.text.resources.cldr.FormatDataProvider",
+    "allDeclaredConstructors": true
+  },
+  {
+    "condition": {
+      "typeReachable": "sun.util.resources.LocaleData"
+    },
+    "name": "sun.text.resources.cldr.FormatData_en",
+    "allDeclaredConstructors": true
+  },
+  {
+    "condition": {
+      "typeReachable": "sun.util.resources.LocaleData"
+    },
+    "name": "sun.text.resources.cldr.FormatData_en_US_POSIX",
+    "allDeclaredConstructors": true
+  },
+  {
+    "condition": {
+      "typeReachable": "sun.util.resources.LocaleData"
+    },
+    "name": "sun.util.resources.CalendarData",
+    "allDeclaredConstructors": true
+  },
+  {
+    "condition": {
+      "typeReachable": "sun.util.resources.LocaleData"
+    },
+    "name": "sun.util.resources.CalendarDataProvider",
+    "allDeclaredConstructors": true
+  },
+  {
+    "condition": {
+      "typeReachable": "sun.util.resources.LocaleData"
+    },
+    "name": "sun.util.resources.CalendarData_en",
+    "allDeclaredConstructors": true
+  },
+  {
+    "condition": {
+      "typeReachable": "sun.util.resources.LocaleData"
+    },
+    "name": "sun.util.resources.CurrencyNames",
+    "allDeclaredConstructors": true
+  },
+  {
+    "condition": {
+      "typeReachable": "sun.util.resources.LocaleData"
+    },
+    "name": "sun.util.resources.CurrencyNamesProvider",
+    "allDeclaredConstructors": true
+  },
+  {
+    "condition": {
+      "typeReachable": "sun.util.resources.LocaleData"
+    },
+    "name": "sun.util.resources.CurrencyNames_en_US",
+    "allDeclaredConstructors": true
+  },
+  {
+    "condition": {
+      "typeReachable": "sun.util.resources.LocaleData"
+    },
+    "name": "sun.util.resources.LocaleDataProvider",
+    "allDeclaredConstructors": true
+  },
+  {
+    "condition": {
+      "typeReachable": "sun.util.resources.LocaleData"
+    },
+    "name": "sun.util.resources.LocaleNames",
+    "allDeclaredConstructors": true
+  },
+  {
+    "condition": {
+      "typeReachable": "sun.util.resources.LocaleData"
+    },
+    "name": "sun.util.resources.LocaleNamesProvider",
+    "allDeclaredConstructors": true
+  },
+  {
+    "condition": {
+      "typeReachable": "sun.util.resources.LocaleData"
+    },
+    "name": "sun.util.resources.LocaleNames_en",
+    "allDeclaredConstructors": true
+  },
+  {
+    "condition": {
+      "typeReachable": "sun.util.resources.LocaleData"
+    },
+    "name": "sun.util.resources.TimeZoneNames",
+    "allDeclaredConstructors": true
+  },
+  {
+    "condition": {
+      "typeReachable": "sun.util.resources.LocaleData"
+    },
+    "name": "sun.util.resources.TimeZoneNamesProvider",
+    "allDeclaredConstructors": true
+  },
+  {
+    "condition": {
+      "typeReachable": "sun.util.resources.LocaleData"
+    },
+    "name": "sun.util.resources.TimeZoneNames_en",
+    "allDeclaredConstructors": true
+  },
+  {
+    "condition": {
+      "typeReachable": "sun.util.resources.LocaleData"
+    },
+    "name": "sun.util.resources.cldr.CalendarData",
+    "allDeclaredConstructors": true
+  },
+  {
+    "condition": {
+      "typeReachable": "sun.util.resources.LocaleData"
+    },
+    "name": "sun.util.resources.cldr.CalendarDataProvider",
+    "allDeclaredConstructors": true
+  },
+  {
+    "condition": {
+      "typeReachable": "sun.util.resources.LocaleData"
+    },
+    "name": "sun.util.resources.cldr.CurrencyNames",
+    "allDeclaredConstructors": true
+  },
+  {
+    "condition": {
+      "typeReachable": "sun.util.resources.LocaleData"
+    },
+    "name": "sun.util.resources.cldr.CurrencyNamesProvider",
+    "allDeclaredConstructors": true
+  },
+  {
+    "condition": {
+      "typeReachable": "sun.util.resources.LocaleData"
+    },
+    "name": "sun.util.resources.cldr.CurrencyNames_en",
+    "allDeclaredConstructors": true
+  },
+  {
+    "condition": {
+      "typeReachable": "sun.util.resources.LocaleData"
+    },
+    "name": "sun.util.resources.cldr.LocaleNames",
+    "allDeclaredConstructors": true
+  },
+  {
+    "condition": {
+      "typeReachable": "sun.util.resources.LocaleData"
+    },
+    "name": "sun.util.resources.cldr.LocaleNamesProvider",
+    "allDeclaredConstructors": true
+  },
+  {
+    "condition": {
+      "typeReachable": "sun.util.resources.LocaleData"
+    },
+    "name": "sun.util.resources.cldr.LocaleNames_en",
+    "allDeclaredConstructors": true
+  },
+  {
+    "condition": {
+      "typeReachable": "sun.util.resources.LocaleData"
+    },
+    "name": "sun.util.resources.cldr.TimeZoneNames",
+    "allDeclaredConstructors": true
+  },
+  {
+    "condition": {
+      "typeReachable": "sun.util.resources.LocaleData"
+    },
+    "name": "sun.util.resources.cldr.TimeZoneNamesProvider",
+    "allDeclaredConstructors": true
+  },
+  {
+    "condition": {
+      "typeReachable": "sun.util.resources.LocaleData"
+    },
+    "name": "sun.util.resources.cldr.TimeZoneNames_en",
+    "allDeclaredConstructors": true
+  }
+]
