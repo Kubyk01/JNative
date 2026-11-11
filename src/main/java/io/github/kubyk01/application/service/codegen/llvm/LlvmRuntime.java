@@ -144,6 +144,7 @@ public class LlvmRuntime {
             declare void @longjmp(i8*, i32) noreturn
 
             declare i8* @__jnative_create_string_array(i32, i8**)
+            declare void @__jnative_wait_non_daemon_threads()
             declare i8* @__jnative_make_bootstrap_props(i32, i32, i32, i32, i32, i32, i32, i32, i32, i32)
             declare i8* @__jnative_new_multi_array(i8*, i32, i32*, i32)
             declare void @__jnative_monitor_enter(i8*)

@@ -1772,6 +1772,7 @@ public class LlvmGenerator implements LlvmGeneratorPort {
         sb.append("define i32 @main(i32 %argc, i8** %argv) {\n");
         sb.append("  %args = call i8* @__jnative_create_string_array(i32 %argc, i8** %argv)\n");
         sb.append("  call void @").append(LlvmRuntime.mangleMethod(entryClass, entryMethod, entryDescriptor)).append("(i8* %args)\n");
+        sb.append("  call void @__jnative_wait_non_daemon_threads()\n");
         sb.append("  ret i32 0\n");
         sb.append("}\n\n");
 

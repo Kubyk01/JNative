@@ -439,6 +439,32 @@ void __jnative_thread_counts(int32_t* live_out, int32_t* daemon_out,
     if (peak_out != NULL) *peak_out = peak;
 }
 
+static int thread_is_daemon(ThreadState* s) {
+    if (THREAD_HOLDER_OFFSET >= 0 && FH_DAEMON_OFFSET >= 0 && s->java_thread != NULL) {
+        void* holder = *(void**)((char*)s->java_thread + THREAD_HOLDER_OFFSET);
+        if (holder != NULL) return *(uint8_t*)((char*)holder + FH_DAEMON_OFFSET) != 0;
+    }
+    return s->is_daemon;
+}
+
+void __jnative_wait_non_daemon_threads(void) {
+    for (;;) {
+        ThreadState* pending = NULL;
+        jn_mutex_lock(&thread_table_lock);
+        for (ThreadState* s = thread_table; s; s = s->next) {
+            if (s == main_thread_state || s == tls_state) continue;
+            if (!s->started || s->finished || thread_is_daemon(s)) continue;
+            pending = s;
+            break;
+        }
+        jn_mutex_unlock(&thread_table_lock);
+        if (pending == NULL) return;
+        jn_mutex_lock(&pending->mutex);
+        while (!pending->finished) jn_cond_wait(&pending->cond, &pending->mutex);
+        jn_mutex_unlock(&pending->mutex);
+    }
+}
+
 typedef struct StartArgs {
     ThreadState* state;
     void* runnable;
