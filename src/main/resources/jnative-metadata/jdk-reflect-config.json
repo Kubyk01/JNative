@@ -306,5 +306,89 @@
     },
     "name": "sun.util.resources.cldr.TimeZoneNames_en",
     "allDeclaredConstructors": true
+  },
+  {
+    "condition": {
+      "typeReachable": "java.security.MessageDigest"
+    },
+    "name": "sun.security.provider.MD5",
+    "allDeclaredConstructors": true
+  },
+  {
+    "condition": {
+      "typeReachable": "java.security.MessageDigest"
+    },
+    "name": "sun.security.provider.SHA",
+    "allDeclaredConstructors": true
+  },
+  {
+    "condition": {
+      "typeReachable": "java.security.MessageDigest"
+    },
+    "name": "sun.security.provider.SHA2$SHA224",
+    "allDeclaredConstructors": true
+  },
+  {
+    "condition": {
+      "typeReachable": "java.security.MessageDigest"
+    },
+    "name": "sun.security.provider.SHA2$SHA256",
+    "allDeclaredConstructors": true
+  },
+  {
+    "condition": {
+      "typeReachable": "java.security.MessageDigest"
+    },
+    "name": "sun.security.provider.SHA5$SHA384",
+    "allDeclaredConstructors": true
+  },
+  {
+    "condition": {
+      "typeReachable": "java.security.MessageDigest"
+    },
+    "name": "sun.security.provider.SHA5$SHA512",
+    "allDeclaredConstructors": true
+  },
+  {
+    "condition": {
+      "typeReachable": "java.security.MessageDigest"
+    },
+    "name": "sun.security.provider.SHA5$SHA512_224",
+    "allDeclaredConstructors": true
+  },
+  {
+    "condition": {
+      "typeReachable": "java.security.MessageDigest"
+    },
+    "name": "sun.security.provider.SHA5$SHA512_256",
+    "allDeclaredConstructors": true
+  },
+  {
+    "condition": {
+      "typeReachable": "java.security.MessageDigest"
+    },
+    "name": "sun.security.provider.SHA3$SHA224",
+    "allDeclaredConstructors": true
+  },
+  {
+    "condition": {
+      "typeReachable": "java.security.MessageDigest"
+    },
+    "name": "sun.security.provider.SHA3$SHA256",
+    "allDeclaredConstructors": true
+  },
+  {
+    "condition": {
+      "typeReachable": "java.security.MessageDigest"
+    },
+    "name": "sun.security.provider.SHA3$SHA384",
+    "allDeclaredConstructors": true
+  },
+  {
+    "condition": {
+      "typeReachable": "java.security.MessageDigest"
+    },
+    "name": "sun.security.provider.SHA3$SHA512",
+    "allDeclaredConstructors": true
   }
 ]

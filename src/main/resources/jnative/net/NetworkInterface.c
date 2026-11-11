@@ -43,12 +43,12 @@ static const char* adapter_label(PIP_ADAPTER_ADDRESSES p,
 
 #include "jnative_runtime.h"
 
-extern void* gv_java_net_NetworkInterface_name_0        __attribute__((weak));
-extern void* gv_java_net_NetworkInterface_displayName_0 __attribute__((weak));
-extern void* gv_java_net_NetworkInterface_index_0       __attribute__((weak));
-extern void* gv_java_net_NetworkInterface_addrs_0       __attribute__((weak));
-extern void* gv_java_net_NetworkInterface_bindings_0    __attribute__((weak));
-extern void* gv_java_net_NetworkInterface_childs_0      __attribute__((weak));
+static void* gv_java_net_NetworkInterface_name_0;
+static void* gv_java_net_NetworkInterface_displayName_0;
+static void* gv_java_net_NetworkInterface_index_0;
+static void* gv_java_net_NetworkInterface_addrs_0;
+static void* gv_java_net_NetworkInterface_bindings_0;
+static void* gv_java_net_NetworkInterface_childs_0;
 
 /* ============================================================================
  *  Helpers shared by both platforms.
@@ -65,18 +65,12 @@ static void* make_java_string_array(int count, char** strings) {
 }
 
 static void set_all_empty(void) {
-    if (&gv_java_net_NetworkInterface_name_0 != NULL)
-        gv_java_net_NetworkInterface_name_0        = jnative_empty_ref_array();
-    if (&gv_java_net_NetworkInterface_displayName_0 != NULL)
-        gv_java_net_NetworkInterface_displayName_0 = jnative_empty_ref_array();
-    if (&gv_java_net_NetworkInterface_index_0 != NULL)
-        gv_java_net_NetworkInterface_index_0       = jnative_int_array(NULL, 0);
-    if (&gv_java_net_NetworkInterface_addrs_0 != NULL)
-        gv_java_net_NetworkInterface_addrs_0       = jnative_empty_ref_array();
-    if (&gv_java_net_NetworkInterface_bindings_0 != NULL)
-        gv_java_net_NetworkInterface_bindings_0    = jnative_empty_ref_array();
-    if (&gv_java_net_NetworkInterface_childs_0 != NULL)
-        gv_java_net_NetworkInterface_childs_0      = jnative_empty_ref_array();
+    gv_java_net_NetworkInterface_name_0        = jnative_empty_ref_array();
+    gv_java_net_NetworkInterface_displayName_0 = jnative_empty_ref_array();
+    gv_java_net_NetworkInterface_index_0       = jnative_int_array(NULL, 0);
+    gv_java_net_NetworkInterface_addrs_0       = jnative_empty_ref_array();
+    gv_java_net_NetworkInterface_bindings_0    = jnative_empty_ref_array();
+    gv_java_net_NetworkInterface_childs_0      = jnative_empty_ref_array();
 }
 
 static void* allocate_network_interface(const char* name, const char* display_name, int32_t index) {
@@ -170,18 +164,12 @@ void __jnative_fn_java_net_NetworkInterface_init___V(void) {
         display[b+1] = kd;
     }
 
-    if (&gv_java_net_NetworkInterface_name_0 != NULL)
-        gv_java_net_NetworkInterface_name_0        = make_java_string_array(count, names);
-    if (&gv_java_net_NetworkInterface_displayName_0 != NULL)
-        gv_java_net_NetworkInterface_displayName_0 = make_java_string_array(count, display);
-    if (&gv_java_net_NetworkInterface_index_0 != NULL)
-        gv_java_net_NetworkInterface_index_0       = jnative_int_array(indices, count);
-    if (&gv_java_net_NetworkInterface_addrs_0 != NULL)
-        gv_java_net_NetworkInterface_addrs_0       = jnative_empty_ref_array();
-    if (&gv_java_net_NetworkInterface_bindings_0 != NULL)
-        gv_java_net_NetworkInterface_bindings_0    = jnative_empty_ref_array();
-    if (&gv_java_net_NetworkInterface_childs_0 != NULL)
-        gv_java_net_NetworkInterface_childs_0      = jnative_empty_ref_array();
+    gv_java_net_NetworkInterface_name_0        = make_java_string_array(count, names);
+    gv_java_net_NetworkInterface_displayName_0 = make_java_string_array(count, display);
+    gv_java_net_NetworkInterface_index_0       = jnative_int_array(indices, count);
+    gv_java_net_NetworkInterface_addrs_0       = jnative_empty_ref_array();
+    gv_java_net_NetworkInterface_bindings_0    = jnative_empty_ref_array();
+    gv_java_net_NetworkInterface_childs_0      = jnative_empty_ref_array();
 
     for (int k = 0; k < count; k++) { free(names[k]); free(display[k]); }
     free(names); free(display); free(indices); free(addrs);
@@ -236,18 +224,12 @@ void __jnative_fn_java_net_NetworkInterface_init___V(void) {
         indices[b+1] = k; names[b+1] = kn; display[b+1] = kd;
     }
 
-    if (&gv_java_net_NetworkInterface_name_0 != NULL)
-        gv_java_net_NetworkInterface_name_0        = make_java_string_array(count, names);
-    if (&gv_java_net_NetworkInterface_displayName_0 != NULL)
-        gv_java_net_NetworkInterface_displayName_0 = make_java_string_array(count, display);
-    if (&gv_java_net_NetworkInterface_index_0 != NULL)
-        gv_java_net_NetworkInterface_index_0       = jnative_int_array(indices, count);
-    if (&gv_java_net_NetworkInterface_addrs_0 != NULL)
-        gv_java_net_NetworkInterface_addrs_0       = jnative_empty_ref_array();
-    if (&gv_java_net_NetworkInterface_bindings_0 != NULL)
-        gv_java_net_NetworkInterface_bindings_0    = jnative_empty_ref_array();
-    if (&gv_java_net_NetworkInterface_childs_0 != NULL)
-        gv_java_net_NetworkInterface_childs_0      = jnative_empty_ref_array();
+    gv_java_net_NetworkInterface_name_0        = make_java_string_array(count, names);
+    gv_java_net_NetworkInterface_displayName_0 = make_java_string_array(count, display);
+    gv_java_net_NetworkInterface_index_0       = jnative_int_array(indices, count);
+    gv_java_net_NetworkInterface_addrs_0       = jnative_empty_ref_array();
+    gv_java_net_NetworkInterface_bindings_0    = jnative_empty_ref_array();
+    gv_java_net_NetworkInterface_childs_0      = jnative_empty_ref_array();
 
     for (int k = 0; k < count; k++) { free(names[k]); free(display[k]); }
     free(names); free(display); free(indices);
@@ -268,6 +250,7 @@ void* __jnative_fn_java_net_NetworkInterface_getByName0__Ljava_lang_String__Ljav
     const char* req = __jnative_read_string_bytes(name_str, &req_len);
     if (!req || req_len <= 0) return NULL;
 
+    if (gv_java_net_NetworkInterface_name_0 == NULL) __jnative_fn_java_net_NetworkInterface_init___V();
     void* namesArr   = gv_java_net_NetworkInterface_name_0;
     void* displayArr = gv_java_net_NetworkInterface_displayName_0;
     void* indicesArr = gv_java_net_NetworkInterface_index_0;
@@ -299,6 +282,7 @@ void* __jnative_fn_java_net_NetworkInterface_getByName0__Ljava_lang_String__Ljav
  * ========================================================================== */
 
 void* __jnative_fn_java_net_NetworkInterface_getAll____Ljava_net_NetworkInterface_(void) {
+    if (gv_java_net_NetworkInterface_name_0 == NULL) __jnative_fn_java_net_NetworkInterface_init___V();
     void* namesArr   = gv_java_net_NetworkInterface_name_0;
     void* displayArr = gv_java_net_NetworkInterface_displayName_0;
     void* indicesArr = gv_java_net_NetworkInterface_index_0;

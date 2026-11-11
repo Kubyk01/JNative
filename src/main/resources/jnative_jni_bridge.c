@@ -456,14 +456,6 @@ static ReflectionField* find_field_hier(ReflectionClass* cls,
     return NULL;
 }
 
-/* Primitive argument staging. Each argument gets its own 8-byte slot so
- * that the LLVM-emitted adaptor can load the exact declared width from
- * offset 0, which is correct on both little- and big-endian hosts. */
-typedef union {
-    uint64_t align;
-    uint8_t  bytes[8];
-} ArgSlot;
-
 /* Pack jvalues into a `void**` argument list suitable for the adaptor. */
 static void* invoke_through_adaptor(ReflectionMethod* rm, void* obj,
                                     const jvalue* args, int nargs)
@@ -471,31 +463,27 @@ static void* invoke_through_adaptor(ReflectionMethod* rm, void* obj,
     if (rm == NULL || rm->adaptor == NULL) return NULL;
     if (nargs > 64) nargs = 64;
 
-    ArgSlot staging[64];
-    void*   packed[64];
+    /* Primitives go inline in the slot: the generated reflection adaptors
+     * load them straight out of args[i] (same contract as
+     * reflect_prepare_args), not through a pointer. */
+    void* packed[64];
 
     const char* desc = (const char*)rm->descriptor;
     for (int i = 0; i < nargs; i++) {
         char tc = desc_param_type_char(desc, i);
+        packed[i] = NULL;
+        void* slot = &packed[i];
         switch (tc) {
             case 'L': case '[': packed[i] = args[i].l;              break;
-            case 'Z': *(uint8_t*)staging[i].bytes = args[i].z ? 1 : 0;
-                      packed[i] = staging[i].bytes;                 break;
-            case 'B': *(int8_t*)staging[i].bytes  = args[i].b;
-                      packed[i] = staging[i].bytes;                 break;
-            case 'C': *(uint16_t*)staging[i].bytes = args[i].c;
-                      packed[i] = staging[i].bytes;                 break;
-            case 'S': *(int16_t*)staging[i].bytes = args[i].s;
-                      packed[i] = staging[i].bytes;                 break;
-            case 'I': *(int32_t*)staging[i].bytes = args[i].i;
-                      packed[i] = staging[i].bytes;                 break;
-            case 'J': *(int64_t*)staging[i].bytes = args[i].j;
-                      packed[i] = staging[i].bytes;                 break;
-            case 'F': *(float*)staging[i].bytes   = args[i].f;
-                      packed[i] = staging[i].bytes;                 break;
-            case 'D': *(double*)staging[i].bytes  = args[i].d;
-                      packed[i] = staging[i].bytes;                 break;
-            default:  packed[i] = NULL;                             break;
+            case 'Z': *(uint8_t*)slot  = args[i].z ? 1 : 0;         break;
+            case 'B': *(int8_t*)slot   = args[i].b;                 break;
+            case 'C': *(uint16_t*)slot = args[i].c;                 break;
+            case 'S': *(int16_t*)slot  = args[i].s;                 break;
+            case 'I': *(int32_t*)slot  = args[i].i;                 break;
+            case 'J': *(int64_t*)slot  = args[i].j;                 break;
+            case 'F': *(float*)slot    = args[i].f;                 break;
+            case 'D': *(double*)slot   = args[i].d;                 break;
+            default:                                                break;
         }
     }
 
@@ -570,16 +558,12 @@ static jclass jn_FindClass(void* env, const char* name) {
     return (jclass)c;
 }
 
+extern void* __jnative_fn_java_lang_Object_getClass___Ljava_lang_Class_(void* obj);
+
 static jclass jn_GetObjectClass(void* env, jobject obj) {
     ENV_UNUSED;
     if (obj == NULL) return NULL;
-    typedef void* (*get_class_fn)(void*);
-    get_class_fn fn = (get_class_fn)dlsym(RTLD_DEFAULT,
-        "fn_java_lang_Object_getClass___Ljava_lang_Class_");
-    if (fn != NULL) return (jclass)fn(obj);
-    /* Fallback: read the vtable slot 0 of java.lang.Object. */
-    void* first = *(void**)obj;
-    return (jclass)first;  /* wrong but the fast path should always hit */
+    return (jclass)__jnative_fn_java_lang_Object_getClass___Ljava_lang_Class_(obj);
 }
 
 static jclass jn_GetSuperclass(void* env, jclass cls) {

@@ -159,15 +159,13 @@ static int class_implements_interface(struct ReflectionClass* cls,
     return 0;
 }
 
-static char* build_type_info_symbol(const char* class_name) {
-    static char buf[512];
-    jnative_type_info_name(class_name, buf, sizeof(buf));
-    return buf;
-}
-
 static void** lookup_type_info(struct ReflectionClass* cls) {
     if (!cls || !cls->cname) return NULL;
-    const char* symbol = build_type_info_symbol(cls->cname);
+    /* Stack buffer: a shared static one raced between threads, so a
+     * concurrent Class.isInstance could dlsym another class's type info
+     * and report false (AtomicXFieldUpdater.accessCheck -> bare CCE). */
+    char symbol[512];
+    jnative_type_info_name(cls->cname, symbol, sizeof(symbol));
     void* handle = jn_dlsym_default;
     if (!handle) return NULL;
     void** type_info = (void**)jn_dlsym_default( symbol);
@@ -1119,12 +1117,15 @@ void* __jnative_fn_java_lang_Class_getDeclaredMethods0__Z__Ljava_lang_reflect_Me
     ReflectionClass* rc = (ReflectionClass*)this_cls;
     ReflectionMethod** mp = rc->methods;
 
+    int hide_define_class = rc == jnative_class_by_name("java/lang/ClassLoader");
+
     int32_t count = 0;
     if (mp != NULL) {
         for (ReflectionMethod** p = mp; *p != NULL; p++) {
             ReflectionMethod* rm = *p;
             if (rm->name == NULL || rm->descriptor == NULL) continue;
             if (public_only && !(rm->modifiers & JNATIVE_ACC_PUBLIC)) continue;
+            if (hide_define_class && strcmp(rm->name, "defineClass") == 0) continue;
             count++;
         }
     }
@@ -1142,6 +1143,7 @@ void* __jnative_fn_java_lang_Class_getDeclaredMethods0__Z__Ljava_lang_reflect_Me
             ReflectionMethod* rm = *p;
             if (rm->name == NULL || rm->descriptor == NULL) continue;
             if (public_only && !(rm->modifiers & JNATIVE_ACC_PUBLIC)) continue;
+            if (hide_define_class && strcmp(rm->name, "defineClass") == 0) continue;
             slots[i++] = create_method_mirror(rc, rm);
         }
     }
@@ -1272,6 +1274,10 @@ int32_t __jnative_fn_java_lang_Class_isRecord0___Z(void* this_cls) {
 
 #define RES_PATH_BUF 1024
 
+extern void* fn_java_lang_ClassLoader_getResourceAsStream__Ljava_lang_String__Ljava_io_InputStream_(
+        void* loader, void* name) JNATIVE_WEAK;
+void* __jnative_override_java_lang_Class_getClassLoader(void* self);
+
 void* __jnative_override_Class_getResourceAsStream(void* this_class,
                                                    void* name_str)
 {
@@ -1314,7 +1320,18 @@ void* __jnative_override_Class_getResourceAsStream(void* this_class,
     lookup_path[lookup_len] = '\0';
 
     const JNativeResourceEntry* res = jnative_find_resource(lookup_path, lookup_len);
-    if (res == NULL) return NULL;
+    if (res == NULL) {
+        /* Not embedded: like the JDK, ask the class's loader, which reads the
+         * runtime classpath jars (e.g. spring-web's CodecConfigurer.properties
+         * via CodecConfigurerFactory.class). Boot classes have no loader. */
+        if (fn_java_lang_ClassLoader_getResourceAsStream__Ljava_lang_String__Ljava_io_InputStream_ == NULL)
+            return NULL;
+        void* loader = __jnative_override_java_lang_Class_getClassLoader(this_class);
+        if (loader == NULL) return NULL;
+        void* path_str = __jnative_make_string_obj(lookup_path, lookup_len);
+        return fn_java_lang_ClassLoader_getResourceAsStream__Ljava_lang_String__Ljava_io_InputStream_(
+            loader, path_str);
+    }
 
     void* bytes = jnative_byte_array(res->data, res->size);
     if (bytes == NULL) {

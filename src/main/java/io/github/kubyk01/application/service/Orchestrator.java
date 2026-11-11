@@ -184,6 +184,7 @@ public class Orchestrator implements OrchestratorPort {
         forcePackageDefinitionMethods(analysis, resolver);
         forceLoggingConfigClasses(analysis);
         forceServiceProviders(analysis, resolver);
+        forceSocketAddressMethods(analysis);
 
         // ------------------------------------------------------------------
         // Superclass-<clinit> closure.
@@ -652,6 +653,16 @@ public class Orchestrator implements OrchestratorPort {
             "java/lang/reflect/InvocationTargetException", "<init>", "(Ljava/lang/Throwable;)V"));
     }
 
+    /** Net.c builds accepted/received peer addresses through these from C. */
+    private void forceSocketAddressMethods(ReachabilityAnalysis analysis) {
+        if (!analysis.getReachableClasses().contains("sun/nio/ch/Net")) return;
+        analysis.addInstantiatedClass("java/net/InetSocketAddress", false);
+        analysis.addExtraReachableMethod(new MethodReference(
+            "java/net/InetAddress", "getByAddress", "([B)Ljava/net/InetAddress;"));
+        analysis.addExtraReachableMethod(new MethodReference(
+            "java/net/InetSocketAddress", "<init>", "(Ljava/net/InetAddress;I)V"));
+    }
+
     private void forceLoggingConfigClasses(ReachabilityAnalysis analysis) {
         if (!analysis.getReachableClasses().contains("java/util/logging/LogManager")) return;
         String javaHome = System.getProperty("java.home");
@@ -903,7 +914,6 @@ public class Orchestrator implements OrchestratorPort {
      *                       may be {@code null} only if the caller did not
      *                       resolve one, in which case the host {@code os.name}
      *                       is used as a fallback
-     * @return the default executable path
      */
     private static void releasePointsTo(Module module) {
         for (Function function : module.getFunctions()) {

@@ -536,9 +536,10 @@ typedef struct CatchContext {
     uint64_t id;
 } CatchContext;
 
-#define CATCH_STACK_DEPTH 64
+#define CATCH_STACK_INITIAL 64
 
-static JN_TLS CatchContext catch_stack[CATCH_STACK_DEPTH];
+static JN_TLS CatchContext* catch_stack = NULL;
+static JN_TLS int          catch_capacity = 0;
 static JN_TLS int          catch_depth = 0;
 static JN_TLS void*        current_exception = NULL;
 static JN_TLS uint64_t     jnative_catch_id_counter = 1;
@@ -548,9 +549,15 @@ static inline CatchContext* current_catch_ctx(void) {
 }
 
 void __jnative_push_catch(void* jmp_buf_ptr, void* type_info) {
-    if (catch_depth >= CATCH_STACK_DEPTH) {
-        fprintf(stderr, "jnative: try/catch nesting > %d\n", CATCH_STACK_DEPTH);
-        abort();
+    if (catch_depth >= catch_capacity) {
+        int cap = catch_capacity > 0 ? catch_capacity * 2 : CATCH_STACK_INITIAL;
+        CatchContext* grown = (CatchContext*)realloc(catch_stack, (size_t)cap * sizeof(CatchContext));
+        if (grown == NULL) {
+            fprintf(stderr, "jnative: out of memory growing catch stack to %d\n", cap);
+            abort();
+        }
+        catch_stack    = grown;
+        catch_capacity = cap;
     }
     CatchContext* ctx = &catch_stack[catch_depth++];
     ctx->type_info   = type_info;

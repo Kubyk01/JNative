@@ -75,6 +75,17 @@ int32_t __jnative_fn_sun_nio_ch_IOUtil_fdVal__Ljava_io_FileDescriptor__I(void* f
     return jnative_fd_of(fdo);
 }
 
+/*
+ * static native void setfdVal(FileDescriptor fd, int value);
+ *
+ * Without it IOUtil.newFD(int) returns a FileDescriptor still holding -1
+ * (EPollSelectorImpl's eventfd -> "Stream Closed" in configureBlocking).
+ */
+void __jnative_fn_sun_nio_ch_IOUtil_setfdVal__Ljava_io_FileDescriptor_I_V(void* fdo, int32_t value) {
+    if (fdo == NULL) __jnative_throw_null_pointer_exception();
+    *(int32_t*)((char*)fdo + FD_OFFSET) = value;
+}
+
 /* ============================================================================
  *  configureBlocking — put the fd into or out of non-blocking mode.
  *

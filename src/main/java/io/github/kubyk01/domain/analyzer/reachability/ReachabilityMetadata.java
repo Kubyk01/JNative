@@ -67,7 +67,7 @@ public class ReachabilityMetadata {
     @Builder
     public static class ProxyInterface {
         @Builder.Default
-        private Set<String> interfaces = new HashSet<>();
+        private Set<String> interfaces = new java.util.LinkedHashSet<>();
     }
 
     @Data

@@ -309,6 +309,69 @@ public class ReachabilityAnalysis {
         return true;
     }
 
+    private static final String SPRING_DATA_REPOSITORY = "org/springframework/data/repository/Repository";
+    private static final String SPRING_TRANSACTIONAL_PROXY = "org/springframework/transaction/interceptor/TransactionalProxy";
+    private final Set<String> repositoryScanned = new HashSet<>();
+
+    /**
+     * Spring Data builds every repository as a JDK proxy over
+     * [repo, Repository, (TransactionalProxy,) Advised, DecoratingProxy].
+     * GraalVM learns these sets from Spring AOT's proxy hints; JNative does
+     * not run Spring AOT, so register the same sets for every reachable
+     * repository interface.
+     */
+    private static final Map<String, List<String>> FRAMEWORK_PROXIES = Map.of(
+        "org/springframework/r2dbc/core/DefaultDatabaseClient",
+        List.of("io/r2dbc/spi/Connection", "io/r2dbc/spi/Wrapped"));
+    private final Set<String> frameworkProxiesDone = new HashSet<>();
+
+    private boolean addFrameworkProxies() {
+        boolean added = false;
+        for (Map.Entry<String, List<String>> e : FRAMEWORK_PROXIES.entrySet()) {
+            if (frameworkProxiesDone.contains(e.getKey())) continue;
+            ClassNode trigger = resolver.getClassNode(e.getKey());
+            if (trigger == null || trigger.isExternal()) continue;
+            frameworkProxiesDone.add(e.getKey());
+            addProxyClass(e.getValue());
+            added = true;
+        }
+        return added;
+    }
+
+    private boolean addSpringDataRepositoryProxies() {
+        ClassNode repo = resolver.getClassNode(SPRING_DATA_REPOSITORY);
+        if (repo == null || repo.isExternal()) return false;
+        boolean added = false;
+        // All loaded classes, not reachableClasses: Spring Data discovers
+        // repositories by classpath scan, so no bytecode edge may reach them.
+        for (String cls : new ArrayList<>(resolver.getAllClasses())) {
+            if (cls.isEmpty() || cls.charAt(0) == '[' || !repositoryScanned.add(cls)) continue;
+            if (cls.startsWith("org/springframework/data/")) continue;
+            ClassNode cn = resolver.getClassNode(cls);
+            if (cn == null || cn.isExternal() || (cn.getAccess() & Opcodes.ACC_INTERFACE) == 0) continue;
+            if (!extendsInterface(cls, SPRING_DATA_REPOSITORY, new HashSet<>())) continue;
+            ClassNode tx = resolver.getClassNode(SPRING_TRANSACTIONAL_PROXY);
+            if (tx != null && !tx.isExternal()) {
+                addProxyClass(List.of(cls, SPRING_DATA_REPOSITORY, SPRING_TRANSACTIONAL_PROXY,
+                    "org/springframework/aop/framework/Advised", "org/springframework/core/DecoratingProxy"));
+            }
+            addProxyClass(List.of(cls, SPRING_DATA_REPOSITORY,
+                "org/springframework/aop/framework/Advised", "org/springframework/core/DecoratingProxy"));
+            added = true;
+        }
+        return added;
+    }
+
+    private boolean extendsInterface(String cls, String target, Set<String> seen) {
+        if (!seen.add(cls)) return false;
+        ClassNode cn = resolver.getClassNode(cls);
+        if (cn == null || cn.getInterfaces() == null) return false;
+        for (String iface : cn.getInterfaces()) {
+            if (iface.equals(target) || extendsInterface(iface, target, seen)) return true;
+        }
+        return false;
+    }
+
     private void seedAnnotationSupport() {
         if (annotationSupportSeeded) return;
         annotationSupportSeeded = true;
@@ -1312,7 +1375,8 @@ public class ReachabilityAnalysis {
                 if (resolveVirtualDispatchSite(site)) addedAnySite.set(true);
                 return null;
             });
-            boolean addedAny = addedAnySite.get() | addOpaqueReflectiveMethods() | addReflectedMethods() | addAnnotationClosure();
+            boolean addedAny = addedAnySite.get() | addOpaqueReflectiveMethods() | addReflectedMethods() | addAnnotationClosure()
+                | addSpringDataRepositoryProxies() | addFrameworkProxies();
 
             // Step 3: drain the worklist. Newly added methods will have
             // their own bytecode scanned in the next iteration.

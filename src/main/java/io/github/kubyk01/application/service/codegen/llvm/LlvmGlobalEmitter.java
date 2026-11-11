@@ -442,6 +442,8 @@ public class LlvmGlobalEmitter {
          * only for determinism of the emitted IR, not for correctness.</p>
          */
         List<String> superInterfaces;
+
+        List<Type> capturedTypes;
     }
 
     private final Map<String, LambdaInfo> lambdaRegistry = new ConcurrentHashMap<>();
@@ -1686,6 +1688,9 @@ public class LlvmGlobalEmitter {
             info.samSig = samSig;
             info.adaptorName = adaptorName;
             info.superInterfaces = superIfacesList;
+            info.capturedTypes = (capturedTypes != null)
+                ? List.copyOf(capturedTypes)
+                : List.of();
             lambdaRegistry.put(lambdaId, info);
 
             String vtableName = "@vtable_" + LlvmTypeMapper.sanitizeIdentifier(lambdaClassName);
@@ -2791,6 +2796,23 @@ public class LlvmGlobalEmitter {
             sb.append("i8* null]\n");
         }
 
+        // Lambda classes need their own __type_info_X too: Object.getClass()
+        // maps vtable -> mirror through __type_info_<cname>[0], so without it
+        // getClass() on a lambda (e.g. a @Bean returning a lambda) is null.
+        List<String> lambdaNames = new ArrayList<>();
+        for (LambdaInfo linfo : lambdaRegistry.values()) {
+            if (linfo.lambdaClassName != null && vtableNames.containsKey(linfo.lambdaClassName)) {
+                lambdaNames.add(linfo.lambdaClassName);
+            }
+        }
+        Collections.sort(lambdaNames);
+        for (String lambdaClassName : lambdaNames) {
+            String typeInfoName = "@__type_info_" + LlvmTypeMapper.sanitizeIdentifier(lambdaClassName);
+            if (typeInfoNames.putIfAbsent(lambdaClassName, typeInfoName) != null) continue;
+            sb.append(typeInfoName).append(" = constant [2 x i8*] [i8* bitcast (%JNativeVTable* ")
+                .append(vtableNames.get(lambdaClassName)).append(" to i8*), i8* null]\n");
+        }
+
         return sb.toString();
     }
 
@@ -3029,6 +3051,35 @@ public class LlvmGlobalEmitter {
         return (offset + 7) & ~7;
     }
 
+    private static boolean isLambdaPseudoClassName(String className) {
+        return className != null && className.startsWith("__Lambda_");
+    }
+
+    private LambdaInfo findLambdaInfoByClassName(String className) {
+        if (className == null || !className.startsWith("__Lambda_")) return null;
+        for (LambdaInfo linfo : lambdaRegistry.values()) {
+            if (className.equals(linfo.lambdaClassName)) {
+                return linfo;
+            }
+        }
+        return null;
+    }
+
+    private int computeLambdaObjectSize(String className) {
+        LambdaInfo linfo = findLambdaInfoByClassName(className);
+        if (linfo == null || linfo.capturedTypes == null || linfo.capturedTypes.isEmpty()) {
+            return OBJECT_HEADER_SIZE;
+        }
+        int offset = OBJECT_HEADER_SIZE;
+        for (Type capType : linfo.capturedTypes) {
+            int align = fieldAlignment(capType);
+            int size  = fieldSize(capType);
+            offset = (offset + align - 1) & -align;
+            offset += size;
+        }
+        return (offset + 7) & ~7;
+    }
+
     // =========================================================================
     //  Reflection data
     // =========================================================================
@@ -3084,6 +3135,13 @@ public class LlvmGlobalEmitter {
                     addReflectionDescriptorTypes(emitClasses, field.getDescriptor());
                 }
             }
+        }
+
+        for (LambdaInfo linfo : lambdaRegistry.values()) {
+            String lambdaClassName = linfo.lambdaClassName;
+            if (lambdaClassName == null || lambdaClassName.isEmpty()) continue;
+            if (lambdaClassName.charAt(0) == '[') continue;
+            emitClasses.add(lambdaClassName);
         }
 
         // ------------------------------------------------------------------
@@ -3186,6 +3244,11 @@ public class LlvmGlobalEmitter {
                 continue;
             }
 
+            if (isLambdaPseudoClassName(cn)) {
+                classNames.add(cn);
+                continue;
+            }
+
             ClassNode node = resolver.getClassNode(cn);
 
             if (node == null) {
@@ -3218,11 +3281,13 @@ public class LlvmGlobalEmitter {
         for (String className : classNames) {
             boolean isPrimitive = PRIMITIVE_TYPE_NAMES.contains(className);
             boolean isArrayPseudoClass = className.charAt(0) == '[';
-            ClassNode classNode = (isPrimitive || isArrayPseudoClass)
+            boolean isLambdaPseudoClass = isLambdaPseudoClassName(className);
+            ClassNode classNode = (isPrimitive || isArrayPseudoClass || isLambdaPseudoClass)
                 ? null
                 : resolver.getClassNode(className);
 
             boolean isReflectClass = !isPrimitive
+                && !isLambdaPseudoClass
                 && reflectInfo != null
                 && reflectInfo.getClassInfoMap().containsKey(className);
 
@@ -3260,6 +3325,13 @@ public class LlvmGlobalEmitter {
             if (isArrayPseudoClass) {
                 info.setSuperName("java/lang/Object");
                 info.getInterfaces().clear();
+            } else if (isLambdaPseudoClass) {
+                LambdaInfo linfo = findLambdaInfoByClassName(className);
+                if (linfo != null) {
+                    info.setSuperName("java/lang/Object");
+                    info.getInterfaces().clear();
+                    info.getInterfaces().addAll(linfo.superInterfaces);
+                }
             } else if (!isPrimitive) {
                 String superName = (classNode != null) ? classNode.getSuperName() : null;
                 if (info.getSuperName() == null && superName != null) {
@@ -3345,8 +3417,10 @@ public class LlvmGlobalEmitter {
              * behaviour.
              */
             int objectSize;
-            if (isPrimitive || isArrayPseudoClass || classNode == null) {
-                objectSize = OBJECT_HEADER_SIZE;
+            if (isPrimitive || isArrayPseudoClass || isLambdaPseudoClass || classNode == null) {
+                objectSize = isLambdaPseudoClass
+                    ? computeLambdaObjectSize(className)
+                    : OBJECT_HEADER_SIZE;
             } else {
                 int computed = computeObjectSize(className);
                 if (computed > 0) {
@@ -3601,11 +3675,17 @@ public class LlvmGlobalEmitter {
                 String adaptorName = "__reflect_adaptor_ctor_"
                     + cleanClassName + "_" + mangledDesc;
 
-                Function impl = module.getFunction(
-                    LlvmRuntime.mangleMethod(className, "<init>", desc));
+                String mangledInit = LlvmRuntime.mangleMethod(className, "<init>", desc);
+                Function impl = module.getFunction(mangledInit);
+                // A native <init> override is registered as an alias: the
+                // lookup returns the C function (no body, different name).
+                boolean nativeOverride = impl != null && impl.getEntryBlock() == null
+                    && !impl.getName().equals(mangledInit)
+                    && impl.getParameters().size() == TypeResolver.descToParamTypes(desc).size() + 1;
                 String adaptorPtr = "i8* null";
-                if (impl != null && impl.getEntryBlock() != null) {
-                    sb.append(emitAdaptorForConstructor(className, ctor, objectSize));
+                if (impl != null && (impl.getEntryBlock() != null || nativeOverride)) {
+                    sb.append(emitAdaptorForConstructor(className, ctor, objectSize,
+                        nativeOverride ? impl.getName() : mangledInit, nativeOverride));
                     adaptorPtr = "i8* bitcast (i8* (i8**)* @"
                         + adaptorName + " to i8*)";
                 }
@@ -3678,6 +3758,8 @@ public class LlvmGlobalEmitter {
             int accessFlags;
             if (isPrimitive || isArrayPseudoClass) {
                 accessFlags = PRIMITIVE_CLASS_MODIFIERS;
+            } else if (isLambdaPseudoClass) {
+                accessFlags = Opcodes.ACC_FINAL | Opcodes.ACC_SYNTHETIC;
             } else {
                 accessFlags = (classNode != null) ? classNode.getAccess() : 0;
             }
@@ -4641,9 +4723,9 @@ public class LlvmGlobalEmitter {
         return sb.toString();
     }
 
-    private String emitAdaptorForConstructor(String className, MethodReference ctor, int objectSize) {
+    private String emitAdaptorForConstructor(String className, MethodReference ctor, int objectSize,
+                                             String origFuncName, boolean cAbi) {
         String desc = ctor.getDescriptor();
-        String origFuncName = LlvmRuntime.mangleMethod(className, "<init>", desc);
         String adaptorName = "__reflect_adaptor_ctor_"
             + LlvmTypeMapper.sanitizeIdentifier(className) + "_"
             + desc.replaceAll("[^a-zA-Z0-9_]", "_");
@@ -4686,9 +4768,18 @@ public class LlvmGlobalEmitter {
         StringBuilder argsCsv = new StringBuilder();
         argsCsv.append("i8* %obj");
         for (int i = 0; i < argLoads.size(); i++) {
-            argsCsv.append(", ")
-                .append(LlvmTypeMapper.toLlvmType(paramTypes.get(i)))
-                .append(" ").append(argLoads.get(i));
+            Type pt = paramTypes.get(i);
+            String arg = argLoads.get(i);
+            // Same C-ABI widening as emitAdaptorForMethod for native overrides.
+            if (cAbi && LlvmTypeMapper.toCAbiType(pt) != pt) {
+                String wide = "%arg" + i + "_abi";
+                sb.append("  ").append(wide)
+                    .append(pt == Type.BOOLEAN || pt == Type.CHAR ? " = zext " : " = sext ")
+                    .append(LlvmTypeMapper.toLlvmType(pt)).append(" ").append(arg).append(" to i32\n");
+                pt = Type.INT;
+                arg = wide;
+            }
+            argsCsv.append(", ").append(LlvmTypeMapper.toLlvmType(pt)).append(" ").append(arg);
         }
         sb.append("  call void @").append(origFuncName)
             .append("(").append(argsCsv).append(")\n");

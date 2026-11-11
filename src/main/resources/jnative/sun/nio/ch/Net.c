@@ -153,40 +153,49 @@ static inline void net_set_fdval(void* fdo, int32_t fd) {
 
 /* =========== InetAddress construction =========== */
 
+/* Built through compiled Java code rather than by poking InetAddressHolder
+ * fields: the JDK 21 layout (int address, Inet6Address holder6) is not a
+ * byte[] at fixed offsets. Forced reachable by
+ * Orchestrator.forceSocketAddressMethods. */
+extern void* fn_java_net_InetAddress_getByAddress___B_Ljava_net_InetAddress_(void*) __attribute__((weak));
+extern void fn_java_net_InetSocketAddress__init___Ljava_net_InetAddress_I_V(void*, void*, int32_t) __attribute__((weak));
+
 static void* net_make_inet_address(const struct sockaddr_storage* ss,
                                     const char* host)
 {
-    ReflectionClass* ia_cls = jnative_class_by_name("java/net/InetAddress");
-    ReflectionClass* h_cls  = jnative_class_by_name(
-        "java/net/InetAddress$InetAddressHolder");
-    if (!ia_cls || !h_cls) return NULL;
-
-    void* holder = jnative_alloc_object(h_cls);
-    if (!holder) return NULL;
-
-    int fam = (int)ss->ss_family;
-    int jf = (fam == AF_INET) ? 1 : 2;
-    int alen = (fam == AF_INET) ? 4 : 16;
+    (void)host;
     const void* addr_bytes;
-
-    if (fam == AF_INET) {
+    int alen;
+    if (ss->ss_family == AF_INET) {
         addr_bytes = &((const struct sockaddr_in*)ss)->sin_addr;
-    } else if (fam == AF_INET6) {
+        alen = 4;
+    } else if (ss->ss_family == AF_INET6) {
         addr_bytes = &((const struct sockaddr_in6*)ss)->sin6_addr;
+        alen = 16;
     } else {
-        free(holder); return NULL;
+        return NULL;
     }
+    if (fn_java_net_InetAddress_getByAddress___B_Ljava_net_InetAddress_ == NULL) return NULL;
+    return fn_java_net_InetAddress_getByAddress___B_Ljava_net_InetAddress_(
+        jnative_byte_array(addr_bytes, alen));
+}
 
-    *(void**)((char*)holder + 8)    = host ? jnative_string(host) : NULL;
-    *(int32_t*)((char*)holder + 16) = jf;
-    *(void**)((char*)holder + 20)   = jnative_byte_array(addr_bytes, alen);
+static int32_t net_port_of(const struct sockaddr_storage* ss) {
+    if (ss->ss_family == AF_INET)  return ntohs(((const struct sockaddr_in*)ss)->sin_port);
+    if (ss->ss_family == AF_INET6) return ntohs(((const struct sockaddr_in6*)ss)->sin6_port);
+    return 0;
+}
 
-    void* ia = jnative_alloc_object(ia_cls);
-    if (!ia) { free(holder); return NULL; }
-
-    *(void**)((char*)ia + 8)  = NULL;
-    *(void**)((char*)ia + 16) = holder;
-    return ia;
+/* new InetSocketAddress(address, port) for the peer in ss, or NULL. */
+static void* net_make_socket_address(const struct sockaddr_storage* ss) {
+    void* ia = net_make_inet_address(ss, NULL);
+    ReflectionClass* cls = jnative_class_by_name("java/net/InetSocketAddress");
+    if (ia == NULL || cls == NULL
+        || fn_java_net_InetSocketAddress__init___Ljava_net_InetAddress_I_V == NULL) return NULL;
+    void* isa = jnative_alloc_object(cls);
+    if (isa == NULL) __jnative_throw_out_of_memory_error();
+    fn_java_net_InetSocketAddress__init___Ljava_net_InetAddress_I_V(isa, ia, net_port_of(ss));
+    return isa;
 }
 
 static int net_sockaddr_from_inetaddress(void* ia, int32_t port,
@@ -388,8 +397,8 @@ void __jnative_fn_sun_nio_ch_Net_bind0__Ljava_io_FileDescriptor_ZZLjava_net_Inet
 
 /* =========== connect0 =========== */
 
-int32_t __jnative_fn_sun_nio_ch_Net_connect0__Ljava_io_FileDescriptor_ZLjava_net_InetAddress_I_I(
-        void* fdo, int32_t prefer_ipv6, void* ia, int32_t port)
+int32_t __jnative_fn_sun_nio_ch_Net_connect0__ZLjava_io_FileDescriptor_Ljava_net_InetAddress_I_I(
+        int32_t prefer_ipv6, void* fdo, void* ia, int32_t port)
 {
     (void)prefer_ipv6;
     jn_os_socket_t s = net_os_socket(fdo);
@@ -401,24 +410,25 @@ int32_t __jnative_fn_sun_nio_ch_Net_connect0__Ljava_io_FileDescriptor_ZLjava_net
 #if defined(_WIN32)
     if (connect(s, (struct sockaddr*)&ss, sslen) == SOCKET_ERROR) {
         int32_t e = WSAGetLastError();
-        if (jn_sock_would_block(e))  return 1;
+        if (jn_sock_would_block(e))  return IOS_UNAVAILABLE;
         if (jn_sock_interrupted(e))  return 0;
         jn_throw_socket_ioexception("connect", e);
     }
 #else
     if (connect(s, (struct sockaddr*)&ss, (socklen_t)sslen) < 0) {
         int32_t e = errno;
-        if (jn_sock_would_block(e))  return 1;
-        if (jn_sock_interrupted(e))  return 0;
+        /* EINPROGRESS (non-blocking connect): the channel finishes it later. */
+        if (jn_sock_would_block(e))  return IOS_UNAVAILABLE;
+        if (jn_sock_interrupted(e))  return IOS_INTERRUPTED;
         jn_throw_socket_ioexception("connect", e);
     }
 #endif
-    return 0;
+    return 1;
 }
 
-/* =========== accept0 =========== */
+/* =========== accept =========== */
 
-int32_t __jnative_fn_sun_nio_ch_Net_accept0__Ljava_io_FileDescriptor_Ljava_io_FileDescriptor__Ljava_net_InetSocketAddress__I(
+int32_t __jnative_fn_sun_nio_ch_Net_accept__Ljava_io_FileDescriptor_Ljava_io_FileDescriptor__Ljava_net_InetSocketAddress__I(
         void* fdo, void* new_fdo, void* isaa_array)
 {
     jn_os_socket_t s = net_os_socket(fdo);
@@ -449,11 +459,8 @@ int32_t __jnative_fn_sun_nio_ch_Net_accept0__Ljava_io_FileDescriptor_Ljava_io_Fi
     net_set_fdval(new_fdo, (int32_t)(intptr_t)new_s);
 
     if (isaa_array != NULL) {
-        void* ia = net_make_inet_address(&ss, NULL);
-        if (ia != NULL) {
-            void** slots = (void**)((char*)isaa_array + JAVA_ARR_HDR);
-            slots[0] = ia;
-        }
+        void** slots = (void**)((char*)isaa_array + JAVA_ARR_HDR);
+        slots[0] = net_make_socket_address(&ss);
     }
     return 1;
 }
@@ -617,11 +624,8 @@ int32_t __jnative_fn_sun_nio_ch_Net_recvFrom__Ljava_io_FileDescriptor_JILjava_ne
 #endif
 
     if (isaa_array != NULL) {
-        void* ia = net_make_inet_address(&ss, NULL);
-        if (ia != NULL) {
-            void** slots = (void**)((char*)isaa_array + JAVA_ARR_HDR);
-            slots[0] = ia;
-        }
+        void** slots = (void**)((char*)isaa_array + JAVA_ARR_HDR);
+        slots[0] = net_make_socket_address(&ss);
     }
     return (int32_t)n;
 }

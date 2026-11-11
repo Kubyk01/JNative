@@ -203,7 +203,7 @@ public class ReachabilityMetadataParser {
 
     private static void parseProxyInterface(JsonNode node, List<ReachabilityMetadata.ProxyInterface> out) {
         if (!node.has("interfaces")) return;
-        Set<String> interfaces = new HashSet<>();
+        Set<String> interfaces = new java.util.LinkedHashSet<>();
         for (JsonNode iface : node.get("interfaces")) {
             interfaces.add(iface.asText());
         }

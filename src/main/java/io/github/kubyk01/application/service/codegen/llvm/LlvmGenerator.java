@@ -1016,6 +1016,7 @@ public class LlvmGenerator implements LlvmGeneratorPort {
     private void ensureExternalDeclarations() {
         resolver.forceLoadSystemClass("java/lang/Object");
         resolver.forceLoadSystemClass("java/lang/Class");
+        resolver.forceLoadSystemClass("java/lang/NoClassDefFoundError");
         // Class.getModule() reads the `module` slot of every @refclass_*
         // constant, and the slot points at the unnamed-module singleton that
         // generateUnnamedModule() emits. Without this class the emitter has
