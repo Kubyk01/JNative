@@ -1460,7 +1460,8 @@ static inline int32_t jnative_raw_fd(void* fd_obj)
     }
     int32_t fd = jnative_fd_of(fd_obj);
     if (fd < 0) {
-        __jnative_throw_exception(NULL);
+        __jnative_throw_exception(
+            __jnative_construct_exception("vtable_java_io_IOException", "Stream Closed"));
     }
     return fd;
 }

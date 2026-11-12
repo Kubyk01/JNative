@@ -425,6 +425,11 @@ static void resolve_locale(char* lang, size_t langsz,
     lang[0] = '\0';
     country[0] = '\0';
 
+#if defined(_WIN32)
+    if (GetLocaleInfoA(LOCALE_USER_DEFAULT, LOCALE_SISO639LANGNAME, lang, (int)langsz) <= 0) lang[0] = '\0';
+    if (GetLocaleInfoA(LOCALE_USER_DEFAULT, LOCALE_SISO3166CTRYNAME, country, (int)countrysz) <= 0) country[0] = '\0';
+    const char* loc = NULL;
+#else
     const char* loc = NULL;
     const char* env = getenv("LC_ALL");
     if (env != NULL && env[0] != '\0') loc = env;
@@ -436,6 +441,7 @@ static void resolve_locale(char* lang, size_t langsz,
         env = getenv("LANG");
         if (env != NULL && env[0] != '\0') loc = env;
     }
+#endif
 
     if (loc != NULL) {
         size_t i = 0;
@@ -452,6 +458,7 @@ static void resolve_locale(char* lang, size_t langsz,
                    && j + 1 < countrysz) {
                 country[j] = (char)toupper((unsigned char)loc[i]);
                 j++;
+                i++;
             }
             country[j] = '\0';
         }

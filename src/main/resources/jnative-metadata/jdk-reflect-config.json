@@ -390,5 +390,68 @@
     },
     "name": "sun.security.provider.SHA3$SHA512",
     "allDeclaredConstructors": true
+  },
+  {
+    "condition": {
+      "typeReachable": "java.security.SecureRandom"
+    },
+    "name": "sun.security.provider.DRBG",
+    "allDeclaredConstructors": true
+  },
+  {
+    "condition": {
+      "typeReachable": "java.security.SecureRandom"
+    },
+    "name": "sun.security.provider.SecureRandom",
+    "allDeclaredConstructors": true
+  },
+  {
+    "condition": {
+      "typeReachable": "java.security.SecureRandom"
+    },
+    "name": "sun.security.provider.NativePRNG",
+    "allDeclaredConstructors": true
+  },
+  {
+    "condition": {
+      "typeReachable": "java.security.SecureRandom"
+    },
+    "name": "sun.security.provider.NativePRNG$Blocking",
+    "allDeclaredConstructors": true
+  },
+  {
+    "condition": {
+      "typeReachable": "java.security.SecureRandom"
+    },
+    "name": "sun.security.provider.NativePRNG$NonBlocking",
+    "allDeclaredConstructors": true
+  },
+  {
+    "condition": {
+      "typeReachable": "java.util.logging.LogManager"
+    },
+    "name": "java.util.logging.ConsoleHandler",
+    "allDeclaredConstructors": true
+  },
+  {
+    "condition": {
+      "typeReachable": "java.util.logging.LogManager"
+    },
+    "name": "java.util.logging.FileHandler",
+    "allDeclaredConstructors": true
+  },
+  {
+    "condition": {
+      "typeReachable": "java.util.logging.LogManager"
+    },
+    "name": "java.util.logging.SimpleFormatter",
+    "allDeclaredConstructors": true
+  },
+  {
+    "condition": {
+      "typeReachable": "java.util.logging.LogManager"
+    },
+    "name": "java.util.logging.XMLFormatter",
+    "allDeclaredConstructors": true
   }
 ]
