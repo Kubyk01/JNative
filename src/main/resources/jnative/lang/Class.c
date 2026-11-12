@@ -16,46 +16,18 @@ extern int __jnative_instanceof(void* obj, void** type_info);
 extern void* __jnative_make_string_obj(const char* bytes, int32_t len);
 extern const char* __jnative_read_string_bytes(void* s, int32_t* out_len);
 
-/*
- * --------------------------------------------------------------------------
+/* --------------------------------------------------------------------------
  * Guard for the reflect-mirror "root" fields.
- *
- * JNATIVE_METHOD_ROOT_OFFSET and JNATIVE_CTOR_ROOT_OFFSET are emitted by
- * LlvmGlobalEmitter.generateLayoutConstants() as `constant i32` globals.
- * The value is not guaranteed to be meaningful on every JDK: a field that
- * a given JDK release no longer declares is published as -1, and a future
- * rename could surface any other value the layout computation produced.
- *
- * The bounds check below is the last line of defence: it is better to
- * silently skip the (redundant) NULL store than to corrupt arbitrary
- * heap. The upper bound is generous relative to any plausible
- * reflect-mirror layout — JDK 21's Method and Constructor both put root
- * within the first ~256 bytes of the object.
- *
- * A root offset of -1 (the value published when the JDK does not declare
- * the field) means "not set" and the store is skipped.
- */
+ * ------------------------------------------------------------------------ */
 #define JNATIVE_ROOT_OFFSET_MAX 512
 
 static inline int jnative_root_offset_is_sane(int32_t offset) {
     return offset > 0 && offset <= JNATIVE_ROOT_OFFSET_MAX;
 }
 
-/*
- * --------------------------------------------------------------------------
+/* --------------------------------------------------------------------------
  * Minimum-size helper.
- *
- * ReflectionClass.object_size for java.lang.reflect.Method and
- * java.lang.reflect.Constructor is computed by LlvmGlobalEmitter as the
- * unaligned sum of the declared field sizes, which can be smaller than
- * the highest field offset returned by getFieldOffset (which applies
- * natural alignment). Writing to the last few fields of such a mirror
- * would then land past the end of the calloc'ed allocation.
- *
- * This helper computes a minimum allocation size that covers every field
- * the mirror routines actually write, so the allocation can never be
- * short no matter how object_size was computed.
- */
+ * ------------------------------------------------------------------------ */
 static inline size_t jnative_reflect_min_size(int32_t* offsets, size_t count) {
     size_t min_size = OBJECT_HEADER_SIZE;
     for (size_t i = 0; i < count; i++) {
@@ -71,11 +43,6 @@ static inline size_t jnative_reflect_min_size(int32_t* offsets, size_t count) {
  * Small helpers
  * ------------------------------------------------------------------------ */
 
-/*
- * Class[] from a NULL-terminated mirror-pointer array. Routed through
- * jnative_ref_array_of_class() so the result carries a real klass mirror
- * and Class.getInterfaces()[i].getClass() resolves to java.lang.Class.
- */
 static void* make_class_array(struct ReflectionClass** ptrs) {
     int count = 0;
     if (ptrs != NULL) {
@@ -85,64 +52,60 @@ static void* make_class_array(struct ReflectionClass** ptrs) {
                                       "[Ljava/lang/Class;");
 }
 
-/*
- * Empty [Ljava/lang/Class; array.
- *
- * Used as the fallback for any reflect-mirror slot that must present a
- * non-null Class[] to the Java layer: Method.parameterTypes,
- * Method.exceptionTypes, Constructor.parameterTypes,
- * Constructor.exceptionTypes.
- *
- * Every java.lang.reflect.Executable consumer — sharedToString,
- * toGenericString, getParameterTypes, getExceptionTypes, the access-check
- * diagnostics in sun.invoke.util.VerifyAccess, Method.copy — iterates
- * at least one of those arrays without a null check. A null slot turns
- * the very first reflective toString into the
- *
- *     java.lang.NullPointerException: Cannot invoke
- *     java.lang.reflect.Executable.sharedToString(...) because <array>
- *     is null
- *
- * that aborted MethodHandleImpl$CountingWrapper.<clinit> during the
- * VarHandle bootstrap. An empty array is indistinguishable from
- * `new Class[0]`, so every consumer behaves as if the executable
- * genuinely declared no parameters / no thrown exceptions.
- */
 static void* empty_param_types_array(void) {
     return jnative_ref_array_of_class(NULL, 0, "[Ljava/lang/Class;");
 }
 
+/*
+ * Hash-based lookup over reflect_all_classes[].
+ *
+ * Delegates to jnative_class_by_name(), which is backed by the
+ * runtime's class-name hash map (build_class_name_map() in
+ * jnative_runtime.c). This replaces the previous O(N) linear scan
+ * (strcmp over 40 631 entries) that dominated the profile.
+ *
+ * All keys in the table are internal (slash-form) names, primitive
+ * names ("void", "int", ...), or array descriptors ("[I",
+ * "[Ljava/lang/String;", ...) — none contain '.', so the exact
+ * lookup is always correct when the input is already in that form.
+ */
 static struct ReflectionClass* find_registered_class(const char* name) {
     if (name == NULL) return NULL;
-    struct ReflectionClass** pp = reflect_all_classes;
-    while (*pp) {
-        struct ReflectionClass* c = *pp;
-        const char* n = c->cname;
-        if (n && strcmp(n, name) == 0) return c;
-        pp++;
-    }
-    return NULL;
+    return (struct ReflectionClass*)jnative_class_by_name(name);
 }
 
 /*
- * Same lookup, but accepts a binary name whose package segments are
- * separated by '.' instead of '/'. java.lang.Class.forName0 receives the
- * binary name exactly as written in the Java source, so we must normalise
- * before hitting reflect_all_classes[] (which is keyed on the slash form
- * emitted by LlvmGlobalEmitter).
+ * Binary-name lookup for Class.forName0.
+ *
+ * Class.forName receives a binary name with dots as package
+ * separators (and dots inside array element descriptors). The table is
+ * keyed on the slash form, so any name containing '.' must be
+ * normalised before the lookup.
+ *
+ * The previous revision always performed an exact lookup first, even
+ * when the name was guaranteed to miss (a dotted name never matches a
+ * slash key), then normalised and scanned again — two full O(N)
+ * passes. Since find_registered_class() is now O(1), the exact lookup
+ * is cheap, but skipping the guaranteed miss when a dot is present is
+ * still the right thing to do: it halves the number of hash lookups
+ * per Class.forName and, more importantly, removes a misleading path
+ * from the profile.
+ *
+ * No-dot names (primitive names, default-package classes, array
+ * descriptors) go straight to the exact lookup.
  */
 static struct ReflectionClass* find_registered_class_dotted(const char* name) {
     if (name == NULL) return NULL;
 
-    struct ReflectionClass* cls = find_registered_class(name);
-    if (cls != NULL) return cls;
+    if (strchr(name, '.') == NULL) {
+        return find_registered_class(name);
+    }
 
     char buf[512];
     size_t n = strlen(name);
     if (n >= sizeof(buf)) return NULL;
-    memcpy(buf, name, n + 1);
-    for (char* p = buf; *p; p++) {
-        if (*p == '.') *p = '/';
+    for (size_t i = 0; i <= n; i++) {
+        buf[i] = (name[i] == '.') ? '/' : name[i];
     }
     return find_registered_class(buf);
 }
@@ -161,9 +124,6 @@ static int class_implements_interface(struct ReflectionClass* cls,
 
 static void** lookup_type_info(struct ReflectionClass* cls) {
     if (!cls || !cls->cname) return NULL;
-    /* Stack buffer: a shared static one raced between threads, so a
-     * concurrent Class.isInstance could dlsym another class's type info
-     * and report false (AtomicXFieldUpdater.accessCheck -> bare CCE). */
     char symbol[512];
     jnative_type_info_name(cls->cname, symbol, sizeof(symbol));
     void* handle = jn_dlsym_default;
@@ -193,13 +153,6 @@ static void* allocate_reflection_object(struct ReflectionClass* cls) {
  *  Reflection object construction
  * ====================================================================== */
 
-/*
- * Convert a JVM type descriptor into a registered Class mirror.
- *
- * Handles reference ("L...;"), array ("[...") and primitive ("I", "J",
- * ...) descriptors. Returns NULL when the corresponding mirror is not
- * present in reflect_all_classes[].
- */
 static ReflectionClass* descriptor_to_class_mirror(const char* desc)
 {
     if (desc == NULL || desc[0] == '\0') return NULL;
@@ -237,9 +190,6 @@ static ReflectionClass* descriptor_to_class_mirror(const char* desc)
     return NULL;
 }
 
-/*
- * Advance a descriptor cursor past exactly one type descriptor.
- */
 static int descriptor_element_end(const char* desc, int i)
 {
     if (desc[i] == '\0') return -1;
@@ -258,9 +208,6 @@ static int descriptor_element_end(const char* desc, int i)
     return i + 1;
 }
 
-/*
- * Build a Class[] from a JVM method descriptor's parameter list.
- */
 static void* build_parameter_types_array(const char* desc)
 {
     if (desc == NULL || desc[0] != '(') return NULL;
@@ -300,14 +247,6 @@ static void* build_parameter_types_array(const char* desc)
     return array;
 }
 
-/*
- * Build a java.lang.reflect.Field from a native ReflectionField
- * descriptor.
- *
- * The mirror is sized generously: the offsets read from the .rodata
- * constants emitted by LlvmGlobalEmitter.generateLayoutConstants() are
- * checked, and the allocation covers every field the routine writes.
- */
 static void* create_field_mirror(ReflectionClass* declaring_cls,
                                  ReflectionField* rf)
 {
@@ -362,88 +301,6 @@ static void* create_field_mirror(ReflectionClass* declaring_cls,
     return field;
 }
 
-/*
- * Build a java.lang.reflect.Method from a native ReflectionMethod
- * descriptor.
- *
- * Both parameterTypes and exceptionTypes are emitted as non-null arrays,
- * matching the contract every Executable consumer expects.
- *
- * The allocation is sized by jnative_reflect_min_size() using every
- * field offset this routine writes, so a short ReflectionClass.object_size
- * (which LlvmGlobalEmitter computes as an unaligned sum) cannot cause a
- * heap overflow.
- *
- * ----------------------------------------------------------------------
- * THE `root` FIELD — CRITICAL SEMANTICS
- * ----------------------------------------------------------------------
- *
- * In the JDK's java.lang.reflect.Method, `root` distinguishes an
- * ORIGINAL Method from a COPY produced by Method.copy():
- *
- *     // original Method created by reflection
- *     root == null
- *
- *     // copy created by Class.getMethod() -> ReflectionFactory.copyMethod()
- *     Method res = new Method(...);
- *     res.root = original;   // non-null -> res IS a copy
- *
- * The very first thing Method.copy() does is reject copies:
- *
- *     if (this.root != null)
- *         throw new IllegalArgumentException("Can not copy a non-root Method");
- *     Method res = new Method(...);
- *     res.root = this;
- *     res.methodAccessor = methodAccessor;
- *     return res;
- *
- * Constructor.copy() mirrors the same logic with the message
- * "Can not copy a non-root Constructor".
- *
- * Therefore a mirror produced by this routine MUST behave as an ORIGINAL:
- * its `root` field must be NULL, and the JDK will set it to point at this
- * mirror on the first copy(). The JDK layer explicitly relies on this:
- *
- *     Class.getDeclaredMethod(...)
- *         -> getDeclaredMethods0()    // this routine; produces root-candidates
- *         -> searchMethods()          // picks the matching mirror
- *         -> ReflectionFactory.copyMethod(mirror)
- *             -> mirror.copy()        // requires mirror.root == null
- *
- * A previous revision of this file wrote `root = method` ("self"),
- * intending to make the mirror "its own root". That reading is incorrect
- * for the JDK's actual semantics: `root != null` marks a mirror as
- * ALREADY a copy, and the next copy() throws. The observable failure was
- * the very first reflective lookup performed by any JDK or library code:
- *
- *     com.google.gson.internal.reflect.ReflectionHelper.<clinit>
- *         -> Class.class.getMethod("isRecord")
- *             -> Method.copy()
- *                 -> IllegalArgumentException:
- *                        Can not copy a non-root Method
- *
- * Gson 2.10.1's <clinit> runs this exact sequence to set up its
- * RecordSupportedHelper, and the resulting exception cascaded through
- * the entire image:
- *
- *     jnative: <clinit> of com/google/gson/internal/reflect/ReflectionHelper
- *              abandoned: ...
- *     Exception in thread "main"
- *         java.lang.IllegalArgumentException:
- *             GSON (2.10.1) cannot handle io.github.kubyk01.Main$Person
- *
- * The fix is to leave `root` at its calloc-initialised value of NULL.
- * Because `jnative_alloc_object_at_least()` uses calloc(1, size), the
- * root slot is already zero. The bounds-checked write below is retained
- * purely as an explicit no-op for the reader — it stores NULL (the value
- * the slot already has), which is idempotent and keeps the invariant
- * visible at every call site. The guard still protects against a wild
- * offset from a JDK whose Method layout changed and in which
- * JNATIVE_METHOD_ROOT_OFFSET ended up pointing outside the object.
- *
- * The same reasoning and the same fix apply to
- * create_constructor_mirror().
- */
 static void* create_method_mirror(ReflectionClass* declaring_cls,
                                   ReflectionMethod* rm)
 {
@@ -520,12 +377,6 @@ static void* create_method_mirror(ReflectionClass* declaring_cls,
                 jnative_annotation_bytes(am->annotation_default, am->annotation_default_len);
     }
 
-    /*
-     * root MUST be NULL for the mirror to be a valid "original" Method.
-     * jnative_alloc_object_at_least() calloc()s the storage, so the slot
-     * is already NULL; the store below is a self-documenting no-op that
-     * also re-applies the bounds guard. See the long comment above.
-     */
     if (jnative_root_offset_is_sane(JNATIVE_METHOD_ROOT_OFFSET)) {
         *(void**)((char*)method + JNATIVE_METHOD_ROOT_OFFSET) = NULL;
     }
@@ -533,19 +384,6 @@ static void* create_method_mirror(ReflectionClass* declaring_cls,
     return method;
 }
 
-/*
- * Build a java.lang.reflect.Constructor from a native
- * ReflectionConstructor descriptor.
- *
- * Same non-null contract for both parameterTypes and exceptionTypes as
- * create_method_mirror above.
- *
- * The same `root == NULL` invariant applies here: Constructor.copy()
- * begins with exactly the same check as Method.copy() and rejects a
- * source whose `root != null`. The mirror produced by this routine is
- * an ORIGINAL — root stays NULL until the JDK's first copy() sets it to
- * point back at the mirror.
- */
 static void* create_constructor_mirror(ReflectionClass* declaring_cls,
                                        ReflectionConstructor* rc_ctor)
 {
@@ -650,78 +488,11 @@ int __jnative_fn_java_lang_Class_isPrimitive___Z(void* this_cls) {
 
 /* ============================================================================
  * Class.getName() / Class.initClassName() — cached dotted class name.
- *
- * Both the JDK-level Class.getName() and the native initClassName() are
- * specified to return the same thing: the binary name of the class, with
- * every '/' replaced by '.'. (For array types, the JVM descriptor is kept
- * verbatim: "[I", "[Ljava.lang.String;", "[[I" — only the '/' characters
- * inside the "L...;" component are folded, which is exactly what the
- * documented JDK behaviour requires.)
- *
- * The JDK-level implementation of Class.getName() caches the result in the
- * Class object's `name` field (see java.base/java/lang/Class.java:
- *
- *     public String getName() {
- *         String name = this.name;
- *         if (name == null) {
- *             name = initClassName();
- *             this.name = name;
- *         }
- *         return name;
- *     }
- *
- * ). In this runtime, that field lives at offset 8 of the Class mirror
- * (ReflectionClass.name in jnative_runtime.h), is emitted as "i8* null" in
- * every @refclass_* constant, and is *supposed* to be written back by the
- * emitted IR the first time the JDK path runs. In practice that write does
- * not take effect: profiling shows initClassName being called on every
- * single getName(), and because initClassName delegates to
- * __jnative_make_string_obj -> jnative_array_alloc("[B") ->
- * jnative_class_by_name("[B"), which is a linear scan over
- * reflect_all_classes[], the cost is O(N) per call — 29 % of the whole
- * benchmark in the report.
- *
- * To make the caching independent of the emitted bytecode, both C functions
- * below publish the result into the same slot the JDK path reads from:
- *
- *     1. Load the `name` slot at offset 8 with acquire semantics.
- *     2. If it is non-NULL, return it directly (fast path, O(1)).
- *     3. Otherwise compute the dotted name, publish it into the slot with
- *        a release store, and return it.
- *
- * The publish is a compare-and-swap against NULL, so if two threads race on
- * the first call they both end up returning the same String — the loser's
- * computed String is leaked (one per class, only under contention) and the
- * winner's is returned. This matches the JDK's own behaviour: the Java
- * field is not synchronized, and a torn write would be a JMM violation
- * anyway, so the JDK code relies on idempotent recomputation under races.
- *
- * After the first call, the fast path is a single acquire-load of the slot.
- * It does not allocate, does not call into __jnative_make_string_obj, and
- * does not touch jnative_class_by_name. The 29 % of the benchmark that was
- * spent recomputing the name every iteration collapses to one-time setup
- * cost per class.
- *
- * Arrays: the descriptor form is preserved as required by the JDK
- * documentation for Class.getName():
- *
- *     [I          -> "[I"
- *     [Ljava/lang/String; -> "[Ljava.lang.String;"
- *     [[Ljava/lang/Object; -> "[[Ljava.lang.Object;"
- *
- * because the transformation is a pure '/' -> '.' substitution: the leading
- * '[' characters, the primitive single-letter codes, and the surrounding
- * 'L' / ';' all pass through unchanged.
  * ========================================================================== */
 
 static void* cached_dotted_class_name(struct ReflectionClass* cls) {
     if (cls == NULL) return NULL;
 
-    /* Fast path: another caller (either the JDK bytecode path or a
-     * previous invocation of this function) already published the name.
-     * The acquire barrier pairs with the release in the CAS below, so a
-     * non-NULL slot here implies the backing String's fields are visible
-     * to this thread. */
     void* cached = __atomic_load_n(&cls->name, __ATOMIC_ACQUIRE);
     if (cached != NULL) return cached;
 
@@ -744,12 +515,6 @@ static void* cached_dotted_class_name(struct ReflectionClass* cls) {
 
     if (computed == NULL) return NULL;
 
-    /* Publish into the Class mirror's `name` slot with a release store.
-     * If another thread won the race, discard our duplicate (its memory
-     * is small and only ever allocated once per class per contending
-     * thread) and return the winner's instance — that guarantees all
-     * callers observe the same String object, which is what the JDK's
-     * own caching documents. */
     void* expected = NULL;
     if (!__atomic_compare_exchange_n(&cls->name, &expected, computed, 0,
                                       __ATOMIC_RELEASE, __ATOMIC_ACQUIRE)) {
@@ -911,11 +676,27 @@ void* __jnative_fn_java_lang_Class_getDeclaredClasses0____Ljava_lang_Class_(void
     return array;
 }
 
+/* --------------------------------------------------------------------------
+ * Class.getConstantPool() — cached lookup.
+ *
+ * The target class name is a compile-time constant. The previous
+ * revision performed a linear scan over reflect_all_classes[] on
+ * every call (~7 200 calls, 182 M strcmp). Caching the
+ * ReflectionClass* once via jn_once removes both the scan and the
+ * per-call hash computation.
+ * ------------------------------------------------------------------------ */
+static struct ReflectionClass* constant_pool_class;
+static jn_once_t constant_pool_once = JN_ONCE_INIT;
+
+static void constant_pool_init(void) {
+    constant_pool_class = find_registered_class("jdk/internal/reflect/ConstantPool");
+}
+
 void* __jnative_fn_java_lang_Class_getConstantPool___Ljdk_internal_reflect_ConstantPool_(void* this_cls) {
     if (this_cls == NULL) return NULL;
-    struct ReflectionClass* cp_cls = find_registered_class("jdk/internal/reflect/ConstantPool");
-    if (!cp_cls) return NULL;
-    void* cp = allocate_reflection_object(cp_cls);
+    jn_once(&constant_pool_once, constant_pool_init);
+    if (constant_pool_class == NULL) return NULL;
+    void* cp = allocate_reflection_object(constant_pool_class);
     if (cp != NULL) *(void**)((char*)cp + 8) = this_cls;
     return cp;
 }
@@ -986,17 +767,59 @@ void __jnative_fn_java_lang_Class_registerNatives___V(void) {
  * Class.forName0
  * ------------------------------------------------------------------------ */
 
+/*
+ * Hash-map over jnative_lazy_clinit_map, keyed by ReflectionClass*.
+ *
+ * The previous linear scan over 5 560 entries ran on every
+ * Class.forName(initialize=true). Same construction as the nested-
+ * class table above: open addressing, pointer hash, built once under
+ * jn_once. The map only ever grows during startup; afterwards every
+ * lookup is O(1).
+ */
+static const struct JNativeLazyClinitEntryC** lazy_table;
+static size_t lazy_mask;
+static jn_once_t lazy_once = JN_ONCE_INIT;
+
+static size_t lazy_hash(const void* p) {
+    uintptr_t v = (uintptr_t)p;
+    v ^= v >> 17;
+    v *= (uintptr_t)0x9E3779B97F4A7C15ull;
+    return (size_t)(v ^ (v >> 29));
+}
+
+static void lazy_init(void) {
+    if ((uintptr_t)&jnative_lazy_clinit_map_size == 0) return;
+    int64_t n = jnative_lazy_clinit_map_size;
+    if (n <= 0) return;
+    size_t cap = 16;
+    while (cap < (size_t)n * 2) cap <<= 1;
+    const struct JNativeLazyClinitEntryC** table =
+        calloc(cap, sizeof(*table));
+    if (table == NULL) return;
+    for (int64_t i = 0; i < n; i++) {
+        struct ReflectionClass* c = jnative_lazy_clinit_map[i].cls;
+        if (c == NULL) continue;
+        size_t h = lazy_hash(c) & (cap - 1);
+        while (table[h] != NULL) h = (h + 1) & (cap - 1);
+        table[h] = &jnative_lazy_clinit_map[i];
+    }
+    lazy_mask = cap - 1;
+    lazy_table = table;
+}
+
 static void run_lazy_clinit_if_present(struct ReflectionClass* cls) {
     if (cls == NULL) return;
-    const int64_t size = jnative_lazy_clinit_map_size;
-    if (size <= 0) return;
-    for (int64_t i = 0; i < size; i++) {
-        if (jnative_lazy_clinit_map[i].cls == cls) {
+    jn_once(&lazy_once, lazy_init);
+    if (lazy_table == NULL) return;
+    size_t h = lazy_hash(cls) & lazy_mask;
+    while (lazy_table[h] != NULL) {
+        if (lazy_table[h]->cls == cls) {
             void (*wrapper)(void) =
-                (void (*)(void))jnative_lazy_clinit_map[i].wrapper;
+                (void (*)(void))lazy_table[h]->wrapper;
             if (wrapper != NULL) wrapper();
             return;
         }
+        h = (h + 1) & lazy_mask;
     }
 }
 
@@ -1088,26 +911,6 @@ void* __jnative_fn_java_lang_Class_getGenericSignature0___Ljava_lang_String_(voi
     return NULL;
 }
 
-/*
- * private native Method[] getDeclaredMethods0(boolean publicOnly);
- *
- * Walks ReflectionClass.methods and builds a java.lang.reflect.Method
- * per entry. Returns a zero-length array only when the class genuinely
- * has no methods in the emitted metadata.
- *
- * This is not optional. MethodHandles.Lookup.findVarHandle() resolves
- * through MemberName.Factory.resolve -> MethodHandleNatives.resolve,
- * which reports failure by way of a ReflectiveOperationException; the
- * <clinit> of Striped64, Striped64$Cell, AtomicReference,
- * AtomicBoolean, AtomicMarkableReference, ConcurrentSkipListMap,
- * LinkedTransferQueue and FutureTask all catch exactly that and rethrow
- * it as an ExceptionInInitializerError.
- *
- * The implementation is deliberately defensive about the metadata
- * array: entries whose `name` or `descriptor` pointer is NULL are
- * skipped rather than dereferenced, and a top-level NULL in `rc->methods`
- * terminates the walk without crashing.
- */
 void* __jnative_fn_java_lang_Class_getDeclaredMethods0__Z__Ljava_lang_reflect_Method_(
         void* this_cls, int32_t public_only) {
     if (this_cls == NULL) {
@@ -1151,13 +954,6 @@ void* __jnative_fn_java_lang_Class_getDeclaredMethods0__Z__Ljava_lang_reflect_Me
     return array;
 }
 
-/*
- * private native Field[] getDeclaredFields0(boolean publicOnly);
- *
- * Walks ReflectionClass.fields and builds a java.lang.reflect.Field per
- * entry. Defensive about NULL name/descriptor pointers, same as the
- * method variant above.
- */
 void* __jnative_fn_java_lang_Class_getDeclaredFields0__Z__Ljava_lang_reflect_Field_(
         void* this_cls, int32_t public_only) {
     if (this_cls == NULL) {
@@ -1197,11 +993,6 @@ void* __jnative_fn_java_lang_Class_getDeclaredFields0__Z__Ljava_lang_reflect_Fie
     return array;
 }
 
-/*
- * private native Constructor<T>[] getDeclaredConstructors0(boolean publicOnly);
- *
- * Same shape as getDeclaredMethods0, over ReflectionClass.constructors.
- */
 void* __jnative_fn_java_lang_Class_getDeclaredConstructors0__Z__Ljava_lang_reflect_Constructor_(
         void* this_cls, int32_t public_only) {
     if (this_cls == NULL) {
@@ -1321,9 +1112,6 @@ void* __jnative_override_Class_getResourceAsStream(void* this_class,
 
     const JNativeResourceEntry* res = jnative_find_resource(lookup_path, lookup_len);
     if (res == NULL) {
-        /* Not embedded: like the JDK, ask the class's loader, which reads the
-         * runtime classpath jars (e.g. spring-web's CodecConfigurer.properties
-         * via CodecConfigurerFactory.class). Boot classes have no loader. */
         if (fn_java_lang_ClassLoader_getResourceAsStream__Ljava_lang_String__Ljava_io_InputStream_ == NULL)
             return NULL;
         void* loader = __jnative_override_java_lang_Class_getClassLoader(this_class);
@@ -1362,6 +1150,7 @@ void* __jnative_override_java_lang_Class_getClassLoader(void* self) {
     run_lazy_clinit_if_present(jnative_class_by_name("java/lang/ClassLoader"));
     return fn_java_lang_ClassLoader_getSystemClassLoader___Ljava_lang_ClassLoader_();
 }
+
 typedef struct {
     ReflectionClass* cls;
     int32_t          version;
