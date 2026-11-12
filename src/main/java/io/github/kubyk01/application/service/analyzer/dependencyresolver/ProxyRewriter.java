@@ -5,13 +5,14 @@ import org.objectweb.asm.ClassVisitor;
 import org.objectweb.asm.ClassWriter;
 import org.objectweb.asm.MethodVisitor;
 import org.objectweb.asm.Opcodes;
+import org.objectweb.asm.Type;
 
 final class ProxyRewriter {
 
     static final String PROXY = "java/lang/reflect/Proxy";
     private static final String SUPPORT = "io/github/kubyk01/application/service/analyzer/reachabilityanalysis/annotation/runtime/JNativeProxySupport";
-    private static final String GET_CTOR_DESC =
-        "(Ljava/lang/Class;Ljava/lang/ClassLoader;[Ljava/lang/Class;)Ljava/lang/reflect/Constructor;";
+    private static final String GET_CTOR_SUFFIX =
+        "Ljava/lang/ClassLoader;[Ljava/lang/Class;)Ljava/lang/reflect/Constructor;";
     private static final String IS_PROXY_DESC = "(Ljava/lang/Class;)Z";
 
     private ProxyRewriter() {}
@@ -24,10 +25,16 @@ final class ProxyRewriter {
             public MethodVisitor visitMethod(int access, String name, String descriptor,
                                              String signature, String[] exceptions) {
                 MethodVisitor mv = super.visitMethod(access, name, descriptor, signature, exceptions);
-                if ("getProxyConstructor".equals(name) && GET_CTOR_DESC.equals(descriptor)) {
+                if ("getProxyConstructor".equals(name) && (access & Opcodes.ACC_STATIC) != 0
+                        && descriptor.endsWith(GET_CTOR_SUFFIX)) {
+                    Type[] args = Type.getArgumentTypes(descriptor);
+                    int loaderSlot = 0;
+                    for (int i = 0; i < args.length - 2; i++) {
+                        loaderSlot += args[i].getSize();
+                    }
                     mv.visitCode();
-                    mv.visitVarInsn(Opcodes.ALOAD, 1);
-                    mv.visitVarInsn(Opcodes.ALOAD, 2);
+                    mv.visitVarInsn(Opcodes.ALOAD, loaderSlot);
+                    mv.visitVarInsn(Opcodes.ALOAD, loaderSlot + 1);
                     mv.visitMethodInsn(Opcodes.INVOKESTATIC, SUPPORT, "proxyConstructor",
                         "(Ljava/lang/ClassLoader;[Ljava/lang/Class;)Ljava/lang/reflect/Constructor;", false);
                     mv.visitInsn(Opcodes.ARETURN);

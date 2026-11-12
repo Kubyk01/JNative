@@ -264,6 +264,7 @@ public class Compiler implements CompilerPort {
 
             linkCmd.add("-flto=thin");
             linkCmd.add("-O" + effectiveOptLevel);
+            linkCmd.add("-g");
 
             if (msvcLinker) {
                 if (!isAvailable("lld-link")) {
@@ -1397,7 +1398,8 @@ public class Compiler implements CompilerPort {
         for (String f : definedFunctions) {
             if (f.startsWith("__destruct_")) {
                 exports.add(f);
-            } else if (f.startsWith("fn_") && f.endsWith("__clinit____V")) {
+            } else if (f.startsWith("fn_")
+                    && (f.endsWith("__clinit____V") || f.endsWith("__init____V"))) {
                 exports.add(f);
             }
         }

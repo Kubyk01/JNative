@@ -1561,6 +1561,7 @@ public class LlvmGenerator implements LlvmGeneratorPort {
         List<ClinitScheduleEntry> currentBatch = new ArrayList<>();
         int batchIdCounter = 0;
         boolean jniPreloaded = false;
+        boolean systemPropsInitialized = false;
         globals.append("declare void @__jnative_jni_preload_bundled()\n");
 
         for (ClinitScheduleEntry entry : clinitSchedule) {
@@ -1594,6 +1595,9 @@ public class LlvmGenerator implements LlvmGeneratorPort {
                 // the result. The arguments are taken from the phase's real
                 // signature, so initPhase2(ZZ)I and initPhase1()V are
                 // handled correctly and without hard-coding.
+                if ("java/lang/System".equals(f.getOwnerClass()) && name.contains("_initPhase1_")) {
+                    systemPropsInitialized = true;
+                }
                 Type retType = f.getReturnType();
                 String retLlvm = LlvmTypeMapper.toLlvmType(retType);
 
@@ -1721,9 +1725,11 @@ public class LlvmGenerator implements LlvmGeneratorPort {
         // after the general <clinit> schedule, so any <clinit> that read
         // the bootstrap table has already seen a consistent snapshot.
         // ------------------------------------------------------------------
-        sb.append("  %final_props = call i8* @__jnative_make_bootstrap_props(")
-            .append(offsetArgs).append(")\n");
-        sb.append("  store i8* %final_props, i8** @gv_java_lang_System_props\n");
+        if (!systemPropsInitialized) {
+            sb.append("  %final_props = call i8* @__jnative_make_bootstrap_props(")
+                .append(offsetArgs).append(")\n");
+            sb.append("  store i8* %final_props, i8** @gv_java_lang_System_props\n");
+        }
 
         // ------------------------------------------------------------------
         // End of initializers

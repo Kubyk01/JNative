@@ -242,7 +242,113 @@ static char* resolve_class_path(void) {
     return out;
 }
 
+#if defined(_WIN32)
+static const char* wide_to_utf8(const wchar_t* w, char* buf, size_t bufsz) {
+    if (WideCharToMultiByte(CP_UTF8, 0, w, -1, buf, (int)bufsz, NULL, NULL) <= 0) buf[0] = '\0';
+    return buf;
+}
+
+static const char* env_utf8(const wchar_t* name, char* buf, size_t bufsz) {
+    wchar_t w[PATH_MAX];
+    DWORD n = GetEnvironmentVariableW(name, w, PATH_MAX);
+    if (n == 0 || n >= PATH_MAX) return NULL;
+    wide_to_utf8(w, buf, bufsz);
+    return buf[0] != '\0' ? buf : NULL;
+}
+#else
+#include <sys/utsname.h>
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#endif
+#endif
+
+static const char* resolve_file_separator(void) {
+#if defined(_WIN32)
+    return "\\";
+#else
+    return "/";
+#endif
+}
+
+static const char* resolve_path_separator(void) {
+#if defined(_WIN32)
+    return ";";
+#else
+    return ":";
+#endif
+}
+
+static const char* resolve_line_separator(void) {
+#if defined(_WIN32)
+    return "\r\n";
+#else
+    return "\n";
+#endif
+}
+
+static void resolve_os(char* name, size_t namesz, char* version, size_t versionsz) {
+    name[0] = '\0';
+    version[0] = '\0';
+#if defined(_WIN32)
+    typedef LONG (WINAPI *rtl_get_version_fn)(PRTL_OSVERSIONINFOEXW);
+    RTL_OSVERSIONINFOEXW vi;
+    memset(&vi, 0, sizeof(vi));
+    vi.dwOSVersionInfoSize = sizeof(vi);
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    rtl_get_version_fn get_version = ntdll != NULL
+        ? (rtl_get_version_fn)(void*)GetProcAddress(ntdll, "RtlGetVersion") : NULL;
+    if (get_version == NULL || get_version(&vi) != 0) {
+        snprintf(name, namesz, "Windows (unknown)");
+        return;
+    }
+    DWORD major = vi.dwMajorVersion, minor = vi.dwMinorVersion, build = vi.dwBuildNumber;
+    int workstation = vi.wProductType == VER_NT_WORKSTATION;
+    const char* n = "Windows (unknown)";
+    if (major == 10 && minor == 0) {
+        if (workstation) n = build >= 22000 ? "Windows 11" : "Windows 10";
+        else if (build >= 26100) n = "Windows Server 2025";
+        else if (build >= 20348) n = "Windows Server 2022";
+        else if (build >= 17677) n = "Windows Server 2019";
+        else n = "Windows Server 2016";
+    } else if (major == 6 && minor == 3) {
+        n = workstation ? "Windows 8.1" : "Windows Server 2012 R2";
+    } else if (major == 6 && minor == 2) {
+        n = workstation ? "Windows 8" : "Windows Server 2012";
+    } else if (major == 6 && minor == 1) {
+        n = workstation ? "Windows 7" : "Windows Server 2008 R2";
+    } else if (major == 6 && minor == 0) {
+        n = workstation ? "Windows Vista" : "Windows Server 2008";
+    }
+    snprintf(name, namesz, "%s", n);
+    snprintf(version, versionsz, "%lu.%lu", (unsigned long)major, (unsigned long)minor);
+#else
+    struct utsname u;
+    if (uname(&u) != 0) return;
+#if defined(__APPLE__)
+    snprintf(name, namesz, "Mac OS X");
+    size_t len = versionsz;
+    if (sysctlbyname("kern.osproductversion", version, &len, NULL, 0) != 0 || version[0] == '\0') {
+        snprintf(version, versionsz, "%s", u.release);
+    }
+#else
+    snprintf(name, namesz, "%s", u.sysname);
+    snprintf(version, versionsz, "%s", u.release);
+#endif
+#endif
+}
+
+extern int32_t __jnative_fn_java_lang_Class_getClassFileVersion0___I(void* this_class);
+
+static int32_t resolve_class_file_major(void) {
+    return __jnative_fn_java_lang_Class_getClassFileVersion0___I(find_class("java/lang/Object")) & 0xFFFF;
+}
+
 static const char* resolve_tmpdir(char* buf, size_t bufsz) {
+#if defined(_WIN32)
+    wchar_t w[PATH_MAX];
+    DWORD n = GetTempPathW(PATH_MAX, w);
+    if (bufsz > 0 && n > 0 && n < PATH_MAX) return wide_to_utf8(w, buf, bufsz);
+#endif
     if (bufsz == 0) return "/tmp";
 
     const char* env = getenv("TMPDIR");
@@ -288,6 +394,9 @@ static const char* resolve_arch_abi(void) {
 
 static const char* resolve_user_home(char* buf, size_t bufsz) {
     if (bufsz == 0) return "";
+#if defined(_WIN32)
+    if (env_utf8(L"USERPROFILE", buf, bufsz) != NULL) return buf;
+#endif
     const char* home = getenv("HOME");
     if (home == NULL || home[0] == '\0') home = "/";
     strncpy(buf, home, bufsz - 1);
@@ -297,6 +406,11 @@ static const char* resolve_user_home(char* buf, size_t bufsz) {
 
 static const char* resolve_user_name(char* buf, size_t bufsz) {
     if (bufsz == 0) return "";
+#if defined(_WIN32)
+    wchar_t wuser[256];
+    DWORD wlen = 256;
+    if (GetUserNameW(wuser, &wlen) && wuser[0] != L'\0') return wide_to_utf8(wuser, buf, bufsz);
+#endif
     const char* user = getenv("USER");
     if (user == NULL || user[0] == '\0') user = getenv("LOGNAME");
     if (user == NULL || user[0] == '\0') user = "user";
@@ -576,16 +690,20 @@ void* __jnative_fn_jdk_internal_util_SystemProps_Raw_platformProperties____Ljava
     string_array_set(arr, RAW_NDX(format_language),  lang_buf);
     string_array_set(arr, RAW_NDX(format_country),   country_buf);
 
+    char os_name_buf[64];
+    char os_version_buf[64];
+    resolve_os(os_name_buf, sizeof(os_name_buf), os_version_buf, sizeof(os_version_buf));
+
     string_array_set(arr, RAW_NDX(file_encoding),   "UTF-8");
     string_array_set(arr, RAW_NDX(native_encoding), "UTF-8");
-    string_array_set(arr, RAW_NDX(file_separator),  "/");
+    string_array_set(arr, RAW_NDX(file_separator),  resolve_file_separator());
     string_array_set(arr, RAW_NDX(java_io_tmpdir),
                      resolve_tmpdir(tmpdir_buf, sizeof(tmpdir_buf)));
-    string_array_set(arr, RAW_NDX(line_separator),  "\n");
+    string_array_set(arr, RAW_NDX(line_separator),  resolve_line_separator());
     string_array_set(arr, RAW_NDX(os_arch),         resolve_os_arch());
-    string_array_set(arr, RAW_NDX(os_name),         "Linux");
-    string_array_set(arr, RAW_NDX(os_version),      "");
-    string_array_set(arr, RAW_NDX(path_separator),  ":");
+    string_array_set(arr, RAW_NDX(os_name),         os_name_buf);
+    string_array_set(arr, RAW_NDX(os_version),      os_version_buf);
+    string_array_set(arr, RAW_NDX(path_separator),  resolve_path_separator());
 
     string_array_set(arr, RAW_NDX(stderr_encoding), "UTF-8");
     string_array_set(arr, RAW_NDX(stdin_encoding),  "UTF-8");
@@ -780,15 +898,23 @@ void* __jnative_make_bootstrap_props(
     JNATIVE_INSERT("user.language", lang_buf);
     JNATIVE_INSERT("user.country",  country_buf);
 
-    JNATIVE_INSERT("java.version",               "21.0.0");
-    JNATIVE_INSERT("java.version.date",          "2026-09-19");
+    char os_name_buf[64];
+    char os_version_buf[64];
+    resolve_os(os_name_buf, sizeof(os_name_buf), os_version_buf, sizeof(os_version_buf));
+    int32_t class_major = resolve_class_file_major();
+    char feature_buf[16];
+    char class_version_buf[16];
+    snprintf(feature_buf, sizeof(feature_buf), "%d", (int)(class_major - 44));
+    snprintf(class_version_buf, sizeof(class_version_buf), "%d.0", (int)class_major);
+
+    JNATIVE_INSERT("java.version",               feature_buf);
     JNATIVE_INSERT("java.vendor",                "jnative");
     JNATIVE_INSERT("java.vendor.url",            "https://github.com/kubyk01/jnative");
     JNATIVE_INSERT("java.vendor.version",        "jnative");
-    JNATIVE_INSERT("java.specification.version", "21");
+    JNATIVE_INSERT("java.specification.version", feature_buf);
     JNATIVE_INSERT("java.specification.vendor",  "jnative");
     JNATIVE_INSERT("java.specification.name",    "Java Platform API Specification");
-    JNATIVE_INSERT("java.vm.specification.version", "21");
+    JNATIVE_INSERT("java.vm.specification.version", feature_buf);
     JNATIVE_INSERT("java.vm.specification.vendor",  "jnative");
     JNATIVE_INSERT("java.vm.specification.name",    "Java Virtual Machine Specification");
     JNATIVE_INSERT("java.vm.version",            "0.1");
@@ -799,13 +925,13 @@ void* __jnative_make_bootstrap_props(
     JNATIVE_INSERT("jdk.reflect.useNativeAccessorOnly", "true");
     JNATIVE_INSERT("jdk.reflect.useDirectMethodHandle", "methods");
 
-    JNATIVE_INSERT("os.name", "Linux");
+    JNATIVE_INSERT("os.name", os_name_buf);
     JNATIVE_INSERT("os.arch", resolve_os_arch());
-    JNATIVE_INSERT("os.version", "");
+    JNATIVE_INSERT("os.version", os_version_buf);
 
-    JNATIVE_INSERT("file.separator",             "/");
-    JNATIVE_INSERT("path.separator",             ":");
-    JNATIVE_INSERT("line.separator",             "\n");
+    JNATIVE_INSERT("file.separator",             resolve_file_separator());
+    JNATIVE_INSERT("path.separator",             resolve_path_separator());
+    JNATIVE_INSERT("line.separator",             resolve_line_separator());
     JNATIVE_INSERT("file.encoding",              "UTF-8");
     JNATIVE_INSERT("native.encoding",            "UTF-8");
     JNATIVE_INSERT("stdin.encoding",             "UTF-8");
@@ -814,7 +940,7 @@ void* __jnative_make_bootstrap_props(
     JNATIVE_INSERT("sun.jnu.encoding",           "UTF-8");
     JNATIVE_INSERT("sun.io.unicode.encoding",    "UnicodeLittle");
 
-    JNATIVE_INSERT("java.class.version",         "65.0");
+    JNATIVE_INSERT("java.class.version",         class_version_buf);
     JNATIVE_INSERT("sun.nio.MaxDirectMemorySize", "-1");
     JNATIVE_INSERT("sun.nio.PageAlignDirectMemory", "false");
 
