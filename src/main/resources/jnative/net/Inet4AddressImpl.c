@@ -38,40 +38,9 @@
  * given hostname, family and 4-byte IPv4 address. Returns NULL if
  * either of the required classes is not in the reflection registry or
  * if any allocation fails.
- *
- * The field layout used here matches LlvmGlobalEmitter.getFieldOffset
- * for the two target classes:
- *
- *   java.net.InetAddress:
- *       offset  8 : String canonicalHostName
- *       offset 16 : InetAddressHolder holder
- *
- *   java.net.InetAddress$InetAddressHolder:
- *       offset  8 : String hostName
- *       offset 16 : int    family
- *       offset 20 : byte[] addressBytes
  */
 static void* make_inet4_address(const uint8_t* bytes, const char* hostname) {
-    ReflectionClass* ia_cls =
-        jnative_class_by_name("java/net/InetAddress");
-    ReflectionClass* h_cls =
-        jnative_class_by_name("java/net/InetAddress$InetAddressHolder");
-    if (!ia_cls || !h_cls) return NULL;
-
-    void* holder = jnative_alloc_object(h_cls);
-    if (!holder) return NULL;
-
-    *(void**)((char*)holder + 8)    = jnative_string(hostname);
-    *(int32_t*)((char*)holder + 16) = JAVA_IPV4;
-    *(void**)((char*)holder + 20)   = jnative_byte_array(bytes, 4);
-
-    void* ia = jnative_alloc_object(ia_cls);
-    if (!ia) { free(holder); return NULL; }
-
-    *(void**)((char*)ia + 8)  = NULL;
-    *(void**)((char*)ia + 16) = holder;
-
-    return ia;
+    return jnative_make_inet_address(bytes, 4, hostname);
 }
 
 /*

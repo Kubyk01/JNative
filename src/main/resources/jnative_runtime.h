@@ -1381,6 +1381,59 @@ static inline void* jnative_byte_array(const void* data, int32_t len)
     return arr;
 }
 
+static inline int jnative_field_offset(ReflectionClass* cls, const char* name)
+{
+    if (cls == NULL || cls->fields == NULL) return -1;
+    for (int i = 0; cls->fields[i] != NULL; i++) {
+        if (strcmp((const char*)cls->fields[i]->name, name) == 0) return cls->fields[i]->offset;
+    }
+    return -1;
+}
+
+static inline void* jnative_make_inet_address(const uint8_t* bytes, int len, const char* hostname)
+{
+    ReflectionClass* h_cls = jnative_class_by_name("java/net/InetAddress$InetAddressHolder");
+    int o_orig = jnative_field_offset(h_cls, "originalHostName");
+    int o_host = jnative_field_offset(h_cls, "hostName");
+    int o_addr = jnative_field_offset(h_cls, "address");
+    int o_family = jnative_field_offset(h_cls, "family");
+    if (o_orig < 0 || o_host < 0 || o_addr < 0 || o_family < 0) return NULL;
+    if (len != 4 && len != 16) return NULL;
+
+    ReflectionClass* cls = jnative_class_by_name(len == 4 ? "java/net/Inet4Address" : "java/net/Inet6Address");
+    int o_holder = jnative_field_offset(cls, "holder");
+    if (o_holder < 0) return NULL;
+
+    void* holder = jnative_alloc_object(h_cls);
+    if (holder == NULL) return NULL;
+    void* host = jnative_string(hostname);
+    *(void**)((char*)holder + o_orig) = host;
+    *(void**)((char*)holder + o_host) = host;
+
+    void* ia;
+    if (len == 4) {
+        ia = jnative_alloc_object(cls);
+        if (ia == NULL) { free(holder); return NULL; }
+        *(int32_t*)((char*)holder + o_addr) = (int32_t)(((uint32_t)bytes[0] << 24) | ((uint32_t)bytes[1] << 16)
+                                                       | ((uint32_t)bytes[2] << 8) | (uint32_t)bytes[3]);
+        *(int32_t*)((char*)holder + o_family) = 1;
+    } else {
+        ReflectionClass* h6_cls = jnative_class_by_name("java/net/Inet6Address$Inet6AddressHolder");
+        int o_holder6 = jnative_field_offset(cls, "holder6");
+        int o_ip = jnative_field_offset(h6_cls, "ipaddress");
+        if (o_holder6 < 0 || o_ip < 0) { free(holder); return NULL; }
+        void* holder6 = jnative_alloc_object(h6_cls);
+        if (holder6 == NULL) { free(holder); return NULL; }
+        ia = jnative_alloc_object(cls);
+        if (ia == NULL) { free(holder); free(holder6); return NULL; }
+        *(void**)((char*)holder6 + o_ip) = jnative_byte_array(bytes, 16);
+        *(int32_t*)((char*)holder + o_family) = 2;
+        *(void**)((char*)ia + o_holder6) = holder6;
+    }
+    *(void**)((char*)ia + o_holder) = holder;
+    return ia;
+}
+
 static inline void* jnative_ref_array_of_class(void** items, int32_t count,
                                                const char* klass_name)
 {
