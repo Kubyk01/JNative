@@ -663,6 +663,22 @@ typedef struct {
 extern const JNativeResourceEntry jnative_builtin_resources[]     JNATIVE_WEAK;
 extern const int32_t jnative_builtin_resources_count             JNATIVE_WEAK;
 
+typedef struct {
+    const char* path;
+    uint64_t offset;
+    uint64_t size;
+} JNativeRuntimeFile;
+
+extern const unsigned char jnative_runtime_data[];
+extern const uint64_t jnative_runtime_data_size;
+extern const JNativeRuntimeFile jnative_runtime_files[];
+extern const uint64_t jnative_runtime_files_count;
+extern const char* const jnative_runtime_classpath[];
+extern const char* __jnative_runtime_java_home(void);
+extern char* __jnative_runtime_path(const char* name);
+extern char* __jnative_runtime_class_path(void);
+extern const unsigned char* __jnative_runtime_file_data(const char* path, uint64_t* size);
+
 /* ========================================================================
  *  Runtime functions (defined in jnative_runtime.c)
  * ======================================================================== */
@@ -1119,6 +1135,8 @@ extern const JNativeResourceEntry* jnative_find_resource(const char* path,
  * JAVA_ARR_LENGTH_OFFSET, and its payload starts at JAVA_ARR_HDR.
  */
 extern void* __jnative_make_byte_array_input_stream(void* bytes);
+
+extern void* __jnative_new_direct_byte_buffer(void* address, int64_t capacity);
 
 /**
  * Drop-in replacement for the generated

@@ -1481,43 +1481,23 @@ JNATIVE_NORETURN static void jn_throw_unsatisfied_link(const char* owner,
 
 extern const char* const __jnative_bundled_jni_libraries[];
 
-static size_t jn_executable_dir(char* buf, size_t bufsz) {
-#if defined(_WIN32)
-    DWORD n = GetModuleFileNameA(NULL, buf, (DWORD)bufsz);
-    long len = (n > 0 && n < bufsz) ? (long)n : -1;
-#else
-    long len = jn_readlink("/proc/self/exe", buf, bufsz - 1);
-#endif
-    if (len <= 0) return 0;
-    buf[len] = '\0';
-    char* cut = NULL;
-    for (char* p = buf; *p != '\0'; p++) {
-        if (*p == '/' || *p == '\\') cut = p;
-    }
-    if (cut == NULL) return 0;
-    cut[1] = '\0';
-    return strlen(buf);
-}
-
 void __jnative_jni_preload_bundled(void) {
     if (__jnative_bundled_jni_libraries[0] == NULL) return;
-    char dir[4096];
-    size_t dlen = jn_executable_dir(dir, sizeof(dir));
     for (size_t i = 0; __jnative_bundled_jni_libraries[i] != NULL; i++) {
         const char* name = __jnative_bundled_jni_libraries[i];
-        char path[4096 + 256];
-        if (dlen > 0) snprintf(path, sizeof(path), "%s%s", dir, name);
-        else snprintf(path, sizeof(path), "%s", name);
+        char* path = __jnative_runtime_path(name);
         void* handle = dlopen(path, RTLD_NOW | RTLD_GLOBAL);
         if (handle == NULL) {
             const char* err = dlerror();
             fprintf(stderr, "jnative: warning: cannot preload %s: %s\n",
                     path, err != NULL ? err : "unknown error");
+            free(path);
             continue;
         }
         if (!__jnative_jni_register_library(handle, 1)) {
             fprintf(stderr, "jnative: warning: JNI_OnLoad failed for %s\n", path);
         }
+        free(path);
     }
 }
 
@@ -1661,6 +1641,10 @@ static jobject jn_NewDirectByteBuffer(void* env, void* address, jlong capacity) 
         return jn_NewObjectA(env, cls, mid, args);
     }
     return NULL;
+}
+
+void* __jnative_new_direct_byte_buffer(void* address, int64_t capacity) {
+    return jn_NewDirectByteBuffer(NULL, address, capacity);
 }
 
 /* ========================================================================

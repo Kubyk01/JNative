@@ -11,7 +11,7 @@ import io.github.kubyk01.application.service.codegen.NativeOverrideScanner;
 import io.github.kubyk01.application.service.codegen.ResourceEmbedder;
 import io.github.kubyk01.application.service.codegen.llvm.LlvmGenerator;
 import io.github.kubyk01.application.service.analyzer.classanalysis.annotation.cglib.CglibPregenerator;
-import io.github.kubyk01.application.service.compiler.ClasspathExporter;
+import io.github.kubyk01.application.service.compiler.RuntimeClasspath;
 import io.github.kubyk01.application.service.compiler.TargetJdk;
 import io.github.kubyk01.application.service.codegen.llvm.nativepolymorphicfunctionresolver.PolymorphicResolver;
 import io.github.kubyk01.application.service.optimizer.ArrayCoAllocator;
@@ -141,23 +141,18 @@ public class Orchestrator implements OrchestratorPort {
         // --- 2. Class analysis --------------------------------------------
         ClassAnalysis analysis = new ClassAnalysis(resolver);
         analysis.analyze();
-        if (!noCompile && Files.isRegularFile(path)) {
-            Path exePath = outputFile != null ? Paths.get(outputFile) : defaultOutputPath(path, targetPlatform);
-            try {
-                Path classpathDir = ClasspathExporter.export(path, resolver.getScannedJars(), exePath);
-                System.out.println("Runtime classpath exported: " + classpathDir.toAbsolutePath());
-                List<Path> runtimeClasspath = new ArrayList<>();
-                for (String entry : Files.readAllLines(classpathDir.resolve("classpath"))) {
-                    if (!entry.isBlank()) runtimeClasspath.add(classpathDir.resolve(entry.trim()));
-                }
+        if (!noCompile) {
+            try (RuntimeClasspath runtimeClasspath = RuntimeClasspath.create(path, resolver.getScannedJars(),
+                    generatedOutputDirectory().resolve(".jnative-spool"))) {
                 Map<String, byte[]> cglibClasses =
-                    CglibPregenerator.generate(runtimeClasspath, analysis.annotatedApplicationClasses());
+                    CglibPregenerator.generate(runtimeClasspath.entries(), analysis.annotatedApplicationClasses());
                 if (!cglibClasses.isEmpty()) {
                     System.out.println("Pre-generated " + cglibClasses.size() + " CGLIB class(es)");
                     cglibClasses.forEach(analysis::define);
                 }
             } catch (IOException e) {
-                log.error("Failed to export runtime classpath", e);
+                log.error("Failed to prepare runtime classpath", e);
+                return;
             }
         }
         Set<String> lazyOnlyClasses = analysis.lazyOnlyClasses(
@@ -379,8 +374,8 @@ public class Orchestrator implements OrchestratorPort {
         // kind, so no consumer needs to know which source an entry came
         // from.
         List<Map.Entry<String, byte[]>> embedded = new ArrayList<>();
-        embedded.addAll(ResourceEmbedder.collectJavaBaseResources());
-        embedded.addAll(ResourceEmbedder.collectJdkRuntimeData());
+        embedded.addAll(ResourceEmbedder.collectJavaBaseResources(resolver.getRuntimeJavaHome()));
+        embedded.addAll(ResourceEmbedder.collectJdkRuntimeData(resolver.getRuntimeJavaHome()));
         System.out.println("Embedding " + embedded.size()
             + " built-in resource(s) from java.base and JDK runtime data.");
 

@@ -35,6 +35,7 @@ public class Compiler implements CompilerPort {
     private static final String RUNTIME_SOURCE_RESOURCE_PATH = "jnative_runtime.c";
     private static final String RUNTIME_HEADER_RESOURCE_PATH = "jnative_runtime.h";
     private static final String JNI_BRIDGE_RESOURCE_PATH = "jnative_jni_bridge.c";
+    private static final String EMBEDDED_RUNTIME_RESOURCE_PATH = "jnative_embedded_runtime.c";
 
     private static final String PORTABILITY_DIR = "jnative_portability/";
     private static final String PLATFORM_HEADER_RESOURCE_PATH = PORTABILITY_DIR + "jnative_platform.h";
@@ -109,11 +110,13 @@ public class Compiler implements CompilerPort {
         final TargetPlatform target = (targetPlatform != null)
                 ? targetPlatform
                 : TargetPlatform.detectFromBuildHost();
+        RuntimeImageEmbedder.validate(resolver.getRuntimeJavaHome());
 
         Path tempDir = Files.createTempDirectory(BUILD_ROOT_NAME);
         tempDir.toFile().deleteOnExit();
 
-        try {
+        try (RuntimeClasspath runtimeClasspath = RuntimeClasspath.create(
+                resolver.getInputPath(), resolver.getScannedJars(), tempDir)) {
             String compiler = detectCompiler(target);
 
             MsvcToolchain msvcToolchain = null;
@@ -146,6 +149,8 @@ public class Compiler implements CompilerPort {
             Path jniBridgeSource = extractResource(
                     JNI_BRIDGE_RESOURCE_PATH,
                     tempDir.resolve(JNI_BRIDGE_RESOURCE_PATH));
+            Path embeddedRuntimeSource = extractResource(EMBEDDED_RUNTIME_RESOURCE_PATH,
+                    tempDir.resolve(EMBEDDED_RUNTIME_RESOURCE_PATH));
 
             Path portabilityDir = tempDir.resolve("jnative_portability");
             Files.createDirectories(portabilityDir);
@@ -188,27 +193,29 @@ public class Compiler implements CompilerPort {
             Path cDir = tempDir.resolve("c");
             Files.createDirectories(cDir);
 
-            tasks.add(new CompileTask(runtimeSource, cDir.resolve("jnative_runtime.o"), false));
-            tasks.add(new CompileTask(platformSource, cDir.resolve("jnative_platform.o"), false));
-            tasks.add(new CompileTask(portabilitySource, cDir.resolve("jnative_portability.o"), false));
-            tasks.add(new CompileTask(jniBridgeSource, cDir.resolve("jnative_jni_bridge.o"), false));
+            tasks.add(new CompileTask(runtimeSource, cDir.resolve("jnative_runtime.o"), SourceKind.C));
+            tasks.add(new CompileTask(platformSource, cDir.resolve("jnative_platform.o"), SourceKind.C));
+            tasks.add(new CompileTask(portabilitySource, cDir.resolve("jnative_portability.o"), SourceKind.C));
+            tasks.add(new CompileTask(jniBridgeSource, cDir.resolve("jnative_jni_bridge.o"), SourceKind.C));
+            tasks.add(new CompileTask(embeddedRuntimeSource, cDir.resolve("jnative_embedded_runtime.o"), SourceKind.C));
+            List<Path> nativeLibs = resolveNativeLoadOrder(collectNativeLibraries(module,
+                    runtimeClasspath.entries(), target, tempDir.resolve("native-libraries")), target);
+            RuntimeImageEmbedder.Sources runtimeImage = RuntimeImageEmbedder.embed(
+                    resolver.getRuntimeJavaHome(), runtimeClasspath.entries(), nativeLibs, tempDir, target);
+            tasks.add(new CompileTask(runtimeImage.table(), cDir.resolve("jnative_runtime_files.o"), SourceKind.C));
+            tasks.add(new CompileTask(runtimeImage.assembly(), cDir.resolve("jnative_runtime_image.o"), SourceKind.ASSEMBLY));
 
             for (Path src : extraSources) {
                 Path rel = tempDir.relativize(src);
                 Path objWithPath = cDir.resolve(
                         rel.toString().replaceAll("\\.c$", ".o"));
                 Files.createDirectories(objWithPath.getParent());
-                tasks.add(new CompileTask(src, objWithPath, false));
+                tasks.add(new CompileTask(src, objWithPath, SourceKind.C));
             }
-
-            List<Path> nativeLibs = resolveNativeLoadOrder(
-                    collectNativeLibraries(module, resolver, target), target);
-            Path bundledLibsSource = writeBundledLibrariesSource(tempDir, nativeLibs);
-            tasks.add(new CompileTask(bundledLibsSource, cDir.resolve("jnative_bundled_libs.o"), false));
 
             if (target.isWindows()) {
                 Path symtab = writeWindowsSymbolTable(module, llPaths, tempDir, target);
-                tasks.add(new CompileTask(symtab, cDir.resolve("jnative_self_symbols.o"), false));
+                tasks.add(new CompileTask(symtab, cDir.resolve("jnative_self_symbols.o"), SourceKind.C));
             }
 
             int irIndex = 0;
@@ -216,7 +223,7 @@ public class Compiler implements CompilerPort {
                 String base = sanitizeForObjName(ll.getFileName().toString());
                 Path obj = tempDir.resolve("ir")
                         .resolve(String.format("%05d_%s.o", irIndex++, base));
-                tasks.add(new CompileTask(ll, obj, true));
+                tasks.add(new CompileTask(ll, obj, SourceKind.IR));
             }
 
             // ------------------------------------------------------------------
@@ -340,15 +347,6 @@ public class Compiler implements CompilerPort {
 
             appendLinkerLibraries(linkCmd, target);
 
-            // ------------------------------------------------------------------
-            // 6. Native library discovery and bundling.
-            // ------------------------------------------------------------------
-            if (!target.isWindows()) {
-                linkCmd.add("-Wl,--disable-new-dtags");
-                linkCmd.add("-Wl,-rpath,$ORIGIN");
-                linkCmd.add("-Wl,-rpath," + new File(".").getAbsolutePath());
-            }
-
             System.out.println("Linking for target " + target.triple() + "...");
             ProcessBuilder linkBuilder = new ProcessBuilder(linkCmd);
             linkBuilder.inheritIO();
@@ -357,8 +355,6 @@ public class Compiler implements CompilerPort {
                 throw new RuntimeException("Linking failed with exit code " + exit
                         + " (target: " + target.triple() + ")");
             }
-
-            bundleNativeLibraries(exePath, nativeLibs);
 
         } finally {
             Files.walk(tempDir)
@@ -1076,12 +1072,14 @@ public class Compiler implements CompilerPort {
     //  Per-unit compile
     // =====================================================================
 
+    private enum SourceKind { C, IR, ASSEMBLY }
+
     private static final class CompileTask {
         private final Path src;
         private final Path obj;
-        private final boolean isIr;
-        CompileTask(Path src, Path obj, boolean isIr) {
-            this.src = src; this.obj = obj; this.isIr = isIr;
+        private final SourceKind kind;
+        CompileTask(Path src, Path obj, SourceKind kind) {
+            this.src = src; this.obj = obj; this.kind = kind;
         }
     }
 
@@ -1164,17 +1162,25 @@ public class Compiler implements CompilerPort {
         Path parent = task.obj.getParent();
         if (parent != null) Files.createDirectories(parent);
 
+        if (task.kind == SourceKind.ASSEMBLY) {
+            List<String> command = new ArrayList<>(List.of(compiler, "-c", "-x", "assembler"));
+            if (!isMinGwWrapper(compiler)) command.add("--target=" + target.triple());
+            command.addAll(List.of(task.src.toString(), "-o", task.obj.toString()));
+            runCompileCommand(command, task, target);
+            return;
+        }
+
         List<String> command = new ArrayList<>();
         command.add(compiler);
         command.add("-c");
         command.add("-x");
-        command.add(task.isIr ? "ir" : "c");
+        command.add(task.kind == SourceKind.IR ? "ir" : "c");
         command.add("-O" + optimizationLevel);
         command.add(optimizationLevel == 0 ? "-fno-lto" : "-flto=thin");
         command.add("-g");
         command.add("-fno-omit-frame-pointer");
 
-        if (task.isIr) {
+        if (task.kind == SourceKind.IR) {
             command.add("-Wno-override-module");
         } else {
             command.add("-I" + includeDir.toString());
@@ -1205,7 +1211,7 @@ public class Compiler implements CompilerPort {
                 command.add("-D_CRT_NONSTDC_NO_DEPRECATE=1");
                 command.add("-D__USE_MINGW_ANSI_STDIO=1");
             } else {
-                appendWindowsSysrootToCompiler(command, sysroot, task.isIr, target);
+                appendWindowsSysrootToCompiler(command, sysroot, task.kind == SourceKind.IR, target);
                 if (!isMinGwWrapper(compiler)) {
                     command.add("--target=" + target.triple());
                 }
@@ -1225,6 +1231,11 @@ public class Compiler implements CompilerPort {
         command.add("-o");
         command.add(task.obj.toString());
 
+        runCompileCommand(command, task, target);
+    }
+
+    private void runCompileCommand(List<String> command, CompileTask task, TargetPlatform target)
+            throws IOException, InterruptedException {
         ProcessBuilder pb = new ProcessBuilder(command);
         pb.inheritIO();
         int exit = pb.start().waitFor();
@@ -1633,6 +1644,13 @@ public class Compiler implements CompilerPort {
                                              DependencyResolver resolver,
                                              TargetPlatform target)
             throws IOException {
+        Path extractDir = Files.createTempDirectory("jnative-natives-");
+        extractDir.toFile().deleteOnExit();
+        return collectNativeLibraries(module, resolver.getScannedJars(), target, extractDir);
+    }
+
+    private List<Path> collectNativeLibraries(Module module, List<Path> classpath,
+                                              TargetPlatform target, Path extractDir) throws IOException {
 
         boolean usesJni = false;
         for (io.github.kubyk01.domain.ir.Function f : module.getFunctions()) {
@@ -1643,10 +1661,9 @@ public class Compiler implements CompilerPort {
         }
         if (!usesJni) return List.of();
 
-        Path extractDir = Files.createTempDirectory("jnative-natives-");
-        extractDir.toFile().deleteOnExit();
+        Files.createDirectories(extractDir);
         List<Path> result = new ArrayList<>();
-        Set<Path> jars = new LinkedHashSet<>(resolver.getScannedJars());
+        Set<Path> jars = new LinkedHashSet<>(classpath);
         for (Path jar : jars) {
             extractNativeLibraries(jar, target, extractDir, result);
         }
@@ -1655,31 +1672,35 @@ public class Compiler implements CompilerPort {
     }
 
     private void extractNativeLibraries(Path jar, TargetPlatform target,
-                                        Path extractDir, List<Path> out) {
+                                        Path extractDir, List<Path> out) throws IOException {
         String suffix = target.nativeLibrarySuffix();
         try (JarFile jf = new JarFile(jar.toFile())) {
             Enumeration<JarEntry> entries = jf.entries();
             while (entries.hasMoreElements()) {
                 JarEntry e = entries.nextElement();
                 String n = e.getName();
-                if (e.isDirectory() || !n.endsWith(suffix)) continue;
-                if (!n.contains("native/") && !n.contains("natives/")) continue;
+                String base = n.substring(n.lastIndexOf('/') + 1);
+                String lower = base.toLowerCase(Locale.ROOT);
+                if (e.isDirectory() || !(lower.endsWith(suffix)
+                        || suffix.equals(".so") && lower.matches(".*\\.so(?:\\.[0-9]+)+"))) continue;
                 if (!matchesTargetArch(n, target)) continue;
                 if (!matchesTargetOs(n, target)) continue;
-                String base = n.substring(n.lastIndexOf('/') + 1);
                 Path dest = extractDir.resolve(base);
-                if (Files.exists(dest)) continue;
                 byte[] bytes;
                 try (InputStream is = jf.getInputStream(e)) {
                     bytes = is.readAllBytes();
                 }
                 if (!elfMatchesTarget(bytes, target)) continue;
+                if (Files.exists(dest)) {
+                    if (!Arrays.equals(Files.readAllBytes(dest), bytes)) {
+                        throw new IOException("Conflicting native library " + base + " in " + jar);
+                    }
+                    continue;
+                }
                 Files.write(dest, bytes);
                 out.add(dest);
                 log.info("Extracted native library {} from {}", base, jar.getFileName());
             }
-        } catch (IOException e) {
-            log.debug("Skipping JAR {}: {}", jar, e.getMessage());
         }
     }
 
@@ -1824,19 +1845,6 @@ public class Compiler implements CompilerPort {
     //  Native library bundling
     // =====================================================================
 
-    private void bundleNativeLibraries(Path exePath, List<Path> nativeLibs) throws IOException {
-        if (nativeLibs.isEmpty()) return;
-        Path exeDir = exePath.toAbsolutePath().getParent();
-        int copied = 0;
-        for (Path lib : nativeLibs) {
-            Path dest = exeDir.resolve(lib.getFileName().toString());
-            Files.copy(lib, dest, StandardCopyOption.REPLACE_EXISTING);
-            copied++;
-        }
-        System.out.println("Bundled " + copied
-                + " native library/libraries next to " + exePath);
-    }
-
     private List<Path> resolveNativeLoadOrder(List<Path> roots, TargetPlatform target) {
         Set<Path> dirs = new LinkedHashSet<>();
         for (Path lib : roots) {
@@ -1888,23 +1896,6 @@ public class Compiler implements CompilerPort {
             }
         }
         return null;
-    }
-
-    private static Path writeBundledLibrariesSource(Path tempDir, List<Path> libs) throws IOException {
-        StringBuilder sb = new StringBuilder();
-        sb.append("const char* const __jnative_bundled_jni_libraries[] = {\n");
-        for (Path lib : libs) {
-            sb.append("    \"");
-            for (char c : lib.getFileName().toString().toCharArray()) {
-                if (c == '"' || c == '\\') sb.append('\\');
-                sb.append(c);
-            }
-            sb.append("\",\n");
-        }
-        sb.append("    0\n};\n");
-        Path src = tempDir.resolve("jnative_bundled_libs.c");
-        Files.writeString(src, sb.toString());
-        return src;
     }
 
     // =====================================================================

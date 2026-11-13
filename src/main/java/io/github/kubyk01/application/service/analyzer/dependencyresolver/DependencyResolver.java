@@ -102,6 +102,14 @@ public class DependencyResolver {
     private Path targetJavaHome;
     private Set<String> targetModules; // lazily listed from the target image
 
+    public Path getRuntimeJavaHome() {
+        return targetJavaHome != null ? targetJavaHome : Path.of(System.getProperty("java.home"));
+    }
+
+    public Path getInputPath() {
+        return inputArchive;
+    }
+
     /**
      * Absolute path of the top-level input archive, if {@link #scan(Path)}
      * was given a Spring Boot fat jar. Used by {@link #loadFromNestedJarIndex}

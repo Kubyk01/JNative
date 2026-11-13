@@ -184,7 +184,11 @@ public final class ResourceEmbedder {
             return List.of();
         }
 
-        Path tzdb = Paths.get(javaHome, "lib", "tzdb.dat");
+        return collectJdkRuntimeData(Paths.get(javaHome));
+    }
+
+    public static List<Map.Entry<String, byte[]>> collectJdkRuntimeData(Path javaHome) {
+        Path tzdb = javaHome.resolve("lib").resolve("tzdb.dat");
         if (!Files.isRegularFile(tzdb)) {
             System.err.println(
                 "ResourceEmbedder: " + tzdb + " not found; the generated "
@@ -245,16 +249,20 @@ public final class ResourceEmbedder {
      *         source yielded anything
      */
     public static List<Map.Entry<String, byte[]>> collectJavaBaseResources() {
-        List<Map.Entry<String, byte[]>> resources = readAllFromJmod();
+        return collectJavaBaseResources(Paths.get(System.getProperty("java.home")));
+    }
+
+    public static List<Map.Entry<String, byte[]>> collectJavaBaseResources(Path javaHome) {
+        List<Map.Entry<String, byte[]>> resources = readAllFromJmod(javaHome);
 
         if (resources.isEmpty()) {
-            resources = readAllFromJrt();
+            resources = readAllFromJrt(javaHome);
         }
 
         if (resources.isEmpty()) {
             System.err.println(
                 "ResourceEmbedder: no java.base resources could be collected. "
-                    + "Tried $JAVA_HOME/" + JMOD_RELATIVE_PATH
+                    + "Tried " + javaHome.resolve(JMOD_RELATIVE_PATH)
                     + " and jrt:/modules/" + MODULE_NAME + ". "
                     + "Class.getResourceAsStream will return null for every "
                     + "resource, and callers like MimeTable.load() will fail "
@@ -288,9 +296,9 @@ public final class ResourceEmbedder {
      * <p>Returns an empty list when the jmod is absent or unreadable; the
      * caller then falls back to the jrt source.</p>
      */
-    private static List<Map.Entry<String, byte[]>> readAllFromJmod() {
-        Path jmod = locateJmod();
-        if (jmod == null) {
+    private static List<Map.Entry<String, byte[]>> readAllFromJmod(Path javaHome) {
+        Path jmod = javaHome.resolve(JMOD_RELATIVE_PATH);
+        if (!Files.isRegularFile(jmod)) {
             return List.of();
         }
 
@@ -334,38 +342,20 @@ public final class ResourceEmbedder {
      * <p>Used when the JDK ships only a runtime image and no
      * {@code jmods/} directory.</p>
      */
-    private static List<Map.Entry<String, byte[]>> readAllFromJrt() {
-        FileSystem fs;
-        try {
-            fs = getJrtFileSystem();
-        } catch (IOException e) {
-            return List.of();
-        }
-
-        Path root = fs.getPath("/modules/" + MODULE_NAME);
-        if (!Files.isDirectory(root)) {
-            return List.of();
-        }
-
+    private static List<Map.Entry<String, byte[]>> readAllFromJrt(Path javaHome) {
         List<Map.Entry<String, byte[]>> out = new ArrayList<>();
-        try {
-            Files.walk(root)
-                .filter(Files::isRegularFile)
-                .forEach(p -> {
-                    // p = /modules/java.base/sun/net/www/content-types.properties
-                    // Strip the module root and the leading '/'.
-                    String full = p.toString();
-                    String marker = "/modules/" + MODULE_NAME + "/";
-                    int idx = full.indexOf(marker);
-                    if (idx < 0) return;
-                    String stripped = full.substring(idx + marker.length());
-                    if (!keepAsResource(stripped)) return;
-                    try {
-                        out.add(new AbstractMap.SimpleImmutableEntry<>(
-                            stripped, Files.readAllBytes(p)));
-                    } catch (IOException ignored) {
+        try (FileSystem fs = FileSystems.newFileSystem(URI.create("jrt:/"),
+                Map.of("java.home", javaHome.toAbsolutePath().toString()))) {
+            Path root = fs.getPath("/modules/" + MODULE_NAME);
+            if (!Files.isDirectory(root)) return List.of();
+            try (var files = Files.walk(root)) {
+                for (Path file : files.filter(Files::isRegularFile).toList()) {
+                    String name = root.relativize(file).toString();
+                    if (keepAsResource(name)) {
+                        out.add(new AbstractMap.SimpleImmutableEntry<>(name, Files.readAllBytes(file)));
                     }
-                });
+                }
+            }
         } catch (IOException e) {
             return List.of();
         }

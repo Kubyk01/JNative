@@ -89,71 +89,20 @@ static void* make_empty_string_array(void) {
     return jnative_ref_array_of_class(NULL, 0, "[Ljava/lang/String;");
 }
 
-static const char* resolve_java_home(char* buf, size_t bufsz) {
-    if (bufsz == 0) return "";
-
-    const char* env = getenv("JAVA_HOME");
-    if (env && env[0]) {
-        strncpy(buf, env, bufsz - 1);
-        buf[bufsz - 1] = '\0';
-        return buf;
-    }
-
-#if defined(__linux__)
-    ssize_t n = jn_readlink("/proc/self/exe", buf, bufsz - 1);
-    if (n > 0) {
-        buf[n] = '\0';
-        char* slash = strrchr(buf, '/');
-        if (slash && slash != buf) {
-            *slash = '\0';
-            return buf;
-        }
-    }
-#elif defined(__APPLE__)
-    {
-        extern int _NSGetExecutablePath(char* buf, uint32_t* size);
-        uint32_t size = (uint32_t)bufsz;
-        if (_NSGetExecutablePath(buf, &size) == 0) {
-            char* slash = strrchr(buf, '/');
-            if (slash && slash != buf) {
-                *slash = '\0';
-                return buf;
-            }
-        }
-    }
-#endif
-
-    strncpy(buf, "/usr/lib/jnative", bufsz - 1);
-    buf[bufsz - 1] = '\0';
-    return buf;
-}
-
 static const char* resolve_library_path(char* buf, size_t bufsz) {
     if (bufsz == 0) return "";
     buf[0] = '\0';
 #if defined(_WIN32)
-    DWORD n = GetModuleFileNameA(NULL, buf, (DWORD)bufsz);
-    long len = (n > 0 && n < bufsz) ? (long)n : -1;
     const char sep = ';';
     const char* env = getenv("PATH");
 #else
-    long len = jn_readlink("/proc/self/exe", buf, bufsz - 1);
     const char sep = ':';
     const char* env = getenv("LD_LIBRARY_PATH");
 #endif
-    size_t pos = 0;
-    if (len > 0) {
-        buf[len] = '\0';
-        char* cut = NULL;
-        for (char* p = buf; *p != '\0'; p++) {
-            if (*p == '/' || *p == '\\') cut = p;
-        }
-        if (cut == buf) cut++;
-        if (cut != NULL) *cut = '\0';
-        pos = strlen(buf);
-    } else {
-        buf[0] = '\0';
-    }
+    char* libraries = __jnative_runtime_path("native");
+    snprintf(buf, bufsz, "%s", libraries);
+    free(libraries);
+    size_t pos = strlen(buf);
     if (env != NULL && env[0] != '\0') {
         size_t elen = strlen(env);
         if (pos > 0 && pos + 1 < bufsz) buf[pos++] = sep;
@@ -163,83 +112,6 @@ static const char* resolve_library_path(char* buf, size_t bufsz) {
         buf[pos] = '\0';
     }
     return buf;
-}
-
-static int resolve_exe_path(char* buf, size_t bufsz) {
-#if defined(_WIN32)
-    wchar_t wbuf[PATH_MAX];
-    DWORD n = GetModuleFileNameW(NULL, wbuf, PATH_MAX);
-    if (n == 0 || n >= PATH_MAX) return 0;
-    int u = WideCharToMultiByte(CP_UTF8, 0, wbuf, (int)n, buf, (int)bufsz - 1, NULL, NULL);
-    if (u <= 0) return 0;
-    buf[u] = '\0';
-    return 1;
-#elif defined(__APPLE__)
-    extern int _NSGetExecutablePath(char* buf, uint32_t* size);
-    uint32_t size = (uint32_t)bufsz;
-    return _NSGetExecutablePath(buf, &size) == 0;
-#else
-    long n = jn_readlink("/proc/self/exe", buf, bufsz - 1);
-    if (n <= 0) return 0;
-    buf[n] = '\0';
-    return 1;
-#endif
-}
-
-static FILE* open_utf8(const char* path) {
-#if defined(_WIN32)
-    wchar_t wpath[PATH_MAX];
-    if (MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, PATH_MAX) <= 0) return NULL;
-    return _wfopen(wpath, L"rb");
-#else
-    return fopen(path, "rb");
-#endif
-}
-
-static char* resolve_class_path(void) {
-#if defined(_WIN32)
-    const char sep = ';';
-    const char dirsep = '\\';
-#else
-    const char sep = ':';
-    const char dirsep = '/';
-#endif
-    char base[PATH_MAX];
-    if (!resolve_exe_path(base, sizeof(base) - 32)) return NULL;
-    strcat(base, ".classpath");
-    size_t base_len = strlen(base);
-    char list_path[PATH_MAX];
-    snprintf(list_path, sizeof(list_path), "%s%cclasspath", base, dirsep);
-    FILE* f = open_utf8(list_path);
-    if (f == NULL) return NULL;
-
-    size_t cap = 4096, pos = 0;
-    char* out = (char*)malloc(cap);
-    if (out == NULL) { fclose(f); return NULL; }
-    out[0] = '\0';
-    char line[PATH_MAX];
-    while (fgets(line, sizeof(line), f) != NULL) {
-        size_t n = strcspn(line, "\r\n");
-        line[n] = '\0';
-        if (n == 0) continue;
-        size_t need = pos + 1 + base_len + 1 + n + 1;
-        if (need > cap) {
-            while (cap < need) cap *= 2;
-            char* nb = (char*)realloc(out, cap);
-            if (nb == NULL) { free(out); fclose(f); return NULL; }
-            out = nb;
-        }
-        if (pos > 0) out[pos++] = sep;
-        memcpy(out + pos, base, base_len);
-        pos += base_len;
-        out[pos++] = dirsep;
-        memcpy(out + pos, line, n);
-        pos += n;
-        out[pos] = '\0';
-    }
-    fclose(f);
-    if (pos == 0) { free(out); return NULL; }
-    return out;
 }
 
 #if defined(_WIN32)
@@ -619,8 +491,7 @@ void* __jnative_fn_jdk_internal_util_SystemProps_Raw_cmdProperties___Ljava_util_
                                              "[Ljava/util/HashMap$Node;");
     if (table == NULL) abort();
 
-    char home_buf[PATH_MAX];
-    const char* java_home = resolve_java_home(home_buf, sizeof(home_buf));
+    const char* java_home = __jnative_runtime_java_home();
 
     char libpath_buf[PATH_MAX * 4];
     const char* libpath = resolve_library_path(libpath_buf, sizeof(libpath_buf));
@@ -633,7 +504,7 @@ void* __jnative_fn_jdk_internal_util_SystemProps_Raw_cmdProperties___Ljava_util_
     cmd_props_put(table, table_size, node_vtable,
                   "jdk.reflect.useDirectMethodHandle", "methods");
     int32_t cmd_count = 5;
-    char* class_path = resolve_class_path();
+    char* class_path = __jnative_runtime_class_path();
     if (class_path != NULL) {
         cmd_props_put(table, table_size, node_vtable, "java.class.path", class_path);
         free(class_path);
@@ -878,8 +749,7 @@ void* __jnative_make_bootstrap_props(
         }                                                                                 \
     } while (0)
 
-    char home_buf[PATH_MAX];
-    const char* java_home = resolve_java_home(home_buf, sizeof(home_buf));
+    const char* java_home = __jnative_runtime_java_home();
     char cwd_buf[PATH_MAX];
     const char* cwd = jn_getcwd_utf8(cwd_buf, sizeof(cwd_buf));
     if (cwd == NULL) cwd = "/";
@@ -958,7 +828,7 @@ void* __jnative_make_bootstrap_props(
     JNATIVE_INSERT("jdk.module.main",            "");
     JNATIVE_INSERT("jdk.module.main.class",      "");
 
-    char* class_path = resolve_class_path();
+    char* class_path = __jnative_runtime_class_path();
     if (class_path != NULL) {
         JNATIVE_INSERT("java.class.path", class_path);
         free(class_path);

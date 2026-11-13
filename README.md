@@ -147,12 +147,14 @@ The following features are implemented, subject to application-specific constrai
 - **File I/O:** regular file I/O through per-class C overrides for `FileInputStream`, `FileOutputStream`, `RandomAccessFile`, and `UnixFileSystem`.
 - **Networking:** `Inet4Address`, `Inet6Address`, `InetAddress`, and `NetworkInterface`, including interface enumeration and reverse lookups.
 - **Reflection mirrors:** `Class.getDeclaredMethods0`, `getDeclaredFields0`, and `getDeclaredConstructors0` construct real `Field`, `Method`, and `Constructor` mirrors with populated `parameterTypes`, `exceptionTypes`, and root fields, supporting `Executable.sharedToString` and `ReflectionData` without null-pointer failures.
-- **Resources and time zones:** embeds every non-`.class` resource in the `java.base` module and the build JDK's `lib/tzdb.dat`, served through `Class.getResourceAsStream` and `FileInputStream` for `/lib/tzdb.dat`.
+- **Resources and time zones:** embeds every non-`.class` resource in the target JDK's `java.base` module and its `lib/tzdb.dat`, served through `Class.getResourceAsStream` and `FileInputStream` for `/lib/tzdb.dat`.
 - **Shutdown cleanup:** cycle-safe destruction uses a freed-address set and per-thread claim stack to detect doubly reachable objects and destructor cycles during `atexit` cleanup.
 - **Destructor fast/slow paths:** outside shutdown, destructors use a direct load-check-free call; during shutdown, they use a cycle-safe slow path.
 - **Core system APIs:** `System.out`, `System.err`, `System.in`, `System.getProperties`, `System.setProperty`, `System.currentTimeMillis`, `System.nanoTime`, `System.identityHashCode`, and `System.exit`.
 
-The produced executable does not require a JDK, JVM, or `libz` at runtime. Target platform system libraries and runtime ABI requirements still apply.
+Distribute the executable alone. Application resources, classpath archives, discovered JNI libraries, and the target JDK's `release`, `conf/`, `lib/`, and available `legal/` trees are embedded as binary data. No `<executable>.classpath`, `<executable>.runtime`, or companion JNI libraries are generated or required. Spring Boot classes and dependency JARs retain their classpath order, including duplicate resource names in separate archives. The executable does not require an installed JDK, JVM, or `libz`.
+
+At startup, JDK filesystem APIs and the OS library loader use files materialized from the executable in a private temporary directory. `java.home`, `java.class.path`, and JNI loading point there; normal process exit attempts to remove the extracted files. The module reader accesses the embedded image directly. Cross-compilation reuses complete target JDKs in `~/.jnative/jdk/<version>-<os>-<arch>/` and replaces incomplete caches at the same location after downloading and validating their replacements. Target platform system libraries and runtime ABI requirements still apply.
 
 ## Memory Management Model
 

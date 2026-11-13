@@ -12,10 +12,14 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.channels.FileChannel;
+import java.nio.channels.FileLock;
+import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
 import java.security.DigestInputStream;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
@@ -28,12 +32,6 @@ import java.util.zip.GZIPInputStream;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
 
-/**
- * The JDK class library differs per OS (WinNTFileSystem vs UnixFileSystem, WindowsFileSystemProvider
- * vs LinuxFileSystemProvider, ...), so a cross-OS build must compile the TARGET's java.base, not the
- * one of the JVM running JNative. Downloads the Temurin JDK of the running feature version for the
- * target OS/arch once (~/.jnative/jdk), keeping only lib/ (the jimage + jrt-fs.jar) and release.
- */
 public final class TargetJdk {
 
     private static final String API = "https://api.adoptium.net/v3/assets/latest/%d/hotspot"
@@ -42,7 +40,7 @@ public final class TargetJdk {
     private TargetJdk() { }
 
     /** java.home of a JDK for {@code target}'s OS, or null when the running JDK already matches. */
-    public static Path ensure(TargetPlatform target) throws IOException {
+    public static synchronized Path ensure(TargetPlatform target) throws IOException {
         if (target == null || !target.isCrossOs()) return null;
         int feature = Runtime.version().feature(); // C natives in resources are written against this JDK
         String os = target.isWindows() ? "windows" : target.isDarwin() ? "mac" : "linux";
@@ -53,9 +51,26 @@ public final class TargetJdk {
             default -> throw new IllegalStateException("No JDK download for architecture of '" + target.triple() + "'");
         };
 
-        Path root = Paths.get(System.getProperty("user.home"), ".jnative", "jdk", feature + "-" + os + "-" + arch);
-        if (Files.exists(root.resolve(".complete"))) return findJavaHome(root);
+        Path root = Paths.get(System.getProperty("user.home"), ".jnative", "jdk",
+                feature + "-" + os + "-" + arch);
+        Files.createDirectories(root.getParent());
+        Path lockPath = root.resolveSibling(root.getFileName() + ".lock");
+        try (FileChannel channel = FileChannel.open(lockPath, StandardOpenOption.CREATE, StandardOpenOption.WRITE);
+             FileLock lock = channel.lock()) {
+            if (Files.exists(root.resolve(".complete"))) {
+                try {
+                    Path home = findJavaHome(root);
+                    RuntimeImageEmbedder.validate(home);
+                    return home;
+                } catch (IOException e) {
+                    System.out.println("Refreshing incomplete target JDK cache at " + root + ": " + e.getMessage());
+                }
+            }
+            return download(root, feature, os, arch);
+        }
+    }
 
+    private static Path download(Path root, int feature, String os, String arch) throws IOException {
         try {
             HttpClient http = HttpClient.newBuilder().followRedirects(HttpClient.Redirect.NORMAL).build();
             String api = String.format(API, feature, arch, os);
@@ -71,7 +86,6 @@ public final class TargetJdk {
 
             System.out.println("Downloading target JDK " + assets.get(0).path("release_name").asText()
                     + " (" + os + "/" + arch + ") to " + root + " ...");
-            Files.createDirectories(root.getParent());
             Path archive = Files.createTempFile(root.getParent(), "download", name.endsWith(".zip") ? ".zip" : ".tar.gz");
             Path tmp = Files.createTempDirectory(root.getParent(), root.getFileName() + ".tmp");
             try {
@@ -83,12 +97,9 @@ public final class TargetJdk {
                     throw new IOException("SHA256 mismatch for " + name + ": expected " + sha + ", got " + actual);
                 }
                 extract(archive, name.endsWith(".zip"), tmp);
+                RuntimeImageEmbedder.validate(findJavaHome(tmp));
                 Files.writeString(tmp.resolve(".complete"), name + "\n");
-                try {
-                    Files.move(tmp, root, StandardCopyOption.ATOMIC_MOVE);
-                } catch (IOException e) {
-                    if (!Files.exists(root.resolve(".complete"))) throw e; // a parallel build finished first
-                }
+                install(tmp, root);
             } finally {
                 Files.deleteIfExists(archive);
                 deleteTree(tmp);
@@ -100,9 +111,42 @@ public final class TargetJdk {
         return findJavaHome(root);
     }
 
-    /** Only lib/ (modules image, jrt-fs.jar, tzdb.dat, ...) and the release file are needed. */
+    private static void install(Path source, Path root) throws IOException {
+        Path previous = null;
+        if (Files.exists(root)) {
+            previous = Files.createTempDirectory(root.getParent(), root.getFileName() + ".previous");
+            Files.delete(previous);
+            move(root, previous);
+        }
+        try {
+            move(source, root);
+        } catch (IOException failure) {
+            if (previous != null) {
+                try {
+                    move(previous, root);
+                } catch (IOException rollback) {
+                    failure.addSuppressed(rollback);
+                }
+            }
+            throw failure;
+        }
+        if (previous != null) deleteTree(previous);
+    }
+
+    private static void move(Path source, Path destination) throws IOException {
+        try {
+            Files.move(source, destination, StandardCopyOption.ATOMIC_MOVE);
+        } catch (AtomicMoveNotSupportedException e) {
+            Files.move(source, destination);
+        }
+    }
+
     private static boolean keep(String entry) {
-        return entry.contains("/lib/") || entry.endsWith("/release");
+        if (entry.endsWith("/release")) return true;
+        for (String directory : RuntimeImageEmbedder.DIRECTORIES) {
+            if (entry.contains("/" + directory + "/") || entry.endsWith("/" + directory)) return true;
+        }
+        return false;
     }
 
     private static void extract(Path archive, boolean zip, Path dest) throws IOException {
@@ -131,7 +175,7 @@ public final class TargetJdk {
                     .map(Path::getParent)
                     .filter(h -> Files.isRegularFile(h.resolve("lib").resolve("modules")))
                     .findFirst()
-                    .orElseThrow(() -> new IOException("Target JDK in " + root + " has no lib/modules; delete the folder and retry"));
+                    .orElseThrow(() -> new IOException("Target JDK in " + root + " has no runtime image with release and lib/modules"));
         }
     }
 
