@@ -1,4 +1,4 @@
-package io.github.kubyk01.application.service.analyzer.reachabilityanalysis.annotation.runtime;
+package io.github.kubyk01.application.service.analyzer.classanalysis.annotation.runtime;
 
 import java.lang.reflect.Constructor;
 import java.lang.reflect.InvocationHandler;

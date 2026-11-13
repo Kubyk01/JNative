@@ -1,9 +1,9 @@
-package io.github.kubyk01.application.service.analyzer.reachabilityanalysis.annotation;
+package io.github.kubyk01.application.service.analyzer.classanalysis.annotation;
 
 import io.github.kubyk01.application.service.analyzer.dependencyresolver.DependencyResolver;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.ClassNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.MethodNode;
-import io.github.kubyk01.application.service.analyzer.reachabilityanalysis.annotation.runtime.JNativeProxySupport;
+import io.github.kubyk01.application.service.analyzer.classanalysis.annotation.runtime.JNativeProxySupport;
 import org.objectweb.asm.ClassWriter;
 import org.objectweb.asm.Label;
 import org.objectweb.asm.MethodVisitor;

@@ -1,4 +1,4 @@
-package io.github.kubyk01.application.service.analyzer.reachabilityanalysis.annotation.cglib;
+package io.github.kubyk01.application.service.analyzer.classanalysis.annotation.cglib;
 
 import lombok.extern.slf4j.Slf4j;
 

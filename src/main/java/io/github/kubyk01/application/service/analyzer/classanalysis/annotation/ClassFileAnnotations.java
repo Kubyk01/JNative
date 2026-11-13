@@ -1,4 +1,4 @@
-package io.github.kubyk01.application.service.analyzer.reachabilityanalysis.annotation;
+package io.github.kubyk01.application.service.analyzer.classanalysis.annotation;
 
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
