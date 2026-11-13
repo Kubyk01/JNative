@@ -237,31 +237,61 @@ public class LlvmGenerator implements LlvmGeneratorPort {
             f.getOwnerClass() == null ? "" : f.getOwnerClass()));
 
 
+        int totalToEmit = toEmit.size();
+        int batchSize = INITIAL_EMIT_BATCH;
+        int from = 0;
         String openOwner = null;
         java.io.Writer openWriter = null;
         try {
-            for (int from = 0; from < toEmit.size(); from += EMIT_BATCH) {
-                List<Function> batch = new ArrayList<>(
-                    toEmit.subList(from, Math.min(toEmit.size(), from + EMIT_BATCH)));
+            while (from < totalToEmit) {
+                int end = Math.min(from + batchSize, totalToEmit);
+                List<Function> batch = new ArrayList<>(toEmit.subList(from, end));
                 List<String> bodies = LlvmUtil.parallelMapOrdered(batch, scheduler, func -> {
                     LlvmFunctionEmitter emitter = new LlvmFunctionEmitter(
                         module, globalEmitter, polymorphicResolverRef, resolver);
                     return emitter.emitFunction(func);
                 });
+                long batchBytes = 0L;
                 for (int i = 0; i < batch.size(); i++) {
-                    String owner = batch.get(i).getOwnerClass();
+                    Function func = batch.get(i);
+                    String body = bodies.get(i);
+                    String owner = func.getOwnerClass();
                     String key = owner == null ? "" : owner;
                     if (!key.equals(openOwner)) {
-                        if (openWriter != null) openWriter.close();
-                        openWriter = null;
+                        if (openWriter != null) {
+                            openWriter.close();
+                            openWriter = null;
+                        }
                         Path spool = key.isEmpty()
                             ? moduleSpool
                             : classSpools.computeIfAbsent(key, k -> spoolPath(spoolDir, k));
                         openWriter = openSpool(spool);
                         openOwner = key;
                     }
-                    openWriter.write(bodies.get(i));
+                    openWriter.write(body);
+                    batchBytes += body.length();
                     bodies.set(i, null);
+                }
+                from = end;
+
+                if (batchBytes > TARGET_EMIT_BATCH_BYTES && batchSize > MIN_EMIT_BATCH) {
+                    int next = Math.max(MIN_EMIT_BATCH, batchSize / 2);
+                    System.out.println("IR bodies: " + from + "/" + totalToEmit
+                        + " function(s), batch=" + batch.size()
+                        + " " + (batchBytes / (1024 * 1024)) + " MB, shrinking "
+                        + batchSize + " -> " + next);
+                    batchSize = next;
+                } else if (batchBytes < TARGET_EMIT_BATCH_BYTES / 4 && batchSize < MAX_EMIT_BATCH) {
+                    int next = Math.min(MAX_EMIT_BATCH, batchSize * 2);
+                    System.out.println("IR bodies: " + from + "/" + totalToEmit
+                        + " function(s), batch=" + batch.size()
+                        + " " + (batchBytes / (1024 * 1024)) + " MB, growing "
+                        + batchSize + " -> " + next);
+                    batchSize = next;
+                } else {
+                    System.out.println("IR bodies: " + from + "/" + totalToEmit
+                        + " function(s), batch=" + batch.size()
+                        + " " + (batchBytes / (1024 * 1024)) + " MB");
                 }
             }
         } finally {
@@ -392,7 +422,10 @@ public class LlvmGenerator implements LlvmGeneratorPort {
         deleteTree(spoolDir);
     }
 
-    private static final int EMIT_BATCH = 4096;
+    private static final int MIN_EMIT_BATCH = 64;
+    private static final int MAX_EMIT_BATCH = 4096;
+    private static final int INITIAL_EMIT_BATCH = 256;
+    private static final long TARGET_EMIT_BATCH_BYTES = 32L * 1024 * 1024;
 
     private record ClassUnit(String name, List<Path> bodies) {}
 
@@ -688,7 +721,7 @@ public class LlvmGenerator implements LlvmGeneratorPort {
             int typeEnd = scanTypeToken(src, j, limit);
             if (typeEnd > j && !isPrivate && !name.isEmpty()) {
                 out.put(name.substring(1),                       // strip '@'
-                    new GlobalDecl(src.substring(j, typeEnd), isConst));
+                    new GlobalDecl(src.substring(j, typeEnd).intern(), isConst));
             }
             i = skipInitializer(src, Math.max(typeEnd, j), n);
         }
