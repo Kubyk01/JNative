@@ -198,28 +198,67 @@ static void* net_make_socket_address(const struct sockaddr_storage* ss) {
     return isa;
 }
 
-static int net_sockaddr_from_inetaddress(void* ia, int32_t port,
+extern JNativeVTable vtable_java_net_Inet6Address __attribute__((weak));
+extern void* fn_java_net_Inet4Address_getAddress____B(void*) __attribute__((weak));
+extern void* fn_java_net_Inet6Address_getAddress____B(void*) __attribute__((weak));
+extern int32_t fn_java_net_Inet6Address_getScopeId___I(void*) __attribute__((weak));
+
+static int net_socket_is_ipv6(jn_os_socket_t s) {
+    struct sockaddr_storage ss;
+#if defined(_WIN32)
+    int len = (int)sizeof(ss);
+    if (getsockname(s, (struct sockaddr*)&ss, &len) == SOCKET_ERROR) return 0;
+#else
+    socklen_t len = (socklen_t)sizeof(ss);
+    if (getsockname(s, (struct sockaddr*)&ss, &len) < 0) return 0;
+#endif
+    return ss.ss_family == AF_INET6;
+}
+
+/* Like the JDK's NET_InetAddressToSockaddr: an IPv4 address on an IPv6
+ * (dual-stack) socket becomes v4-mapped, and the IPv4 wildcard becomes "::". */
+static void net_sockaddr_from_inetaddress(void* ia, int32_t port, int prefer_ipv6,
                                           struct sockaddr_storage* ss, int* sslen)
 {
-    void* holder = *(void**)((char*)ia + 16);
-    int fam = *(int32_t*)((char*)holder + 16);
-    void* addr_bytes = *(void**)((char*)holder + 20);
+    if (ia == NULL) __jnative_throw_null_pointer_exception();
+    int is6 = &vtable_java_net_Inet6Address != NULL
+        && *(void**)ia == (void*)&vtable_java_net_Inet6Address;
+    void* bytes = NULL;
+    if (is6) {
+        if (fn_java_net_Inet6Address_getAddress____B != NULL)
+            bytes = fn_java_net_Inet6Address_getAddress____B(ia);
+    } else if (fn_java_net_Inet4Address_getAddress____B != NULL) {
+        bytes = fn_java_net_Inet4Address_getAddress____B(ia);
+    }
+    if (bytes == NULL || jnative_array_length(bytes) != (is6 ? 16 : 4)) {
+        __jnative_throw_io_ctx("cannot read InetAddress bytes", "sun.nio.ch.Net");
+    }
+    const uint8_t* addr = (const uint8_t*)bytes + JAVA_ARR_HDR;
     memset(ss, 0, sizeof(*ss));
 
-    if (fam == 1) {
+    if (!is6 && !prefer_ipv6) {
         struct sockaddr_in* sin = (struct sockaddr_in*)ss;
         sin->sin_family = AF_INET;
         sin->sin_port   = htons((uint16_t)port);
-        memcpy(&sin->sin_addr, (uint8_t*)addr_bytes + JAVA_ARR_HDR, 4);
+        memcpy(&sin->sin_addr, addr, 4);
         *sslen = (int)sizeof(*sin);
-    } else {
-        struct sockaddr_in6* sin6 = (struct sockaddr_in6*)ss;
-        sin6->sin6_family = AF_INET6;
-        sin6->sin6_port   = htons((uint16_t)port);
-        memcpy(&sin6->sin6_addr, (uint8_t*)addr_bytes + JAVA_ARR_HDR, 16);
-        *sslen = (int)sizeof(*sin6);
+        return;
     }
-    return 0;
+
+    struct sockaddr_in6* sin6 = (struct sockaddr_in6*)ss;
+    sin6->sin6_family = AF_INET6;
+    sin6->sin6_port   = htons((uint16_t)port);
+    uint8_t* dst = (uint8_t*)&sin6->sin6_addr;
+    if (is6) {
+        memcpy(dst, addr, 16);
+        if (fn_java_net_Inet6Address_getScopeId___I != NULL)
+            sin6->sin6_scope_id = (uint32_t)fn_java_net_Inet6Address_getScopeId___I(ia);
+    } else if ((addr[0] | addr[1] | addr[2] | addr[3]) != 0) {
+        dst[10] = 0xFF;
+        dst[11] = 0xFF;
+        memcpy(dst + 12, addr, 4);
+    }
+    *sslen = (int)sizeof(*sin6);
 }
 
 /* =========== <clinit> natives =========== */
@@ -327,9 +366,9 @@ int32_t __jnative_fn_sun_nio_ch_Net_canUseIPv6Only__Ljava_io_FileDescriptor_Z_Z(
 /* =========== socket0 =========== */
 
 int32_t __jnative_fn_sun_nio_ch_Net_socket0__ZZZZ_I(
-        int32_t prefer_ipv6, int32_t stream, int32_t reuse, int32_t blocking)
+        int32_t prefer_ipv6, int32_t stream, int32_t reuse, int32_t fast_loopback)
 {
-    (void)reuse;
+    (void)fast_loopback;
 
     int family = prefer_ipv6 ? AF_INET6 : AF_INET;
     int type   = stream ? SOCK_STREAM : SOCK_DGRAM;
@@ -337,27 +376,29 @@ int32_t __jnative_fn_sun_nio_ch_Net_socket0__ZZZZ_I(
     jn_os_socket_t s = socket(family, type, 0);
 
 #if defined(_WIN32)
+    (void)reuse;
     if (s == JN_OS_INVALID_SOCKET) {
         jn_throw_socket_ioexception("socket", WSAGetLastError());
     }
-    if (!blocking) {
-        u_long mode = 1;
-        if (ioctlsocket(s, FIONBIO, &mode) == SOCKET_ERROR) {
-            int32_t e = WSAGetLastError();
-            closesocket(s);
-            jn_throw_socket_ioexception("ioctlsocket(FIONBIO)", e);
-        }
+    SetHandleInformation((HANDLE)s, HANDLE_FLAG_INHERIT, 0);
+    if (prefer_ipv6) {
+        int off = 0;
+        setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, (const char*)&off, sizeof(off));
     }
 #else
     if (s < 0) {
         jn_throw_socket_ioexception("socket", errno);
     }
-    if (!blocking) {
-        int flags = fcntl(s, F_GETFL, 0);
-        if (flags < 0 || fcntl(s, F_SETFL, flags | O_NONBLOCK) < 0) {
+    if (prefer_ipv6) {
+        int off = 0;
+        setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, &off, sizeof(off));
+    }
+    if (reuse) {
+        int on = 1;
+        if (setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) < 0) {
             int32_t e = errno;
             close(s);
-            jn_throw_socket_ioexception("fcntl(O_NONBLOCK)", e);
+            jn_throw_socket_ioexception("setsockopt(SO_REUSEADDR)", e);
         }
     }
 #endif
@@ -371,12 +412,11 @@ void __jnative_fn_sun_nio_ch_Net_bind0__Ljava_io_FileDescriptor_ZZLjava_net_Inet
         void* fdo, int32_t prefer_ipv6, int32_t use_excl_bind,
         void* ia, int32_t port)
 {
-    (void)prefer_ipv6;
     jn_os_socket_t s = net_os_socket(fdo);
 
     struct sockaddr_storage ss;
     int sslen = 0;
-    net_sockaddr_from_inetaddress(ia, port, &ss, &sslen);
+    net_sockaddr_from_inetaddress(ia, port, prefer_ipv6, &ss, &sslen);
 
 #if defined(_WIN32)
     if (use_excl_bind) {
@@ -400,12 +440,11 @@ void __jnative_fn_sun_nio_ch_Net_bind0__Ljava_io_FileDescriptor_ZZLjava_net_Inet
 int32_t __jnative_fn_sun_nio_ch_Net_connect0__ZLjava_io_FileDescriptor_Ljava_net_InetAddress_I_I(
         int32_t prefer_ipv6, void* fdo, void* ia, int32_t port)
 {
-    (void)prefer_ipv6;
     jn_os_socket_t s = net_os_socket(fdo);
 
     struct sockaddr_storage ss;
     int sslen = 0;
-    net_sockaddr_from_inetaddress(ia, port, &ss, &sslen);
+    net_sockaddr_from_inetaddress(ia, port, prefer_ipv6, &ss, &sslen);
 
 #if defined(_WIN32)
     if (connect(s, (struct sockaddr*)&ss, sslen) == SOCKET_ERROR) {
@@ -569,7 +608,7 @@ int32_t __jnative_fn_sun_nio_ch_Net_sendTo__Ljava_io_FileDescriptor_JILjava_net_
     const void* buf = (const void*)(intptr_t)address;
     struct sockaddr_storage ss;
     int sslen = 0;
-    net_sockaddr_from_inetaddress(ia, port, &ss, &sslen);
+    net_sockaddr_from_inetaddress(ia, port, net_socket_is_ipv6(s), &ss, &sslen);
 
 #if defined(_WIN32)
     int n = sendto(s, (const char*)buf, len, 0,
@@ -708,6 +747,26 @@ void* __jnative_fn_sun_nio_ch_Net_remoteInetAddress__Ljava_io_FileDescriptor__Lj
     }
 #endif
     return net_make_inet_address(&ss, NULL);
+}
+
+int32_t __jnative_fn_sun_nio_ch_Net_remotePort__Ljava_io_FileDescriptor__I(
+        void* fdo)
+{
+    jn_os_socket_t s = net_os_socket(fdo);
+    struct sockaddr_storage ss;
+    memset(&ss, 0, sizeof(ss));
+    int sslen = (int)sizeof(ss);
+
+#if defined(_WIN32)
+    if (getpeername(s, (struct sockaddr*)&ss, &sslen) == SOCKET_ERROR) {
+        jn_throw_socket_ioexception("getpeername", WSAGetLastError());
+    }
+#else
+    if (getpeername(s, (struct sockaddr*)&ss, (socklen_t*)&sslen) < 0) {
+        jn_throw_socket_ioexception("getpeername", errno);
+    }
+#endif
+    return net_port_of(&ss);
 }
 
 int32_t __jnative_fn_sun_nio_ch_Net_localPort__Ljava_io_FileDescriptor__I(
@@ -910,6 +969,79 @@ int32_t __jnative_fn_sun_nio_ch_Net_poll__Ljava_io_FileDescriptor_IJ_I(
     }
     return rc > 0 ? (int32_t)pfd.revents : 0;
 #endif
+}
+
+/* =========== pollConnect / discardOOB =========== */
+
+__attribute__((noreturn))
+static void net_throw_connect_failed(int32_t err) {
+    char msg[128];
+    snprintf(msg, sizeof(msg), "Connection refused (error %d)", (int)err);
+    void* exc = __jnative_construct_exception("vtable_java_net_ConnectException", msg);
+    if (exc == NULL) jn_throw_socket_ioexception("connect", err);
+    __jnative_throw_exception(exc);
+}
+
+/* True once a non-blocking connect has completed, false on timeout
+ * (timeout in ms, negative = wait forever); throws if the connect failed. */
+int32_t __jnative_fn_sun_nio_ch_Net_pollConnect__Ljava_io_FileDescriptor_J_Z(
+        void* fdo, int64_t timeout)
+{
+    jn_os_socket_t s = net_os_socket(fdo);
+    int so_error = 0;
+
+#if defined(_WIN32)
+    fd_set wr, ex;
+    FD_ZERO(&wr);
+    FD_ZERO(&ex);
+    FD_SET(s, &wr);
+    FD_SET(s, &ex);
+    struct timeval tv;
+    struct timeval* tvp = NULL;
+    if (timeout >= 0) {
+        tv.tv_sec  = (long)(timeout / 1000);
+        tv.tv_usec = (long)((timeout % 1000) * 1000);
+        tvp = &tv;
+    }
+    int rc = select(0, NULL, &wr, &ex, tvp);
+    if (rc == SOCKET_ERROR) {
+        jn_throw_socket_ioexception("select", WSAGetLastError());
+    }
+    if (rc == 0) return 0;
+    int optlen = (int)sizeof(so_error);
+    if (getsockopt(s, SOL_SOCKET, SO_ERROR, (char*)&so_error, &optlen) == SOCKET_ERROR) {
+        so_error = WSAGetLastError();
+    }
+    if (so_error == 0 && FD_ISSET(s, &ex) && !FD_ISSET(s, &wr)) so_error = WSAECONNREFUSED;
+#else
+    struct pollfd pfd;
+    pfd.fd      = s;
+    pfd.events  = POLLOUT;
+    pfd.revents = 0;
+    int ms = timeout < 0 ? -1 : (timeout > INT32_MAX ? INT32_MAX : (int)timeout);
+    int rc = poll(&pfd, 1, ms);
+    if (rc < 0) {
+        if (errno == EINTR) return 0;
+        jn_throw_socket_ioexception("poll", errno);
+    }
+    if (rc == 0) return 0;
+    socklen_t optlen = (socklen_t)sizeof(so_error);
+    if (getsockopt(s, SOL_SOCKET, SO_ERROR, &so_error, &optlen) < 0) {
+        so_error = errno;
+    }
+#endif
+    if (so_error != 0) net_throw_connect_failed(so_error);
+    return 1;
+}
+
+int32_t __jnative_fn_sun_nio_ch_Net_discardOOB__Ljava_io_FileDescriptor__Z(
+        void* fdo)
+{
+    jn_os_socket_t s = net_os_socket(fdo);
+    char data[8];
+    int32_t discarded = 0;
+    while (recv(s, data, sizeof(data), MSG_OOB) > 0) discarded = 1;
+    return discarded;
 }
 
 /* =========== isLoopback =========== */

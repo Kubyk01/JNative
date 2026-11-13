@@ -85,7 +85,7 @@ void __jnative_fn_java_io_FileInputStream_open0__Ljava_lang_String__V(
 
     int fd;
 #if defined(_WIN32)
-    fd = _open(path_buf, _O_RDONLY | _O_BINARY | _O_NOINHERIT);
+    fd = jn_open_utf8(path_buf, _O_RDONLY | _O_BINARY | _O_NOINHERIT, 0);
 #else
     fd = open(path_buf, O_RDONLY | O_CLOEXEC);
 #endif

@@ -10,7 +10,7 @@ import org.objectweb.asm.Type;
 final class ProxyRewriter {
 
     static final String PROXY = "java/lang/reflect/Proxy";
-    private static final String SUPPORT = "io/github/kubyk01/application/service/analyzer/reachabilityanalysis/annotation/runtime/JNativeProxySupport";
+    static final String SUPPORT = "io/github/kubyk01/application/service/analyzer/reachabilityanalysis/annotation/runtime/JNativeProxySupport";
     private static final String GET_CTOR_SUFFIX =
         "Ljava/lang/ClassLoader;[Ljava/lang/Class;)Ljava/lang/reflect/Constructor;";
     private static final String IS_PROXY_DESC = "(Ljava/lang/Class;)Z";

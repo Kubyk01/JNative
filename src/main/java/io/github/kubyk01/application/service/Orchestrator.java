@@ -661,6 +661,12 @@ public class Orchestrator implements OrchestratorPort {
             "java/net/InetAddress", "getByAddress", "([B)Ljava/net/InetAddress;"));
         analysis.addExtraReachableMethod(new MethodReference(
             "java/net/InetSocketAddress", "<init>", "(Ljava/net/InetAddress;I)V"));
+        analysis.addExtraReachableMethod(new MethodReference(
+            "java/net/Inet4Address", "getAddress", "()[B"));
+        analysis.addExtraReachableMethod(new MethodReference(
+            "java/net/Inet6Address", "getAddress", "()[B"));
+        analysis.addExtraReachableMethod(new MethodReference(
+            "java/net/Inet6Address", "getScopeId", "()I"));
     }
 
     private void forceLoggingConfigClasses(ReachabilityAnalysis analysis) {

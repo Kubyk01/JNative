@@ -103,6 +103,27 @@ static inline long jn_readlink(const char* path, char* buf, size_t len) {
     return -1;
 }
 
+static inline int jn_open_utf8(const char* path, int flags, int mode) {
+    int n = MultiByteToWideChar(CP_UTF8, 0, path, -1, NULL, 0);
+    if (n <= 0) { errno = ENOENT; return -1; }
+    wchar_t* w = (wchar_t*)malloc((size_t)n * sizeof(wchar_t));
+    if (w == NULL) { errno = ENOMEM; return -1; }
+    MultiByteToWideChar(CP_UTF8, 0, path, -1, w, n);
+    int fd = _wopen(w, flags, mode);
+    int saved = errno;
+    free(w);
+    errno = saved;
+    return fd;
+}
+
+static inline char* jn_getcwd_utf8(char* buf, size_t size) {
+    wchar_t* w = _wgetcwd(NULL, 0);
+    if (w == NULL) return NULL;
+    int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, buf, (int)size, NULL, NULL);
+    free(w);
+    return n > 0 ? buf : NULL;
+}
+
 int jn_cpu_count(void);
 
 #if defined(__MINGW32__) || defined(__MINGW64__)
@@ -251,6 +272,9 @@ extern void* jn_dlsym_default;
 #include <termios.h>
 #include <signal.h>
 #include <fcntl.h>
+
+#define jn_open_utf8(path, flags, mode) open((path), (flags), (mode))
+#define jn_getcwd_utf8(buf, size)       getcwd((buf), (size))
 
 typedef int jn_socket_t;
 #define JN_INVALID_SOCKET (-1)

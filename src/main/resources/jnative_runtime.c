@@ -1307,10 +1307,11 @@ static void __jnative_unwind_with_backtrace(int skip) {
 static volatile LONG __jnative_in_fatal_handler_win = 0;
 
 static LONG CALLBACK __jnative_vectored_handler(EXCEPTION_POINTERS* ep) {
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+    if ((code & 0xC0000000u) != 0xC0000000u) return EXCEPTION_CONTINUE_SEARCH;
     if (__jnative_in_fatal_handler_win) return EXCEPTION_CONTINUE_SEARCH;
     __jnative_in_fatal_handler_win = 1;
 
-    DWORD code = ep->ExceptionRecord->ExceptionCode;
     ULONG_PTR fault = (ULONG_PTR)ep->ExceptionRecord->ExceptionInformation[1];
     const char* sig_desc;
     switch (code) {
@@ -1485,10 +1486,12 @@ static void __jnative_auto_init(void) {
 #define JNATIVE_THROWABLE_MESSAGE_OFFSET 16
 #define JNATIVE_EXCEPTION_OBJECT_SIZE    64
 
+static JN_TLS char jnative_last_missing_vtable[256];
+
 static JNativeVTable* __jnative_lookup_vtable_weak(const char* symbol) {
     void* handle = jn_dlsym_default;
-    if (handle == NULL) return NULL;
-    void* sym = dlsym(handle, symbol);
+    void* sym = handle != NULL ? dlsym(handle, symbol) : NULL;
+    if (sym == NULL) snprintf(jnative_last_missing_vtable, sizeof(jnative_last_missing_vtable), "%s", symbol);
     return (JNativeVTable*)sym;
 }
 
@@ -1694,9 +1697,13 @@ int __jnative_instanceof(void* obj, void** type_info) {
 __attribute__((noreturn))
 void __jnative_throw_exception_ctx(void* exc, const char* caller) {
     if (exc == NULL) {
-        exc = __jnative_make_exception_object(
-            "vtable_java_lang_Throwable",
-            "NULL exception object substituted by __jnative_throw_exception_ctx");
+        char msg[512];
+        snprintf(msg, sizeof(msg),
+            "NULL exception object substituted by __jnative_throw_exception_ctx "
+            "(caller: %s, last missing vtable: %s)",
+            caller ? caller : "?",
+            jnative_last_missing_vtable[0] ? jnative_last_missing_vtable : "none");
+        exc = __jnative_make_exception_object("vtable_java_lang_Throwable", msg);
     }
     if (exc == NULL) {
         const char* msg = "jnative: fatal: NULL exception thrown and no "

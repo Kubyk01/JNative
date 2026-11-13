@@ -71,8 +71,6 @@ public class MethodBytecodeVisitor extends ClassVisitor {
             this.descriptor = descriptor;
         }
 
-        String ownerClass() { return ownerClass; }
-        String name()       { return name; }
         String descriptor() { return descriptor; }
     }
 
@@ -228,7 +226,7 @@ public class MethodBytecodeVisitor extends ClassVisitor {
 
         @Override
         public void visitCode() {
-            simulator.seedClassParameters(isStatic, currentMethod.getDescriptor());
+            simulator.seedTrackedParameters(isStatic, currentMethod.getDescriptor());
             super.visitCode();
         }
 
@@ -901,6 +899,9 @@ public class MethodBytecodeVisitor extends ClassVisitor {
                         return TypedValue.fromConstant(
                             Type.reference("java/lang/Class"), className);
                     }
+                    if (arg.getParamIndex() >= 0) {
+                        analysis.addReflectiveLookupParam(currentMethod, arg.getParamIndex());
+                    }
                 }
                 return null;
             }
@@ -927,6 +928,9 @@ public class MethodBytecodeVisitor extends ClassVisitor {
                         analysis.addInstantiatedClass(className, reachableFromUser);
                         return TypedValue.fromConstant(
                             Type.reference("java/lang/Class"), className);
+                    }
+                    if (arg.getParamIndex() >= 0) {
+                        analysis.addReflectiveLookupParam(currentMethod, arg.getParamIndex());
                     }
                 }
                 return null;
@@ -1132,7 +1136,7 @@ public class MethodBytecodeVisitor extends ClassVisitor {
                     targetClass = resolveClassNameFromValue(receiver);
                 }
                 if (targetClass == null && receiver != null && receiver.getParamIndex() >= 0) {
-                    analysis.addConstructorLookupParam(currentMethod, receiver.getParamIndex());
+                    analysis.addReflectiveLookupParam(currentMethod, receiver.getParamIndex());
                     return null;
                 }
                 if (targetClass == null) {
@@ -1533,11 +1537,12 @@ public class MethodBytecodeVisitor extends ClassVisitor {
             String calleeOwner = null;
             boolean ownerResolved = false;
             for (int i = 0; i < params.length; i++) {
-                if (params[i].getSort() != org.objectweb.asm.Type.OBJECT
-                    || !"java/lang/Class".equals(params[i].getInternalName())) continue;
+                if (!isClassCarrier(params[i])) continue;
                 if (args == null) args = simulator.peekArguments(params.length);
                 TypedValue arg = args.get(i);
-                String cls = (arg.isConstant() && arg.getValue() instanceof String s && !s.isEmpty())
+                boolean byName = "java/lang/String".equals(params[i].getInternalName());
+                String cls = (arg.isConstant() && arg.getValue() instanceof String s && !s.isEmpty()
+                        && (!byName || looksLikeClassName(s)))
                     ? s.replace('.', '/') : null;
                 if (cls == null && arg.getParamIndex() < 0) continue;
                 if (!ownerResolved) {
@@ -1730,6 +1735,22 @@ public class MethodBytecodeVisitor extends ClassVisitor {
     //  Bytecode-level type simulation (unchanged)
     // ------------------------------------------------------------------
 
+    private static boolean isClassCarrier(org.objectweb.asm.Type t) {
+        if (t.getSort() != org.objectweb.asm.Type.OBJECT) return false;
+        String n = t.getInternalName();
+        return "java/lang/Class".equals(n) || "java/lang/String".equals(n);
+    }
+
+    private static boolean looksLikeClassName(String s) {
+        int n = s.length();
+        if (n < 3 || n > 256 || s.indexOf('.') <= 0 || s.charAt(n - 1) == '.') return false;
+        for (int i = 0; i < n; i++) {
+            char c = s.charAt(i);
+            if (c != '.' && !Character.isJavaIdentifierPart(c)) return false;
+        }
+        return true;
+    }
+
     private static class TypeSimulator {
         private final Deque<TypedValue> stack = new ArrayDeque<>();
         private final Map<Integer, TypedValue> locals = new HashMap<>();
@@ -1741,12 +1762,11 @@ public class MethodBytecodeVisitor extends ClassVisitor {
         void storeLocal(int idx, TypedValue tv) { locals.put(idx, tv); }
         TypedValue loadLocal(int idx) { return locals.getOrDefault(idx, TypedValue.UNKNOWN); }
 
-        void seedClassParameters(boolean isStatic, String desc) {
+        void seedTrackedParameters(boolean isStatic, String desc) {
             int slot = isStatic ? 0 : 1;
             org.objectweb.asm.Type[] params = org.objectweb.asm.Type.getArgumentTypes(desc);
             for (int i = 0; i < params.length; i++) {
-                if (params[i].getSort() == org.objectweb.asm.Type.OBJECT
-                    && "java/lang/Class".equals(params[i].getInternalName())) {
+                if (isClassCarrier(params[i])) {
                     locals.put(slot, TypedValue.fromParameter(i));
                 }
                 slot += params[i].getSize();

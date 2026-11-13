@@ -689,7 +689,7 @@ void* __jnative_fn_jdk_internal_util_SystemProps_Raw_platformProperties____Ljava
 
     resolve_locale(lang_buf, sizeof(lang_buf), country_buf, sizeof(country_buf));
 
-    const char* cwd = getcwd(cwd_buf, sizeof(cwd_buf));
+    const char* cwd = jn_getcwd_utf8(cwd_buf, sizeof(cwd_buf));
     if (cwd == NULL) cwd = "/";
 
     string_array_set(arr, RAW_NDX(display_language), lang_buf);
@@ -881,7 +881,7 @@ void* __jnative_make_bootstrap_props(
     char home_buf[PATH_MAX];
     const char* java_home = resolve_java_home(home_buf, sizeof(home_buf));
     char cwd_buf[PATH_MAX];
-    const char* cwd = getcwd(cwd_buf, sizeof(cwd_buf));
+    const char* cwd = jn_getcwd_utf8(cwd_buf, sizeof(cwd_buf));
     if (cwd == NULL) cwd = "/";
     char user_buf[256];
     const char* user = resolve_user_name(user_buf, sizeof(user_buf));

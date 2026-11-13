@@ -1046,7 +1046,6 @@ public class Compiler implements CompilerPort {
         if (isMsvc) return;
 
         linkCmd.add("--sysroot=" + sysroot);
-        linkCmd.add("--gcc-toolchain=" + sysroot);
         String tripleDir = mingwTripleDir(target);
         if (Files.isDirectory(Paths.get(sysroot, tripleDir, "lib"))) {
             addLibIfDir(linkCmd, sysroot, tripleDir, "lib");

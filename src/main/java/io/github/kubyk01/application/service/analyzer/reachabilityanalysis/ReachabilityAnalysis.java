@@ -166,19 +166,19 @@ public class ReachabilityAnalysis {
     private final Object paramClassLock = new Object();
     private final Map<String, Set<String>> paramClasses = new HashMap<>();
     private final Map<String, Set<String>> paramForwards = new HashMap<>();
-    private final Set<String> ctorLookupParams = new HashSet<>();
+    private final Set<String> reflectiveLookupParams = new HashSet<>();
 
     private static String paramKey(String owner, String name, String desc, int index) {
         return (owner == null ? "*" : owner) + "|" + name + "|" + desc + "#" + index;
     }
 
-    public void addConstructorLookupParam(MethodReference method, int index) {
+    public void addReflectiveLookupParam(MethodReference method, int index) {
         List<String> found = new ArrayList<>();
         synchronized (paramClassLock) {
             for (String key : List.of(
                     paramKey(method.getOwner(), method.getName(), method.getDescriptor(), index),
                     paramKey(null, method.getName(), method.getDescriptor(), index))) {
-                if (ctorLookupParams.add(key)) found.addAll(paramClasses.getOrDefault(key, Set.of()));
+                if (reflectiveLookupParams.add(key)) found.addAll(paramClasses.getOrDefault(key, Set.of()));
             }
         }
         found.forEach(this::registerReflectiveConstructors);
@@ -215,7 +215,7 @@ public class ReachabilityAnalysis {
         while (!work.isEmpty()) {
             String[] kv = work.poll();
             if (!paramClasses.computeIfAbsent(kv[0], k -> new HashSet<>()).add(kv[1])) continue;
-            if (ctorLookupParams.contains(kv[0])) found.add(kv[1]);
+            if (reflectiveLookupParams.contains(kv[0])) found.add(kv[1]);
             for (String next : paramForwards.getOrDefault(kv[0], Set.of())) {
                 work.add(new String[]{next, kv[1]});
             }
@@ -230,6 +230,7 @@ public class ReachabilityAnalysis {
             cn = resolver.getClassNode(className);
         }
         if (cn == null || cn.isExternal() || cn.getMethods() == null) return;
+        addClassWithInit(className, true);
         for (MethodNode m : cn.getMethods()) {
             if (!m.getName().equals("<init>")) continue;
             MethodReference ref = new MethodReference(className, "<init>", m.getDescriptor());

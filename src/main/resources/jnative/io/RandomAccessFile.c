@@ -28,7 +28,7 @@
 
 #if defined(_WIN32)
 #  include <io.h>
-#  define raf_open     _open
+#  define raf_open     jn_open_utf8
 #  define raf_read     _read
 #  define raf_write    _write
 #  define raf_lseek    _lseeki64

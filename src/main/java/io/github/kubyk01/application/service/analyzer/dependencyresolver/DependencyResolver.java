@@ -264,7 +264,7 @@ public class DependencyResolver {
             }
         }
 
-        if (targetJavaHome == null) {
+        if (targetJavaHome == null || ProxyRewriter.SUPPORT.equals(internalName)) {
             try (InputStream is = ClassLoader.getSystemResourceAsStream(internalName + ".class")) {
                 if (is != null) {
                     bytes = is.readAllBytes();
