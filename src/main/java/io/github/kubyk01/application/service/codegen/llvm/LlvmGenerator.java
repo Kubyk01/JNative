@@ -170,13 +170,41 @@ public class LlvmGenerator implements LlvmGeneratorPort {
 
     @Override
     public void generate(Path outputDir) throws IOException {
+        long maxUnitBytes = Long.parseLong(System.getProperty("jnative.llvmUnitBytes",
+                Long.toString(1024L * 1024L)));
+        if (maxUnitBytes < 0) {
+            throw new IllegalArgumentException("jnative.llvmUnitBytes must be nonnegative");
+        }
         Files.createDirectories(outputDir);
         ensureExternalDeclarations();
         generateLambdaAdaptors();
         globalEmitter.prepareLayouts();
 
+        Path spoolDir = outputDir.resolve(".jnative-spool");
+        deleteTree(spoolDir);
+        Files.createDirectories(spoolDir);
+        Path moduleSpool = spoolDir.resolve(".module.body");
+        Map<String, Path> classSpools = new LinkedHashMap<>();
+        globalEmitter.setAdaptorSink((className, text) -> {
+            try (java.io.Writer w = openSpool(classSpools.computeIfAbsent(className, k -> spoolPath(spoolDir, k)))) {
+                w.write(text);
+            } catch (IOException e) {
+                throw new java.io.UncheckedIOException(e);
+            }
+        });
+
         String structDefs   = globalEmitter.generateStructDefinitions();
-        String globalDefs   = globalEmitter.generateGlobalDefinitions();
+        Map<String, GlobalDecl> knownGlobals = new HashMap<>();
+        List<Path> globalSpools = new ArrayList<>();
+        for (java.util.function.Supplier<String> part : globalEmitter.globalDefinitionParts()) {
+            String text = part.get();
+            knownGlobals.putAll(parseGlobalDecls(text));
+            Path spool = spoolDir.resolve(".globals" + globalSpools.size());
+            try (java.io.Writer w = openSpool(spool)) {
+                w.write(text);
+            }
+            globalSpools.add(spool);
+        }
         String lambdaVts    = globalEmitter.emitLambdaVtables();
 
         // The lambda struct text and the reflection ABI types take part in the
@@ -208,11 +236,6 @@ public class LlvmGenerator implements LlvmGeneratorPort {
         toEmit.sort(Comparator.comparing(f ->
             f.getOwnerClass() == null ? "" : f.getOwnerClass()));
 
-        Path spoolDir = outputDir.resolve(".jnative-spool");
-        deleteTree(spoolDir);
-        Files.createDirectories(spoolDir);
-        Path moduleSpool = spoolDir.resolve(".module.body");
-        Map<String, Path> classSpools = new LinkedHashMap<>();
 
         String openOwner = null;
         java.io.Writer openWriter = null;
@@ -252,7 +275,6 @@ public class LlvmGenerator implements LlvmGeneratorPort {
         //         deferred strings included. ----
         // Parsed one by one rather than concatenated: globalDefs is the
         // largest string in the generator and a joined copy doubles it.
-        Map<String, GlobalDecl> knownGlobals = parseGlobalDecls(globalDefs);
         knownGlobals.putAll(parseGlobalDecls(lambdaVts));
         knownGlobals.putAll(parseGlobalDecls(deferred));
 
@@ -315,26 +337,29 @@ public class LlvmGenerator implements LlvmGeneratorPort {
             : "";
         Files.deleteIfExists(moduleSpool);
 
-        String moduleTail = globalDefs
-            + "\n" + lambdaVts
+        String moduleTail = lambdaVts
             + "\n" + deferred
             + "\n" + moduleBodies
             + moduleDecls
             + runInit
             + main;
-        globalDefs = null;   // now duplicated inside moduleTail; let the GC take it
         moduleBodies = null;
 
-        String moduleExterns = buildExterns(
-            moduleTail,
-            Collections.emptyMap(),
-            module);
+        String moduleExterns = buildExterns(moduleTail, knownGlobals, module);
 
         String modulePrelude = buildFilteredPrelude(
             moduleTail, moduleExterns, preludeDefs, preludeKeys);
 
         writeLl(outputDir.resolve("_module.ll"), modulePrelude, moduleExterns, moduleTail);
         moduleTail = null;
+
+        for (int gi = 0; gi < globalSpools.size(); gi++) {
+            String body = Files.readString(globalSpools.get(gi), StandardCharsets.UTF_8);
+            Files.deleteIfExists(globalSpools.get(gi));
+            String externs = buildExterns(body, knownGlobals, module);
+            writeLl(outputDir.resolve("_globals" + gi + ".ll"),
+                buildFilteredPrelude(body, externs, preludeDefs, preludeKeys), externs, body);
+        }
 
         // Embedded resources get their own translation unit, streamed byte by
         // byte: as IR text they are several times their raw size and holding
@@ -347,32 +372,65 @@ public class LlvmGenerator implements LlvmGeneratorPort {
             globalEmitter.writeEmbeddedResources(w);
         }
 
-        // ---- 6. Write one .ll file per class. ----
-        // Each file is independent: it reads only the immutable emission
-        // results and the module. Building and writing them in parallel
-        // keeps the single-threaded tail of the compiler short.
-        LlvmUtil.parallelMapOrdered(new ArrayList<>(classSpools.entrySet()), scheduler, e -> {
-            String className = e.getKey();
+        List<ClassUnit> classUnits = partitionClassBodies(classSpools, maxUnitBytes);
+        LlvmUtil.parallelMapOrdered(classUnits, scheduler, unit -> {
             try {
-                String body = Files.readString(e.getValue(), StandardCharsets.UTF_8);
-
+                String body = readClassBodies(unit.bodies());
                 String externs = buildExterns(body, knownGlobals, module);
-
                 String prelude = buildFilteredPrelude(body, externs, preludeDefs, preludeKeys);
-
-                Path out = outputDir.resolve(className + ".ll");
+                Path out = outputDir.resolve(unit.name() + ".ll");
                 if (out.getParent() != null) Files.createDirectories(out.getParent());
                 writeLl(out, prelude, externs, body);
-                Files.deleteIfExists(e.getValue());
+                for (Path source : unit.bodies()) {
+                    Files.deleteIfExists(source);
+                }
             } catch (IOException ex) {
                 throw new java.io.UncheckedIOException(ex);
             }
-            return className;
+            return unit.name();
         });
         deleteTree(spoolDir);
     }
 
     private static final int EMIT_BATCH = 4096;
+
+    private record ClassUnit(String name, List<Path> bodies) {}
+
+    private static List<ClassUnit> partitionClassBodies(Map<String, Path> classSpools,
+                                                       long maxUnitBytes) throws IOException {
+        List<ClassUnit> units = new ArrayList<>();
+        List<Path> bodies = new ArrayList<>();
+        List<Map.Entry<String, Path>> classes = new ArrayList<>(classSpools.entrySet());
+        classes.sort(Map.Entry.comparingByKey());
+        long bytes = 0;
+        String firstClass = null;
+        for (Map.Entry<String, Path> entry : classes) {
+            long size = Files.size(entry.getValue());
+            if (!bodies.isEmpty() && (maxUnitBytes == 0 || size > maxUnitBytes - bytes)) {
+                units.add(new ClassUnit(firstClass, List.copyOf(bodies)));
+                bodies.clear();
+                bytes = 0;
+            }
+            if (bodies.isEmpty()) firstClass = entry.getKey();
+            bodies.add(entry.getValue());
+            bytes += size;
+        }
+        if (!bodies.isEmpty()) {
+            units.add(new ClassUnit(firstClass, List.copyOf(bodies)));
+        }
+        return units;
+    }
+
+    private static String readClassBodies(List<Path> sources) throws IOException {
+        if (sources.size() == 1) {
+            return Files.readString(sources.getFirst(), StandardCharsets.UTF_8);
+        }
+        StringBuilder body = new StringBuilder();
+        for (Path source : sources) {
+            body.append(Files.readString(source, StandardCharsets.UTF_8)).append('\n');
+        }
+        return body.toString();
+    }
 
     private static Path spoolPath(Path spoolDir, String className) {
         return spoolDir.resolve(className + ".body");
@@ -1313,7 +1371,7 @@ public class LlvmGenerator implements LlvmGeneratorPort {
         } else {
             log.warn("java.lang.String.<clinit> is missing from the module; "
                 + "COMPACT_STRINGS will default to false and every String.length() "
-                + "will be halved. Check that ReachabilityAnalysis triggers "
+                + "will be halved. Check that ClassAnalysis triggers "
                 + "triggerClinit(\"java/lang/String\", ...) and that the class has "
                 + "bytecode available.");
         }
@@ -1426,7 +1484,7 @@ public class LlvmGenerator implements LlvmGeneratorPort {
                 log.warn("jdk.internal.misc.UnsafeConstants.<clinit> is "
                     + "missing from the module; Unsafe.ADDRESS_SIZE will "
                     + "be read as 0 and every Unsafe.allocateMemory() call "
-                    + "will return NULL. Check that ReachabilityAnalysis "
+                    + "will return NULL. Check that ClassAnalysis "
                     + "triggers clinit on UnsafeConstants when Unsafe.<clinit> "
                     + "reads its fields.");
             }

@@ -69,9 +69,7 @@ void* __jnative_fn_java_net_Inet4AddressImpl_lookupAllHostAddr__Ljava_lang_Strin
     if (!host_str) {
         __jnative_throw_exception(NULL);
     }
-    int32_t hostLen = 0;
-    const char* host = __jnative_read_string_bytes(host_str, &hostLen);
-    (void)hostLen;
+    const char* host = __jnative_read_string_bytes(host_str, NULL);
 
     struct addrinfo hints;
     memset(&hints, 0, sizeof(hints));
@@ -259,8 +257,8 @@ int32_t __jnative_fn_java_net_Inet4AddressImpl_isReachable0___BI_BI_Z(
     memcpy(&sin.sin_addr, addr, 4);
     sin.sin_port = htons(7);
 
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) {
+    jn_socket_t fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd == JN_INVALID_SOCKET) {
         return 0;
     }
 
@@ -277,6 +275,6 @@ int32_t __jnative_fn_java_net_Inet4AddressImpl_isReachable0___BI_BI_Z(
     } while (rc < 0 && errno == EINTR);
 
     int reachable = (rc == 0 || errno == ECONNREFUSED) ? 1 : 0;
-    close(fd);
+    jn_close_socket(fd);
     return reachable;
 }

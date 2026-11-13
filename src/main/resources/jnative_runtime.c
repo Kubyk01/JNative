@@ -668,9 +668,9 @@ static ClinitEntry* clinit_lookup_or_create(const char* name) {
 
 __attribute__((noinline))
 int32_t __jnative_clinit_enter(void* name_str) {
-    int32_t len = 0;
-    const char* name = __jnative_read_string_bytes(name_str, &len);
-    if (name == NULL || len <= 0) return 0;
+    const char* name = __jnative_read_string_bytes(name_str, NULL);
+    int32_t len = (int32_t)strlen(name);
+    if (len <= 0) return 0;
 
     jn_mutex_lock(&clinit_lock);
     ClinitEntry* e = clinit_lookup_or_create(name);
@@ -709,9 +709,8 @@ int32_t __jnative_clinit_enter(void* name_str) {
 
 __attribute__((noinline))
 void __jnative_clinit_exit(void* name_str) {
-    int32_t len = 0;
-    const char* name = __jnative_read_string_bytes(name_str, &len);
-    if (name == NULL || len <= 0) return;
+    const char* name = __jnative_read_string_bytes(name_str, NULL);
+    if (name[0] == '\0') return;
     clinit_stack_pop();
     jn_mutex_lock(&clinit_lock);
     ClinitEntry* e = clinit_lookup(name);
@@ -2291,8 +2290,8 @@ const char* __jnative_read_string_bytes(void* s, int32_t* out_len) {
     for (int32_t i = 0; ascii && i < blen; i++) {
         if (src[i] & 0x80) ascii = 0;
     }
-    if (ascii) {
-        if (out_len) *out_len = blen;
+    if (ascii && out_len != NULL) {
+        *out_len = blen;
         return (const char*)src;
     }
     jn_once(&jn_utf8_ring_once, jn_utf8_ring_init);

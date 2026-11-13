@@ -1,6 +1,6 @@
 package io.github.kubyk01.application.service.codegen.llvm;
 
-import io.github.kubyk01.application.service.analyzer.reachabilityanalysis.annotation.ClassFileAnnotations;
+import io.github.kubyk01.application.service.analyzer.classanalysis.annotation.ClassFileAnnotations;
 
 import io.github.kubyk01.application.service.analyzer.dependencyresolver.DependencyResolver;
 import io.github.kubyk01.application.service.analyzer.ssa.TypeResolver;
@@ -207,6 +207,9 @@ public class LlvmGlobalEmitter {
     private final DependencyResolver resolver;
     private final Set<String> pointsToStaticFields;
     private final ReflectInfo reflectInfo;
+
+    @lombok.Setter
+    private java.util.function.BiConsumer<String, String> adaptorSink;
 
     // -------------------------------------------------------------------------
     //  Caches. Every map/set that is written by one thread and read by
@@ -813,33 +816,16 @@ public class LlvmGlobalEmitter {
      * global that has no reference inside its own module, which would leave
      * the external references unresolved at link time.
      */
-    public String generateGlobalDefinitions() {
+    public List<java.util.function.Supplier<String>> globalDefinitionParts() {
         prepareLayouts();
-        return generateLayoutConstants() +
-            generateStaticFields() +
-            // generateStringLiterals() depends on vtableNames, which only exists
-            // after generateVtables(); the reflection data depends on the string
-            // literal pool; the unnamed module and the embedded-resource table
-            // depend on the vtables. The ordering below is load-bearing and
-            // mirrors the original generateGlobals() chain.
-            generateVtables() +
-            generateTypeStringConstants() +
-            generateStringLiterals() +
-            generateTypeInfo() +
-            generateUnnamedModule() +
-            // Embedded resources are NOT part of this text: they can be many
-            // MB of escaped bytes, so writeEmbeddedResources streams them to
-            // their own .ll file instead of holding them in the heap.
-            generateReflectionData() +
-            generateFunctionIndex() +
-            // Runs last so that emittedRefClassNames (filled by
-            // generateReflectionData) is complete: every row of the map points
-            // at an @refclass_* constant that already exists.
-            emitLazyClinitMap(lazyClinitWrappers) +
-            // The completion flags are referenced by the guard wrappers'
-            // bodies, which are emitted as ordinary functions; the globals
-            // themselves are plain i32 and do not depend on anything else.
-            emitLazyClinitFlags();
+        return List.of(
+            () -> generateLayoutConstants() + generateStaticFields(),
+            this::generateVtables,
+            () -> generateTypeStringConstants() + generateStringLiterals()
+                + generateTypeInfo() + generateUnnamedModule(),
+            this::generateReflectionData,
+            this::generateFunctionIndex,
+            () -> emitLazyClinitMap(lazyClinitWrappers) + emitLazyClinitFlags());
     }
 
     public String generateLayoutConstants() {
@@ -3282,6 +3268,8 @@ public class LlvmGlobalEmitter {
             boolean isPrimitive = PRIMITIVE_TYPE_NAMES.contains(className);
             boolean isArrayPseudoClass = className.charAt(0) == '[';
             boolean isLambdaPseudoClass = isLambdaPseudoClassName(className);
+            StringBuilder adaptorDefs = adaptorSink == null || isArrayPseudoClass || isLambdaPseudoClass
+                ? sb : new StringBuilder();
             ClassNode classNode = (isPrimitive || isArrayPseudoClass || isLambdaPseudoClass)
                 ? null
                 : resolver.getClassNode(className);
@@ -3471,7 +3459,7 @@ public class LlvmGlobalEmitter {
                 // descriptor through several paths:
                 //
                 //   - a MethodNode synthesised by the reflection machinery
-                //     (ReachabilityAnalysis.applyMetadata, or a reflective
+                //     (ClassAnalysis.applyMetadata, or a reflective
                 //     Class.getDeclaredMethod / MethodHandles.Lookup.findXxx
                 //     handler) whose descriptor slot was never populated;
                 //
@@ -3536,7 +3524,10 @@ public class LlvmGlobalEmitter {
                     LlvmRuntime.mangleMethod(className, methodName, desc));
                 String adaptorPtr = "i8* null";
                 if (impl != null && impl.getEntryBlock() != null) {
-                    sb.append(emitAdaptorForMethod(className, method));
+                    adaptorDefs.append(emitAdaptorForMethod(className, method));
+                    if (adaptorDefs != sb) {
+                        sb.append("declare i8* @").append(adaptorName).append("(i8*, i8**)\n");
+                    }
                     adaptorPtr = "i8* bitcast (i8* (i8*, i8**)* @"
                         + adaptorName + " to i8*)";
                 }
@@ -3684,8 +3675,11 @@ public class LlvmGlobalEmitter {
                     && impl.getParameters().size() == TypeResolver.descToParamTypes(desc).size() + 1;
                 String adaptorPtr = "i8* null";
                 if (impl != null && (impl.getEntryBlock() != null || nativeOverride)) {
-                    sb.append(emitAdaptorForConstructor(className, ctor, objectSize,
+                    adaptorDefs.append(emitAdaptorForConstructor(className, ctor, objectSize,
                         nativeOverride ? impl.getName() : mangledInit, nativeOverride));
+                    if (adaptorDefs != sb) {
+                        sb.append("declare i8* @").append(adaptorName).append("(i8**)\n");
+                    }
                     adaptorPtr = "i8* bitcast (i8* (i8**)* @"
                         + adaptorName + " to i8*)";
                 }
@@ -3705,6 +3699,9 @@ public class LlvmGlobalEmitter {
             }
             String ctorsArray = "@refctors_" + cleanClassName;
             appendNullTerminatedPtrArray(sb, ctorsArray, ctorPtrs);
+            if (adaptorDefs != sb && adaptorDefs.length() > 0) {
+                adaptorSink.accept(className, adaptorDefs.toString());
+            }
 
             String superClassPtr = "null";
             if (isArrayPseudoClass) {

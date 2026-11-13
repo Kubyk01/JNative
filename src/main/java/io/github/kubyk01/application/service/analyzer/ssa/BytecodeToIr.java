@@ -1,7 +1,7 @@
 package io.github.kubyk01.application.service.analyzer.ssa;
 
 import io.github.kubyk01.application.service.analyzer.dependencyresolver.DependencyResolver;
-import io.github.kubyk01.application.service.analyzer.reachabilityanalysis.ReachabilityAnalysis;
+import io.github.kubyk01.application.service.analyzer.classanalysis.ClassAnalysis;
 import io.github.kubyk01.application.service.codegen.NativeOverride;
 import io.github.kubyk01.application.service.codegen.llvm.LlvmRuntime;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.ClassNode;
@@ -40,7 +40,7 @@ import static io.github.kubyk01.util.LlvmUtil.extractCalleeName;
 public class BytecodeToIr {
 
     private final DependencyResolver resolver;
-    private final ReachabilityAnalysis reachability;
+    private final ClassAnalysis reachability;
     private final IrBuilder builder = new IrBuilder();
     private final Map<String, Map<String, Set<Integer>>> deadCodeMethods = new ConcurrentHashMap<>();
 
@@ -50,7 +50,7 @@ public class BytecodeToIr {
     private final Map<String, NativeOverride> overrides = new HashMap<>();
 
     public BytecodeToIr(DependencyResolver resolver,
-                        ReachabilityAnalysis reachability,
+                        ClassAnalysis reachability,
                         List<NativeOverride> nativeOverrides) {
         this.resolver = resolver;
         this.reachability = reachability;
@@ -77,7 +77,7 @@ public class BytecodeToIr {
         ThreadLocal<IrBuilder> builders =
             ThreadLocal.withInitial(() -> new IrBuilder(module));
         LlvmUtil.parallelMapOrdered(
-            new ArrayList<>(reachability.getReachableMethods()), scheduler, ref -> {
+            new ArrayList<>(reachability.getMethods()), scheduler, ref -> {
                 NativeOverride match = findOverride(ref);
                 if (match != null) {
                     // Alias every reachable overload onto the single C function.

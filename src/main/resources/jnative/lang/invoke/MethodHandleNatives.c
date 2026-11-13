@@ -411,8 +411,7 @@ static const char* method_type_descriptor(void* method_type) {
     void* desc_str = fn(method_type);
     if (desc_str == NULL) return NULL;
 
-    int32_t len = 0;
-    return __jnative_read_string_bytes(desc_str, &len);
+    return __jnative_read_string_bytes(desc_str, NULL);
 }
 
 /*
@@ -690,8 +689,7 @@ void* __jnative_fn_java_lang_invoke_MethodHandleNatives_resolve__BLjava_lang_inv
 
     const char* name = NULL;
     if (name_str != NULL) {
-        int32_t name_len = 0;
-        name = __jnative_read_string_bytes(name_str, &name_len);
+        name = __jnative_read_string_bytes(name_str, NULL);
     }
 
     int32_t real_modifiers = 0;

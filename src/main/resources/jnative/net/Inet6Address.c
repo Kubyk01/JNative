@@ -11,9 +11,9 @@ void __jnative_fn_java_net_Inet6Address_init___V(void) {
         return;
     }
 
-    int fd = socket(AF_INET6, SOCK_STREAM, 0);
-    if (fd >= 0) {
-        close(fd);
+    jn_socket_t fd = socket(AF_INET6, SOCK_STREAM, 0);
+    if (fd != JN_INVALID_SOCKET) {
+        jn_close_socket(fd);
     }
 
     __jnative_inet6_init_done = 1;

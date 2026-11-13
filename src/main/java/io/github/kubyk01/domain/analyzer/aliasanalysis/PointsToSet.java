@@ -1,6 +1,8 @@
 package io.github.kubyk01.domain.analyzer.aliasanalysis;
 
+import java.lang.ref.WeakReference;
 import java.util.AbstractSet;
+import java.util.WeakHashMap;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Iterator;
@@ -10,6 +12,26 @@ import java.util.Set;
 public final class PointsToSet extends AbstractSet<AllocationSite> {
 
     private static final int[] NO_IDS = new int[0];
+
+    @SuppressWarnings("unchecked")
+    private static final WeakHashMap<PointsToSet, WeakReference<PointsToSet>>[] INTERNED = new WeakHashMap[256];
+
+    static {
+        for (int i = 0; i < INTERNED.length; i++) INTERNED[i] = new WeakHashMap<>();
+    }
+
+    private static PointsToSet intern(PointsToSet s) {
+        if (s.ids.length < 2) return s;
+        int h = s.hashCode();
+        WeakHashMap<PointsToSet, WeakReference<PointsToSet>> stripe = INTERNED[(h ^ (h >>> 16)) & 255];
+        synchronized (stripe) {
+            WeakReference<PointsToSet> ref = stripe.get(s);
+            PointsToSet existing = ref == null ? null : ref.get();
+            if (existing != null) return existing;
+            stripe.put(s, new WeakReference<>(s));
+            return s;
+        }
+    }
 
     public static final PointsToSet EMPTY = new PointsToSet(NO_IDS);
 
@@ -23,7 +45,7 @@ public final class PointsToSet extends AbstractSet<AllocationSite> {
     public static PointsToSet empty() { return EMPTY; }
 
     public static PointsToSet ofSortedUnique(int[] ids) {
-        return ids.length == 0 ? EMPTY : new PointsToSet(ids);
+        return ids.length == 0 ? EMPTY : intern(new PointsToSet(ids));
     }
 
     public static PointsToSet copyOf(Collection<AllocationSite> sites) {
@@ -38,7 +60,7 @@ public final class PointsToSet extends AbstractSet<AllocationSite> {
             if (w == 0 || a[w - 1] != a[i]) a[w++] = a[i];
         }
         if (w == 1) return AllocationSite.byId(a[0]).singleton();
-        return new PointsToSet(w == a.length ? a : Arrays.copyOf(a, w));
+        return intern(new PointsToSet(w == a.length ? a : Arrays.copyOf(a, w)));
     }
 
     public int[] rawIds() { return ids; }
@@ -106,8 +128,8 @@ public final class PointsToSet extends AbstractSet<AllocationSite> {
         if (a == null || a.isEmpty()) return b;
         int[] x = a.ids, y = b.ids;
         int nx = x.length, ny = y.length;
-        if (x[nx - 1] < y[0]) return new PointsToSet(concat(x, y));
-        if (y[ny - 1] < x[0]) return new PointsToSet(concat(y, x));
+        if (x[nx - 1] < y[0]) return intern(new PointsToSet(concat(x, y)));
+        if (y[ny - 1] < x[0]) return intern(new PointsToSet(concat(y, x)));
         int i = 0, j = 0, n = 0;
         while (i < nx && j < ny) {
             int u = x[i], v = y[j];
@@ -130,7 +152,7 @@ public final class PointsToSet extends AbstractSet<AllocationSite> {
         }
         while (i < nx) out[k++] = x[i++];
         while (j < ny) out[k++] = y[j++];
-        return new PointsToSet(out);
+        return intern(new PointsToSet(out));
     }
 
     private static int[] concat(int[] lo, int[] hi) {

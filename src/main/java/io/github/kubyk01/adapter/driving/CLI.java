@@ -131,8 +131,6 @@ public class CLI implements Runnable {
         @CommandLine.Option(names = "--debug-name",
             description = "Debug only this class or method (shows only matching items)")
         String debugName,
-        @CommandLine.Option(names = "--classes-graph",
-            description = "Show call graph from entry point") boolean showClassesGraph,
         @CommandLine.Option(names = "--cores",
             description = "Maximum number of CPU cores this run may use. "
                 + "A value of 0 (the default) means: use every core "
@@ -213,7 +211,7 @@ public class CLI implements Runnable {
         Path path = file.toPath();
         orchestrator.analyze(path, entryClass, entryMethod, descriptor,
             showClasses, showAlias, showEscape, showLifetime, showDestructor,
-            outputFile, noCompile, includeSystem, debugName, showClassesGraph,
+            outputFile, noCompile, includeSystem, debugName,
             cores, optimizationLevel, platform);
     }
 }

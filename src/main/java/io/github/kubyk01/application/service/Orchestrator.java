@@ -2,7 +2,7 @@ package io.github.kubyk01.application.service;
 
 import io.github.kubyk01.application.service.analyzer.Analyzer;
 import io.github.kubyk01.application.service.analyzer.dependencyresolver.DependencyResolver;
-import io.github.kubyk01.application.service.analyzer.reachabilityanalysis.ReachabilityAnalysis;
+import io.github.kubyk01.application.service.analyzer.classanalysis.ClassAnalysis;
 import io.github.kubyk01.application.service.analyzer.ssa.BytecodeToIr;
 import io.github.kubyk01.application.service.analyzer.ssa.OutOfSsaPass;
 import io.github.kubyk01.application.service.analyzer.ssa.SSATransformer;
@@ -10,7 +10,7 @@ import io.github.kubyk01.application.service.codegen.NativeOverride;
 import io.github.kubyk01.application.service.codegen.NativeOverrideScanner;
 import io.github.kubyk01.application.service.codegen.ResourceEmbedder;
 import io.github.kubyk01.application.service.codegen.llvm.LlvmGenerator;
-import io.github.kubyk01.application.service.analyzer.reachabilityanalysis.annotation.cglib.CglibPregenerator;
+import io.github.kubyk01.application.service.analyzer.classanalysis.annotation.cglib.CglibPregenerator;
 import io.github.kubyk01.application.service.compiler.ClasspathExporter;
 import io.github.kubyk01.application.service.compiler.TargetJdk;
 import io.github.kubyk01.application.service.codegen.llvm.nativepolymorphicfunctionresolver.PolymorphicResolver;
@@ -53,7 +53,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.function.Predicate;
 import java.util.stream.Collectors;
 
 @Slf4j
@@ -79,7 +78,6 @@ public class Orchestrator implements OrchestratorPort {
                         boolean noCompile,
                         boolean includeSystem,
                         String debugName,
-                        boolean showClassesGraph,
                         int cores,
                         int optimizationLevel,
                         TargetPlatform targetPlatform) {
@@ -102,7 +100,7 @@ public class Orchestrator implements OrchestratorPort {
         try {
             runAnalysis(path, entryClass, entryMethod, entryDescriptor,
                     showClasses, showAlias, showEscape, showLifetime, showDestructor,
-                    outputFile, noCompile, includeSystem, debugName, showClassesGraph,
+                    outputFile, noCompile, includeSystem, debugName,
                     effectiveCores, optimizationLevel, scheduler, targetPlatform);
         } finally {
             scheduler.dispose();
@@ -122,7 +120,6 @@ public class Orchestrator implements OrchestratorPort {
                              boolean noCompile,
                              boolean includeSystem,
                              String debugName,
-                             boolean showClassesGraph,
                              int effectiveCores,
                              int optimizationLevel,
                              Scheduler scheduler,
@@ -141,13 +138,9 @@ public class Orchestrator implements OrchestratorPort {
         }
         System.out.println("Parsed classes: " + resolver.getAllClasses().size());
 
-        // --- 2. Reachability analysis -------------------------------------
-        ReachabilityAnalysis analysis = new ReachabilityAnalysis(resolver);
-        analysis.setScheduler(scheduler);
-        analysis.applyMetadata(resolver.getMetadata());
-        analysis.analyzeFromEntry(entryClass, entryMethod, entryDescriptor);
-        Set<String> reachableFromEntry = new HashSet<>(analysis.getReachableClasses());
-        analysis.addAllApplicationClasses();
+        // --- 2. Class analysis --------------------------------------------
+        ClassAnalysis analysis = new ClassAnalysis(resolver);
+        analysis.analyze();
         if (!noCompile && Files.isRegularFile(path)) {
             Path exePath = outputFile != null ? Paths.get(outputFile) : defaultOutputPath(path, targetPlatform);
             try {
@@ -161,101 +154,17 @@ public class Orchestrator implements OrchestratorPort {
                     CglibPregenerator.generate(runtimeClasspath, analysis.annotatedApplicationClasses());
                 if (!cglibClasses.isEmpty()) {
                     System.out.println("Pre-generated " + cglibClasses.size() + " CGLIB class(es)");
-                    analysis.addGeneratedClasses(cglibClasses);
+                    cglibClasses.forEach(analysis::define);
                 }
             } catch (IOException e) {
                 log.error("Failed to export runtime classpath", e);
             }
         }
-        Set<String> lazyOnlyClasses = new HashSet<>(analysis.getReachableClasses());
-        lazyOnlyClasses.removeAll(reachableFromEntry);
+        Set<String> lazyOnlyClasses = analysis.lazyOnlyClasses(
+                entryClass.replace('.', '/'), "java/lang/System", "java/lang/String");
 
-        // The native Class.getResourceAsStream override builds a
-        // ByteArrayInputStream from C, so the ordinary bytecode closure never
-        // sees those methods. Force them in and re-run the fixed point before
-        // the reachable sets are snapshotted below, otherwise the class and
-        // method listings would be missing them and the vtable slots would
-        // hold unresolved thunks.
-        forceResourceStreamMethods(analysis);
-        forcePerfMethods(analysis);
-        forceReflectionInvokeMethods(analysis);
-        forceStackWalkMethods(analysis, resolver);
-        forceNativeAccessMethods(analysis, resolver);
-        forcePackageDefinitionMethods(analysis, resolver);
-        forceLoggingConfigClasses(analysis);
-        forceServiceProviders(analysis, resolver);
-        forceSocketAddressMethods(analysis);
-
-        // ------------------------------------------------------------------
-        // Superclass-<clinit> closure.
-        //
-        // Every class whose <clinit> must run before another class's — the
-        // transitive superclass chain of the reachable set — is forced into
-        // the reachable set here, before translation. This is the only way
-        // to guarantee that LlvmGenerator.generateMain()'s eager schedule
-        // covers the full JVMS §5.5 step-5 chain without an ad-hoc
-        // resurrection pass after the module has been built.
-        //
-        // The concrete failure this closes is documented on
-        // ReachabilityAnalysis.ensureSuperclassClinitsReachable().
-        // ------------------------------------------------------------------
-        analysis.ensureSuperclassClinitsReachable();
-
-        // ------------------------------------------------------------------
-        // Descriptor-type closure.
-        //
-        // Pull in every class referenced only from a parameter type,
-        // return type, or field type of a class already in the class map.
-        // Without this pass a class that is referenced only through such
-        // a descriptor — the canonical case being a provider
-        // implementation whose name is read from a String field at run
-        // time and handed to Class.forName — is present in the reachable
-        // set as a name but absent from the class map, and therefore has
-        // no vtable, no struct type, and no reflection record. At run
-        // time Class.forName0 then fails to find it, and any Java-level
-        // catch (ClassNotFoundException) or NoSuchAlgorithmException on
-        // the caller's frame receives NULL rather than an exception
-        // object.
-        //
-        // The concrete failure this closes is documented on
-        // ReachabilityAnalysis.expandClassMapToDescriptorClosure().
-        // ------------------------------------------------------------------
-        analysis.expandClassMapToDescriptorClosure();
-
-        // ------------------------------------------------------------------
-        // Interface-implementation closure.
-        //
-        // The reachability walk reaches a class only through NEW, GETSTATIC /
-        // PUTSTATIC, INVOKESTATIC, or a resolved virtual/interface dispatch.
-        // A class that participates in the image only as the runtime type of
-        // an interface-typed receiver is reached, but its concrete
-        // implementations of the interface's methods may not be — because
-        // resolveVirtualDispatchFixedPoint only resolves slots whose dispatch
-        // site was actually observed, and by the time that site is resolved
-        // the concrete class may not yet be in instantiatedClasses.
-        //
-        // Codegen emits an itable entry for every method of every interface
-        // that every non-external class implements, so any implementation
-        // that is missing from reachableMethods becomes a NULL function
-        // pointer in the itable, and the first caller that dispatches
-        // through it traps with __jnative_unresolved_slot.
-        //
-        // The concrete failure this closes: JceSecurity.<clinit> ->
-        // JceSecurity.setupJurisdictionPolicies -> for (Path p : stream)
-        // -> DirectoryStream.iterator(), where stream's runtime type is
-        // sun/nio/fs/UnixSecureDirectoryStream. The implementation of
-        // iterator() is inherited from sun/nio/fs/UnixDirectoryStream, and
-        // that method had never been added to the reachable set.
-        //
-        // The pass must run *before* the snapshots of allClasses/allMethods
-        // below, so that the newly-added methods are picked up by
-        // BytecodeToIr.translate() and receive the ordinary SSA / analysis
-        // pipeline.
-        // ------------------------------------------------------------------
-        analysis.ensureInterfaceImplementationsReachable();
-
-        Set<String> allClasses = analysis.getReachableClasses();
-        Set<MethodReference> allMethods = analysis.getReachableMethods();
+        Set<String> allClasses = analysis.getClasses();
+        Set<MethodReference> allMethods = analysis.getMethods();
 
         Set<String> usedSystemClasses = ConcurrentHashMap.newKeySet();
         Set<String> polymorphicClasses = ConcurrentHashMap.newKeySet();
@@ -327,10 +236,6 @@ public class Orchestrator implements OrchestratorPort {
         }
 
         // --- 5. Optional prints -------------------------------------------
-        if (showClassesGraph) {
-            printCallGraph(analysis, entryClass, entryMethod, entryDescriptor,
-                    includeSystem, debugName);
-        }
 
         if (showClasses) {
             Set<String> filteredClasses = classesToShow.stream()
@@ -488,7 +393,7 @@ public class Orchestrator implements OrchestratorPort {
         llvmGen.setEmbeddedResources(embedded);
         llvmGen.setTargetPlatform(targetPlatform);
 
-        Path genDir = Paths.get("target", "generated-jnative");
+        Path genDir = generatedOutputDirectory();
         try {
             if (Files.exists(genDir)) {
                 try (var stream = Files.walk(genDir)) {
@@ -580,10 +485,10 @@ public class Orchestrator implements OrchestratorPort {
      * one — an unusual case, but one that has a well-defined outcome
      * rather than an exception.</p>
      */
-    private List<NativeOverride> collectNativeOverrides(ReachabilityAnalysis analysis) {
+    private List<NativeOverride> collectNativeOverrides(ClassAnalysis analysis) {
         List<NativeOverride> discovered = new ArrayList<>();
 
-        for (String cls : analysis.getReachableClasses()) {
+        for (String cls : analysis.getClasses()) {
             String cResourcePath = cResourcePathForClass(cls);
             List<NativeOverride> found = NativeOverrideScanner.scan(cResourcePath);
             if (!found.isEmpty()) {
@@ -617,254 +522,6 @@ public class Orchestrator implements OrchestratorPort {
             return "jnative/" + internalName.substring("java/".length()) + ".c";
         }
         return "jnative/" + internalName + ".c";
-    }
-
-    // =====================================================================
-    //  Forced reachability
-    // =====================================================================
-
-    /**
-     * Marks the {@code ByteArrayInputStream} methods that the native
-     * {@code Class.getResourceAsStream} override depends on as reachable.
-     *
-     * <p>Nothing in the bytecode of any reachable method calls them: the
-     * override constructs the stream from C
-     * ({@code __jnative_make_byte_array_input_stream} in
-     * {@code jnative_runtime.c}), so the worklist never learns about them and
-     * their vtable slots would be filled with unresolved thunks. The set below
-     * is the JDK code {@code ICUBinary.getRequiredData} drives on the returned
-     * stream: {@code available}, the two {@code read} overloads, and
-     * {@code close} from the try-with-resources.
-     */
-    private void forceReflectionInvokeMethods(ReachabilityAnalysis analysis) {
-        String[][] boxes = {
-            {"java/lang/Boolean", "Z"}, {"java/lang/Byte", "B"},
-            {"java/lang/Short", "S"}, {"java/lang/Character", "C"},
-            {"java/lang/Integer", "I"}, {"java/lang/Long", "J"},
-            {"java/lang/Float", "F"}, {"java/lang/Double", "D"}
-        };
-        for (String[] box : boxes) {
-            analysis.addExtraReachableMethod(new MethodReference(
-                box[0], "valueOf", "(" + box[1] + ")L" + box[0] + ";"));
-        }
-        analysis.addInstantiatedClass("java/lang/reflect/InvocationTargetException", false);
-        analysis.addInstantiatedClass("java/lang/NoClassDefFoundError", false);
-        analysis.addExtraReachableMethod(new MethodReference(
-            "java/lang/reflect/InvocationTargetException", "<init>", "(Ljava/lang/Throwable;)V"));
-    }
-
-    /** Net.c builds accepted/received peer addresses through these from C. */
-    private void forceSocketAddressMethods(ReachabilityAnalysis analysis) {
-        if (!analysis.getReachableClasses().contains("sun/nio/ch/Net")) return;
-        analysis.addInstantiatedClass("java/net/InetSocketAddress", false);
-        analysis.addExtraReachableMethod(new MethodReference(
-            "java/net/InetAddress", "getByAddress", "([B)Ljava/net/InetAddress;"));
-        analysis.addExtraReachableMethod(new MethodReference(
-            "java/net/InetSocketAddress", "<init>", "(Ljava/net/InetAddress;I)V"));
-        analysis.addExtraReachableMethod(new MethodReference(
-            "java/net/Inet4Address", "getAddress", "()[B"));
-        analysis.addExtraReachableMethod(new MethodReference(
-            "java/net/Inet6Address", "getAddress", "()[B"));
-        analysis.addExtraReachableMethod(new MethodReference(
-            "java/net/Inet6Address", "getScopeId", "()I"));
-    }
-
-    private void forceLoggingConfigClasses(ReachabilityAnalysis analysis) {
-        if (!analysis.getReachableClasses().contains("java/util/logging/LogManager")) return;
-        String javaHome = System.getProperty("java.home");
-        if (javaHome == null || javaHome.isEmpty()) return;
-        java.nio.file.Path config = java.nio.file.Path.of(javaHome, "conf", "logging.properties");
-        if (!java.nio.file.Files.isRegularFile(config)) return;
-        java.util.Properties props = new java.util.Properties();
-        try (java.io.InputStream in = java.nio.file.Files.newInputStream(config)) {
-            props.load(in);
-        } catch (java.io.IOException e) {
-            log.warn("Cannot read {}: {}", config, e.getMessage());
-            return;
-        }
-        for (String key : props.stringPropertyNames()) {
-            boolean classList = key.equals("handlers") || key.endsWith(".handlers") || key.equals("config");
-            boolean singleClass = key.endsWith(".formatter") || key.endsWith(".filter");
-            if (!classList && !singleClass) continue;
-            for (String name : props.getProperty(key).trim().split("[\\s,]+")) {
-                if (name.isEmpty()) continue;
-                analysis.addReflectivelyInstantiatedClass(name.replace('.', '/'));
-            }
-        }
-    }
-
-    private void forceServiceProviders(ReachabilityAnalysis analysis, DependencyResolver resolver) {
-        Map<String, List<String>> services = resolver.getServiceProviders();
-        Set<String> done = new HashSet<>();
-        boolean added = true;
-        while (added && analysis.getReachableClasses().contains("java/util/ServiceLoader")) {
-            added = false;
-            for (Map.Entry<String, List<String>> e : services.entrySet()) {
-                if (!analysis.getReachableClasses().contains(e.getKey().replace('.', '/'))) continue;
-                for (String provider : e.getValue()) {
-                    if (done.add(provider)) {
-                        analysis.addReflectivelyInstantiatedClass(provider.replace('.', '/'));
-                        added = true;
-                    }
-                }
-            }
-        }
-    }
-
-    private void forceStackWalkMethods(ReachabilityAnalysis analysis, DependencyResolver resolver) {
-        analysis.addExtraReachableMethod(new MethodReference(
-            "java/lang/StackStreamFactory$AbstractStackWalker", "doStackWalk", "(JIIII)Ljava/lang/Object;"));
-        String rmn = "java/lang/invoke/ResolvedMethodName";
-        if (!analysis.getReachableClasses().contains("java/lang/StackFrameInfo")
-                || !isDeclaredClass(resolver, "java/lang/ClassFrameInfo")
-                || !isDeclaredClass(resolver, rmn)) {
-            return;
-        }
-        boolean hasDeclaringClass = resolver.getClassNode(rmn).getMethods().stream()
-            .anyMatch(m -> m.getName().equals("declaringClass")
-                && m.getDescriptor().equals("()Ljava/lang/Class;"));
-        if (!hasDeclaringClass) return;
-        analysis.addInstantiatedClass(rmn, false);
-        analysis.addExtraReachableMethod(new MethodReference(rmn, "declaringClass", "()Ljava/lang/Class;"));
-    }
-
-    private void forceNativeAccessMethods(ReachabilityAnalysis analysis, DependencyResolver resolver) {
-        String reflection = "jdk/internal/reflect/Reflection";
-        String module = "java/lang/Module";
-        String checkDesc = "(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/Class;Z)V";
-        if (!isDeclaredClass(resolver, reflection) || !isDeclaredClass(resolver, module)) return;
-        boolean overridden = resolver.getClassNode(reflection).getMethods().stream()
-            .anyMatch(m -> m.getName().equals("ensureNativeAccess")
-                && m.getDescriptor().equals("(Ljava/lang/Class;Ljava/lang/Class;Ljava/lang/String;Z)V"));
-        boolean target = resolver.getClassNode(module).getMethods().stream()
-            .anyMatch(m -> m.getName().equals("ensureNativeAccess") && m.getDescriptor().equals(checkDesc));
-        if (overridden && target) {
-            analysis.addExtraReachableMethod(new MethodReference(module, "ensureNativeAccess", checkDesc));
-        }
-    }
-
-    private void forcePackageDefinitionMethods(ReachabilityAnalysis analysis, DependencyResolver resolver) {
-        if (!analysis.getReachableClasses().contains("jdk/internal/loader/BootLoader")) return;
-        String[][] methods = {
-            {"jdk/internal/loader/ClassLoaders", "bootLoader", "()Ljdk/internal/loader/BuiltinClassLoader;"},
-            {"java/lang/ClassLoader", "getDefinedPackage", "(Ljava/lang/String;)Ljava/lang/Package;"},
-            {"jdk/internal/loader/BuiltinClassLoader", "defineOrCheckPackage",
-                "(Ljava/lang/String;Ljava/util/jar/Manifest;Ljava/net/URL;)Ljava/lang/Package;"},
-            {"java/util/jar/Manifest", "<init>", "(Ljava/io/InputStream;)V"}
-        };
-        for (String[] m : methods) {
-            if (!isDeclaredClass(resolver, m[0])) return;
-            boolean declared = resolver.getClassNode(m[0]).getMethods().stream()
-                .anyMatch(mn -> mn.getName().equals(m[1]) && mn.getDescriptor().equals(m[2]));
-            if (!declared) return;
-        }
-        analysis.addInstantiatedClass("java/util/jar/Manifest", false);
-        for (String[] m : methods) {
-            analysis.addExtraReachableMethod(new MethodReference(m[0], m[1], m[2]));
-        }
-    }
-
-    private static boolean isDeclaredClass(DependencyResolver resolver, String name) {
-        if (resolver.isMissingClass(name)) return false;
-        ClassNode cn = resolver.getClassNode(name);
-        return cn != null && !cn.isExternal() && cn.getMethods() != null;
-    }
-
-    private void forceResourceStreamMethods(ReachabilityAnalysis analysis) {
-        String owner = "java/io/ByteArrayInputStream";
-        analysis.addExtraReachableMethod(
-                new MethodReference(owner, "<init>", "([B)V"));
-        analysis.addExtraReachableMethod(
-                new MethodReference(owner, "available", "()I"));
-        analysis.addExtraReachableMethod(
-                new MethodReference(owner, "read", "([BII)I"));
-        analysis.addExtraReachableMethod(
-                new MethodReference(owner, "read", "()I"));
-        analysis.addExtraReachableMethod(
-                new MethodReference(owner, "skip", "(J)J"));
-        analysis.addExtraReachableMethod(
-                new MethodReference(owner, "mark", "(I)V"));
-        analysis.addExtraReachableMethod(
-                new MethodReference(owner, "reset", "()V"));
-        analysis.addExtraReachableMethod(
-                new MethodReference(owner, "close", "()V"));
-    }
-
-    /**
-     * Forces the java.nio methods used by the C implementation of
-     * jdk.internal.perf.Perf.create* into the reachable set.
-     * <p>
-     * Perf.create* is native; its C body cannot construct the ByteBuffer
-     * directly (field layout is JDK-version dependent and HeapByteBuffer is
-     * package-private), so Perf.c dlsyms ByteBuffer.allocate. For that to
-     * resolve, three methods must be translated:
-     *   - ByteBuffer.allocate(int) — emits the dlsym target and instantiates
-     *     HeapByteBuffer, which is the concrete candidate for the abstract
-     *     ByteBuffer.asLongBuffer() call from PerfCounter.<init>.
-     *   - HeapByteBuffer.putLong(int, long) — non-zero initial counter value.
-     *   - ByteBuffer.put(byte[]) — Perf.createByteArray.
-     * <p>
-     * Without this, Perf.create* returned NULL, PerfCounter.<clinit> NPE'd on
-     * bb.order(...) / bb.asLongBuffer(), and the failure cascaded through
-     * ClassLoader.findClass, ZipFile.open and ModuleBootstrap.boot.
-     */
-    private void forcePerfMethods(ReachabilityAnalysis analysis) {
-        analysis.addExtraReachableMethod(new MethodReference(
-            "java/nio/ByteBuffer", "allocate",
-            "(I)Ljava/nio/ByteBuffer;"));
-
-        analysis.addExtraReachableMethod(new MethodReference(
-            "java/nio/ByteBuffer", "put",
-            "([B)Ljava/nio/ByteBuffer;"));
-
-        analysis.addExtraReachableMethod(new MethodReference(
-            "java/nio/HeapByteBuffer", "putLong",
-            "(IJ)Ljava/nio/ByteBuffer;"));
-
-        analysis.addExtraReachableMethod(new MethodReference(
-            "java/lang/ClassLoader", "getSystemClassLoader",
-            "()Ljava/lang/ClassLoader;"));
-    }
-
-    // =====================================================================
-    //  Printing / filtering helpers (unchanged)
-    // =====================================================================
-
-    private void printCallGraph(ReachabilityAnalysis analysis, String entryClass,
-                                String entryMethod, String entryDescriptor,
-                                boolean includeSystem, String debugName) {
-        MethodReference entry = new MethodReference(
-                entryClass.replace('.', '/'), entryMethod, entryDescriptor);
-        Map<MethodReference, Set<MethodReference>> graph = analysis.getCallGraph();
-        Set<MethodReference> visited = new HashSet<>();
-        Predicate<MethodReference> filter = mr -> {
-            if (!includeSystem && LlvmUtil.isSystemClassName(mr.getOwner())) return false;
-            return debugName == null || mr.toString().contains(debugName);
-        };
-        System.out.println("\nCall graph from entry:");
-        printMethodTree(entry, graph, filter, visited, 0);
-    }
-
-    private void printMethodTree(MethodReference method,
-                                 Map<MethodReference, Set<MethodReference>> graph,
-                                 Predicate<MethodReference> filter,
-                                 Set<MethodReference> visited,
-                                 int depth) {
-        if (!filter.test(method)) return;
-        String indent = "  ".repeat(depth);
-        System.out.println(indent + method);
-        if (!visited.add(method)) {
-            System.out.println(indent + "  (already visited)");
-            return;
-        }
-        Set<MethodReference> callees = graph.get(method);
-        if (callees != null) {
-            for (MethodReference callee : callees) {
-                if (filter.test(callee)) {
-                    printMethodTree(callee, graph, filter, visited, depth + 1);
-                }
-            }
-        }
     }
 
     private static boolean matchesDebug(String debugName, String name) {
@@ -933,6 +590,19 @@ public class Orchestrator implements OrchestratorPort {
                 }
             }
         }
+    }
+
+    private static Path generatedOutputDirectory() {
+        Path workingDirectory = Path.of("").toAbsolutePath().normalize();
+        for (Path directory = workingDirectory; directory != null; directory = directory.getParent()) {
+            if (Path.of("target").equals(directory.getFileName())) {
+                return directory.resolve("generated-jnative");
+            }
+            if (Files.isRegularFile(directory.resolve("pom.xml"))) {
+                return directory.resolve("target").resolve("generated-jnative");
+            }
+        }
+        return workingDirectory.resolve("target").resolve("generated-jnative");
     }
 
     private static Path defaultOutputPath(Path input, TargetPlatform targetPlatform) {

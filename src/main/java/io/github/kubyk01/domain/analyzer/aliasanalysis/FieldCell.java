@@ -72,7 +72,7 @@ public final class FieldCell {
                 int pos = Arrays.binarySearch(arr, reader);
                 if (pos >= 0) return false;
                 Object next;
-                if (arr.length >= SMALL_READERS) {
+                if (arr.length >= Math.max(SMALL_READERS, capacity >>> 5)) {
                     AtomicLongArray bits = new AtomicLongArray((capacity >>> 6) + 1);
                     for (int x : arr) bits.set(x >>> 6, bits.get(x >>> 6) | (1L << x));
                     bits.set(reader >>> 6, bits.get(reader >>> 6) | (1L << reader));

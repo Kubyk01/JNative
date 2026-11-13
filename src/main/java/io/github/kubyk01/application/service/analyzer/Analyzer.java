@@ -112,15 +112,22 @@ public class Analyzer {
         }
 
         List<Function> clinitFunctions = new ArrayList<>();
+        List<Function> lazyClinits = new ArrayList<>();
         for (Function func : module.getFunctions()) {
-            if (func.getName().endsWith("__clinit____V")) clinitFunctions.add(func);
+            if (!func.getName().endsWith("__clinit____V")) continue;
+            if (lazyOnlyClasses.contains(func.getOwnerClass())) {
+                lazyClinits.add(func);
+                deferredClinits.add(func.getName());
+            } else {
+                clinitFunctions.add(func);
+            }
         }
 
         List<Function> phaseFunctions = collectPhaseFunctions(module, resolver);
 
         // One call graph + fact scan shared by the sort and the lazy-<clinit> pass;
         // the module does not change between them.
-        InitGraph initGraph = clinitFunctions.isEmpty() && phaseFunctions.isEmpty()
+        InitGraph initGraph = clinitFunctions.isEmpty() && lazyClinits.isEmpty() && phaseFunctions.isEmpty()
             ? null : buildInitGraph(module, resolver);
 
         List<ClinitScheduleEntry> clinitSchedule = sortInitializers(
@@ -141,6 +148,7 @@ public class Analyzer {
                 clinitsToInstrument.add(f);
             }
         }
+        clinitsToInstrument.addAll(lazyClinits);
 
         Map<String, String> clinitWrappers = new HashMap<>();
         applyLazyClinitForCyclicClasses(module, resolver, initGraph,
@@ -1288,9 +1296,6 @@ public class Analyzer {
             initReadBits, initWriteBits, funcIndex, fieldIdMap, fieldWords);
         deferred.addAll(computeJniDependentClinits(module, clinitOrder));
         deferred.addAll(computeMissingClassClinits(clinitOrder, resolver));
-        for (Function clinit : clinitOrder) {
-            if (lazyOnlyClasses.contains(clinit.getOwnerClass())) deferred.add(clinit.getName());
-        }
 
         if (!deferred.isEmpty()) {
             this.deferredClinits.addAll(deferred);

@@ -1091,8 +1091,16 @@ public class Compiler implements CompilerPort {
                             String sysroot, MsvcToolchain msvcToolchain)
             throws IOException, InterruptedException {
 
+        List<CompileTask> scheduledTasks = new ArrayList<>(tasks);
+        Map<Path, Long> sourceSizes = new HashMap<>();
+        for (CompileTask task : scheduledTasks) {
+            sourceSizes.put(task.src, Files.size(task.src));
+        }
+        scheduledTasks.sort(Comparator.comparingLong(
+                (CompileTask task) -> sourceSizes.get(task.src)).reversed());
+
         if (threadCount <= 1 || tasks.size() <= 1) {
-            for (CompileTask task : tasks) {
+            for (CompileTask task : scheduledTasks) {
                 compileOne(compiler, task, includeDir, optimizationLevel,
                         target, sysroot, msvcToolchain);
             }
@@ -1112,9 +1120,9 @@ public class Compiler implements CompilerPort {
         for (int i = 0; i < threadCount; i++) {
             futures.add(pool.submit(() -> {
                 int idx;
-                while ((idx = nextTask.getAndIncrement()) < tasks.size()) {
+                while ((idx = nextTask.getAndIncrement()) < scheduledTasks.size()) {
                     try {
-                        compileOne(compiler, tasks.get(idx), includeDir,
+                        compileOne(compiler, scheduledTasks.get(idx), includeDir,
                                 optimizationLevel, target, sysroot,
                                 msvcToolchain);
                     } catch (Throwable t) {
@@ -1345,27 +1353,28 @@ public class Compiler implements CompilerPort {
         //    start with an instruction mnemonic — none of those begin with `@`,
         //    so the `startsWith("@")` filter is exact.
         // ------------------------------------------------------------------
-        Path moduleLl = null;
+        Set<String> definedGlobals = new HashSet<>();
+        boolean moduleFound = false;
         for (Path ll : llPaths) {
-            if ("_module.ll".equals(ll.getFileName().toString())) {
-                moduleLl = ll;
-                break;
+            String fileName = ll.getFileName().toString();
+            if (!fileName.equals("_module.ll") && !fileName.startsWith("_globals")) continue;
+            moduleFound = true;
+            try (var lines = Files.lines(ll)) {
+                lines.forEach(line -> {
+                    if (!line.startsWith("@")) return;
+                    int eq = line.indexOf(" = ");
+                    if (eq <= 0) return;
+                    String rhs = line.substring(eq + 3).trim();
+                    if (rhs.startsWith("external ") || rhs.startsWith("extern_weak ")
+                            || rhs.startsWith("declare ")) return;
+                    definedGlobals.add(line.substring(1, eq).trim().replace("\"", ""));
+                });
             }
         }
-        if (moduleLl == null) {
+        if (!moduleFound) {
             throw new IllegalStateException(
                 "Cannot generate Windows export def: _module.ll not found in "
                     + llPaths);
-        }
-        Set<String> definedGlobals = new HashSet<>();
-        for (String line : Files.readAllLines(moduleLl)) {
-            if (!line.startsWith("@")) continue;
-            int eq = line.indexOf(" = ");
-            if (eq <= 0) continue;
-            String lhs = line.substring(1, eq).trim().replace("\"", "");
-            String rhs = line.substring(eq + 3).trim();
-            if (rhs.startsWith("external ") || rhs.startsWith("declare ")) continue;
-            definedGlobals.add(lhs);
         }
 
         // ------------------------------------------------------------------

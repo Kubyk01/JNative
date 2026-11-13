@@ -32,10 +32,7 @@ void* __jnative_fn_java_lang_ClassLoader_findLoadedClass0__Ljava_lang_String__Lj
         void* this_loader, void* name_str) {
     (void)this_loader;
     if (name_str == NULL) return NULL;
-    int32_t len = 0;
-    const char* name = __jnative_read_string_bytes(name_str, &len);
-    (void)len;
-    return (void*)jnative_class_by_dotted_name(name);
+    return (void*)jnative_class_by_dotted_name(__jnative_read_string_bytes(name_str, NULL));
 }
 
 /* --------------------------------------------------------------------------
@@ -57,10 +54,7 @@ void* __jnative_fn_java_lang_ClassLoader_findLoadedClass0__Ljava_lang_String__Lj
 void* __jnative_fn_java_lang_ClassLoader_findBootstrapClass__Ljava_lang_String__Ljava_lang_Class_(
         void* name_str) {
     if (name_str == NULL) return NULL;
-    int32_t len = 0;
-    const char* name = __jnative_read_string_bytes(name_str, &len);
-    (void)len;
-    return (void*)jnative_class_by_dotted_name(name);
+    return (void*)jnative_class_by_dotted_name(__jnative_read_string_bytes(name_str, NULL));
 }
 
 /* --------------------------------------------------------------------------

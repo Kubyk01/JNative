@@ -93,8 +93,12 @@ typedef SSIZE_T ssize_t;
 #  define JN_UNUSED
 #endif
 
-typedef int jn_socket_t;
+typedef SOCKET jn_socket_t;
 #define JN_INVALID_SOCKET INVALID_SOCKET
+
+static inline int jn_close_socket(jn_socket_t socket) {
+    return closesocket(socket);
+}
 
 typedef int jn_socklen_t;
 
@@ -278,6 +282,10 @@ extern void* jn_dlsym_default;
 
 typedef int jn_socket_t;
 #define JN_INVALID_SOCKET (-1)
+
+static inline int jn_close_socket(jn_socket_t socket) {
+    return close(socket);
+}
 
 typedef socklen_t jn_socklen_t;
 

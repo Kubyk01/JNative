@@ -1,11 +1,11 @@
 package io.github.kubyk01.application.service.analyzer.dependencyresolver;
 
-import io.github.kubyk01.application.service.analyzer.reachabilityanalysis.ReachabilityMetadataParser;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.kubyk01.application.service.analyzer.ssa.TypeResolver;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.ClassNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.FieldNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.MethodNode;
-import io.github.kubyk01.domain.analyzer.reachability.ReachabilityMetadata;
 import io.github.kubyk01.domain.ir.Type;
 import lombok.Getter;
 import lombok.RequiredArgsConstructor;
@@ -18,7 +18,6 @@ import org.objectweb.asm.FieldVisitor;
 import org.objectweb.asm.MethodVisitor;
 import org.objectweb.asm.Opcodes;
 
-import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.io.InputStream;
@@ -95,7 +94,7 @@ public class DependencyResolver {
     private final Set<String> loadedClasses  = ConcurrentHashMap.newKeySet();
 
     @Getter
-    private final ReachabilityMetadata metadata = ReachabilityMetadata.builder().build();
+    private final List<List<String>> proxyInterfaces = new java.util.concurrent.CopyOnWriteArrayList<>();
 
     private FileSystem jrtFileSystem;
 
@@ -527,11 +526,6 @@ public class DependencyResolver {
 
     public void scan(Path path) throws IOException {
         this.inputArchive = path;
-        try (InputStream builtin = DependencyResolver.class.getResourceAsStream(
-                "/jnative-metadata/jdk-reflect-config.json")) {
-            if (builtin != null) parseMetadataStream(builtin, "jdk-reflect-config.json");
-        }
-
         if (Files.isDirectory(path)) {
             Files.walk(path)
                     .filter(p -> p.toString().endsWith(".class"))
@@ -634,7 +628,7 @@ public class DependencyResolver {
                     try (InputStream is = jar.getInputStream(entry)) {
                         byte[] raw = is.readAllBytes();
                         recordPackageSource(new ClassReader(raw).getClassName(), location, manifest);
-                        parseClassStream(new ByteArrayInputStream(raw));
+                        parseClassBytes(name, raw);
                     }
                 }
 
@@ -658,19 +652,13 @@ public class DependencyResolver {
 
     private void parseMetadataStream(InputStream is, String fileName) {
         try {
-            // Jackson's ObjectMapper closes the stream it is given
-            // (AUTO_CLOSE_SOURCE). When this method is called with the
-            // shared ZipInputStream that walks a nested jar, that close
-            // tears the whole archive down and every subsequent
-            // getNextEntry()/read() throws "Stream closed", silently
-            // dropping every remaining class in that jar. Buffering the
-            // small JSON entry first hands Jackson a stream it may close
-            // harmlessly. readAllBytes() on the ZipInputStream consumes
-            // exactly the current entry, leaving the archive walk intact.
-            byte[] bytes = is.readAllBytes();
-            ReachabilityMetadata part = ReachabilityMetadataParser.parse(
-                    new ByteArrayInputStream(bytes), fileName);
-            metadata.merge(part);
+            JsonNode root = new ObjectMapper().readTree(is.readAllBytes());
+            for (JsonNode node : root.isObject() ? root.path("proxyInterfaces") : root) {
+                if (node.has("name") || !node.path("interfaces").isArray()) continue;
+                List<String> interfaces = new ArrayList<>();
+                node.get("interfaces").forEach(i -> interfaces.add(i.asText()));
+                if (!interfaces.isEmpty()) proxyInterfaces.add(interfaces);
+            }
         } catch (Exception e) {
             log.warn("Failed to parse metadata stream: {}", fileName, e);
         }
@@ -744,7 +732,33 @@ public class DependencyResolver {
         }
     }
 
-    public void loadAllNestedClasses() {
+    public void loadAllClasses() {
+        loadAllNestedClasses();
+        int before = classBytes.size();
+        try {
+            List<Path> files;
+            try (var walk = Files.walk(getJrtFileSystem().getPath("/modules"))) {
+                files = walk.filter(p -> p.getNameCount() > 2 && p.toString().endsWith(".class")).toList();
+            }
+            for (Path file : files) {
+                String name = file.subpath(2, file.getNameCount()).toString();
+                name = name.substring(0, name.length() - ".class".length());
+                if (name.endsWith("module-info") || classBytes.containsKey(name)) continue;
+                try {
+                    parseClassBytes(name, Files.readAllBytes(file));
+                    missingClasses.remove(name);
+                    loadedClasses.add(name);
+                } catch (IOException | RuntimeException e) {
+                    log.warn("Failed to load system class {}: {}", name, e.getMessage());
+                }
+            }
+        } catch (IOException e) {
+            throw new UncheckedIOException("Cannot read the JDK module image", e);
+        }
+        System.out.println("Loaded " + (classBytes.size() - before) + " JDK classes from the module image");
+    }
+
+    private void loadAllNestedClasses() {
         Map<Path, Map<String, Map<String, String>>> byJar = new HashMap<>();
         for (Map.Entry<String, NestedClassRef> e : nestedClassIndex.entrySet()) {
             String name = e.getKey();
@@ -832,123 +846,10 @@ public class DependencyResolver {
     }
 
     private void parseClassFile(Path classFile) {
-        try (InputStream is = Files.newInputStream(classFile)) {
-            parseClassStream(is);
+        try {
+            parseClassBytes(classFile.toString(), Files.readAllBytes(classFile));
         } catch (Exception e) {
             log.error("Failed to parse class file: {}", classFile, e);
-        }
-    }
-
-    private void parseClassStream(InputStream is) throws IOException {
-        try {
-            byte[] bytes = transformClass(is.readAllBytes());
-            ClassReader reader = new ClassReader(bytes);
-
-            ClassNode.ClassNodeBuilder builder = ClassNode.builder();
-            final String[] currentClassName = {null};
-            final List<FieldNode> fields = new ArrayList<>();
-            final List<MethodNode> methods = new ArrayList<>();
-            final List<String> polymorphicMethodNames = new ArrayList<>();
-
-            try {
-                reader.accept(new ClassVisitor(Opcodes.ASM9) {
-                    @Override
-                    public void visit(int version, int access, String name, String signature,
-                                      String superName, String[] interfaces) {
-                        currentClassName[0] = name;
-                        builder.name(name)
-                                .superName(superName)
-                                .interfaces(interfaces != null ? Arrays.asList(interfaces) : Collections.emptyList())
-                                .access(access)
-                                .classFileVersion(version)
-                                .signature(signature)
-                                .isInterface((access & Opcodes.ACC_INTERFACE) != 0)
-                                .isExternal(false);
-                    }
-
-                    @Override
-                    public FieldVisitor visitField(int access, String name, String descriptor,
-                                                   String signature, Object value) {
-                    fields.add(FieldNode.builder()
-                            .name(name)
-                            .descriptor(descriptor)
-                            .type(Type.fromDescriptor(descriptor))
-                            .access(access)
-                            .owner(currentClassName[0])   // declaring class
-                            .constantValue(value)
-                            .build());
-                        return null;
-                    }
-
-                    @Override
-                    public MethodVisitor visitMethod(int access, String name, String descriptor,
-                                                     String signature, String[] exceptions) {
-                        MethodNode.MethodNodeBuilder mb = MethodNode.builder()
-                                .name(name)
-                                .descriptor(descriptor)
-                                .returnType(TypeResolver.descToReturnType(descriptor))
-                                .parameterTypes(TypeResolver.descToParamTypes(descriptor))
-                                .access(access)
-                                .isAbstract((access & Opcodes.ACC_ABSTRACT) != 0)
-                                .isNative((access & Opcodes.ACC_NATIVE) != 0)
-                                .isStatic((access & Opcodes.ACC_STATIC) != 0);
-
-                        return new MethodVisitor(Opcodes.ASM9) {
-                            @Override
-                            public AnnotationVisitor visitAnnotation(String desc, boolean visible) {
-                                if ("Ljdk/internal/reflect/CallerSensitive;".equals(desc)
-                                        || "Lsun/reflect/CallerSensitive;".equals(desc)) {
-                                    mb.callerSensitive(true);
-                                }
-                                if ("Ljava/lang/invoke/MethodHandle$PolymorphicSignature;".equals(desc)) {
-                                    mb.isPolymorphicSignature(true);
-                                    polymorphicMethodNames.add(name);
-                                }
-                                return super.visitAnnotation(desc, visible);
-                            }
-
-                            @Override
-                            public void visitEnd() {
-                                methods.add(mb.build());
-                                super.visitEnd();
-                            }
-                        };
-                    }
-                }, ClassReader.SKIP_CODE | ClassReader.SKIP_DEBUG);
-            } catch (Exception e) {
-                System.err.println("ERROR during reader.accept for class " + currentClassName[0] + ": " + e);
-                e.printStackTrace();
-                throw e;
-            }
-
-            ClassNode classNode = builder
-                    .fields(fields)
-                    .methods(methods)
-                    .polymorphicMethodNames(polymorphicMethodNames)
-                    .build();
-
-            String name = currentClassName[0];
-            if (name == null) {
-                System.err.println("ERROR: currentClassName is null, class not processed");
-                return;
-            }
-            classMap.put(name, classNode);
-            classBytes.put(name, bytes);
-
-            // Update the subtype index for this class. The value sets are
-            // concurrent key sets (see the field declaration), so a
-            // concurrent subclass-closure traversal in another thread
-            // observes a consistent, non-throwing iteration.
-            if (classNode.getSuperName() != null) {
-                indexSubtype(classNode.getSuperName(), name);
-            }
-            for (String iface : classNode.getInterfaces()) {
-                indexSubtype(iface, name);
-            }
-        } catch (Exception e) {
-            System.err.println("ERROR in parseClassStream: " + e.getMessage());
-            e.printStackTrace();
-            throw new IOException("Failed to parse class", e);
         }
     }
 
