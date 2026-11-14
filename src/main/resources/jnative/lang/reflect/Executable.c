@@ -3,6 +3,102 @@
 
 #include "jnative_runtime.h"
 
+static ReflectionParameter* find_parameter_metadata(void* executable,
+                                                    int32_t* out_count)
+{
+    if (out_count != NULL) *out_count = 0;
+    if (executable == NULL) return NULL;
+
+    void* object_vtable = *(void**)executable;
+    ReflectionClass* method_class = jnative_class_by_name("java/lang/reflect/Method");
+    if (method_class != NULL
+            && object_vtable == jnative_lookup_class_vtable(method_class)) {
+        ReflectionClass* declaring = *(ReflectionClass**)((char*)executable
+                + JNATIVE_METHOD_CLAZZ_OFFSET);
+        int32_t slot = *(int32_t*)((char*)executable + JNATIVE_METHOD_SLOT_OFFSET);
+        if (declaring == NULL || declaring->methods == NULL || slot < 0) return NULL;
+        for (ReflectionMethod** p = declaring->methods; *p != NULL; p++) {
+            if ((*p)->slot == slot) {
+                if (out_count != NULL) *out_count = (*p)->parameter_count;
+                return (*p)->parameters;
+            }
+        }
+        return NULL;
+    }
+
+    ReflectionClass* constructor_class =
+        jnative_class_by_name("java/lang/reflect/Constructor");
+    if (constructor_class != NULL
+            && object_vtable == jnative_lookup_class_vtable(constructor_class)) {
+        ReflectionClass* declaring = *(ReflectionClass**)((char*)executable
+                + JNATIVE_CTOR_CLAZZ_OFFSET);
+        int32_t slot = *(int32_t*)((char*)executable + JNATIVE_CTOR_SLOT_OFFSET);
+        if (declaring == NULL || declaring->constructors == NULL || slot < 0) return NULL;
+        for (ReflectionConstructor** p = declaring->constructors; *p != NULL; p++) {
+            if ((*p)->slot == slot) {
+                if (out_count != NULL) *out_count = (*p)->parameter_count;
+                return (*p)->parameters;
+            }
+        }
+    }
+
+    return NULL;
+}
+
+/*
+ * Executable.getParameters0() supplies real MethodParameters metadata to
+ * java.lang.reflect.Executable. Returning NULL deliberately leaves the JDK
+ * to synthesize argN values when a class file has no complete attribute.
+ */
+void* __jnative_fn_java_lang_reflect_Executable_getParameters0____Ljava_lang_reflect_Parameter_(
+        void* this_executable)
+{
+    if (this_executable == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+
+    int32_t parameter_count = 0;
+    ReflectionParameter* metadata =
+        find_parameter_metadata(this_executable, &parameter_count);
+    if (metadata == NULL || parameter_count <= 0) return NULL;
+
+    if (JNATIVE_PARAMETER_NAME_OFFSET < 0
+            || JNATIVE_PARAMETER_MODIFIERS_OFFSET < 0
+            || JNATIVE_PARAMETER_EXECUTABLE_OFFSET < 0
+            || JNATIVE_PARAMETER_INDEX_OFFSET < 0) {
+        return NULL;
+    }
+
+    ReflectionClass* parameter_class =
+        jnative_class_by_name("java/lang/reflect/Parameter");
+    if (parameter_class == NULL) return NULL;
+
+    void* result = jnative_ref_array_of_class(NULL, parameter_count,
+            "[Ljava/lang/reflect/Parameter;");
+    if (result == NULL) {
+        __jnative_throw_out_of_memory_error_ctx("Executable.getParameters0");
+    }
+
+    void** parameter_slots = (void**)((char*)result + JAVA_ARR_HDR);
+    for (int32_t i = 0; i < parameter_count; i++) {
+        void* parameter = jnative_alloc_object(parameter_class);
+        if (parameter == NULL) {
+            __jnative_throw_out_of_memory_error_ctx("Executable.getParameters0");
+        }
+
+        *(void**)((char*)parameter + JNATIVE_PARAMETER_NAME_OFFSET) =
+            jnative_string(metadata[i].name);
+        *(int32_t*)((char*)parameter + JNATIVE_PARAMETER_MODIFIERS_OFFSET) =
+            metadata[i].modifiers;
+        *(void**)((char*)parameter + JNATIVE_PARAMETER_EXECUTABLE_OFFSET) =
+            this_executable;
+        *(int32_t*)((char*)parameter + JNATIVE_PARAMETER_INDEX_OFFSET) = i;
+        parameter_slots[i] = parameter;
+    }
+
+    return result;
+}
+
 /*
  * private native byte[] getTypeAnnotationBytes0();
  *

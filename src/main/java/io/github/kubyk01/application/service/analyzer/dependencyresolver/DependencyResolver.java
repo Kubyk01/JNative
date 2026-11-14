@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.kubyk01.application.service.analyzer.ssa.TypeResolver;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.ClassNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.FieldNode;
+import io.github.kubyk01.domain.analyzer.dependencyresolver.MethodParameterInfo;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.MethodNode;
 import io.github.kubyk01.domain.ir.Type;
 import io.github.kubyk01.util.JImage;
@@ -357,7 +358,7 @@ public class DependencyResolver {
                     }
                 }
 
-                MethodNode mn = MethodNode.builder()
+                MethodNode.MethodNodeBuilder methodBuilder = MethodNode.builder()
                         .name(method.getName())
                         .descriptor(desc)
                         .returnType(Type.fromDescriptor(returnDesc))
@@ -367,9 +368,13 @@ public class DependencyResolver {
                         .isNative(Modifier.isNative(method.getModifiers()))
                         .isStatic(Modifier.isStatic(method.getModifiers()))
                         .isPolymorphicSignature(isPoly)
-                        .callerSensitive(isCS)
-                        .build();
-                builder.method(mn);
+                        .callerSensitive(isCS);
+                for (java.lang.reflect.Parameter parameter : method.getParameters()) {
+                    methodBuilder.parameter(new MethodParameterInfo(
+                            parameter.isNamePresent() ? parameter.getName() : null,
+                            parameter.getModifiers()));
+                }
+                builder.method(methodBuilder.build());
 
                 if (isPoly) {
                     builder.polymorphicMethodName(method.getName());
@@ -383,7 +388,7 @@ public class DependencyResolver {
                         .map(t -> Type.fromDescriptor(t.getDescriptor()))
                         .collect(Collectors.toList());
 
-                builder.method(MethodNode.builder()
+                MethodNode.MethodNodeBuilder constructorBuilder = MethodNode.builder()
                         .name("<init>")
                         .descriptor(desc)
                         .returnType(Type.VOID)
@@ -392,8 +397,13 @@ public class DependencyResolver {
                         .isAbstract(false)
                         .isNative(false)
                         .isStatic(false)
-                        .isPolymorphicSignature(false)
-                        .build());
+                        .isPolymorphicSignature(false);
+                for (java.lang.reflect.Parameter parameter : ctor.getParameters()) {
+                    constructorBuilder.parameter(new MethodParameterInfo(
+                            parameter.isNamePresent() ? parameter.getName() : null,
+                            parameter.getModifiers()));
+                }
+                builder.method(constructorBuilder.build());
             }
 
             ClassNode node = builder.build();
@@ -910,6 +920,11 @@ public class DependencyResolver {
 
                     return new MethodVisitor(Opcodes.ASM9) {
                         @Override
+                        public void visitParameter(String parameterName, int parameterAccess) {
+                            mb.parameter(new MethodParameterInfo(parameterName, parameterAccess));
+                        }
+
+                        @Override
                         public AnnotationVisitor visitAnnotation(String desc, boolean visible) {
                             if ("Ljdk/internal/reflect/CallerSensitive;".equals(desc)
                                     || "Lsun/reflect/CallerSensitive;".equals(desc)) {
@@ -929,7 +944,7 @@ public class DependencyResolver {
                         }
                     };
                 }
-            }, ClassReader.SKIP_CODE | ClassReader.SKIP_DEBUG);
+            }, ClassReader.SKIP_CODE);
         } catch (Exception e) {
             throw new IOException("Failed to parse class " + internalName, e);
         }

@@ -60,8 +60,9 @@
  *     C struct                     LLVM type
  *     ------------------------     --------------------------------
  *     ReflectionField              %ReflectionField       { i8*, i8*, i32, i32 }
- *     ReflectionMethod             %ReflectionMethod      { i8*, i8*, i8*, i32 }
- *     ReflectionConstructor        %ReflectionConstructor { i8*, i8*, i32 }
+ *     ReflectionParameter          %ReflectionParameter   { i8*, i32 }
+ *     ReflectionMethod             %ReflectionMethod      { i8*, i8*, i8*, i32, %ReflectionParameter*, i32, i32 }
+ *     ReflectionConstructor        %ReflectionConstructor { i8*, i8*, i32, %ReflectionParameter*, i32, i32 }
  *     ReflectionClass              %ReflectionClass       { %JNativeVTable*, i8*, ..., i8* }
  *     JNativeIfaceMapEntry         %JNativeIfaceMapEntry  { i32, i8** }
  *     JNativeIfaceMap              %JNativeIfaceMap       { i32, %JNativeIfaceMapEntry* }
@@ -357,6 +358,7 @@ extern "C" {
  * ======================================================================== */
 
 typedef struct ReflectionField       ReflectionField;
+typedef struct ReflectionParameter   ReflectionParameter;
 typedef struct ReflectionMethod      ReflectionMethod;
 typedef struct ReflectionConstructor ReflectionConstructor;
 typedef struct ReflectionClass       ReflectionClass;
@@ -372,17 +374,28 @@ struct ReflectionField {
     int   modifiers;    /* JVM access flags (ACC_*)                   */
 };
 
+struct ReflectionParameter {
+    void* name;         /* const char* — null when the class file omitted it */
+    int   modifiers;    /* MethodParameters access flags                    */
+};
+
 struct ReflectionMethod {
     void* name;         /* const char* — method name                  */
     void* descriptor;   /* const char* — JVM method descriptor        */
     void* adaptor;      /* i8* (i8* obj, i8** args) * reflect trampoline */
     int   modifiers;    /* JVM access flags                            */
+    ReflectionParameter* parameters; /* optional MethodParameters entries */
+    int   parameter_count;
+    int   slot;          /* index in ReflectionClass.methods             */
 };
 
 struct ReflectionConstructor {
     void* descriptor;   /* const char* — JVM method descriptor        */
     void* adaptor;      /* i8* (i8** args) * reflect trampoline       */
     int   modifiers;    /* JVM access flags                            */
+    ReflectionParameter* parameters; /* optional MethodParameters entries */
+    int   parameter_count;
+    int   slot;          /* index in ReflectionClass.constructors       */
 };
 
 /*
@@ -552,6 +565,10 @@ extern const int32_t JNATIVE_CTOR_PARAM_TYPES_OFFSET;
 extern const int32_t JNATIVE_CTOR_EXC_TYPES_OFFSET;
 extern const int32_t JNATIVE_CTOR_MODIFIERS_OFFSET;
 extern const int32_t JNATIVE_CTOR_ROOT_OFFSET;
+extern const int32_t JNATIVE_PARAMETER_NAME_OFFSET;
+extern const int32_t JNATIVE_PARAMETER_MODIFIERS_OFFSET;
+extern const int32_t JNATIVE_PARAMETER_EXECUTABLE_OFFSET;
+extern const int32_t JNATIVE_PARAMETER_INDEX_OFFSET;
 extern const int32_t JNATIVE_FIELD_ANNOTATIONS_OFFSET;
 extern const int32_t JNATIVE_METHOD_ANNOTATIONS_OFFSET;
 extern const int32_t JNATIVE_METHOD_PARAM_ANNOTATIONS_OFFSET;

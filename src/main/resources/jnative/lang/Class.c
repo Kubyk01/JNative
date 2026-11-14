@@ -361,7 +361,7 @@ static void* create_method_mirror(ReflectionClass* declaring_cls,
     void* exc_types = empty_param_types_array();
 
     *(void**)((char*)method + JNATIVE_METHOD_CLAZZ_OFFSET)       = declaring_cls;
-    *(int32_t*)((char*)method + JNATIVE_METHOD_SLOT_OFFSET)      = 0;
+    *(int32_t*)((char*)method + JNATIVE_METHOD_SLOT_OFFSET)      = rm->slot;
     *(void**)((char*)method + JNATIVE_METHOD_NAME_OFFSET)        = name_str;
     *(void**)((char*)method + JNATIVE_METHOD_RETURN_TYPE_OFFSET) = return_type;
     *(void**)((char*)method + JNATIVE_METHOD_PARAM_TYPES_OFFSET) = param_types;
@@ -437,7 +437,7 @@ static void* create_constructor_mirror(ReflectionClass* declaring_cls,
     void* exc_types = empty_param_types_array();
 
     *(void**)((char*)ctor + JNATIVE_CTOR_CLAZZ_OFFSET)       = declaring_cls;
-    *(int32_t*)((char*)ctor + JNATIVE_CTOR_SLOT_OFFSET)      = 0;
+    *(int32_t*)((char*)ctor + JNATIVE_CTOR_SLOT_OFFSET)      = rc_ctor->slot;
     *(void**)((char*)ctor + JNATIVE_CTOR_PARAM_TYPES_OFFSET) = param_types;
     *(void**)((char*)ctor + JNATIVE_CTOR_EXC_TYPES_OFFSET)   = exc_types;
     *(int32_t*)((char*)ctor + JNATIVE_CTOR_MODIFIERS_OFFSET) = rc_ctor->modifiers;

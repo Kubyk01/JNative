@@ -8,6 +8,7 @@ import io.github.kubyk01.application.service.codegen.llvm.nativepolymorphicfunct
 import io.github.kubyk01.domain.analyzer.dependencyresolver.ClassNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.FieldNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.FieldReference;
+import io.github.kubyk01.domain.analyzer.dependencyresolver.MethodParameterInfo;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.MethodNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.MethodReference;
 import io.github.kubyk01.domain.analyzer.reflection.ReflectClassInfo;
@@ -68,6 +69,9 @@ import static io.github.kubyk01.util.LlvmUtil.extractFieldName;
 @Slf4j
 @RequiredArgsConstructor
 public class LlvmGlobalEmitter {
+
+    private record ReflectionParameterData(String pointer, int count) {
+    }
 
     public static final int OBJECT_HEADER_SIZE = 8;
 
@@ -746,9 +750,10 @@ public class LlvmGlobalEmitter {
             return cachedTypeDefinitions;
         }
         cachedTypeDefinitions = "%JNativeResourceEntry = type { i8*, i8*, i32 }\n" +
-            "%ReflectionMethod = type { i8*, i8*, i8*, i32 }\n" +
+            "%ReflectionParameter = type { i8*, i32 }\n" +
+            "%ReflectionMethod = type { i8*, i8*, i8*, i32, %ReflectionParameter*, i32, i32 }\n" +
             "%ReflectionField = type { i8*, i8*, i32, i32 }\n" +
-            "%ReflectionConstructor = type { i8*, i8*, i32 }\n" +
+            "%ReflectionConstructor = type { i8*, i8*, i32, %ReflectionParameter*, i32, i32 }\n" +
             // Must stay in lockstep with `struct ReflectionClass` in
             // jnative_runtime.h and with the @refclass_* constant emission below.
             //
@@ -907,6 +912,14 @@ public class LlvmGlobalEmitter {
         sb.append("@JNATIVE_CTOR_EXC_TYPES_OFFSET        = constant i32 ").append(ctorExc).append("\n");
         sb.append("@JNATIVE_CTOR_MODIFIERS_OFFSET        = constant i32 ").append(ctorMods).append("\n");
         sb.append("@JNATIVE_CTOR_ROOT_OFFSET             = constant i32 ").append(ctorRoot).append("\n");
+        sb.append("@JNATIVE_PARAMETER_NAME_OFFSET        = constant i32 ")
+            .append(safeGlobalFieldOffsetAllowMissing("java/lang/reflect/Parameter", "name")).append("\n");
+        sb.append("@JNATIVE_PARAMETER_MODIFIERS_OFFSET   = constant i32 ")
+            .append(safeGlobalFieldOffsetAllowMissing("java/lang/reflect/Parameter", "modifiers")).append("\n");
+        sb.append("@JNATIVE_PARAMETER_EXECUTABLE_OFFSET  = constant i32 ")
+            .append(safeGlobalFieldOffsetAllowMissing("java/lang/reflect/Parameter", "executable")).append("\n");
+        sb.append("@JNATIVE_PARAMETER_INDEX_OFFSET       = constant i32 ")
+            .append(safeGlobalFieldOffsetAllowMissing("java/lang/reflect/Parameter", "index")).append("\n");
         sb.append("@JNATIVE_FIELD_ANNOTATIONS_OFFSET       = constant i32 ")
             .append(safeGlobalFieldOffsetAllowMissing("java/lang/reflect/Field", "annotations")).append("\n");
         sb.append("@JNATIVE_METHOD_ANNOTATIONS_OFFSET      = constant i32 ")
@@ -3090,6 +3103,43 @@ public class LlvmGlobalEmitter {
         }
     }
 
+    private ReflectionParameterData emitReflectionParameterData(
+            StringBuilder sb,
+            StringBuilder strConsts,
+            String arrayName,
+            MethodNode method,
+            String descriptor) {
+        if (method == null || descriptor == null || descriptor.isEmpty()) {
+            return new ReflectionParameterData("null", 0);
+        }
+
+        List<MethodParameterInfo> parameters = method.getParameters();
+        int descriptorParameterCount = TypeResolver.descToParamTypes(descriptor).size();
+        // The MethodParameters attribute is optional. An absent or incomplete
+        // attribute must retain the JDK behavior: synthesize argN names and
+        // report isNamePresent() == false instead of claiming partial data.
+        if (descriptorParameterCount == 0 || parameters.size() != descriptorParameterCount) {
+            return new ReflectionParameterData("null", 0);
+        }
+
+        String arrayType = "[" + descriptorParameterCount + " x %ReflectionParameter]";
+        sb.append(arrayName).append(" = private constant ").append(arrayType).append(" [");
+        for (int i = 0; i < parameters.size(); i++) {
+            if (i > 0) sb.append(", ");
+            MethodParameterInfo parameter = parameters.get(i);
+            String namePointer = parameter.name() == null
+                ? "null"
+                : ensureStringConstantPtr(strConsts, parameter.name());
+            sb.append("%ReflectionParameter { i8* ").append(namePointer)
+                .append(", i32 ").append(parameter.access()).append(" }");
+        }
+        sb.append("]\n");
+
+        String pointer = "getelementptr inbounds (" + arrayType + ", " + arrayType
+            + "* " + arrayName + ", i32 0, i32 0)";
+        return new ReflectionParameterData(pointer, descriptorParameterCount);
+    }
+
     private String generateReflectionData() {
         StringBuilder sb = new StringBuilder();
         StringBuilder strConsts = new StringBuilder();
@@ -3155,6 +3205,10 @@ public class LlvmGlobalEmitter {
         // not visible to the build-time reachability analysis.
         // ------------------------------------------------------------------
         emitClasses.addAll(PRIMITIVE_TYPE_NAMES);
+        // Executable.getParameters0 constructs instances of this class in
+        // the native reflection runtime, so its mirror and type info must
+        // exist even if the app only reaches it through framework reflection.
+        emitClasses.add("java/lang/reflect/Parameter");
 
         // ------------------------------------------------------------------
         // Array mirrors.
@@ -3210,6 +3264,7 @@ public class LlvmGlobalEmitter {
         emitClasses.add("[Ljava/lang/reflect/Field;");
         emitClasses.add("[Ljava/lang/reflect/Method;");
         emitClasses.add("[Ljava/lang/reflect/Constructor;");
+        emitClasses.add("[Ljava/lang/reflect/Parameter;");
 
         List<String> classNames = new ArrayList<>();
         for (String cn : emitClasses) {
@@ -3454,7 +3509,9 @@ public class LlvmGlobalEmitter {
             List<MethodReference> sortedMethods = new ArrayList<>(info.getMethods());
             sortedMethods.sort(Comparator.comparing(MethodReference::toString));
             List<String> methodPtrs = new ArrayList<>();
+            int methodSlot = 0;
             for (MethodReference method : sortedMethods) {
+                int currentMethodSlot = methodSlot++;
                 String methodName = method.getName();
                 String desc = method.getDescriptor();
 
@@ -3545,11 +3602,17 @@ public class LlvmGlobalEmitter {
                 if (mn != null) modifiers = mn.getAccess();
 
                 String methodVar = "@refmethod_" + cleanClassName + "_" + mangledSuffix;
+                ReflectionParameterData parameterData = emitReflectionParameterData(
+                    sb, strConsts, methodVar + "_parameters", mn, desc);
+
                 sb.append(methodVar).append(" = constant %ReflectionMethod { i8* ")
                     .append(ensureStringConstantPtr(strConsts, methodName))
                     .append(", i8* ").append(ensureStringConstantPtr(strConsts, desc))
                     .append(", ").append(adaptorPtr)
-                    .append(", i32 ").append(modifiers).append(" }\n");
+                    .append(", i32 ").append(modifiers)
+                    .append(", %ReflectionParameter* ").append(parameterData.pointer())
+                    .append(", i32 ").append(parameterData.count())
+                    .append(", i32 ").append(currentMethodSlot).append(" }\n");
                 methodPtrs.add("i8* bitcast (%ReflectionMethod* " + methodVar + " to i8*)");
             }
             String methodsArray = "@refmethods_" + cleanClassName;
@@ -3655,7 +3718,9 @@ public class LlvmGlobalEmitter {
             List<MethodReference> sortedCtors = new ArrayList<>(info.getConstructors());
             sortedCtors.sort(Comparator.comparing(MethodReference::toString));
             List<String> ctorPtrs = new ArrayList<>();
+            int constructorSlot = 0;
             for (MethodReference ctor : sortedCtors) {
+                int currentConstructorSlot = constructorSlot++;
                 String desc = ctor.getDescriptor();
                 // Same null-descriptor guard as for methods above. A null
                 // constructor descriptor would give
@@ -3697,10 +3762,15 @@ public class LlvmGlobalEmitter {
                 if (mn != null) modifiers = mn.getAccess();
 
                 String ctorVar = "@refctor_" + cleanClassName + "_" + mangledDesc;
+                ReflectionParameterData parameterData = emitReflectionParameterData(
+                    sb, strConsts, ctorVar + "_parameters", mn, desc);
                 sb.append(ctorVar).append(" = constant %ReflectionConstructor { i8* ")
                     .append(ensureStringConstantPtr(strConsts, desc))
                     .append(", ").append(adaptorPtr)
-                    .append(", i32 ").append(modifiers).append(" }\n");
+                    .append(", i32 ").append(modifiers)
+                    .append(", %ReflectionParameter* ").append(parameterData.pointer())
+                    .append(", i32 ").append(parameterData.count())
+                    .append(", i32 ").append(currentConstructorSlot).append(" }\n");
                 ctorPtrs.add("i8* bitcast (%ReflectionConstructor* " + ctorVar + " to i8*)");
             }
             String ctorsArray = "@refctors_" + cleanClassName;
