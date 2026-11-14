@@ -30,11 +30,19 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.objectweb.asm.ClassReader;
 import org.objectweb.asm.Opcodes;
+import org.objectweb.asm.Type;
+import org.objectweb.asm.tree.AbstractInsnNode;
+import org.objectweb.asm.tree.LdcInsnNode;
+import org.objectweb.asm.tree.MethodInsnNode;
+import org.objectweb.asm.tree.TypeInsnNode;
+
+import java.nio.charset.StandardCharsets;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
 import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -74,6 +82,7 @@ public class ClassAnalysis {
                 addProxy(List.of(name));
             }
         }
+        loaded.forEach(this::addCallSiteProxies);
         for (List<String> interfaces : resolver.getProxyInterfaces()) {
             addProxy(interfaces.stream().map(i -> i.replace('.', '/')).toList());
         }
@@ -172,6 +181,55 @@ public class ClassAnalysis {
             if (m.getName().equals("<init>")) info.addConstructor(ref);
             else if (!m.getName().equals("<clinit>")) info.addMethod(ref);
         }
+    }
+
+    private void addCallSiteProxies(String className) {
+        byte[] bytes = resolver.getClassBytes(className);
+        if (bytes == null || !new String(bytes, StandardCharsets.ISO_8859_1).contains("newProxyInstance")) return;
+        org.objectweb.asm.tree.ClassNode cn = new org.objectweb.asm.tree.ClassNode();
+        new ClassReader(bytes).accept(cn, ClassReader.SKIP_DEBUG | ClassReader.SKIP_FRAMES);
+        List<List<String>> sites = new ArrayList<>();
+        Set<String> staticTypes = new LinkedHashSet<>();
+        for (org.objectweb.asm.tree.MethodNode mn : cn.methods) {
+            List<String> array = null;
+            for (AbstractInsnNode insn : mn.instructions) {
+                if (insn.getOpcode() == Opcodes.ANEWARRAY && "java/lang/Class".equals(((TypeInsnNode) insn).desc)) {
+                    array = new ArrayList<>();
+                } else if (insn.getOpcode() == Opcodes.AASTORE && array != null) {
+                    String literal = insn.getPrevious() instanceof LdcInsnNode ldc && ldc.cst instanceof Type t
+                        && t.getSort() == Type.OBJECT ? t.getInternalName() : null;
+                    array.add(literal);
+                    if (literal != null && mn.name.equals("<clinit>")) staticTypes.add(literal);
+                } else if (insn instanceof MethodInsnNode call && array != null
+                        && call.owner.equals("java/lang/reflect/Proxy") && call.name.equals("newProxyInstance")) {
+                    sites.add(array);
+                    array = null;
+                }
+            }
+        }
+        for (List<String> site : sites) {
+            List<List<String>> combos = List.of(List.of());
+            for (String element : site) {
+                List<List<String>> next = new ArrayList<>();
+                for (List<String> combo : combos) {
+                    for (String candidate : element != null ? List.of(element) : staticTypes) {
+                        if (combo.contains(candidate)) continue;
+                        List<String> extended = new ArrayList<>(combo);
+                        extended.add(candidate);
+                        next.add(extended);
+                    }
+                }
+                combos = next.size() > 64 ? List.of() : next;
+            }
+            for (List<String> combo : combos) {
+                if (!combo.isEmpty() && combo.stream().allMatch(this::isInterface)) addProxy(combo);
+            }
+        }
+    }
+
+    private boolean isInterface(String name) {
+        ClassNode cn = resolver.getClassNode(name);
+        return cn != null && cn.isInterface();
     }
 
     private void addProxy(List<String> interfaces) {

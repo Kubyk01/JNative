@@ -971,22 +971,22 @@ public class DependencyResolver {
     }
 
     public MethodNode findMethodInHierarchy(String className, String methodName, String descriptor, String[] foundOwner) {
+        MethodResult result = resolveMethod(className, methodName, descriptor);
+        if (result == null) return null;
+        if (foundOwner != null) foundOwner[0] = result.foundOwner();
+        return result.method();
+    }
+
+    private MethodResult resolveMethod(String className, String methodName, String descriptor) {
         MethodKey key = new MethodKey(className, methodName, descriptor);
         MethodResult cached = methodCache.get(key);
-        if (cached != null) {
-            if (foundOwner != null) foundOwner[0] = cached.foundOwner();
-            return cached.method();
-        }
-        MethodNode result = findMethodInHierarchyUncached(className, methodName, descriptor, foundOwner);
-        if (result != null) {
-            methodCache.put(key, new MethodResult(result,
-                foundOwner != null ? foundOwner[0] : null));
-        }
+        if (cached != null) return cached;
+        MethodResult result = resolveMethodUncached(className, methodName, descriptor);
+        if (result != null) methodCache.put(key, result);
         return result;
     }
 
-    private MethodNode findMethodInHierarchyUncached(String className, String methodName,
-                                                     String descriptor, String[] foundOwner) {
+    private MethodResult resolveMethodUncached(String className, String methodName, String descriptor) {
         ClassNode cn = classMap.get(className);
         if (cn == null) {
             loadSystemClass(className);
@@ -995,30 +995,42 @@ public class DependencyResolver {
         }
         for (MethodNode mn : cn.getMethods()) {
             if (mn.getName().equals(methodName) && mn.getDescriptor().equals(descriptor)) {
-                if (foundOwner != null) foundOwner[0] = className;
-                return mn;
+                return new MethodResult(mn, className);
             }
         }
         for (MethodNode mn : cn.getMethods()) {
             if (mn.getName().equals(methodName) && mn.isPolymorphicSignature()) {
-                if (foundOwner != null) foundOwner[0] = className;
-                return mn;
+                return new MethodResult(mn, className);
             }
         }
+        MethodResult best = null;
         String superName = cn.getSuperName();
         if (superName != null && !superName.equals(className)) {
-            MethodNode r = findMethodInHierarchy(superName, methodName, descriptor, foundOwner);
-            if (r != null) return r;
+            best = resolveMethod(superName, methodName, descriptor);
         } else if (superName == null && !"java/lang/Object".equals(className)) {
-            MethodNode r = findMethodInHierarchy("java/lang/Object", methodName, descriptor, foundOwner);
-            if (r != null) return r;
+            best = resolveMethod("java/lang/Object", methodName, descriptor);
         }
+        if (best != null && !classMap.get(best.foundOwner()).isInterface()) return best;
         for (String iface : cn.getInterfaces()) {
             if (iface.equals(className)) continue;
-            MethodNode r = findMethodInHierarchy(iface, methodName, descriptor, foundOwner);
-            if (r != null) return r;
+            MethodResult r = resolveMethod(iface, methodName, descriptor);
+            if (r == null) continue;
+            if (best == null || extendsInterface(r.foundOwner(), best.foundOwner())
+                    || (best.method().isAbstract() && !r.method().isAbstract()
+                        && !extendsInterface(best.foundOwner(), r.foundOwner()))) {
+                best = r;
+            }
         }
-        return null;
+        return best;
+    }
+
+    private boolean extendsInterface(String sub, String sup) {
+        ClassNode cn = classMap.get(sub);
+        if (cn == null) return false;
+        for (String iface : cn.getInterfaces()) {
+            if (iface.equals(sup) || extendsInterface(iface, sup)) return true;
+        }
+        return false;
     }
 
     public FieldNode getField(String className, String fieldName) {

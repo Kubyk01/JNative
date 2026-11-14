@@ -131,6 +131,10 @@ public class LlvmRuntime {
             declare i32 @atexit(void ()*)
             declare i64 @llvm.objectsize.i64.p0i8(i8*, i1)
             declare void @llvm.memset.p0i8.i64(i8* nocapture writeonly, i8, i64, i1 immarg)
+            declare i32 @llvm.fptosi.sat.i32.f32(float)
+            declare i32 @llvm.fptosi.sat.i32.f64(double)
+            declare i64 @llvm.fptosi.sat.i64.f32(float)
+            declare i64 @llvm.fptosi.sat.i64.f64(double)
 
             declare i32 @pthread_mutex_lock(i8*)
             declare i32 @pthread_mutex_unlock(i8*)

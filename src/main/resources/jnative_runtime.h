@@ -558,6 +558,9 @@ extern const int32_t JNATIVE_METHOD_PARAM_ANNOTATIONS_OFFSET;
 extern const int32_t JNATIVE_METHOD_ANNOTATION_DEFAULT_OFFSET;
 extern const int32_t JNATIVE_CTOR_ANNOTATIONS_OFFSET;
 extern const int32_t JNATIVE_CTOR_PARAM_ANNOTATIONS_OFFSET;
+extern const int32_t JNATIVE_FIELD_SIGNATURE_OFFSET;
+extern const int32_t JNATIVE_METHOD_SIGNATURE_OFFSET;
+extern const int32_t JNATIVE_CTOR_SIGNATURE_OFFSET;
 
 /* JVM access-flag bits used by the reflection filter paths. */
 #ifndef JNATIVE_ACC_PUBLIC
@@ -746,6 +749,7 @@ typedef struct {
     int32_t        parameter_annotations_len;
     const uint8_t* annotation_default;
     int32_t        annotation_default_len;
+    const char*    signature;
 } JNativeAnnotationMember;
 
 typedef struct {

@@ -918,7 +918,13 @@ public class LlvmGlobalEmitter {
         sb.append("@JNATIVE_CTOR_ANNOTATIONS_OFFSET        = constant i32 ")
             .append(safeGlobalFieldOffsetAllowMissing("java/lang/reflect/Constructor", "annotations")).append("\n");
         sb.append("@JNATIVE_CTOR_PARAM_ANNOTATIONS_OFFSET  = constant i32 ")
-            .append(safeGlobalFieldOffsetAllowMissing("java/lang/reflect/Constructor", "parameterAnnotations")).append("\n\n");
+            .append(safeGlobalFieldOffsetAllowMissing("java/lang/reflect/Constructor", "parameterAnnotations")).append("\n");
+        sb.append("@JNATIVE_FIELD_SIGNATURE_OFFSET         = constant i32 ")
+            .append(safeGlobalFieldOffsetAllowMissing("java/lang/reflect/Field", "signature")).append("\n");
+        sb.append("@JNATIVE_METHOD_SIGNATURE_OFFSET        = constant i32 ")
+            .append(safeGlobalFieldOffsetAllowMissing("java/lang/reflect/Method", "signature")).append("\n");
+        sb.append("@JNATIVE_CTOR_SIGNATURE_OFFSET          = constant i32 ")
+            .append(safeGlobalFieldOffsetAllowMissing("java/lang/reflect/Constructor", "signature")).append("\n\n");
 
         sb.append("@JNATIVE_SFI_MEMBERNAME_OFFSET    = constant i32 ")
           .append(declaredFieldOffsetOrMissing("java/lang/StackFrameInfo", "memberName")).append("\n");
@@ -3699,7 +3705,7 @@ public class LlvmGlobalEmitter {
             }
             String ctorsArray = "@refctors_" + cleanClassName;
             appendNullTerminatedPtrArray(sb, ctorsArray, ctorPtrs);
-            if (adaptorDefs != sb && adaptorDefs.length() > 0) {
+            if (adaptorDefs != sb && !adaptorDefs.isEmpty()) {
                 adaptorSink.accept(className, adaptorDefs.toString());
             }
 
@@ -4261,15 +4267,16 @@ public class LlvmGlobalEmitter {
                 String anns = annotationBlob(data, "@__jnative_annot_b_" + blob++, m.annotations());
                 String params = annotationBlob(data, "@__jnative_annot_b_" + blob++, m.parameterAnnotations());
                 String dflt = annotationBlob(data, "@__jnative_annot_b_" + blob++, m.annotationDefault());
-                memberRows.add("  { i8*, i8*, i8*, i32, i8*, i32, i8*, i32 } { i8* "
+                memberRows.add("  { i8*, i8*, i8*, i32, i8*, i32, i8*, i32, i8* } { i8* "
                     + ensureStringConstantPtr(strConsts, m.name()) + ", i8* "
                     + ensureStringConstantPtr(strConsts, m.descriptor()) + ", "
-                    + anns + ", " + params + ", " + dflt + " }");
+                    + anns + ", " + params + ", " + dflt + ", i8* "
+                    + ensureStringConstantPtr(strConsts, m.signature()) + " }");
             }
             String membersPtr = "i8* null";
             if (!memberRows.isEmpty()) {
                 String membersVar = "@__jnative_annot_m_" + id;
-                String arrayType = "[" + memberRows.size() + " x { i8*, i8*, i8*, i32, i8*, i32, i8*, i32 }]";
+                String arrayType = "[" + memberRows.size() + " x { i8*, i8*, i8*, i32, i8*, i32, i8*, i32, i8* }]";
                 data.append(membersVar).append(" = private constant ").append(arrayType).append(" [\n")
                     .append(String.join(",\n", memberRows)).append("\n]\n");
                 membersPtr = "i8* bitcast (" + arrayType + "* " + membersVar + " to i8*)";

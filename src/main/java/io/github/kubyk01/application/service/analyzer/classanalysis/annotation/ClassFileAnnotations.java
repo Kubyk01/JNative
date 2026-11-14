@@ -1,15 +1,18 @@
 package io.github.kubyk01.application.service.analyzer.classanalysis.annotation;
 
+import lombok.Getter;
+
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
+@Getter
 public final class ClassFileAnnotations {
 
     public record Member(String name, String descriptor, byte[] annotations,
-                         byte[] parameterAnnotations, byte[] annotationDefault) {}
+                         byte[] parameterAnnotations, byte[] annotationDefault, String signature) {}
 
     private final byte[] constantPool;
     private final int constantPoolCount;
@@ -25,12 +28,6 @@ public final class ClassFileAnnotations {
         this.members = members;
         this.referencedTypes = referencedTypes;
     }
-
-    public byte[] getConstantPool() { return constantPool; }
-    public int getConstantPoolCount() { return constantPoolCount; }
-    public byte[] getClassAnnotations() { return classAnnotations; }
-    public List<Member> getMembers() { return members; }
-    public Set<String> getReferencedTypes() { return referencedTypes; }
 
     public boolean isEmpty() {
         return classAnnotations == null && members.isEmpty();
@@ -104,6 +101,7 @@ public final class ClassFileAnnotations {
                 String name = utf8(u2());
                 String desc = utf8(u2());
                 byte[] anns = null, params = null, dflt = null;
+                String signature = null;
                 int attrs = u2();
                 for (int a = 0; a < attrs; a++) {
                     String attr = utf8(u2());
@@ -112,11 +110,12 @@ public final class ClassFileAnnotations {
                         case "RuntimeVisibleAnnotations" -> { anns = slice(len); scanAnnotations(anns); }
                         case "RuntimeVisibleParameterAnnotations" -> { params = slice(len); scanParameterAnnotations(params); }
                         case "AnnotationDefault" -> { dflt = slice(len); scanElementValue(ByteBuffer.wrap(dflt)); }
+                        case "Signature" -> signature = utf8(u2());
                         default -> skip(len);
                     }
                 }
-                if (anns != null || params != null || dflt != null) {
-                    out.add(new Member(name, desc, anns, params, dflt));
+                if (anns != null || params != null || dflt != null || signature != null) {
+                    out.add(new Member(name, desc, anns, params, dflt, signature));
                 }
             }
         }

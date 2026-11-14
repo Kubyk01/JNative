@@ -4047,6 +4047,13 @@ public class LlvmFunctionEmitter {
             }
         } else if (fromInt && toFloat) {
             castOp = "sitofp";
+        } else if (fromFloat && (toLlvm.equals("i32") || toLlvm.equals("i64"))) {
+            String sat = newAux("cast");
+            sb.append("  ").append(sat).append(" = call ").append(toLlvm)
+                    .append(" @llvm.fptosi.sat.").append(toLlvm)
+                    .append(fromLlvm.equals("float") ? ".f32(" : ".f64(")
+                    .append(fromLlvm).append(" ").append(value).append(")\n");
+            return sat;
         } else if (fromFloat && toInt) {
             castOp = "fptosi";
         } else {

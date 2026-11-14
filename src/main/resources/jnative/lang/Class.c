@@ -297,6 +297,10 @@ static void* create_field_mirror(ReflectionClass* declaring_cls,
         *(void**)((char*)field + JNATIVE_FIELD_ANNOTATIONS_OFFSET) =
             jnative_annotation_bytes(am->annotations, am->annotations_len);
     }
+    if (am != NULL && am->signature != NULL && JNATIVE_FIELD_SIGNATURE_OFFSET > 0) {
+        *(void**)((char*)field + JNATIVE_FIELD_SIGNATURE_OFFSET) =
+            __jnative_make_string_obj(am->signature, (int32_t)strlen(am->signature));
+    }
 
     return field;
 }
@@ -377,6 +381,11 @@ static void* create_method_mirror(ReflectionClass* declaring_cls,
                 jnative_annotation_bytes(am->annotation_default, am->annotation_default_len);
     }
 
+    if (am != NULL && am->signature != NULL && JNATIVE_METHOD_SIGNATURE_OFFSET > 0) {
+        *(void**)((char*)method + JNATIVE_METHOD_SIGNATURE_OFFSET) =
+            __jnative_make_string_obj(am->signature, (int32_t)strlen(am->signature));
+    }
+
     if (jnative_root_offset_is_sane(JNATIVE_METHOD_ROOT_OFFSET)) {
         *(void**)((char*)method + JNATIVE_METHOD_ROOT_OFFSET) = NULL;
     }
@@ -441,6 +450,11 @@ static void* create_constructor_mirror(ReflectionClass* declaring_cls,
         if (JNATIVE_CTOR_PARAM_ANNOTATIONS_OFFSET > 0)
             *(void**)((char*)ctor + JNATIVE_CTOR_PARAM_ANNOTATIONS_OFFSET) =
                 jnative_annotation_bytes(am->parameter_annotations, am->parameter_annotations_len);
+    }
+
+    if (am != NULL && am->signature != NULL && JNATIVE_CTOR_SIGNATURE_OFFSET > 0) {
+        *(void**)((char*)ctor + JNATIVE_CTOR_SIGNATURE_OFFSET) =
+            __jnative_make_string_obj(am->signature, (int32_t)strlen(am->signature));
     }
 
     if (jnative_root_offset_is_sane(JNATIVE_CTOR_ROOT_OFFSET)) {
