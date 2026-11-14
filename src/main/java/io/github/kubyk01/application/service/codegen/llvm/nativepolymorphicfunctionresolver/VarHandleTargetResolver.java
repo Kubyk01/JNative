@@ -42,7 +42,8 @@ public class VarHandleTargetResolver {
     private static final String METHOD_HANDLES = "java/lang/invoke/MethodHandles";
     private static final String LOOKUP = "java/lang/invoke/MethodHandles$Lookup";
     private static final String MH_UTIL = "jdk/internal/invoke/MhUtil";
-    private static final String VAR_HANDLE = "java/lang/invoke/VarHandle";
+    private static final String CONSTANT_BOOTSTRAPS = "java/lang/invoke/ConstantBootstraps";
+    private static final String VAR_HANDLE ="java/lang/invoke/VarHandle";
 
     private final DependencyResolver resolver;
     private final Map<String, Optional<Target>> cache = new ConcurrentHashMap<>();
@@ -292,6 +293,18 @@ public class VarHandleTargetResolver {
                             : UNKNOWN);
                     return;
                 }
+            }
+            if (opcode == Opcodes.INVOKESTATIC && CONSTANT_BOOTSTRAPS.equals(owner)
+                    && "(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;Ljava/lang/Class;Ljava/lang/Class;Ljava/lang/Class;)Ljava/lang/invoke/VarHandle;".equals(descriptor)
+                    && ("fieldVarHandle".equals(name) || "staticFieldVarHandle".equals(name))) {
+                Object type = pop();
+                Object recv = pop();
+                pop();
+                Object field = pop();
+                Object lookup = pop();
+                Kind kind = "fieldVarHandle".equals(name) ? Kind.INSTANCE_FIELD : Kind.STATIC_FIELD;
+                push(lookup instanceof LookupIn ? fieldTarget(kind, recv, field, type) : UNKNOWN);
+                return;
             }
             if (opcode == Opcodes.INVOKEVIRTUAL && LOOKUP.equals(owner)
                     && "(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/Class;)Ljava/lang/invoke/VarHandle;".equals(descriptor)
