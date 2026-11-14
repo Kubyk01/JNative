@@ -159,7 +159,7 @@ void __jnative_fn_java_io_FileOutputStream_open0__Ljava_lang_String_Z_V(
     if (append) flags |= _O_APPEND;
     else        flags |= _O_TRUNC;
 
-    fd = _open(path_buf, flags, _S_IREAD | _S_IWRITE);
+    fd = jn_open_utf8(path_buf, flags, _S_IREAD | _S_IWRITE);
 #else
     /*
      * POSIX: unchanged from the previous revision. O_CLOEXEC keeps

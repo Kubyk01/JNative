@@ -35,6 +35,7 @@ public class Compiler implements CompilerPort {
     private static final String RUNTIME_SOURCE_RESOURCE_PATH = "jnative_runtime.c";
     private static final String RUNTIME_HEADER_RESOURCE_PATH = "jnative_runtime.h";
     private static final String JNI_BRIDGE_RESOURCE_PATH = "jnative_jni_bridge.c";
+    private static final String EMBEDDED_RUNTIME_RESOURCE_PATH = "jnative_embedded_runtime.c";
 
     private static final String PORTABILITY_DIR = "jnative_portability/";
     private static final String PLATFORM_HEADER_RESOURCE_PATH = PORTABILITY_DIR + "jnative_platform.h";
@@ -109,11 +110,13 @@ public class Compiler implements CompilerPort {
         final TargetPlatform target = (targetPlatform != null)
                 ? targetPlatform
                 : TargetPlatform.detectFromBuildHost();
+        RuntimeImageEmbedder.validate(resolver.getRuntimeJavaHome());
 
         Path tempDir = Files.createTempDirectory(BUILD_ROOT_NAME);
         tempDir.toFile().deleteOnExit();
 
-        try {
+        try (RuntimeClasspath runtimeClasspath = RuntimeClasspath.create(
+                resolver.getInputPath(), resolver.getScannedJars(), tempDir)) {
             String compiler = detectCompiler(target);
 
             MsvcToolchain msvcToolchain = null;
@@ -146,6 +149,8 @@ public class Compiler implements CompilerPort {
             Path jniBridgeSource = extractResource(
                     JNI_BRIDGE_RESOURCE_PATH,
                     tempDir.resolve(JNI_BRIDGE_RESOURCE_PATH));
+            Path embeddedRuntimeSource = extractResource(EMBEDDED_RUNTIME_RESOURCE_PATH,
+                    tempDir.resolve(EMBEDDED_RUNTIME_RESOURCE_PATH));
 
             Path portabilityDir = tempDir.resolve("jnative_portability");
             Files.createDirectories(portabilityDir);
@@ -188,17 +193,29 @@ public class Compiler implements CompilerPort {
             Path cDir = tempDir.resolve("c");
             Files.createDirectories(cDir);
 
-            tasks.add(new CompileTask(runtimeSource, cDir.resolve("jnative_runtime.o"), false));
-            tasks.add(new CompileTask(platformSource, cDir.resolve("jnative_platform.o"), false));
-            tasks.add(new CompileTask(portabilitySource, cDir.resolve("jnative_portability.o"), false));
-            tasks.add(new CompileTask(jniBridgeSource, cDir.resolve("jnative_jni_bridge.o"), false));
+            tasks.add(new CompileTask(runtimeSource, cDir.resolve("jnative_runtime.o"), SourceKind.C));
+            tasks.add(new CompileTask(platformSource, cDir.resolve("jnative_platform.o"), SourceKind.C));
+            tasks.add(new CompileTask(portabilitySource, cDir.resolve("jnative_portability.o"), SourceKind.C));
+            tasks.add(new CompileTask(jniBridgeSource, cDir.resolve("jnative_jni_bridge.o"), SourceKind.C));
+            tasks.add(new CompileTask(embeddedRuntimeSource, cDir.resolve("jnative_embedded_runtime.o"), SourceKind.C));
+            List<Path> nativeLibs = resolveNativeLoadOrder(collectNativeLibraries(module,
+                    runtimeClasspath.entries(), target, tempDir.resolve("native-libraries")), target);
+            RuntimeImageEmbedder.Sources runtimeImage = RuntimeImageEmbedder.embed(
+                    resolver.getRuntimeJavaHome(), runtimeClasspath.entries(), nativeLibs, tempDir, target);
+            tasks.add(new CompileTask(runtimeImage.table(), cDir.resolve("jnative_runtime_files.o"), SourceKind.C));
+            tasks.add(new CompileTask(runtimeImage.assembly(), cDir.resolve("jnative_runtime_image.o"), SourceKind.ASSEMBLY));
 
             for (Path src : extraSources) {
                 Path rel = tempDir.relativize(src);
                 Path objWithPath = cDir.resolve(
                         rel.toString().replaceAll("\\.c$", ".o"));
                 Files.createDirectories(objWithPath.getParent());
-                tasks.add(new CompileTask(src, objWithPath, false));
+                tasks.add(new CompileTask(src, objWithPath, SourceKind.C));
+            }
+
+            if (target.isWindows()) {
+                Path symtab = writeWindowsSymbolTable(module, llPaths, tempDir, target);
+                tasks.add(new CompileTask(symtab, cDir.resolve("jnative_self_symbols.o"), SourceKind.C));
             }
 
             int irIndex = 0;
@@ -206,7 +223,7 @@ public class Compiler implements CompilerPort {
                 String base = sanitizeForObjName(ll.getFileName().toString());
                 Path obj = tempDir.resolve("ir")
                         .resolve(String.format("%05d_%s.o", irIndex++, base));
-                tasks.add(new CompileTask(ll, obj, true));
+                tasks.add(new CompileTask(ll, obj, SourceKind.IR));
             }
 
             // ------------------------------------------------------------------
@@ -242,11 +259,6 @@ public class Compiler implements CompilerPort {
             // -L<gcc-runtime-dir> explicitly for every directory that
             // contains libgcc.a. See findGccRuntimeLibDirs below.
             // ------------------------------------------------------------------
-            Path defFile = null;
-            if (target.isWindows()) {
-                defFile = generateWindowsExportDef(module, llPaths, tempDir);
-            }
-
             List<String> linkCmd = new ArrayList<>();
             linkCmd.add(compiler);
 
@@ -259,6 +271,7 @@ public class Compiler implements CompilerPort {
 
             linkCmd.add("-flto=thin");
             linkCmd.add("-O" + effectiveOptLevel);
+            linkCmd.add("-g");
 
             if (msvcLinker) {
                 if (!isAvailable("lld-link")) {
@@ -271,6 +284,9 @@ public class Compiler implements CompilerPort {
                 }
                 linkCmd.add("-fuse-ld=lld");
                 linkCmd.add("-flto-jobs=" + effectiveCores);
+                // MSVC-mode lld-link reports a symbol made weak in several objects as duplicate
+                // (MinGW mode allows it); the runtime relies on ELF-style weak, so allow it.
+                linkCmd.add("-Wl,-lld-allow-duplicate-weak");
             } else {
                 // Windows doesn't append .exe to a name that already has an extension (".lld").
                 if (!isAvailable(TargetPlatform.detectFromBuildHost().isWindows() ? "ld.lld.exe" : "ld.lld")) {
@@ -329,32 +345,7 @@ public class Compiler implements CompilerPort {
             linkCmd.add("-o");
             linkCmd.add(exePath.toString());
 
-            appendLinkerLibraries(linkCmd, target, defFile);
-
-            // ------------------------------------------------------------------
-            // 6. Native library discovery and bundling.
-            // ------------------------------------------------------------------
-            List<Path> nativeLibs = collectNativeLibraries(module, resolver, target);
-            Set<Path> nativeLibDirs = new LinkedHashSet<>();
-            for (Path lib : nativeLibs) {
-                if (target.isWindows()) {
-                    linkCmd.add(lib.toString());
-                } else {
-                    linkCmd.add("-Wl,--no-as-needed");
-                    linkCmd.add(lib.toString());
-                }
-                Path parent = lib.toAbsolutePath().getParent();
-                if (parent != null) nativeLibDirs.add(parent);
-            }
-
-            if (!target.isWindows()) {
-                linkCmd.add("-Wl,--disable-new-dtags");
-                linkCmd.add("-Wl,-rpath,$ORIGIN");
-                linkCmd.add("-Wl,-rpath," + new File(".").getAbsolutePath());
-                for (Path dir : nativeLibDirs) {
-                    linkCmd.add("-Wl,-rpath," + dir);
-                }
-            }
+            appendLinkerLibraries(linkCmd, target);
 
             System.out.println("Linking for target " + target.triple() + "...");
             ProcessBuilder linkBuilder = new ProcessBuilder(linkCmd);
@@ -364,8 +355,6 @@ public class Compiler implements CompilerPort {
                 throw new RuntimeException("Linking failed with exit code " + exit
                         + " (target: " + target.triple() + ")");
             }
-
-            bundleNativeLibraries(exePath, nativeLibs, nativeLibDirs, target);
 
         } finally {
             Files.walk(tempDir)
@@ -971,9 +960,8 @@ public class Compiler implements CompilerPort {
         if (root == null || root.isEmpty()) return false;
         Path p = Paths.get(root);
         if (Files.exists(p.resolve("include").resolve("stdlib.h"))) return true;
-        if (Files.exists(p.resolve("sys-root").resolve("mingw")
-                .resolve("include").resolve("stdlib.h"))) return true;
-        return false;
+        return Files.exists(p.resolve("sys-root").resolve("mingw")
+            .resolve("include").resolve("stdlib.h"));
     }
 
     private static String findExecutable(String name) {
@@ -1054,7 +1042,6 @@ public class Compiler implements CompilerPort {
         if (isMsvc) return;
 
         linkCmd.add("--sysroot=" + sysroot);
-        linkCmd.add("--gcc-toolchain=" + sysroot);
         String tripleDir = mingwTripleDir(target);
         if (Files.isDirectory(Paths.get(sysroot, tripleDir, "lib"))) {
             addLibIfDir(linkCmd, sysroot, tripleDir, "lib");
@@ -1085,12 +1072,14 @@ public class Compiler implements CompilerPort {
     //  Per-unit compile
     // =====================================================================
 
+    private enum SourceKind { C, IR, ASSEMBLY }
+
     private static final class CompileTask {
         private final Path src;
         private final Path obj;
-        private final boolean isIr;
-        CompileTask(Path src, Path obj, boolean isIr) {
-            this.src = src; this.obj = obj; this.isIr = isIr;
+        private final SourceKind kind;
+        CompileTask(Path src, Path obj, SourceKind kind) {
+            this.src = src; this.obj = obj; this.kind = kind;
         }
     }
 
@@ -1100,8 +1089,16 @@ public class Compiler implements CompilerPort {
                             String sysroot, MsvcToolchain msvcToolchain)
             throws IOException, InterruptedException {
 
+        List<CompileTask> scheduledTasks = new ArrayList<>(tasks);
+        Map<Path, Long> sourceSizes = new HashMap<>();
+        for (CompileTask task : scheduledTasks) {
+            sourceSizes.put(task.src, Files.size(task.src));
+        }
+        scheduledTasks.sort(Comparator.comparingLong(
+                (CompileTask task) -> sourceSizes.get(task.src)).reversed());
+
         if (threadCount <= 1 || tasks.size() <= 1) {
-            for (CompileTask task : tasks) {
+            for (CompileTask task : scheduledTasks) {
                 compileOne(compiler, task, includeDir, optimizationLevel,
                         target, sysroot, msvcToolchain);
             }
@@ -1121,9 +1118,9 @@ public class Compiler implements CompilerPort {
         for (int i = 0; i < threadCount; i++) {
             futures.add(pool.submit(() -> {
                 int idx;
-                while ((idx = nextTask.getAndIncrement()) < tasks.size()) {
+                while ((idx = nextTask.getAndIncrement()) < scheduledTasks.size()) {
                     try {
-                        compileOne(compiler, tasks.get(idx), includeDir,
+                        compileOne(compiler, scheduledTasks.get(idx), includeDir,
                                 optimizationLevel, target, sysroot,
                                 msvcToolchain);
                     } catch (Throwable t) {
@@ -1165,17 +1162,25 @@ public class Compiler implements CompilerPort {
         Path parent = task.obj.getParent();
         if (parent != null) Files.createDirectories(parent);
 
+        if (task.kind == SourceKind.ASSEMBLY) {
+            List<String> command = new ArrayList<>(List.of(compiler, "-c", "-x", "assembler"));
+            if (!isMinGwWrapper(compiler)) command.add("--target=" + target.triple());
+            command.addAll(List.of(task.src.toString(), "-o", task.obj.toString()));
+            runCompileCommand(command, task, target);
+            return;
+        }
+
         List<String> command = new ArrayList<>();
         command.add(compiler);
         command.add("-c");
         command.add("-x");
-        command.add(task.isIr ? "ir" : "c");
+        command.add(task.kind == SourceKind.IR ? "ir" : "c");
         command.add("-O" + optimizationLevel);
         command.add(optimizationLevel == 0 ? "-fno-lto" : "-flto=thin");
         command.add("-g");
         command.add("-fno-omit-frame-pointer");
 
-        if (task.isIr) {
+        if (task.kind == SourceKind.IR) {
             command.add("-Wno-override-module");
         } else {
             command.add("-I" + includeDir.toString());
@@ -1206,7 +1211,7 @@ public class Compiler implements CompilerPort {
                 command.add("-D_CRT_NONSTDC_NO_DEPRECATE=1");
                 command.add("-D__USE_MINGW_ANSI_STDIO=1");
             } else {
-                appendWindowsSysrootToCompiler(command, sysroot, task.isIr, target);
+                appendWindowsSysrootToCompiler(command, sysroot, task.kind == SourceKind.IR, target);
                 if (!isMinGwWrapper(compiler)) {
                     command.add("--target=" + target.triple());
                 }
@@ -1226,6 +1231,11 @@ public class Compiler implements CompilerPort {
         command.add("-o");
         command.add(task.obj.toString());
 
+        runCompileCommand(command, task, target);
+    }
+
+    private void runCompileCommand(List<String> command, CompileTask task, TargetPlatform target)
+            throws IOException, InterruptedException {
         ProcessBuilder pb = new ProcessBuilder(command);
         pb.inheritIO();
         int exit = pb.start().waitFor();
@@ -1323,9 +1333,15 @@ public class Compiler implements CompilerPort {
     //  Windows export table
     // =====================================================================
 
-    private static Path generateWindowsExportDef(Module module,
-                                                 List<Path> llPaths,
-                                                 Path tempDir) throws IOException {
+    /**
+     * The C runtime looks symbols up by name (dlsym/GetProcAddress on itself). A PE export
+     * table holds at most 65535 entries, so instead of exporting them this writes a sorted
+     * name -> address table that jnative_dlfcn_win32.h / jn_lib_sym_self search first.
+     */
+    private static Path writeWindowsSymbolTable(Module module,
+                                                List<Path> llPaths,
+                                                Path tempDir,
+                                                TargetPlatform target) throws IOException {
         Set<String> exports = new TreeSet<>();
 
         // ------------------------------------------------------------------
@@ -1348,27 +1364,28 @@ public class Compiler implements CompilerPort {
         //    start with an instruction mnemonic — none of those begin with `@`,
         //    so the `startsWith("@")` filter is exact.
         // ------------------------------------------------------------------
-        Path moduleLl = null;
+        Set<String> definedGlobals = new HashSet<>();
+        boolean moduleFound = false;
         for (Path ll : llPaths) {
-            if ("_module.ll".equals(ll.getFileName().toString())) {
-                moduleLl = ll;
-                break;
+            String fileName = ll.getFileName().toString();
+            if (!fileName.equals("_module.ll") && !fileName.startsWith("_globals")) continue;
+            moduleFound = true;
+            try (var lines = Files.lines(ll)) {
+                lines.forEach(line -> {
+                    if (!line.startsWith("@")) return;
+                    int eq = line.indexOf(" = ");
+                    if (eq <= 0) return;
+                    String rhs = line.substring(eq + 3).trim();
+                    if (rhs.startsWith("external ") || rhs.startsWith("extern_weak ")
+                            || rhs.startsWith("declare ")) return;
+                    definedGlobals.add(line.substring(1, eq).trim().replace("\"", ""));
+                });
             }
         }
-        if (moduleLl == null) {
+        if (!moduleFound) {
             throw new IllegalStateException(
                 "Cannot generate Windows export def: _module.ll not found in "
                     + llPaths);
-        }
-        Set<String> definedGlobals = new HashSet<>();
-        for (String line : Files.readAllLines(moduleLl)) {
-            if (!line.startsWith("@")) continue;
-            int eq = line.indexOf(" = ");
-            if (eq <= 0) continue;
-            String lhs = line.substring(1, eq).trim();
-            String rhs = line.substring(eq + 3).trim();
-            if (rhs.startsWith("external ") || rhs.startsWith("declare ")) continue;
-            definedGlobals.add(lhs);
         }
 
         // ------------------------------------------------------------------
@@ -1400,7 +1417,8 @@ public class Compiler implements CompilerPort {
         for (String f : definedFunctions) {
             if (f.startsWith("__destruct_")) {
                 exports.add(f);
-            } else if (f.startsWith("fn_") && f.endsWith("__clinit____V")) {
+            } else if (f.startsWith("fn_")
+                    && (f.endsWith("__clinit____V") || f.endsWith("__init____V"))) {
                 exports.add(f);
             }
         }
@@ -1432,17 +1450,37 @@ public class Compiler implements CompilerPort {
         }
 
         // ------------------------------------------------------------------
-        // 6. Write the .def file.
+        // 6. Write the table. TreeSet order == strcmp order (names are ASCII),
+        //    so the runtime can bsearch it. Asm labels give the exact symbol
+        //    name; 32-bit x86 Windows prefixes C symbols with '_'.
         // ------------------------------------------------------------------
-        Path defFile = tempDir.resolve("exports.def");
-        StringBuilder sb = new StringBuilder("EXPORTS\n");
+        String prefix = target.triple().matches("i[3-6]86-.*") ? "_" : "";
+        StringBuilder sb = new StringBuilder(
+                "#include <stdlib.h>\n#include <string.h>\n"
+                + "typedef struct { const char* n; const void* a; } JnSelfSym;\n");
+        int i = 0;
         for (String sym : exports) {
-            sb.append("    ").append(sym).append("\n");
+            sb.append(definedFunctions.contains(sym) ? "extern void s" + i + "(void)" : "extern char s" + i)
+              .append(" __asm__(\"").append(prefix).append(sym).append("\");\n");
+            i++;
         }
-        Files.writeString(defFile, sb.toString());
+        sb.append("static const JnSelfSym jn_self_syms[] = {\n");
+        i = 0;
+        for (String sym : exports) {
+            sb.append("    {\"").append(sym).append("\", (const void*)&s").append(i++).append("},\n");
+        }
+        sb.append("    {0, 0}\n};\n")
+          .append("static int jn_self_cmp(const void* k, const void* e) {\n")
+          .append("    return strcmp((const char*)k, ((const JnSelfSym*)e)->n);\n}\n")
+          .append("void* __jnative_self_symbol(const char* name) {\n")
+          .append("    const JnSelfSym* s = (const JnSelfSym*)bsearch(name, jn_self_syms, ")
+          .append(exports.size()).append(", sizeof(JnSelfSym), jn_self_cmp);\n")
+          .append("    return s ? (void*)s->a : NULL;\n}\n");
 
-        System.out.println("Windows export table: " + exports.size() + " symbol(s)");
-        return defFile;
+        Path src = tempDir.resolve("jnative_self_symbols.c");
+        Files.writeString(src, sb.toString());
+        System.out.println("Windows self-symbol table: " + exports.size() + " symbol(s)");
+        return src;
     }
 
     /**
@@ -1554,14 +1592,10 @@ public class Compiler implements CompilerPort {
     // =====================================================================
 
     private static void appendLinkerLibraries(List<String> linkCmd,
-                                              TargetPlatform target,
-                                              Path defFile) {
+                                              TargetPlatform target) {
         if (target.isWindows()
                 && target.triple().toLowerCase(Locale.ROOT).contains("-msvc")) {
             linkCmd.add("-Wl,/subsystem:console");
-            if (defFile != null) {
-                linkCmd.add("-Wl,/def:" + defFile.toAbsolutePath());
-            }
             linkCmd.add("-Wl,/opt:ref");
             linkCmd.add("-ldbghelp");
             linkCmd.add("-lws2_32");
@@ -1575,9 +1609,6 @@ public class Compiler implements CompilerPort {
             linkCmd.add("-mconsole");
             linkCmd.add("-Wl,--subsystem,console");
             linkCmd.add("-static-libgcc");
-            if (defFile != null) {
-                linkCmd.add(defFile.toString());
-            }
             linkCmd.add("-Wl,--gc-sections");
             linkCmd.add("-lm");
             linkCmd.add("-Wl,-Bstatic");
@@ -1613,177 +1644,258 @@ public class Compiler implements CompilerPort {
                                              DependencyResolver resolver,
                                              TargetPlatform target)
             throws IOException {
-
-        Set<String> wanted = new HashSet<>();
-        for (io.github.kubyk01.domain.ir.Function f : module.getFunctions()) {
-            if (f.isJniNative()) wanted.add(f.getName());
-        }
-        if (wanted.isEmpty()) return List.of();
-
-        List<Path> candidates = new ArrayList<>();
-
         Path extractDir = Files.createTempDirectory("jnative-natives-");
         extractDir.toFile().deleteOnExit();
-        scanClasspathJarsForNatives(target, extractDir, candidates);
+        return collectNativeLibraries(module, resolver.getScannedJars(), target, extractDir);
+    }
 
-        Set<String> stillWanted = new HashSet<>(wanted);
+    private List<Path> collectNativeLibraries(Module module, List<Path> classpath,
+                                              TargetPlatform target, Path extractDir) throws IOException {
+
+        boolean usesJni = false;
+        for (io.github.kubyk01.domain.ir.Function f : module.getFunctions()) {
+            if (f.isJniNative()) {
+                usesJni = true;
+                break;
+            }
+        }
+        if (!usesJni) return List.of();
+
+        Files.createDirectories(extractDir);
         List<Path> result = new ArrayList<>();
-        Collections.sort(candidates);
-
-        for (Path lib : candidates) {
-            if (stillWanted.isEmpty()) break;
-            Set<String> exported = readExportedSymbols(lib, target);
-            Set<String> overlap = new HashSet<>(exported);
-            overlap.retainAll(stillWanted);
-            if (overlap.isEmpty()) continue;
-            result.add(lib);
-            stillWanted.removeAll(overlap);
-            log.info("Native library {} provides {} required JNI symbol(s)",
-                    lib, overlap.size());
+        Set<Path> jars = new LinkedHashSet<>(classpath);
+        for (Path jar : jars) {
+            extractNativeLibraries(jar, target, extractDir, result);
         }
-
-        if (!stillWanted.isEmpty()) {
-            log.warn("{} JNI symbol(s) have neither a JNative C implementation "
-                            + "under jnative/** nor a matching platform library under "
-                            + "META-INF/native/. The link step will fail. Missing "
-                            + "symbols: {}",
-                    stillWanted.size(),
-                    stillWanted.stream().limit(5).collect(Collectors.joining(", ")));
-        }
+        Collections.sort(result);
         return result;
     }
 
-    private Set<String> readExportedSymbols(Path lib, TargetPlatform target)
-            throws IOException {
-        if (target.isWindows()) {
-            return PeSymbolReader.read(lib);
-        }
-        try {
-            return ElfSymbolReader.read(lib);
-        } catch (Throwable t) {
-            return readExportedSymbolsViaNm(lib);
+    private void extractNativeLibraries(Path jar, TargetPlatform target,
+                                        Path extractDir, List<Path> out) throws IOException {
+        String suffix = target.nativeLibrarySuffix();
+        try (JarFile jf = new JarFile(jar.toFile())) {
+            Enumeration<JarEntry> entries = jf.entries();
+            while (entries.hasMoreElements()) {
+                JarEntry e = entries.nextElement();
+                String n = e.getName();
+                String base = n.substring(n.lastIndexOf('/') + 1);
+                String lower = base.toLowerCase(Locale.ROOT);
+                if (e.isDirectory() || !(lower.endsWith(suffix)
+                        || suffix.equals(".so") && lower.matches(".*\\.so(?:\\.[0-9]+)+"))) continue;
+                if (!matchesTargetArch(n, target)) continue;
+                if (!matchesTargetOs(n, target)) continue;
+                Path dest = extractDir.resolve(base);
+                byte[] bytes;
+                try (InputStream is = jf.getInputStream(e)) {
+                    bytes = is.readAllBytes();
+                }
+                if (!elfMatchesTarget(bytes, target)) continue;
+                if (Files.exists(dest)) {
+                    if (!Arrays.equals(Files.readAllBytes(dest), bytes)) {
+                        throw new IOException("Conflicting native library " + base + " in " + jar);
+                    }
+                    continue;
+                }
+                Files.write(dest, bytes);
+                out.add(dest);
+                log.info("Extracted native library {} from {}", base, jar.getFileName());
+            }
         }
     }
 
-    private Set<String> readExportedSymbolsViaNm(Path lib) {
-        try {
-            Process p = new ProcessBuilder("nm", "-D", "--defined-only", lib.toString())
-                    .redirectErrorStream(true).start();
-            Set<String> syms = new HashSet<>();
-            try (var r = new java.io.BufferedReader(
-                    new java.io.InputStreamReader(p.getInputStream()))) {
-                String line;
-                while ((line = r.readLine()) != null) {
-                    int sp = line.lastIndexOf(' ');
-                    if (sp < 0 || sp + 1 >= line.length()) continue;
-                    String name = line.substring(sp + 1).trim();
-                    if (!name.isEmpty()) syms.add(name);
+    private static final Map<String, List<String>> ARCH_ALIASES = Map.of(
+            "x86_64", List.of("x86_64", "amd64", "x64"),
+            "aarch64", List.of("aarch64", "arm64", "aarch_64"),
+            "i686", List.of("i686", "i386", "x86", "x86_32"),
+            "arm", List.of("arm", "armv7", "armhf", "arm32"),
+            "ppc64le", List.of("ppc64le"),
+            "s390x", List.of("s390x"),
+            "riscv64", List.of("riscv64"),
+            "loongarch64", List.of("loongarch64"));
+
+    private static final Map<String, List<String>> OS_ALIASES = Map.of(
+            "linux", List.of("linux"),
+            "android", List.of("android"),
+            "darwin", List.of("darwin", "mac", "macos", "macosx", "osx"),
+            "windows", List.of("windows", "win", "win32", "win64", "mingw"),
+            "freebsd", List.of("freebsd"),
+            "openbsd", List.of("openbsd"),
+            "netbsd", List.of("netbsd"),
+            "sunos", List.of("sunos", "solaris"),
+            "aix", List.of("aix"));
+
+    private static String targetOs(TargetPlatform target) {
+        String t = target.triple().toLowerCase(Locale.ROOT);
+        if (t.contains("android")) return "android";
+        if (t.contains("linux")) return "linux";
+        if (target.isDarwin() || t.contains("darwin") || t.contains("macos") || t.contains("apple")) return "darwin";
+        if (target.isWindows() || t.contains("windows") || t.contains("mingw") || t.contains("msvc")) return "windows";
+        if (t.contains("freebsd")) return "freebsd";
+        if (t.contains("openbsd")) return "openbsd";
+        if (t.contains("netbsd")) return "netbsd";
+        if (t.contains("solaris") || t.contains("sunos")) return "sunos";
+        if (t.contains("aix")) return "aix";
+        return null;
+    }
+
+    private static boolean matchesTargetOs(String entry, TargetPlatform target) {
+        String os = targetOs(target);
+        if (os == null) return true;
+        String[] tokens = entry.toLowerCase(Locale.ROOT).split("[/\\\\.\\-_]");
+        boolean sawOs = false;
+        for (Map.Entry<String, List<String>> o : OS_ALIASES.entrySet()) {
+            for (String alias : o.getValue()) {
+                for (String t : tokens) {
+                    if (!t.equals(alias)) continue;
+                    if (o.getKey().equals(os)) {
+                        if (!os.equals("linux") || !containsToken(tokens, OS_ALIASES.get("android"))) return true;
+                    }
+                    sawOs = true;
                 }
             }
-            p.waitFor();
-            return syms;
-        } catch (Exception e) {
-            return Set.of();
         }
+        return !sawOs;
     }
 
-    private void scanClasspathJarsForNatives(TargetPlatform target,
-                                             Path extractDir,
-                                             List<Path> out) {
-        String suffix = target.nativeLibrarySuffix();
+    private static boolean containsToken(String[] tokens, List<String> aliases) {
+        for (String t : tokens) {
+            if (aliases.contains(t)) return true;
+        }
+        return false;
+    }
 
-        String cp = System.getProperty("java.class.path", "");
-        Set<Path> jars = new LinkedHashSet<>();
-        for (String entry : cp.split(File.pathSeparator)) {
-            if (entry.isEmpty()) continue;
-            Path p = Paths.get(entry);
-            if (Files.isRegularFile(p) && entry.endsWith(".jar")) {
-                jars.add(p);
-            }
+    private record ElfArch(int elfClass, int elfData, int machine) {}
+
+    private static final Map<String, ElfArch> ELF_ARCHES = Map.of(
+            "x86_64", new ElfArch(2, 1, 62),
+            "aarch64", new ElfArch(2, 1, 183),
+            "i686", new ElfArch(1, 1, 3),
+            "arm", new ElfArch(1, 1, 40),
+            "ppc64le", new ElfArch(2, 1, 21),
+            "ppc64", new ElfArch(2, 2, 21),
+            "s390x", new ElfArch(2, 2, 22),
+            "riscv64", new ElfArch(2, 1, 243),
+            "loongarch64", new ElfArch(2, 1, 258));
+
+    private static String targetArch(TargetPlatform target) {
+        String arch = target.triple().split("-")[0].toLowerCase(Locale.ROOT);
+        if (arch.matches("i[3-6]86")) return "i686";
+        if (arch.equals("arm64")) return "aarch64";
+        if (arch.equals("amd64")) return "x86_64";
+        if (arch.startsWith("arm")) return "arm";
+        if (arch.equals("powerpc64le")) return "ppc64le";
+        if (arch.equals("powerpc64")) return "ppc64";
+        return arch;
+    }
+
+    private static boolean elfMatchesTarget(byte[] bytes, TargetPlatform target) {
+        if (bytes.length < 20 || bytes[0] != 0x7f || bytes[1] != 'E' || bytes[2] != 'L' || bytes[3] != 'F') {
+            return true;
+        }
+        int elfClass = bytes[4] & 0xff;
+        int elfData = bytes[5] & 0xff;
+        int osAbi = bytes[7] & 0xff;
+        int machine = elfData == 2
+                ? ((bytes[18] & 0xff) << 8) | (bytes[19] & 0xff)
+                : ((bytes[19] & 0xff) << 8) | (bytes[18] & 0xff);
+
+        ElfArch expected = ELF_ARCHES.get(targetArch(target));
+        if (expected != null
+                && (elfClass != expected.elfClass()
+                || elfData != expected.elfData()
+                || machine != expected.machine())) {
+            return false;
         }
 
-        for (Path jar : jars) {
-            try (JarFile jf = new JarFile(jar.toFile())) {
-                Enumeration<JarEntry> entries = jf.entries();
-                while (entries.hasMoreElements()) {
-                    JarEntry e = entries.nextElement();
-                    String n = e.getName();
-                    if (!n.endsWith(suffix)) continue;
-                    if (!n.contains("native/") && !n.contains("natives/")) continue;
-                    String base = n.substring(n.lastIndexOf('/') + 1);
-                    Path dest = extractDir.resolve(base);
-                    if (Files.exists(dest)) continue;
-                    try (InputStream is = jf.getInputStream(e)) {
-                        Files.copy(is, dest, StandardCopyOption.REPLACE_EXISTING);
-                        out.add(dest);
-                        log.info("Extracted native library {} from {}", base, jar);
+        String os = targetOs(target);
+        if (os == null) return true;
+        return switch (os) {
+            case "linux", "android" -> osAbi == 0 || osAbi == 3;
+            case "freebsd" -> osAbi == 0 || osAbi == 9;
+            case "netbsd" -> osAbi == 0 || osAbi == 2;
+            case "openbsd" -> osAbi == 0 || osAbi == 12;
+            case "sunos" -> osAbi == 0 || osAbi == 6;
+            case "aix" -> osAbi == 0 || osAbi == 7;
+            default -> true;
+        };
+    }
+
+    private static boolean matchesTargetArch(String entry, TargetPlatform target) {
+        String arch = target.triple().split("-")[0].toLowerCase(Locale.ROOT);
+        if (arch.matches("i[3-6]86")) arch = "i686";
+        if (arch.startsWith("arm") && !arch.equals("arm64")) arch = "arm";
+        if (arch.equals("arm64")) arch = "aarch64";
+        String[] tokens = entry.toLowerCase(Locale.ROOT).split("[/\\\\.-]");
+        String matched = null;
+        for (Map.Entry<String, List<String>> a : ARCH_ALIASES.entrySet()) {
+            for (String alias : a.getValue()) {
+                for (String t : tokens) {
+                    if (t.equals(alias) || t.endsWith("_" + alias)) {
+                        if (a.getKey().equals(arch)) return true;
+                        matched = a.getKey();
                     }
                 }
-            } catch (IOException e) {
-                log.debug("Skipping JAR {}: {}", jar, e.getMessage());
             }
         }
+        return matched == null;
     }
 
     // =====================================================================
     //  Native library bundling
     // =====================================================================
 
-    private void bundleNativeLibraries(Path exePath, List<Path> nativeLibs,
-                                       Set<Path> nativeLibDirs,
-                                       TargetPlatform target) throws IOException {
-
-        if (nativeLibs.isEmpty()) return;
-
-        Path exeDir = exePath.toAbsolutePath().getParent();
-        Set<Path> copied = new LinkedHashSet<>();
-
-        for (Path lib : nativeLibs) {
-            Path dest = exeDir.resolve(lib.getFileName().toString());
-            if (Files.exists(dest)) continue;
-            Files.copy(lib, dest, StandardCopyOption.REPLACE_EXISTING);
-            copied.add(dest);
+    private List<Path> resolveNativeLoadOrder(List<Path> roots, TargetPlatform target) {
+        Set<Path> dirs = new LinkedHashSet<>();
+        for (Path lib : roots) {
+            Path parent = lib.toAbsolutePath().getParent();
+            if (parent != null) dirs.add(parent);
         }
+        LinkedHashSet<Path> ordered = new LinkedHashSet<>();
+        Set<Path> visiting = new HashSet<>();
+        for (Path lib : roots) {
+            visitNativeLibrary(lib.toAbsolutePath(), dirs, target, ordered, visiting);
+        }
+        return new ArrayList<>(ordered);
+    }
 
-        Deque<Path> toVisit = new ArrayDeque<>(copied);
-        while (!toVisit.isEmpty()) {
-            Path lib = toVisit.poll();
-
-            Set<String> needed = target.isWindows()
+    private void visitNativeLibrary(Path lib, Set<Path> dirs, TargetPlatform target,
+                                    LinkedHashSet<Path> ordered, Set<Path> visiting) {
+        if (ordered.contains(lib) || !visiting.add(lib)) return;
+        Set<String> needed;
+        try {
+            needed = target.isWindows()
                     ? PeSymbolReader.readImportedLibraries(lib)
                     : ElfSymbolReader.readNeededLibraries(lib);
-
-            for (String soname : needed) {
-                if (soname.startsWith("/") || soname.contains("\\")) continue;
-
-                Path source = null;
-                for (Path dir : nativeLibDirs) {
-                    Path candidate = dir.resolve(soname);
-                    if (Files.isRegularFile(candidate)) {
-                        source = candidate;
-                        break;
-                    }
-                    if (target.isWindows()) {
-                        try (var stream = Files.list(dir)) {
-                            source = stream
-                                    .filter(p -> p.getFileName().toString()
-                                            .equalsIgnoreCase(soname))
-                                    .findFirst().orElse(null);
-                        }
-                        if (source != null) break;
-                    }
-                }
-                if (source == null) continue;
-
-                Path dest = exeDir.resolve(source.getFileName().toString());
-                if (Files.exists(dest)) continue;
-                Files.copy(source, dest, StandardCopyOption.REPLACE_EXISTING);
-                toVisit.add(dest);
+        } catch (IOException e) {
+            log.warn("Could not read dependencies of {}: {}", lib, e.getMessage());
+            needed = Set.of();
+        }
+        for (String soname : needed) {
+            if (soname.startsWith("/") || soname.contains("\\")) continue;
+            Path dep = findBundledDependency(soname, dirs, target);
+            if (dep != null) {
+                visitNativeLibrary(dep.toAbsolutePath(), dirs, target, ordered, visiting);
             }
         }
+        ordered.add(lib);
+    }
 
-        System.out.println("Bundled " + copied.size()
-                + " native library/libraries next to " + exePath);
+    private static Path findBundledDependency(String soname, Set<Path> dirs, TargetPlatform target) {
+        for (Path dir : dirs) {
+            Path candidate = dir.resolve(soname);
+            if (Files.isRegularFile(candidate)) return candidate;
+            if (target.isWindows()) {
+                try (var stream = Files.list(dir)) {
+                    Path match = stream
+                            .filter(p -> p.getFileName().toString().equalsIgnoreCase(soname))
+                            .findFirst().orElse(null);
+                    if (match != null) return match;
+                } catch (IOException ignored) {
+                }
+            }
+        }
+        return null;
     }
 
     // =====================================================================

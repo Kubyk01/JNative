@@ -5,18 +5,18 @@ import io.github.kubyk01.domain.analyzer.dependencyresolver.MethodReference;
 import lombok.Getter;
 import lombok.Setter;
 
-import java.util.HashSet;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 @Getter
 public class ReflectClassInfo {
     private final String className;
     @Setter
-    private String superName;
-    private final Set<String> interfaces = new HashSet<>();
-    private final Set<MethodReference> methods = new HashSet<>();
-    private final Set<FieldReference> fields = new HashSet<>();
-    private final Set<MethodReference> constructors = new HashSet<>();
+    private volatile String superName;
+    private final Set<String> interfaces = ConcurrentHashMap.newKeySet();
+    private final Set<MethodReference> methods = ConcurrentHashMap.newKeySet();
+    private final Set<FieldReference> fields = ConcurrentHashMap.newKeySet();
+    private final Set<MethodReference> constructors = ConcurrentHashMap.newKeySet();
 
     public ReflectClassInfo(String className) {
         this.className = className;

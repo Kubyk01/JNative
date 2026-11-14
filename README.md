@@ -17,14 +17,14 @@ No JVM. No GC pauses. No runtime interpreter overhead.
 ## How It Works
 
 1. **Dependency resolution** — Reads `.class` files, plain JARs, directory trees, and Spring Boot fat JARs. Nested JARs are indexed lazily.
-2. **Reachability analysis** — Starts at the entry point and walks reachable bytecode. Resolves reflection targets when names are compile-time constants, applies GraalVM-compatible `META-INF/native-image/` metadata, and closes over superclass `<clinit>` chains, descriptor types, and interface implementations.
+2. **Class analysis** — Loads every class of the input, its dependencies and the whole JDK module image, and puts all of them (every method, field and constructor) into the build, so `Class.forName` and reflection work for any class that is in the build. Pre-generates JDK proxy classes for annotation types, Spring Data repositories and `proxy-config.json` entries.
 3. **Bytecode to SSA IR** — Converts the JVM stack machine into basic blocks and static single-assignment (SSA) form. Handles `JSR`/`RET`, try/catch, monitor enter/exit, and polymorphic signatures explicitly.
 4. **Analysis pipeline** — Runs fixed-point interprocedural points-to/alias, escape, and lifetime analyses on a shared scheduler sized by `--cores`.
 5. **Initialization scheduling** — Topologically sorts `<clinit>` bodies and `System.initPhase1/2/3` according to field-writer-before-reader dependencies. Cyclic groups use lazy-triggered initialization; independent groups at the same level can initialize in parallel at startup.
 6. **Destructor insertion** — Inserts destructor calls at each allocation's last use. For heap-escaped sites, pairs cleanup with nulling the containing field so later overwrite instrumentation does not double-free.
 7. **Optimizations** — Performs scalar replacement of stack-escaping objects, dead-destructor elimination, and destructor inlining while preserving cycle safety through `__jnative_free`'s static-range check and shutdown guard.
-8. **LLVM IR generation** — Emits one `.ll` file per owner class and a shared `_module.ll` for globals, `main`, and the initializer driver. Files include only the type definitions, externs, and function declarations they reference.
-9. **Native compile and link** — Compiles each C runtime, per-class C, and LLVM IR translation unit to ThinLTO bitcode in parallel, then links with `clang -flto=thin -fuse-ld=lld` and `--thinlto-jobs=<cores>`.
+8. **LLVM IR generation** — Groups class bodies into LLVM translation units with a default body-size limit of 1 MiB; a larger class stays in its own unit. Shared globals, resources, `main`, and the initializer driver use separate units. Files include only the type definitions, externs, and function declarations they reference.
+9. **Native compile and link** — Compiles C and LLVM IR translation units in parallel, scheduling larger sources first. Optimized builds use ThinLTO bitcode and link with `clang -flto=thin -fuse-ld=lld` and parallel ThinLTO backends.
 
 ## Supported Languages
 
@@ -100,6 +100,8 @@ jnative analyze <file.jar|dir|.class> [options]
 
 Builds a native executable or, with `--no-compile`, generates LLVM IR only.
 
+Generated IR goes in `target/generated-jnative`. Running from `target` or one of its subdirectories reuses that directory instead of creating `target/target`; elsewhere within a Maven project, the nearest ancestor containing `pom.xml` supplies the project root. Temporary bodies stay in `target/generated-jnative/.jnative-spool` until generation finishes successfully. Set the JVM property `-Djnative.llvmUnitBytes=<bytes>` before `-jar` to change the class-body grouping limit, or use `0` for one unit per class.
+
 | Option | Description |
 | --- | --- |
 | `--entry` | Fully qualified entry class. For a JAR, defaults to the manifest's `Main-Class`. |
@@ -108,13 +110,12 @@ Builds a native executable or, with `--no-compile`, generates LLVM IR only.
 | `--output` | Output file. By default, the input filename with `.jar`/`.class` stripped, next to the input; appends `.exe` for Windows targets. For example, `Test.jar` becomes `Test` or `Test.exe`. |
 | `--no-compile` | Generate LLVM IR only; do not invoke the compiler or linker. |
 | `--include-system` | Include JDK classes and methods in analysis dumps. |
-| `--classes` | Show reachable user classes and methods. |
+| `--classes` | Show user classes and methods in the build. |
 | `--alias` | Show alias-analysis points-to sets. |
 | `--escape` | Show per-site escape status. |
 | `--lifetime` | Show destruction points. |
 | `--destructor` | Show destructor insertion. |
 | `--all` | Equivalent to `--classes --alias --escape --lifetime --destructor`. |
-| `--classes-graph` | Print the call graph reachable from the entry point. |
 | `--debug-name` | Restrict analysis output to items whose names contain this substring. |
 | `--cores` | Maximum CPU cores. `0` (default) uses `Runtime.availableProcessors()`. Controls parallel analysis, C compilation, and `--thinlto-jobs`. |
 | `-O` | Optimization level `0`–`3` (default: `2`), passed as `-O<level>` to IR-to-bitcode and ThinLTO linking. |
@@ -131,13 +132,13 @@ The following features are implemented, subject to application-specific constrai
 - **Exception handling:** `try`/`catch`/`finally` via `setjmp`/`longjmp` with typed catch dispatch. Exceptions carry diagnostic messages and are matched against `@__type_info_*` vtables, allowing a `catch (IOException)` to catch a runtime-created `FileNotFoundException`.
 - **Strings and dynamic calls:** compact-string literals (LATIN1 or UTF-16BE according to content), `invokedynamic` for `LambdaMetafactory` and `StringConcatFactory`, and string concatenation.
 - **Type operations:** `instanceof` and `checkcast`.
-- **Reflection:** within the compile-time reachable closure:
-    - `Class.forName` and `ClassLoader.loadClass` with constant class names.
+- **Reflection:** for every class in the build (input, dependencies, JDK):
+    - `Class.forName` and `ClassLoader.loadClass` with any class name.
     - `Class.getMethod`, `getDeclaredMethod`, `getConstructor`, `getDeclaredConstructor`, `getField`, `getDeclaredField`, and `newInstance`.
     - `Method.invoke` and `Constructor.newInstance`.
     - `MethodHandles.Lookup.findStatic`, `findVirtual`, `findSpecial`, `findConstructor`, `findGetter`, `findSetter`, `findStaticGetter`, `findStaticSetter`, `findVarHandle`, and `findStaticVarHandle`.
     - `jdk.internal.misc.Unsafe.objectFieldOffset` and `allocateInstance`.
-- **GraalVM-compatible metadata:** supports `reflect-config.json`, `proxy-config.json`, `jni-config.json`, and `resource-config.json` under `META-INF/native-image/`, including `condition.typeReachable` filtering.
+- **GraalVM-compatible metadata:** `proxy-config.json` under `META-INF/native-image/` declares extra JDK proxy interface sets; reflection, JNI and resource configs are not needed because everything is included.
 - **Spring Boot:** lazily indexes nested JARs under `BOOT-INF/lib/` and loads individual classes on demand.
 - **Concurrency:** `java.lang.Thread` runs on real pthreads, with support for `start`, `join`, `interrupt`, `park`/`unpark`, daemon and priority flags, thread names, context class loaders, and stack-trace-style thread enumeration.
 - **Array copying:** `System.arraycopy`, including typed fast paths for `byte[]`, `char[]`, and `int[]`.
@@ -146,12 +147,14 @@ The following features are implemented, subject to application-specific constrai
 - **File I/O:** regular file I/O through per-class C overrides for `FileInputStream`, `FileOutputStream`, `RandomAccessFile`, and `UnixFileSystem`.
 - **Networking:** `Inet4Address`, `Inet6Address`, `InetAddress`, and `NetworkInterface`, including interface enumeration and reverse lookups.
 - **Reflection mirrors:** `Class.getDeclaredMethods0`, `getDeclaredFields0`, and `getDeclaredConstructors0` construct real `Field`, `Method`, and `Constructor` mirrors with populated `parameterTypes`, `exceptionTypes`, and root fields, supporting `Executable.sharedToString` and `ReflectionData` without null-pointer failures.
-- **Resources and time zones:** embeds every non-`.class` resource in the `java.base` module and the build JDK's `lib/tzdb.dat`, served through `Class.getResourceAsStream` and `FileInputStream` for `/lib/tzdb.dat`.
+- **Resources and time zones:** embeds every non-`.class` resource in the target JDK's `java.base` module and its `lib/tzdb.dat`, served through `Class.getResourceAsStream` and `FileInputStream` for `/lib/tzdb.dat`.
 - **Shutdown cleanup:** cycle-safe destruction uses a freed-address set and per-thread claim stack to detect doubly reachable objects and destructor cycles during `atexit` cleanup.
 - **Destructor fast/slow paths:** outside shutdown, destructors use a direct load-check-free call; during shutdown, they use a cycle-safe slow path.
 - **Core system APIs:** `System.out`, `System.err`, `System.in`, `System.getProperties`, `System.setProperty`, `System.currentTimeMillis`, `System.nanoTime`, `System.identityHashCode`, and `System.exit`.
 
-The produced executable does not require a JDK, JVM, or `libz` at runtime. Target platform system libraries and runtime ABI requirements still apply.
+Distribute the executable alone. Application resources, classpath archives, discovered JNI libraries, and the target JDK's `release`, `conf/`, `lib/`, and available `legal/` trees are embedded as binary data. No `<executable>.classpath`, `<executable>.runtime`, or companion JNI libraries are generated or required. Spring Boot classes and dependency JARs retain their classpath order, including duplicate resource names in separate archives. The executable does not require an installed JDK, JVM, or `libz`.
+
+At startup, JDK filesystem APIs and the OS library loader use files materialized from the executable in a private temporary directory. `java.home`, `java.class.path`, and JNI loading point there; normal process exit attempts to remove the extracted files. The module reader accesses the embedded image directly. Cross-compilation reuses complete target JDKs in `~/.jnative/jdk/<version>-<os>-<arch>/` and replaces incomplete caches at the same location after downloading and validating their replacements. Target platform system libraries and runtime ABI requirements still apply.
 
 ## Memory Management Model
 

@@ -42,7 +42,6 @@ import org.objectweb.asm.ClassReader;
 import org.objectweb.asm.ClassVisitor;
 import org.objectweb.asm.MethodVisitor;
 import org.objectweb.asm.Opcodes;
-import reactor.core.publisher.Flux;
 import reactor.core.scheduler.Scheduler;
 import reactor.core.scheduler.Schedulers;
 
@@ -65,10 +64,16 @@ public class Analyzer {
     private final Set<String> deferredClinits = new LinkedHashSet<>();
 
     @Setter
+    private int parallelism = Runtime.getRuntime().availableProcessors();
+
+    @Setter
     private BytecodeToIr translator;
 
     @Setter
     private ReflectInfo reflectInfo;
+
+    @Setter
+    private Set<String> lazyOnlyClasses = Set.of();
 
     public AnalyzerResult analyze(Module module,
                                   DependencyResolver resolver,
@@ -107,14 +112,26 @@ public class Analyzer {
         }
 
         List<Function> clinitFunctions = new ArrayList<>();
+        List<Function> lazyClinits = new ArrayList<>();
         for (Function func : module.getFunctions()) {
-            if (func.getName().endsWith("__clinit____V")) clinitFunctions.add(func);
+            if (!func.getName().endsWith("__clinit____V")) continue;
+            if (lazyOnlyClasses.contains(func.getOwnerClass())) {
+                lazyClinits.add(func);
+                deferredClinits.add(func.getName());
+            } else {
+                clinitFunctions.add(func);
+            }
         }
 
         List<Function> phaseFunctions = collectPhaseFunctions(module, resolver);
 
+        // One call graph + fact scan shared by the sort and the lazy-<clinit> pass;
+        // the module does not change between them.
+        InitGraph initGraph = clinitFunctions.isEmpty() && lazyClinits.isEmpty() && phaseFunctions.isEmpty()
+            ? null : buildInitGraph(module, resolver);
+
         List<ClinitScheduleEntry> clinitSchedule = sortInitializers(
-            clinitFunctions, phaseFunctions, resolver, module,
+            clinitFunctions, phaseFunctions, resolver, module, initGraph,
             entryClass, entryMethod, entryDescriptor);
 
         List<Function> clinitsToInstrument = new ArrayList<>();
@@ -131,13 +148,15 @@ public class Analyzer {
                 clinitsToInstrument.add(f);
             }
         }
+        clinitsToInstrument.addAll(lazyClinits);
 
         Map<String, String> clinitWrappers = new HashMap<>();
-        applyLazyClinitForCyclicClasses(module, resolver,
+        applyLazyClinitForCyclicClasses(module, resolver, initGraph,
             clinitsToInstrument, clinitWrappers,
             deferredClinits);
+        initGraph = null;
 
-        AliasAnalysisResult aliasResult = new AliasAnalyzer(module, scheduler).analyze();
+        AliasAnalysisResult aliasResult = new AliasAnalyzer(module, scheduler, parallelism).analyze();
         if (showAlias) {
             System.out.println("\n--- Alias Analysis ---");
             System.out.println("Alias analysis complete.");
@@ -227,6 +246,7 @@ public class Analyzer {
 
     private void applyLazyClinitForCyclicClasses(Module module,
                                                  DependencyResolver resolver,
+                                                 InitGraph g,
                                                  List<Function> clinitFunctions,
                                                  Map<String, String> clinitWrappers,
                                                  Set<String> forcedDeferredClinits) {
@@ -257,138 +277,82 @@ public class Analyzer {
             }
         }
 
-        Map<String, Set<String>> callGraph = new ConcurrentHashMap<>();
-        List<Function> functionsSnapshot = new ArrayList<>(module.getFunctions());
-        LlvmUtil.awaitMono(Flux.fromIterable(functionsSnapshot)
-            .filter(f -> f.getEntryBlock() != null)
-            .parallel()
-            .runOn(scheduler)
-            .doOnNext(func -> {
-                Set<String> callees = new HashSet<>();
-                for (BasicBlock block : func.getBlocks()) {
-                    for (Instruction inst : block.getInstructions()) {
-                        collectDirectCallees(inst, callees, module, resolver);
-                    }
-                }
-                callGraph.put(func.getName(), callees);
-            })
-            .sequential()
-            .then());
+        List<String> nodes = new ArrayList<>(allWithClinit);
+        Collections.sort(nodes);
+        Map<String, Integer> nodeId = new HashMap<>(nodes.size() * 2);
+        for (int i = 0; i < nodes.size(); i++) nodeId.put(nodes.get(i), i);
+        int[] graphClassToNode = new int[g.classes().size()];
+        for (int i = 0; i < graphClassToNode.length; i++) {
+            graphClassToNode[i] = nodeId.getOrDefault(g.classes().get(i), -1);
+        }
+        IntArrayList[] edges = new IntArrayList[nodes.size()];
+        for (int i = 0; i < edges.length; i++) edges[i] = new IntArrayList();
+        IntArrayList[] fieldWriters = new IntArrayList[g.fields().size()];
+        IntArrayList[] fieldReaders = new IntArrayList[g.fields().size()];
 
-        Map<String, Set<String>> nestedClinits  = new ConcurrentHashMap<>();
-        Map<String, Set<String>> classDepDeltas = new ConcurrentHashMap<>();
-        Map<String, Set<String>> fieldWriters   = new ConcurrentHashMap<>();
-        Map<String, Set<String>> fieldReaders   = new ConcurrentHashMap<>();
-
-        Map<String, Set<String>> triggerCache    = new ConcurrentHashMap<>();
-        Map<String, Set<String>> fieldWriteCache = new ConcurrentHashMap<>();
-        Map<String, Set<String>> fieldReadCache  = new ConcurrentHashMap<>();
-
-        LlvmUtil.awaitMono(Flux.fromIterable(clinitFunctions)
-            .parallel()
-            .runOn(scheduler)
-            .doOnNext(clinit -> {
-                String className = clinitNameToClassName.get(clinit.getName());
-                if (className == null) return;
-
-                Set<String> visited = new HashSet<>();
-                Set<String> nested  = new LinkedHashSet<>();
-                Set<String> delta   = new HashSet<>();
-                Deque<String> worklist = new ArrayDeque<>();
-
-                visited.add(clinit.getName());
-                worklist.push(clinit.getName());
-
-                while (!worklist.isEmpty()) {
-                    String cur = worklist.pop();
-                    Function f = module.getFunction(cur);
-                    if (f != null && f.getEntryBlock() != null) {
-                        Set<String> trig = triggerCache.computeIfAbsent(cur,
-                            k -> scanTriggers(module.getFunction(k)));
-                        for (String t : trig) if (!t.equals(className)) delta.add(t);
-
-                        for (String fld : fieldWriteCache.computeIfAbsent(cur,
-                            k -> scanFieldWrites(module.getFunction(k)))) {
-                            fieldWriters.computeIfAbsent(fld, k -> ConcurrentHashMap.newKeySet())
-                                .add(className);
-                        }
-                        for (String fld : fieldReadCache.computeIfAbsent(cur,
-                            k -> scanFieldReads(module.getFunction(k)))) {
-                            fieldReaders.computeIfAbsent(fld, k -> ConcurrentHashMap.newKeySet())
-                                .add(className);
-                        }
-                    }
-
-                    Set<String> callees = callGraph.get(cur);
-                    if (callees == null) continue;
-                    for (String callee : callees) {
-                        if (clinitNames.contains(callee)) { nested.add(callee); continue; }
-                        if (visited.add(callee)) worklist.push(callee);
-                    }
-                }
-
-                ClassNode cn = resolver.getClassNode(className);
-                Set<String> supVisited = new HashSet<>();
-                while (cn != null && cn.getSuperName() != null
-                    && !cn.getSuperName().equals(cn.getName())
-                    && supVisited.add(cn.getSuperName())) {
-                    String sup = cn.getSuperName();
-                    if ("java/lang/Object".equals(sup)) break;
-                    delta.add(sup);
-                    cn = resolver.getClassNode(sup);
-                }
-                for (String nc : nested) {
-                    String ncls = clinitNameToClassName.get(nc);
-                    if (ncls != null && !ncls.equals(className)) delta.add(ncls);
-                }
-
-                nestedClinits.put(clinit.getName(), nested);
-                if (!delta.isEmpty()) {
-                    classDepDeltas.compute(className, (k, e) -> {
-                        if (e == null) return delta;
-                        e.addAll(delta);
-                        return e;
-                    });
-                }
-            })
-            .sequential()
-            .then());
-
-        Map<String, Set<String>> classDeps = new LinkedHashMap<>();
-        for (String cls : allWithClinit) classDeps.put(cls, new LinkedHashSet<>());
-
-        for (Map.Entry<String, Set<String>> entry : classDepDeltas.entrySet()) {
-            Set<String> deps = classDeps.get(entry.getKey());
-            if (deps == null) continue;
-            List<String> sorted = new ArrayList<>(entry.getValue());
-            Collections.sort(sorted);
-            deps.addAll(sorted);
+        boolean[] cut = new boolean[g.live().size()];
+        List<Integer> roots = new ArrayList<>();
+        for (String name : clinitNames) {
+            Integer idx = g.index().get(name);
+            if (idx == null) continue;
+            cut[idx] = true;
+            if (clinitNameToClassName.containsKey(name)) roots.add(idx);
+        }
+        InitFacts[] facts = closeOverInitializers(g, cut, roots);
+        for (int idx : roots) {
+            String className = clinitNameToClassName.get(g.live().get(idx).getName());
+            int self = nodeId.get(className);
+            InitFacts f = facts[idx];
+            IntArrayList out = edges[self];
+            forEachBit(f.trig(), c -> {
+                int dep = graphClassToNode[c];
+                if (dep >= 0 && dep != self) out.add(dep);
+            });
+            ClassNode cn = resolver.getClassNode(className);
+            Set<String> supVisited = new HashSet<>();
+            while (cn != null && cn.getSuperName() != null
+                && !cn.getSuperName().equals(cn.getName())
+                && !"java/lang/Object".equals(cn.getSuperName())
+                && supVisited.add(cn.getSuperName())) {
+                Integer sup = nodeId.get(cn.getSuperName());
+                if (sup != null) out.add(sup);
+                cn = resolver.getClassNode(cn.getSuperName());
+            }
+            for (int n : f.nested()) {
+                Integer nested = nodeId.get(clinitNameToClassName.get(g.live().get(n).getName()));
+                if (nested != null && nested != self) out.add(nested);
+            }
+            forEachBit(f.writes(), fld -> {
+                if (fieldWriters[fld] == null) fieldWriters[fld] = new IntArrayList();
+                fieldWriters[fld].add(self);
+            });
+            forEachBit(f.reads(), fld -> {
+                if (fieldReaders[fld] == null) fieldReaders[fld] = new IntArrayList();
+                fieldReaders[fld].add(self);
+            });
         }
 
-        for (Map.Entry<String, Set<String>> entry : fieldReaders.entrySet()) {
-            Set<String> writers = fieldWriters.get(entry.getKey());
-            if (writers == null || writers.isEmpty()) continue;
-            for (String reader : entry.getValue()) {
-                if (writers.contains(reader)) continue;
-                Set<String> readerDeps = classDeps.get(reader);
-                if (readerDeps == null) continue;
-                for (String writer : writers) {
-                    if (!reader.equals(writer)) readerDeps.add(writer);
-                }
+        for (int fld = 0; fld < fieldReaders.length; fld++) {
+            if (fieldReaders[fld] == null || fieldWriters[fld] == null) continue;
+            fieldWriters[fld].sortUnique();
+            int[] writers = fieldWriters[fld].toArray();
+            fieldReaders[fld].sortUnique();
+            for (int r = 0; r < fieldReaders[fld].size(); r++) {
+                int reader = fieldReaders[fld].get(r);
+                if (Arrays.binarySearch(writers, reader) >= 0) continue;
+                for (int writer : writers) edges[reader].add(writer);
             }
         }
 
-        List<Set<String>> sccs = LazyClinitInstrumenter.stronglyConnectedComponents(classDeps);
+        int[][] adjacency = new int[nodes.size()][];
+        for (int i = 0; i < adjacency.length; i++) {
+            edges[i].sortUnique();
+            adjacency[i] = edges[i].toArray();
+            edges[i] = null;
+        }
+
         Set<String> cyclicClasses = new LinkedHashSet<>();
-        for (Set<String> scc : sccs) {
-            if (scc.size() > 1) {
-                cyclicClasses.addAll(scc);
-            } else {
-                String c = scc.iterator().next();
-                Set<String> deps = classDeps.get(c);
-                if (deps != null && deps.contains(c)) cyclicClasses.add(c);
-            }
-        }
+        for (int i : cyclicNodes(adjacency)) cyclicClasses.add(nodes.get(i));
         cyclicClasses.addAll(forcedClasses);
         if (cyclicClasses.isEmpty()) return;
 
@@ -412,48 +376,338 @@ public class Analyzer {
         }
     }
 
-    private static Set<String> scanTriggers(Function f) {
-        if (f == null || f.getEntryBlock() == null) return Set.of();
-        Set<String> out = new HashSet<>();
-        for (BasicBlock b : f.getBlocks()) {
-            for (Instruction i : b.getInstructions()) {
-                Opcode op = i.getOpcode();
-                if (op == Opcode.NEW || op == Opcode.GET_STATIC
-                    || op == Opcode.PUT_STATIC || op == Opcode.STATIC_CALL) {
-                    String owner = extractTriggerOwner(i);
-                    if (owner != null && !owner.isEmpty()) out.add(owner);
+    // ------------------------------------------------------------------
+    //  Initializer reachability: one shared call graph, SCC-condensed closure
+    // ------------------------------------------------------------------
+
+    /**
+     * Direct-call graph and per-function static-init facts over functions with
+     * a body, indexed by position in {@code live}. Fact ids index
+     * {@code classes} (trigger owners) and {@code fields} (static field keys).
+     */
+    private record InitGraph(List<Function> live, Map<String, Integer> index, int[][] callees,
+                             List<String> classes, List<String> fields,
+                             Map<String, Integer> fieldIds,
+                             int[][] trig, int[][] reads, int[][] writes) {
+        int classWords() { return (classes.size() + 63) >>> 6; }
+        int fieldWords() { return (fields.size() + 63) >>> 6; }
+    }
+
+    /**
+     * What one initializer reaches through direct calls without entering
+     * another initializer. Bit arrays may be shared between initializers and
+     * must not be mutated; {@code nested} holds function indices.
+     */
+    private record InitFacts(long[] trig, long[] reads, long[] writes, int[] nested) {}
+
+    private static final int[] NO_TARGETS = new int[0];
+
+    private InitGraph buildInitGraph(Module module, DependencyResolver resolver) {
+        List<Function> live = new ArrayList<>();
+        for (Function f : module.getFunctions()) {
+            if (f.getEntryBlock() != null) live.add(f);
+        }
+        int n = live.size();
+        Map<String, Integer> index = new HashMap<>(n * 2);
+        for (int i = 0; i < n; i++) index.put(live.get(i).getName(), i);
+
+        int[][] callees = new int[n][];
+        String[][] trigNames  = new String[n][];
+        String[][] readNames  = new String[n][];
+        String[][] writeNames = new String[n][];
+        Set<String> classUniverse = ConcurrentHashMap.newKeySet();
+        Set<String> fieldUniverse = ConcurrentHashMap.newKeySet();
+        Map<String, int[]> directCache  = new ConcurrentHashMap<>();
+        Map<String, int[]> virtualCache = new ConcurrentHashMap<>();
+
+        forEachIndexParallel(n, i -> {
+            IntArrayList calls = new IntArrayList();
+            Set<String> tr = new HashSet<>();
+            Set<String> rd = new HashSet<>();
+            Set<String> wr = new HashSet<>();
+            for (BasicBlock block : live.get(i).getBlocks()) {
+                for (Instruction inst : block.getInstructions()) {
+                    collectDirectCallees(inst, calls, module, resolver, index, directCache, virtualCache);
+                    Opcode op = inst.getOpcode();
+                    if (op == Opcode.NEW || op == Opcode.GET_STATIC
+                        || op == Opcode.PUT_STATIC || op == Opcode.STATIC_CALL) {
+                        String owner = extractTriggerOwner(inst);
+                        if (owner != null && !owner.isEmpty()) tr.add(owner);
+                    }
+                    if (op == Opcode.GET_STATIC || op == Opcode.PUT_STATIC) {
+                        String key = extractStaticFieldKey(inst);
+                        if (key != null) (op == Opcode.PUT_STATIC ? wr : rd).add(key);
+                    }
                 }
             }
+            calls.sortUnique();
+            callees[i] = calls.isEmpty() ? NO_TARGETS : calls.toArray();
+            trigNames[i]  = tr.toArray(new String[0]);
+            readNames[i]  = rd.toArray(new String[0]);
+            writeNames[i] = wr.toArray(new String[0]);
+            classUniverse.addAll(tr);
+            fieldUniverse.addAll(rd);
+            fieldUniverse.addAll(wr);
+        });
+
+        List<String> classes = new ArrayList<>(classUniverse);
+        List<String> fields  = new ArrayList<>(fieldUniverse);
+        Collections.sort(classes);
+        Collections.sort(fields);
+        Map<String, Integer> classIds = new HashMap<>(classes.size() * 2);
+        for (int i = 0; i < classes.size(); i++) classIds.put(classes.get(i), i);
+        Map<String, Integer> fieldIds = new HashMap<>(fields.size() * 2);
+        for (int i = 0; i < fields.size(); i++) fieldIds.put(fields.get(i), i);
+
+        int[][] trig = new int[n][], reads = new int[n][], writes = new int[n][];
+        forEachIndexParallel(n, i -> {
+            trig[i]   = toIds(trigNames[i], classIds);
+            reads[i]  = toIds(readNames[i], fieldIds);
+            writes[i] = toIds(writeNames[i], fieldIds);
+            trigNames[i] = readNames[i] = writeNames[i] = null;
+        });
+
+        System.out.println("Pre-computing init facts: " + classes.size()
+            + " trigger class(es), " + fields.size() + " static field key(s)");
+        return new InitGraph(live, index, callees, classes, fields, fieldIds, trig, reads, writes);
+    }
+
+    private static int[] toIds(String[] names, Map<String, Integer> ids) {
+        if (names.length == 0) return NO_TARGETS;
+        int[] out = new int[names.length];
+        for (int i = 0; i < names.length; i++) out[i] = ids.get(names[i]);
+        return out;
+    }
+
+    private static void forEachBit(long[] bits, java.util.function.IntConsumer action) {
+        for (int w = 0; w < bits.length; w++) {
+            for (long word = bits[w]; word != 0; word &= word - 1) {
+                action.accept((w << 6) + Long.numberOfTrailingZeros(word));
+            }
+        }
+    }
+
+    private static List<Integer> cyclicNodes(int[][] adjacency) {
+        int n = adjacency.length;
+        int[] index = new int[n];
+        int[] low = new int[n];
+        int[] edgePos = new int[n];
+        boolean[] onStack = new boolean[n];
+        Arrays.fill(index, -1);
+        int[] callStack = new int[n];
+        int[] sccStack = new int[n];
+        int sccTop = 0;
+        int counter = 0;
+        List<Integer> cyclic = new ArrayList<>();
+        for (int start = 0; start < n; start++) {
+            if (index[start] >= 0) continue;
+            int callTop = 0;
+            callStack[callTop++] = start;
+            index[start] = low[start] = counter++;
+            sccStack[sccTop++] = start;
+            onStack[start] = true;
+            while (callTop > 0) {
+                int u = callStack[callTop - 1];
+                if (edgePos[u] < adjacency[u].length) {
+                    int v = adjacency[u][edgePos[u]++];
+                    if (index[v] < 0) {
+                        index[v] = low[v] = counter++;
+                        sccStack[sccTop++] = v;
+                        onStack[v] = true;
+                        callStack[callTop++] = v;
+                    } else if (onStack[v]) {
+                        low[u] = Math.min(low[u], index[v]);
+                    }
+                    continue;
+                }
+                callTop--;
+                if (callTop > 0) {
+                    int parent = callStack[callTop - 1];
+                    low[parent] = Math.min(low[parent], low[u]);
+                }
+                if (low[u] != index[u]) continue;
+                int first = sccTop;
+                int v;
+                do {
+                    v = sccStack[--sccTop];
+                    onStack[v] = false;
+                } while (v != u);
+                boolean selfLoop = Arrays.binarySearch(adjacency[u], u) >= 0;
+                if (first - sccTop > 1 || selfLoop) {
+                    for (int i = sccTop; i < first; i++) cyclic.add(sccStack[i]);
+                }
+            }
+        }
+        Collections.sort(cyclic);
+        return cyclic;
+    }
+
+    /**
+     * For every root, the union of facts over all functions reachable by
+     * direct calls without entering a {@code cut} function (calls into a cut
+     * function are recorded as nested instead). Same result as one DFS per
+     * root, but each strongly connected component of the call graph is
+     * summarized once, bottom-up, so the cost is O(edges x words) instead of
+     * O(roots x reachable). Summaries are copy-on-write shared and freed once
+     * their last caller component has consumed them.
+     */
+    private static InitFacts[] closeOverInitializers(InitGraph g, boolean[] cut, List<Integer> roots) {
+        int n = g.live().size();
+        int[][] callees = g.callees();
+        int[] cutId = new int[n];
+        IntArrayList cutNodes = new IntArrayList();
+        for (int i = 0; i < n; i++) {
+            if (cut[i]) { cutId[i] = cutNodes.size(); cutNodes.add(i); }
+        }
+        int classWords = g.classWords(), fieldWords = g.fieldWords();
+        int cutWords = (cutNodes.size() + 63) >>> 6;
+
+        // Iterative Tarjan over non-cut edges, started only from roots. A cut
+        // node has no incoming non-cut edge, so each root is its own component.
+        int[] idx = new int[n];
+        Arrays.fill(idx, -1);
+        int[] low = new int[n];
+        int[] comp = new int[n];
+        Arrays.fill(comp, -1);
+        int[] tstack = new int[n];
+        int[] cstack = new int[n];
+        int[] epos = new int[n];
+        IntArrayList members = new IntArrayList();   // nodes, grouped by component, sinks first
+        IntArrayList compStart = new IntArrayList();
+        int counter = 0, comps = 0, tsp = 0;
+        for (int root : roots) {
+            if (idx[root] >= 0) continue;
+            int csp = 0;
+            idx[root] = low[root] = counter++;
+            tstack[tsp++] = root;
+            cstack[csp] = root; epos[csp++] = 0;
+            while (csp > 0) {
+                int u = cstack[csp - 1];
+                int[] su = callees[u];
+                if (epos[csp - 1] < su.length) {
+                    int v = su[epos[csp - 1]++];
+                    if (cut[v]) continue;
+                    if (idx[v] < 0) {
+                        idx[v] = low[v] = counter++;
+                        tstack[tsp++] = v;
+                        cstack[csp] = v; epos[csp++] = 0;
+                    } else if (comp[v] < 0) {
+                        low[u] = Math.min(low[u], idx[v]);
+                    }
+                    continue;
+                }
+                csp--;
+                if (csp > 0) {
+                    int p = cstack[csp - 1];
+                    low[p] = Math.min(low[p], low[u]);
+                }
+                if (low[u] == idx[u]) {
+                    compStart.add(members.size());
+                    int w;
+                    do {
+                        w = tstack[--tsp];
+                        comp[w] = comps;
+                        members.add(w);
+                    } while (w != u);
+                    comps++;
+                }
+            }
+        }
+        compStart.add(members.size());
+
+        int[] refs = new int[comps];
+        for (int k = 0; k < members.size(); k++) {
+            int u = members.get(k);
+            for (int v : callees[u]) {
+                if (!cut[v] && comp[v] != comp[u]) refs[comp[v]]++;
+            }
+        }
+
+        long[][][] summary = new long[comps][][];
+        for (int c = 0; c < comps; c++) {
+            SharedBits trig = new SharedBits(classWords);
+            SharedBits rd   = new SharedBits(fieldWords);
+            SharedBits wr   = new SharedBits(fieldWords);
+            SharedBits nest = new SharedBits(cutWords);
+            int from = compStart.get(c), to = compStart.get(c + 1);
+            for (int k = from; k < to; k++) {
+                int u = members.get(k);
+                for (int id : g.trig()[u])   trig.set(id);
+                for (int id : g.reads()[u])  rd.set(id);
+                for (int id : g.writes()[u]) wr.set(id);
+                for (int v : callees[u]) {
+                    if (cut[v]) { nest.set(cutId[v]); continue; }
+                    if (comp[v] == c) continue;
+                    long[][] s = summary[comp[v]];
+                    trig.or(s[0]); rd.or(s[1]); wr.or(s[2]); nest.or(s[3]);
+                }
+            }
+            summary[c] = new long[][] { trig.bits, rd.bits, wr.bits, nest.bits };
+            for (int k = from; k < to; k++) {
+                for (int v : callees[members.get(k)]) {
+                    if (!cut[v] && comp[v] != c && --refs[comp[v]] == 0) summary[comp[v]] = null;
+                }
+            }
+        }
+
+        InitFacts[] out = new InitFacts[n];
+        for (int root : roots) {
+            long[][] s = summary[comp[root]];
+            IntArrayList nested = new IntArrayList();
+            if (s[3] != null) {
+                for (int w = 0; w < s[3].length; w++) {
+                    for (long word = s[3][w]; word != 0; word &= word - 1) {
+                        nested.add(cutNodes.get((w << 6) + Long.numberOfTrailingZeros(word)));
+                    }
+                }
+            }
+            out[root] = new InitFacts(
+                s[0] != null ? s[0] : new long[classWords],
+                s[1] != null ? s[1] : new long[fieldWords],
+                s[2] != null ? s[2] : new long[fieldWords],
+                nested.toArray());
         }
         return out;
     }
 
-    private static Set<String> scanFieldWrites(Function f) {
-        if (f == null || f.getEntryBlock() == null) return Set.of();
-        Set<String> out = new HashSet<>();
-        for (BasicBlock b : f.getBlocks()) {
-            for (Instruction i : b.getInstructions()) {
-                if (i.getOpcode() == Opcode.PUT_STATIC) {
-                    String k = extractStaticFieldKey(i);
-                    if (k != null) out.add(k);
-                }
-            }
-        }
-        return out;
-    }
+    /** Copy-on-write bitset accumulator: adopts an incoming array by reference until it must diverge. */
+    private static final class SharedBits {
+        private final int words;
+        long[] bits;
+        private boolean owned;
 
-    private static Set<String> scanFieldReads(Function f) {
-        if (f == null || f.getEntryBlock() == null) return Set.of();
-        Set<String> out = new HashSet<>();
-        for (BasicBlock b : f.getBlocks()) {
-            for (Instruction i : b.getInstructions()) {
-                if (i.getOpcode() == Opcode.GET_STATIC) {
-                    String k = extractStaticFieldKey(i);
-                    if (k != null) out.add(k);
-                }
-            }
+        SharedBits(int words) { this.words = words; }
+
+        void set(int id) {
+            long mask = 1L << (id & 63);
+            if (bits != null && (bits[id >>> 6] & mask) != 0) return;
+            own();
+            bits[id >>> 6] |= mask;
         }
-        return out;
+
+        void or(long[] add) {
+            if (add == null || add == bits) return;
+            if (bits == null) { bits = add; return; }
+            if (!owned) {
+                if (subset(add, bits)) return;
+                if (subset(bits, add)) { bits = add; return; }
+            }
+            own();
+            for (int i = 0; i < words; i++) bits[i] |= add[i];
+        }
+
+        private void own() {
+            if (owned) return;
+            bits = bits == null ? new long[words] : bits.clone();
+            owned = true;
+        }
+
+        private static boolean subset(long[] a, long[] b) {
+            for (int i = 0; i < a.length; i++) {
+                if ((a[i] & ~b[i]) != 0) return false;
+            }
+            return true;
+        }
     }
 
     private static String sanitizeForWrapper(String s) {
@@ -493,7 +747,7 @@ public class Analyzer {
                     cn = resolver.getClassNode(owner);
                     if (cn == null) continue;
                 }
-                if (cn.isExternal() || cn.isInterface()) continue;
+                if (cn.isExternal()) continue;
 
                 boolean declaresClinit = false;
                 for (MethodNode mn : cn.getMethods()) {
@@ -531,12 +785,12 @@ public class Analyzer {
             Set<String> referenced = collectTriggeredOwners(module, resolver);
             for (String owner : referenced) {
                 ClassNode cn = resolver.getClassNode(owner);
-                if (cn == null || cn.isExternal() || cn.isInterface()) continue;
+                if (cn == null || cn.isExternal()) continue;
 
                 if (resolver.getClassBytes(owner) == null) {
                     resolver.reloadSystemClass(owner);
                     cn = resolver.getClassNode(owner);
-                    if (cn == null || cn.isExternal() || cn.isInterface()) continue;
+                    if (cn == null || cn.isExternal()) continue;
                 }
                 boolean declaresClinit = false;
                 for (MethodNode mn : cn.getMethods()) {
@@ -749,6 +1003,7 @@ public class Analyzer {
         List<Function> phaseFunctions,
         DependencyResolver resolver,
         Module module,
+        InitGraph g,
         String entryClass,
         String entryMethod,
         String entryDescriptor) {
@@ -776,98 +1031,12 @@ public class Analyzer {
             clinitNameToClassName.put(clinitName, cn.getName());
         }
 
-        Map<String, Set<String>> callGraph = new ConcurrentHashMap<>();
-        List<Function> functionsSnapshot = new ArrayList<>(module.getFunctions());
-        forEachParallel(functionsSnapshot, func -> {
-            if (func.getEntryBlock() == null) return;
-            Set<String> callees = new HashSet<>();
-            for (BasicBlock block : func.getBlocks()) {
-                for (Instruction inst : block.getInstructions()) {
-                    collectDirectCallees(inst, callees, module, resolver);
-                }
-            }
-            callGraph.put(func.getName(), callees);
-        });
-
-        List<Function> liveFunctions = new ArrayList<>(functionsSnapshot.size());
-        for (Function f : functionsSnapshot) {
-            if (f.getEntryBlock() != null) liveFunctions.add(f);
-        }
-
-        Map<String, Integer> funcIndex = new HashMap<>(liveFunctions.size() * 2);
-        for (int i = 0; i < liveFunctions.size(); i++) {
-            funcIndex.put(liveFunctions.get(i).getName(), i);
-        }
-
-        TreeSet<String> triggerClassUniverse = new TreeSet<>();
-        TreeSet<String> fieldKeyUniverse     = new TreeSet<>();
-        for (Function f : liveFunctions) {
-            for (BasicBlock b : f.getBlocks()) {
-                for (Instruction inst : b.getInstructions()) {
-                    Opcode op = inst.getOpcode();
-                    if (op == Opcode.NEW || op == Opcode.GET_STATIC
-                        || op == Opcode.PUT_STATIC || op == Opcode.STATIC_CALL) {
-                        String owner = extractTriggerOwner(inst);
-                        if (owner != null && !owner.isEmpty()) triggerClassUniverse.add(owner);
-                    }
-                    if (op == Opcode.GET_STATIC || op == Opcode.PUT_STATIC) {
-                        String key = extractStaticFieldKey(inst);
-                        if (key != null) fieldKeyUniverse.add(key);
-                    }
-                }
-            }
-        }
-
-        final List<String> classList = new ArrayList<>(triggerClassUniverse);
-        final List<String> fieldList = new ArrayList<>(fieldKeyUniverse);
-
-        final Map<String, Integer> classIdMap = new HashMap<>(classList.size() * 2);
-        for (int i = 0; i < classList.size(); i++) classIdMap.put(classList.get(i), i);
-        final Map<String, Integer> fieldIdMap = new HashMap<>(fieldList.size() * 2);
-        for (int i = 0; i < fieldList.size(); i++) fieldIdMap.put(fieldList.get(i), i);
-
-        final int classWords = (classList.size() + 63) >>> 6;
-        final int fieldWords = (fieldList.size() + 63) >>> 6;
-
-        System.out.println("Pre-computing init facts: " + classList.size()
-            + " trigger class(es), " + fieldList.size() + " static field key(s)");
-
-        final int[][] funcTriggerIds = new int[liveFunctions.size()][];
-        final int[][] funcReadIds    = new int[liveFunctions.size()][];
-        final int[][] funcWriteIds   = new int[liveFunctions.size()][];
-
-        forEachParallel(liveFunctions, func -> {
-            int idx = funcIndex.get(func.getName());
-            ArrayList<Integer> trig = new ArrayList<>();
-            ArrayList<Integer> rd   = new ArrayList<>();
-            ArrayList<Integer> wr   = new ArrayList<>();
-            for (BasicBlock block : func.getBlocks()) {
-                for (Instruction inst : block.getInstructions()) {
-                    Opcode op = inst.getOpcode();
-                    if (op == Opcode.NEW || op == Opcode.GET_STATIC
-                        || op == Opcode.PUT_STATIC || op == Opcode.STATIC_CALL) {
-                        String owner = extractTriggerOwner(inst);
-                        if (owner != null && !owner.isEmpty()) {
-                            Integer id = classIdMap.get(owner);
-                            if (id != null) trig.add(id);
-                        }
-                    }
-                    if (op == Opcode.GET_STATIC || op == Opcode.PUT_STATIC) {
-                        String key = extractStaticFieldKey(inst);
-                        if (key != null) {
-                            Integer id = fieldIdMap.get(key);
-                            if (id != null) {
-                                if (op == Opcode.PUT_STATIC) wr.add(id);
-                                else                         rd.add(id);
-                            }
-                        }
-                    }
-                }
-            }
-            funcTriggerIds[idx] = toIntArray(trig);
-            funcReadIds[idx]    = toIntArray(rd);
-            funcWriteIds[idx]   = toIntArray(wr);
-        });
+        final List<Function> liveFunctions = g.live();
+        final Map<String, Integer> funcIndex = g.index();
+        final List<String> classList = g.classes();
+        final List<String> fieldList = g.fields();
+        final Map<String, Integer> fieldIdMap = g.fieldIds();
+        final int fieldWords = g.fieldWords();
 
         Set<String> allInitializerNames = new HashSet<>(clinitNames);
         for (Function f : phaseFunctions) allInitializerNames.add(f.getName());
@@ -876,53 +1045,29 @@ public class Analyzer {
         allInit.addAll(clinitFunctions);
         allInit.addAll(phaseFunctions);
 
+        boolean[] cut = new boolean[liveFunctions.size()];
+        for (String name : allInitializerNames) {
+            Integer idx = funcIndex.get(name);
+            if (idx != null) cut[idx] = true;
+        }
+        List<Integer> roots = new ArrayList<>(allInit.size());
+        for (Function init : allInit) {
+            Integer idx = funcIndex.get(init.getName());
+            if (idx != null) roots.add(idx);
+        }
+        InitFacts[] initFacts = closeOverInitializers(g, cut, roots);
+
         final long[][] initTriggerBits = new long[liveFunctions.size()][];
         final long[][] initReadBits    = new long[liveFunctions.size()][];
         final long[][] initWriteBits   = new long[liveFunctions.size()][];
         final int[][]  nestedInit      = new int[liveFunctions.size()][];
-        final Set<String> allInitializerNamesF = allInitializerNames;
-        final Map<String, Set<String>> callGraphF = callGraph;
-
-        forEachParallel(allInit, init -> {
-            String initName = init.getName();
-            Integer initIdxObj = funcIndex.get(initName);
-            if (initIdxObj == null) return;
-            int initIdx = initIdxObj;
-            long[] trig = new long[classWords];
-            long[] rd   = new long[fieldWords];
-            long[] wr   = new long[fieldWords];
-            IntArrayList nested = new IntArrayList();
-            Set<String> visited  = new HashSet<>();
-            Deque<String> worklist = new ArrayDeque<>();
-
-            visited.add(initName);
-            worklist.push(initName);
-            orInFunctionFacts(initName, funcIndex,
-                funcTriggerIds, funcReadIds, funcWriteIds, trig, rd, wr);
-
-            while (!worklist.isEmpty()) {
-                String cur = worklist.pop();
-                Set<String> callees = callGraphF.get(cur);
-                if (callees == null) continue;
-                for (String callee : callees) {
-                    if (allInitializerNamesF.contains(callee)) {
-                        Integer nIdx = funcIndex.get(callee);
-                        if (nIdx != null) nested.add(nIdx);
-                        continue;
-                    }
-                    if (visited.add(callee)) {
-                        worklist.push(callee);
-                        orInFunctionFacts(callee, funcIndex,
-                            funcTriggerIds, funcReadIds, funcWriteIds, trig, rd, wr);
-                    }
-                }
-            }
-
-            initTriggerBits[initIdx] = trig;
-            initReadBits[initIdx] = rd;
-            initWriteBits[initIdx] = wr;
-            nestedInit[initIdx] = nested.toArray();
-        });
+        for (int idx : roots) {
+            initTriggerBits[idx] = initFacts[idx].trig();
+            initReadBits[idx]    = initFacts[idx].reads();
+            initWriteBits[idx]   = initFacts[idx].writes();
+            nestedInit[idx]      = initFacts[idx].nested();
+        }
+        initFacts = null;
 
         // Every initializer's trigger facts become direct dependency
         // edges, indexed by function position instead of by Function or
@@ -1039,19 +1184,27 @@ public class Analyzer {
             baseEdges += d.size();
         }
 
+        BitSet[] provenance = new BitSet[liveFunctions.size()];
         for (int fieldId = 0; fieldId < fieldList.size(); fieldId++) {
             IntArrayList writers = fieldWriters[fieldId];
             IntArrayList readers = fieldReaders[fieldId];
             if (writers == null || writers.isEmpty() || readers == null) continue;
+            BitSet writerBits = new BitSet(liveFunctions.size());
+            for (int wi = 0; wi < writers.size(); wi++) writerBits.set(writers.get(wi));
             for (int ri = 0; ri < readers.size(); ri++) {
                 int reader = readers.get(ri);
-                IntArrayList rd = depsList[reader];
-                if (rd == null) continue;
-                for (int wi = 0; wi < writers.size(); wi++) {
-                    int writer = writers.get(wi);
-                    if (reader != writer) rd.add(writer);
-                }
+                if (depsList[reader] == null) continue;
+                if (provenance[reader] == null) provenance[reader] = new BitSet(liveFunctions.size());
+                provenance[reader].or(writerBits);
             }
+        }
+        for (int reader = 0; reader < provenance.length; reader++) {
+            BitSet bits = provenance[reader];
+            if (bits == null) continue;
+            bits.clear(reader);
+            IntArrayList rd = depsList[reader];
+            for (int w = bits.nextSetBit(0); w >= 0; w = bits.nextSetBit(w + 1)) rd.add(w);
+            provenance[reader] = null;
         }
 
         int[][] deps = new int[liveFunctions.size()][];
@@ -1089,7 +1242,7 @@ public class Analyzer {
         }
 
         Map<String, Integer> activationDepth = computeActivationDepth(
-            callGraph, clinitNames,
+            g, clinitNames,
             entryRoots(entryClass, entryMethod, entryDescriptor));
 
         Map<Function, Set<Function>> clinitDeps = new LinkedHashMap<>();
@@ -1141,6 +1294,8 @@ public class Analyzer {
         Set<String> deferred = computeDeferredClinits(
             clinitOrder, phaseOrder, afterMap,
             initReadBits, initWriteBits, funcIndex, fieldIdMap, fieldWords);
+        deferred.addAll(computeJniDependentClinits(module, clinitOrder));
+        deferred.addAll(computeMissingClassClinits(clinitOrder, resolver));
 
         if (!deferred.isEmpty()) {
             this.deferredClinits.addAll(deferred);
@@ -1352,6 +1507,101 @@ public class Analyzer {
         }
     }
 
+
+    private static Function resolveCallTarget(Module module, String callee) {
+        if (callee == null || callee.indexOf('(') < 0) return null;
+        Function f = module.getFunction(LlvmRuntime.mangleCallable(callee));
+        if (f == null) f = module.getFunction("__jnative_" + LlvmRuntime.mangleCallable(callee));
+        if (f == null) f = module.getFunction(callee);
+        return f;
+    }
+
+    private Set<String> computeJniDependentClinits(Module module, List<Function> clinitOrder) {
+        Map<Function, Set<Function>> callers = new HashMap<>();
+        Set<Function> tainted = new HashSet<>();
+        Deque<Function> work = new ArrayDeque<>();
+
+        for (Function f : module.getFunctions()) {
+            if (f.getEntryBlock() == null) continue;
+            for (BasicBlock b : f.getBlocks()) {
+                for (Instruction inst : b.getInstructions()) {
+                    Opcode op = inst.getOpcode();
+                    if (op != Opcode.CALL && op != Opcode.STATIC_CALL && op != Opcode.SPECIAL_CALL
+                        && op != Opcode.VIRTUAL_CALL && op != Opcode.INTERFACE_CALL) continue;
+                    for (int k = 0; k < Math.min(2, inst.getOperands().size()); k++) {
+                        Function target = resolveCallTarget(module, extractCalleeConstant(inst, k));
+                        if (target == null) continue;
+                        if (target.isJniNative() && target.getEntryBlock() == null) {
+                            if (tainted.add(f)) work.add(f);
+                        } else {
+                            callers.computeIfAbsent(target, x -> new HashSet<>()).add(f);
+                        }
+                    }
+                }
+            }
+        }
+
+        while (!work.isEmpty()) {
+            Function f = work.poll();
+            for (Function caller : callers.getOrDefault(f, Set.of())) {
+                if (tainted.add(caller)) work.add(caller);
+            }
+        }
+
+        Set<String> result = new LinkedHashSet<>();
+        for (Function c : clinitOrder) {
+            if (tainted.contains(c)) result.add(c.getName());
+        }
+        if (!result.isEmpty()) {
+            System.out.println("Deferring " + result.size()
+                + " <clinit>(s) that call JNI natives to lazy initialization.");
+        }
+        return result;
+    }
+
+    /**
+     * A <clinit> that directly uses a class absent from the classpath (e.g. Spring's
+     * CoroutinesUtils -> kotlin.jvm.JvmClassMappingKt) throws NoClassDefFoundError when it
+     * runs. The JVM only runs it on first use of its class (guarded by KotlinDetector etc.),
+     * so it must stay lazy instead of running eagerly at startup.
+     */
+    private static Set<String> computeMissingClassClinits(List<Function> clinitOrder,
+                                                          DependencyResolver resolver) {
+        Set<String> result = new LinkedHashSet<>();
+        for (Function c : clinitOrder) {
+            if (c.getEntryBlock() == null) continue;
+            scan:
+            for (BasicBlock b : c.getBlocks()) {
+                for (Instruction inst : b.getInstructions()) {
+                    Opcode op = inst.getOpcode();
+                    List<String> owners = new ArrayList<>(3);
+                    owners.add(extractTriggerOwner(inst));
+                    if (op == Opcode.CALL || op == Opcode.STATIC_CALL || op == Opcode.SPECIAL_CALL
+                        || op == Opcode.VIRTUAL_CALL || op == Opcode.INTERFACE_CALL) {
+                        for (int k = 0; k < 2; k++) {
+                            String callee = extractCalleeConstant(inst, k);
+                            int paren = callee == null ? -1 : callee.indexOf('(');
+                            int dot = callee == null ? -1 : callee.indexOf('.');
+                            if (dot > 0 && (paren < 0 || dot < paren)) owners.add(callee.substring(0, dot));
+                        }
+                    }
+                    for (String owner : owners) {
+                        if (owner == null || owner.isEmpty() || owner.charAt(0) == '[') continue;
+                        if (resolver.isMissingClass(owner)) {
+                            result.add(c.getName());
+                            break scan;
+                        }
+                    }
+                }
+            }
+        }
+        if (!result.isEmpty()) {
+            System.out.println("Deferring " + result.size()
+                + " <clinit>(s) that use classes missing from the classpath to lazy initialization.");
+        }
+        return result;
+    }
+
     private Set<String> computeDeferredClinits(
         List<Function> clinitOrder,
         List<Function> phaseOrder,
@@ -1438,29 +1688,6 @@ public class Analyzer {
         return deferred;
     }
 
-    private static void orInFunctionFacts(String funcName,
-                                          Map<String, Integer> funcIndex,
-                                          int[][] funcTriggers,
-                                          int[][] funcReads,
-                                          int[][] funcWrites,
-                                          long[] trigBits,
-                                          long[] readBits,
-                                          long[] writeBits) {
-        Integer idxObj = funcIndex.get(funcName);
-        if (idxObj == null) return;
-        int idx = idxObj;
-
-        for (int id : funcTriggers[idx]) trigBits[id >>> 6] |= 1L << (id & 63);
-        for (int id : funcReads[idx])    readBits[id >>> 6] |= 1L << (id & 63);
-        for (int id : funcWrites[idx])   writeBits[id >>> 6] |= 1L << (id & 63);
-    }
-
-    private static int[] toIntArray(List<Integer> list) {
-        int[] arr = new int[list.size()];
-        for (int i = 0; i < list.size(); i++) arr[i] = list.get(i);
-        return arr;
-    }
-
     private static boolean bitsIntersect(long[] a, long[] b) {
         int n = Math.min(a.length, b.length);
         for (int i = 0; i < n; i++) {
@@ -1508,63 +1735,82 @@ public class Analyzer {
         }
     }
 
-    private static void collectDirectCallees(Instruction inst,
-                                             Set<String> out,
-                                             Module module,
-                                             DependencyResolver resolver) {
-        Opcode op = inst.getOpcode();
-        switch (op) {
-            case STATIC_CALL, CALL -> {
-                String callee = extractCalleeConstant(inst, 0);
-                if (callee == null) break;
-                Function calleeFunc = module.getFunction(callee);
-                if (calleeFunc == null) {
-                    calleeFunc = module.getFunction(LlvmRuntime.mangleCallable(callee));
-                }
-                if (calleeFunc != null && calleeFunc.getEntryBlock() != null) {
-                    out.add(calleeFunc.getName());
-                }
-            }
-            case SPECIAL_CALL -> {
-                String callee = extractCalleeConstant(inst, 1);
-                if (callee == null) break;
-                Function calleeFunc = module.getFunction(callee);
-                if (calleeFunc == null) {
-                    calleeFunc = module.getFunction(LlvmRuntime.mangleCallable(callee));
-                }
-                if (calleeFunc != null && calleeFunc.getEntryBlock() != null) {
-                    out.add(calleeFunc.getName());
-                }
-            }
-            case VIRTUAL_CALL, INTERFACE_CALL -> {
-                String callee = extractCalleeConstant(inst, 1);
-                if (callee == null) break;
-                int dotIdx = callee.lastIndexOf('.');
-                int parenIdx = callee.indexOf('(');
-                if (dotIdx <= 0 || parenIdx <= dotIdx) break;
-                String owner = callee.substring(0, dotIdx);
-                String methodPart = callee.substring(dotIdx + 1);
-                int localParenIdx = parenIdx - dotIdx - 1;
-                String methodName = methodPart.substring(0, localParenIdx);
-                String descriptor = methodPart.substring(localParenIdx);
-
-                Set<String> candidates = new HashSet<>();
-                candidates.add(owner);
-                candidates.addAll(resolver.getSubclasses(owner));
-
-                for (String cls : candidates) {
-                    String[] foundOwner = new String[1];
-                    MethodNode mn = resolver.findMethodInHierarchy(
-                        cls, methodName, descriptor, foundOwner);
-                    if (mn == null || mn.isAbstract() || mn.isNative()) continue;
-                    String decl = foundOwner[0] != null ? foundOwner[0] : cls;
-                    String mangled = LlvmRuntime.mangleMethod(decl, methodName, descriptor);
-                    Function f = module.getFunction(mangled);
-                    if (f != null && f.getEntryBlock() != null) out.add(mangled);
-                }
-            }
-            default -> { }
+    /** Runs {@code action} over 0..n-1 in about parallelism*4 contiguous chunks. */
+    private void forEachIndexParallel(int n, java.util.function.IntConsumer action) {
+        if (n == 0) return;
+        int chunks = Math.max(1, Math.min(n, parallelism * 4));
+        List<int[]> ranges = new ArrayList<>(chunks);
+        for (int c = 0; c < chunks; c++) {
+            ranges.add(new int[] { (int) ((long) n * c / chunks), (int) ((long) n * (c + 1) / chunks) });
         }
+        forEachParallel(ranges, r -> {
+            for (int i = r[0]; i < r[1]; i++) action.accept(i);
+        });
+    }
+
+    /**
+     * Adds the indices of the bodies a call can reach. Resolutions are memoized
+     * per callee string: the same target is called from many sites, and virtual
+     * resolution walks every subclass.
+     */
+    private static void collectDirectCallees(Instruction inst,
+                                             IntArrayList out,
+                                             Module module,
+                                             DependencyResolver resolver,
+                                             Map<String, Integer> index,
+                                             Map<String, int[]> directCache,
+                                             Map<String, int[]> virtualCache) {
+        Opcode op = inst.getOpcode();
+        boolean virtual = op == Opcode.VIRTUAL_CALL || op == Opcode.INTERFACE_CALL;
+        if (!virtual && op != Opcode.STATIC_CALL && op != Opcode.CALL && op != Opcode.SPECIAL_CALL) return;
+        String callee = extractCalleeConstant(inst,
+            op == Opcode.STATIC_CALL || op == Opcode.CALL ? 0 : 1);
+        if (callee == null) return;
+        Map<String, int[]> cache = virtual ? virtualCache : directCache;
+        int[] targets = cache.get(callee);
+        if (targets == null) {
+            targets = virtual
+                ? resolveVirtualTargets(callee, module, resolver, index)
+                : resolveDirectTarget(callee, module, index);
+            cache.putIfAbsent(callee, targets);
+        }
+        out.addAll(targets);
+    }
+
+    private static int[] resolveDirectTarget(String callee, Module module, Map<String, Integer> index) {
+        Function f = module.getFunction(callee);
+        if (f == null) f = module.getFunction(LlvmRuntime.mangleCallable(callee));
+        Integer i = f == null ? null : index.get(f.getName()); // index holds only bodies
+        return i == null ? NO_TARGETS : new int[] { i };
+    }
+
+    private static int[] resolveVirtualTargets(String callee, Module module,
+                                               DependencyResolver resolver,
+                                               Map<String, Integer> index) {
+        int dotIdx = callee.lastIndexOf('.');
+        int parenIdx = callee.indexOf('(');
+        if (dotIdx <= 0 || parenIdx <= dotIdx) return NO_TARGETS;
+        String owner = callee.substring(0, dotIdx);
+        String methodName = callee.substring(dotIdx + 1, parenIdx);
+        String descriptor = callee.substring(parenIdx);
+
+        Set<String> candidates = new HashSet<>();
+        candidates.add(owner);
+        candidates.addAll(resolver.getSubclasses(owner));
+
+        IntArrayList out = new IntArrayList();
+        String[] foundOwner = new String[1];
+        for (String cls : candidates) {
+            foundOwner[0] = null;
+            MethodNode mn = resolver.findMethodInHierarchy(cls, methodName, descriptor, foundOwner);
+            if (mn == null || mn.isAbstract() || mn.isNative()) continue;
+            String decl = foundOwner[0] != null ? foundOwner[0] : cls;
+            Integer i = index.get(LlvmRuntime.mangleMethod(decl, methodName, descriptor));
+            if (i != null) out.add(i);
+        }
+        if (out.isEmpty()) return NO_TARGETS;
+        out.sortUnique();
+        return out.toArray();
     }
 
     private static void computeClinitLevelsAndCyclic(
@@ -1624,34 +1870,59 @@ public class Analyzer {
                                       Set<Function> onStack,
                                       List<List<Function>> sccs,
                                       int[] counter) {
+        Deque<Function> callStack = new ArrayDeque<>();
+        Deque<Iterator<Function>> iterStack = new ArrayDeque<>();
+        enterNode(v, deps, index, lowlink, stack, onStack, counter, callStack, iterStack);
+
+        while (!callStack.isEmpty()) {
+            Function u = callStack.peek();
+            Iterator<Function> it = iterStack.peek();
+            if (it.hasNext()) {
+                Function w = it.next();
+                if (!index.containsKey(w)) {
+                    enterNode(w, deps, index, lowlink, stack, onStack, counter, callStack, iterStack);
+                } else if (onStack.contains(w)) {
+                    lowlink.put(u, Math.min(lowlink.get(u), index.get(w)));
+                }
+                continue;
+            }
+
+            callStack.pop();
+            iterStack.pop();
+            if (lowlink.get(u).equals(index.get(u))) {
+                List<Function> scc = new ArrayList<>();
+                Function w;
+                do {
+                    w = stack.pop();
+                    onStack.remove(w);
+                    scc.add(w);
+                } while (w != u);
+                sccs.add(scc);
+            }
+            Function parent = callStack.peek();
+            if (parent != null) {
+                lowlink.put(parent, Math.min(lowlink.get(parent), lowlink.get(u)));
+            }
+        }
+    }
+
+    private static void enterNode(Function v,
+                                  Map<Function, Set<Function>> deps,
+                                  Map<Function, Integer> index,
+                                  Map<Function, Integer> lowlink,
+                                  Deque<Function> stack,
+                                  Set<Function> onStack,
+                                  int[] counter,
+                                  Deque<Function> callStack,
+                                  Deque<Iterator<Function>> iterStack) {
         int idx = counter[0]++;
         index.put(v, idx);
         lowlink.put(v, idx);
         stack.push(v);
         onStack.add(v);
-
         Set<Function> successors = deps.get(v);
-        if (successors != null) {
-            for (Function w : successors) {
-                if (!index.containsKey(w)) {
-                    strongConnect(w, deps, index, lowlink, stack, onStack, sccs, counter);
-                    lowlink.put(v, Math.min(lowlink.get(v), lowlink.get(w)));
-                } else if (onStack.contains(w)) {
-                    lowlink.put(v, Math.min(lowlink.get(v), index.get(w)));
-                }
-            }
-        }
-
-        if (lowlink.get(v).equals(index.get(v))) {
-            List<Function> scc = new ArrayList<>();
-            Function w;
-            do {
-                w = stack.pop();
-                onStack.remove(w);
-                scc.add(w);
-            } while (w != v);
-            sccs.add(scc);
-        }
+        callStack.push(v);
+        iterStack.push(successors != null ? successors.iterator() : Collections.emptyIterator());
     }
 
     private static List<Function> tarjanLinearize(List<Function> nodes,
@@ -1724,32 +1995,43 @@ public class Analyzer {
         return a.getName().compareTo(b.getName());
     }
 
+    /** 0-1 BFS from the roots; entering a <clinit> costs one activation level. */
     private static Map<String, Integer> computeActivationDepth(
-        Map<String, Set<String>> callGraph,
+        InitGraph g,
         Set<String> clinitNames,
         Collection<String> roots) {
-        Map<String, Integer> depth = new HashMap<>();
-        Deque<String> queue = new ArrayDeque<>();
+        int n = g.live().size();
+        int[] depth = new int[n];
+        Arrays.fill(depth, Integer.MAX_VALUE);
+        boolean[] isClinit = new boolean[n];
+        for (String name : clinitNames) {
+            Integer i = g.index().get(name);
+            if (i != null) isClinit[i] = true;
+        }
+        Map<String, Integer> result = new HashMap<>();
+        ArrayDeque<Integer> queue = new ArrayDeque<>();
         for (String root : roots) {
             if (root == null) continue;
-            if (depth.putIfAbsent(root, 0) == null) queue.addLast(root);
+            result.putIfAbsent(root, 0); // roots count even without a body
+            Integer i = g.index().get(root);
+            if (i != null && depth[i] != 0) { depth[i] = 0; queue.addLast(i); }
         }
 
         while (!queue.isEmpty()) {
-            String cur = queue.removeFirst();
-            int curDepth = depth.get(cur);
-            Set<String> callees = callGraph.get(cur);
-            if (callees == null) continue;
-            for (String callee : callees) {
-                int next = curDepth + (clinitNames.contains(callee) ? 1 : 0);
-                Integer previous = depth.get(callee);
-                if (previous != null && previous <= next) continue;
-                depth.put(callee, next);
+            int cur = queue.removeFirst();
+            int curDepth = depth[cur];
+            for (int callee : g.callees()[cur]) {
+                int next = curDepth + (isClinit[callee] ? 1 : 0);
+                if (depth[callee] <= next) continue;
+                depth[callee] = next;
                 if (next == curDepth) queue.addFirst(callee);
                 else                  queue.addLast(callee);
             }
         }
-        return depth;
+        for (int i = 0; i < n; i++) {
+            if (depth[i] != Integer.MAX_VALUE) result.put(g.live().get(i).getName(), depth[i]);
+        }
+        return result;
     }
 
     private static List<String> entryRoots(String entryClass, String entryMethod,

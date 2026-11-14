@@ -161,6 +161,7 @@ static ReflectionConstructor* lookup_reflection_constructor(
 
 extern void* __jnative_fn_java_lang_Object_getClass___Ljava_lang_Class_(void* obj);
 extern void* __jnative_get_exception_object(void);
+extern int   __jnative_fn_java_lang_Class_isInstance__Ljava_lang_Object__Z(void* cls, void* obj);
 
 extern void* fn_java_lang_Boolean_valueOf__Z_Ljava_lang_Boolean_(_Bool)        __attribute__((weak));
 extern void* fn_java_lang_Byte_valueOf__B_Ljava_lang_Byte_(int8_t)             __attribute__((weak));
@@ -447,6 +448,15 @@ void* __jnative_fn_jdk_internal_reflect_NativeMethodAccessorImpl_invoke0__Ljava_
     if (!is_static && obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
+    /* DirectMethodHandleAccessor.checkReceiver: without it a mismatched
+     * receiver is dispatched anyway and crashes inside the target (e.g. H2
+     * invoking com.sun.management.OperatingSystemMXBean methods on the base
+     * java.lang.management OS bean). */
+    if (!is_static
+        && !__jnative_fn_java_lang_Class_isInstance__Ljava_lang_Object__Z(clazz, obj)) {
+        reflect_throw("vtable_java_lang_IllegalArgumentException",
+                      "object is not an instance of declaring class");
+    }
 
     ReflectionMethod* m = NULL;
     if (!is_static && (modifiers & REFLECT_ACC_PRIVATE) == 0) {
@@ -456,8 +466,11 @@ void* __jnative_fn_jdk_internal_reflect_NativeMethodAccessorImpl_invoke0__Ljava_
         m = lookup_reflection_method((ReflectionClass*)clazz, name, descriptor);
     }
     if (m == NULL || m->adaptor == NULL) {
-        reflect_throw("vtable_java_lang_InternalError",
-                      "no reflective entry point for method");
+        char msg[1400];
+        const char* cname = ((ReflectionClass*)clazz)->cname;
+        snprintf(msg, sizeof(msg), "no reflective entry point for method %s.%s%s",
+                 cname != NULL ? cname : "?", name, descriptor);
+        reflect_throw("vtable_java_lang_InternalError", msg);
     }
 
     void** args = reflect_prepare_args(parameter_types_array, args_array);

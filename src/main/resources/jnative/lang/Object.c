@@ -428,6 +428,12 @@ void __jnative_fn_java_lang_Object_wait0__J_V(void *obj, int64_t timeoutMillis) 
 
     jn_mutex_lock(&m->mutex);
     m->wait_count++;
+    /* Java wait() releases the object's monitor; the notifier must be able
+     * to take it. Done after wait_count++ under m->mutex so a notifier that
+     * then acquires the monitor cannot broadcast before we are waiting.
+     * shortcut: releases one recursion level only, upgrade if a wait() inside
+     * nested synchronized(obj) blocks shows up. */
+    __jnative_monitor_exit(obj);
 
     struct timespec ts;
     if (timeoutMillis == 0) {
@@ -445,6 +451,9 @@ void __jnative_fn_java_lang_Object_wait0__J_V(void *obj, int64_t timeoutMillis) 
 
     m->wait_count--;
     jn_mutex_unlock(&m->mutex);
+    /* Retake the monitor only after dropping m->mutex: the notifier holds
+     * the monitor while it locks m->mutex, so the reverse order would deadlock. */
+    __jnative_monitor_enter(obj);
 }
 
 /* ---- System.nanoTime() ---- */

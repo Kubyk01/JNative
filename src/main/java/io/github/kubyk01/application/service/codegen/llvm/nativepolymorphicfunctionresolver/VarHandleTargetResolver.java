@@ -2,6 +2,7 @@ package io.github.kubyk01.application.service.codegen.llvm.nativepolymorphicfunc
 
 import io.github.kubyk01.application.service.analyzer.dependencyresolver.DependencyResolver;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.FieldNode;
+import io.github.kubyk01.domain.ir.BasicBlock;
 import io.github.kubyk01.domain.ir.Constant;
 import io.github.kubyk01.domain.ir.Instruction;
 import io.github.kubyk01.domain.ir.Opcode;
@@ -16,11 +17,15 @@ import org.objectweb.asm.MethodVisitor;
 import org.objectweb.asm.Opcodes;
 
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.Deque;
 import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 public class VarHandleTargetResolver {
@@ -37,7 +42,8 @@ public class VarHandleTargetResolver {
     private static final String METHOD_HANDLES = "java/lang/invoke/MethodHandles";
     private static final String LOOKUP = "java/lang/invoke/MethodHandles$Lookup";
     private static final String MH_UTIL = "jdk/internal/invoke/MhUtil";
-    private static final String VAR_HANDLE = "java/lang/invoke/VarHandle";
+    private static final String CONSTANT_BOOTSTRAPS = "java/lang/invoke/ConstantBootstraps";
+    private static final String VAR_HANDLE ="java/lang/invoke/VarHandle";
 
     private final DependencyResolver resolver;
     private final Map<String, Optional<Target>> cache = new ConcurrentHashMap<>();
@@ -59,22 +65,53 @@ public class VarHandleTargetResolver {
                 || !c.getValue().toString().startsWith(VAR_HANDLE + ".")) {
             return null;
         }
-        Value receiver = call.getOperands().getFirst();
-        for (int depth = 0; depth < 8 && receiver instanceof Temporary t; depth++) {
-            Instruction def = t.getDefiningInstruction();
-            if (def == null) return null;
-            if (def.getOpcode() == Opcode.GET_STATIC) {
-                String full = LlvmUtil.extractFieldName(def);
-                int dot = full.lastIndexOf('.');
-                return dot > 0 ? resolve(full.substring(0, dot), full.substring(dot + 1)) : null;
-            }
-            if ((def.getOpcode() != Opcode.CHECKCAST && def.getOpcode() != Opcode.CAST)
-                    || def.getOperands().isEmpty()) {
-                return null;
-            }
-            receiver = def.getOperands().getFirst();
+        return resolveReceiver(call.getOperands().getFirst(), 0, new HashSet<>());
+    }
+
+    private Target resolveReceiver(Value receiver, int depth, Set<Instruction> visited) {
+        if (depth >= 64 || !(receiver instanceof Temporary t)) return null;
+        Instruction def = t.getDefiningInstruction();
+        if (def == null || !visited.add(def)) return null;
+        if (def.getOpcode() == Opcode.GET_STATIC) {
+            String full = LlvmUtil.extractFieldName(def);
+            int dot = full.lastIndexOf('.');
+            return dot > 0 ? resolve(full.substring(0, dot), full.substring(dot + 1)) : null;
         }
-        return null;
+        if (def.getOpcode() == Opcode.LOAD) {
+            return resolveLocalSlot(def, depth, visited);
+        }
+        if (def.getOperands().isEmpty()) return null;
+        if (def.getOpcode() == Opcode.CHECKCAST || def.getOpcode() == Opcode.CAST
+                || def.getOpcode() == Opcode.STORE) {
+            return resolveReceiver(def.getOperands().getFirst(), depth + 1, visited);
+        }
+        if (def.getOpcode() != Opcode.PHI) return null;
+        return resolveAll(def.getOperands(), depth, visited);
+    }
+
+    private Target resolveLocalSlot(Instruction load, int depth, Set<Instruction> visited) {
+        if (load.getParent() == null || load.getParent().getFunction() == null) return null;
+        List<Value> stored = new ArrayList<>();
+        for (BasicBlock block : load.getParent().getFunction().getBlocks()) {
+            for (Instruction inst : block.getInstructions()) {
+                if (inst.getOpcode() == Opcode.STORE
+                        && inst.getLocalIndex() == load.getLocalIndex()
+                        && !inst.getOperands().isEmpty()) {
+                    stored.add(inst.getOperands().getFirst());
+                }
+            }
+        }
+        return resolveAll(stored, depth, visited);
+    }
+
+    private Target resolveAll(List<Value> values, int depth, Set<Instruction> visited) {
+        Target common = null;
+        for (Value incoming : values) {
+            Target target = resolveReceiver(incoming, depth + 1, new HashSet<>(visited));
+            if (target == null || (common != null && !common.equals(target))) return null;
+            common = target;
+        }
+        return common;
     }
 
     private Target compute(String holderClass, String handleField) {
@@ -241,8 +278,8 @@ public class VarHandleTargetResolver {
                     Object type = pop();
                     Object field = pop();
                     Object lookup = pop();
-                    push(lookup instanceof LookupIn l
-                            ? fieldTarget(Kind.INSTANCE_FIELD, Type.reference(l.lookupClass()), field, type)
+                    push(lookup instanceof LookupIn(String lookupClass)
+                            ? fieldTarget(Kind.INSTANCE_FIELD, Type.reference(lookupClass), field, type)
                             : UNKNOWN);
                     return;
                 }
@@ -256,6 +293,18 @@ public class VarHandleTargetResolver {
                             : UNKNOWN);
                     return;
                 }
+            }
+            if (opcode == Opcodes.INVOKESTATIC && CONSTANT_BOOTSTRAPS.equals(owner)
+                    && "(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;Ljava/lang/Class;Ljava/lang/Class;Ljava/lang/Class;)Ljava/lang/invoke/VarHandle;".equals(descriptor)
+                    && ("fieldVarHandle".equals(name) || "staticFieldVarHandle".equals(name))) {
+                Object type = pop();
+                Object recv = pop();
+                pop();
+                Object field = pop();
+                Object lookup = pop();
+                Kind kind = "fieldVarHandle".equals(name) ? Kind.INSTANCE_FIELD : Kind.STATIC_FIELD;
+                push(lookup instanceof LookupIn ? fieldTarget(kind, recv, field, type) : UNKNOWN);
+                return;
             }
             if (opcode == Opcodes.INVOKEVIRTUAL && LOOKUP.equals(owner)
                     && "(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/Class;)Ljava/lang/invoke/VarHandle;".equals(descriptor)

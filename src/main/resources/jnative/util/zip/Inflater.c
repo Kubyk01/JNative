@@ -130,6 +130,10 @@ typedef struct {
 
     uint32_t adler_a;
     uint32_t adler_b;
+
+    uint8_t* hold;
+    size_t   hold_len;
+    size_t   hold_cap;
 } InflaterState;
 
 /*
@@ -450,12 +454,13 @@ static int decode_more(InflaterState* s) {
     }
 
     if (s->state == ST_STORED_DATA) {
-        while (s->stored_remaining > 0) {
+        if (s->stored_remaining > 0) {
             if (window_room(s) <= 0) return 0;
             uint32_t b;
             if (read_bits(s, 8, &b) < 0) return -1;
             emit_byte(s, (uint8_t)b);
             s->stored_remaining--;
+            return 0;
         }
         if (s->bfinal) {
             s->state = s->nowrap ? ST_DONE : ST_TRAILER;
@@ -515,6 +520,7 @@ static int decode_more(InflaterState* s) {
     }
 
     if (s->state == ST_TRAILER) {
+        align_byte(s);
         uint32_t c0, c1, c2, c3;
         if (read_bits(s, 8, &c0) < 0) return -1;
         if (read_bits(s, 8, &c1) < 0) return -1;
@@ -541,16 +547,28 @@ static int decode_more(InflaterState* s) {
  * written into the output buffer is written through `out_produced`.
  * =========================================================================
  */
-static int inflate_call(InflaterState* s,
-                        const uint8_t* in, size_t in_len,
-                        uint8_t* out, size_t out_len,
-                        size_t* out_produced)
+static int64_t inflate_call(InflaterState* s,
+                            const uint8_t* in, size_t in_len,
+                            uint8_t* out, size_t out_len)
 {
-    s->in = in;
-    s->in_len = in_len;
+    size_t old_hold = s->hold_len;
+    size_t need = old_hold + in_len;
+    if (need > s->hold_cap) {
+        size_t cap = s->hold_cap ? s->hold_cap : 4096;
+        while (cap < need) cap *= 2;
+        uint8_t* nh = (uint8_t*)realloc(s->hold, cap);
+        if (nh == NULL) __jnative_throw_out_of_memory_error_ctx("Inflater.inflate");
+        s->hold = nh;
+        s->hold_cap = cap;
+    }
+    if (in_len > 0) memcpy(s->hold + s->hold_len, in, in_len);
+    s->in = s->hold;
+    s->in_len = need;
     s->in_pos = 0;
 
     size_t produced = 0;
+    int status = Z_OK;
+    int starved = 0;
 
     for (;;) {
         while (s->drained_total < s->win_total && produced < out_len) {
@@ -564,27 +582,61 @@ static int inflate_call(InflaterState* s,
             s->drained_total += avail;
         }
 
-        s->total_in += s->in_pos;
-        s->in_pos = 0;
-        s->in_len = 0;
-
         if (s->state == ST_DONE && s->drained_total >= s->win_total) {
-            *out_produced = produced;
-            return Z_STREAM_END;
+            status = Z_STREAM_END;
+            break;
         }
-        if (produced >= out_len) {
-            *out_produced = produced;
-            return Z_OK;
-        }
+        if (produced >= out_len) break;
 
+        size_t saved_pos = s->in_pos;
+        uint32_t saved_buf = s->bitbuf;
+        int saved_cnt = s->bitcnt;
         int r = decode_more(s);
-        if (r == 1) continue;
-        if (r == 0) continue;
-        if (r == -1) { *out_produced = produced; return Z_OK; }
-        if (r == -3) { *out_produced = produced; return Z_NEED_DICT; }
-        *out_produced = produced;
-        return Z_DATA_ERROR;
+        if (r >= 0) continue;
+        if (r == -1) {
+            s->in_pos = saved_pos;
+            s->bitbuf = saved_buf;
+            s->bitcnt = saved_cnt;
+            starved = 1;
+        } else if (r == -3) {
+            status = Z_NEED_DICT;
+        } else {
+            status = Z_DATA_ERROR;
+        }
+        break;
     }
+
+    size_t left = s->in_len - s->in_pos;
+    size_t consumed = in_len;
+    if (s->state == ST_DONE) {
+        size_t unused = left + (size_t)(s->bitcnt / 8);
+        consumed = unused >= in_len ? 0 : in_len - unused;
+        s->hold_len = 0;
+    } else if (starved || status != Z_OK) {
+        if (left > 0) memmove(s->hold, s->hold + s->in_pos, left);
+        s->hold_len = left;
+    } else {
+        consumed = s->in_pos > old_hold ? s->in_pos - old_hold : 0;
+        size_t keep = s->in_pos < old_hold ? old_hold - s->in_pos : 0;
+        if (keep > 0) memmove(s->hold, s->hold + s->in_pos, keep);
+        s->hold_len = keep;
+    }
+    s->in = NULL;
+    s->in_len = 0;
+    s->in_pos = 0;
+    s->total_in += consumed;
+
+    if (status == Z_DATA_ERROR) {
+        void* exc = __jnative_construct_exception(
+            "vtable_java_util_zip_DataFormatException", "invalid deflate data");
+        if (exc != NULL) __jnative_throw_exception(exc);
+        __jnative_throw_io_ctx("invalid deflate data", "Inflater.inflate");
+    }
+
+    return (int64_t)(consumed & 0x7fffffffu)
+         | ((int64_t)(produced & 0x7fffffffu) << 31)
+         | (status == Z_STREAM_END ? (int64_t)1 << 62 : 0)
+         | (status == Z_NEED_DICT ? (int64_t)((uint64_t)1 << 63) : 0);
 }
 
 /*
@@ -635,8 +687,7 @@ void __jnative_fn_java_util_zip_Inflater_initIDs___V(void) {
  * throw helper; there is no "null state" path because the Java caller
  * has no way to recover from one.
  */
-int64_t __jnative_fn_java_util_zip_Inflater_init__Z_J(void* self, int32_t nowrap) {
-    (void)self;
+int64_t __jnative_fn_java_util_zip_Inflater_init__Z_J(int32_t nowrap) {
     InflaterState* s = (InflaterState*)calloc(1, sizeof(InflaterState));
     if (s == NULL) {
         __jnative_throw_exception(NULL);
@@ -655,9 +706,11 @@ int64_t __jnative_fn_java_util_zip_Inflater_init__Z_J(void* self, int32_t nowrap
  * no-op, matching the reference implementation's tolerance for a
  * double-end call.
  */
-void __jnative_fn_java_util_zip_Inflater_end__J_V(void* self, int64_t addr) {
-    (void)self;
-    if (addr != 0) free((void*)(intptr_t)addr);
+void __jnative_fn_java_util_zip_Inflater_end__J_V(int64_t addr) {
+    if (addr != 0) {
+        free(((InflaterState*)(intptr_t)addr)->hold);
+        free((void*)(intptr_t)addr);
+    }
 }
 
 /*
@@ -689,8 +742,7 @@ int64_t __jnative_fn_java_util_zip_Inflater_getBytesWritten__J_J(void* self, int
  * holding the low-order sum and the high 16 bits holding the
  * high-order sum.
  */
-int32_t __jnative_fn_java_util_zip_Inflater_getAdler__J_I(void* self, int64_t addr) {
-    (void)self;
+int32_t __jnative_fn_java_util_zip_Inflater_getAdler__J_I(int64_t addr) {
     InflaterState* s = (InflaterState*)(intptr_t)addr;
     return s ? (int32_t)((s->adler_b << 16) | s->adler_a) : 0;
 }
@@ -702,8 +754,7 @@ int32_t __jnative_fn_java_util_zip_Inflater_getAdler__J_I(void* self, int64_t ad
  * underlying allocation, so the same Inflater object can be reused for
  * a new stream.
  */
-void __jnative_fn_java_util_zip_Inflater_reset__J_V(void* self, int64_t addr) {
-    (void)self;
+void __jnative_fn_java_util_zip_Inflater_reset__J_V(int64_t addr) {
     InflaterState* s = (InflaterState*)(intptr_t)addr;
     if (s == NULL) return;
     s->bitbuf = 0; s->bitcnt = 0;
@@ -715,6 +766,7 @@ void __jnative_fn_java_util_zip_Inflater_reset__J_V(void* self, int64_t addr) {
     s->win_total = 0; s->drained_total = 0;
     s->adler_a = 1; s->adler_b = 0;
     s->needs_dict = 0; s->dict_adler = 0;
+    s->hold_len = 0;
 }
 
 /*
@@ -726,12 +778,9 @@ void __jnative_fn_java_util_zip_Inflater_reset__J_V(void* self, int64_t addr) {
  * from the slice `input[inputOff .. inputOff+inputLen)`; uncompressed
  * output is written into `output[outputOff .. outputOff+outputLen)`.
  *
- * The return value is the number of bytes written into the output
- * array. The zlib status (stream end, need dict, data error) is
- * communicated through the Java-side wrapper's own checks against the
- * inflater's internal state, not through this return value; the
- * return-value interpretation matches the JDK's own contract for this
- * native.
+ * The return value packs input bytes consumed (bits 0-30), output
+ * bytes written (bits 31-61), finished (bit 62) and needDict (bit 63),
+ * as Inflater.inflate decodes it.
  */
 int64_t __jnative_fn_java_util_zip_Inflater_inflateBytesBytes__J_BII_BII_J(
         void* self, int64_t addr,
@@ -744,10 +793,8 @@ int64_t __jnative_fn_java_util_zip_Inflater_inflateBytesBytes__J_BII_BII_J(
     if (input == NULL || output == NULL) {
         __jnative_throw_null_pointer_exception();
     }
-    size_t produced = 0;
-    inflate_call(s, jbyte_in(input, inputOff), (size_t)inputLen,
-                    jbyte_out(output, outputOff), (size_t)outputLen, &produced);
-    return (int64_t)produced;
+    return inflate_call(s, jbyte_in(input, inputOff), (size_t)inputLen,
+                        jbyte_out(output, outputOff), (size_t)outputLen);
 }
 
 /*
@@ -758,7 +805,7 @@ int64_t __jnative_fn_java_util_zip_Inflater_inflateBytesBytes__J_BII_BII_J(
  * The direct-buffer-to-byte-array entry point. Compressed input is read
  * from the raw address `inputAddress` for `inputLen` bytes; output goes
  * into `output[outputOff .. outputOff+outputLen)`. The return value is
- * the number of bytes written.
+ * packed as for inflateBytesBytes.
  */
 int64_t __jnative_fn_java_util_zip_Inflater_inflateBufferBytes__JJI_BII_J(
         void* self, int64_t addr,
@@ -769,47 +816,31 @@ int64_t __jnative_fn_java_util_zip_Inflater_inflateBufferBytes__JJI_BII_J(
     InflaterState* s = (InflaterState*)(intptr_t)addr;
     if (s == NULL) return (int64_t)Z_STREAM_ERROR;
     if (output == NULL) __jnative_throw_null_pointer_exception();
-    size_t produced = 0;
-    inflate_call(s, (const uint8_t*)(intptr_t)inputAddress, (size_t)inputLen,
-                    jbyte_out(output, outputOff), (size_t)outputLen, &produced);
-    return (int64_t)produced;
+    return inflate_call(s, (const uint8_t*)(intptr_t)inputAddress, (size_t)inputLen,
+                        jbyte_out(output, outputOff), (size_t)outputLen);
 }
 
-/*
- * Legacy compatibility wrappers.
- *
- * These match the older descriptor forms that earlier JDK versions (and
- * earlier revisions of this runtime) used for the same logical
- * operations: one returns an int32 instead of an int64, the other
- * accepts the output as a raw address instead of a Java byte[]. They
- * are kept so the same source file links against the older call sites
- * that the LLVM backend may still emit for pre-JDK-11 class files.
- */
-int32_t __jnative_fn_java_util_zip_Inflater_inflateBytesBuffer__JLjava_lang_byte_IJI_I(
+int64_t __jnative_fn_java_util_zip_Inflater_inflateBytesBuffer__J_BIIJI_J(
         void* self, int64_t addr,
         void* input, int32_t inputOff, int32_t inputLen,
         int64_t outputAddress, int32_t outputLen)
 {
     (void)self;
     InflaterState* s = (InflaterState*)(intptr_t)addr;
-    if (s == NULL) return Z_STREAM_ERROR;
+    if (s == NULL) return (int64_t)Z_STREAM_ERROR;
     if (input == NULL) __jnative_throw_null_pointer_exception();
-    size_t produced = 0;
-    inflate_call(s, jbyte_in(input, inputOff), (size_t)inputLen,
-                    (uint8_t*)(intptr_t)outputAddress, (size_t)outputLen, &produced);
-    return (int32_t)produced;
+    return inflate_call(s, jbyte_in(input, inputOff), (size_t)inputLen,
+                        (uint8_t*)(intptr_t)outputAddress, (size_t)outputLen);
 }
 
-int32_t __jnative_fn_java_util_zip_Inflater_inflateBufferBuffer__JJIJI_I(
+int64_t __jnative_fn_java_util_zip_Inflater_inflateBufferBuffer__JJIJI_J(
         void* self, int64_t addr,
         int64_t inputAddress, int32_t inputLen,
         int64_t outputAddress, int32_t outputLen)
 {
     (void)self;
     InflaterState* s = (InflaterState*)(intptr_t)addr;
-    if (s == NULL) return Z_STREAM_ERROR;
-    size_t produced = 0;
-    inflate_call(s, (const uint8_t*)(intptr_t)inputAddress, (size_t)inputLen,
-                    (uint8_t*)(intptr_t)outputAddress, (size_t)outputLen, &produced);
-    return (int32_t)produced;
+    if (s == NULL) return (int64_t)Z_STREAM_ERROR;
+    return inflate_call(s, (const uint8_t*)(intptr_t)inputAddress, (size_t)inputLen,
+                        (uint8_t*)(intptr_t)outputAddress, (size_t)outputLen);
 }

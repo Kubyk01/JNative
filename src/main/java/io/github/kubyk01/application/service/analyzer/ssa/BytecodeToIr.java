@@ -1,7 +1,7 @@
 package io.github.kubyk01.application.service.analyzer.ssa;
 
 import io.github.kubyk01.application.service.analyzer.dependencyresolver.DependencyResolver;
-import io.github.kubyk01.application.service.analyzer.reachabilityanalysis.ReachabilityAnalysis;
+import io.github.kubyk01.application.service.analyzer.classanalysis.ClassAnalysis;
 import io.github.kubyk01.application.service.codegen.NativeOverride;
 import io.github.kubyk01.application.service.codegen.llvm.LlvmRuntime;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.ClassNode;
@@ -32,6 +32,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 import static io.github.kubyk01.util.LlvmUtil.extractCalleeName;
 
@@ -39,8 +40,9 @@ import static io.github.kubyk01.util.LlvmUtil.extractCalleeName;
 public class BytecodeToIr {
 
     private final DependencyResolver resolver;
-    private final ReachabilityAnalysis reachability;
+    private final ClassAnalysis reachability;
     private final IrBuilder builder = new IrBuilder();
+    private final Map<String, Map<String, Set<Integer>>> deadCodeMethods = new ConcurrentHashMap<>();
 
     private Scheduler scheduler = Schedulers.single();
 
@@ -48,7 +50,7 @@ public class BytecodeToIr {
     private final Map<String, NativeOverride> overrides = new HashMap<>();
 
     public BytecodeToIr(DependencyResolver resolver,
-                        ReachabilityAnalysis reachability,
+                        ClassAnalysis reachability,
                         List<NativeOverride> nativeOverrides) {
         this.resolver = resolver;
         this.reachability = reachability;
@@ -75,7 +77,7 @@ public class BytecodeToIr {
         ThreadLocal<IrBuilder> builders =
             ThreadLocal.withInitial(() -> new IrBuilder(module));
         LlvmUtil.parallelMapOrdered(
-            new ArrayList<>(reachability.getReachableMethods()), scheduler, ref -> {
+            new ArrayList<>(reachability.getMethods()), scheduler, ref -> {
                 NativeOverride match = findOverride(ref);
                 if (match != null) {
                     // Alias every reachable overload onto the single C function.
@@ -255,7 +257,8 @@ public class BytecodeToIr {
             if (!o.getClassName().equals(ref.getOwner()))       continue;
             if (!o.getMethodName().equals(ref.getName()))       continue;
             if (o.getDescriptor() != null
-                && !o.getDescriptor().equals(ref.getDescriptor())) continue;
+                && !LlvmRuntime.mangleMethod(ref.getOwner(), ref.getName(), o.getDescriptor())
+                    .equals(LlvmRuntime.mangleMethod(ref.getOwner(), ref.getName(), ref.getDescriptor()))) continue;
             return o;
         }
         return null;
@@ -353,6 +356,10 @@ public class BytecodeToIr {
                 func.setOwnerClass(declaringOwner);
                 func.setJniNative(jni);
                 func.setStaticJniNative(jni && declaring.isStatic());
+                if (jni) {
+                    func.setJniMethodName(name);
+                    func.setJniDescriptor(desc);
+                }
 
                 List<Type> allParams = new ArrayList<>();
                 if (!declaring.isStatic()) {
@@ -487,12 +494,16 @@ public class BytecodeToIr {
                 }
             };
 
+            byte[] classBytes = bytes;
+            Set<Integer> liveLabels = deadCodeMethods
+                .computeIfAbsent(owner, k -> DeadCodeFilter.scan(classBytes))
+                .get(name + desc);
             reader.accept(new ClassVisitor(Opcodes.ASM9) {
                 @Override
                 public MethodVisitor visitMethod(int access, String mName, String mDesc,
                                                  String signature, String[] exceptions) {
                     if (mName.equals(name) && mDesc.equals(desc)) {
-                        return translator;
+                        return DeadCodeFilter.wrap(translator, liveLabels);
                     }
                     return null;
                 }

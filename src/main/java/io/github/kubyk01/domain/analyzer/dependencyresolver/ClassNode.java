@@ -16,6 +16,7 @@ public class ClassNode {
     private List<String> interfaces;
     private int access;
     private int classFileVersion;
+    private String signature;
     @Singular
     private List<FieldNode> fields;
     @Singular

@@ -411,8 +411,7 @@ static const char* method_type_descriptor(void* method_type) {
     void* desc_str = fn(method_type);
     if (desc_str == NULL) return NULL;
 
-    int32_t len = 0;
-    return __jnative_read_string_bytes(desc_str, &len);
+    return __jnative_read_string_bytes(desc_str, NULL);
 }
 
 /*
@@ -588,7 +587,16 @@ void __jnative_fn_java_lang_invoke_MethodHandleNatives_init__Ljava_lang_invoke_M
         *(void**)((char*)self + MEMBERNAME_FIELD_CLAZZ)  = clazz;
         *(void**)((char*)self + MEMBERNAME_FIELD_NAME)   = name;
         *(void**)((char*)self + MEMBERNAME_FIELD_TYPE)   = method_type;
-        *(int32_t*)((char*)self + MEMBERNAME_FIELD_FLAGS) = modifiers | MN_IS_METHOD;
+        /* Like HotSpot's init_method_MemberName: the refKind must be set, or a later
+         * resolve() derives ACC_STATIC from REF_NONE and clears it. */
+        int32_t ref_kind;
+        if (modifiers & JNATIVE_ACC_STATIC)  ref_kind = JN_REF_invokeStatic;
+        else if (modifiers & 0x0002)         ref_kind = JN_REF_invokeSpecial;   /* private */
+        else if (clazz != NULL && (((ReflectionClass*)clazz)->modifiers & 0x0200))
+                                             ref_kind = JN_REF_invokeInterface;
+        else                                 ref_kind = JN_REF_invokeVirtual;
+        *(int32_t*)((char*)self + MEMBERNAME_FIELD_FLAGS) =
+            modifiers | MN_IS_METHOD | (ref_kind << MN_REFERENCE_KIND_SHIFT);
         return;
     }
 
@@ -599,7 +607,8 @@ void __jnative_fn_java_lang_invoke_MethodHandleNatives_init__Ljava_lang_invoke_M
         *(void**)((char*)self + MEMBERNAME_FIELD_CLAZZ)  = clazz;
         *(void**)((char*)self + MEMBERNAME_FIELD_NAME)   = NULL;
         *(void**)((char*)self + MEMBERNAME_FIELD_TYPE)   = NULL;
-        *(int32_t*)((char*)self + MEMBERNAME_FIELD_FLAGS) = modifiers | MN_IS_CONSTRUCTOR;
+        *(int32_t*)((char*)self + MEMBERNAME_FIELD_FLAGS) =
+            modifiers | MN_IS_CONSTRUCTOR | (JN_REF_newInvokeSpecial << MN_REFERENCE_KIND_SHIFT);
         return;
     }
 
@@ -611,7 +620,11 @@ void __jnative_fn_java_lang_invoke_MethodHandleNatives_init__Ljava_lang_invoke_M
         *(void**)((char*)self + MEMBERNAME_FIELD_CLAZZ)  = clazz;
         *(void**)((char*)self + MEMBERNAME_FIELD_NAME)   = name;
         *(void**)((char*)self + MEMBERNAME_FIELD_TYPE)   = NULL;
-        *(int32_t*)((char*)self + MEMBERNAME_FIELD_FLAGS) = modifiers | MN_IS_FIELD;
+        /* HotSpot's init_field_MemberName: getStatic/getField; MemberName(Field, true)
+         * then turns it into the put variant itself. */
+        int32_t ref_kind = (modifiers & JNATIVE_ACC_STATIC) ? JN_REF_getStatic : JN_REF_getField;
+        *(int32_t*)((char*)self + MEMBERNAME_FIELD_FLAGS) =
+            modifiers | MN_IS_FIELD | (ref_kind << MN_REFERENCE_KIND_SHIFT);
         return;
     }
 }
@@ -676,8 +689,7 @@ void* __jnative_fn_java_lang_invoke_MethodHandleNatives_resolve__BLjava_lang_inv
 
     const char* name = NULL;
     if (name_str != NULL) {
-        int32_t name_len = 0;
-        name = __jnative_read_string_bytes(name_str, &name_len);
+        name = __jnative_read_string_bytes(name_str, NULL);
     }
 
     int32_t real_modifiers = 0;

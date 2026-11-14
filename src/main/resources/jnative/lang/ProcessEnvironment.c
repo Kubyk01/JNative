@@ -28,8 +28,8 @@ static void* pe_make_string(const WCHAR* w, int32_t n)
         if (latin1) {
             d[i] = (uint8_t)w[i];
         } else {
-            d[i * 2] = (uint8_t)(w[i] >> 8);
-            d[i * 2 + 1] = (uint8_t)(w[i] & 0xFF);
+            d[i * 2] = (uint8_t)(w[i] & 0xFF);
+            d[i * 2 + 1] = (uint8_t)(w[i] >> 8);
         }
     }
     d[bytes] = 0;
@@ -52,6 +52,54 @@ void* __jnative_fn_java_lang_ProcessEnvironment_environmentBlock___Ljava_lang_St
     void* s = pe_make_string(block, i);
     FreeEnvironmentStringsW(block);
     return s;
+}
+
+#else
+
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "jnative_runtime.h"
+
+#if defined(__APPLE__)
+#include <crt_externs.h>
+#define JNATIVE_ENVIRON (*_NSGetEnviron())
+#else
+extern char** environ;
+#define JNATIVE_ENVIRON environ
+#endif
+
+void* __jnative_fn_java_lang_ProcessEnvironment_environ_____B(void)
+{
+    char** env = JNATIVE_ENVIRON;
+    int32_t count = 0;
+    if (env != NULL) {
+        for (int32_t i = 0; env[i] != NULL; i++) {
+            const char* eq = strchr(env[i], '=');
+            if (eq != NULL && eq != env[i]) count++;
+        }
+    }
+
+    void* result = jnative_ref_array_of_class(NULL, count * 2, "[[B");
+    if (result == NULL) __jnative_throw_out_of_memory_error_ctx("ProcessEnvironment.environ");
+    if (count == 0) return result;
+
+    void** slots = (void**)jnative_array_data(result);
+    int32_t j = 0;
+    for (int32_t i = 0; env[i] != NULL && j < count; i++) {
+        const char* eq = strchr(env[i], '=');
+        if (eq == NULL || eq == env[i]) continue;
+        void* name = jnative_byte_array(env[i], (int32_t)(eq - env[i]));
+        void* value = jnative_byte_array(eq + 1, (int32_t)strlen(eq + 1));
+        if (name == NULL || value == NULL) {
+            __jnative_throw_out_of_memory_error_ctx("ProcessEnvironment.environ");
+        }
+        slots[2 * j] = name;
+        slots[2 * j + 1] = value;
+        j++;
+    }
+    return result;
 }
 
 #endif

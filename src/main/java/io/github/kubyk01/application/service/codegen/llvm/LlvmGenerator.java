@@ -4,7 +4,6 @@ import io.github.kubyk01.application.service.analyzer.dependencyresolver.Depende
 import io.github.kubyk01.application.service.analyzer.ssa.TypeResolver;
 import io.github.kubyk01.application.service.codegen.llvm.nativepolymorphicfunctionresolver.PolymorphicResolver;
 import io.github.kubyk01.domain.analyzer.ClinitScheduleEntry;
-import io.github.kubyk01.domain.analyzer.aliasanalysis.AliasAnalysisResult;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.ClassNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.FieldNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.FieldReference;
@@ -145,7 +144,7 @@ public class LlvmGenerator implements LlvmGeneratorPort {
     }
 
     public LlvmGenerator(Module module, DependencyResolver resolver,
-                         AliasAnalysisResult aliasResult,
+                         Set<String> pointsToStaticFields,
                          String entryClass, String entryMethod, String entryDescriptor,
                          ReflectInfo reflectInfo,
                          PolymorphicResolver polymorphicResolver) {
@@ -155,7 +154,7 @@ public class LlvmGenerator implements LlvmGeneratorPort {
         this.entryMethod = entryMethod;
         this.entryDescriptor = entryDescriptor;
         this.reflectInfo = reflectInfo;
-        this.globalEmitter = new LlvmGlobalEmitter(module, resolver, aliasResult, reflectInfo);
+        this.globalEmitter = new LlvmGlobalEmitter(module, resolver, pointsToStaticFields, reflectInfo);
         this.polymorphicResolverRef = polymorphicResolver;
     }
 
@@ -171,13 +170,41 @@ public class LlvmGenerator implements LlvmGeneratorPort {
 
     @Override
     public void generate(Path outputDir) throws IOException {
+        long maxUnitBytes = Long.parseLong(System.getProperty("jnative.llvmUnitBytes",
+                Long.toString(1024L * 1024L)));
+        if (maxUnitBytes < 0) {
+            throw new IllegalArgumentException("jnative.llvmUnitBytes must be nonnegative");
+        }
         Files.createDirectories(outputDir);
         ensureExternalDeclarations();
         generateLambdaAdaptors();
         globalEmitter.prepareLayouts();
 
+        Path spoolDir = outputDir.resolve(".jnative-spool");
+        deleteTree(spoolDir);
+        Files.createDirectories(spoolDir);
+        Path moduleSpool = spoolDir.resolve(".module.body");
+        Map<String, Path> classSpools = new LinkedHashMap<>();
+        globalEmitter.setAdaptorSink((className, text) -> {
+            try (java.io.Writer w = openSpool(classSpools.computeIfAbsent(className, k -> spoolPath(spoolDir, k)))) {
+                w.write(text);
+            } catch (IOException e) {
+                throw new java.io.UncheckedIOException(e);
+            }
+        });
+
         String structDefs   = globalEmitter.generateStructDefinitions();
-        String globalDefs   = globalEmitter.generateGlobalDefinitions();
+        Map<String, GlobalDecl> knownGlobals = new HashMap<>();
+        List<Path> globalSpools = new ArrayList<>();
+        for (java.util.function.Supplier<String> part : globalEmitter.globalDefinitionParts()) {
+            String text = part.get();
+            knownGlobals.putAll(parseGlobalDecls(text));
+            Path spool = spoolDir.resolve(".globals" + globalSpools.size());
+            try (java.io.Writer w = openSpool(spool)) {
+                w.write(text);
+            }
+            globalSpools.add(spool);
+        }
         String lambdaVts    = globalEmitter.emitLambdaVtables();
 
         // The lambda struct text and the reflection ABI types take part in the
@@ -196,12 +223,12 @@ public class LlvmGenerator implements LlvmGeneratorPort {
         preludeDefs.putAll(parseSingleLineDefinitions(extraStructsText));
         preludeDefs.putAll(parseSingleLineDefinitions(structDefs));
         preludeDefs.putAll(parseSingleLineDefinitions(LlvmRuntime.getDeclarations()));
+        RegionSet preludeKeys = new RegionSet(preludeDefs.size());
+        for (String k : preludeDefs.keySet()) preludeKeys.add(k);
 
-        // ---- 1. Emit EVERY function body, grouped by owner class. The
-        //         bodies are accumulated in memory rather than streamed,
-        //         because the deferred strings they register are only known
-        //         once emission is finished. (Typically tens-to-hundreds of
-        //         MB, which fits the heap.) ----
+        // ---- 1. Emit EVERY function body, grouped by owner class. Bodies
+        //         are emitted in batches and spooled to one file per class,
+        //         so the heap never holds the whole program's IR text. ----
         List<Function> toEmit = new ArrayList<>();
         for (Function f : module.getFunctions()) {
             if (f.getEntryBlock() != null) toEmit.add(f);
@@ -209,31 +236,66 @@ public class LlvmGenerator implements LlvmGeneratorPort {
         toEmit.sort(Comparator.comparing(f ->
             f.getOwnerClass() == null ? "" : f.getOwnerClass()));
 
-        List<String> bodies = LlvmUtil.parallelMapOrdered(toEmit, scheduler, func -> {
-            LlvmFunctionEmitter emitter = new LlvmFunctionEmitter(
-                module, globalEmitter, polymorphicResolverRef, resolver);
-            return emitter.emitFunction(func);
-        });
 
-        Map<String, StringBuilder> classBodies = new LinkedHashMap<>();
-        StringBuilder moduleBodies = new StringBuilder();
-        for (int i = 0; i < toEmit.size(); i++) {
-            Function func = toEmit.get(i);
-            String body = bodies.get(i);
-            String owner = func.getOwnerClass();
-            if (owner != null && !owner.isEmpty()) {
-                classBodies.computeIfAbsent(owner, k -> new StringBuilder()).append(body);
-            } else {
-                moduleBodies.append(body);
-            }
-        }
+        int totalToEmit = toEmit.size();
+        int batchSize = INITIAL_EMIT_BATCH;
+        int from = 0;
+        String openOwner = null;
+        java.io.Writer openWriter = null;
+        try {
+            while (from < totalToEmit) {
+                int end = Math.min(from + batchSize, totalToEmit);
+                List<Function> batch = new ArrayList<>(toEmit.subList(from, end));
+                List<String> bodies = LlvmUtil.parallelMapOrdered(batch, scheduler, func -> {
+                    LlvmFunctionEmitter emitter = new LlvmFunctionEmitter(
+                        module, globalEmitter, polymorphicResolverRef, resolver);
+                    return emitter.emitFunction(func);
+                });
+                long batchBytes = 0L;
+                for (int i = 0; i < batch.size(); i++) {
+                    Function func = batch.get(i);
+                    String body = bodies.get(i);
+                    String owner = func.getOwnerClass();
+                    String key = owner == null ? "" : owner;
+                    if (!key.equals(openOwner)) {
+                        if (openWriter != null) {
+                            openWriter.close();
+                            openWriter = null;
+                        }
+                        Path spool = key.isEmpty()
+                            ? moduleSpool
+                            : classSpools.computeIfAbsent(key, k -> spoolPath(spoolDir, k));
+                        openWriter = openSpool(spool);
+                        openOwner = key;
+                    }
+                    openWriter.write(body);
+                    batchBytes += body.length();
+                    bodies.set(i, null);
+                }
+                from = end;
 
-        Map<String, Set<String>> functionsByOwner = new HashMap<>();
-        for (Function f : toEmit) {
-            String owner = f.getOwnerClass();
-            if (owner != null && !owner.isEmpty()) {
-                functionsByOwner.computeIfAbsent(owner, k -> new HashSet<>()).add(f.getName());
+                if (batchBytes > TARGET_EMIT_BATCH_BYTES && batchSize > MIN_EMIT_BATCH) {
+                    int next = Math.max(MIN_EMIT_BATCH, batchSize / 2);
+                    System.out.println("IR bodies: " + from + "/" + totalToEmit
+                        + " function(s), batch=" + batch.size()
+                        + " " + (batchBytes / (1024 * 1024)) + " MB, shrinking "
+                        + batchSize + " -> " + next);
+                    batchSize = next;
+                } else if (batchBytes < TARGET_EMIT_BATCH_BYTES / 4 && batchSize < MAX_EMIT_BATCH) {
+                    int next = Math.min(MAX_EMIT_BATCH, batchSize * 2);
+                    System.out.println("IR bodies: " + from + "/" + totalToEmit
+                        + " function(s), batch=" + batch.size()
+                        + " " + (batchBytes / (1024 * 1024)) + " MB, growing "
+                        + batchSize + " -> " + next);
+                    batchSize = next;
+                } else {
+                    System.out.println("IR bodies: " + from + "/" + totalToEmit
+                        + " function(s), batch=" + batch.size()
+                        + " " + (batchBytes / (1024 * 1024)) + " MB");
+                }
             }
+        } finally {
+            if (openWriter != null) openWriter.close();
         }
 
         // ---- 2. Deferred strings are now fully known. Collect them. ----
@@ -241,8 +303,10 @@ public class LlvmGenerator implements LlvmGeneratorPort {
 
         // ---- 3. knownGlobals = every definition that lives in _module.ll,
         //         deferred strings included. ----
-        Map<String, GlobalDecl> knownGlobals =
-            parseGlobalDecls(globalDefs + "\n" + lambdaVts + "\n" + deferred);
+        // Parsed one by one rather than concatenated: globalDefs is the
+        // largest string in the generator and a joined copy doubles it.
+        knownGlobals.putAll(parseGlobalDecls(lambdaVts));
+        knownGlobals.putAll(parseGlobalDecls(deferred));
 
         // ---- 4. Functions without bodies: declarations for _module.ll. ----
         //         moduleAvailable = everything already defined OR declared in
@@ -256,15 +320,33 @@ public class LlvmGenerator implements LlvmGeneratorPort {
                 moduleAvailable.add(f.getName());
             }
         }
+        boolean jniResolveDeclared = false;
         for (Function func : new ArrayList<>(module.getFunctions())) {
             if (func.getEntryBlock() == null
+                && func.isJniNative()
+                && func.getJniMethodName() != null
                 && moduleAvailable.add(func.getName())) {
+                if (!jniResolveDeclared) {
+                    moduleDecls.append("declare i8* @__jnative_jni_resolve(i8**, i8*, i8*, i8*, i8*, i8*)\n");
+                    jniResolveDeclared = true;
+                }
+                moduleDecls.append(emitJniTrampoline(func));
+                continue;
+            }
+            if (func.getEntryBlock() == null
+                && moduleAvailable.add(func.getName())) {
+                if (func.getName().startsWith("__jnative_fn_")
+                    && !func.getName().startsWith("__jnative_fn_java_lang_invoke_MethodHandle_invoke")) {
+                    moduleDecls.append(emitWeakNativeDefault(func));
+                    continue;
+                }
                 moduleDecls.append(emitDeclaration(func));
                 if (func.getName().startsWith("__jnative_fn_java_lang_invoke_MethodHandle_invoke")) {
-                    classBodies.computeIfAbsent("java/lang/invoke/MethodHandle", k -> new StringBuilder())
-                        .append(emitWeakDefaultDefinition(func));
-                    functionsByOwner.computeIfAbsent("java/lang/invoke/MethodHandle", k -> new HashSet<>())
-                        .add(func.getName());
+                    Path spool = classSpools.computeIfAbsent(
+                        "java/lang/invoke/MethodHandle", k -> spoolPath(spoolDir, k));
+                    try (java.io.Writer w = openSpool(spool)) {
+                        w.write(emitWeakDefaultDefinition(func));
+                    }
                 }
             }
         }
@@ -280,54 +362,128 @@ public class LlvmGenerator implements LlvmGeneratorPort {
         // not double-count it.
         String runInit = generateRunAllInitializers();
         String main = generateMain();
+        String moduleBodies = Files.exists(moduleSpool)
+            ? Files.readString(moduleSpool, StandardCharsets.UTF_8)
+            : "";
+        Files.deleteIfExists(moduleSpool);
 
-        String moduleTail = globalDefs
-            + "\n" + lambdaVts
+        String moduleTail = lambdaVts
             + "\n" + deferred
             + "\n" + moduleBodies
             + moduleDecls
             + runInit
             + main;
+        moduleBodies = null;
 
-        String moduleExterns = buildExterns(
-            moduleTail,
-            moduleAvailable,
-            Collections.emptyMap(),
-            module);
+        String moduleExterns = buildExterns(moduleTail, knownGlobals, module);
 
         String modulePrelude = buildFilteredPrelude(
-            moduleTail + "\n" + moduleExterns, preludeDefs);
+            moduleTail, moduleExterns, preludeDefs, preludeKeys);
 
-        String moduleSb = modulePrelude
-            + moduleExterns
-            + moduleTail;
+        writeLl(outputDir.resolve("_module.ll"), modulePrelude, moduleExterns, moduleTail);
+        moduleTail = null;
 
-        Path modulePath = outputDir.resolve("_module.ll");
-        Files.writeString(modulePath, moduleSb, StandardCharsets.UTF_8);
+        for (int gi = 0; gi < globalSpools.size(); gi++) {
+            String body = Files.readString(globalSpools.get(gi), StandardCharsets.UTF_8);
+            Files.deleteIfExists(globalSpools.get(gi));
+            String externs = buildExterns(body, knownGlobals, module);
+            writeLl(outputDir.resolve("_globals" + gi + ".ll"),
+                buildFilteredPrelude(body, externs, preludeDefs, preludeKeys), externs, body);
+        }
 
-        // ---- 6. Write one .ll file per class. ----
-        // Each file is independent: it reads only the immutable emission
-        // results and the module. Building and writing them in parallel
-        // keeps the single-threaded tail of the compiler short.
-        LlvmUtil.parallelMapOrdered(new ArrayList<>(classBodies.entrySet()), scheduler, e -> {
-            String className = e.getKey();
-            String body = e.getValue().toString();
+        // Embedded resources get their own translation unit, streamed byte by
+        // byte: as IR text they are several times their raw size and holding
+        // them in globalDefs ran the heap out (OutOfMemoryError in
+        // generateGlobalDefinitions). Only C references these symbols.
+        try (var w = Files.newBufferedWriter(outputDir.resolve("_resources.ll"),
+                StandardCharsets.UTF_8)) {
+            w.write(targetPlatform.preamble());
+            w.write("%JNativeResourceEntry = type { i8*, i8*, i32 }\n");
+            globalEmitter.writeEmbeddedResources(w);
+        }
 
-            Set<String> definedHere = functionsByOwner.getOrDefault(className, Set.of());
-
-            String externs = buildExterns(body, definedHere, knownGlobals, module);
-
-            String prelude = buildFilteredPrelude(body + "\n" + externs, preludeDefs);
-
+        List<ClassUnit> classUnits = partitionClassBodies(classSpools, maxUnitBytes);
+        LlvmUtil.parallelMapOrdered(classUnits, scheduler, unit -> {
             try {
-                Path out = outputDir.resolve(className + ".ll");
+                String body = readClassBodies(unit.bodies());
+                String externs = buildExterns(body, knownGlobals, module);
+                String prelude = buildFilteredPrelude(body, externs, preludeDefs, preludeKeys);
+                Path out = outputDir.resolve(unit.name() + ".ll");
                 if (out.getParent() != null) Files.createDirectories(out.getParent());
-                Files.writeString(out, prelude + externs + body, StandardCharsets.UTF_8);
+                writeLl(out, prelude, externs, body);
+                for (Path source : unit.bodies()) {
+                    Files.deleteIfExists(source);
+                }
             } catch (IOException ex) {
                 throw new java.io.UncheckedIOException(ex);
             }
-            return className;
+            return unit.name();
         });
+        deleteTree(spoolDir);
+    }
+
+    private static final int MIN_EMIT_BATCH = 64;
+    private static final int MAX_EMIT_BATCH = 4096;
+    private static final int INITIAL_EMIT_BATCH = 256;
+    private static final long TARGET_EMIT_BATCH_BYTES = 32L * 1024 * 1024;
+
+    private record ClassUnit(String name, List<Path> bodies) {}
+
+    private static List<ClassUnit> partitionClassBodies(Map<String, Path> classSpools,
+                                                       long maxUnitBytes) throws IOException {
+        List<ClassUnit> units = new ArrayList<>();
+        List<Path> bodies = new ArrayList<>();
+        List<Map.Entry<String, Path>> classes = new ArrayList<>(classSpools.entrySet());
+        classes.sort(Map.Entry.comparingByKey());
+        long bytes = 0;
+        String firstClass = null;
+        for (Map.Entry<String, Path> entry : classes) {
+            long size = Files.size(entry.getValue());
+            if (!bodies.isEmpty() && (maxUnitBytes == 0 || size > maxUnitBytes - bytes)) {
+                units.add(new ClassUnit(firstClass, List.copyOf(bodies)));
+                bodies.clear();
+                bytes = 0;
+            }
+            if (bodies.isEmpty()) firstClass = entry.getKey();
+            bodies.add(entry.getValue());
+            bytes += size;
+        }
+        if (!bodies.isEmpty()) {
+            units.add(new ClassUnit(firstClass, List.copyOf(bodies)));
+        }
+        return units;
+    }
+
+    private static String readClassBodies(List<Path> sources) throws IOException {
+        if (sources.size() == 1) {
+            return Files.readString(sources.getFirst(), StandardCharsets.UTF_8);
+        }
+        StringBuilder body = new StringBuilder();
+        for (Path source : sources) {
+            body.append(Files.readString(source, StandardCharsets.UTF_8)).append('\n');
+        }
+        return body.toString();
+    }
+
+    private static Path spoolPath(Path spoolDir, String className) {
+        return spoolDir.resolve(className + ".body");
+    }
+
+    private static java.io.Writer openSpool(Path spool) throws IOException {
+        if (spool.getParent() != null) Files.createDirectories(spool.getParent());
+        return Files.newBufferedWriter(spool, StandardCharsets.UTF_8,
+            java.nio.file.StandardOpenOption.CREATE,
+            java.nio.file.StandardOpenOption.WRITE,
+            java.nio.file.StandardOpenOption.APPEND);
+    }
+
+    private static void deleteTree(Path root) throws IOException {
+        if (!Files.exists(root)) return;
+        List<Path> paths;
+        try (java.util.stream.Stream<Path> walk = Files.walk(root)) {
+            paths = walk.sorted(Comparator.reverseOrder()).toList();
+        }
+        for (Path p : paths) Files.deleteIfExists(p);
     }
 
     /**
@@ -352,19 +508,23 @@ public class LlvmGenerator implements LlvmGeneratorPort {
      * </ol>
      */
     private String buildFilteredPrelude(String bodyContent,
-                                        Map<String, String> allDefs) {
+                                        String externs,
+                                        Map<String, String> allDefs,
+                                        RegionSet defKeys) {
 
-        // Transitive closure of the set of used names.
+        // Transitive closure of the set of used names. The two texts are
+        // scanned separately instead of concatenating a copy of the body.
         Set<String> needed = new LinkedHashSet<>();
         Deque<String> worklist = new ArrayDeque<>();
 
-        seedFilter(needed, worklist, allDefs, bodyContent);
+        seedFilter(needed, worklist, defKeys, bodyContent);
+        seedFilter(needed, worklist, defKeys, externs);
 
         while (!worklist.isEmpty()) {
             String name = worklist.poll();
             String def = allDefs.get(name);
             if (def == null) continue;
-            seedFilter(needed, worklist, allDefs, def);
+            seedFilter(needed, worklist, defKeys, def);
         }
 
         StringBuilder sb = new StringBuilder();
@@ -438,7 +598,7 @@ public class LlvmGenerator implements LlvmGeneratorPort {
      */
     private static void seedFilter(Set<String> needed,
                                    Deque<String> worklist,
-                                   Map<String, String> allDefs,
+                                   RegionSet defKeys,
                                    String text) {
         if (text == null || text.isEmpty()) return;
 
@@ -463,6 +623,7 @@ public class LlvmGenerator implements LlvmGeneratorPort {
             if (c == '%' || c == '@') {
                 int start = i;
                 int j = i + 1;
+                int h = c; // String.hashCode polynomial over the token, sigil included
                 while (j < n) {
                     char d = text.charAt(j);
                     boolean ident =
@@ -471,11 +632,12 @@ public class LlvmGenerator implements LlvmGeneratorPort {
                         || (d >= '0' && d <= '9')
                         || d == '_' || d == '.' || d == '$' || d == '-';
                     if (!ident) break;
+                    h = 31 * h + d;
                     j++;
                 }
                 if (j > start + 1) {
-                    String key = text.substring(start, j);
-                    if (allDefs.containsKey(key) && needed.add(key)) {
+                    String key = defKeys.find(text, start, j, h); // no substring per token
+                    if (key != null && needed.add(key)) {
                         worklist.add(key);
                     }
                 }
@@ -559,7 +721,7 @@ public class LlvmGenerator implements LlvmGeneratorPort {
             int typeEnd = scanTypeToken(src, j, limit);
             if (typeEnd > j && !isPrivate && !name.isEmpty()) {
                 out.put(name.substring(1),                       // strip '@'
-                    new GlobalDecl(src.substring(j, typeEnd), isConst));
+                    new GlobalDecl(src.substring(j, typeEnd).intern(), isConst));
             }
             i = skipInitializer(src, Math.max(typeEnd, j), n);
         }
@@ -711,7 +873,7 @@ public class LlvmGenerator implements LlvmGeneratorPort {
      * </pre>
      *
      * <p>The character set below matches the one used by
-     * {@link #seedFilter(Set, Deque, Map, String)} and by every symbol
+     * {@link #seedFilter(Set, Deque, RegionSet, String)} and by every symbol
      * that {@code LlvmRuntime.mangleMethod} actually produces.</p>
      *
      * <p>The body of a typical class references a few dozen globals, so the
@@ -719,34 +881,21 @@ public class LlvmGenerator implements LlvmGeneratorPort {
      * whole-module extern list would be.</p>
      */
     private String buildExterns(String bodyContent,
-                                Set<String> definedHere,
                                 Map<String, GlobalDecl> knownGlobals,
                                 Module module) {
-        Set<String> used = new HashSet<>();
-        int i = 0, n = bodyContent.length();
-        while ((i = bodyContent.indexOf("@", i)) >= 0) {
-            int j = i + 1;
-            while (j < n) {
-                char c = bodyContent.charAt(j);
-                // a-zA-Z0-9_ . $ - — the exact set LLVM accepts in
-                // unquoted identifiers and the exact set the mangler
-                // produces.
-                if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
-                    || (c >= '0' && c <= '9') || c == '_' || c == '.'
-                    || c == '$' || c == '-') {
-                    j++;
-                } else {
-                    break;
-                }
-            }
-            if (j > i + 1) used.add(bodyContent.substring(i + 1, j));
-            i = j;
+        List<String> used = collectUsedSymbols(bodyContent);
+        Set<String> definedHere = collectLocalDefinitions(bodyContent);
+        String adapters = buildJniAliasAdapters(used, definedHere, module);
+        if (!adapters.isEmpty()) {
+            // Only the adapter text is new; scan it instead of the whole body again.
+            java.util.TreeSet<String> all = new java.util.TreeSet<>(used);
+            all.addAll(collectUsedSymbols(adapters));
+            used = new ArrayList<>(all);
+            definedHere.addAll(collectLocalDefinitions(adapters));
         }
 
-        StringBuilder sb = new StringBuilder();
-        List<String> sorted = new ArrayList<>(used);
-        Collections.sort(sorted);
-        for (String name : sorted) {
+        StringBuilder sb = new StringBuilder(adapters);
+        for (String name : used) {
             if (name.startsWith("llvm.")) continue;
             if (definedHere.contains(name)) continue;
             GlobalDecl d = knownGlobals.get(name);
@@ -762,15 +911,203 @@ public class LlvmGenerator implements LlvmGeneratorPort {
             }
             Function func = module.getFunction(name);
             if (func != null) {
-                sb.append(emitDeclaration(func));
+                String stub = func.getEntryBlock() == null && name.startsWith("__jnative_fn_")
+                    ? weakNativeStub(name, bodyContent, adapters)
+                    : null;
+                sb.append(stub != null ? stub : emitDeclaration(func));
+                continue;
+            }
+            if (name.startsWith("refclass_")) {
+                sb.append("@").append(name).append(" = extern_weak global %ReflectionClass\n");
+                continue;
+            }
+            if (name.startsWith("__jnative_fn_")) {
+                String stub = weakNativeStub(name, bodyContent, adapters);
+                if (stub != null) sb.append(stub);
             }
         }
         return sb.toString();
     }
 
+    /** Unique {@code @symbol} names in the text, sorted. */
+    private static List<String> collectUsedSymbols(String bodyContent) {
+        RegionSet used = new RegionSet(256);
+        int i = 0, n = bodyContent.length();
+        while ((i = bodyContent.indexOf('@', i)) >= 0) {
+            int j = i + 1;
+            int h = 0;
+            while (j < n) {
+                char c = bodyContent.charAt(j);
+                // a-zA-Z0-9_ . $ - — the exact set LLVM accepts in
+                // unquoted identifiers and the exact set the mangler
+                // produces.
+                if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+                    || (c >= '0' && c <= '9') || c == '_' || c == '.'
+                    || c == '$' || c == '-') {
+                    h = 31 * h + c;
+                    j++;
+                } else {
+                    break;
+                }
+            }
+            if (j > i + 1) used.addRegion(bodyContent, i + 1, j, h); // allocates only first sighting
+            i = j;
+        }
+
+        List<String> out = used.toList();
+        Collections.sort(out);
+        return out;
+    }
+
+    private String buildJniAliasAdapters(List<String> sortedUsed, Set<String> definedHere, Module module) {
+        StringBuilder sb = new StringBuilder();
+        for (String name : sortedUsed) {
+            if (definedHere.contains(name)) continue;
+            Function func = module.getFunction(name);
+            if (func == null || !func.isJniNative() || func.getJniMethodName() == null) continue;
+            if (func.getEntryBlock() != null || func.getName().equals(name)) continue;
+
+            String ret = LlvmTypeMapper.toLlvmType(func.getReturnType());
+            List<String> types = new ArrayList<>();
+            for (Parameter p : func.getParameters()) {
+                types.add(LlvmTypeMapper.toLlvmType(LlvmTypeMapper.toCAbiType(p.getType())));
+            }
+            StringBuilder params = new StringBuilder();
+            StringBuilder args = new StringBuilder("i8* %env");
+            if (func.isStaticJniNative()) {
+                args.append(", i8* bitcast (%ReflectionClass* ")
+                    .append(globalEmitter.getRefClassGlobalName(func.getOwnerClass()))
+                    .append(" to i8*)");
+            }
+            for (int k = 0; k < types.size(); k++) {
+                if (k > 0) params.append(", ");
+                params.append(types.get(k)).append(" %a").append(k);
+                args.append(", ").append(types.get(k)).append(" %a").append(k);
+            }
+            sb.append("define weak ").append(ret).append(" @").append(name)
+              .append("(").append(params).append(") {\n");
+            sb.append("  %env = call i8* @__jnative_get_jnienv()\n");
+            if ("void".equals(ret)) {
+                sb.append("  call void @").append(func.getName()).append("(").append(args).append(")\n");
+                sb.append("  ret void\n");
+            } else {
+                sb.append("  %r = call ").append(ret).append(" @").append(func.getName())
+                  .append("(").append(args).append(")\n");
+                sb.append("  ret ").append(ret).append(" %r\n");
+            }
+            sb.append("}\n");
+        }
+        return sb.toString();
+    }
+
+    private static Set<String> collectLocalDefinitions(String body) {
+        Set<String> out = new HashSet<>();
+        int n = body.length();
+        int i = 0;
+        while (i < n) {
+            int eol = body.indexOf('\n', i);
+            if (eol < 0) eol = n;
+            int start = i;
+            if (body.startsWith("define ", start) || body.startsWith("declare ", start)) {
+                int at = body.indexOf(" @", start);
+                if (at >= 0 && at < eol) {
+                    int paren = body.indexOf('(', at);
+                    if (paren > at && paren < eol) out.add(body.substring(at + 2, paren));
+                }
+            } else if (body.charAt(start) == '@') {
+                int end = start + 1;
+                while (end < eol && body.charAt(end) != ' ' && body.charAt(end) != '=') end++;
+                if (end > start + 1) out.add(body.substring(start + 1, end));
+            }
+            i = eol + 1;
+        }
+        return out;
+    }
+
+    /** Stub from the first call site in {@code body}, else in {@code extra} (the two were once one concatenated string). */
+    private static List<String> lambdaMarkerInterfaces(InvokeDynamicInfo info) {
+        List<String> out = new ArrayList<>();
+        Handle bsm = info.bootstrapMethod();
+        if (bsm == null || !"altMetafactory".equals(bsm.getName())) return out;
+        Object[] args = info.bootstrapArgs();
+        if (args == null || args.length < 4 || !(args[3] instanceof Integer flags)) return out;
+        int i = 4;
+        if ((flags & java.lang.invoke.LambdaMetafactory.FLAG_MARKERS) != 0
+                && i < args.length && args[i] instanceof Integer count) {
+            i++;
+            for (int k = 0; k < count && i < args.length; k++, i++) {
+                if (args[i] instanceof org.objectweb.asm.Type t
+                        && t.getSort() == org.objectweb.asm.Type.OBJECT) {
+                    out.add(t.getInternalName());
+                }
+            }
+        }
+        if ((flags & java.lang.invoke.LambdaMetafactory.FLAG_SERIALIZABLE) != 0) {
+            out.add("java/io/Serializable");
+        }
+        return out;
+    }
+
+    private static String weakNativeStub(String name, String body, String extra) {
+        String stub = weakNativeStub(name, body);
+        return stub != null || extra.isEmpty() ? stub : weakNativeStub(name, extra);
+    }
+
+    private static void writeLl(Path out, String prelude, String externs, String body) throws IOException {
+        try (var w = Files.newBufferedWriter(out, StandardCharsets.UTF_8)) {
+            w.write(prelude);
+            w.write(externs);
+            w.write(body);
+        }
+    }
+
+    private static String weakNativeStub(String name, String body) {
+        String key = " @" + name + "(";
+        int at = body.indexOf(key);
+        if (at < 0) return null;
+        int lineStart = body.lastIndexOf('\n', at) + 1;
+        int callIdx = body.lastIndexOf("call ", at);
+        if (callIdx < lineStart) return null;
+        String ret = body.substring(callIdx + 5, at).trim();
+        if (ret.isEmpty()) return null;
+
+        List<String> types = new ArrayList<>();
+        int p = at + key.length();
+        int argStart = p;
+        int depth = 1;
+        for (; p < body.length() && depth > 0; p++) {
+            char c = body.charAt(p);
+            if (c == '(' || c == '[' || c == '{') {
+                depth++;
+            } else if (c == ')' || c == ']' || c == '}') {
+                depth--;
+                if (depth == 0) addArgType(types, body.substring(argStart, p));
+            } else if (c == ',' && depth == 1) {
+                addArgType(types, body.substring(argStart, p));
+                argStart = p + 1;
+            }
+        }
+        if (depth != 0) return null;
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("define weak ").append(ret).append(" @").append(name).append("(")
+          .append(String.join(", ", types)).append(") {\n  ret ").append(ret);
+        if (!"void".equals(ret)) sb.append(" zeroinitializer");
+        sb.append("\n}\n");
+        return sb.toString();
+    }
+
+    private static void addArgType(List<String> types, String arg) {
+        String a = arg.trim();
+        if (a.isEmpty()) return;
+        int sp = a.indexOf(' ');
+        types.add(sp < 0 ? a : a.substring(0, sp));
+    }
+
     private void ensureExternalDeclarations() {
         resolver.forceLoadSystemClass("java/lang/Object");
         resolver.forceLoadSystemClass("java/lang/Class");
+        resolver.forceLoadSystemClass("java/lang/NoClassDefFoundError");
         // Class.getModule() reads the `module` slot of every @refclass_*
         // constant, and the slot points at the unnamed-module singleton that
         // generateUnnamedModule() emits. Without this class the emitter has
@@ -902,8 +1239,100 @@ public class LlvmGenerator implements LlvmGeneratorPort {
         }
     }
 
+    private static List<String> jniParamTypes(Function func) {
+        List<String> types = new ArrayList<>();
+        types.add("i8*");
+        if (func.isStaticJniNative()) types.add("i8*");
+        for (Parameter p : func.getParameters()) {
+            types.add(LlvmTypeMapper.toLlvmType(LlvmTypeMapper.toCAbiType(p.getType())));
+        }
+        return types;
+    }
+
+    private static String jniStringConstant(StringBuilder defs, String global, String value) {
+        byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
+        StringBuilder lit = new StringBuilder();
+        for (byte b : bytes) {
+            int c = b & 0xFF;
+            if (c >= 0x20 && c < 0x7F && c != '"' && c != '\\') {
+                lit.append((char) c);
+            } else {
+                lit.append('\\').append(String.format("%02X", c));
+            }
+        }
+        int len = bytes.length + 1;
+        defs.append(global).append(" = private unnamed_addr constant [").append(len)
+            .append(" x i8] c\"").append(lit).append("\\00\"\n");
+        return "i8* getelementptr inbounds ([" + len + " x i8], [" + len + " x i8]* "
+            + global + ", i32 0, i32 0)";
+    }
+
+    private String emitJniTrampoline(Function func) {
+        String sym = func.getName();
+        String owner = func.getOwnerClass();
+        String method = func.getJniMethodName();
+        String desc = func.getJniDescriptor();
+        String[] values = {
+            owner, method, desc,
+            LlvmRuntime.toJniSymbolName(owner, method, desc, 1),
+            LlvmRuntime.toJniSymbolName(owner, method, desc, 2)
+        };
+
+        StringBuilder sb = new StringBuilder();
+        String slot = "@__jni_slot_" + sym;
+        sb.append(slot).append(" = internal global i8* null\n");
+        List<String> refs = new ArrayList<>();
+        for (int i = 0; i < values.length; i++) {
+            refs.add(jniStringConstant(sb, "@__jni_s" + i + "_" + sym, values[i]));
+        }
+
+        List<String> types = jniParamTypes(func);
+        String ret = LlvmTypeMapper.toLlvmType(func.getReturnType());
+        boolean boolRet = func.getReturnType() == Type.BOOLEAN;
+        String nativeRet = boolRet ? "i8" : ret;
+
+        StringBuilder params = new StringBuilder();
+        StringBuilder args = new StringBuilder();
+        for (int i = 0; i < types.size(); i++) {
+            if (i > 0) {
+                params.append(", ");
+                args.append(", ");
+            }
+            params.append(types.get(i)).append(" %a").append(i);
+            args.append(types.get(i)).append(" %a").append(i);
+        }
+
+        sb.append("define weak ").append(ret).append(" @").append(sym)
+          .append("(").append(params).append(") {\n");
+        sb.append("  %fp = call i8* @__jnative_jni_resolve(i8** ").append(slot);
+        for (String r : refs) sb.append(", ").append(r);
+        sb.append(")\n");
+        sb.append("  %fn = bitcast i8* %fp to ").append(nativeRet)
+          .append(" (").append(String.join(", ", types)).append(")*\n");
+        if ("void".equals(ret)) {
+            sb.append("  call void %fn(").append(args).append(")\n");
+            sb.append("  ret void\n");
+        } else {
+            sb.append("  %r = call ").append(nativeRet).append(" %fn(").append(args).append(")\n");
+            if (boolRet) {
+                sb.append("  %b = icmp ne i8 %r, 0\n");
+                sb.append("  ret i1 %b\n");
+            } else {
+                sb.append("  ret ").append(ret).append(" %r\n");
+            }
+        }
+        sb.append("}\n");
+        return sb.toString();
+    }
+
     private String emitDeclaration(Function func) {
         StringBuilder sb = new StringBuilder();
+        if (func.isJniNative() && func.getEntryBlock() == null && func.getJniMethodName() != null) {
+            sb.append("declare ").append(LlvmTypeMapper.toLlvmType(func.getReturnType()))
+              .append(" @").append(func.getName()).append("(")
+              .append(String.join(", ", jniParamTypes(func))).append(")\n");
+            return sb.toString();
+        }
         sb.append("declare ").append(LlvmTypeMapper.toLlvmType(func.getReturnType()))
             .append(" @").append(func.getName()).append("(");
         List<Parameter> params = func.getParameters();
@@ -913,6 +1342,28 @@ public class LlvmGenerator implements LlvmGeneratorPort {
             sb.append(LlvmTypeMapper.toLlvmType(func.getEntryBlock() == null ? LlvmTypeMapper.toCAbiType(pt) : pt));
         }
         sb.append(")\n");
+        return sb.toString();
+    }
+
+    private static boolean isJdkClass(String owner) {
+        if (owner == null) return true;
+        return owner.startsWith("java/") || owner.startsWith("javax/")
+            || owner.startsWith("jdk/") || owner.startsWith("sun/")
+            || owner.startsWith("com/sun/");
+    }
+
+    private String emitWeakNativeDefault(Function func) {
+        String ret = LlvmTypeMapper.toLlvmType(func.getReturnType());
+        StringBuilder sb = new StringBuilder();
+        sb.append("define weak ").append(ret).append(" @").append(func.getName()).append("(");
+        List<Parameter> params = func.getParameters();
+        for (int i = 0; i < params.size(); i++) {
+            if (i > 0) sb.append(", ");
+            sb.append(LlvmTypeMapper.toLlvmType(LlvmTypeMapper.toCAbiType(params.get(i).getType())));
+        }
+        sb.append(") {\n  ret ").append(ret);
+        if (!"void".equals(ret)) sb.append(" zeroinitializer");
+        sb.append("\n}\n");
         return sb.toString();
     }
 
@@ -953,7 +1404,7 @@ public class LlvmGenerator implements LlvmGeneratorPort {
         } else {
             log.warn("java.lang.String.<clinit> is missing from the module; "
                 + "COMPACT_STRINGS will default to false and every String.length() "
-                + "will be halved. Check that ReachabilityAnalysis triggers "
+                + "will be halved. Check that ClassAnalysis triggers "
                 + "triggerClinit(\"java/lang/String\", ...) and that the class has "
                 + "bytecode available.");
         }
@@ -1066,7 +1517,7 @@ public class LlvmGenerator implements LlvmGeneratorPort {
                 log.warn("jdk.internal.misc.UnsafeConstants.<clinit> is "
                     + "missing from the module; Unsafe.ADDRESS_SIZE will "
                     + "be read as 0 and every Unsafe.allocateMemory() call "
-                    + "will return NULL. Check that ReachabilityAnalysis "
+                    + "will return NULL. Check that ClassAnalysis "
                     + "triggers clinit on UnsafeConstants when Unsafe.<clinit> "
                     + "reads its fields.");
             }
@@ -1200,6 +1651,9 @@ public class LlvmGenerator implements LlvmGeneratorPort {
         int bootstrapPhaseIdx = 0;
         List<ClinitScheduleEntry> currentBatch = new ArrayList<>();
         int batchIdCounter = 0;
+        boolean jniPreloaded = false;
+        boolean systemPropsInitialized = false;
+        globals.append("declare void @__jnative_jni_preload_bundled()\n");
 
         for (ClinitScheduleEntry entry : clinitSchedule) {
             Function f = entry.function();
@@ -1207,6 +1661,15 @@ public class LlvmGenerator implements LlvmGeneratorPort {
 
             if (bootstrapPrereqNames.contains(name)) continue;
             if (name.equals(hashedModulesClinitName)) continue;
+
+            if (!jniPreloaded && !entry.bootstrapPhase() && !isJdkClass(f.getOwnerClass())) {
+                if (!currentBatch.isEmpty()) {
+                    emitParallelBatch(sb, globals, currentBatch, batchIdCounter++);
+                    currentBatch.clear();
+                }
+                sb.append("  call void @__jnative_jni_preload_bundled()\n");
+                jniPreloaded = true;
+            }
 
             // Deferred clinits are NOT in clinitSchedule: Analyzer.sortInitializers
             // removes them before emitting the schedule so that Stage 4 cannot
@@ -1223,6 +1686,9 @@ public class LlvmGenerator implements LlvmGeneratorPort {
                 // the result. The arguments are taken from the phase's real
                 // signature, so initPhase2(ZZ)I and initPhase1()V are
                 // handled correctly and without hard-coding.
+                if ("java/lang/System".equals(f.getOwnerClass()) && name.contains("_initPhase1_")) {
+                    systemPropsInitialized = true;
+                }
                 Type retType = f.getReturnType();
                 String retLlvm = LlvmTypeMapper.toLlvmType(retType);
 
@@ -1281,6 +1747,9 @@ public class LlvmGenerator implements LlvmGeneratorPort {
         }
         if (!currentBatch.isEmpty()) {
             emitParallelBatch(sb, globals, currentBatch, batchIdCounter++);
+        }
+        if (!jniPreloaded) {
+            sb.append("  call void @__jnative_jni_preload_bundled()\n");
         }
 
         // ------------------------------------------------------------------
@@ -1347,9 +1816,11 @@ public class LlvmGenerator implements LlvmGeneratorPort {
         // after the general <clinit> schedule, so any <clinit> that read
         // the bootstrap table has already seen a consistent snapshot.
         // ------------------------------------------------------------------
-        sb.append("  %final_props = call i8* @__jnative_make_bootstrap_props(")
-            .append(offsetArgs).append(")\n");
-        sb.append("  store i8* %final_props, i8** @gv_java_lang_System_props\n");
+        if (!systemPropsInitialized) {
+            sb.append("  %final_props = call i8* @__jnative_make_bootstrap_props(")
+                .append(offsetArgs).append(")\n");
+            sb.append("  store i8* %final_props, i8** @gv_java_lang_System_props\n");
+        }
 
         // ------------------------------------------------------------------
         // End of initializers
@@ -1398,6 +1869,7 @@ public class LlvmGenerator implements LlvmGeneratorPort {
         sb.append("define i32 @main(i32 %argc, i8** %argv) {\n");
         sb.append("  %args = call i8* @__jnative_create_string_array(i32 %argc, i8** %argv)\n");
         sb.append("  call void @").append(LlvmRuntime.mangleMethod(entryClass, entryMethod, entryDescriptor)).append("(i8* %args)\n");
+        sb.append("  call void @__jnative_wait_non_daemon_threads()\n");
         sb.append("  ret i32 0\n");
         sb.append("}\n\n");
 
@@ -1517,7 +1989,8 @@ public class LlvmGenerator implements LlvmGeneratorPort {
             builder.createFunction(adaptorName, retType, allParamTypes);
 
         globalEmitter.registerLambdaClass(
-            lambdaId, samInterface, samSig, adaptorName, call.getCapturedTypes());
+            lambdaId, samInterface, samSig, adaptorName, call.getCapturedTypes(),
+            lambdaMarkerInterfaces(info));
 
         builder.createBlock(adaptorName + "_entry");
         BasicBlock entry = builder.currentBlock();
@@ -1611,6 +2084,13 @@ public class LlvmGenerator implements LlvmGeneratorPort {
             callArgs.add(new Constant(Type.NULL, null));
         }
 
+        /* JLS §15.13.3: SAM slots are erased (Object) while the target may
+         * take primitives, so box/unbox every non-receiver argument. */
+        int firstImplArg = isStatic ? 0 : 1;
+        for (int i = firstImplArg; i < callArgs.size(); i++) {
+            callArgs.set(i, adaptValue(builder, callArgs.get(i), implParamTypes.get(i - firstImplArg)));
+        }
+
         String calleeName = implOwner + "." + implName + implDesc;
 
         if (callOpcode == Opcode.INTERFACE_CALL) {
@@ -1642,16 +2122,43 @@ public class LlvmGenerator implements LlvmGeneratorPort {
             }
         }
 
-        if (!retType.isVoid()) {
-            Temporary result = builder.newTemporary(retType);
+        /* The call result carries the target's own return type; the SAM's
+         * erased return type is reached by boxing/unboxing afterwards. */
+        Type implRet = TypeResolver.descToReturnType(implDesc);
+        if (!retType.isVoid() && !implRet.isVoid()) {
+            Temporary result = builder.newTemporary(implRet);
             callInst.setResult(result);
             result.setDefiningInstruction(callInst);
             entry.addInstruction(callInst);
-            builder.createReturn(result);
+            builder.createReturn(adaptValue(builder, result, retType));
         } else {
             entry.addInstruction(callInst);
-            builder.createReturn(null);
+            builder.createReturn(retType.isVoid() ? null : new Constant(Type.NULL, null));
         }
+    }
+
+    /**
+     * Boxes a primitive {@code v} when {@code to} is a reference, unboxes a
+     * reference {@code v} when {@code to} is primitive, otherwise returns
+     * {@code v} unchanged. The boxing methods are made reachable by
+     * {@code MethodBytecodeVisitor.addMethodRefBoxing}.
+     */
+    private Value adaptValue(IrBuilder builder, Value v, Type to) {
+        Type from = v.getType();
+        if (from.isPrimitive() && !to.isPrimitive()) {
+            String w = TypeResolver.wrapperClassOf(TypeResolver.primitiveDescriptor(from));
+            String callee = w + ".valueOf(" + TypeResolver.primitiveDescriptor(from) + ")L" + w + ";";
+            return builder.addInstruction(Opcode.STATIC_CALL, Type.reference(w),
+                new Constant(Type.reference(callee), callee), v).getResult();
+        }
+        if (to.isPrimitive() && (from.isReference() || from.isUnknown())) {
+            String w = TypeResolver.wrapperClassOf(TypeResolver.primitiveDescriptor(to));
+            String callee = w + "." + to + "Value()" + TypeResolver.primitiveDescriptor(to);
+            globalEmitter.ensureClassLayoutBuilt(w);
+            return builder.addInstruction(Opcode.VIRTUAL_CALL, to,
+                v, new Constant(Type.reference(callee), callee)).getResult();
+        }
+        return v;
     }
 
     /**

@@ -311,6 +311,14 @@ static void* create_thread_object(void) {
     return t;
 }
 
+/* Thread.isAlive() is Java code reading `eetop != 0`, so the runtime must
+ * keep that field non-zero for the thread's whole life. */
+static void set_eetop(void* java_thread, int64_t v) {
+    if (java_thread && THREAD_EETOP_OFFSET >= 0) {
+        *(int64_t*)((char*)java_thread + THREAD_EETOP_OFFSET) = v;
+    }
+}
+
 static ThreadState* find_thread_state(void* java_thread) {
     if (!java_thread) return NULL;
     jn_mutex_lock(&thread_table_lock);
@@ -393,6 +401,7 @@ static ThreadState* ensure_main_thread(void) {
     s->running = 1;
     s->started = 1;
     s->priority = 5;
+    set_eetop(s->java_thread, 1);
     if (THREAD_TID_OFFSET >= 0) {
         s->tid = *(int64_t*)((char*)s->java_thread + THREAD_TID_OFFSET);
     }
@@ -406,10 +415,61 @@ static ThreadState* ensure_main_thread(void) {
     return s;
 }
 
+static int32_t peak_live_threads = 0;
+
+void __jnative_thread_counts(int32_t* live_out, int32_t* daemon_out,
+                             int64_t* started_out, int32_t* peak_out) {
+    jn_mutex_lock(&thread_table_lock);
+    int32_t live = 0;
+    int32_t daemon = 0;
+    int64_t started = 0;
+    for (ThreadState* s = thread_table; s; s = s->next) {
+        if (!s->started) continue;
+        started++;
+        if (s->finished) continue;
+        live++;
+        if (s->is_daemon) daemon++;
+    }
+    if (live > peak_live_threads) peak_live_threads = live;
+    int32_t peak = peak_live_threads;
+    jn_mutex_unlock(&thread_table_lock);
+    if (live_out != NULL) *live_out = live;
+    if (daemon_out != NULL) *daemon_out = daemon;
+    if (started_out != NULL) *started_out = started;
+    if (peak_out != NULL) *peak_out = peak;
+}
+
+static int thread_is_daemon(ThreadState* s) {
+    if (THREAD_HOLDER_OFFSET >= 0 && FH_DAEMON_OFFSET >= 0 && s->java_thread != NULL) {
+        void* holder = *(void**)((char*)s->java_thread + THREAD_HOLDER_OFFSET);
+        if (holder != NULL) return *(uint8_t*)((char*)holder + FH_DAEMON_OFFSET) != 0;
+    }
+    return s->is_daemon;
+}
+
+void __jnative_wait_non_daemon_threads(void) {
+    for (;;) {
+        ThreadState* pending = NULL;
+        jn_mutex_lock(&thread_table_lock);
+        for (ThreadState* s = thread_table; s; s = s->next) {
+            if (s == main_thread_state || s == tls_state) continue;
+            if (!s->started || s->finished || thread_is_daemon(s)) continue;
+            pending = s;
+            break;
+        }
+        jn_mutex_unlock(&thread_table_lock);
+        if (pending == NULL) return;
+        jn_mutex_lock(&pending->mutex);
+        while (!pending->finished) jn_cond_wait(&pending->cond, &pending->mutex);
+        jn_mutex_unlock(&pending->mutex);
+    }
+}
+
 typedef struct StartArgs {
     ThreadState* state;
     void* runnable;
 } StartArgs;
+
 
 /*
  * pthread entry point. Publishes the ThreadState into the thread-local slot,
@@ -429,10 +489,21 @@ static void* thread_entry(void* arg) {
     jn_cond_broadcast(&s->cond);
     jn_mutex_unlock(&s->mutex);
 
+    __jnative_thread_counts(NULL, NULL, NULL, NULL);
+
     if (runnable) {
         extern void __jnative_invoke_runnable(void* runnable);
         __jnative_invoke_runnable(runnable);
     }
+
+    /* Same as HotSpot's ensure_join: Thread.join() does
+     * synchronized(this){ while(isAlive()) wait(); }, so clear eetop and
+     * notify under the Thread's monitor to avoid a lost wakeup. */
+    extern void __jnative_fn_java_lang_Object_notifyAll___V(void* obj);
+    __jnative_monitor_enter(s->java_thread);
+    set_eetop(s->java_thread, 0);
+    __jnative_fn_java_lang_Object_notifyAll___V(s->java_thread);
+    __jnative_monitor_exit(s->java_thread);
 
     jn_mutex_lock(&s->mutex);
     s->running = 0;
@@ -581,6 +652,7 @@ void __jnative_fn_java_lang_Thread_start__V(void* this_thread) {
         return;
     }
     s->started = 1;
+    set_eetop(this_thread, 1);
     jn_mutex_unlock(&s->mutex);
 
     StartArgs* sa = malloc(sizeof(StartArgs));
@@ -600,6 +672,7 @@ void __jnative_fn_java_lang_Thread_start__V(void* this_thread) {
     pthread_attr_destroy(&attr);
     if (rc != 0) {
         free(sa);
+        set_eetop(this_thread, 0);
         __jnative_throw_exception(NULL);
     }
 }

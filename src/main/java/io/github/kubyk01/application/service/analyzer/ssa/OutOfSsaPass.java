@@ -130,10 +130,23 @@ public final class OutOfSsaPass {
     private OutOfSsaPass() {}
 
     public static void transform(Module module) {
+        transform(module, null);
+    }
+
+    /** Transforms every function; functions are independent, so they run in parallel on {@code scheduler}. */
+    public static void transform(Module module, reactor.core.scheduler.Scheduler scheduler) {
+        List<Function> live = new ArrayList<>();
         for (Function func : module.getFunctions()) {
-            if (func.getEntryBlock() == null) continue;
-            transformFunction(func);
+            if (func.getEntryBlock() != null) live.add(func);
         }
+        if (scheduler == null) {
+            for (Function func : live) transformFunction(func);
+            return;
+        }
+        io.github.kubyk01.util.LlvmUtil.parallelMapOrdered(live, scheduler, func -> {
+            transformFunction(func);
+            return null;
+        });
     }
 
     // =====================================================================

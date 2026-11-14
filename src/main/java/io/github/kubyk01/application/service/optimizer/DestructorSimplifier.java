@@ -159,9 +159,9 @@ public class DestructorSimplifier {
 
         for (Function func : dead) {
             log.debug("Removing dead destructor: {}", func.getName());
-            module.removeFunction(func);
             destructors.remove(func);
         }
+        module.removeFunctions(dead);
     }
 
     private void collectCalls(Function func, Set<Function> accumulator) {
@@ -634,12 +634,6 @@ public class DestructorSimplifier {
             }
 
             BasicBlock tail = splitBlockAt(func, block, callIdx);
-            if (tail == null) {
-                log.warn("DestructorSimplifier: could not split block {} "
-                        + "at instruction {} — leaving destructor call intact",
-                    block.getLabel(), callIdx);
-                return;
-            }
 
             emitInlineBody(func, block, tail, obj, fields);
             block = tail;

@@ -1,9 +1,10 @@
 package io.github.kubyk01.application.service.codegen.llvm;
 
+import io.github.kubyk01.application.service.analyzer.classanalysis.annotation.ClassFileAnnotations;
+
 import io.github.kubyk01.application.service.analyzer.dependencyresolver.DependencyResolver;
 import io.github.kubyk01.application.service.analyzer.ssa.TypeResolver;
 import io.github.kubyk01.application.service.codegen.llvm.nativepolymorphicfunctionresolver.VarHandleTargetResolver;
-import io.github.kubyk01.domain.analyzer.aliasanalysis.AliasAnalysisResult;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.ClassNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.FieldNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.FieldReference;
@@ -31,6 +32,8 @@ import io.github.kubyk01.domain.ir.Value;
 import io.github.kubyk01.util.LlvmUtil;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.objectweb.asm.ClassReader;
+import org.objectweb.asm.ClassVisitor;
 import org.objectweb.asm.Opcodes;
 
 import java.util.*;
@@ -202,8 +205,11 @@ public class LlvmGlobalEmitter {
 
     private final Module module;
     private final DependencyResolver resolver;
-    private final AliasAnalysisResult aliasResult;
+    private final Set<String> pointsToStaticFields;
     private final ReflectInfo reflectInfo;
+
+    @lombok.Setter
+    private java.util.function.BiConsumer<String, String> adaptorSink;
 
     // -------------------------------------------------------------------------
     //  Caches. Every map/set that is written by one thread and read by
@@ -308,7 +314,7 @@ public class LlvmGlobalEmitter {
      * stripped, {@code '/'}-separated, no leading package of the caller).
      *
      * <p>Registered through {@link #addEmbeddedResource} and emitted by
-     * {@link #generateEmbeddedResources()} as a {@code constant} table the
+     * {@link #writeEmbeddedResources} as a {@code constant} table the
      * C side indexes with {@code jnative_find_resource}.
      */
     private final Map<String, byte[]> embeddedResources = new LinkedHashMap<>();
@@ -439,6 +445,8 @@ public class LlvmGlobalEmitter {
          * only for determinism of the emitted IR, not for correctness.</p>
          */
         List<String> superInterfaces;
+
+        List<Type> capturedTypes;
     }
 
     private final Map<String, LambdaInfo> lambdaRegistry = new ConcurrentHashMap<>();
@@ -808,31 +816,16 @@ public class LlvmGlobalEmitter {
      * global that has no reference inside its own module, which would leave
      * the external references unresolved at link time.
      */
-    public String generateGlobalDefinitions() {
+    public List<java.util.function.Supplier<String>> globalDefinitionParts() {
         prepareLayouts();
-        return generateLayoutConstants() +
-            generateStaticFields() +
-            // generateStringLiterals() depends on vtableNames, which only exists
-            // after generateVtables(); the reflection data depends on the string
-            // literal pool; the unnamed module and the embedded-resource table
-            // depend on the vtables. The ordering below is load-bearing and
-            // mirrors the original generateGlobals() chain.
-            generateVtables() +
-            generateTypeStringConstants() +
-            generateStringLiterals() +
-            generateTypeInfo() +
-            generateUnnamedModule() +
-            generateEmbeddedResources() +
-            generateReflectionData() +
-            generateFunctionIndex() +
-            // Runs last so that emittedRefClassNames (filled by
-            // generateReflectionData) is complete: every row of the map points
-            // at an @refclass_* constant that already exists.
-            emitLazyClinitMap(lazyClinitWrappers) +
-            // The completion flags are referenced by the guard wrappers'
-            // bodies, which are emitted as ordinary functions; the globals
-            // themselves are plain i32 and do not depend on anything else.
-            emitLazyClinitFlags();
+        return List.of(
+            () -> generateLayoutConstants() + generateStaticFields(),
+            this::generateVtables,
+            () -> generateTypeStringConstants() + generateStringLiterals()
+                + generateTypeInfo() + generateUnnamedModule(),
+            this::generateReflectionData,
+            this::generateFunctionIndex,
+            () -> emitLazyClinitMap(lazyClinitWrappers) + emitLazyClinitFlags());
     }
 
     public String generateLayoutConstants() {
@@ -845,6 +838,7 @@ public class LlvmGlobalEmitter {
         int threadTid = safeGlobalFieldOffset("java/lang/Thread", "tid");
         int threadName = safeGlobalFieldOffset("java/lang/Thread", "name");
         int threadInterruptLock = safeGlobalFieldOffsetAllowMissing("java/lang/Thread", "interruptLock");
+        int threadEetop = safeGlobalFieldOffsetAllowMissing("java/lang/Thread", "eetop");
 
         int fhSize = computeObjectSize("java/lang/Thread$FieldHolder");
         int fhGroup = safeGlobalFieldOffset("java/lang/Thread$FieldHolder", "group");
@@ -862,6 +856,7 @@ public class LlvmGlobalEmitter {
         sb.append("@THREAD_TID_OFFSET           = constant i32 ").append(threadTid).append("\n");
         sb.append("@THREAD_NAME_OFFSET          = constant i32 ").append(threadName).append("\n");
         sb.append("@THREAD_INTERRUPTLOCK_OFFSET = constant i32 ").append(threadInterruptLock).append("\n");
+        sb.append("@THREAD_EETOP_OFFSET         = constant i32 ").append(threadEetop).append("\n");
         sb.append("@FH_OBJECT_SIZE              = constant i32 ").append(fhSize).append("\n");
         sb.append("@FH_GROUP_OFFSET             = constant i32 ").append(fhGroup).append("\n");
         sb.append("@FH_PRIORITY_OFFSET          = constant i32 ").append(fhPriority).append("\n");
@@ -911,7 +906,52 @@ public class LlvmGlobalEmitter {
         sb.append("@JNATIVE_CTOR_PARAM_TYPES_OFFSET      = constant i32 ").append(ctorParams).append("\n");
         sb.append("@JNATIVE_CTOR_EXC_TYPES_OFFSET        = constant i32 ").append(ctorExc).append("\n");
         sb.append("@JNATIVE_CTOR_MODIFIERS_OFFSET        = constant i32 ").append(ctorMods).append("\n");
-        sb.append("@JNATIVE_CTOR_ROOT_OFFSET             = constant i32 ").append(ctorRoot).append("\n\n");
+        sb.append("@JNATIVE_CTOR_ROOT_OFFSET             = constant i32 ").append(ctorRoot).append("\n");
+        sb.append("@JNATIVE_FIELD_ANNOTATIONS_OFFSET       = constant i32 ")
+            .append(safeGlobalFieldOffsetAllowMissing("java/lang/reflect/Field", "annotations")).append("\n");
+        sb.append("@JNATIVE_METHOD_ANNOTATIONS_OFFSET      = constant i32 ")
+            .append(safeGlobalFieldOffsetAllowMissing("java/lang/reflect/Method", "annotations")).append("\n");
+        sb.append("@JNATIVE_METHOD_PARAM_ANNOTATIONS_OFFSET = constant i32 ")
+            .append(safeGlobalFieldOffsetAllowMissing("java/lang/reflect/Method", "parameterAnnotations")).append("\n");
+        sb.append("@JNATIVE_METHOD_ANNOTATION_DEFAULT_OFFSET = constant i32 ")
+            .append(safeGlobalFieldOffsetAllowMissing("java/lang/reflect/Method", "annotationDefault")).append("\n");
+        sb.append("@JNATIVE_CTOR_ANNOTATIONS_OFFSET        = constant i32 ")
+            .append(safeGlobalFieldOffsetAllowMissing("java/lang/reflect/Constructor", "annotations")).append("\n");
+        sb.append("@JNATIVE_CTOR_PARAM_ANNOTATIONS_OFFSET  = constant i32 ")
+            .append(safeGlobalFieldOffsetAllowMissing("java/lang/reflect/Constructor", "parameterAnnotations")).append("\n\n");
+
+        sb.append("@JNATIVE_SFI_MEMBERNAME_OFFSET    = constant i32 ")
+          .append(declaredFieldOffsetOrMissing("java/lang/StackFrameInfo", "memberName")).append("\n");
+        sb.append("@JNATIVE_SFI_BCI_OFFSET           = constant i32 ")
+          .append(declaredFieldOffsetOrMissing("java/lang/StackFrameInfo", "bci")).append("\n");
+        sb.append("@JNATIVE_MEMBERNAME_CLAZZ_OFFSET  = constant i32 ")
+          .append(declaredFieldOffsetOrMissing("java/lang/invoke/MemberName", "clazz")).append("\n");
+        sb.append("@JNATIVE_MEMBERNAME_NAME_OFFSET   = constant i32 ")
+          .append(declaredFieldOffsetOrMissing("java/lang/invoke/MemberName", "name")).append("\n");
+        sb.append("@JNATIVE_MEMBERNAME_TYPE_OFFSET   = constant i32 ")
+          .append(declaredFieldOffsetOrMissing("java/lang/invoke/MemberName", "type")).append("\n");
+        sb.append("@JNATIVE_MEMBERNAME_FLAGS_OFFSET  = constant i32 ")
+          .append(declaredFieldOffsetOrMissing("java/lang/invoke/MemberName", "flags")).append("\n");
+        sb.append("@JNATIVE_CFI_CLASS_OR_MEMBER_NAME_OFFSET = constant i32 ")
+          .append(declaredFieldOffsetOrMissing("java/lang/ClassFrameInfo", "classOrMemberName")).append("\n");
+        sb.append("@JNATIVE_CFI_FLAGS_OFFSET                = constant i32 ")
+          .append(declaredFieldOffsetOrMissing("java/lang/ClassFrameInfo", "flags")).append("\n");
+        sb.append("@JNATIVE_SFI_NAME_OFFSET                 = constant i32 ")
+          .append(declaredFieldOffsetOrMissing("java/lang/StackFrameInfo", "name")).append("\n");
+        sb.append("@JNATIVE_SFI_TYPE_OFFSET                 = constant i32 ")
+          .append(declaredFieldOffsetOrMissing("java/lang/StackFrameInfo", "type")).append("\n");
+        sb.append("@JNATIVE_RMN_VMHOLDER_OFFSET             = constant i32 ")
+          .append(declaredFieldOffsetOrMissing("java/lang/invoke/ResolvedMethodName", "vmholder")).append("\n");
+        sb.append("@JNATIVE_STE_DECLARING_CLASS_OBJECT_OFFSET = constant i32 ")
+          .append(declaredFieldOffsetOrMissing("java/lang/StackTraceElement", "declaringClassObject")).append("\n");
+        sb.append("@JNATIVE_STE_DECLARING_CLASS_OFFSET        = constant i32 ")
+          .append(declaredFieldOffsetOrMissing("java/lang/StackTraceElement", "declaringClass")).append("\n");
+        sb.append("@JNATIVE_STE_METHOD_NAME_OFFSET            = constant i32 ")
+          .append(declaredFieldOffsetOrMissing("java/lang/StackTraceElement", "methodName")).append("\n");
+        sb.append("@JNATIVE_STE_FILE_NAME_OFFSET              = constant i32 ")
+          .append(declaredFieldOffsetOrMissing("java/lang/StackTraceElement", "fileName")).append("\n");
+        sb.append("@JNATIVE_STE_LINE_NUMBER_OFFSET            = constant i32 ")
+          .append(declaredFieldOffsetOrMissing("java/lang/StackTraceElement", "lineNumber")).append("\n\n");
         return sb.toString();
     }
 
@@ -929,6 +969,13 @@ public class LlvmGlobalEmitter {
         } catch (Exception e) {
             return -1;
         }
+    }
+
+    private int declaredFieldOffsetOrMissing(String owner, String field) {
+        if (resolver.isMissingClass(owner)) return -1;
+        ClassNode cn = resolver.getClassNode(owner);
+        if (cn == null || cn.isExternal()) return -1;
+        return safeGlobalFieldOffsetAllowMissing(owner, field);
     }
     /**
      * Emits the shared java.lang.Module object pointed at by every
@@ -1029,24 +1076,23 @@ public class LlvmGlobalEmitter {
      * Emits every resource registered through {@link #addEmbeddedResource} as a
      * byte array plus one flat lookup table.
      *
-     * <p>The entry layout is {@code %JNativeResourceEntry} and is declared here
-     * rather than in {@link #generateReflectionData()} because this table is
-     * emitted before it. The C side walks the table with
+     * <p>Streamed into its own {@code _resources.ll}; the caller writes the
+     * target preamble and the {@code %JNativeResourceEntry} type first. The
+     * C side walks the table with
      * {@code jnative_find_resource} and needs no knowledge of LLVM globals.
      *
      * <p>Paths are sorted so the emitted IR is stable across runs regardless of
      * hash iteration order.
      */
-    private String generateEmbeddedResources() {
-        StringBuilder sb = new StringBuilder();
-        sb.append("\n; ----- Embedded resources -----\n");
+    public void writeEmbeddedResources(java.io.Writer w) throws java.io.IOException {
+        w.write("\n; ----- Embedded resources -----\n");
 
         if (embeddedResources.isEmpty()) {
-            sb.append("@jnative_builtin_resources = constant "
+            w.write("@jnative_builtin_resources = constant "
                 + "[1 x %JNativeResourceEntry] "
                 + "[%JNativeResourceEntry { i8* null, i8* null, i32 0 }]\n");
-            sb.append("@jnative_builtin_resources_count = constant i32 0\n\n");
-            return sb.toString();
+            w.write("@jnative_builtin_resources_count = constant i32 0\n\n");
+            return;
         }
 
         List<String> keys = new ArrayList<>(embeddedResources.keySet());
@@ -1057,59 +1103,53 @@ public class LlvmGlobalEmitter {
             String path = keys.get(i);
             byte[] data = embeddedResources.get(path);
 
-            String pathRef = emitResourceByteLiteral(sb, "__jnative_res_path_" + i,
+            String pathRef = writeResourceByteLiteral(w, "__jnative_res_path_" + i,
                 path.getBytes(StandardCharsets.UTF_8), 1);
-            String dataRef = emitResourceByteLiteral(sb, "__jnative_res_data_" + i,
+            String dataRef = writeResourceByteLiteral(w, "__jnative_res_data_" + i,
                 data, 0);
 
             entryRefs.add("%JNativeResourceEntry { i8* " + pathRef
                 + ", i8* " + dataRef + ", i32 " + data.length + " }");
         }
 
-        sb.append("@jnative_builtin_resources = constant [")
-            .append(entryRefs.size())
-            .append(" x %JNativeResourceEntry] [\n");
+        w.write("@jnative_builtin_resources = constant [" + entryRefs.size()
+            + " x %JNativeResourceEntry] [\n");
         for (int i = 0; i < entryRefs.size(); i++) {
-            if (i > 0) sb.append(",\n");
-            sb.append("  ").append(entryRefs.get(i));
+            if (i > 0) w.write(",\n");
+            w.write("  ");
+            w.write(entryRefs.get(i));
         }
-        sb.append("\n]\n");
-        sb.append("@jnative_builtin_resources_count = constant i32 ")
-            .append(entryRefs.size()).append("\n\n");
-        return sb.toString();
+        w.write("\n]\n");
+        w.write("@jnative_builtin_resources_count = constant i32 " + entryRefs.size() + "\n\n");
     }
 
+    private static final char[] HEX = "0123456789ABCDEF".toCharArray();
+
     /**
-     * Emits {@code bytes} as a {@code private constant [N x i8]} and returns a
+     * Writes {@code bytes} as a {@code constant [N x i8]} and returns a
      * {@code getelementptr} expression yielding a pointer to its first element.
+     * Bytes go straight to {@code w}; no escaped copy is built in the heap.
      *
      * <p>When {@code nulTerminate} is non-zero one {@code \00} byte is appended,
      * so the C side can use {@code strlen} on the path.
      */
-    private String emitResourceByteLiteral(StringBuilder sb, String baseName,
-                                           byte[] bytes, int nulTerminate) {
+    private static String writeResourceByteLiteral(java.io.Writer w, String baseName,
+                                                   byte[] bytes, int nulTerminate)
+            throws java.io.IOException {
         int total = bytes.length + nulTerminate;
-        StringBuilder esc = new StringBuilder();
+        w.write("@" + baseName + " = unnamed_addr constant [" + total + " x i8] c\"");
         for (byte b : bytes) {
             int v = b & 0xFF;
-            switch (v) {
-                case '\\' -> esc.append("\\5C");
-                case '"'  -> esc.append("\\22");
-                case '\n' -> esc.append("\\0A");
-                case '\r' -> esc.append("\\0D");
-                case '\t' -> esc.append("\\09");
-                default -> {
-                    if (v < 0x20 || v > 0x7E) esc.append(String.format("\\%02X", v));
-                    else esc.append((char) v);
-                }
+            if (v < 0x20 || v > 0x7E || v == '\\' || v == '"') {
+                w.write('\\');
+                w.write(HEX[v >>> 4]);
+                w.write(HEX[v & 0xF]);
+            } else {
+                w.write(v);
             }
         }
-        if (nulTerminate != 0) esc.append("\\00");
-
-        sb.append("@").append(baseName)
-            .append(" = unnamed_addr constant [")
-            .append(total).append(" x i8] c\"")
-            .append(esc).append("\", align 1\n");
+        if (nulTerminate != 0) w.write("\\00");
+        w.write("\", align 1\n");
         return "getelementptr inbounds ([" + total + " x i8], [" + total
             + " x i8]* @" + baseName + ", i32 0, i32 0)";
     }
@@ -1559,7 +1599,8 @@ public class LlvmGlobalEmitter {
                                       String samInterface,
                                       String samSig,
                                       String adaptorName,
-                                      List<Type> capturedTypes) {
+                                      List<Type> capturedTypes,
+                                      List<String> markerInterfaces) {
         prepareLayouts();
 
         if (samInterface == null
@@ -1600,6 +1641,13 @@ public class LlvmGlobalEmitter {
              */
             LinkedHashSet<String> superIfaces = new LinkedHashSet<>();
             collectLambdaSuperInterfaces(samInterface, superIfaces);
+            if (markerInterfaces != null) {
+                for (String marker : markerInterfaces) {
+                    ClassNode markerNode = resolver.getClassNode(marker);
+                    if (markerNode == null || !markerNode.isInterface()) continue;
+                    collectLambdaSuperInterfaces(marker, superIfaces);
+                }
+            }
             List<String> superIfacesList = new ArrayList<>(superIfaces);
 
             /*
@@ -1626,6 +1674,9 @@ public class LlvmGlobalEmitter {
             info.samSig = samSig;
             info.adaptorName = adaptorName;
             info.superInterfaces = superIfacesList;
+            info.capturedTypes = (capturedTypes != null)
+                ? List.copyOf(capturedTypes)
+                : List.of();
             lambdaRegistry.put(lambdaId, info);
 
             String vtableName = "@vtable_" + LlvmTypeMapper.sanitizeIdentifier(lambdaClassName);
@@ -1931,6 +1982,8 @@ public class LlvmGlobalEmitter {
             ClassNode superNode = resolver.getClassNode(cls.getSuperName());
             if (superNode != null && !superNode.isExternal()) {
                 result.addAll(collectInstanceFields(superNode));
+            } else {
+                result.addAll(phantomFields().getOrDefault(cls.getSuperName(), List.of()));
             }
         }
         for (FieldNode f : cls.getFields()) {
@@ -1941,6 +1994,108 @@ public class LlvmGlobalEmitter {
         return result;
     }
 
+    private volatile Map<String, List<FieldNode>> phantomFields;
+    private final Set<FieldNode> phantomNodes = Collections.newSetFromMap(new IdentityHashMap<>());
+
+    private Map<String, List<FieldNode>> phantomFields() {
+        Map<String, List<FieldNode>> p = phantomFields;
+        if (p != null) return p;
+        synchronized (this) {
+            if (phantomFields == null) phantomFields = collectPhantomFields();
+            return phantomFields;
+        }
+    }
+
+    private Map<String, List<FieldNode>> collectPhantomFields() {
+        Map<String, Set<String>> names = new TreeMap<>();
+        for (Function function : module.getFunctions()) {
+            for (BasicBlock block : function.getBlocks()) {
+                for (Instruction inst : block.getInstructions()) {
+                    Opcode op = inst.getOpcode();
+                    String owner;
+                    String field;
+                    if (op == Opcode.GET_FIELD || op == Opcode.PUT_FIELD) {
+                        if (inst.getOperands().size() < 2
+                            || !(inst.getOperands().get(1) instanceof Constant c)
+                            || !c.getType().isReference()) continue;
+                        String full = extractFieldName(inst);
+                        int dot = full.lastIndexOf('.');
+                        if (dot > 0) {
+                            owner = full.substring(0, dot);
+                            field = full.substring(dot + 1);
+                        } else {
+                            Value base = inst.getOperands().getFirst();
+                            if (base == null || base.getType() == null) continue;
+                            owner = LlvmUtil.extractClassName(base);
+                            field = full;
+                        }
+                    } else if (op == Opcode.VIRTUAL_CALL) {
+                        VarHandleTargetResolver.Target vh = getVarHandleTargets().resolveCallSite(inst);
+                        if (vh == null || vh.kind() != VarHandleTargetResolver.Kind.INSTANCE_FIELD) continue;
+                        owner = vh.owner();
+                        field = vh.fieldName();
+                    } else {
+                        continue;
+                    }
+                    if (owner == null || field == null || field.isEmpty()
+                        || LlvmTypeMapper.LAZY_CLINIT_FLAG_FIELD.equals(field)) continue;
+                    String host = unresolvedFieldHost(owner, field);
+                    if (host != null) names.computeIfAbsent(host, k -> new TreeSet<>()).add(field);
+                }
+            }
+        }
+        Map<String, List<FieldNode>> out = new HashMap<>();
+        Type slotType = Type.reference("java/lang/Object");
+        for (Map.Entry<String, Set<String>> e : names.entrySet()) {
+            List<FieldNode> list = new ArrayList<>(e.getValue().size());
+            for (String name : e.getValue()) {
+                FieldNode fn = FieldNode.builder()
+                    .name(name)
+                    .descriptor("Ljava/lang/Object;")
+                    .type(slotType)
+                    .access(Opcodes.ACC_PRIVATE | Opcodes.ACC_SYNTHETIC)
+                    .owner(e.getKey())
+                    .build();
+                list.add(fn);
+                phantomNodes.add(fn);
+            }
+            out.put(e.getKey(), List.copyOf(list));
+        }
+        return out;
+    }
+
+    private String unresolvedFieldHost(String owner, String field) {
+        if ("java/lang/Class".equals(owner) || "java/lang/Object".equals(owner)) return null;
+        ClassNode cn = resolver.getClassNode(owner);
+        if (cn == null || cn.isInterface()) return null;
+        if (cn.isExternal()) return owner.startsWith("[") ? null : owner;
+        Set<String> seen = new HashSet<>();
+        while (seen.add(cn.getName())) {
+            for (FieldNode f : cn.getFields()) {
+                if ((f.getAccess() & Opcodes.ACC_STATIC) == 0 && f.getName().equals(field)) return null;
+            }
+            String sup = cn.getSuperName();
+            if (sup == null || sup.equals("java/lang/Object") || sup.equals(cn.getName())) return null;
+            ClassNode next = resolver.getClassNode(sup);
+            if (next == null || next.isExternal()) return sup;
+            cn = next;
+        }
+        return null;
+    }
+
+    private int phantomFieldOffset(String className, String fieldName) {
+        List<FieldNode> fields = phantomFields().get(className);
+        if (fields == null) return -1;
+        int offset = OBJECT_HEADER_SIZE;
+        for (FieldNode f : fields) {
+            int align = fieldAlignment(f.getType());
+            offset = (offset + align - 1) & -align;
+            if (f.getName().equals(fieldName)) return offset;
+            offset += fieldSize(f.getType());
+        }
+        return -1;
+    }
+
     // =========================================================================
     //  Static fields
     // =========================================================================
@@ -1948,8 +2103,8 @@ public class LlvmGlobalEmitter {
     private final Set<String> staticFieldStringConstants = new LinkedHashSet<>();
 
     private String generateStaticFields() {
-        Set<String> allFields = new TreeSet<>(aliasResult.getGraph()
-                .getStaticFieldPointsToMap().keySet());
+        Map<String, Type> usedFieldTypes = new HashMap<>();
+        Set<String> allFields = new TreeSet<>(pointsToStaticFields);
         if (reflectInfo != null) {
             allFields.addAll(reflectInfo.staticFieldKeys(resolver::getField));
         }
@@ -1972,6 +2127,10 @@ public class LlvmGlobalEmitter {
                         continue;
                     }
                     allFields.add(fullName);
+                    Type usedType = op == Opcode.GET_STATIC
+                        ? (inst.getResult() != null ? inst.getResult().getType() : null)
+                        : (inst.getOperands().size() > 1 ? inst.getOperands().get(1).getType() : null);
+                    if (usedType != null && !usedType.isUnknown()) usedFieldTypes.putIfAbsent(fullName, usedType);
                 }
             }
         }
@@ -2039,7 +2198,7 @@ public class LlvmGlobalEmitter {
             }
 
             Type fieldType = getFieldType(owner, fieldName);
-            if (fieldType == null) fieldType = Type.UNKNOWN;
+            if (fieldType == null) fieldType = usedFieldTypes.getOrDefault(fullName, Type.UNKNOWN);
             String llvmType = LlvmTypeMapper.toLlvmType(fieldType);
 
             String init = staticFieldInitializer(owner, fieldName, fieldType, llvmType);
@@ -2281,7 +2440,7 @@ public class LlvmGlobalEmitter {
      * <p>
      * Encoding follows the compact-string contract:
      *   coder == 0: LATIN1, one byte per char (all chars <= U+00FF).
-     *   coder == 1: UTF-16BE, two bytes per char (otherwise).
+     *   coder == 1: UTF-16LE, two bytes per char (otherwise).
      * The length word is the byte count; String.length() recovers the char
      * count via `value.length >> coder`.
      * <p>
@@ -2343,8 +2502,9 @@ public class LlvmGlobalEmitter {
              * same representation java.lang.String uses internally when
              * String.COMPACT_STRINGS is true.
              *
-             * Every other string is encoded as UTF-16BE: two bytes per
-             * character code unit, high byte first. This is the same
+             * Every other string is encoded as UTF-16LE: two bytes per
+             * character code unit, low byte first, matching
+             * StringUTF16.isBigEndian() on every supported target. This is the same
              * representation java.lang.String uses internally when the
              * compact-string optimisation is not in effect.
              */
@@ -2375,7 +2535,7 @@ public class LlvmGlobalEmitter {
                 lengthField = charCount;
             } else {
                 /*
-                 * UTF-16BE form. Two bytes per character code unit, high
+                 * UTF-16LE form. Two bytes per character code unit, low
                  * byte first. Surrogate pairs are emitted as two
                  * consecutive code units, exactly as they appear in the
                  * Java String.
@@ -2389,8 +2549,8 @@ public class LlvmGlobalEmitter {
                 bytes = new byte[charCount * 2];
                 for (int i = 0; i < charCount; i++) {
                     char ch = s.charAt(i);
-                    bytes[i * 2]     = (byte) (ch >>> 8);
-                    bytes[i * 2 + 1] = (byte) (ch & 0xFF);
+                    bytes[i * 2]     = (byte) (ch & 0xFF);
+                    bytes[i * 2 + 1] = (byte) (ch >>> 8);
                 }
                 coder = 1;
                 lengthField = charCount * 2;
@@ -2622,6 +2782,23 @@ public class LlvmGlobalEmitter {
             sb.append("i8* null]\n");
         }
 
+        // Lambda classes need their own __type_info_X too: Object.getClass()
+        // maps vtable -> mirror through __type_info_<cname>[0], so without it
+        // getClass() on a lambda (e.g. a @Bean returning a lambda) is null.
+        List<String> lambdaNames = new ArrayList<>();
+        for (LambdaInfo linfo : lambdaRegistry.values()) {
+            if (linfo.lambdaClassName != null && vtableNames.containsKey(linfo.lambdaClassName)) {
+                lambdaNames.add(linfo.lambdaClassName);
+            }
+        }
+        Collections.sort(lambdaNames);
+        for (String lambdaClassName : lambdaNames) {
+            String typeInfoName = "@__type_info_" + LlvmTypeMapper.sanitizeIdentifier(lambdaClassName);
+            if (typeInfoNames.putIfAbsent(lambdaClassName, typeInfoName) != null) continue;
+            sb.append(typeInfoName).append(" = constant [2 x i8*] [i8* bitcast (%JNativeVTable* ")
+                .append(vtableNames.get(lambdaClassName)).append(" to i8*), i8* null]\n");
+        }
+
         return sb.toString();
     }
 
@@ -2736,8 +2913,10 @@ public class LlvmGlobalEmitter {
                 "Cannot resolve class for field offset: " + className + "." + fieldName);
         }
         if (cls.isExternal()) {
-            fieldOffsets.put(key, OBJECT_HEADER_SIZE);
-            return OBJECT_HEADER_SIZE;
+            int phantom = phantomFieldOffset(className, fieldName);
+            int offset = phantom >= 0 ? phantom : OBJECT_HEADER_SIZE;
+            fieldOffsets.put(key, offset);
+            return offset;
         }
 
         List<FieldNode> allFields = collectInstanceFields(cls);
@@ -2858,9 +3037,52 @@ public class LlvmGlobalEmitter {
         return (offset + 7) & ~7;
     }
 
+    private static boolean isLambdaPseudoClassName(String className) {
+        return className != null && className.startsWith("__Lambda_");
+    }
+
+    private LambdaInfo findLambdaInfoByClassName(String className) {
+        if (className == null || !className.startsWith("__Lambda_")) return null;
+        for (LambdaInfo linfo : lambdaRegistry.values()) {
+            if (className.equals(linfo.lambdaClassName)) {
+                return linfo;
+            }
+        }
+        return null;
+    }
+
+    private int computeLambdaObjectSize(String className) {
+        LambdaInfo linfo = findLambdaInfoByClassName(className);
+        if (linfo == null || linfo.capturedTypes == null || linfo.capturedTypes.isEmpty()) {
+            return OBJECT_HEADER_SIZE;
+        }
+        int offset = OBJECT_HEADER_SIZE;
+        for (Type capType : linfo.capturedTypes) {
+            int align = fieldAlignment(capType);
+            int size  = fieldSize(capType);
+            offset = (offset + align - 1) & -align;
+            offset += size;
+        }
+        return (offset + 7) & ~7;
+    }
+
     // =========================================================================
     //  Reflection data
     // =========================================================================
+
+    private void addDeclaredMethodMetadata(ReflectClassInfo info) {
+        ClassNode cn = resolver.getClassNode(info.getClassName());
+        if (cn == null || cn.isExternal() || cn.getMethods() == null) return;
+        Set<String> present = new HashSet<>();
+        for (MethodReference m : info.getMethods()) present.add(m.getName() + m.getDescriptor());
+        for (MethodNode mn : cn.getMethods()) {
+            if (mn.getName().equals("<init>") || mn.getName().equals("<clinit>")) continue;
+            if (mn.getDescriptor() == null || mn.getDescriptor().isEmpty()) continue;
+            if (present.add(mn.getName() + mn.getDescriptor())) {
+                info.addMethod(new MethodReference(info.getClassName(), mn.getName(), mn.getDescriptor()));
+            }
+        }
+    }
 
     private String generateReflectionData() {
         StringBuilder sb = new StringBuilder();
@@ -2888,6 +3110,7 @@ public class LlvmGlobalEmitter {
                 emitClasses.add(cls);
             }
             for (ReflectClassInfo info : reflectInfo.getClassInfoMap().values()) {
+                addDeclaredMethodMetadata(info);
                 for (MethodReference method : info.getMethods()) {
                     addReflectionDescriptorTypes(emitClasses, method.getDescriptor());
                 }
@@ -2898,6 +3121,13 @@ public class LlvmGlobalEmitter {
                     addReflectionDescriptorTypes(emitClasses, field.getDescriptor());
                 }
             }
+        }
+
+        for (LambdaInfo linfo : lambdaRegistry.values()) {
+            String lambdaClassName = linfo.lambdaClassName;
+            if (lambdaClassName == null || lambdaClassName.isEmpty()) continue;
+            if (lambdaClassName.charAt(0) == '[') continue;
+            emitClasses.add(lambdaClassName);
         }
 
         // ------------------------------------------------------------------
@@ -3000,6 +3230,11 @@ public class LlvmGlobalEmitter {
                 continue;
             }
 
+            if (isLambdaPseudoClassName(cn)) {
+                classNames.add(cn);
+                continue;
+            }
+
             ClassNode node = resolver.getClassNode(cn);
 
             if (node == null) {
@@ -3032,11 +3267,15 @@ public class LlvmGlobalEmitter {
         for (String className : classNames) {
             boolean isPrimitive = PRIMITIVE_TYPE_NAMES.contains(className);
             boolean isArrayPseudoClass = className.charAt(0) == '[';
-            ClassNode classNode = (isPrimitive || isArrayPseudoClass)
+            boolean isLambdaPseudoClass = isLambdaPseudoClassName(className);
+            StringBuilder adaptorDefs = adaptorSink == null || isArrayPseudoClass || isLambdaPseudoClass
+                ? sb : new StringBuilder();
+            ClassNode classNode = (isPrimitive || isArrayPseudoClass || isLambdaPseudoClass)
                 ? null
                 : resolver.getClassNode(className);
 
             boolean isReflectClass = !isPrimitive
+                && !isLambdaPseudoClass
                 && reflectInfo != null
                 && reflectInfo.getClassInfoMap().containsKey(className);
 
@@ -3047,6 +3286,7 @@ public class LlvmGlobalEmitter {
                     Map<String, FieldNode> mostDerivedByName = new LinkedHashMap<>();
                     for (FieldNode f : collectInstanceFields(classNode)) {
                         if ((f.getAccess() & Opcodes.ACC_STATIC) != 0) continue;
+                        if (phantomNodes.contains(f)) continue;
                         mostDerivedByName.put(f.getName(), f);
                     }
                     for (FieldNode f : mostDerivedByName.values()) {
@@ -3073,6 +3313,13 @@ public class LlvmGlobalEmitter {
             if (isArrayPseudoClass) {
                 info.setSuperName("java/lang/Object");
                 info.getInterfaces().clear();
+            } else if (isLambdaPseudoClass) {
+                LambdaInfo linfo = findLambdaInfoByClassName(className);
+                if (linfo != null) {
+                    info.setSuperName("java/lang/Object");
+                    info.getInterfaces().clear();
+                    info.getInterfaces().addAll(linfo.superInterfaces);
+                }
             } else if (!isPrimitive) {
                 String superName = (classNode != null) ? classNode.getSuperName() : null;
                 if (info.getSuperName() == null && superName != null) {
@@ -3158,8 +3405,10 @@ public class LlvmGlobalEmitter {
              * behaviour.
              */
             int objectSize;
-            if (isPrimitive || isArrayPseudoClass || classNode == null) {
-                objectSize = OBJECT_HEADER_SIZE;
+            if (isPrimitive || isArrayPseudoClass || isLambdaPseudoClass || classNode == null) {
+                objectSize = isLambdaPseudoClass
+                    ? computeLambdaObjectSize(className)
+                    : OBJECT_HEADER_SIZE;
             } else {
                 int computed = computeObjectSize(className);
                 if (computed > 0) {
@@ -3210,7 +3459,7 @@ public class LlvmGlobalEmitter {
                 // descriptor through several paths:
                 //
                 //   - a MethodNode synthesised by the reflection machinery
-                //     (ReachabilityAnalysis.applyMetadata, or a reflective
+                //     (ClassAnalysis.applyMetadata, or a reflective
                 //     Class.getDeclaredMethod / MethodHandles.Lookup.findXxx
                 //     handler) whose descriptor slot was never populated;
                 //
@@ -3275,7 +3524,10 @@ public class LlvmGlobalEmitter {
                     LlvmRuntime.mangleMethod(className, methodName, desc));
                 String adaptorPtr = "i8* null";
                 if (impl != null && impl.getEntryBlock() != null) {
-                    sb.append(emitAdaptorForMethod(className, method));
+                    adaptorDefs.append(emitAdaptorForMethod(className, method));
+                    if (adaptorDefs != sb) {
+                        sb.append("declare i8* @").append(adaptorName).append("(i8*, i8**)\n");
+                    }
                     adaptorPtr = "i8* bitcast (i8* (i8*, i8**)* @"
                         + adaptorName + " to i8*)";
                 }
@@ -3414,11 +3666,20 @@ public class LlvmGlobalEmitter {
                 String adaptorName = "__reflect_adaptor_ctor_"
                     + cleanClassName + "_" + mangledDesc;
 
-                Function impl = module.getFunction(
-                    LlvmRuntime.mangleMethod(className, "<init>", desc));
+                String mangledInit = LlvmRuntime.mangleMethod(className, "<init>", desc);
+                Function impl = module.getFunction(mangledInit);
+                // A native <init> override is registered as an alias: the
+                // lookup returns the C function (no body, different name).
+                boolean nativeOverride = impl != null && impl.getEntryBlock() == null
+                    && !impl.getName().equals(mangledInit)
+                    && impl.getParameters().size() == TypeResolver.descToParamTypes(desc).size() + 1;
                 String adaptorPtr = "i8* null";
-                if (impl != null && impl.getEntryBlock() != null) {
-                    sb.append(emitAdaptorForConstructor(className, ctor, objectSize));
+                if (impl != null && (impl.getEntryBlock() != null || nativeOverride)) {
+                    adaptorDefs.append(emitAdaptorForConstructor(className, ctor, objectSize,
+                        nativeOverride ? impl.getName() : mangledInit, nativeOverride));
+                    if (adaptorDefs != sb) {
+                        sb.append("declare i8* @").append(adaptorName).append("(i8**)\n");
+                    }
                     adaptorPtr = "i8* bitcast (i8* (i8**)* @"
                         + adaptorName + " to i8*)";
                 }
@@ -3438,6 +3699,9 @@ public class LlvmGlobalEmitter {
             }
             String ctorsArray = "@refctors_" + cleanClassName;
             appendNullTerminatedPtrArray(sb, ctorsArray, ctorPtrs);
+            if (adaptorDefs != sb && adaptorDefs.length() > 0) {
+                adaptorSink.accept(className, adaptorDefs.toString());
+            }
 
             String superClassPtr = "null";
             if (isArrayPseudoClass) {
@@ -3491,6 +3755,8 @@ public class LlvmGlobalEmitter {
             int accessFlags;
             if (isPrimitive || isArrayPseudoClass) {
                 accessFlags = PRIMITIVE_CLASS_MODIFIERS;
+            } else if (isLambdaPseudoClass) {
+                accessFlags = Opcodes.ACC_FINAL | Opcodes.ACC_SYNTHETIC;
             } else {
                 accessFlags = (classNode != null) ? classNode.getAccess() : 0;
             }
@@ -3590,7 +3856,12 @@ public class LlvmGlobalEmitter {
 
         sb.append(generateSymbolClassMap(strConsts, classVarNames));
         sb.append(generateClassFileVersionMap(classVarNames));
+        sb.append(generateClassSignatureMap(strConsts, classVarNames));
         sb.append(generateCallerSensitiveSymbols(strConsts));
+        sb.append(generateAnnotationTable(strConsts, classVarNames));
+        sb.append(generateNestedClassTable(classVarNames));
+        sb.append(generateNativeAccessPackages(strConsts));
+        sb.append(generatePackageLocations(strConsts));
         sb.append(generateClassIntConstants(strConsts,
             "jnative_systemprops_raw_constants", "jdk/internal/util/SystemProps$Raw"));
 
@@ -3633,12 +3904,24 @@ public class LlvmGlobalEmitter {
             sb.append("@jnative_function_index = global [1 x %JNativeFunctionEntry] [")
               .append("%JNativeFunctionEntry { i8* null, i8* null, %ReflectionClass* null }]\n");
             sb.append("@jnative_function_index_size = constant i64 0\n");
+            sb.append("@jnative_function_info = constant [1 x { i8*, i8*, i32 }] [")
+              .append("{ i8*, i8*, i32 } { i8* null, i8* null, i32 0 }]\n");
             return sb.toString();
         }
 
         StringBuilder strConsts = new StringBuilder();
         List<String> lines = new ArrayList<>(allFuncs.size());
+        List<String> infoLines = new ArrayList<>(allFuncs.size());
+        Map<String, Map<String, MethodNode>> methodsByMangled = new HashMap<>();
         for (Function f : allFuncs) {
+            MethodNode mn = methodForFunction(f, methodsByMangled);
+            if (mn != null) {
+                infoLines.add("  { i8*, i8*, i32 } { i8* " + ensureStringConstantPtr(strConsts, mn.getName())
+                              + ", i8* " + ensureStringConstantPtr(strConsts, mn.getDescriptor())
+                              + ", i32 " + mn.getAccess() + " }");
+            } else {
+                infoLines.add("  { i8*, i8*, i32 } { i8* null, i8* null, i32 0 }");
+            }
             String name = f.getName();
             String fnPtrTy = llvmFunctionPointerType(f);
             String namePtr = ensureStringConstantPtr(strConsts, name);
@@ -3663,8 +3946,30 @@ public class LlvmGlobalEmitter {
         sb.append("@jnative_function_index_size = constant i64 ")
           .append(allFuncs.size()).append("\n\n");
 
+        sb.append("@jnative_function_info = constant [")
+          .append(allFuncs.size())
+          .append(" x { i8*, i8*, i32 }] [\n");
+        sb.append(String.join(",\n", infoLines));
+        sb.append("\n]\n\n");
+
         sb.append(strConsts);
         return sb.toString();
+    }
+
+    private MethodNode methodForFunction(Function f, Map<String, Map<String, MethodNode>> cache) {
+        String owner = f.getOwnerClass();
+        if (owner == null || owner.isEmpty()) return null;
+        Map<String, MethodNode> byMangled = cache.computeIfAbsent(owner, k -> {
+            Map<String, MethodNode> m = new HashMap<>();
+            ClassNode cn = resolver.getClassNode(k);
+            if (cn != null && cn.getMethods() != null) {
+                for (MethodNode mn : cn.getMethods()) {
+                    m.putIfAbsent(LlvmRuntime.mangleMethod(k, mn.getName(), mn.getDescriptor()), mn);
+                }
+            }
+            return m;
+        });
+        return byMangled.get(f.getName());
     }
 
     /**
@@ -3913,6 +4218,133 @@ public class LlvmGlobalEmitter {
         return sb.toString();
     }
 
+    private String generateClassSignatureMap(StringBuilder strConsts, Map<String, String> classVarNames) {
+        TreeMap<String, String> signatures = new TreeMap<>();
+        for (ClassNode cn : resolver.getClassMap().values()) {
+            String className = cn.getName();
+            if (className == null || cn.getSignature() == null) continue;
+            if (classVarNames.containsKey(className)) {
+                signatures.put(className, cn.getSignature());
+            }
+        }
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("@jnative_class_signatures = constant [")
+            .append(signatures.size() + 1)
+            .append(" x { %ReflectionClass*, i8* }] [\n");
+        for (Map.Entry<String, String> e : signatures.entrySet()) {
+            sb.append("  { %ReflectionClass*, i8* } { %ReflectionClass* ")
+                .append(classVarNames.get(e.getKey()))
+                .append(", i8* ").append(ensureStringConstantPtr(strConsts, e.getValue())).append(" },\n");
+        }
+        sb.append("  { %ReflectionClass*, i8* } { %ReflectionClass* null, i8* null }\n");
+        sb.append("]\n");
+        sb.append("@jnative_class_signatures_size = constant i64 ")
+            .append(signatures.size()).append("\n");
+        return sb.toString();
+    }
+
+    private String generateAnnotationTable(StringBuilder strConsts, Map<String, String> classVarNames) {
+        StringBuilder data = new StringBuilder();
+        List<String> rows = new ArrayList<>();
+        int blob = 0;
+        for (String className : new TreeSet<>(classVarNames.keySet())) {
+            byte[] bytes = resolver.getClassBytes(className);
+            if (bytes == null) continue;
+            ClassFileAnnotations annotations = ClassFileAnnotations.parse(bytes);
+            if (annotations == null || annotations.isEmpty()) continue;
+            int id = rows.size();
+            String cp = annotationBlob(data, "@__jnative_annot_cp_" + id, annotations.getConstantPool());
+            String classAnns = annotationBlob(data, "@__jnative_annot_c_" + id, annotations.getClassAnnotations());
+            List<String> memberRows = new ArrayList<>();
+            for (ClassFileAnnotations.Member m : annotations.getMembers()) {
+                String anns = annotationBlob(data, "@__jnative_annot_b_" + blob++, m.annotations());
+                String params = annotationBlob(data, "@__jnative_annot_b_" + blob++, m.parameterAnnotations());
+                String dflt = annotationBlob(data, "@__jnative_annot_b_" + blob++, m.annotationDefault());
+                memberRows.add("  { i8*, i8*, i8*, i32, i8*, i32, i8*, i32 } { i8* "
+                    + ensureStringConstantPtr(strConsts, m.name()) + ", i8* "
+                    + ensureStringConstantPtr(strConsts, m.descriptor()) + ", "
+                    + anns + ", " + params + ", " + dflt + " }");
+            }
+            String membersPtr = "i8* null";
+            if (!memberRows.isEmpty()) {
+                String membersVar = "@__jnative_annot_m_" + id;
+                String arrayType = "[" + memberRows.size() + " x { i8*, i8*, i8*, i32, i8*, i32, i8*, i32 }]";
+                data.append(membersVar).append(" = private constant ").append(arrayType).append(" [\n")
+                    .append(String.join(",\n", memberRows)).append("\n]\n");
+                membersPtr = "i8* bitcast (" + arrayType + "* " + membersVar + " to i8*)";
+            }
+            rows.add("  { %ReflectionClass*, i8*, i32, i32, i8*, i32, i8*, i32 } { %ReflectionClass* "
+                + classVarNames.get(className) + ", " + cp + ", i32 " + annotations.getConstantPoolCount()
+                + ", " + classAnns + ", " + membersPtr + ", i32 " + memberRows.size() + " }");
+        }
+        StringBuilder sb = new StringBuilder(data);
+        sb.append("@jnative_annotation_classes = constant [").append(rows.size() + 1)
+            .append(" x { %ReflectionClass*, i8*, i32, i32, i8*, i32, i8*, i32 }] [\n");
+        for (String row : rows) sb.append(row).append(",\n");
+        sb.append("  { %ReflectionClass*, i8*, i32, i32, i8*, i32, i8*, i32 } zeroinitializer\n]\n");
+        sb.append("@jnative_annotation_classes_size = constant i64 ").append(rows.size()).append("\n");
+        return sb.toString();
+    }
+
+    private String generateNestedClassTable(Map<String, String> classVarNames) {
+        Map<String, String> declaring = new TreeMap<>();
+        Map<String, Set<String>> members = new TreeMap<>();
+        for (String className : new TreeSet<>(classVarNames.keySet())) {
+            byte[] bytes = resolver.getClassBytes(className);
+            if (bytes == null) continue;
+            new ClassReader(bytes).accept(new ClassVisitor(Opcodes.ASM9) {
+                @Override
+                public void visitInnerClass(String name, String outerName, String innerName, int access) {
+                    if (outerName == null || innerName == null) return;
+                    if (!classVarNames.containsKey(name) || !classVarNames.containsKey(outerName)) return;
+                    if (name.equals(className)) declaring.put(name, outerName);
+                    if (outerName.equals(className)) members.computeIfAbsent(className, k -> new TreeSet<>()).add(name);
+                }
+            }, ClassReader.SKIP_CODE | ClassReader.SKIP_DEBUG | ClassReader.SKIP_FRAMES);
+        }
+        Set<String> classes = new TreeSet<>(declaring.keySet());
+        classes.addAll(members.keySet());
+        StringBuilder data = new StringBuilder();
+        List<String> rows = new ArrayList<>();
+        for (String className : classes) {
+            String declaringRef = declaring.containsKey(className)
+                ? "%ReflectionClass* " + classVarNames.get(declaring.get(className))
+                : "%ReflectionClass* null";
+            Set<String> list = members.getOrDefault(className, Set.of());
+            String membersRef = "%ReflectionClass** null";
+            if (!list.isEmpty()) {
+                String var = "@__jnative_nested_" + rows.size();
+                String type = "[" + (list.size() + 1) + " x %ReflectionClass*]";
+                List<String> ptrs = new ArrayList<>();
+                for (String m : list) ptrs.add("%ReflectionClass* " + classVarNames.get(m));
+                ptrs.add("%ReflectionClass* null");
+                data.append(var).append(" = private constant ").append(type).append(" [")
+                    .append(String.join(", ", ptrs)).append("]\n");
+                membersRef = "%ReflectionClass** getelementptr inbounds (" + type + ", " + type + "* " + var
+                    + ", i32 0, i32 0)";
+            }
+            rows.add("  { %ReflectionClass*, %ReflectionClass*, %ReflectionClass**, i32 } { %ReflectionClass* "
+                + classVarNames.get(className) + ", " + declaringRef + ", " + membersRef + ", i32 " + list.size() + " }");
+        }
+        StringBuilder sb = new StringBuilder(data);
+        sb.append("@jnative_nested_classes = constant [").append(rows.size() + 1)
+            .append(" x { %ReflectionClass*, %ReflectionClass*, %ReflectionClass**, i32 }] [\n");
+        for (String row : rows) sb.append(row).append(",\n");
+        sb.append("  { %ReflectionClass*, %ReflectionClass*, %ReflectionClass**, i32 } zeroinitializer\n]\n");
+        sb.append("@jnative_nested_classes_size = constant i64 ").append(rows.size()).append("\n");
+        return sb.toString();
+    }
+
+    private static String annotationBlob(StringBuilder data, String name, byte[] bytes) {
+        if (bytes == null) return "i8* null, i32 0";
+        if (bytes.length == 0) return "i8* null, i32 0";
+        data.append(name).append(" = private unnamed_addr constant [").append(bytes.length)
+            .append(" x i8] c\"").append(llvmByteString(bytes)).append("\"\n");
+        return "i8* getelementptr inbounds ([" + bytes.length + " x i8], [" + bytes.length + " x i8]* "
+            + name + ", i32 0, i32 0), i32 " + bytes.length;
+    }
+
     private String generateClassIntConstants(StringBuilder strConsts, String symbol, String className) {
         List<String> rows = new ArrayList<>();
         ClassNode cn = resolver.getClassNode(className);
@@ -3931,6 +4363,96 @@ public class LlvmGlobalEmitter {
         rows.forEach(sb::append);
         sb.append("  { i8*, i32 } zeroinitializer\n]\n");
         return sb.toString();
+    }
+
+    private String generateNativeAccessPackages(StringBuilder strConsts) {
+        Set<String> granted = resolver.jdkNativeAccessModules();
+        TreeSet<String> packages = new TreeSet<>();
+        for (String className : emittedRefClassNames) {
+            if (className.isEmpty() || className.charAt(0) == '[') continue;
+            int slash = className.lastIndexOf('/');
+            if (slash <= 0) continue;
+            String pkg = className.substring(0, slash);
+            if (packages.contains(pkg)) continue;
+            String moduleName = resolver.systemModuleOfPackage(pkg);
+            if (moduleName != null && granted.contains(moduleName)) packages.add(pkg);
+        }
+
+        StringBuilder sb = new StringBuilder("\n");
+        sb.append("@jnative_native_access_packages = constant [")
+            .append(packages.size() + 1).append(" x i8*] [\n");
+        for (String pkg : packages) {
+            sb.append("  i8* ").append(ensureStringConstantPtr(strConsts, pkg)).append(",\n");
+        }
+        sb.append("  i8* null\n]\n");
+        sb.append("@jnative_native_access_packages_size = constant i64 ")
+            .append(packages.size()).append("\n");
+        return sb.toString();
+    }
+
+    private String generatePackageLocations(StringBuilder strConsts) {
+        TreeSet<String> packages = new TreeSet<>();
+        for (String className : emittedRefClassNames) {
+            if (className.isEmpty() || className.charAt(0) == '[') continue;
+            int slash = className.lastIndexOf('/');
+            if (slash > 0) packages.add(className.substring(0, slash));
+        }
+
+        StringBuilder data = new StringBuilder();
+        Map<String, String> manifestGlobals = new HashMap<>();
+        List<String> rows = new ArrayList<>(packages.size());
+        for (String pkg : packages) {
+            String location;
+            byte[] manifest = null;
+            String moduleName = resolver.systemModuleOfPackage(pkg);
+            if (moduleName != null) {
+                location = "jrt:/" + moduleName;
+            } else {
+                DependencyResolver.PackageSource src = resolver.getPackageSource(pkg);
+                location = src != null ? src.location() : "";
+                manifest = src != null ? src.manifest() : null;
+            }
+            String manifestPtr = "i8* null";
+            int manifestLen = 0;
+            if (manifest != null && manifest.length > 0) {
+                byte[] bytes = manifest;
+                String global = manifestGlobals.computeIfAbsent(location, k -> {
+                    String name = "@jnative_package_manifest_" + manifestGlobals.size();
+                    data.append(name).append(" = private constant [").append(bytes.length)
+                        .append(" x i8] c\"").append(llvmByteString(bytes)).append("\"\n");
+                    return name;
+                });
+                manifestPtr = "i8* getelementptr inbounds ([" + manifest.length + " x i8], ["
+                    + manifest.length + " x i8]* " + global + ", i32 0, i32 0)";
+                manifestLen = manifest.length;
+            }
+            rows.add("  { i8*, i8*, i8*, i32 } { i8* " + ensureStringConstantPtr(strConsts, pkg)
+                + ", i8* " + ensureStringConstantPtr(strConsts, location)
+                + ", " + manifestPtr + ", i32 " + manifestLen + " }");
+        }
+
+        StringBuilder sb = new StringBuilder("\n");
+        sb.append(data);
+        sb.append("@jnative_package_locations = constant [").append(rows.size() + 1)
+            .append(" x { i8*, i8*, i8*, i32 }] [\n");
+        for (String row : rows) sb.append(row).append(",\n");
+        sb.append("  { i8*, i8*, i8*, i32 } zeroinitializer\n]\n");
+        sb.append("@jnative_package_locations_size = constant i64 ").append(rows.size()).append("\n");
+        return sb.toString();
+    }
+
+    private static String llvmByteString(byte[] bytes) {
+        StringBuilder out = new StringBuilder(bytes.length + 16);
+        for (byte b : bytes) {
+            int v = b & 0xFF;
+            if (v < 0x20 || v > 0x7E || v == '"' || v == '\\') {
+                out.append('\\').append(Character.toUpperCase(Character.forDigit(v >> 4, 16)))
+                   .append(Character.toUpperCase(Character.forDigit(v & 0xF, 16)));
+            } else {
+                out.append((char) v);
+            }
+        }
+        return out.toString();
     }
 
     private String generateCallerSensitiveSymbols(StringBuilder strConsts) {
@@ -4198,9 +4720,9 @@ public class LlvmGlobalEmitter {
         return sb.toString();
     }
 
-    private String emitAdaptorForConstructor(String className, MethodReference ctor, int objectSize) {
+    private String emitAdaptorForConstructor(String className, MethodReference ctor, int objectSize,
+                                             String origFuncName, boolean cAbi) {
         String desc = ctor.getDescriptor();
-        String origFuncName = LlvmRuntime.mangleMethod(className, "<init>", desc);
         String adaptorName = "__reflect_adaptor_ctor_"
             + LlvmTypeMapper.sanitizeIdentifier(className) + "_"
             + desc.replaceAll("[^a-zA-Z0-9_]", "_");
@@ -4243,9 +4765,18 @@ public class LlvmGlobalEmitter {
         StringBuilder argsCsv = new StringBuilder();
         argsCsv.append("i8* %obj");
         for (int i = 0; i < argLoads.size(); i++) {
-            argsCsv.append(", ")
-                .append(LlvmTypeMapper.toLlvmType(paramTypes.get(i)))
-                .append(" ").append(argLoads.get(i));
+            Type pt = paramTypes.get(i);
+            String arg = argLoads.get(i);
+            // Same C-ABI widening as emitAdaptorForMethod for native overrides.
+            if (cAbi && LlvmTypeMapper.toCAbiType(pt) != pt) {
+                String wide = "%arg" + i + "_abi";
+                sb.append("  ").append(wide)
+                    .append(pt == Type.BOOLEAN || pt == Type.CHAR ? " = zext " : " = sext ")
+                    .append(LlvmTypeMapper.toLlvmType(pt)).append(" ").append(arg).append(" to i32\n");
+                pt = Type.INT;
+                arg = wide;
+            }
+            argsCsv.append(", ").append(LlvmTypeMapper.toLlvmType(pt)).append(" ").append(arg);
         }
         sb.append("  call void @").append(origFuncName)
             .append("(").append(argsCsv).append(")\n");

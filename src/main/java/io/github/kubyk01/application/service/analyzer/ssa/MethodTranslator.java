@@ -7,6 +7,7 @@ import io.github.kubyk01.domain.analyzer.dependencyresolver.MethodNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.MethodReference;
 import io.github.kubyk01.domain.ir.BasicBlock;
 import io.github.kubyk01.domain.ir.BranchTerminator;
+import io.github.kubyk01.domain.ir.CondBranchTerminator;
 import io.github.kubyk01.domain.ir.Constant;
 import io.github.kubyk01.domain.ir.Function;
 import io.github.kubyk01.domain.ir.IndirectBranchTerminator;
@@ -70,6 +71,8 @@ public class MethodTranslator extends MethodVisitor {
     private final Map<Label, Integer> labelStackHeight = new HashMap<>();
     private final Map<Label, List<Type>> labelStackTypes = new HashMap<>();
     private int nextSyntheticLocal = 10000;
+    private int ldcBlockCounter = 0;
+    private String lastLoadedClass = null;
 
     /**
      * Bytecode offset of the instruction currently being visited, or -1
@@ -90,7 +93,7 @@ public class MethodTranslator extends MethodVisitor {
      *  without going through
      * . For a try-range inside a loop
      *  that is not the whole-method approximation: the only path from
-     *
+     * <p>
      *  to
      *  in the CFG runs around the entire
      *  loop, so the BFS pulls in the loop header, the loop tail and every
@@ -99,17 +102,17 @@ public class MethodTranslator extends MethodVisitor {
      *  pattern in
      *  —
      *  that produces false exceptional edges such as
-     *
+     * <p>
      * , which in turn make the handler's
      *  reads appear live in the loop header and create PHI nodes whose
      *  preheader operand has never been assigned. The PHI's incoming
      *  value on the preheader edge does not exist in the JVM verifier's
      *  model (the slot is not definitely assigned on that path), and
-     *
+     * <p>
      *  correctly refuses to invent
      *  one: it emits
      * , which
-     *
+     * <p>
      *  then rejects.</p>
      *  <p>The bytecode-interval formulation is the semantics the JVM
      *  specification uses: the protected range of a try-catch entry is a
@@ -497,6 +500,8 @@ public class MethodTranslator extends MethodVisitor {
             case Opcodes.MONITOREXIT:
                 handlers.monitorExit();
                 break;
+            case Opcodes.NOP:
+                break;
 
             default:
                 log.warn("Unhandled insn opcode: {}", opcode);
@@ -605,13 +610,13 @@ public class MethodTranslator extends MethodVisitor {
         recordBlockOffset();
         switch (opcode) {
             case Opcodes.GETFIELD:
-                handlers.getField(owner, name);
+                handlers.getField(owner, name, desc);
                 break;
             case Opcodes.PUTFIELD:
                 handlers.putField(owner, name);
                 break;
             case Opcodes.GETSTATIC:
-                handlers.getStatic(owner, name);
+                handlers.getStatic(owner, name, desc);
                 break;
             case Opcodes.PUTSTATIC:
                 handlers.putStatic(owner, name);
@@ -804,8 +809,13 @@ public class MethodTranslator extends MethodVisitor {
             case org.objectweb.asm.Type asmType -> {
                 int sort = asmType.getSort();
                 if (sort == org.objectweb.asm.Type.OBJECT) {
-                    frame.push(new Constant(Type.reference("java/lang/Class"),
-                        asmType.getInternalName()));
+                    String internalName = asmType.getInternalName();
+                    lastLoadedClass = internalName;
+                    if (isClassMirrorAvailable(internalName)) {
+                        frame.push(new Constant(Type.reference("java/lang/Class"), internalName));
+                    } else {
+                        emitClassLiteralForMissingClass(internalName);
+                    }
                 } else if (sort == org.objectweb.asm.Type.ARRAY) {
                     frame.push(new Constant(Type.reference("java/lang/Class"),
                         asmType.getDescriptor()));
@@ -815,6 +825,86 @@ public class MethodTranslator extends MethodVisitor {
             }
             case null, default -> frame.push(new Constant(Type.UNKNOWN, value));
         }
+    }
+
+    private boolean isClassMirrorAvailable(String internalName) {
+        ClassNode cn = resolver.getClassNode(internalName);
+        if (cn != null && !cn.isExternal() && resolver.getClassBytes(internalName) != null) {
+            return true;
+        }
+        resolver.forceLoadSystemClass(internalName);
+        cn = resolver.getClassNode(internalName);
+        return cn != null && !cn.isExternal() && resolver.getClassBytes(internalName) != null;
+    }
+
+    private void emitClassLiteralForMissingClass(String internalName) {
+        Function func = currentFunction;
+        BasicBlock saved = builder.currentBlock();
+        if (func == null || saved == null) {
+            frame.push(new Constant(Type.reference("java/lang/Class"), internalName));
+            return;
+        }
+
+        int id = ++ldcBlockCounter;
+        BasicBlock throwBlock = new BasicBlock("ldc_ncdfe_" + id + "_" + sanitizeForLabel(internalName));
+        BasicBlock okBlock = new BasicBlock("ldc_ok_" + id + "_" + sanitizeForLabel(internalName));
+        func.addBlock(throwBlock);
+        func.addBlock(okBlock);
+
+        Integer savedOffset = blockOffsets.get(saved);
+        if (savedOffset == null && currentBytecodeOffset >= 0) {
+            savedOffset = currentBytecodeOffset;
+        }
+        if (savedOffset != null) {
+            blockOffsets.put(throwBlock, savedOffset);
+        }
+
+        Constant classConst = new Constant(Type.reference("java/lang/Class"), internalName);
+
+        Instruction isNull = new Instruction(Opcode.EQ);
+        isNull.addOperand(classConst);
+        isNull.addOperand(new Constant(Type.NULL, null));
+        Temporary isNullResult = builder.newTemporary(Type.BOOLEAN);
+        isNull.setResult(isNullResult);
+        isNullResult.setDefiningInstruction(isNull);
+        isNull.setParent(saved);
+        saved.addInstruction(isNull);
+
+        saved.setTerminator(new CondBranchTerminator(isNullResult, throwBlock, okBlock));
+
+        builder.setCurrentBlock(throwBlock);
+        currentBlock = throwBlock;
+
+        Instruction construct = new Instruction(Opcode.STATIC_CALL);
+        construct.addOperand(new Constant(
+            Type.reference("__jnative_construct_exception"), "__jnative_construct_exception"));
+        construct.addOperand(new Constant(
+            Type.reference("__llvm_vtable_ptr__"), "java/lang/NoClassDefFoundError"));
+        construct.addOperand(new Constant(Type.reference("java/lang/String"), internalName));
+        Temporary exc = builder.newTemporary(Type.reference("java/lang/NoClassDefFoundError"));
+        construct.setResult(exc);
+        exc.setDefiningInstruction(construct);
+        construct.setParent(throwBlock);
+        throwBlock.addInstruction(construct);
+        builder.createThrow(exc);
+
+        builder.setCurrentBlock(okBlock);
+        currentBlock = okBlock;
+        frame.push(classConst);
+    }
+
+    private static String sanitizeForLabel(String s) {
+        StringBuilder sb = new StringBuilder(s.length());
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+                || (c >= '0' && c <= '9') || c == '_') {
+                sb.append(c);
+            } else {
+                sb.append('_');
+            }
+        }
+        return sb.toString();
     }
 
     @Override

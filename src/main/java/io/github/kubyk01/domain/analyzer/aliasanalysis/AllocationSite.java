@@ -6,29 +6,83 @@ import io.github.kubyk01.domain.ir.Opcode;
 import io.github.kubyk01.domain.ir.Type;
 import lombok.Getter;
 
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReferenceArray;
+
 @Getter
 public final class AllocationSite {
+
+    private record Key(String methodName, int instructionIndex, String typeName, Type type) {}
+
+    private static final int CHUNK_BITS = 12;
+    private static final int CHUNK_SIZE = 1 << CHUNK_BITS;
+    private static final int CHUNK_MASK = CHUNK_SIZE - 1;
+    private static final ConcurrentHashMap<Key, AllocationSite> INTERNED = new ConcurrentHashMap<>();
+    private static final AtomicInteger NEXT_ID = new AtomicInteger();
+    private static final AtomicReferenceArray<AllocationSite[]> CHUNKS =
+        new AtomicReferenceArray<>(1 << (31 - CHUNK_BITS));
+
     public static final AllocationSite UNKNOWN =
-        new AllocationSite("<unknown>", -1, "<unknown>", Type.UNKNOWN, 0);
+        of("<unknown>", -1, "<unknown>", Type.UNKNOWN);
 
     private final String methodName;
     private final int instructionIndex;
     private final String typeName;
     private final Type type;
     private final int cachedHash;
+    private final int id;
+    @Getter(lombok.AccessLevel.NONE)
+    private volatile PointsToSet singleton;
 
     private AllocationSite(String methodName, int instructionIndex,
-                           String typeName, Type type, int cachedHash) {
+                           String typeName, Type type, int cachedHash, int id) {
         this.methodName = methodName;
         this.instructionIndex = instructionIndex;
         this.typeName = typeName;
         this.type = type;
         this.cachedHash = cachedHash;
+        this.id = id;
     }
 
     public static AllocationSite of(String methodName, int idx,
                                     String typeName, Type type) {
-        return new AllocationSite(methodName, idx, typeName, type, computeHash(methodName, idx, typeName, type));
+        Key key = new Key(methodName, idx, typeName, type);
+        AllocationSite existing = INTERNED.get(key);
+        if (existing != null) return existing;
+        return INTERNED.computeIfAbsent(key, AllocationSite::register);
+    }
+
+    private static AllocationSite register(Key k) {
+        int id = NEXT_ID.getAndIncrement();
+        AllocationSite site = new AllocationSite(k.methodName(), k.instructionIndex(), k.typeName(), k.type(),
+            computeHash(k.methodName(), k.instructionIndex(), k.typeName(), k.type()), id);
+        int chunkIndex = id >>> CHUNK_BITS;
+        AllocationSite[] chunk = CHUNKS.get(chunkIndex);
+        if (chunk == null) {
+            AllocationSite[] fresh = new AllocationSite[CHUNK_SIZE];
+            chunk = CHUNKS.compareAndExchange(chunkIndex, null, fresh);
+            if (chunk == null) chunk = fresh;
+        }
+        chunk[id & CHUNK_MASK] = site;
+        return site;
+    }
+
+    public static AllocationSite byId(int id) {
+        return CHUNKS.get(id >>> CHUNK_BITS)[id & CHUNK_MASK];
+    }
+
+    public static int count() {
+        return NEXT_ID.get();
+    }
+
+    public PointsToSet singleton() {
+        PointsToSet s = singleton;
+        if (s == null) {
+            s = PointsToSet.ofSortedUnique(new int[]{id});
+            singleton = s;
+        }
+        return s;
     }
 
     public static AllocationSite fromInstruction(Instruction inst, String methodName, int idx) {

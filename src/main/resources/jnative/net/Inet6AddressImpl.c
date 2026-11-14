@@ -47,43 +47,11 @@
  * into the address array depends on the family: 4 for IPv4, 16 for
  * IPv6. Returns NULL if either of the required classes is not in the
  * reflection registry or if any allocation fails.
- *
- * The field layout used here matches LlvmGlobalEmitter.getFieldOffset
- * for the two target classes:
- *
- *   java.net.InetAddress:
- *       offset  8 : String canonicalHostName
- *       offset 16 : InetAddressHolder holder
- *
- *   java.net.InetAddress$InetAddressHolder:
- *       offset  8 : String hostName
- *       offset 16 : int    family
- *       offset 20 : byte[] addressBytes
  */
 static void* make_inet_address(const uint8_t* bytes, int java_family,
                                const char* hostname)
 {
-    ReflectionClass* ia_cls =
-        jnative_class_by_name("java/net/InetAddress");
-    ReflectionClass* h_cls =
-        jnative_class_by_name("java/net/InetAddress$InetAddressHolder");
-    if (!ia_cls || !h_cls) return NULL;
-
-    void* holder = jnative_alloc_object(h_cls);
-    if (!holder) return NULL;
-
-    *(void**)((char*)holder + 8)    = jnative_string(hostname);
-    *(int32_t*)((char*)holder + 16) = java_family;
-    *(void**)((char*)holder + 20)   =
-        jnative_byte_array(bytes, java_family == JAVA_IPV4 ? 4 : 16);
-
-    void* ia = jnative_alloc_object(ia_cls);
-    if (!ia) { free(holder); return NULL; }
-
-    *(void**)((char*)ia + 8)  = NULL;
-    *(void**)((char*)ia + 16) = holder;
-
-    return ia;
+    return jnative_make_inet_address(bytes, java_family == JAVA_IPV4 ? 4 : 16, hostname);
 }
 
 void* __jnative_fn_java_net_Inet6AddressImpl_lookupAllHostAddr__Ljava_lang_String_I__Ljava_net_InetAddress_(
@@ -93,9 +61,7 @@ void* __jnative_fn_java_net_Inet6AddressImpl_lookupAllHostAddr__Ljava_lang_Strin
     if (!host_str) {
         __jnative_throw_exception(NULL);
     }
-    int32_t hostLen = 0;
-    const char* host = __jnative_read_string_bytes(host_str, &hostLen);
-    (void)hostLen;
+    const char* host = __jnative_read_string_bytes(host_str, NULL);
 
     struct addrinfo hints;
     memset(&hints, 0, sizeof(hints));
@@ -259,8 +225,8 @@ int32_t __jnative_fn_java_net_Inet6AddressImpl_isReachable0___BII_BII_Z(
         return 0;
     }
 
-    int fd = socket(ss.ss_family, SOCK_STREAM, 0);
-    if (fd < 0) {
+    jn_socket_t fd = socket(ss.ss_family, SOCK_STREAM, 0);
+    if (fd == JN_INVALID_SOCKET) {
         return 0;
     }
 
@@ -291,6 +257,6 @@ int32_t __jnative_fn_java_net_Inet6AddressImpl_isReachable0___BII_BII_Z(
         reachable = 1;
     }
 
-    close(fd);
+    jn_close_socket(fd);
     return reachable;
 }

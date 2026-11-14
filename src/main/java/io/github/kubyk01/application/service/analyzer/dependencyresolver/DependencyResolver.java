@@ -1,14 +1,15 @@
 package io.github.kubyk01.application.service.analyzer.dependencyresolver;
 
-import io.github.kubyk01.application.service.analyzer.reachabilityanalysis.ReachabilityMetadataParser;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.kubyk01.application.service.analyzer.ssa.TypeResolver;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.ClassNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.FieldNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.MethodNode;
-import io.github.kubyk01.domain.analyzer.reachability.ReachabilityMetadata;
 import io.github.kubyk01.domain.ir.Type;
 import lombok.Getter;
 import lombok.RequiredArgsConstructor;
+import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
 import org.objectweb.asm.AnnotationVisitor;
 import org.objectweb.asm.ClassReader;
@@ -17,8 +18,8 @@ import org.objectweb.asm.FieldVisitor;
 import org.objectweb.asm.MethodVisitor;
 import org.objectweb.asm.Opcodes;
 
-import java.io.ByteArrayInputStream;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.io.InputStream;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
@@ -29,6 +30,9 @@ import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Schedulers;
 import java.util.stream.Collectors;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
@@ -90,15 +94,20 @@ public class DependencyResolver {
     private final Set<String> loadedClasses  = ConcurrentHashMap.newKeySet();
 
     @Getter
-    private final ReachabilityMetadata metadata = ReachabilityMetadata.builder().build();
+    private final List<List<String>> proxyInterfaces = new java.util.concurrent.CopyOnWriteArrayList<>();
 
     private FileSystem jrtFileSystem;
 
+    @Setter
     private Path targetJavaHome;
     private Set<String> targetModules; // lazily listed from the target image
 
-    public void setTargetJavaHome(Path targetJavaHome) {
-        this.targetJavaHome = targetJavaHome;
+    public Path getRuntimeJavaHome() {
+        return targetJavaHome != null ? targetJavaHome : Path.of(System.getProperty("java.home"));
+    }
+
+    public Path getInputPath() {
+        return inputArchive;
     }
 
     /**
@@ -110,6 +119,54 @@ public class DependencyResolver {
      * file; in those cases there are no nested jars to index.
      */
     private volatile Path inputArchive;
+
+    private final List<Path> scannedJars = new java.util.concurrent.CopyOnWriteArrayList<>();
+
+    private static final String SERVICES_PREFIX = "META-INF/services/";
+
+    private final Map<String, Set<String>> serviceProviders = new ConcurrentHashMap<>();
+
+    public Map<String, List<String>> getServiceProviders() {
+        Map<String, List<String>> out = new LinkedHashMap<>();
+        for (Map.Entry<String, Set<String>> e : new TreeMap<>(serviceProviders).entrySet()) {
+            synchronized (e.getValue()) {
+                out.put(e.getKey(), List.copyOf(e.getValue()));
+            }
+        }
+        return out;
+    }
+
+    private void addServiceFile(String entryName, byte[] content) {
+        String service = entryName.substring(SERVICES_PREFIX.length());
+        if (service.isEmpty() || service.indexOf('/') >= 0) return;
+        Set<String> providers = serviceProviders.computeIfAbsent(service,
+                k -> Collections.synchronizedSet(new LinkedHashSet<>()));
+        for (String line : new String(content, java.nio.charset.StandardCharsets.UTF_8).split("\\R")) {
+            int hash = line.indexOf('#');
+            String name = (hash >= 0 ? line.substring(0, hash) : line).trim();
+            if (!name.isEmpty()) providers.add(name);
+        }
+    }
+
+    private byte[] transformClass(byte[] bytes) {
+        String className = new ClassReader(bytes).getClassName();
+        if (ProxyRewriter.PROXY.equals(className)) return ProxyRewriter.rewrite(bytes);
+        if (!ServiceLoaderRewriter.ITERATOR.equals(className)) return bytes;
+        return ServiceLoaderRewriter.rewrite(bytes, getServiceProviders());
+    }
+
+    public synchronized void defineSyntheticClass(String internalName, byte[] bytes) {
+        if (classBytes.containsKey(internalName)) return;
+        try {
+            parseClassBytes(internalName, bytes);
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+
+    public List<Path> getScannedJars() {
+        return List.copyOf(scannedJars);
+    }
 
     /**
      * Lazy index of every .class entry that lives inside a nested jar of a
@@ -214,7 +271,7 @@ public class DependencyResolver {
             }
         }
 
-        if (targetJavaHome == null) {
+        if (targetJavaHome == null || ProxyRewriter.SUPPORT.equals(internalName)) {
             try (InputStream is = ClassLoader.getSystemResourceAsStream(internalName + ".class")) {
                 if (is != null) {
                     bytes = is.readAllBytes();
@@ -477,7 +534,6 @@ public class DependencyResolver {
 
     public void scan(Path path) throws IOException {
         this.inputArchive = path;
-
         if (Files.isDirectory(path)) {
             Files.walk(path)
                     .filter(p -> p.toString().endsWith(".class"))
@@ -486,6 +542,12 @@ public class DependencyResolver {
                     .filter(p -> p.toString().endsWith(".json")
                             && p.toString().contains(NATIVE_IMAGE_METADATA_PREFIX))
                     .forEach(this::parseMetadataFile);
+            try (var files = Files.walk(path)) {
+                for (Path file : (Iterable<Path>) files.filter(Files::isRegularFile)::iterator) {
+                    String rel = path.relativize(file).toString().replace('\\', '/');
+                    if (rel.startsWith(SERVICES_PREFIX)) addServiceFile(rel, Files.readAllBytes(file));
+                }
+            }
         } else if (path.toString().endsWith(".jar")) {
             // Load the input jar's classes first (as before), so the class map is
             // fully populated before any dependency detection runs.
@@ -505,6 +567,16 @@ public class DependencyResolver {
                     // Load the dependency's classes, skipping any class whose name
                     // is already in the map — the input jar must always win.
                     scanJar(depJar, true);
+                }
+                List<Path> referencedJars =
+                        MavenDependencyLoader.resolveReferencedDependencies(path, dependencyJars);
+                if (!referencedJars.isEmpty()) {
+                    System.out.println("Loading " + referencedJars.size()
+                            + " additional jar(s) that provide classes referenced by the application");
+                    for (Path extraJar : referencedJars) {
+                        System.out.println("  " + extraJar.getFileName());
+                        scanJar(extraJar, true);
+                    }
                 }
             }
         } else if (path.toString().endsWith(".class")) {
@@ -531,7 +603,10 @@ public class DependencyResolver {
      *                      class the resolver already knows about.
      */
     private void scanJar(Path jarPath, boolean skipExisting) throws IOException {
+        scannedJars.add(jarPath);
         try (JarFile jar = new JarFile(jarPath.toFile())) {
+            String location = jarPath.getFileName().toString();
+            byte[] manifest = readManifestBytes(jar);
             Enumeration<JarEntry> entries = jar.entries();
             while (entries.hasMoreElements()) {
                 JarEntry entry = entries.nextElement();
@@ -539,6 +614,15 @@ public class DependencyResolver {
 
                 if (name.endsWith(".jar")) {
                     indexNestedJar(jar, jarPath, entry);
+                    continue;
+                }
+
+                int services = name.indexOf(SERVICES_PREFIX);
+                if (!entry.isDirectory() && (services == 0
+                        || (services > 0 && name.startsWith("classes/", services - "classes/".length())))) {
+                    try (InputStream is = jar.getInputStream(entry)) {
+                        addServiceFile(name.substring(services), is.readAllBytes());
+                    }
                     continue;
                 }
 
@@ -550,7 +634,9 @@ public class DependencyResolver {
                         }
                     }
                     try (InputStream is = jar.getInputStream(entry)) {
-                        parseClassStream(is);
+                        byte[] raw = is.readAllBytes();
+                        recordPackageSource(new ClassReader(raw).getClassName(), location, manifest);
+                        parseClassBytes(name, raw);
                     }
                 }
 
@@ -574,19 +660,13 @@ public class DependencyResolver {
 
     private void parseMetadataStream(InputStream is, String fileName) {
         try {
-            // Jackson's ObjectMapper closes the stream it is given
-            // (AUTO_CLOSE_SOURCE). When this method is called with the
-            // shared ZipInputStream that walks a nested jar, that close
-            // tears the whole archive down and every subsequent
-            // getNextEntry()/read() throws "Stream closed", silently
-            // dropping every remaining class in that jar. Buffering the
-            // small JSON entry first hands Jackson a stream it may close
-            // harmlessly. readAllBytes() on the ZipInputStream consumes
-            // exactly the current entry, leaving the archive walk intact.
-            byte[] bytes = is.readAllBytes();
-            ReachabilityMetadata part = ReachabilityMetadataParser.parse(
-                    new ByteArrayInputStream(bytes), fileName);
-            metadata.merge(part);
+            JsonNode root = new ObjectMapper().readTree(is.readAllBytes());
+            for (JsonNode node : root.isObject() ? root.path("proxyInterfaces") : root) {
+                if (node.has("name") || !node.path("interfaces").isArray()) continue;
+                List<String> interfaces = new ArrayList<>();
+                node.get("interfaces").forEach(i -> interfaces.add(i.asText()));
+                if (!interfaces.isEmpty()) proxyInterfaces.add(interfaces);
+            }
         } catch (Exception e) {
             log.warn("Failed to parse metadata stream: {}", fileName, e);
         }
@@ -600,6 +680,9 @@ public class DependencyResolver {
      */
     private void indexNestedJar(JarFile outerJar, Path outerJarPath, JarEntry nestedEntry) {
         String nestedName = nestedEntry.getName();
+        String location = outerJarPath.getFileName() + "!/" + nestedName;
+        List<String> nestedClasses = new ArrayList<>();
+        byte[] manifest = null;
         try (InputStream is = outerJar.getInputStream(nestedEntry);
              ZipInputStream zis = new ZipInputStream(is)) {
 
@@ -613,15 +696,122 @@ public class DependencyResolver {
                     nestedClassIndex.putIfAbsent(
                             internalName,
                             new NestedClassRef(outerJarPath, nestedName, entryName));
+                    nestedClasses.add(internalName);
+                } else if (entryName.equalsIgnoreCase(JarFile.MANIFEST_NAME)) {
+                    manifest = zis.readAllBytes();
                 } else if (entryName.startsWith(NATIVE_IMAGE_METADATA_PREFIX)
                         && entryName.endsWith(".json")) {
                     parseMetadataStream(zis, nestedName + "!/" + entryName);
+                } else if (entryName.startsWith(SERVICES_PREFIX) && !entry.isDirectory()) {
+                    addServiceFile(entryName, zis.readAllBytes());
                 }
 
                 zis.closeEntry();
             }
         } catch (IOException e) {
             log.warn("Failed to index nested jar {}: {}", nestedName, e.getMessage());
+        }
+        for (String internalName : nestedClasses) {
+            recordPackageSource(internalName, location, manifest);
+        }
+    }
+
+    public record PackageSource(String location, byte[] manifest) {}
+
+    private final Map<String, PackageSource> packageSources = new ConcurrentHashMap<>();
+
+    public PackageSource getPackageSource(String internalPackage) {
+        return packageSources.get(internalPackage);
+    }
+
+    private void recordPackageSource(String internalClassName, String location, byte[] manifest) {
+        if (internalClassName == null) return;
+        int slash = internalClassName.lastIndexOf('/');
+        if (slash <= 0 || internalClassName.startsWith("META-INF/")) return;
+        packageSources.putIfAbsent(internalClassName.substring(0, slash),
+                new PackageSource(location, manifest));
+    }
+
+    private static byte[] readManifestBytes(JarFile jar) throws IOException {
+        JarEntry entry = jar.getJarEntry(JarFile.MANIFEST_NAME);
+        if (entry == null) return null;
+        try (InputStream is = jar.getInputStream(entry)) {
+            return is.readAllBytes();
+        }
+    }
+
+    public void loadAllClasses() {
+        loadAllNestedClasses();
+        int before = classBytes.size();
+        try {
+            List<Path> files;
+            try (var walk = Files.walk(getJrtFileSystem().getPath("/modules"))) {
+                files = walk.filter(p -> p.getNameCount() > 2 && p.toString().endsWith(".class")).toList();
+            }
+            for (Path file : files) {
+                String name = file.subpath(2, file.getNameCount()).toString();
+                name = name.substring(0, name.length() - ".class".length());
+                if (name.endsWith("module-info") || classBytes.containsKey(name)) continue;
+                try {
+                    parseClassBytes(name, Files.readAllBytes(file));
+                    missingClasses.remove(name);
+                    loadedClasses.add(name);
+                } catch (IOException | RuntimeException e) {
+                    log.warn("Failed to load system class {}: {}", name, e.getMessage());
+                }
+            }
+        } catch (IOException e) {
+            throw new UncheckedIOException("Cannot read the JDK module image", e);
+        }
+        System.out.println("Loaded " + (classBytes.size() - before) + " JDK classes from the module image");
+    }
+
+    private void loadAllNestedClasses() {
+        Map<Path, Map<String, Map<String, String>>> byJar = new HashMap<>();
+        for (Map.Entry<String, NestedClassRef> e : nestedClassIndex.entrySet()) {
+            String name = e.getKey();
+            if (name.startsWith("META-INF/") || name.endsWith("module-info") || name.endsWith("package-info")) {
+                continue;
+            }
+            NestedClassRef ref = e.getValue();
+            byJar.computeIfAbsent(ref.outerJar(), k -> new HashMap<>())
+                 .computeIfAbsent(ref.nestedJarEntryName(), k -> new HashMap<>())
+                 .put(ref.classEntryName(), name);
+        }
+        Flux.fromIterable(byJar.entrySet())
+            .flatMapIterable(outer -> outer.getValue().entrySet().stream()
+                .map(nested -> Map.entry(outer.getKey(), nested))
+                .toList())
+            .flatMap(job -> Mono.fromRunnable(() -> loadNestedJar(job.getKey(), job.getValue().getKey(), job.getValue().getValue()))
+                .subscribeOn(Schedulers.boundedElastic()))
+            .then()
+            .block();
+    }
+
+    private void loadNestedJar(Path outerJar, String nestedJarName, Map<String, String> classesByEntry) {
+        try (JarFile outer = new JarFile(outerJar.toFile())) {
+            JarEntry nestedEntry = outer.getJarEntry(nestedJarName);
+            if (nestedEntry == null) return;
+            try (InputStream is = outer.getInputStream(nestedEntry);
+                 ZipInputStream zis = new ZipInputStream(is)) {
+                ZipEntry entry;
+                while ((entry = zis.getNextEntry()) != null) {
+                    String internalName = classesByEntry.get(entry.getName());
+                    if (internalName != null && nestedClassIndex.remove(internalName) != null
+                            && !classMap.containsKey(internalName)) {
+                        try {
+                            parseClassBytes(internalName, zis.readAllBytes());
+                            loadedClasses.add(internalName);
+                        } catch (IOException | RuntimeException ex) {
+                            log.warn("Failed to parse class {} from nested jar: {}",
+                                    internalName, ex.getMessage());
+                        }
+                    }
+                    zis.closeEntry();
+                }
+            }
+        } catch (IOException e) {
+            log.warn("Failed to read nested jar {} of {}: {}", nestedJarName, outerJar, e.getMessage());
         }
     }
 
@@ -664,128 +854,10 @@ public class DependencyResolver {
     }
 
     private void parseClassFile(Path classFile) {
-        try (InputStream is = Files.newInputStream(classFile)) {
-            parseClassStream(is);
+        try {
+            parseClassBytes(classFile.toString(), Files.readAllBytes(classFile));
         } catch (Exception e) {
             log.error("Failed to parse class file: {}", classFile, e);
-        }
-    }
-
-    private void parseClassStream(InputStream is) throws IOException {
-        try {
-            byte[] bytes = is.readAllBytes();
-            ClassReader reader = new ClassReader(bytes);
-
-            ClassNode.ClassNodeBuilder builder = ClassNode.builder();
-            final String[] currentClassName = {null};
-            final List<FieldNode> fields = new ArrayList<>();
-            final List<MethodNode> methods = new ArrayList<>();
-            final List<String> polymorphicMethodNames = new ArrayList<>();
-
-            try {
-                reader.accept(new ClassVisitor(Opcodes.ASM9) {
-                    @Override
-                    public void visit(int version, int access, String name, String signature,
-                                      String superName, String[] interfaces) {
-                        currentClassName[0] = name;
-                        builder.name(name)
-                                .superName(superName)
-                                .interfaces(interfaces != null ? Arrays.asList(interfaces) : Collections.emptyList())
-                                .access(access)
-                                .classFileVersion(version)
-                                .isInterface((access & Opcodes.ACC_INTERFACE) != 0)
-                                .isExternal(false);
-                    }
-
-                    @Override
-                    public FieldVisitor visitField(int access, String name, String descriptor,
-                                                   String signature, Object value) {
-                    fields.add(FieldNode.builder()
-                            .name(name)
-                            .descriptor(descriptor)
-                            .type(Type.fromDescriptor(descriptor))
-                            .access(access)
-                            .owner(currentClassName[0])   // declaring class
-                            .constantValue(value)
-                            .build());
-                        return null;
-                    }
-
-                    @Override
-                    public MethodVisitor visitMethod(int access, String name, String descriptor,
-                                                     String signature, String[] exceptions) {
-                        MethodNode.MethodNodeBuilder mb = MethodNode.builder()
-                                .name(name)
-                                .descriptor(descriptor)
-                                .returnType(TypeResolver.descToReturnType(descriptor))
-                                .parameterTypes(TypeResolver.descToParamTypes(descriptor))
-                                .access(access)
-                                .isAbstract((access & Opcodes.ACC_ABSTRACT) != 0)
-                                .isNative((access & Opcodes.ACC_NATIVE) != 0)
-                                .isStatic((access & Opcodes.ACC_STATIC) != 0);
-
-                        return new MethodVisitor(Opcodes.ASM9) {
-                            @Override
-                            public AnnotationVisitor visitAnnotation(String desc, boolean visible) {
-                                if ("Ljdk/internal/reflect/CallerSensitive;".equals(desc)
-                                        || "Lsun/reflect/CallerSensitive;".equals(desc)) {
-                                    mb.callerSensitive(true);
-                                }
-                                if ("Ljava/lang/invoke/MethodHandle$PolymorphicSignature;".equals(desc)) {
-                                    mb.isPolymorphicSignature(true);
-                                    polymorphicMethodNames.add(name);
-                                }
-                                return super.visitAnnotation(desc, visible);
-                            }
-
-                            @Override
-                            public void visitEnd() {
-                                methods.add(mb.build());
-                                super.visitEnd();
-                            }
-                        };
-                    }
-                }, ClassReader.SKIP_CODE | ClassReader.SKIP_DEBUG);
-            } catch (Exception e) {
-                System.err.println("ERROR during reader.accept for class " + currentClassName[0] + ": " + e);
-                e.printStackTrace();
-                throw e;
-            }
-
-            ClassNode classNode = builder
-                    .fields(fields)
-                    .methods(methods)
-                    .polymorphicMethodNames(polymorphicMethodNames)
-                    .build();
-
-            String name = currentClassName[0];
-            if (name == null) {
-                System.err.println("ERROR: currentClassName is null, class not processed");
-                return;
-            }
-            classMap.put(name, classNode);
-            classBytes.put(name, bytes);
-
-            // Update the subtype index for this class. The value sets are
-            // concurrent key sets (see the field declaration), so a
-            // concurrent subclass-closure traversal in another thread
-            // observes a consistent, non-throwing iteration.
-            if (classNode.getSuperName() != null) {
-                subclasses
-                        .computeIfAbsent(classNode.getSuperName(),
-                                k -> ConcurrentHashMap.newKeySet())
-                        .add(name);
-            }
-            for (String iface : classNode.getInterfaces()) {
-                subclasses
-                        .computeIfAbsent(iface,
-                                k -> ConcurrentHashMap.newKeySet())
-                        .add(name);
-            }
-        } catch (Exception e) {
-            System.err.println("ERROR in parseClassStream: " + e.getMessage());
-            e.printStackTrace();
-            throw new IOException("Failed to parse class", e);
         }
     }
 
@@ -795,18 +867,18 @@ public class DependencyResolver {
             if (isArrayTypeName(cn.getName())) continue;
 
             if (cn.getSuperName() != null) {
-                subclasses
-                        .computeIfAbsent(cn.getSuperName(),
-                                k -> ConcurrentHashMap.newKeySet())
-                        .add(cn.getName());
+                indexSubtype(cn.getSuperName(), cn.getName());
             }
             for (String iface : cn.getInterfaces()) {
-                subclasses
-                        .computeIfAbsent(iface,
-                                k -> ConcurrentHashMap.newKeySet())
-                        .add(cn.getName());
+                indexSubtype(iface, cn.getName());
             }
         }
+    }
+
+    public boolean isMissingClass(String internalName) {
+        if (internalName == null || internalName.isEmpty() || isArrayTypeName(internalName)) return false;
+        getClassNode(internalName);
+        return missingClasses.contains(internalName);
     }
 
     public ClassNode getClassNode(String internalName) {
@@ -841,7 +913,8 @@ public class DependencyResolver {
         return previous != null ? previous : stub;
     }
 
-    private void parseClassBytes(String internalName, byte[] bytes) throws IOException {
+    private void parseClassBytes(String internalName, byte[] original) throws IOException {
+        byte[] bytes = transformClass(original);
         ClassReader reader = new ClassReader(bytes);
         ClassNode.ClassNodeBuilder builder = ClassNode.builder();
         final String[] currentClassName = {null};
@@ -860,6 +933,7 @@ public class DependencyResolver {
                             .interfaces(interfaces != null ? Arrays.asList(interfaces) : Collections.emptyList())
                             .access(access)
                             .classFileVersion(version)
+                            .signature(signature)
                             .isInterface((access & Opcodes.ACC_INTERFACE) != 0)
                             .isExternal(false);
                 }
@@ -933,17 +1007,11 @@ public class DependencyResolver {
 
         // Defensive guard against array descriptors.
         if (!isArrayTypeName(name) && classNode.getSuperName() != null) {
-            subclasses
-                    .computeIfAbsent(classNode.getSuperName(),
-                            k -> ConcurrentHashMap.newKeySet())
-                    .add(name);
+            indexSubtype(classNode.getSuperName(), name);
         }
         if (!isArrayTypeName(name)) {
             for (String iface : classNode.getInterfaces()) {
-                subclasses
-                        .computeIfAbsent(iface,
-                                k -> ConcurrentHashMap.newKeySet())
-                        .add(name);
+                indexSubtype(iface, name);
             }
         }
     }
@@ -1047,10 +1115,90 @@ public class DependencyResolver {
         return classBytes.get(internalName);
     }
 
+    private final Map<String, Optional<String>> systemPackageModules = new ConcurrentHashMap<>();
+    private volatile Set<String> jdkNativeAccessModules;
+
+    public String systemModuleOfPackage(String internalPackage) {
+        if (internalPackage == null || internalPackage.isEmpty()) return null;
+        return systemPackageModules.computeIfAbsent(internalPackage, pkg -> {
+            try {
+                FileSystem fs = getJrtFileSystem();
+                if (fs == null) return Optional.empty();
+                Path dir = fs.getPath("/packages/" + pkg.replace('/', '.'));
+                if (!Files.isDirectory(dir)) return Optional.empty();
+                try (var entries = Files.list(dir)) {
+                    return entries.map(p -> p.getFileName().toString().replace("/", ""))
+                            .filter(s -> !s.isEmpty())
+                            .findFirst();
+                }
+            } catch (IOException | RuntimeException e) {
+                log.debug("Cannot map package {} to a system module: {}", pkg, e.getMessage());
+                return Optional.empty();
+            }
+        }).orElse(null);
+    }
+
+    public Set<String> jdkNativeAccessModules() {
+        Set<String> cached = jdkNativeAccessModules;
+        if (cached != null) return cached;
+        synchronized (this) {
+            if (jdkNativeAccessModules != null) return jdkNativeAccessModules;
+            Set<String> modules = new TreeSet<>();
+            modules.add("java.base");
+            String holder = "jdk/internal/module/ModuleLoaderMap$Modules";
+            getClassNode(holder);
+            byte[] bytes = getClassBytes(holder);
+            if (bytes != null) {
+                new ClassReader(bytes).accept(new ClassVisitor(Opcodes.ASM9) {
+                    @Override
+                    public MethodVisitor visitMethod(int access, String name, String descriptor,
+                                                     String signature, String[] exceptions) {
+                        if (!"<clinit>".equals(name)) return null;
+                        return new MethodVisitor(Opcodes.ASM9) {
+                            private final List<String> pending = new ArrayList<>();
+
+                            @Override
+                            public void visitLdcInsn(Object value) {
+                                if (value instanceof String s) pending.add(s);
+                            }
+
+                            @Override
+                            public void visitFieldInsn(int opcode, String owner, String field, String desc) {
+                                if (opcode != Opcodes.PUTSTATIC) return;
+                                if (field.equals("nativeAccessModules")) modules.addAll(pending);
+                                pending.clear();
+                            }
+                        };
+                    }
+                }, ClassReader.SKIP_DEBUG | ClassReader.SKIP_FRAMES);
+            }
+            jdkNativeAccessModules = Set.copyOf(modules);
+            return jdkNativeAccessModules;
+        }
+    }
+
+    private record SubclassClosure(long version, Set<String> classes) {}
+
+    private final Map<String, SubclassClosure> subclassClosureCache = new ConcurrentHashMap<>();
+    private final java.util.concurrent.atomic.AtomicLong subclassIndexVersion =
+            new java.util.concurrent.atomic.AtomicLong();
+
+    private void indexSubtype(String parent, String child) {
+        if (subclasses.computeIfAbsent(parent, k -> ConcurrentHashMap.newKeySet()).add(child)) {
+            subclassIndexVersion.incrementAndGet();
+        }
+    }
+
+    /** Transitive subtypes of {@code className}; read-only, cached until the subtype index changes. */
     public Set<String> getSubclasses(String className) {
+        long version = subclassIndexVersion.get();
+        SubclassClosure cached = subclassClosureCache.get(className);
+        if (cached != null && cached.version() == version) return cached.classes();
         Set<String> result = new HashSet<>();
         collectSubclasses(className, result);
-        return result;
+        Set<String> classes = Collections.unmodifiableSet(result);
+        subclassClosureCache.put(className, new SubclassClosure(version, classes));
+        return classes;
     }
 
     private void collectSubclasses(String className, Set<String> accumulator) {
