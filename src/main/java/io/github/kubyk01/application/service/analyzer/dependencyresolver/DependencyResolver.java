@@ -7,6 +7,7 @@ import io.github.kubyk01.domain.analyzer.dependencyresolver.ClassNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.FieldNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.MethodNode;
 import io.github.kubyk01.domain.ir.Type;
+import io.github.kubyk01.util.JImage;
 import lombok.Getter;
 import lombok.RequiredArgsConstructor;
 import lombok.Setter;
@@ -24,7 +25,6 @@ import java.io.InputStream;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
-import java.net.URI;
 import java.nio.file.*;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
@@ -96,11 +96,10 @@ public class DependencyResolver {
     @Getter
     private final List<List<String>> proxyInterfaces = new java.util.concurrent.CopyOnWriteArrayList<>();
 
-    private FileSystem jrtFileSystem;
+    private JImage jdkImage;
 
     @Setter
     private Path targetJavaHome;
-    private Set<String> targetModules; // lazily listed from the target image
 
     public Path getRuntimeJavaHome() {
         return targetJavaHome != null ? targetJavaHome : Path.of(System.getProperty("java.home"));
@@ -284,7 +283,7 @@ public class DependencyResolver {
         }
 
         if (bytes == null) {
-            bytes = loadClassFromJrt(internalName);
+            bytes = loadClassFromJdkImage(internalName);
         }
 
         if (bytes != null) {
@@ -423,72 +422,21 @@ public class DependencyResolver {
         }
     }
 
-    private byte[] loadClassFromJrt(String internalName) {
+    private byte[] loadClassFromJdkImage(String internalName) {
         try {
-            FileSystem fs = getJrtFileSystem();
-            if (fs == null) return null;
-
-            Set<String> moduleNames = new HashSet<>();
-            if (targetJavaHome != null) {
-                // The target image's module set, not the host's (e.g. jdk.crypto.mscapi is Windows-only).
-                if (targetModules == null) {
-                    Set<String> names = new HashSet<>();
-                    try (var dirs = Files.list(fs.getPath("/modules"))) {
-                        dirs.forEach(d -> names.add(d.getFileName().toString()));
-                    }
-                    targetModules = names;
-                }
-                moduleNames.addAll(targetModules);
-            } else {
-                for (Module module : ModuleLayer.boot().modules()) {
-                    moduleNames.add(module.getName());
-                }
-            }
-            if (!moduleNames.contains("java.base")) {
-                moduleNames.add("java.base");
-            }
-
-            for (String moduleName : moduleNames) {
-                // Leading '/' is REQUIRED: the JRT filesystem resolves
-                // relative paths against an internal root that does not
-                // contain the module tree, so Files.exists() on a path
-                // built by fs.getPath("modules", ...) silently returns
-                // false. The absolute form is the only one that works.
-                Path classPath = fs.getPath(
-                        "/modules/" + moduleName + "/" + internalName + ".class");
-                if (Files.exists(classPath)) {
-                    byte[] bytes = Files.readAllBytes(classPath);
-                    log.debug("Loaded system class {} from jrt:/{}/{}",
-                            internalName, moduleName, internalName + ".class");
-                    return bytes;
-                }
-            }
-        } catch (Exception e) {
-            log.debug("Failed to load system class {} via jrt:/: {}",
+            return jdkImage().readClass(internalName);
+        } catch (IOException | RuntimeException e) {
+            log.debug("Failed to load system class {} from the JDK module image: {}",
                     internalName, e.getMessage());
+            return null;
         }
-        return null;
     }
 
-    private FileSystem getJrtFileSystem() throws IOException {
-        if (jrtFileSystem != null && jrtFileSystem.isOpen()) {
-            return jrtFileSystem;
+    private synchronized JImage jdkImage() throws IOException {
+        if (jdkImage == null) {
+            jdkImage = JImage.open(getRuntimeJavaHome());
         }
-        if (targetJavaHome != null) {
-            // jrt-fs.jar of the given java.home reads that JDK's lib/modules, whatever OS it was built for.
-            jrtFileSystem = FileSystems.newFileSystem(URI.create("jrt:/"),
-                    Map.of("java.home", targetJavaHome.toString()));
-            return jrtFileSystem;
-        }
-        try {
-            jrtFileSystem = FileSystems.getFileSystem(URI.create("jrt:/"));
-            return jrtFileSystem;
-        } catch (FileSystemNotFoundException e) {
-            Map<String, String> env = new HashMap<>();
-            env.put("java.home", System.getProperty("java.home"));
-            jrtFileSystem = FileSystems.newFileSystem(URI.create("jrt:/"), env);
-            return jrtFileSystem;
-        }
+        return jdkImage;
     }
 
     public synchronized void forceLoadSystemClass(String internalName) {
@@ -744,16 +692,11 @@ public class DependencyResolver {
         loadAllNestedClasses();
         int before = classBytes.size();
         try {
-            List<Path> files;
-            try (var walk = Files.walk(getJrtFileSystem().getPath("/modules"))) {
-                files = walk.filter(p -> p.getNameCount() > 2 && p.toString().endsWith(".class")).toList();
-            }
-            for (Path file : files) {
-                String name = file.subpath(2, file.getNameCount()).toString();
-                name = name.substring(0, name.length() - ".class".length());
-                if (name.endsWith("module-info") || classBytes.containsKey(name)) continue;
+            JImage image = jdkImage();
+            for (String name : image.classNames()) {
+                if (classBytes.containsKey(name)) continue;
                 try {
-                    parseClassBytes(name, Files.readAllBytes(file));
+                    parseClassBytes(name, image.readClass(name));
                     missingClasses.remove(name);
                     loadedClasses.add(name);
                 } catch (IOException | RuntimeException e) {
@@ -1122,15 +1065,7 @@ public class DependencyResolver {
         if (internalPackage == null || internalPackage.isEmpty()) return null;
         return systemPackageModules.computeIfAbsent(internalPackage, pkg -> {
             try {
-                FileSystem fs = getJrtFileSystem();
-                if (fs == null) return Optional.empty();
-                Path dir = fs.getPath("/packages/" + pkg.replace('/', '.'));
-                if (!Files.isDirectory(dir)) return Optional.empty();
-                try (var entries = Files.list(dir)) {
-                    return entries.map(p -> p.getFileName().toString().replace("/", ""))
-                            .filter(s -> !s.isEmpty())
-                            .findFirst();
-                }
+                return Optional.ofNullable(jdkImage().moduleOfPackage(pkg));
             } catch (IOException | RuntimeException e) {
                 log.debug("Cannot map package {} to a system module: {}", pkg, e.getMessage());
                 return Optional.empty();
