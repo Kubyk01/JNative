@@ -952,6 +952,9 @@ extern int  __jnative_dtor_enter(void* this_obj);
 extern void __jnative_dtor_unclaim(void* this_obj);
 extern void __jnative_free(void* p);
 extern void __jnative_free_fast(void* p);
+extern void    __jnative_share(void* p);
+extern int32_t __jnative_release_owner(void* p);
+extern void    __jnative_free_owned(void* p);
 
 /* ---- Exception construction and throwers --------------------------- */
 
@@ -1309,6 +1312,7 @@ static inline void jnative_type_info_name(const char* class_name,
 /* ---- Class lookup (defined in jnative_runtime.c, hashed) ---- */
 
 extern ReflectionClass* jnative_class_by_name(const char* name);
+extern void jnative_ensure_class_initialized(ReflectionClass* cls);
 extern ReflectionClass* jnative_class_by_dotted_name(const char* name);
 
 /* Cached "[B" mirror, initialised once via pthread_once. Used by the
@@ -1427,6 +1431,36 @@ static inline int jnative_field_offset(ReflectionClass* cls, const char* name)
         if (strcmp((const char*)cls->fields[i]->name, name) == 0) return cls->fields[i]->offset;
     }
     return -1;
+}
+
+static inline int jnative_field_offset_in(ReflectionClass* cls, const char* name)
+{
+    for (ReflectionClass* c = cls; c != NULL; c = c->superclass) {
+        int off = jnative_field_offset(c, name);
+        if (off > 0) return off;
+    }
+    return -1;
+}
+
+static inline int jnative_named_field_offset(const char* class_name, const char* field_name)
+{
+    int off = jnative_field_offset_in(jnative_class_by_name(class_name), field_name);
+    if (off <= 0) {
+        fprintf(stderr, "jnative: fatal: field %s.%s is not in the reflection metadata\n",
+                class_name, field_name);
+        abort();
+    }
+    return off;
+}
+
+static inline int jnative_cached_field_offset(int* cache, const char* class_name, const char* field_name)
+{
+    int off = __atomic_load_n(cache, __ATOMIC_RELAXED);
+    if (off <= 0) {
+        off = jnative_named_field_offset(class_name, field_name);
+        __atomic_store_n(cache, off, __ATOMIC_RELAXED);
+    }
+    return off;
 }
 
 static inline void* jnative_make_inet_address(const uint8_t* bytes, int len, const char* hostname)

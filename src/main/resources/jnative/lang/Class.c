@@ -837,6 +837,10 @@ static void run_lazy_clinit_if_present(struct ReflectionClass* cls) {
     }
 }
 
+void jnative_ensure_class_initialized(struct ReflectionClass* cls) {
+    run_lazy_clinit_if_present(cls);
+}
+
 static void* make_class_not_found_exception(const char* name, int32_t len) {
     char buf[512];
     if (name != NULL && len > 0 && (size_t)len < sizeof(buf)) {

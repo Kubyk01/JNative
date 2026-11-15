@@ -139,8 +139,7 @@ public class DependencyResolver {
     private void addServiceFile(String entryName, byte[] content) {
         String service = entryName.substring(SERVICES_PREFIX.length());
         if (service.isEmpty() || service.indexOf('/') >= 0) return;
-        Set<String> providers = serviceProviders.computeIfAbsent(service,
-                k -> Collections.synchronizedSet(new LinkedHashSet<>()));
+        Set<String> providers = providersOf(service);
         for (String line : new String(content, java.nio.charset.StandardCharsets.UTF_8).split("\\R")) {
             int hash = line.indexOf('#');
             String name = (hash >= 0 ? line.substring(0, hash) : line).trim();
@@ -444,9 +443,35 @@ public class DependencyResolver {
 
     private synchronized JImage jdkImage() throws IOException {
         if (jdkImage == null) {
-            jdkImage = JImage.open(getRuntimeJavaHome());
+            JImage image = JImage.open(getRuntimeJavaHome());
+            addModuleProviders(image);
+            jdkImage = image;
         }
         return jdkImage;
+    }
+
+    private void addModuleProviders(JImage image) throws IOException {
+        for (String module : image.moduleNames()) {
+            byte[] info = image.read(module, "module-info.class");
+            if (info == null) continue;
+            new ClassReader(info).accept(new ClassVisitor(Opcodes.ASM9) {
+                @Override
+                public org.objectweb.asm.ModuleVisitor visitModule(String name, int access, String version) {
+                    return new org.objectweb.asm.ModuleVisitor(Opcodes.ASM9) {
+                        @Override
+                        public void visitProvide(String service, String... providers) {
+                            Set<String> set = providersOf(service.replace('/', '.'));
+                            for (String p : providers) set.add(p.replace('/', '.'));
+                        }
+                    };
+                }
+            }, ClassReader.SKIP_CODE | ClassReader.SKIP_DEBUG | ClassReader.SKIP_FRAMES);
+        }
+    }
+
+    private Set<String> providersOf(String service) {
+        return serviceProviders.computeIfAbsent(service,
+                k -> Collections.synchronizedSet(new LinkedHashSet<>()));
     }
 
     public synchronized void forceLoadSystemClass(String internalName) {

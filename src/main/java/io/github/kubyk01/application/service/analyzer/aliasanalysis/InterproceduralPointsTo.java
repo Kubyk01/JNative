@@ -51,6 +51,7 @@ public class InterproceduralPointsTo {
     private static final byte K_GET_STATIC = 6;
     private static final byte K_PUT_STATIC = 7;
     private static final byte K_CALL = 8;
+    private static final byte K_COPY = 9;
 
     private static final byte F_NULL_SUMMARY_DONE = 1;
     private static final byte F_RETURNED_DONE = 2;
@@ -318,6 +319,10 @@ public class InterproceduralPointsTo {
                         if (res == null) continue;
                         rel.add(inst); kinds.add(K_PHI); auxs.add(0); inputs.add(ops.size()); infos.add(null);
                     }
+                    case CAST, CHECKCAST -> {
+                        if (res == null || ops.isEmpty() || ops.getFirst() == null) continue;
+                        rel.add(inst); kinds.add(K_COPY); auxs.add(0); inputs.add(1); infos.add(null);
+                    }
                     case GET_FIELD, ALOAD -> {
                         if (ops.size() < 2 || res == null) continue;
                         String field = op == Opcode.ALOAD ? PointsToGraph.ARRAY_ELEMENT_FIELD : extractFieldName(inst);
@@ -399,7 +404,7 @@ public class InterproceduralPointsTo {
                 case K_LOAD -> {
                     if (lastStore[f.aux[i]] >= i) return true;
                 }
-                case K_STORE, K_GET_FIELD -> {
+                case K_STORE, K_GET_FIELD, K_COPY -> {
                     if (definedAtOrAfter(defPos, ops.getFirst(), i)) return true;
                 }
                 case K_PHI -> {
@@ -566,6 +571,12 @@ public class InterproceduralPointsTo {
                 }
                 case K_PHI -> {
                     if (evalPhi(inst, last, o)) local = true;
+                }
+                case K_COPY -> {
+                    PointsToSet src = graph.get(inst.getOperands().getFirst());
+                    if (src == last[o]) continue;
+                    last[o] = src;
+                    if (!src.isEmpty() && graph.merge(inst.getResult(), src)) local = true;
                 }
                 case K_GET_FIELD -> {
                     if (evalGetField(f, i, inst, last, o)) local = true;

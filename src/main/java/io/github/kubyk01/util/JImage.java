@@ -121,6 +121,10 @@ public final class JImage {
         }
     }
 
+    public Set<String> moduleNames() {
+        return Collections.unmodifiableSet(modules.keySet());
+    }
+
     public Set<String> resources(String module) {
         Map<String, Location> resources = modules.get(module);
         return resources == null ? Set.of() : Collections.unmodifiableSet(resources.keySet());

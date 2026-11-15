@@ -81,7 +81,7 @@ public class LlvmRuntime {
      * every CALL site.
      */
     private static final Pattern MANGLED_CALLABLE_PATTERN = Pattern.compile(
-        "^[a-zA-Z0-9_/$]+\\.[a-zA-Z0-9_<>$]+\\([^)]*\\)[^)]*$");
+        "^[^.;\\[()]+\\.[^.;\\[/()]+\\([^)]*\\)[^)]*$");
 
     /**
      * Returns the block of {@code declare} lines that every generated module
@@ -118,6 +118,8 @@ public class LlvmRuntime {
             declare void @free(i8*)
             declare void @__jnative_free(i8*)
             declare void @__jnative_free_fast(i8*)
+            declare i32  @__jnative_release_owner(i8*)
+            declare void @__jnative_free_owned(i8*)
             declare void @__jnative_destruct_dispatch(i8*)
             declare void @__jnative_destruct_dispatch_if_not_same(i8*, i8*)
 
@@ -159,6 +161,7 @@ public class LlvmRuntime {
             declare void @__jnative_pop_catch()
             declare void @__jnative_throw_exception(i8*)
             declare i8* @__jnative_construct_exception(i8*, i8*)
+            declare i8* @__jnative_methodhandle_invoke(i8*, i8**, i8*)
             declare i8* @__jnative_get_exception_object()
             declare i1 @__jnative_catch_matches(i8*, i8**)
 

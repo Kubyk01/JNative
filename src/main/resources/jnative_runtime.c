@@ -433,6 +433,112 @@ void __jnative_free_fast(void* p) {
     free(p);
 }
 
+typedef void (*jnative_destructor_fn)(void*);
+static jnative_destructor_fn jnative_destructor_for(void* key);
+
+typedef struct {
+    uintptr_t key;
+    int64_t   extra;
+} JNativeShareSlot;
+
+static jn_mutex_t        jnative_share_lock = JN_MUTEX_INITIALIZER;
+static JNativeShareSlot* jnative_share_slots;
+static size_t            jnative_share_cap;
+static size_t            jnative_share_used;
+static int64_t           jnative_share_live;
+
+static int jnative_share_grow(void) {
+    size_t new_cap = jnative_share_cap == 0 ? 1024 : jnative_share_cap * 2;
+    JNativeShareSlot* fresh = (JNativeShareSlot*)calloc(new_cap, sizeof(JNativeShareSlot));
+    if (fresh == NULL) return 0;
+    for (size_t i = 0; i < jnative_share_cap; i++) {
+        uintptr_t k = jnative_share_slots[i].key;
+        if (k == 0) continue;
+        size_t idx = (size_t)(jnative_mix(k) & (new_cap - 1));
+        while (fresh[idx].key != 0) idx = (idx + 1) & (new_cap - 1);
+        fresh[idx] = jnative_share_slots[i];
+    }
+    free(jnative_share_slots);
+    jnative_share_slots = fresh;
+    jnative_share_cap = new_cap;
+    return 1;
+}
+
+static void jnative_share_remove_at(size_t idx) {
+    size_t mask = jnative_share_cap - 1;
+    size_t hole = idx;
+    size_t j = idx;
+    for (;;) {
+        j = (j + 1) & mask;
+        uintptr_t k = jnative_share_slots[j].key;
+        if (k == 0) break;
+        size_t home = (size_t)(jnative_mix(k) & mask);
+        if (((j - home) & mask) >= ((j - hole) & mask)) {
+            jnative_share_slots[hole] = jnative_share_slots[j];
+            hole = j;
+        }
+    }
+    jnative_share_slots[hole].key = 0;
+    jnative_share_slots[hole].extra = 0;
+    jnative_share_used--;
+    __atomic_store_n(&jnative_share_live, (int64_t)jnative_share_used, __ATOMIC_RELEASE);
+}
+
+void __jnative_share(void* p) {
+    if (p == NULL) return;
+    uintptr_t addr = (uintptr_t)p;
+    if (jnative_static_low != 0 && jnative_static_high != 0
+        && addr >= jnative_static_low && addr < jnative_static_high) {
+        return;
+    }
+    void* type_word = *(void**)p;
+    if (type_word == NULL || jnative_destructor_for(type_word) == NULL) return;
+    jn_mutex_lock(&jnative_share_lock);
+    if ((jnative_share_used + 1) * 2 > jnative_share_cap && !jnative_share_grow()) {
+        jn_mutex_unlock(&jnative_share_lock);
+        __jnative_throw_out_of_memory_error_ctx("__jnative_share");
+    }
+    size_t mask = jnative_share_cap - 1;
+    size_t idx = (size_t)(jnative_mix(addr) & mask);
+    while (jnative_share_slots[idx].key != 0 && jnative_share_slots[idx].key != addr) {
+        idx = (idx + 1) & mask;
+    }
+    if (jnative_share_slots[idx].key == 0) {
+        jnative_share_slots[idx].key = addr;
+        jnative_share_slots[idx].extra = 0;
+        jnative_share_used++;
+        __atomic_store_n(&jnative_share_live, (int64_t)jnative_share_used, __ATOMIC_RELEASE);
+    }
+    jnative_share_slots[idx].extra++;
+    jn_mutex_unlock(&jnative_share_lock);
+}
+
+int32_t __jnative_release_owner(void* p) {
+    if (p == NULL) return 0;
+    if (__atomic_load_n(&jnative_share_live, __ATOMIC_ACQUIRE) == 0) return 1;
+    uintptr_t addr = (uintptr_t)p;
+    jn_mutex_lock(&jnative_share_lock);
+    int32_t last_owner = 1;
+    if (jnative_share_cap != 0) {
+        size_t mask = jnative_share_cap - 1;
+        size_t idx = (size_t)(jnative_mix(addr) & mask);
+        while (jnative_share_slots[idx].key != 0) {
+            if (jnative_share_slots[idx].key == addr) {
+                last_owner = 0;
+                if (--jnative_share_slots[idx].extra == 0) jnative_share_remove_at(idx);
+                break;
+            }
+            idx = (idx + 1) & mask;
+        }
+    }
+    jn_mutex_unlock(&jnative_share_lock);
+    return last_owner;
+}
+
+void __jnative_free_owned(void* p) {
+    if (__jnative_release_owner(p)) __jnative_free(p);
+}
+
 /* ========================================================================
  *  Monitor table
  * ====================================================================== */

@@ -141,7 +141,9 @@ int32_t __jnative_fn_jdk_internal_loader_NativeLibraries_load__Ljdk_internal_loa
     }
 
     if (lib != NULL) {
-        *(void**)((char*)lib + 16) = handle;
+        static int handle_off;
+        *(int64_t*)((char*)lib + jnative_cached_field_offset(&handle_off,
+            "jdk/internal/loader/NativeLibraries$NativeLibraryImpl", "handle")) = (int64_t)(intptr_t)handle;
     }
     return 1;
 }

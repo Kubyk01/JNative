@@ -1356,6 +1356,13 @@ public class LlvmFunctionEmitter {
                         allArgs.add(operands.get(i));
                     }
                     List<Value> argsWithoutReceiver = allArgs.subList(1, allArgs.size());
+
+                    if ("java/lang/invoke/MethodHandle".equals(owner)
+                            && ("invoke".equals(methodName) || "invokeExact".equals(methodName))) {
+                        emitMethodHandleInvoke(sb, receiver, argsWithoutReceiver, methodDesc,
+                                retType, inst.getResult(), resultName, ranges);
+                        break;
+                    }
                     List<Type> paramTypes = argsWithoutReceiver.stream()
                             .map(Value::getType)
                             .collect(Collectors.toList());
@@ -3019,6 +3026,68 @@ public class LlvmFunctionEmitter {
         sb.append("  ").append(cast).append(" = bitcast ").append(fromTy).append(" ").append(value)
                 .append(" to ").append(toTy).append("\n");
         return cast;
+    }
+
+    private void emitMethodHandleInvoke(StringBuilder sb, Value receiver, List<Value> args,
+                                        String siteDesc, Type retType, Value result,
+                                        String resultName, List<TryCatchRange> ranges) {
+        Type object = Type.reference("java/lang/Object");
+        List<Type> siteParams = TypeResolver.descToParamTypes(siteDesc);
+        Type siteRet = TypeResolver.descToReturnType(siteDesc);
+        String argv = newAux("mh_args");
+        pendingSlotDeclarations.add("  " + argv + " = alloca i8*, i32 "
+                + Math.max(1, args.size()) + ", align 8\n");
+        String descRef = stringRef(siteDesc);
+        emitCall(sb, retType, result, resultName, ranges, (callSb, resultReg) -> {
+            for (int i = 0; i < args.size(); i++) {
+                Value arg = args.get(i);
+                Type paramType = i < siteParams.size() ? siteParams.get(i) : arg.getType();
+                String slot = newAux("mh_slot");
+                callSb.append("  ").append(slot).append(" = getelementptr i8*, i8** ")
+                        .append(argv).append(", i32 ").append(i).append("\n");
+                callSb.append("  store i8* null, i8** ").append(slot).append("\n");
+                if (paramType.isPrimitive()) {
+                    String ty = LlvmTypeMapper.toLlvmType(paramType);
+                    String val = castValueToType(callSb, getLlvmValue(callSb, arg), arg.getType(), paramType);
+                    String typed = newAux("mh_slot_cast");
+                    callSb.append("  ").append(typed).append(" = bitcast i8** ").append(slot)
+                            .append(" to ").append(ty).append("*\n");
+                    callSb.append("  store ").append(ty).append(" ").append(val).append(", ")
+                            .append(ty).append("* ").append(typed).append("\n");
+                } else {
+                    String val = castValueToType(callSb, getLlvmValue(callSb, arg), arg.getType(), object);
+                    callSb.append("  store i8* ").append(val).append(", i8** ").append(slot).append("\n");
+                }
+            }
+            String mh = castValueToType(callSb, getLlvmValue(callSb, receiver), receiver.getType(), object);
+            String raw = newAux("mh_ret");
+            callSb.append("  ").append(raw).append(" = call i8* @__jnative_methodhandle_invoke(i8* ")
+                    .append(mh).append(", i8** ").append(argv).append(", i8* ").append(descRef).append(")\n");
+            if (resultReg == null) return;
+            String value;
+            if (siteRet.isPrimitive()) {
+                String ty = LlvmTypeMapper.toLlvmType(siteRet);
+                String typed = newAux("mh_ret_cast");
+                callSb.append("  ").append(typed).append(" = bitcast i8* ").append(raw)
+                        .append(" to ").append(ty).append("*\n");
+                value = newAux("mh_ret_val");
+                callSb.append("  ").append(value).append(" = load ").append(ty).append(", ")
+                        .append(ty).append("* ").append(typed).append("\n");
+                value = castValueToType(callSb, value, siteRet, retType);
+            } else {
+                value = castValueToType(callSb, raw, object, retType);
+            }
+            String retLlvm = LlvmTypeMapper.toLlvmType(retType);
+            if (retType.isPrimitive()) {
+                String zero = retType == Type.FLOAT || retType == Type.DOUBLE ? "0.0" : "0";
+                String op = retType == Type.FLOAT || retType == Type.DOUBLE ? "fadd" : "add";
+                callSb.append("  ").append(resultReg).append(" = ").append(op).append(" ")
+                        .append(retLlvm).append(" ").append(value).append(", ").append(zero).append("\n");
+            } else {
+                callSb.append("  ").append(resultReg).append(" = bitcast ").append(retLlvm).append(" ")
+                        .append(value).append(" to ").append(retLlvm).append("\n");
+            }
+        });
     }
 
     private void emitPolymorphicCall(StringBuilder sb, List<Value> args,

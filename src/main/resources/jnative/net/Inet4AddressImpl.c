@@ -63,11 +63,23 @@ static void* make_inet4_address(const uint8_t* bytes, const char* hostname) {
  * Java-side caller's UnknownHostException catch block converts into
  * the appropriate checked exception.
  */
-void* __jnative_fn_java_net_Inet4AddressImpl_lookupAllHostAddr__Ljava_lang_String___Ljava_net_InetAddress_(
-        void* host_str)
+JNATIVE_NORETURN static void throw_unknown_host(const char* host, const char* reason)
 {
+    char msg[512];
+    snprintf(msg, sizeof(msg), "%s: %s", host, reason);
+    void* exc = __jnative_construct_exception("vtable_java_net_UnknownHostException", msg);
+    if (exc == NULL) {
+        __jnative_throw_io_ctx(msg, NULL);
+    }
+    __jnative_throw_exception(exc);
+}
+
+void* __jnative_fn_java_net_Inet4AddressImpl_lookupAllHostAddr__Ljava_lang_String___Ljava_net_InetAddress_(
+        void* this_impl, void* host_str)
+{
+    (void)this_impl;
     if (!host_str) {
-        __jnative_throw_exception(NULL);
+        __jnative_throw_null_pointer_exception();
     }
     const char* host = __jnative_read_string_bytes(host_str, NULL);
 
@@ -79,7 +91,7 @@ void* __jnative_fn_java_net_Inet4AddressImpl_lookupAllHostAddr__Ljava_lang_Strin
     struct addrinfo* res = NULL;
     int rc = getaddrinfo(host, NULL, &hints, &res);
     if (rc != 0 || !res) {
-        __jnative_throw_exception(NULL);
+        throw_unknown_host(host, rc != 0 ? gai_strerror(rc) : "no addresses");
     }
 
     int count = 0;
@@ -88,7 +100,7 @@ void* __jnative_fn_java_net_Inet4AddressImpl_lookupAllHostAddr__Ljava_lang_Strin
     }
     if (count == 0) {
         freeaddrinfo(res);
-        __jnative_throw_exception(NULL);
+        throw_unknown_host(host, "no addresses");
     }
 
     /* InetAddress[] — the descriptor matches the declared Java return
@@ -98,7 +110,7 @@ void* __jnative_fn_java_net_Inet4AddressImpl_lookupAllHostAddr__Ljava_lang_Strin
                                              "[Ljava/net/InetAddress;");
     if (!array) {
         freeaddrinfo(res);
-        __jnative_throw_exception(NULL);
+        __jnative_throw_out_of_memory_error();
     }
 
     void** slots = (void**)((char*)array + JAVA_ARR_HDR);
@@ -126,11 +138,11 @@ void* __jnative_fn_java_net_Inet4AddressImpl_lookupAllHostAddr__Ljava_lang_Strin
  * resolution is the correct answer regardless of which bits are set.
  */
 void* __jnative_fn_java_net_Inet4AddressImpl_lookupAllHostAddr__Ljava_lang_String_I__Ljava_net_InetAddress_(
-        void* host_str, int32_t policy)
+        void* this_impl, void* host_str, int32_t policy)
 {
     (void)policy;
     return __jnative_fn_java_net_Inet4AddressImpl_lookupAllHostAddr__Ljava_lang_String___Ljava_net_InetAddress_(
-        host_str);
+        this_impl, host_str);
 }
 
 /*
@@ -155,11 +167,11 @@ void* __jnative_fn_java_net_Inet4AddressImpl_lookupAllHostAddr__Ljava_lang_Strin
  * respectively.
  */
 void* __jnative_fn_java_net_Inet4AddressImpl_lookupAllHostAddr__Ljava_lang_String_Ljava_net_spi_InetAddressResolver_LookupPolicy___Ljava_net_InetAddress_(
-        void* host_str, void* lookup_policy)
+        void* this_impl, void* host_str, void* lookup_policy)
 {
     (void)lookup_policy;
     return __jnative_fn_java_net_Inet4AddressImpl_lookupAllHostAddr__Ljava_lang_String___Ljava_net_InetAddress_(
-        host_str);
+        this_impl, host_str);
 }
 
 /*
@@ -174,12 +186,17 @@ void* __jnative_fn_java_net_Inet4AddressImpl_lookupAllHostAddr__Ljava_lang_Strin
  * the Java-side caller translates that into UnknownHostException.
  */
 void* __jnative_fn_java_net_Inet4AddressImpl_getHostByAddr___B_Ljava_lang_String_(
-        void* addr_bytes)
+        void* this_impl, void* addr_bytes)
 {
-    if (!addr_bytes) return NULL;
+    (void)this_impl;
+    if (!addr_bytes) {
+        __jnative_throw_null_pointer_exception();
+    }
 
     int32_t len = jnative_array_length(addr_bytes);
-    if (len != 4) return NULL;
+    if (len != 4) {
+        throw_unknown_host("getHostByAddr", "invalid address length");
+    }
     uint8_t* bytes = (uint8_t*)jnative_array_data(addr_bytes);
 
     struct sockaddr_in sin;
@@ -192,7 +209,7 @@ void* __jnative_fn_java_net_Inet4AddressImpl_getHostByAddr___B_Ljava_lang_String
                          hostbuf, sizeof(hostbuf),
                          NULL, 0, NI_NAMEREQD);
     if (rc != 0) {
-        return NULL;
+        throw_unknown_host("getHostByAddr", gai_strerror(rc));
     }
     return jnative_string(hostbuf);
 }
@@ -208,8 +225,9 @@ void* __jnative_fn_java_net_Inet4AddressImpl_getHostByAddr___B_Ljava_lang_String
  * failed gethostname returns NULL, which the Java-side caller treats
  * as "no local host name available".
  */
-void* __jnative_fn_java_net_Inet4AddressImpl_getLocalHostName___Ljava_lang_String_(void)
+void* __jnative_fn_java_net_Inet4AddressImpl_getLocalHostName___Ljava_lang_String_(void* this_impl)
 {
+    (void)this_impl;
     char buf[256];
     if (gethostname(buf, sizeof(buf)) != 0) {
         return NULL;
@@ -236,9 +254,10 @@ void* __jnative_fn_java_net_Inet4AddressImpl_getLocalHostName___Ljava_lang_Strin
  * opposite.
  */
 int32_t __jnative_fn_java_net_Inet4AddressImpl_isReachable0___BI_BI_Z(
-        void* addr_bytes, int32_t timeout,
+        void* this_impl, void* addr_bytes, int32_t timeout,
         void* inf_bytes, int32_t ttl)
 {
+    (void)this_impl;
     (void)inf_bytes; (void)ttl;
 
     if (addr_bytes == NULL) {

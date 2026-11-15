@@ -295,6 +295,13 @@ void *__jnative_fn_java_lang_Object_clone___Ljava_lang_Object_(void *obj) {
             return NULL;
         }
         memcpy(copy, obj, (size_t)total);
+        struct ReflectionClass *arr_cls = find_class_object_in_registry(first_word);
+        const char *arr_name = arr_cls != NULL ? arr_cls->cname : NULL;
+        if (arr_name != NULL && arr_name[0] == '[' && (arr_name[1] == 'L' || arr_name[1] == '[')
+            && elem_size == (int32_t)sizeof(void *)) {
+            void **elems = (void **)((char *)copy + JAVA_ARR_HDR);
+            for (int32_t i = 0; i < length; i++) __jnative_share(elems[i]);
+        }
         return copy;
     }
 
@@ -323,6 +330,17 @@ void *__jnative_fn_java_lang_Object_clone___Ljava_lang_Object_(void *obj) {
     }
 
     memcpy(clone, obj, (size_t)size);
+    for (struct ReflectionClass *c = cls; c != NULL; c = c->superclass) {
+        if (c->fields == NULL) continue;
+        for (struct ReflectionField **fp = c->fields; *fp != NULL; fp++) {
+            struct ReflectionField *f = *fp;
+            const char *desc = (const char *)f->descriptor;
+            if ((f->modifiers & 0x0008) != 0 || desc == NULL) continue;
+            if (desc[0] != 'L' && desc[0] != '[') continue;
+            if (f->offset <= 0 || f->offset + (int)sizeof(void *) > size) continue;
+            __jnative_share(*(void **)((char *)clone + f->offset));
+        }
+    }
     return clone;
 }
 

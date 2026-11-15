@@ -2035,7 +2035,7 @@ public class LlvmGenerator implements LlvmGeneratorPort {
          * ============================================================= */
         if (isConstructor) {
             buildConstructorAdaptor(
-                builder, entry, implOwner, implDesc, samArgs);
+                builder, entry, implOwner, implDesc, loadedCaptures, samArgs);
             return;
         }
 
@@ -2187,16 +2187,21 @@ public class LlvmGenerator implements LlvmGeneratorPort {
                                          BasicBlock entry,
                                          String implOwner,
                                          String implDesc,
+                                         List<Value> captures,
                                          List<Value> samArgs) {
         List<Type> ctorParamTypes = TypeResolver.descToParamTypes(implDesc);
         int ctorArity = ctorParamTypes.size();
 
-        List<Value> ctorArgs = new ArrayList<>(samArgs);
+        List<Value> ctorArgs = new ArrayList<>(captures);
+        ctorArgs.addAll(samArgs);
         while (ctorArgs.size() > ctorArity) {
             ctorArgs.removeLast();
         }
         while (ctorArgs.size() < ctorArity) {
             ctorArgs.add(new Constant(Type.NULL, null));
+        }
+        for (int i = 0; i < ctorArity; i++) {
+            ctorArgs.set(i, adaptValue(builder, ctorArgs.get(i), ctorParamTypes.get(i)));
         }
 
         // Ensure the class layout (and its vtable) is built.

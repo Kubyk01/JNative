@@ -1408,8 +1408,33 @@ private void emitDestructionGuard(BasicBlock entry,
         entry.addSuccessor(returnBlock);
         entry.addSuccessor(entryAfterNull);
 
+        // Object.clone() leaves the copied children with several owners; only the last one destroys them.
+        Instruction ownerCall = new Instruction(Opcode.STATIC_CALL);
+        ownerCall.addOperand(new Constant(
+            Type.reference("__jnative_release_owner"), "__jnative_release_owner"));
+        ownerCall.addOperand(thisParam);
+        Temporary ownerResult = new Temporary(Type.INT);
+        ownerCall.setResult(ownerResult);
+        ownerResult.setDefiningInstruction(ownerCall);
+        entryAfterNull.addInstruction(ownerCall);
+
+        Instruction stillShared = new Instruction(Opcode.EQ);
+        stillShared.addOperand(ownerResult);
+        stillShared.addOperand(new Constant(Type.INT, 0));
+        Temporary stillSharedBool = new Temporary(Type.BOOLEAN);
+        stillShared.setResult(stillSharedBool);
+        stillSharedBool.setDefiningInstruction(stillShared);
+        entryAfterNull.addInstruction(stillShared);
+
+        BasicBlock lastOwner = new BasicBlock(entry.getLabel() + "_last_owner");
+        func.addBlock(lastOwner);
+        entryAfterNull.setTerminator(
+            new CondBranchTerminator(stillSharedBool, returnBlock, lastOwner));
+        entryAfterNull.addSuccessor(returnBlock);
+        entryAfterNull.addSuccessor(lastOwner);
+
         // ---------------------------------------------------------------
-        // Shutdown-guard — исходная логика, перенесённая в entryAfterNull.
+        // Shutdown-guard — исходная логика, перенесённая в lastOwner.
         // ---------------------------------------------------------------
         BasicBlock slowCheck = new BasicBlock(entry.getLabel() + "_dtor_slow");
         func.addBlock(slowCheck);
@@ -1420,7 +1445,7 @@ private void emitDestructionGuard(BasicBlock entry,
         Temporary shutdownVal = new Temporary(Type.INT);
         shutdownLoad.setResult(shutdownVal);
         shutdownVal.setDefiningInstruction(shutdownLoad);
-        entryAfterNull.addInstruction(shutdownLoad);
+        lastOwner.addInstruction(shutdownLoad);
 
         Instruction inShutdown = new Instruction(Opcode.NE);
         inShutdown.addOperand(shutdownVal);
@@ -1428,12 +1453,12 @@ private void emitDestructionGuard(BasicBlock entry,
         Temporary inShutdownBool = new Temporary(Type.BOOLEAN);
         inShutdown.setResult(inShutdownBool);
         inShutdownBool.setDefiningInstruction(inShutdown);
-        entryAfterNull.addInstruction(inShutdown);
+        lastOwner.addInstruction(inShutdown);
 
-        entryAfterNull.setTerminator(
+        lastOwner.setTerminator(
             new CondBranchTerminator(inShutdownBool, slowCheck, bodyFast));
-        entryAfterNull.addSuccessor(slowCheck);
-        entryAfterNull.addSuccessor(bodyFast);
+        lastOwner.addSuccessor(slowCheck);
+        lastOwner.addSuccessor(bodyFast);
 
         // ---------------------------------------------------------------
         // Slow-path: __jnative_dtor_enter + claim-check (без изменений).
@@ -1634,8 +1659,10 @@ private void emitDestructionGuard(BasicBlock entry,
 
         emitDestructionGuard(entry, thisParam, returnBlock, bodyFast, bodySlow);
 
+        List<FieldNode> ownedFields = collectAllReferenceFields(classNode);
+
         // ---- Fast path: destroy children, then __jnative_free_fast ----
-        for (FieldNode field : collectAllReferenceFields(classNode)) {
+        for (FieldNode field : ownedFields) {
             if ((field.getAccess() & Opcodes.ACC_STATIC) != 0) continue;
             Type fieldType = field.getType();
             if (!isManagedType(fieldType)) continue;
@@ -1665,7 +1692,7 @@ private void emitDestructionGuard(BasicBlock entry,
         bodyFast.setTerminator(new ReturnTerminator(null));
 
         // ---- Slow path: destroy children, unclaim, __jnative_free ----
-        for (FieldNode field : collectAllReferenceFields(classNode)) {
+        for (FieldNode field : ownedFields) {
             if ((field.getAccess() & Opcodes.ACC_STATIC) != 0) continue;
             Type fieldType = field.getType();
             if (!isManagedType(fieldType)) continue;
