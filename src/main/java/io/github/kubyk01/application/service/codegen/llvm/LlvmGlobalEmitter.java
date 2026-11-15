@@ -3579,7 +3579,7 @@ public class LlvmGlobalEmitter {
                     desc = "()V";
                 }
 
-                String mangledSuffix = methodName + "_"
+                String mangledSuffix = LlvmTypeMapper.sanitizeIdentifier(methodName) + "_"
                     + desc.replaceAll("[^a-zA-Z0-9_]", "_");
                 String adaptorName = "__reflect_adaptor_" + cleanClassName + "_" + mangledSuffix;
 
@@ -4714,7 +4714,7 @@ public class LlvmGlobalEmitter {
         String origFuncName = LlvmRuntime.mangleMethod(className, methodName, desc);
         String adaptorName = "__reflect_adaptor_"
             + LlvmTypeMapper.sanitizeIdentifier(className) + "_"
-            + methodName + "_" + desc.replaceAll("[^a-zA-Z0-9_]", "_");
+            + LlvmTypeMapper.sanitizeIdentifier(methodName) + "_" + desc.replaceAll("[^a-zA-Z0-9_]", "_");
 
         List<Type> paramTypes = TypeResolver.descToParamTypes(desc);
         Type retType = TypeResolver.descToReturnType(desc);

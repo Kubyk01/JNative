@@ -119,6 +119,7 @@ public class SSATransformer {
         initializeStacks(function);
         insertPhiFunctions(function);
         renameBlock(function.getEntryBlock());
+        padPhiOperands(function);
         optimizePhis(function);
         cleanupPhis(function);
         cleanupNops(function);
@@ -683,10 +684,12 @@ public class SSATransformer {
                 Type declaredType = (inst.getResult() != null)
                     ? inst.getResult().getType()
                     : operand.getType();
+                int bucket = typeBucket(inst.getResult() != null
+                    ? inst.getResult().getType()
+                    : Type.UNKNOWN);
                 if (declaredType.isUnknown()) {
                     declaredType = operand.getType();
                 }
-                int bucket = typeBucket(declaredType);
                 SlotKey key = new SlotKey(idx, bucket);
 
                 savedSizes.putIfAbsent(key, stackSize(key));
@@ -905,6 +908,15 @@ public class SSATransformer {
         if (stack != null) {
             while (stack.size() > size) {
                 stack.pop();
+            }
+        }
+    }
+
+    private void padPhiOperands(Function function) {
+        for (BasicBlock block : function.getBlocks()) {
+            int preds = block.getPredecessors().size();
+            for (Instruction inst : block.getInstructions()) {
+                if (inst.getOpcode() == Opcode.PHI) ensurePhiOperandCount(inst, preds);
             }
         }
     }

@@ -472,6 +472,10 @@ public class MethodTranslator extends MethodVisitor {
                 Value index = frame.pop();
                 Value array = frame.pop();
                 Instruction inst = builder.addInstruction(Opcode.ALOAD, array, index);
+                Type elementType = primitiveArrayLoadType(opcode);
+                if (elementType != null && inst.getResult().getType().isUnknown()) {
+                    inst.getResult().setType(elementType);
+                }
                 frame.push(inst.getResult());
                 break;
             }
@@ -805,7 +809,7 @@ public class MethodTranslator extends MethodVisitor {
             case Long l -> handlers.pushLong(l);
             case Float v -> handlers.pushFloat(v);
             case Double v -> handlers.pushDouble(v);
-            case String s -> frame.push(new Constant(Type.reference("java/lang/String"), value));
+            case String ignored -> frame.push(new Constant(Type.reference("java/lang/String"), value));
             case org.objectweb.asm.Type asmType -> {
                 int sort = asmType.getSort();
                 if (sort == org.objectweb.asm.Type.OBJECT) {
@@ -1163,11 +1167,25 @@ public class MethodTranslator extends MethodVisitor {
         return block;
     }
 
+    private static Type primitiveArrayLoadType(int opcode) {
+        return switch (opcode) {
+            case Opcodes.IALOAD -> Type.INT;
+            case Opcodes.LALOAD -> Type.LONG;
+            case Opcodes.FALOAD -> Type.FLOAT;
+            case Opcodes.DALOAD -> Type.DOUBLE;
+            case Opcodes.BALOAD -> Type.BYTE;
+            case Opcodes.CALOAD -> Type.CHAR;
+            case Opcodes.SALOAD -> Type.SHORT;
+            default -> null;
+        };
+    }
+
     private void emitStackStoresForTarget(Label label) {
         Integer base = labelStackBase.get(label);
         Integer height = labelStackHeight.get(label);
         if (base == null || height == null || height == 0) return;
 
+        List<Type> slotTypes = labelStackTypes.get(label);
         List<Value> stack = frame.snapshotStackFromBottom();
         if (stack.size() < height) {
             log.warn("Stack underflow while materialising slots for {}: "
@@ -1179,7 +1197,9 @@ public class MethodTranslator extends MethodVisitor {
             Value v = (start + i) < stack.size()
                 ? stack.get(start + i)
                 : new UndefinedValue(Type.UNKNOWN);
-            builder.createStore(v, base + i);
+            Type slotType = (slotTypes != null && i < slotTypes.size()) ? slotTypes.get(i) : null;
+            builder.createStore(v, base + i,
+                slotType != null && slotType.isPrimitive() ? slotType : v.getType());
         }
     }
 
