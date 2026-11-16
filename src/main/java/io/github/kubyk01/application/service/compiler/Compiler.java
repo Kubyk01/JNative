@@ -1,5 +1,6 @@
 package io.github.kubyk01.application.service.compiler;
 
+import io.github.kubyk01.application.service.GeneratedOutputDirectory;
 import io.github.kubyk01.application.service.analyzer.dependencyresolver.DependencyResolver;
 import io.github.kubyk01.application.service.codegen.llvm.LlvmRuntime;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.ClassNode;
@@ -112,11 +113,10 @@ public class Compiler implements CompilerPort {
                 : TargetPlatform.detectFromBuildHost();
         RuntimeImageEmbedder.validate(resolver.getRuntimeJavaHome());
 
-        Path tempDir = Files.createTempDirectory(BUILD_ROOT_NAME);
-        tempDir.toFile().deleteOnExit();
-
-        try (RuntimeClasspath runtimeClasspath = RuntimeClasspath.create(
-                resolver.getInputPath(), resolver.getScannedJars(), tempDir)) {
+        try (BuildWorkspace workspace = BuildWorkspace.create();
+             RuntimeClasspath runtimeClasspath = RuntimeClasspath.create(
+                     resolver.getInputPath(), resolver.getScannedJars(), workspace.path())) {
+            Path tempDir = workspace.path();
             String compiler = detectCompiler(target);
 
             MsvcToolchain msvcToolchain = null;
@@ -356,12 +356,43 @@ public class Compiler implements CompilerPort {
                         + " (target: " + target.triple() + ")");
             }
 
-        } finally {
-            Files.walk(tempDir)
-                    .sorted(Comparator.reverseOrder())
-                    .forEach(p -> {
-                        try { Files.deleteIfExists(p); } catch (IOException ignored) { }
-                    });
+        }
+    }
+
+    private static final class BuildWorkspace implements AutoCloseable {
+        private final Path path;
+
+        private BuildWorkspace(Path path) {
+            this.path = path;
+        }
+
+        static BuildWorkspace create() throws IOException {
+            Path tempRoot = GeneratedOutputDirectory.resolve().resolve(".temp");
+            Files.createDirectories(tempRoot);
+            return new BuildWorkspace(Files.createTempDirectory(tempRoot, BUILD_ROOT_NAME));
+        }
+
+        Path path() {
+            return path;
+        }
+
+        @Override
+        public void close() throws IOException {
+            try (var paths = Files.walk(path)) {
+                for (Path entry : paths.sorted(Comparator.reverseOrder()).toList()) {
+                    Files.deleteIfExists(entry);
+                }
+            }
+        }
+
+        void retainUntilShutdown() {
+            Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+                try {
+                    close();
+                } catch (IOException ignored) {
+                    // A shutdown hook must not prevent other hooks from running.
+                }
+            }, "jnative-temp-cleanup"));
         }
     }
 
@@ -1644,9 +1675,24 @@ public class Compiler implements CompilerPort {
                                              DependencyResolver resolver,
                                              TargetPlatform target)
             throws IOException {
-        Path extractDir = Files.createTempDirectory("jnative-natives-");
-        extractDir.toFile().deleteOnExit();
-        return collectNativeLibraries(module, resolver.getScannedJars(), target, extractDir);
+        BuildWorkspace workspace = BuildWorkspace.create();
+        try {
+            List<Path> nativeLibraries = collectNativeLibraries(
+                    module, resolver.getScannedJars(), target, workspace.path());
+            if (nativeLibraries.isEmpty()) {
+                workspace.close();
+                return nativeLibraries;
+            }
+            workspace.retainUntilShutdown();
+            return nativeLibraries;
+        } catch (IOException | RuntimeException failure) {
+            try {
+                workspace.close();
+            } catch (IOException cleanupFailure) {
+                failure.addSuppressed(cleanupFailure);
+            }
+            throw failure;
+        }
     }
 
     private List<Path> collectNativeLibraries(Module module, List<Path> classpath,

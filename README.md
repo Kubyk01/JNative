@@ -100,7 +100,7 @@ jnative analyze <file.jar|dir|.class> [options]
 
 Builds a native executable or, with `--no-compile`, generates LLVM IR only.
 
-Generated IR goes in `target/generated-jnative`. Running from `target` or one of its subdirectories reuses that directory instead of creating `target/target`; elsewhere within a Maven project, the nearest ancestor containing `pom.xml` supplies the project root. Temporary bodies stay in `target/generated-jnative/.jnative-spool` until generation finishes successfully. Set the JVM property `-Djnative.llvmUnitBytes=<bytes>` before `-jar` to change the class-body grouping limit, or use `0` for one unit per class.
+Generated IR goes in `target/generated-jnative`. Running from `target` or one of its subdirectories reuses that directory instead of creating `target/target`; elsewhere within a Maven project, the nearest ancestor containing `pom.xml` supplies the project root. Temporary bodies stay in `target/generated-jnative/.jnative-spool` until generation finishes successfully. Native compiler workspaces, including extracted C sources and object files, are created under `target/generated-jnative/.temp` and removed after each build. Set the JVM property `-Djnative.llvmUnitBytes=<bytes>` before `-jar` to change the class-body grouping limit, or use `0` for one unit per class.
 
 | Option | Description |
 | --- | --- |

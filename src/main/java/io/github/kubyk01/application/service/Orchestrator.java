@@ -143,7 +143,7 @@ public class Orchestrator implements OrchestratorPort {
         analysis.analyze();
         if (!noCompile) {
             try (RuntimeClasspath runtimeClasspath = RuntimeClasspath.create(path, resolver.getScannedJars(),
-                    generatedOutputDirectory().resolve(".jnative-spool"))) {
+                    GeneratedOutputDirectory.resolve().resolve(".jnative-spool"))) {
                 Map<String, byte[]> cglibClasses =
                     CglibPregenerator.generate(runtimeClasspath.entries(), analysis.annotatedApplicationClasses());
                 if (!cglibClasses.isEmpty()) {
@@ -388,11 +388,14 @@ public class Orchestrator implements OrchestratorPort {
         llvmGen.setEmbeddedResources(embedded);
         llvmGen.setTargetPlatform(targetPlatform);
 
-        Path genDir = generatedOutputDirectory();
+        Path genDir = GeneratedOutputDirectory.resolve();
         try {
             if (Files.exists(genDir)) {
+                // A separate compiler process may still own a workspace here.
+                Path compilerTempDir = genDir.resolve(".temp");
                 try (var stream = Files.walk(genDir)) {
-                    stream.sorted(Comparator.reverseOrder()).forEach(p -> {
+                    stream.filter(p -> !p.equals(genDir) && !p.startsWith(compilerTempDir))
+                          .sorted(Comparator.reverseOrder()).forEach(p -> {
                         try {
                             Files.deleteIfExists(p);
                         } catch (IOException ex) {
@@ -585,19 +588,6 @@ public class Orchestrator implements OrchestratorPort {
                 }
             }
         }
-    }
-
-    private static Path generatedOutputDirectory() {
-        Path workingDirectory = Path.of("").toAbsolutePath().normalize();
-        for (Path directory = workingDirectory; directory != null; directory = directory.getParent()) {
-            if (Path.of("target").equals(directory.getFileName())) {
-                return directory.resolve("generated-jnative");
-            }
-            if (Files.isRegularFile(directory.resolve("pom.xml"))) {
-                return directory.resolve("target").resolve("generated-jnative");
-            }
-        }
-        return workingDirectory.resolve("target").resolve("generated-jnative");
     }
 
     private static Path defaultOutputPath(Path input, TargetPlatform targetPlatform) {
