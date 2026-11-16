@@ -24,18 +24,18 @@ import java.util.regex.Pattern;
 
 /**
  * Computes an EscapeSummary for a native Java method by parsing its C body.
- *
+ * <p>
  * Escape routes recognized: return escape (parameter is returned) and
  * heap escape (parameter written into a field / array / global). Every
  * other use — read, compare, passed to a non-retaining library
  * function — is treated as non-escaping.
- *
+ * <p>
  * The C source is scanned linearly (no regex backtracking on the whole
  * source). Helper calls within the same translation unit are resolved
  * recursively; both the top-level callee and every helper push onto a
  * per-thread stack and break cycles on revisit with the conservative
  * "everything escapes" summary. Helper summaries are cached.
- *
+ * <p>
  * Thread-safe: cache / helperCache / sourceByOwner / functionsByOwner are
  * ConcurrentHashMap; inProgressLocal is a ThreadLocal.
  */
@@ -441,11 +441,16 @@ public final class NativeBodyEscapeAnalyzer {
     }
 
     private static boolean isIdentifierStart(char c) {
-        return Character.isLetter(c) || c == '_';
+        if (c < 128) return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
+        return Character.isLetter(c);
     }
 
     private static boolean isIdentifierChar(char c) {
-        return Character.isLetterOrDigit(c) || c == '_';
+        if (c < 128) {
+            return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+                || (c >= '0' && c <= '9') || c == '_';
+        }
+        return Character.isLetterOrDigit(c);
     }
 
     // ==================================================================
@@ -707,7 +712,7 @@ public final class NativeBodyEscapeAnalyzer {
     }
 
     private static boolean isWordChar(char c) {
-        return Character.isLetterOrDigit(c) || c == '_';
+        return isIdentifierChar(c);
     }
 
     private static boolean isDereferencedLhs(String lhs) {

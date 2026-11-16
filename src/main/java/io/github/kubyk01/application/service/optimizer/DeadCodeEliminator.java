@@ -124,11 +124,11 @@ public class DeadCodeEliminator {
             }
         }
 
-        for (Function func : new ArrayList<>(module.getFunctions())) {
-            if (emptyClinits.contains(func.getName())) {
-                module.removeFunction(func);
-            }
+        Set<Function> doomed = new HashSet<>();
+        for (Function func : module.getFunctions()) {
+            if (emptyClinits.contains(func.getName())) doomed.add(func);
         }
+        module.removeFunctions(doomed);
 
         log.debug("Removed {} empty <clinit> function(s)", emptyClinits.size());
     }
@@ -194,37 +194,39 @@ public class DeadCodeEliminator {
     private Set<Value> collectUsedValues(Set<String> readStaticFields) {
         Set<Value> used = ConcurrentHashMap.newKeySet();
 
+        // Each worker closes over the values it newly marks, so the def-use
+        // closure runs in parallel instead of as one serial pass. Whoever
+        // wins used.add(x) expands x, so the global closure stays complete.
         forEachParallel(new ArrayList<>(module.getFunctions()), func -> {
             if (func.getEntryBlock() == null) return;
+            Deque<Value> worklist = new ArrayDeque<>();
             for (BasicBlock block : func.getBlocks()) {
                 for (Instruction inst : block.getInstructions()) {
                     if (isRoot(inst, readStaticFields)) {
                         for (Value op : inst.getOperands()) {
-                            if (op != null) used.add(op);
+                            if (op != null && used.add(op)) worklist.add(op);
                         }
                     }
                 }
                 Terminator term = block.getTerminator();
                 if (term != null) {
                     for (Value v : terminatorOperands(term)) {
-                        if (v != null) used.add(v);
+                        if (v != null && used.add(v)) worklist.add(v);
+                    }
+                }
+            }
+            while (!worklist.isEmpty()) {
+                Value v = worklist.poll();
+                if (v instanceof Temporary t) {
+                    Instruction def = t.getDefiningInstruction();
+                    if (def != null) {
+                        for (Value op : def.getOperands()) {
+                            if (op != null && used.add(op)) worklist.add(op);
+                        }
                     }
                 }
             }
         });
-
-        Deque<Value> worklist = new ArrayDeque<>(used);
-        while (!worklist.isEmpty()) {
-            Value v = worklist.poll();
-            if (v instanceof Temporary t) {
-                Instruction def = t.getDefiningInstruction();
-                if (def != null) {
-                    for (Value op : def.getOperands()) {
-                        if (op != null && used.add(op)) worklist.add(op);
-                    }
-                }
-            }
-        }
 
         return used;
     }

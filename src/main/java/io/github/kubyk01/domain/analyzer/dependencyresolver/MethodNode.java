@@ -14,6 +14,8 @@ public class MethodNode {
     private String descriptor;
     private Type returnType;
     private List<Type> parameterTypes;
+    @Singular("parameter")
+    private List<MethodParameterInfo> parameters;
     private int access;
     @Singular
     private List<String> exceptions;     // internal names

@@ -375,7 +375,7 @@ int32_t __jnative_fn_sun_nio_fs_UnixNativeDispatcher_open0__JII_I(
     (void)mode;
     wchar_t wpath[4096];
     if (win_path_from_addr(pathAddress, wpath, 4096) < 0)
-        return -LINUX_ENAMETOOLONG;
+        throw_unix_exception(LINUX_ENAMETOOLONG);
 
     DWORD access;
     switch (flags & LNX_O_ACCMODE) {
@@ -400,10 +400,10 @@ int32_t __jnative_fn_sun_nio_fs_UnixNativeDispatcher_open0__JII_I(
                            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS,
                            NULL);
     if (h == INVALID_HANDLE_VALUE)
-        return -jn_win_err_to_linux_errno(GetLastError());
+        throw_unix_exception_from_win();
 
     int fd = _open_osfhandle((intptr_t)h, _O_BINARY);
-    if (fd < 0) { CloseHandle(h); return -LINUX_ENOMEM; }
+    if (fd < 0) { CloseHandle(h); throw_unix_exception(LINUX_ENOMEM); }
     return fd;
 }
 
@@ -417,7 +417,8 @@ int32_t __jnative_fn_sun_nio_fs_UnixNativeDispatcher_openat0__IJII_I(
 
 int32_t __jnative_fn_sun_nio_fs_UnixNativeDispatcher_dup__I_I(int32_t fd) {
     int nfd = _dup(fd);
-    return (nfd >= 0) ? nfd : -LINUX_EBADF;
+    if (nfd < 0) throw_unix_exception(LINUX_EBADF);
+    return nfd;
 }
 
 void __jnative_fn_sun_nio_fs_UnixNativeDispatcher_close0__I_V(int32_t fd) {
@@ -429,17 +430,19 @@ void __jnative_fn_sun_nio_fs_UnixNativeDispatcher_close0__I_V(int32_t fd) {
 int32_t __jnative_fn_sun_nio_fs_UnixNativeDispatcher_read0__IJI_I(
         int32_t fd, int64_t buf, int32_t len)
 {
-    if (fd < 0) return -LINUX_EBADF;
+    if (fd < 0) throw_unix_exception(LINUX_EBADF);
     int n = _read(fd, (void*)(intptr_t)buf, (unsigned)len);
-    return (n < 0) ? -errno : n;
+    if (n < 0) throw_unix_exception(errno);
+    return n;
 }
 
 int32_t __jnative_fn_sun_nio_fs_UnixNativeDispatcher_write0__IJI_I(
         int32_t fd, int64_t buf, int32_t len)
 {
-    if (fd < 0) return -LINUX_EBADF;
+    if (fd < 0) throw_unix_exception(LINUX_EBADF);
     int n = _write(fd, (void*)(intptr_t)buf, (unsigned)len);
-    return (n < 0) ? -errno : n;
+    if (n < 0) throw_unix_exception(errno);
+    return n;
 }
 
 int32_t __jnative_fn_sun_nio_fs_UnixNativeDispatcher_pread0__IJIJ_I(
@@ -605,9 +608,9 @@ int32_t __jnative_fn_sun_nio_fs_UnixNativeDispatcher_stat0__JLsun_nio_fs_UnixFil
 {
     wchar_t wpath[4096];
     if (win_path_from_addr(pathAddress, wpath, 4096) < 0)
-        return -LINUX_ENAMETOOLONG;
+        return LINUX_ENAMETOOLONG;
     if (fill_unix_file_attrs_from_path(attrs, wpath, 1) < 0)
-        return -jn_win_err_to_linux_errno(GetLastError());
+        return jn_win_err_to_linux_errno(GetLastError());
     return 0;
 }
 
@@ -1197,21 +1200,32 @@ void    __jnative_fn_sun_nio_fs_UnixNativeDispatcher_init___V(void) { }
 int32_t __jnative_fn_sun_nio_fs_UnixNativeDispatcher_open0__JII_I(
         int64_t pathAddress, int32_t flags, int32_t mode)
 {
-    int r = open((const char*)(intptr_t)pathAddress, flags, (mode_t)mode);
-    return (r < 0) ? -errno : r;
+    int r;
+    do {
+        r = open((const char*)(intptr_t)pathAddress, flags, (mode_t)mode);
+    } while (r < 0 && errno == EINTR);
+    if (r < 0) throw_unix_exception_from_errno();
+    return r;
 }
 
 int32_t __jnative_fn_sun_nio_fs_UnixNativeDispatcher_openat0__IJII_I(
         int32_t dfd, int64_t pathAddress, int32_t flags, int32_t mode)
 {
-    int r = openat(dfd, (const char*)(intptr_t)pathAddress,
-                   flags, (mode_t)mode);
-    return (r < 0) ? -errno : r;
+    int r;
+    do {
+        r = openat(dfd, (const char*)(intptr_t)pathAddress, flags, (mode_t)mode);
+    } while (r < 0 && errno == EINTR);
+    if (r < 0) throw_unix_exception_from_errno();
+    return r;
 }
 
 int32_t __jnative_fn_sun_nio_fs_UnixNativeDispatcher_dup__I_I(int32_t fd) {
-    int r = dup(fd);
-    return (r < 0) ? -errno : r;
+    int r;
+    do {
+        r = dup(fd);
+    } while (r < 0 && errno == EINTR);
+    if (r < 0) throw_unix_exception_from_errno();
+    return r;
 }
 
 void __jnative_fn_sun_nio_fs_UnixNativeDispatcher_close0__I_V(int32_t fd) {
@@ -1221,15 +1235,23 @@ void __jnative_fn_sun_nio_fs_UnixNativeDispatcher_close0__I_V(int32_t fd) {
 int32_t __jnative_fn_sun_nio_fs_UnixNativeDispatcher_read0__IJI_I(
         int32_t fd, int64_t buf, int32_t len)
 {
-    ssize_t n = read(fd, (void*)(intptr_t)buf, (size_t)len);
-    return (n < 0) ? -errno : (int32_t)n;
+    ssize_t n;
+    do {
+        n = read(fd, (void*)(intptr_t)buf, (size_t)len);
+    } while (n < 0 && errno == EINTR);
+    if (n < 0) throw_unix_exception_from_errno();
+    return (int32_t)n;
 }
 
 int32_t __jnative_fn_sun_nio_fs_UnixNativeDispatcher_write0__IJI_I(
         int32_t fd, int64_t buf, int32_t len)
 {
-    ssize_t n = write(fd, (void*)(intptr_t)buf, (size_t)len);
-    return (n < 0) ? -errno : (int32_t)n;
+    ssize_t n;
+    do {
+        n = write(fd, (void*)(intptr_t)buf, (size_t)len);
+    } while (n < 0 && errno == EINTR);
+    if (n < 0) throw_unix_exception_from_errno();
+    return (int32_t)n;
 }
 
 int32_t __jnative_fn_sun_nio_fs_UnixNativeDispatcher_pread0__IJIJ_I(
@@ -1366,7 +1388,7 @@ int32_t __jnative_fn_sun_nio_fs_UnixNativeDispatcher_stat0__JLsun_nio_fs_UnixFil
         fill_unix_file_attrs_from_posix_stat(attrs, &st);
         return 0;
     }
-    return -errno;
+    return errno;
 }
 
 void __jnative_fn_sun_nio_fs_UnixNativeDispatcher_lstat0__JLsun_nio_fs_UnixFileAttributes__V(
@@ -1532,7 +1554,8 @@ int32_t __jnative_fn_sun_nio_fs_UnixNativeDispatcher_fgetxattr0__IJJI_I(
 {
     ssize_t r = fgetxattr(fd, (const char*)(intptr_t)n,
                           (void*)(intptr_t)v, (size_t)l);
-    return (r < 0) ? -errno : (int32_t)r;
+    if (r < 0) throw_unix_exception_from_errno();
+    return (int32_t)r;
 }
 int32_t __jnative_fn_sun_nio_fs_UnixNativeDispatcher_getxattr0__JJJI_I(
         int64_t p, int64_t n, int64_t v, int32_t l)
@@ -1594,7 +1617,8 @@ int32_t __jnative_fn_sun_nio_fs_UnixNativeDispatcher_flistxattr__IJI_I(
         int32_t fd, int64_t v, int32_t l)
 {
     ssize_t r = flistxattr(fd, (char*)(intptr_t)v, (size_t)l);
-    return (r < 0) ? -errno : (int32_t)r;
+    if (r < 0) throw_unix_exception_from_errno();
+    return (int32_t)r;
 }
 int32_t __jnative_fn_sun_nio_fs_UnixNativeDispatcher_listxattr0__JJI_I(
         int64_t p, int64_t v, int32_t l)

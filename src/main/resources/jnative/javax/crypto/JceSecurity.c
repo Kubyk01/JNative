@@ -161,10 +161,47 @@ extern void* gv_javax_crypto_JceSecurity_exemptPolicy  __attribute__((weak));
  *
  * If the constructor symbol cannot be resolved, its only observable
  * effect — the initialisation of the internal per-package map — is
- * performed here by hand. The field lies at byte offset 8 in the
- * emitted %struct.javax_crypto_CryptoPermissions layout (the object
- * header occupies offsets 0..7), and is a java.util.HashMap.
+ * performed here by hand, with the field located and typed through the
+ * reflection metadata.
  */
+static void init_crypto_permissions_map(ReflectionClass* cp_cls, void* cp) {
+    ReflectionField* perms = NULL;
+    for (ReflectionClass* c = cp_cls; c != NULL && perms == NULL; c = c->superclass) {
+        for (int i = 0; c->fields != NULL && c->fields[i] != NULL; i++) {
+            if (strcmp((const char*)c->fields[i]->name, "perms") == 0) {
+                perms = c->fields[i];
+                break;
+            }
+        }
+    }
+    const char* desc = perms != NULL ? (const char*)perms->descriptor : NULL;
+    size_t len = desc != NULL ? strlen(desc) : 0;
+    char map_class[256];
+    char ctor_symbol[320];
+    if (len < 3 || desc[0] != 'L' || desc[len - 1] != ';' || len - 2 >= sizeof(map_class)) {
+        __jnative_throw_exception(__jnative_construct_exception("vtable_java_lang_InternalError",
+            "CryptoPermissions.perms is missing from the reflection metadata"));
+    }
+    memcpy(map_class, desc + 1, len - 2);
+    map_class[len - 2] = '\0';
+    int n = snprintf(ctor_symbol, sizeof(ctor_symbol), "fn_%s__init____V", map_class);
+    for (int i = 3; i < n; i++) {
+        char ch = ctor_symbol[i];
+        if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_')) {
+            ctor_symbol[i] = '_';
+        }
+    }
+    ReflectionClass* map_cls = jnative_class_by_name(map_class);
+    void (*map_ctor)(void*) = (void (*)(void*))lookup_symbol(ctor_symbol);
+    void* map = map_cls != NULL ? jnative_alloc_object(map_cls) : NULL;
+    if (map == NULL || map_ctor == NULL) {
+        __jnative_throw_exception(__jnative_construct_exception("vtable_java_lang_InternalError",
+            "CryptoPermissions.perms cannot be constructed"));
+    }
+    map_ctor(map);
+    *(void**)((char*)cp + perms->offset) = map;
+}
+
 static void* make_empty_crypto_permissions(void) {
     ReflectionClass* cp_cls =
         jnative_class_by_name("javax/crypto/CryptoPermissions");
@@ -187,26 +224,7 @@ static void* make_empty_crypto_permissions(void) {
     if (ctor != NULL) {
         ctor(cp);
     } else {
-        /*
-         * Fallback: initialise the internal per-package map directly.
-         * The field is the first instance field of CryptoPermissions,
-         * at offset 8, and is a java.util.HashMap. An all-zero HashMap
-         * is not valid because its get() / put() paths dereference the
-         * table array, so a real HashMap object is created through the
-         * same constructor path.
-         */
-        ReflectionClass* hm_cls = jnative_class_by_name("java/util/HashMap");
-        if (hm_cls != NULL) {
-            void* hm = jnative_alloc_object(hm_cls);
-            if (hm != NULL) {
-                noarg_ctor_t hm_ctor = (noarg_ctor_t)lookup_symbol(
-                    "fn_java_util_HashMap__init____V");
-                if (hm_ctor != NULL) {
-                    hm_ctor(hm);
-                }
-                *(void**)((char*)cp + 8) = hm;
-            }
-        }
+        init_crypto_permissions_map(cp_cls, cp);
     }
 
     return cp;

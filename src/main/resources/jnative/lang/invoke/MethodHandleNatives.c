@@ -411,8 +411,7 @@ static const char* method_type_descriptor(void* method_type) {
     void* desc_str = fn(method_type);
     if (desc_str == NULL) return NULL;
 
-    int32_t len = 0;
-    return __jnative_read_string_bytes(desc_str, &len);
+    return __jnative_read_string_bytes(desc_str, NULL);
 }
 
 /*
@@ -588,7 +587,16 @@ void __jnative_fn_java_lang_invoke_MethodHandleNatives_init__Ljava_lang_invoke_M
         *(void**)((char*)self + MEMBERNAME_FIELD_CLAZZ)  = clazz;
         *(void**)((char*)self + MEMBERNAME_FIELD_NAME)   = name;
         *(void**)((char*)self + MEMBERNAME_FIELD_TYPE)   = method_type;
-        *(int32_t*)((char*)self + MEMBERNAME_FIELD_FLAGS) = modifiers | MN_IS_METHOD;
+        /* Like HotSpot's init_method_MemberName: the refKind must be set, or a later
+         * resolve() derives ACC_STATIC from REF_NONE and clears it. */
+        int32_t ref_kind;
+        if (modifiers & JNATIVE_ACC_STATIC)  ref_kind = JN_REF_invokeStatic;
+        else if (modifiers & 0x0002)         ref_kind = JN_REF_invokeSpecial;   /* private */
+        else if (clazz != NULL && (((ReflectionClass*)clazz)->modifiers & 0x0200))
+                                             ref_kind = JN_REF_invokeInterface;
+        else                                 ref_kind = JN_REF_invokeVirtual;
+        *(int32_t*)((char*)self + MEMBERNAME_FIELD_FLAGS) =
+            modifiers | MN_IS_METHOD | (ref_kind << MN_REFERENCE_KIND_SHIFT);
         return;
     }
 
@@ -599,7 +607,8 @@ void __jnative_fn_java_lang_invoke_MethodHandleNatives_init__Ljava_lang_invoke_M
         *(void**)((char*)self + MEMBERNAME_FIELD_CLAZZ)  = clazz;
         *(void**)((char*)self + MEMBERNAME_FIELD_NAME)   = NULL;
         *(void**)((char*)self + MEMBERNAME_FIELD_TYPE)   = NULL;
-        *(int32_t*)((char*)self + MEMBERNAME_FIELD_FLAGS) = modifiers | MN_IS_CONSTRUCTOR;
+        *(int32_t*)((char*)self + MEMBERNAME_FIELD_FLAGS) =
+            modifiers | MN_IS_CONSTRUCTOR | (JN_REF_newInvokeSpecial << MN_REFERENCE_KIND_SHIFT);
         return;
     }
 
@@ -611,7 +620,11 @@ void __jnative_fn_java_lang_invoke_MethodHandleNatives_init__Ljava_lang_invoke_M
         *(void**)((char*)self + MEMBERNAME_FIELD_CLAZZ)  = clazz;
         *(void**)((char*)self + MEMBERNAME_FIELD_NAME)   = name;
         *(void**)((char*)self + MEMBERNAME_FIELD_TYPE)   = NULL;
-        *(int32_t*)((char*)self + MEMBERNAME_FIELD_FLAGS) = modifiers | MN_IS_FIELD;
+        /* HotSpot's init_field_MemberName: getStatic/getField; MemberName(Field, true)
+         * then turns it into the put variant itself. */
+        int32_t ref_kind = (modifiers & JNATIVE_ACC_STATIC) ? JN_REF_getStatic : JN_REF_getField;
+        *(int32_t*)((char*)self + MEMBERNAME_FIELD_FLAGS) =
+            modifiers | MN_IS_FIELD | (ref_kind << MN_REFERENCE_KIND_SHIFT);
         return;
     }
 }
@@ -676,8 +689,7 @@ void* __jnative_fn_java_lang_invoke_MethodHandleNatives_resolve__BLjava_lang_inv
 
     const char* name = NULL;
     if (name_str != NULL) {
-        int32_t name_len = 0;
-        name = __jnative_read_string_bytes(name_str, &name_len);
+        name = __jnative_read_string_bytes(name_str, NULL);
     }
 
     int32_t real_modifiers = 0;
@@ -1288,4 +1300,379 @@ void __jnative_fn_java_lang_invoke_MethodHandleNatives_clearCallSiteContext__Lja
         void* context)
 {
     (void)context;
+}
+
+typedef union {
+    int64_t i;
+    double  d;
+    void*   l;
+} MhValue;
+
+JNATIVE_NORETURN static void mh_throw(const char* vtable_symbol, const char* msg)
+{
+    void* exc = __jnative_construct_exception(vtable_symbol, msg);
+    if (exc == NULL) {
+        exc = __jnative_construct_exception("vtable_java_lang_InternalError", msg);
+    }
+    __jnative_throw_exception(exc);
+}
+
+static ReflectionClass* mh_class_of(void* obj)
+{
+    void* first = *(void**)obj;
+    if (first == NULL || __jnative_is_class_mirror(first)) return NULL;
+    const char* name = ((JNativeVTable*)first)->name;
+    return name != NULL ? jnative_class_by_name(name) : NULL;
+}
+
+static int mh_field_offset(ReflectionClass* cls, const char* name)
+{
+    for (; cls != NULL; cls = cls->superclass) {
+        int off = jnative_field_offset(cls, name);
+        if (off >= 0) return off;
+    }
+    return -1;
+}
+
+static int mh_is_ref(char k)    { return k == 'L' || k == '['; }
+static int mh_is_float(char k)  { return k == 'F' || k == 'D'; }
+
+static int mh_parse_kinds(const char* desc, char* kinds, int cap, char* ret)
+{
+    if (desc == NULL || desc[0] != '(') return -1;
+    int n = 0;
+    const char* p = desc + 1;
+    while (*p && *p != ')') {
+        char k = *p;
+        while (*p == '[') p++;
+        if (*p == 'L') {
+            while (*p && *p != ';') p++;
+        }
+        if (*p == '\0') return -1;
+        p++;
+        if (n >= cap) return -1;
+        kinds[n++] = (k == '[') ? 'L' : k;
+    }
+    if (*p != ')') return -1;
+    *ret = (p[1] == '[') ? 'L' : p[1];
+    return n;
+}
+
+static MhValue mh_read(char k, const void* p)
+{
+    MhValue v;
+    v.i = 0;
+    switch (k) {
+        case 'Z': v.i = *(const uint8_t*)p; break;
+        case 'B': v.i = *(const int8_t*)p; break;
+        case 'C': v.i = *(const uint16_t*)p; break;
+        case 'S': v.i = *(const int16_t*)p; break;
+        case 'I': v.i = *(const int32_t*)p; break;
+        case 'J': v.i = *(const int64_t*)p; break;
+        case 'F': v.d = *(const float*)p; break;
+        case 'D': v.d = *(const double*)p; break;
+        default:  v.l = *(void* const*)p; break;
+    }
+    return v;
+}
+
+static void mh_write(char k, MhValue v, void* p)
+{
+    switch (k) {
+        case 'Z': *(uint8_t*)p  = (uint8_t)(v.i != 0); break;
+        case 'B': *(int8_t*)p   = (int8_t)v.i; break;
+        case 'C': *(uint16_t*)p = (uint16_t)v.i; break;
+        case 'S': *(int16_t*)p  = (int16_t)v.i; break;
+        case 'I': *(int32_t*)p  = (int32_t)v.i; break;
+        case 'J': *(int64_t*)p  = v.i; break;
+        case 'F': *(float*)p    = (float)v.d; break;
+        case 'D': *(double*)p   = v.d; break;
+        default:  *(void**)p    = v.l; break;
+    }
+}
+
+static MhValue mh_widen(char from, char to, MhValue v)
+{
+    MhValue r;
+    if (mh_is_float(to)) {
+        r.d = mh_is_float(from) ? v.d : (double)v.i;
+    } else {
+        r.i = mh_is_float(from) ? (int64_t)v.d : v.i;
+    }
+    return r;
+}
+
+static const char* mh_box_class(char k)
+{
+    switch (k) {
+        case 'Z': return "java/lang/Boolean";
+        case 'B': return "java/lang/Byte";
+        case 'C': return "java/lang/Character";
+        case 'S': return "java/lang/Short";
+        case 'I': return "java/lang/Integer";
+        case 'J': return "java/lang/Long";
+        case 'F': return "java/lang/Float";
+        case 'D': return "java/lang/Double";
+        default:  return NULL;
+    }
+}
+
+static void* mh_box(char k, MhValue v)
+{
+    char sym[128];
+    const char* cls = mh_box_class(k);
+    snprintf(sym, sizeof(sym), "fn_java_lang_%s_valueOf__%c_Ljava_lang_%s_",
+             cls + strlen("java/lang/"), k, cls + strlen("java/lang/"));
+    void* fn = jn_dlsym_default(sym);
+    if (fn == NULL) {
+        char msg[256];
+        snprintf(msg, sizeof(msg), "MethodHandle.invoke: boxing helper %s is not compiled into the image", sym);
+        mh_throw("vtable_java_lang_InternalError", msg);
+    }
+    switch (k) {
+        case 'Z': return ((void* (*)(_Bool))fn)(v.i != 0);
+        case 'B': return ((void* (*)(int8_t))fn)((int8_t)v.i);
+        case 'C': return ((void* (*)(uint16_t))fn)((uint16_t)v.i);
+        case 'S': return ((void* (*)(int16_t))fn)((int16_t)v.i);
+        case 'I': return ((void* (*)(int32_t))fn)((int32_t)v.i);
+        case 'J': return ((void* (*)(int64_t))fn)(v.i);
+        case 'F': return ((void* (*)(float))fn)((float)v.d);
+        default:  return ((void* (*)(double))fn)(v.d);
+    }
+}
+
+static MhValue mh_unbox(void* obj, char to)
+{
+    if (obj == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+    ReflectionClass* cls = mh_class_of(obj);
+    const char* name = cls != NULL ? cls->cname : NULL;
+    static const char kinds[] = "ZBCSIJFD";
+    for (int i = 0; kinds[i]; i++) {
+        if (name != NULL && strcmp(name, mh_box_class(kinds[i])) == 0) {
+            int off = mh_field_offset(cls, "value");
+            if (off < 0) break;
+            return mh_widen(kinds[i], to, mh_read(kinds[i], (char*)obj + off));
+        }
+    }
+    char msg[256];
+    snprintf(msg, sizeof(msg), "MethodHandle.invoke: cannot convert %s to primitive %c",
+             name != NULL ? name : "?", to);
+    mh_throw("vtable_java_lang_ClassCastException", msg);
+}
+
+static MhValue mh_convert(char from, char to, MhValue v)
+{
+    if (mh_is_ref(from) && mh_is_ref(to)) return v;
+    if (mh_is_ref(to)) {
+        MhValue r;
+        r.l = mh_box(from, v);
+        return r;
+    }
+    if (mh_is_ref(from)) return mh_unbox(v.l, to);
+    return mh_widen(from, to, v);
+}
+
+static int mh_member_descriptor(void* member, void* type, char* out, int cap)
+{
+    void* mtype = type;
+    if (mtype != NULL) {
+        const char* tn = ((JNativeVTable*)*(void**)mtype)->name;
+        if (tn == NULL || strcmp(tn, "java/lang/invoke/MethodType") != 0) mtype = NULL;
+    }
+    if (mtype == NULL) {
+        void* (*get_type)(void*) = (void* (*)(void*))jn_dlsym_default(
+            "fn_java_lang_invoke_MemberName_getMethodType___Ljava_lang_invoke_MethodType_");
+        if (get_type != NULL) mtype = get_type(member);
+    }
+    if (mtype == NULL) return -1;
+    void* (*to_desc)(void*) = (void* (*)(void*))jn_dlsym_default(
+        "fn_java_lang_invoke_MethodType_toMethodDescriptorString___Ljava_lang_String_");
+    if (to_desc == NULL) return -1;
+    return __jnative_read_string_into(to_desc(mtype), out, cap);
+}
+
+#define MH_MAX_ARGS 255
+
+void* __jnative_methodhandle_invoke(void* mh, void** args, const char* site_desc)
+{
+    if (mh == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
+
+    char msg[1024];
+    ReflectionClass* mh_cls = mh_class_of(mh);
+    int member_off = mh_field_offset(mh_cls, "member");
+    void* member = member_off >= 0 ? *(void**)((char*)mh + member_off) : NULL;
+    if (member == NULL) {
+        snprintf(msg, sizeof(msg),
+                 "MethodHandle.invoke%s: %s carries no direct MemberName; only direct method handles "
+                 "(findVirtual/findStatic/findSpecial/findConstructor/find*Getter/find*Setter/unreflect*) "
+                 "can be invoked by this runtime",
+                 site_desc, mh_cls != NULL && mh_cls->cname ? mh_cls->cname : "?");
+        mh_throw("vtable_java_lang_UnsupportedOperationException", msg);
+    }
+
+    ReflectionClass* clazz = *(ReflectionClass**)((char*)member + MEMBERNAME_FIELD_CLAZZ);
+    void* name_str = *(void**)((char*)member + MEMBERNAME_FIELD_NAME);
+    void* type = *(void**)((char*)member + MEMBERNAME_FIELD_TYPE);
+    int32_t flags = *(int32_t*)((char*)member + MEMBERNAME_FIELD_FLAGS);
+    int32_t ref_kind = (flags & MN_REFERENCE_KIND_MASK) >> MN_REFERENCE_KIND_SHIFT;
+
+    char name[512];
+    name[0] = '\0';
+    if (name_str != NULL) __jnative_read_string_into(name_str, name, sizeof(name));
+    const char* owner = clazz != NULL && clazz->cname ? clazz->cname : "?";
+
+    char site_kinds[MH_MAX_ARGS];
+    char site_ret;
+    int site_n = mh_parse_kinds(site_desc, site_kinds, MH_MAX_ARGS, &site_ret);
+
+    char mdesc[1024];
+    char target_desc[1100];
+    int is_field = ref_kind >= JN_REF_getField && ref_kind <= JN_REF_putStatic;
+    if (is_field) {
+        char fdesc[512];
+        class_mirror_to_descriptor((ReflectionClass*)type, fdesc, sizeof(fdesc));
+        snprintf(mdesc, sizeof(mdesc), "%s", fdesc);
+        switch (ref_kind) {
+            case JN_REF_getField:  snprintf(target_desc, sizeof(target_desc), "(Ljava/lang/Object;)%s", fdesc); break;
+            case JN_REF_getStatic: snprintf(target_desc, sizeof(target_desc), "()%s", fdesc); break;
+            case JN_REF_putField:  snprintf(target_desc, sizeof(target_desc), "(Ljava/lang/Object;%s)V", fdesc); break;
+            default:               snprintf(target_desc, sizeof(target_desc), "(%s)V", fdesc); break;
+        }
+    } else {
+        if (mh_member_descriptor(member, type, mdesc, sizeof(mdesc)) < 0) {
+            snprintf(msg, sizeof(msg), "MethodHandle.invoke: cannot read the type of %s.%s", owner, name);
+            mh_throw("vtable_java_lang_InternalError", msg);
+        }
+        if (ref_kind == JN_REF_newInvokeSpecial) {
+            const char* close = strchr(mdesc, ')');
+            snprintf(target_desc, sizeof(target_desc), "%.*sL%s;",
+                     close != NULL ? (int)(close - mdesc + 1) : 0, mdesc, owner);
+        } else if (ref_kind == JN_REF_invokeStatic) {
+            snprintf(target_desc, sizeof(target_desc), "%s", mdesc);
+        } else {
+            snprintf(target_desc, sizeof(target_desc), "(Ljava/lang/Object;%s", mdesc + 1);
+        }
+    }
+
+    char target_kinds[MH_MAX_ARGS];
+    char target_ret;
+    int target_n = mh_parse_kinds(target_desc, target_kinds, MH_MAX_ARGS, &target_ret);
+    if (site_n < 0 || target_n < 0 || site_n != target_n) {
+        snprintf(msg, sizeof(msg), "cannot convert MethodHandle(%s.%s%s) to %s",
+                 owner, name, target_desc, site_desc);
+        mh_throw("vtable_java_lang_invoke_WrongMethodTypeException", msg);
+    }
+
+    if (ref_kind == JN_REF_getStatic || ref_kind == JN_REF_putStatic
+            || ref_kind == JN_REF_invokeStatic || ref_kind == JN_REF_newInvokeSpecial) {
+        jnative_ensure_class_initialized(clazz);
+    }
+
+    void* conv[MH_MAX_ARGS + 1];
+    for (int i = 0; i < site_n; i++) {
+        conv[i] = NULL;
+        MhValue v = mh_convert(site_kinds[i], target_kinds[i], mh_read(site_kinds[i], &args[i]));
+        mh_write(target_kinds[i], v, &conv[i]);
+    }
+
+    void* raw = NULL;
+    switch (ref_kind) {
+        case JN_REF_newInvokeSpecial: {
+            ReflectionConstructor* c = find_constructor_in_hierarchy(clazz, mdesc, NULL);
+            if (c == NULL || c->adaptor == NULL) {
+                snprintf(msg, sizeof(msg), "MethodHandle.invoke: no compiled constructor %s%s", owner, mdesc);
+                mh_throw("vtable_java_lang_InternalError", msg);
+            }
+            raw = ((void* (*)(void**))c->adaptor)(conv);
+            break;
+        }
+        case JN_REF_invokeStatic:
+        case JN_REF_invokeVirtual:
+        case JN_REF_invokeInterface:
+        case JN_REF_invokeSpecial: {
+            void* recv = NULL;
+            void** margs = conv;
+            ReflectionMethod* m = NULL;
+            if (ref_kind != JN_REF_invokeStatic) {
+                recv = conv[0];
+                margs = conv + 1;
+                if (recv == NULL) {
+                    __jnative_throw_null_pointer_exception();
+                }
+                if (ref_kind != JN_REF_invokeSpecial) {
+                    m = find_method_in_hierarchy(mh_class_of(recv), name, mdesc, NULL);
+                }
+            }
+            if (m == NULL) m = find_method_in_hierarchy(clazz, name, mdesc, NULL);
+            if (m == NULL || m->adaptor == NULL) {
+                snprintf(msg, sizeof(msg), "MethodHandle.invoke: no compiled method %s.%s%s", owner, name, mdesc);
+                mh_throw("vtable_java_lang_InternalError", msg);
+            }
+            raw = ((void* (*)(void*, void**))m->adaptor)(recv, margs);
+            break;
+        }
+        case JN_REF_getField:
+        case JN_REF_putField: {
+            void* recv = conv[0];
+            if (recv == NULL) {
+                __jnative_throw_null_pointer_exception();
+            }
+            char* addr = (char*)recv
+                + __jnative_fn_java_lang_invoke_MethodHandleNatives_objectFieldOffset__Ljava_lang_invoke_MemberName__J(member);
+            if (ref_kind == JN_REF_getField) {
+                MhValue v = mh_read(target_ret, addr);
+                raw = v.l;
+                if (!mh_is_ref(target_ret)) {
+                    raw = calloc(1, sizeof(MhValue));
+                    mh_write(target_ret, v, raw);
+                }
+            } else {
+                mh_write(target_kinds[1], mh_read(target_kinds[1], &conv[1]), addr);
+            }
+            break;
+        }
+        case JN_REF_getStatic:
+        case JN_REF_putStatic: {
+            char* addr = (char*)__jnative_fn_java_lang_invoke_MethodHandleNatives_staticFieldBase__Ljava_lang_invoke_MemberName__Ljava_lang_Object_(member)
+                + __jnative_fn_java_lang_invoke_MethodHandleNatives_staticFieldOffset__Ljava_lang_invoke_MemberName__J(member);
+            if (addr == NULL) {
+                snprintf(msg, sizeof(msg), "MethodHandle.invoke: static field %s.%s is not in the image", owner, name);
+                mh_throw("vtable_java_lang_InternalError", msg);
+            }
+            if (ref_kind == JN_REF_getStatic) {
+                MhValue v = mh_read(target_ret, addr);
+                raw = v.l;
+                if (!mh_is_ref(target_ret)) {
+                    raw = calloc(1, sizeof(MhValue));
+                    mh_write(target_ret, v, raw);
+                }
+            } else {
+                mh_write(target_kinds[0], mh_read(target_kinds[0], &conv[0]), addr);
+            }
+            break;
+        }
+        default:
+            snprintf(msg, sizeof(msg), "MethodHandle.invoke: unsupported reference kind %d for %s.%s",
+                     ref_kind, owner, name);
+            mh_throw("vtable_java_lang_UnsupportedOperationException", msg);
+    }
+
+    if (site_ret == 'V') return NULL;
+    MhValue rv;
+    rv.i = 0;
+    if (target_ret != 'V') {
+        rv = mh_is_ref(target_ret) ? (MhValue){ .l = raw } : mh_read(target_ret, raw);
+        rv = mh_convert(target_ret, site_ret, rv);
+    }
+    if (mh_is_ref(site_ret)) return rv.l;
+    void* out = calloc(1, sizeof(MhValue));
+    if (out == NULL) {
+        __jnative_throw_out_of_memory_error();
+    }
+    mh_write(site_ret, rv, out);
+    return out;
 }

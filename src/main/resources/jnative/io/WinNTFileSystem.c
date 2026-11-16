@@ -41,7 +41,7 @@ static wchar_t* jstr_to_wchars(void* jstr, int32_t* out_len) {
         }
     } else {
         for (int32_t i = 0; i < char_count; i++) {
-            out[i] = (wchar_t)(((uint16_t)bytes[i * 2] << 8) | bytes[i * 2 + 1]);
+            out[i] = (wchar_t)(bytes[i * 2] | ((uint16_t)bytes[i * 2 + 1] << 8));
         }
     }
     out[char_count] = 0;
@@ -83,8 +83,8 @@ static void* wchars_to_jstr(const wchar_t* wstr, int32_t char_count) {
         uint8_t* data = (uint8_t*)value + JAVA_ARR_HDR;
         for (int32_t i = 0; i < char_count; i++) {
             uint16_t c = (uint16_t)wstr[i];
-            data[i * 2] = (uint8_t)(c >> 8);
-            data[i * 2 + 1] = (uint8_t)(c & 0xFF);
+            data[i * 2] = (uint8_t)(c & 0xFF);
+            data[i * 2 + 1] = (uint8_t)(c >> 8);
         }
         data[char_count * 2] = 0;
         data[char_count * 2 + 1] = 0;

@@ -546,7 +546,7 @@ void __jnative_fn_jdk_internal_misc_Unsafe_fullFence___V(void* this_unsafe) { (v
 
 /* ---- Park / Unpark (per-thread) ---- */
 typedef struct ParkEntry {
-    jn_thread_t thread;
+    void* thread;
     jn_mutex_t mutex;
     jn_cond_t cond;
     int permit;
@@ -557,10 +557,12 @@ typedef struct ParkEntry {
 static jn_mutex_t park_table_lock = JN_MUTEX_INITIALIZER;
 static ParkEntry* park_table = NULL;
 
-static ParkEntry* get_park_entry(jn_thread_t t) {
+extern void* __jnative_fn_java_lang_Thread_currentThread___Ljava_lang_Thread_(void);
+
+static ParkEntry* get_park_entry(void* t) {
     jn_mutex_lock(&park_table_lock);
     for (ParkEntry* e = park_table; e; e = e->next) {
-        if (pthread_equal(e->thread, t)) {
+        if (e->thread == t) {
             jn_mutex_unlock(&park_table_lock);
             return e;
         }
@@ -580,7 +582,8 @@ static ParkEntry* get_park_entry(jn_thread_t t) {
 void __jnative_fn_jdk_internal_misc_Unsafe_park__ZJ_V(void* this_unsafe, int32_t isAbsolute, int64_t time) {
     (void)this_unsafe;
     int abs = isAbsolute ? 1 : 0;
-    ParkEntry* e = get_park_entry(pthread_self());
+    if (time < 0 || (abs && time == 0)) return;
+    ParkEntry* e = get_park_entry(__jnative_fn_java_lang_Thread_currentThread___Ljava_lang_Thread_());
     if (!e) return;
     jn_mutex_lock(&e->mutex);
     if (e->permit) {
@@ -598,8 +601,8 @@ void __jnative_fn_jdk_internal_misc_Unsafe_park__ZJ_V(void* this_unsafe, int32_t
             ts.tv_sec = time / 1000;
             ts.tv_nsec = (time % 1000) * 1000000L;
         } else {
-            ts.tv_sec += time / 1000;
-            ts.tv_nsec += (time % 1000) * 1000000L;
+            ts.tv_sec += time / 1000000000LL;
+            ts.tv_nsec += time % 1000000000LL;
             if (ts.tv_nsec >= 1000000000) { ts.tv_sec++; ts.tv_nsec -= 1000000000; }
         }
         while (e->parked) {
@@ -614,8 +617,7 @@ void __jnative_fn_jdk_internal_misc_Unsafe_unpark__Ljava_lang_Object__V(
         void* this_unsafe, void* thread) {
     (void)this_unsafe;
     if (!thread) return;
-    jn_thread_t t = pthread_self();
-    ParkEntry* e = get_park_entry(t);
+    ParkEntry* e = get_park_entry(thread);
     if (!e) return;
     jn_mutex_lock(&e->mutex);
     if (e->parked) {

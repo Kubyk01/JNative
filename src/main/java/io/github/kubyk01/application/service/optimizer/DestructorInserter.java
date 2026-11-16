@@ -4,6 +4,8 @@ import io.github.kubyk01.application.service.analyzer.dependencyresolver.Depende
 import io.github.kubyk01.application.service.analyzer.ssa.DominatorTree;
 import io.github.kubyk01.domain.analyzer.aliasanalysis.AliasAnalysisResult;
 import io.github.kubyk01.domain.analyzer.aliasanalysis.AllocationSite;
+import io.github.kubyk01.domain.analyzer.aliasanalysis.FieldCell;
+import io.github.kubyk01.domain.analyzer.aliasanalysis.PointsToGraph;
 import io.github.kubyk01.domain.analyzer.aliasanalysis.PointsToSet;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.ClassNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.FieldNode;
@@ -19,8 +21,10 @@ import lombok.RequiredArgsConstructor;
 import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
 import org.objectweb.asm.Opcodes;
+import reactor.core.scheduler.Scheduler;
 
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 
 @Slf4j
 @RequiredArgsConstructor
@@ -34,7 +38,10 @@ public class DestructorInserter {
     private final AliasAnalysisResult aliasResult;
     private final EscapeAnalysisResult escapeResult;
 
-    private final Map<Function, DominatorTree> domTrees = new HashMap<>();
+    private final Map<Function, DominatorTree> domTrees = new ConcurrentHashMap<>();
+
+    @Setter
+    private Scheduler scheduler;
 
     /**
      * Types with at least one {@code NEW}, {@code NEW_ARRAY} or
@@ -71,10 +78,12 @@ public class DestructorInserter {
         // collectAllocatedTypes), so findDestructor returns null for them
         // and no destructor is emitted.
         // ------------------------------------------------------------------
+        // Destructors are independent of each other; creation is race-safe
+        // through registerDestructor, so the types are processed in parallel.
         int generated = 0;
-        for (Type type : allocatedTypes) {
-            Function dtor = findDestructor(type);
-            if (dtor != null) generated++;
+        for (Boolean made : LlvmUtil.parallelMapOrdered(new ArrayList<>(allocatedTypes), scheduler,
+                type -> findDestructor(type) != null)) {
+            if (made) generated++;
         }
 
         // ------------------------------------------------------------------
@@ -124,6 +133,10 @@ public class DestructorInserter {
         // rationale and for the concrete TestHeap crash that motivated
         // the guard.
         // ------------------------------------------------------------------
+        // Every insertion edits only the block of its destruction point, so
+        // the work is grouped by function and functions run in parallel.
+        // Within a function the points keep their original order.
+        Map<Function, List<PendingDestructor>> byFunction = new LinkedHashMap<>();
         for (Map.Entry<AllocationSite, Set<DestructionPoint>> entry
             : lifetimeResult.getDestructionPoints().entrySet()) {
 
@@ -164,13 +177,33 @@ public class DestructorInserter {
                 continue;
             }
             for (DestructionPoint dp : entry.getValue()) {
-                if (!isLiveReference(dp.getObjectRef())) continue;
-                if (!objectRefAvailableAt(dp.getObjectRef(), dp.getBlock())) continue;
-                insertDestructorCall(site, dp, dtor);
+                byFunction.computeIfAbsent(dp.getBlock().getFunction(), k -> new ArrayList<>())
+                    .add(new PendingDestructor(site, dp, dtor));
             }
         }
+        LlvmUtil.parallelMapOrdered(new ArrayList<>(byFunction.values()), scheduler, pending -> {
+            for (PendingDestructor p : pending) {
+                DestructionPoint dp = p.point();
+                if (!isLiveReference(dp.getObjectRef())) continue;
+                if (!objectRefAvailableAt(dp.getObjectRef(), dp.getBlock())) continue;
+                insertDestructorCall(p.site(), dp, p.dtor());
+            }
+            return null;
+        });
         log.info("Destructor insertion: {} destructor(s) generated",
             generated);
+    }
+
+    private record PendingDestructor(AllocationSite site, DestructionPoint point, Function dtor) {}
+
+    /**
+     * Adds a freshly created destructor to the module. When another thread
+     * registered the same name first, that function is returned and the
+     * caller must abandon its own copy.
+     */
+    private Function registerDestructor(Function func) {
+        module.addFunction(func);
+        return module.getFunction(func.getName());
     }
 
     // =====================================================================
@@ -182,6 +215,11 @@ public class DestructorInserter {
      * unique within the module.
      */
     private int splitId = 0;
+
+    private static String baseLabel(String label) {
+        int i = label.indexOf("_rel_");
+        return i < 0 ? label : label.substring(0, i);
+    }
 
     /**
      * Instruments every PUT_FIELD that stores a reference-typed value into a
@@ -610,7 +648,7 @@ public class DestructorInserter {
 
         // ---- 1. Split: move [instIdx, end) to a new tail block ----
         BasicBlock tail = new BasicBlock(
-            block.getLabel() + "_rel_tail_" + (++splitId));
+            baseLabel(block.getLabel()) + "_rel_tail_" + (++splitId));
         func.addBlock(tail);
 
         List<Instruction> moved = new ArrayList<>(insts.subList(instIdx, insts.size()));
@@ -748,7 +786,7 @@ public class DestructorInserter {
 
         // ---- 6. Dispatch block ----
         BasicBlock dispatch = new BasicBlock(
-            block.getLabel() + "_rel_dispatch_" + (++splitId));
+            baseLabel(block.getLabel()) + "_rel_dispatch_" + (++splitId));
         func.addBlock(dispatch);
         block.setTerminator(new CondBranchTerminator(skipResult, tail, dispatch));
 
@@ -788,7 +826,7 @@ public class DestructorInserter {
             current.addInstruction(isT);
 
             BasicBlock freeBlock = new BasicBlock(
-                current.getLabel() + "_rel_free_" + (++splitId));
+                baseLabel(current.getLabel()) + "_rel_free_" + (++splitId));
             func.addBlock(freeBlock);
 
             BasicBlock next;
@@ -796,7 +834,7 @@ public class DestructorInserter {
                 next = tail;
             } else {
                 next = new BasicBlock(
-                    current.getLabel() + "_rel_next_" + (++splitId));
+                    baseLabel(current.getLabel()) + "_rel_next_" + (++splitId));
                 func.addBlock(next);
             }
 
@@ -1011,6 +1049,84 @@ public class DestructorInserter {
             }
         }
 
+        return ownsEverythingDestroyed(baseSites, fieldKey, fieldSites, liveOutSet);
+    }
+
+    private int[] inboundStart;
+    private int[] inboundSrc;
+    private int[] inboundField;
+
+    private void buildInboundEdges() {
+        if (inboundStart != null) return;
+        PointsToGraph graph = aliasResult.getGraph();
+        int n = AllocationSite.count();
+        int unknownId = AllocationSite.UNKNOWN.getId();
+        boolean[] destructible = new boolean[n];
+        for (int id = 0; id < n; id++) {
+            destructible[id] = id != unknownId && isManagedType(AllocationSite.byId(id).getType());
+        }
+        int[] start = new int[n + 1];
+        for (int src = 0; src < n; src++) {
+            for (FieldCell cell : graph.fieldCells(src)) {
+                for (int dst : cell.get().rawIds()) {
+                    if (destructible[dst]) start[dst + 1]++;
+                }
+            }
+        }
+        for (int i = 0; i < n; i++) start[i + 1] += start[i];
+        int[] next = Arrays.copyOf(start, n);
+        int[] sources = new int[start[n]];
+        int[] fields = new int[start[n]];
+        for (int src = 0; src < n; src++) {
+            for (FieldCell cell : graph.fieldCells(src)) {
+                for (int dst : cell.get().rawIds()) {
+                    if (!destructible[dst]) continue;
+                    int at = next[dst]++;
+                    sources[at] = src;
+                    fields[at] = cell.fieldId();
+                }
+            }
+        }
+        inboundSrc = sources;
+        inboundField = fields;
+        inboundStart = start;
+    }
+
+    private boolean ownsEverythingDestroyed(PointsToSet baseSites,
+                                            String fieldKey,
+                                            PointsToSet roots,
+                                            Set<AllocationSite> liveOutSet) {
+        PointsToGraph graph = aliasResult.getGraph();
+        Set<Integer> destroyed = new HashSet<>();
+        Deque<Integer> work = new ArrayDeque<>();
+        for (int id : roots.rawIds()) {
+            if (destroyed.add(id)) work.add(id);
+        }
+        while (!work.isEmpty()) {
+            for (FieldCell cell : graph.fieldCells(work.poll())) {
+                PointsToSet pts = cell.get();
+                if (pts.containsUnknown()) return false;
+                for (int child : pts.rawIds()) {
+                    if (isManagedType(AllocationSite.byId(child).getType()) && destroyed.add(child)) {
+                        work.add(child);
+                    }
+                }
+            }
+        }
+
+        buildInboundEdges();
+        int ownerFieldId = graph.findFieldId(fieldKey);
+        for (int id : destroyed) {
+            AllocationSite site = AllocationSite.byId(id);
+            if (staticFieldSites.contains(site) || liveOutSet.contains(site)) return false;
+            if (id + 1 >= inboundStart.length) return false;
+            for (int e = inboundStart[id]; e < inboundStart[id + 1]; e++) {
+                int src = inboundSrc[e];
+                if (destroyed.contains(src)) continue;
+                if (inboundField[e] == ownerFieldId && baseSites.containsId(src) && roots.containsId(id)) continue;
+                return false;
+            }
+        }
         return true;
     }
 
@@ -1292,8 +1408,33 @@ private void emitDestructionGuard(BasicBlock entry,
         entry.addSuccessor(returnBlock);
         entry.addSuccessor(entryAfterNull);
 
+        // Object.clone() leaves the copied children with several owners; only the last one destroys them.
+        Instruction ownerCall = new Instruction(Opcode.STATIC_CALL);
+        ownerCall.addOperand(new Constant(
+            Type.reference("__jnative_release_owner"), "__jnative_release_owner"));
+        ownerCall.addOperand(thisParam);
+        Temporary ownerResult = new Temporary(Type.INT);
+        ownerCall.setResult(ownerResult);
+        ownerResult.setDefiningInstruction(ownerCall);
+        entryAfterNull.addInstruction(ownerCall);
+
+        Instruction stillShared = new Instruction(Opcode.EQ);
+        stillShared.addOperand(ownerResult);
+        stillShared.addOperand(new Constant(Type.INT, 0));
+        Temporary stillSharedBool = new Temporary(Type.BOOLEAN);
+        stillShared.setResult(stillSharedBool);
+        stillSharedBool.setDefiningInstruction(stillShared);
+        entryAfterNull.addInstruction(stillShared);
+
+        BasicBlock lastOwner = new BasicBlock(entry.getLabel() + "_last_owner");
+        func.addBlock(lastOwner);
+        entryAfterNull.setTerminator(
+            new CondBranchTerminator(stillSharedBool, returnBlock, lastOwner));
+        entryAfterNull.addSuccessor(returnBlock);
+        entryAfterNull.addSuccessor(lastOwner);
+
         // ---------------------------------------------------------------
-        // Shutdown-guard — исходная логика, перенесённая в entryAfterNull.
+        // Shutdown-guard — исходная логика, перенесённая в lastOwner.
         // ---------------------------------------------------------------
         BasicBlock slowCheck = new BasicBlock(entry.getLabel() + "_dtor_slow");
         func.addBlock(slowCheck);
@@ -1304,7 +1445,7 @@ private void emitDestructionGuard(BasicBlock entry,
         Temporary shutdownVal = new Temporary(Type.INT);
         shutdownLoad.setResult(shutdownVal);
         shutdownVal.setDefiningInstruction(shutdownLoad);
-        entryAfterNull.addInstruction(shutdownLoad);
+        lastOwner.addInstruction(shutdownLoad);
 
         Instruction inShutdown = new Instruction(Opcode.NE);
         inShutdown.addOperand(shutdownVal);
@@ -1312,12 +1453,12 @@ private void emitDestructionGuard(BasicBlock entry,
         Temporary inShutdownBool = new Temporary(Type.BOOLEAN);
         inShutdown.setResult(inShutdownBool);
         inShutdownBool.setDefiningInstruction(inShutdown);
-        entryAfterNull.addInstruction(inShutdown);
+        lastOwner.addInstruction(inShutdown);
 
-        entryAfterNull.setTerminator(
+        lastOwner.setTerminator(
             new CondBranchTerminator(inShutdownBool, slowCheck, bodyFast));
-        entryAfterNull.addSuccessor(slowCheck);
-        entryAfterNull.addSuccessor(bodyFast);
+        lastOwner.addSuccessor(slowCheck);
+        lastOwner.addSuccessor(bodyFast);
 
         // ---------------------------------------------------------------
         // Slow-path: __jnative_dtor_enter + claim-check (без изменений).
@@ -1499,7 +1640,8 @@ private void emitDestructionGuard(BasicBlock entry,
 
         Function func = new Function(funcName, Type.VOID);
         func.setOwnerClass(className);
-        module.addFunction(func);
+        Function registered = registerDestructor(func);
+        if (registered != func) return registered;
 
         Parameter thisParam = new Parameter(Type.reference(className), 0);
         func.addParameter(thisParam);
@@ -1517,8 +1659,10 @@ private void emitDestructionGuard(BasicBlock entry,
 
         emitDestructionGuard(entry, thisParam, returnBlock, bodyFast, bodySlow);
 
+        List<FieldNode> ownedFields = collectAllReferenceFields(classNode);
+
         // ---- Fast path: destroy children, then __jnative_free_fast ----
-        for (FieldNode field : collectAllReferenceFields(classNode)) {
+        for (FieldNode field : ownedFields) {
             if ((field.getAccess() & Opcodes.ACC_STATIC) != 0) continue;
             Type fieldType = field.getType();
             if (!isManagedType(fieldType)) continue;
@@ -1548,7 +1692,7 @@ private void emitDestructionGuard(BasicBlock entry,
         bodyFast.setTerminator(new ReturnTerminator(null));
 
         // ---- Slow path: destroy children, unclaim, __jnative_free ----
-        for (FieldNode field : collectAllReferenceFields(classNode)) {
+        for (FieldNode field : ownedFields) {
             if ((field.getAccess() & Opcodes.ACC_STATIC) != 0) continue;
             Type fieldType = field.getType();
             if (!isManagedType(fieldType)) continue;
@@ -1683,7 +1827,8 @@ private void emitDestructionGuard(BasicBlock entry,
         }
 
         Function func = new Function(funcName, Type.VOID);
-        module.addFunction(func);
+        Function registered = registerDestructor(func);
+        if (registered != func) return registered;
 
         Parameter arrParam = new Parameter(arrayType, 0);
         func.addParameter(arrParam);
@@ -1882,7 +2027,8 @@ private void emitDestructionGuard(BasicBlock entry,
         if (existing != null) return existing;
 
         Function func = new Function(funcName, Type.VOID);
-        module.addFunction(func);
+        Function registered = registerDestructor(func);
+        if (registered != func) return registered;
 
         Parameter arrParam = new Parameter(arrayType, 0);
         func.addParameter(arrParam);

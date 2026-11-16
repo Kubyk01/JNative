@@ -1,7 +1,7 @@
 package io.github.kubyk01.application.service.analyzer.ssa;
 
 import io.github.kubyk01.application.service.analyzer.dependencyresolver.DependencyResolver;
-import io.github.kubyk01.application.service.analyzer.reachabilityanalysis.ReachabilityAnalysis;
+import io.github.kubyk01.application.service.analyzer.classanalysis.ClassAnalysis;
 import io.github.kubyk01.application.service.codegen.llvm.LlvmRuntime;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.ClassNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.MethodNode;
@@ -49,9 +49,9 @@ import java.util.TreeSet;
  * {@code isEnum()} rejects or whose reflective lookup fails.</p>
  *
  * <p>The set of reachable enums is fixed at compile time by
- * {@link ReachabilityAnalysis}, which is also responsible for forcing
+ * {@link ClassAnalysis}, which is also responsible for forcing
  * each enum's {@code values()} into the reachable set (see
- * {@code ReachabilityAnalysis.ensureEnumMethodsReachable}). Both
+ * {@code ClassAnalysis.ensureEnumMethodsReachable}). Both
  * guarantees are what make this dispatch table complete and correct:
  * no enum the program can observe is missing from the chain, and every
  * branch in the chain targets a function that actually exists in the
@@ -81,7 +81,7 @@ public final class EnumConstantsSharedEmitter {
     public static void emit(MethodReference methodRef,
                             IrBuilder builder,
                             DependencyResolver resolver,
-                            ReachabilityAnalysis reachability) {
+                            ClassAnalysis reachability) {
 
         if (!OWNER.equals(methodRef.getOwner())
             || !NAME.equals(methodRef.getName())
@@ -107,7 +107,7 @@ public final class EnumConstantsSharedEmitter {
         // of comparisons does not affect correctness, only the emitted
         // IR bytes.
         TreeSet<String> enums = new TreeSet<>();
-        for (String cls : reachability.getReachableClasses()) {
+        for (String cls : reachability.getClasses()) {
             if (cls == null || cls.isEmpty() || cls.charAt(0) == '[') continue;
             ClassNode cn = resolver.getClassNode(cls);
             if (cn == null || cn.isExternal()) continue;

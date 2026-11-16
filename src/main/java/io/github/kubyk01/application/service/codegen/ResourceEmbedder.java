@@ -1,20 +1,15 @@
 package io.github.kubyk01.application.service.codegen;
 
+import io.github.kubyk01.util.JImage;
+
 import java.io.IOException;
 import java.io.InputStream;
-import java.net.URI;
-import java.nio.file.DirectoryStream;
-import java.nio.file.FileAlreadyExistsException;
-import java.nio.file.FileSystem;
-import java.nio.file.FileSystemNotFoundException;
-import java.nio.file.FileSystems;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.AbstractMap;
 import java.util.ArrayList;
 import java.util.Enumeration;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.regex.Pattern;
@@ -25,12 +20,12 @@ import java.util.zip.ZipFile;
  * Collects resource bytes the JDK reads through Class.getResourceAsStream,
  * for baking into the image. The override installed on
  * Class.getResourceAsStream looks these up in a flat table.
- *
+ * <p>
  * Sources tried in order: $JAVA_HOME/jmods/java.base.jmod (zip,
  * entries under classes/), then jrt:/modules/java.base. Loading via
  * ClassLoader / getResourceAsStream does not work for these because the
  * files live in the module image, not on the class path.
- *
+ * <p>
  * Two collectors: collectJavaBaseResources() embeds every non-.class
  * entry of java.base (statically deciding which resource a reachable
  * path will request is not possible; MimeTable.load() was the first
@@ -184,7 +179,11 @@ public final class ResourceEmbedder {
             return List.of();
         }
 
-        Path tzdb = Paths.get(javaHome, "lib", "tzdb.dat");
+        return collectJdkRuntimeData(Paths.get(javaHome));
+    }
+
+    public static List<Map.Entry<String, byte[]>> collectJdkRuntimeData(Path javaHome) {
+        Path tzdb = javaHome.resolve("lib").resolve("tzdb.dat");
         if (!Files.isRegularFile(tzdb)) {
             System.err.println(
                 "ResourceEmbedder: " + tzdb + " not found; the generated "
@@ -245,16 +244,20 @@ public final class ResourceEmbedder {
      *         source yielded anything
      */
     public static List<Map.Entry<String, byte[]>> collectJavaBaseResources() {
-        List<Map.Entry<String, byte[]>> resources = readAllFromJmod();
+        return collectJavaBaseResources(Paths.get(System.getProperty("java.home")));
+    }
+
+    public static List<Map.Entry<String, byte[]>> collectJavaBaseResources(Path javaHome) {
+        List<Map.Entry<String, byte[]>> resources = readAllFromJmod(javaHome);
 
         if (resources.isEmpty()) {
-            resources = readAllFromJrt();
+            resources = readAllFromJrt(javaHome);
         }
 
         if (resources.isEmpty()) {
             System.err.println(
                 "ResourceEmbedder: no java.base resources could be collected. "
-                    + "Tried $JAVA_HOME/" + JMOD_RELATIVE_PATH
+                    + "Tried " + javaHome.resolve(JMOD_RELATIVE_PATH)
                     + " and jrt:/modules/" + MODULE_NAME + ". "
                     + "Class.getResourceAsStream will return null for every "
                     + "resource, and callers like MimeTable.load() will fail "
@@ -288,9 +291,9 @@ public final class ResourceEmbedder {
      * <p>Returns an empty list when the jmod is absent or unreadable; the
      * caller then falls back to the jrt source.</p>
      */
-    private static List<Map.Entry<String, byte[]>> readAllFromJmod() {
-        Path jmod = locateJmod();
-        if (jmod == null) {
+    private static List<Map.Entry<String, byte[]>> readAllFromJmod(Path javaHome) {
+        Path jmod = javaHome.resolve(JMOD_RELATIVE_PATH);
+        if (!Files.isRegularFile(jmod)) {
             return List.of();
         }
 
@@ -334,38 +337,15 @@ public final class ResourceEmbedder {
      * <p>Used when the JDK ships only a runtime image and no
      * {@code jmods/} directory.</p>
      */
-    private static List<Map.Entry<String, byte[]>> readAllFromJrt() {
-        FileSystem fs;
-        try {
-            fs = getJrtFileSystem();
-        } catch (IOException e) {
-            return List.of();
-        }
-
-        Path root = fs.getPath("/modules/" + MODULE_NAME);
-        if (!Files.isDirectory(root)) {
-            return List.of();
-        }
-
+    private static List<Map.Entry<String, byte[]>> readAllFromJrt(Path javaHome) {
         List<Map.Entry<String, byte[]>> out = new ArrayList<>();
         try {
-            Files.walk(root)
-                .filter(Files::isRegularFile)
-                .forEach(p -> {
-                    // p = /modules/java.base/sun/net/www/content-types.properties
-                    // Strip the module root and the leading '/'.
-                    String full = p.toString();
-                    String marker = "/modules/" + MODULE_NAME + "/";
-                    int idx = full.indexOf(marker);
-                    if (idx < 0) return;
-                    String stripped = full.substring(idx + marker.length());
-                    if (!keepAsResource(stripped)) return;
-                    try {
-                        out.add(new AbstractMap.SimpleImmutableEntry<>(
-                            stripped, Files.readAllBytes(p)));
-                    } catch (IOException ignored) {
-                    }
-                });
+            JImage image = JImage.open(javaHome);
+            for (String name : image.resources(MODULE_NAME)) {
+                if (keepAsResource(name)) {
+                    out.add(new AbstractMap.SimpleImmutableEntry<>(name, image.read(MODULE_NAME, name)));
+                }
+            }
         } catch (IOException e) {
             return List.of();
         }
@@ -443,42 +423,17 @@ public final class ResourceEmbedder {
     // =====================================================================
 
     private static List<Map.Entry<String, byte[]>> readFromJrt() {
-        FileSystem fs;
-        try {
-            fs = getJrtFileSystem();
-        } catch (IOException e) {
-            return List.of();
-        }
-
-        Path icuDir = fs.getPath("/modules/" + MODULE_NAME + "/" + ICU_DATA_PREFIX);
-        if (!Files.isDirectory(icuDir)) {
+        String javaHome = System.getProperty("java.home");
+        if (javaHome == null || javaHome.isEmpty()) {
             return List.of();
         }
 
         List<Map.Entry<String, byte[]>> out = new ArrayList<>();
-
-        try (DirectoryStream<Path> versions = Files.newDirectoryStream(icuDir)) {
-            for (Path version : versions) {
-                if (!Files.isDirectory(version)) {
-                    continue;
-                }
-                String dirName = version.getFileName().toString();
-                if (!isIcuVersionDirectory(dirName)) {
-                    continue;
-                }
-
-                try (DirectoryStream<Path> files =
-                         Files.newDirectoryStream(version)) {
-                    for (Path file : files) {
-                        if (!Files.isRegularFile(file)) {
-                            continue;
-                        }
-                        String fileName = file.getFileName().toString();
-                        String stripped = ICU_DATA_PREFIX + dirName + "/" + fileName;
-
-                        byte[] data = Files.readAllBytes(file);
-                        out.add(new AbstractMap.SimpleImmutableEntry<>(stripped, data));
-                    }
+        try {
+            JImage image = JImage.open(Paths.get(javaHome));
+            for (String name : image.resources(MODULE_NAME)) {
+                if (ICU_DATA_ENTRY.matcher(name).matches()) {
+                    out.add(new AbstractMap.SimpleImmutableEntry<>(name, image.read(MODULE_NAME, name)));
                 }
             }
         } catch (IOException e) {
@@ -487,62 +442,5 @@ public final class ResourceEmbedder {
 
         out.sort(Map.Entry.comparingByKey());
         return out;
-    }
-
-    /**
-     * True iff {@code name} has the form {@code icudt<digits>b} — the
-     * directory name the ICU build system uses for its data. The check is
-     * spelled out rather than using a regex because it is called on every
-     * entry of a small directory and the character-by-character form reads
-     * more directly than the pattern.
-     */
-    private static boolean isIcuVersionDirectory(String name) {
-        final String prefix = "icudt";
-        if (name.length() <= prefix.length() + 1) {
-            return false;
-        }
-        if (!name.startsWith(prefix)) {
-            return false;
-        }
-        if (name.charAt(name.length() - 1) != 'b') {
-            return false;
-        }
-        for (int i = prefix.length(); i < name.length() - 1; i++) {
-            char c = name.charAt(i);
-            if (c < '0' || c > '9') {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    /**
-     * Returns the JRT filesystem, creating it if the JDK has not already
-     * done so. The JDK's own filesystem provider registers {@code jrt:/}
-     * lazily on first access; the primary path is therefore
-     * {@link FileSystems#getFileSystem(URI)}, and the creation path is only
-     * taken if no provider has claimed the URI yet.
-     *
-     * <p>The double lookup inside the {@code catch} block handles the race
-     * where two threads simultaneously discover that {@code jrt:/} is not
-     * yet registered: one of them wins the {@code newFileSystem} call, the
-     * other sees {@link FileAlreadyExistsException} and re-reads the
-     * registered instance. The lookup form is the same one the rest of the
-     * code base uses.</p>
-     */
-    private static FileSystem getJrtFileSystem() throws IOException {
-        URI jrt = URI.create("jrt:/");
-
-        try {
-            return FileSystems.getFileSystem(jrt);
-        } catch (FileSystemNotFoundException notYetRegistered) {
-            Map<String, String> env = new HashMap<>();
-            env.put("java.home", System.getProperty("java.home"));
-            try {
-                return FileSystems.newFileSystem(jrt, env);
-            } catch (FileAlreadyExistsException race) {
-                return FileSystems.getFileSystem(jrt);
-            }
-        }
     }
 }

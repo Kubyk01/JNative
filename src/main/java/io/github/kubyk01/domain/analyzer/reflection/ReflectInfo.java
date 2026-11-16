@@ -5,15 +5,15 @@ import io.github.kubyk01.domain.analyzer.dependencyresolver.FieldReference;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.MethodReference;
 import lombok.Getter;
 
-import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.BiFunction;
 
 @Getter
 public class ReflectInfo {
-    private final Map<String, ReflectClassInfo> classInfoMap = new HashMap<>();
+    private final Map<String, ReflectClassInfo> classInfoMap = new ConcurrentHashMap<>();
 
     public ReflectClassInfo getOrCreateClassInfo(String className) {
         return classInfoMap.computeIfAbsent(className, ReflectClassInfo::new);

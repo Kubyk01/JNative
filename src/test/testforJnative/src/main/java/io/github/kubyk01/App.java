@@ -3,6 +3,13 @@
 package io.github.kubyk01;
 
 import io.r2dbc.spi.ConnectionFactory;
+import io.swagger.v3.oas.annotations.Hidden;
+import io.swagger.v3.oas.annotations.OpenAPIDefinition;
+import io.swagger.v3.oas.annotations.Operation;
+import io.swagger.v3.oas.annotations.Parameter;
+import io.swagger.v3.oas.annotations.info.Info;
+import io.swagger.v3.oas.annotations.media.Schema;
+import io.swagger.v3.oas.annotations.tags.Tag;
 import org.springframework.boot.ApplicationRunner;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
@@ -22,6 +29,10 @@ import java.math.BigDecimal;
 import java.time.LocalDateTime;
 
 @SpringBootApplication
+@OpenAPIDefinition(info = @Info(
+        title = "Orders API",
+        version = "1.0",
+        description = "Reactive orders service backed by H2 (R2DBC)"))
 public class App {
 
     public static void main(String[] args) {
@@ -58,13 +69,20 @@ public class App {
 /* ------------------------------------------------------------------ */
 
 @Table("orders")
+@Schema(description = "A single brokerage order")
 class Order {
     @Id
+    @Schema(description = "Generated id", example = "1", accessMode = Schema.AccessMode.READ_ONLY)
     private Long id;
+    @Schema(description = "Ticker symbol", example = "AAPL")
     private String symbol;
+    @Schema(description = "Order side", example = "BUY", allowableValues = {"BUY", "SELL"})
     private String side;
+    @Schema(description = "Unit price", example = "189.50")
     private BigDecimal price;
+    @Schema(description = "Number of shares", example = "10")
     private Integer quantity;
+    @Schema(description = "Creation timestamp", example = "2026-01-01T12:00:00")
     private LocalDateTime createdAt;
 
     public Order() { }
@@ -107,6 +125,7 @@ interface OrderRepository extends R2dbcRepository<Order, Long> {
 
 @RestController
 @RequestMapping("/api/orders")
+@Tag(name = "Orders", description = "Create and query orders")
 class OrderController {
 
     private final OrderRepository repo;
@@ -117,25 +136,31 @@ class OrderController {
 
     /** All orders - Flux. */
     @GetMapping(produces = MediaType.APPLICATION_JSON_VALUE)
+    @Operation(summary = "List all orders")
     public Flux<Order> all() {
         return repo.findAll();
     }
 
     /** Single order - Mono. */
     @GetMapping(value = "/{id}", produces = MediaType.APPLICATION_JSON_VALUE)
-    public Mono<Order> byId(@PathVariable Long id) {
+    @Operation(summary = "Get an order by id")
+    public Mono<Order> byId(
+            @Parameter(description = "Order id", example = "1") @PathVariable Long id) {
         return repo.findById(id);
     }
 
     /** Orders by ticker - Flux. */
     @GetMapping(value = "/symbol/{symbol}", produces = MediaType.APPLICATION_JSON_VALUE)
-    public Flux<Order> bySymbol(@PathVariable String symbol) {
+    @Operation(summary = "List orders for a ticker symbol")
+    public Flux<Order> bySymbol(
+            @Parameter(description = "Ticker symbol", example = "AAPL") @PathVariable String symbol) {
         return repo.findBySymbol(symbol.toUpperCase());
     }
 
     /** Create an order - Mono. */
     @PostMapping(consumes = MediaType.APPLICATION_JSON_VALUE,
                  produces = MediaType.APPLICATION_JSON_VALUE)
+    @Operation(summary = "Create a new order")
     public Mono<Order> create(@RequestBody Order order) {
         order.setId(null);
         if (order.getCreatedAt() == null) {
@@ -150,6 +175,7 @@ class OrderController {
 /* ------------------------------------------------------------------ */
 
 @RestController
+@Hidden
 class OrderView {
 
     private final OrderRepository repo;

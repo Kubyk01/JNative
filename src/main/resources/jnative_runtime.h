@@ -60,8 +60,9 @@
  *     C struct                     LLVM type
  *     ------------------------     --------------------------------
  *     ReflectionField              %ReflectionField       { i8*, i8*, i32, i32 }
- *     ReflectionMethod             %ReflectionMethod      { i8*, i8*, i8*, i32 }
- *     ReflectionConstructor        %ReflectionConstructor { i8*, i8*, i32 }
+ *     ReflectionParameter          %ReflectionParameter   { i8*, i32 }
+ *     ReflectionMethod             %ReflectionMethod      { i8*, i8*, i8*, i32, %ReflectionParameter*, i32, i32 }
+ *     ReflectionConstructor        %ReflectionConstructor { i8*, i8*, i32, %ReflectionParameter*, i32, i32 }
  *     ReflectionClass              %ReflectionClass       { %JNativeVTable*, i8*, ..., i8* }
  *     JNativeIfaceMapEntry         %JNativeIfaceMapEntry  { i32, i8** }
  *     JNativeIfaceMap              %JNativeIfaceMap       { i32, %JNativeIfaceMapEntry* }
@@ -357,6 +358,7 @@ extern "C" {
  * ======================================================================== */
 
 typedef struct ReflectionField       ReflectionField;
+typedef struct ReflectionParameter   ReflectionParameter;
 typedef struct ReflectionMethod      ReflectionMethod;
 typedef struct ReflectionConstructor ReflectionConstructor;
 typedef struct ReflectionClass       ReflectionClass;
@@ -372,17 +374,28 @@ struct ReflectionField {
     int   modifiers;    /* JVM access flags (ACC_*)                   */
 };
 
+struct ReflectionParameter {
+    void* name;         /* const char* — null when the class file omitted it */
+    int   modifiers;    /* MethodParameters access flags                    */
+};
+
 struct ReflectionMethod {
     void* name;         /* const char* — method name                  */
     void* descriptor;   /* const char* — JVM method descriptor        */
     void* adaptor;      /* i8* (i8* obj, i8** args) * reflect trampoline */
     int   modifiers;    /* JVM access flags                            */
+    ReflectionParameter* parameters; /* optional MethodParameters entries */
+    int   parameter_count;
+    int   slot;          /* index in ReflectionClass.methods             */
 };
 
 struct ReflectionConstructor {
     void* descriptor;   /* const char* — JVM method descriptor        */
     void* adaptor;      /* i8* (i8** args) * reflect trampoline       */
     int   modifiers;    /* JVM access flags                            */
+    ReflectionParameter* parameters; /* optional MethodParameters entries */
+    int   parameter_count;
+    int   slot;          /* index in ReflectionClass.constructors       */
 };
 
 /*
@@ -552,6 +565,19 @@ extern const int32_t JNATIVE_CTOR_PARAM_TYPES_OFFSET;
 extern const int32_t JNATIVE_CTOR_EXC_TYPES_OFFSET;
 extern const int32_t JNATIVE_CTOR_MODIFIERS_OFFSET;
 extern const int32_t JNATIVE_CTOR_ROOT_OFFSET;
+extern const int32_t JNATIVE_PARAMETER_NAME_OFFSET;
+extern const int32_t JNATIVE_PARAMETER_MODIFIERS_OFFSET;
+extern const int32_t JNATIVE_PARAMETER_EXECUTABLE_OFFSET;
+extern const int32_t JNATIVE_PARAMETER_INDEX_OFFSET;
+extern const int32_t JNATIVE_FIELD_ANNOTATIONS_OFFSET;
+extern const int32_t JNATIVE_METHOD_ANNOTATIONS_OFFSET;
+extern const int32_t JNATIVE_METHOD_PARAM_ANNOTATIONS_OFFSET;
+extern const int32_t JNATIVE_METHOD_ANNOTATION_DEFAULT_OFFSET;
+extern const int32_t JNATIVE_CTOR_ANNOTATIONS_OFFSET;
+extern const int32_t JNATIVE_CTOR_PARAM_ANNOTATIONS_OFFSET;
+extern const int32_t JNATIVE_FIELD_SIGNATURE_OFFSET;
+extern const int32_t JNATIVE_METHOD_SIGNATURE_OFFSET;
+extern const int32_t JNATIVE_CTOR_SIGNATURE_OFFSET;
 
 /* JVM access-flag bits used by the reflection filter paths. */
 #ifndef JNATIVE_ACC_PUBLIC
@@ -566,6 +592,9 @@ extern const int32_t JNATIVE_CTOR_ROOT_OFFSET;
  * ======================================================================== */
 
 extern ReflectionClass* reflect_all_classes[];
+
+extern void __jnative_thread_counts(int32_t* live_out, int32_t* daemon_out,
+                                    int64_t* started_out, int32_t* peak_out);
 
 extern SymbolClassEntry jnative_symbol_class_map[]        JNATIVE_WEAK;
 extern const int64_t    jnative_symbol_class_map_size     JNATIVE_WEAK;
@@ -640,7 +669,7 @@ extern int __jnative_function_at_address(uintptr_t pc,
 
 /**
  * One entry of the built-in resource table emitted by
- * LlvmGlobalEmitter.generateEmbeddedResources().
+ * LlvmGlobalEmitter.writeEmbeddedResources() (_resources.ll).
  *
  * <p>Layout matches the emitted %JNativeResourceEntry:
  *   { path, data, size }
@@ -653,6 +682,22 @@ typedef struct {
 
 extern const JNativeResourceEntry jnative_builtin_resources[]     JNATIVE_WEAK;
 extern const int32_t jnative_builtin_resources_count             JNATIVE_WEAK;
+
+typedef struct {
+    const char* path;
+    uint64_t offset;
+    uint64_t size;
+} JNativeRuntimeFile;
+
+extern const unsigned char jnative_runtime_data[];
+extern const uint64_t jnative_runtime_data_size;
+extern const JNativeRuntimeFile jnative_runtime_files[];
+extern const uint64_t jnative_runtime_files_count;
+extern const char* const jnative_runtime_classpath[];
+extern const char* __jnative_runtime_java_home(void);
+extern char* __jnative_runtime_path(const char* name);
+extern char* __jnative_runtime_class_path(void);
+extern const unsigned char* __jnative_runtime_file_data(const char* path, uint64_t* size);
 
 /* ========================================================================
  *  Runtime functions (defined in jnative_runtime.c)
@@ -710,6 +755,36 @@ extern int32_t __jnative_read_string_into(void* s, char* out, int32_t out_cap);
 extern const char* __jnative_read_string_cstr(void* s, int32_t* out_len);
 
 extern void* __jnative_make_string_obj(const char* bytes, int32_t len);
+extern void* __jnative_make_string_mutf8(const uint8_t* bytes, int32_t len);
+
+typedef struct {
+    const char*    name;
+    const char*    descriptor;
+    const uint8_t* annotations;
+    int32_t        annotations_len;
+    const uint8_t* parameter_annotations;
+    int32_t        parameter_annotations_len;
+    const uint8_t* annotation_default;
+    int32_t        annotation_default_len;
+    const char*    signature;
+} JNativeAnnotationMember;
+
+typedef struct {
+    ReflectionClass*               cls;
+    const uint8_t*                 constant_pool;
+    int32_t                        constant_pool_len;
+    int32_t                        constant_pool_count;
+    const uint8_t*                 annotations;
+    int32_t                        annotations_len;
+    const JNativeAnnotationMember* members;
+    int32_t                        member_count;
+} JNativeAnnotationClass;
+
+extern const JNativeAnnotationClass* jnative_annotation_class(const ReflectionClass* cls);
+extern const JNativeAnnotationMember* jnative_annotation_member(const ReflectionClass* cls,
+                                                                const char* name, const char* descriptor);
+extern const uint8_t* jnative_constant_pool_entry(const ReflectionClass* cls, int32_t index, uint8_t* tag);
+extern void* jnative_annotation_bytes(const uint8_t* data, int32_t len);
 extern const char* __jnative_read_string_bytes(void* s, int32_t* out_len);
 extern void* __jnative_string_intern(void* this_str);
 
@@ -877,6 +952,9 @@ extern int  __jnative_dtor_enter(void* this_obj);
 extern void __jnative_dtor_unclaim(void* this_obj);
 extern void __jnative_free(void* p);
 extern void __jnative_free_fast(void* p);
+extern void    __jnative_share(void* p);
+extern int32_t __jnative_release_owner(void* p);
+extern void    __jnative_free_owned(void* p);
 
 /* ---- Exception construction and throwers --------------------------- */
 
@@ -1082,6 +1160,8 @@ extern const JNativeResourceEntry* jnative_find_resource(const char* path,
  */
 extern void* __jnative_make_byte_array_input_stream(void* bytes);
 
+extern void* __jnative_new_direct_byte_buffer(void* address, int64_t capacity);
+
 /**
  * Drop-in replacement for the generated
  * fn_java_lang_Class_getResourceAsStream__Ljava_lang_String__Ljava_io_InputStream_,
@@ -1187,6 +1267,7 @@ extern const int32_t THREAD_HOLDER_OFFSET;
 extern const int32_t THREAD_TID_OFFSET;
 extern const int32_t THREAD_NAME_OFFSET;
 extern const int32_t THREAD_INTERRUPTLOCK_OFFSET;
+extern const int32_t THREAD_EETOP_OFFSET;
 extern const int32_t FH_OBJECT_SIZE;
 extern const int32_t FH_GROUP_OFFSET;
 extern const int32_t FH_PRIORITY_OFFSET;
@@ -1231,6 +1312,7 @@ static inline void jnative_type_info_name(const char* class_name,
 /* ---- Class lookup (defined in jnative_runtime.c, hashed) ---- */
 
 extern ReflectionClass* jnative_class_by_name(const char* name);
+extern void jnative_ensure_class_initialized(ReflectionClass* cls);
 extern ReflectionClass* jnative_class_by_dotted_name(const char* name);
 
 /* Cached "[B" mirror, initialised once via pthread_once. Used by the
@@ -1342,6 +1424,89 @@ static inline void* jnative_byte_array(const void* data, int32_t len)
     return arr;
 }
 
+static inline int jnative_field_offset(ReflectionClass* cls, const char* name)
+{
+    if (cls == NULL || cls->fields == NULL) return -1;
+    for (int i = 0; cls->fields[i] != NULL; i++) {
+        if (strcmp((const char*)cls->fields[i]->name, name) == 0) return cls->fields[i]->offset;
+    }
+    return -1;
+}
+
+static inline int jnative_field_offset_in(ReflectionClass* cls, const char* name)
+{
+    for (ReflectionClass* c = cls; c != NULL; c = c->superclass) {
+        int off = jnative_field_offset(c, name);
+        if (off > 0) return off;
+    }
+    return -1;
+}
+
+static inline int jnative_named_field_offset(const char* class_name, const char* field_name)
+{
+    int off = jnative_field_offset_in(jnative_class_by_name(class_name), field_name);
+    if (off <= 0) {
+        fprintf(stderr, "jnative: fatal: field %s.%s is not in the reflection metadata\n",
+                class_name, field_name);
+        abort();
+    }
+    return off;
+}
+
+static inline int jnative_cached_field_offset(int* cache, const char* class_name, const char* field_name)
+{
+    int off = __atomic_load_n(cache, __ATOMIC_RELAXED);
+    if (off <= 0) {
+        off = jnative_named_field_offset(class_name, field_name);
+        __atomic_store_n(cache, off, __ATOMIC_RELAXED);
+    }
+    return off;
+}
+
+static inline void* jnative_make_inet_address(const uint8_t* bytes, int len, const char* hostname)
+{
+    ReflectionClass* h_cls = jnative_class_by_name("java/net/InetAddress$InetAddressHolder");
+    int o_orig = jnative_field_offset(h_cls, "originalHostName");
+    int o_host = jnative_field_offset(h_cls, "hostName");
+    int o_addr = jnative_field_offset(h_cls, "address");
+    int o_family = jnative_field_offset(h_cls, "family");
+    if (o_orig < 0 || o_host < 0 || o_addr < 0 || o_family < 0) return NULL;
+    if (len != 4 && len != 16) return NULL;
+
+    ReflectionClass* cls = jnative_class_by_name(len == 4 ? "java/net/Inet4Address" : "java/net/Inet6Address");
+    int o_holder = jnative_field_offset(cls, "holder");
+    if (o_holder < 0) return NULL;
+
+    void* holder = jnative_alloc_object(h_cls);
+    if (holder == NULL) return NULL;
+    void* host = jnative_string(hostname);
+    *(void**)((char*)holder + o_orig) = host;
+    *(void**)((char*)holder + o_host) = host;
+
+    void* ia;
+    if (len == 4) {
+        ia = jnative_alloc_object(cls);
+        if (ia == NULL) { free(holder); return NULL; }
+        *(int32_t*)((char*)holder + o_addr) = (int32_t)(((uint32_t)bytes[0] << 24) | ((uint32_t)bytes[1] << 16)
+                                                       | ((uint32_t)bytes[2] << 8) | (uint32_t)bytes[3]);
+        *(int32_t*)((char*)holder + o_family) = 1;
+    } else {
+        ReflectionClass* h6_cls = jnative_class_by_name("java/net/Inet6Address$Inet6AddressHolder");
+        int o_holder6 = jnative_field_offset(cls, "holder6");
+        int o_ip = jnative_field_offset(h6_cls, "ipaddress");
+        if (o_holder6 < 0 || o_ip < 0) { free(holder); return NULL; }
+        void* holder6 = jnative_alloc_object(h6_cls);
+        if (holder6 == NULL) { free(holder); return NULL; }
+        ia = jnative_alloc_object(cls);
+        if (ia == NULL) { free(holder); free(holder6); return NULL; }
+        *(void**)((char*)holder6 + o_ip) = jnative_byte_array(bytes, 16);
+        *(int32_t*)((char*)holder + o_family) = 2;
+        *(void**)((char*)ia + o_holder6) = holder6;
+    }
+    *(void**)((char*)ia + o_holder) = holder;
+    return ia;
+}
+
 static inline void* jnative_ref_array_of_class(void** items, int32_t count,
                                                const char* klass_name)
 {
@@ -1421,7 +1586,8 @@ static inline int32_t jnative_raw_fd(void* fd_obj)
     }
     int32_t fd = jnative_fd_of(fd_obj);
     if (fd < 0) {
-        __jnative_throw_exception(NULL);
+        __jnative_throw_exception(
+            __jnative_construct_exception("vtable_java_io_IOException", "Stream Closed"));
     }
     return fd;
 }

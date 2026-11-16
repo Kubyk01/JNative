@@ -47,55 +47,33 @@
  * into the address array depends on the family: 4 for IPv4, 16 for
  * IPv6. Returns NULL if either of the required classes is not in the
  * reflection registry or if any allocation fails.
- *
- * The field layout used here matches LlvmGlobalEmitter.getFieldOffset
- * for the two target classes:
- *
- *   java.net.InetAddress:
- *       offset  8 : String canonicalHostName
- *       offset 16 : InetAddressHolder holder
- *
- *   java.net.InetAddress$InetAddressHolder:
- *       offset  8 : String hostName
- *       offset 16 : int    family
- *       offset 20 : byte[] addressBytes
  */
 static void* make_inet_address(const uint8_t* bytes, int java_family,
                                const char* hostname)
 {
-    ReflectionClass* ia_cls =
-        jnative_class_by_name("java/net/InetAddress");
-    ReflectionClass* h_cls =
-        jnative_class_by_name("java/net/InetAddress$InetAddressHolder");
-    if (!ia_cls || !h_cls) return NULL;
+    return jnative_make_inet_address(bytes, java_family == JAVA_IPV4 ? 4 : 16, hostname);
+}
 
-    void* holder = jnative_alloc_object(h_cls);
-    if (!holder) return NULL;
-
-    *(void**)((char*)holder + 8)    = jnative_string(hostname);
-    *(int32_t*)((char*)holder + 16) = java_family;
-    *(void**)((char*)holder + 20)   =
-        jnative_byte_array(bytes, java_family == JAVA_IPV4 ? 4 : 16);
-
-    void* ia = jnative_alloc_object(ia_cls);
-    if (!ia) { free(holder); return NULL; }
-
-    *(void**)((char*)ia + 8)  = NULL;
-    *(void**)((char*)ia + 16) = holder;
-
-    return ia;
+JNATIVE_NORETURN static void throw_unknown_host(const char* host, const char* reason)
+{
+    char msg[512];
+    snprintf(msg, sizeof(msg), "%s: %s", host, reason);
+    void* exc = __jnative_construct_exception("vtable_java_net_UnknownHostException", msg);
+    if (exc == NULL) {
+        __jnative_throw_io_ctx(msg, NULL);
+    }
+    __jnative_throw_exception(exc);
 }
 
 void* __jnative_fn_java_net_Inet6AddressImpl_lookupAllHostAddr__Ljava_lang_String_I__Ljava_net_InetAddress_(
-        void* host_str, int32_t policy)
+        void* this_impl, void* host_str, int32_t policy)
 {
+    (void)this_impl;
     (void)policy;
     if (!host_str) {
-        __jnative_throw_exception(NULL);
+        __jnative_throw_null_pointer_exception();
     }
-    int32_t hostLen = 0;
-    const char* host = __jnative_read_string_bytes(host_str, &hostLen);
-    (void)hostLen;
+    const char* host = __jnative_read_string_bytes(host_str, NULL);
 
     struct addrinfo hints;
     memset(&hints, 0, sizeof(hints));
@@ -105,7 +83,7 @@ void* __jnative_fn_java_net_Inet6AddressImpl_lookupAllHostAddr__Ljava_lang_Strin
     struct addrinfo* res = NULL;
     int rc = getaddrinfo(host, NULL, &hints, &res);
     if (rc != 0 || !res) {
-        __jnative_throw_exception(NULL);
+        throw_unknown_host(host, rc != 0 ? gai_strerror(rc) : "no addresses");
     }
 
     int count = 0;
@@ -114,7 +92,7 @@ void* __jnative_fn_java_net_Inet6AddressImpl_lookupAllHostAddr__Ljava_lang_Strin
     }
     if (count == 0) {
         freeaddrinfo(res);
-        __jnative_throw_exception(NULL);
+        throw_unknown_host(host, "no addresses");
     }
 
     /* InetAddress[] — the descriptor matches the declared Java return
@@ -124,7 +102,7 @@ void* __jnative_fn_java_net_Inet6AddressImpl_lookupAllHostAddr__Ljava_lang_Strin
                                              "[Ljava/net/InetAddress;");
     if (!array) {
         freeaddrinfo(res);
-        __jnative_throw_exception(NULL);
+        __jnative_throw_out_of_memory_error();
     }
 
     void** slots = (void**)((char*)array + JAVA_ARR_HDR);
@@ -151,9 +129,12 @@ void* __jnative_fn_java_net_Inet6AddressImpl_lookupAllHostAddr__Ljava_lang_Strin
 }
 
 void* __jnative_fn_java_net_Inet6AddressImpl_getHostByAddr___B_Ljava_lang_String_(
-        void* addr_bytes)
+        void* this_impl, void* addr_bytes)
 {
-    if (!addr_bytes) return NULL;
+    (void)this_impl;
+    if (!addr_bytes) {
+        __jnative_throw_null_pointer_exception();
+    }
 
     int32_t len = jnative_array_length(addr_bytes);
     uint8_t* bytes = (uint8_t*)jnative_array_data(addr_bytes);
@@ -173,7 +154,7 @@ void* __jnative_fn_java_net_Inet6AddressImpl_getHostByAddr___B_Ljava_lang_String
         memcpy(&sin6->sin6_addr, bytes, 16);
         sslen = sizeof(struct sockaddr_in6);
     } else {
-        return NULL;
+        throw_unknown_host("getHostByAddr", "invalid address length");
     }
 
     char hostbuf[NI_MAXHOST];
@@ -181,13 +162,14 @@ void* __jnative_fn_java_net_Inet6AddressImpl_getHostByAddr___B_Ljava_lang_String
                          hostbuf, sizeof(hostbuf),
                          NULL, 0, NI_NAMEREQD);
     if (rc != 0) {
-        return NULL;
+        throw_unknown_host("getHostByAddr", gai_strerror(rc));
     }
     return jnative_string(hostbuf);
 }
 
-void* __jnative_fn_java_net_Inet6AddressImpl_getLocalHostName___Ljava_lang_String_(void)
+void* __jnative_fn_java_net_Inet6AddressImpl_getLocalHostName___Ljava_lang_String_(void* this_impl)
 {
+    (void)this_impl;
     char buf[256];
     if (gethostname(buf, sizeof(buf)) != 0) {
         return NULL;
@@ -226,9 +208,10 @@ void* __jnative_fn_java_net_Inet6AddressImpl_getLocalHostName___Ljava_lang_Strin
  * InetAddress.isReachable(timeout).
  */
 int32_t __jnative_fn_java_net_Inet6AddressImpl_isReachable0___BII_BII_Z(
-        void* addr_bytes, int32_t scope, int32_t timeout,
+        void* this_impl, void* addr_bytes, int32_t scope, int32_t timeout,
         void* inf_bytes, int32_t ttl, int32_t if_scope)
 {
+    (void)this_impl;
     (void)scope; (void)inf_bytes; (void)ttl; (void)if_scope;
 
     if (addr_bytes == NULL) {
@@ -259,8 +242,8 @@ int32_t __jnative_fn_java_net_Inet6AddressImpl_isReachable0___BII_BII_Z(
         return 0;
     }
 
-    int fd = socket(ss.ss_family, SOCK_STREAM, 0);
-    if (fd < 0) {
+    jn_socket_t fd = socket(ss.ss_family, SOCK_STREAM, 0);
+    if (fd == JN_INVALID_SOCKET) {
         return 0;
     }
 
@@ -291,6 +274,6 @@ int32_t __jnative_fn_java_net_Inet6AddressImpl_isReachable0___BII_BII_Z(
         reachable = 1;
     }
 
-    close(fd);
+    jn_close_socket(fd);
     return reachable;
 }

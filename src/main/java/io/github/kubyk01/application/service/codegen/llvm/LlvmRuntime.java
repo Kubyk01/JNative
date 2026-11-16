@@ -41,8 +41,22 @@ public class LlvmRuntime {
      * {@code mangleMethod} is unnecessary and has been removed: it was a pure
      * no-op relative to the final result.</p>
      */
+    private static final ConcurrentHashMap<String, String> SANITIZE_CACHE =
+        new ConcurrentHashMap<>();
+
+    private static final ConcurrentHashMap<String, String> MANGLED_METHOD_CACHE =
+        new ConcurrentHashMap<>();
+
     private static String sanitizeToAsciiIdentifier(String s) {
         if (s == null) return "_";
+        String cached = SANITIZE_CACHE.get(s);
+        if (cached != null) return cached;
+        String result = doSanitize(s);
+        SANITIZE_CACHE.putIfAbsent(s, result);
+        return result;
+    }
+
+    private static String doSanitize(String s) {
         int n = s.length();
         StringBuilder sb = new StringBuilder(n);
         for (int i = 0; i < n; i++) {
@@ -67,7 +81,7 @@ public class LlvmRuntime {
      * every CALL site.
      */
     private static final Pattern MANGLED_CALLABLE_PATTERN = Pattern.compile(
-        "^[a-zA-Z0-9_/$]+\\.[a-zA-Z0-9_<>$]+\\([^)]*\\)[^)]*$");
+        "^[^.;\\[()]+\\.[^.;\\[/()]+\\([^)]*\\)[^)]*$");
 
     /**
      * Returns the block of {@code declare} lines that every generated module
@@ -104,6 +118,8 @@ public class LlvmRuntime {
             declare void @free(i8*)
             declare void @__jnative_free(i8*)
             declare void @__jnative_free_fast(i8*)
+            declare i32  @__jnative_release_owner(i8*)
+            declare void @__jnative_free_owned(i8*)
             declare void @__jnative_destruct_dispatch(i8*)
             declare void @__jnative_destruct_dispatch_if_not_same(i8*, i8*)
 
@@ -117,6 +133,10 @@ public class LlvmRuntime {
             declare i32 @atexit(void ()*)
             declare i64 @llvm.objectsize.i64.p0i8(i8*, i1)
             declare void @llvm.memset.p0i8.i64(i8* nocapture writeonly, i8, i64, i1 immarg)
+            declare i32 @llvm.fptosi.sat.i32.f32(float)
+            declare i32 @llvm.fptosi.sat.i32.f64(double)
+            declare i64 @llvm.fptosi.sat.i64.f32(float)
+            declare i64 @llvm.fptosi.sat.i64.f64(double)
 
             declare i32 @pthread_mutex_lock(i8*)
             declare i32 @pthread_mutex_unlock(i8*)
@@ -130,14 +150,18 @@ public class LlvmRuntime {
             declare void @longjmp(i8*, i32) noreturn
 
             declare i8* @__jnative_create_string_array(i32, i8**)
+            declare void @__jnative_wait_non_daemon_threads()
             declare i8* @__jnative_make_bootstrap_props(i32, i32, i32, i32, i32, i32, i32, i32, i32, i32)
             declare i8* @__jnative_new_multi_array(i8*, i32, i32*, i32)
             declare void @__jnative_monitor_enter(i8*)
             declare void @__jnative_monitor_exit(i8*)
             declare i1 @__jnative_instanceof(i8*, i8**)
+            declare i1 @__jnative_array_instanceof(i8*, i8*)
             declare void @__jnative_push_catch(i8*, i8**)
             declare void @__jnative_pop_catch()
             declare void @__jnative_throw_exception(i8*)
+            declare i8* @__jnative_construct_exception(i8*, i8*)
+            declare i8* @__jnative_methodhandle_invoke(i8*, i8**, i8*)
             declare i8* @__jnative_get_exception_object()
             declare i1 @__jnative_catch_matches(i8*, i8**)
 
@@ -374,9 +398,14 @@ public class LlvmRuntime {
      * memoises the result.</p>
      */
     public static String mangleMethod(String className, String methodName, String descriptor) {
-        return "fn_" + sanitizeToAsciiIdentifier(className)
+        String key = className + '\u0001' + methodName + '\u0001' + descriptor;
+        String cached = MANGLED_METHOD_CACHE.get(key);
+        if (cached != null) return cached;
+        String result = "fn_" + sanitizeToAsciiIdentifier(className)
             + "_" + sanitizeToAsciiIdentifier(methodName)
             + "_" + sanitizeToAsciiIdentifier(descriptor);
+        MANGLED_METHOD_CACHE.putIfAbsent(key, result);
+        return result;
     }
 
     /**

@@ -3,15 +3,29 @@ package io.github.kubyk01.domain.analyzer.aliasanalysis;
 import io.github.kubyk01.domain.ir.Value;
 import lombok.Getter;
 
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReferenceArray;
 
 public class PointsToGraph {
 
-    private final Map<Value, PointsToSet> nodeToPointsTo = new ConcurrentHashMap<>();
-    private final Map<AllocationSite, Map<String, PointsToSet>> fieldPointsTo = new ConcurrentHashMap<>();
-    private final Map<String, PointsToSet> staticFieldPointsTo = new ConcurrentHashMap<>();
+    public static final String ARRAY_ELEMENT_FIELD = "[]";
+
+    private static final int CHUNK_BITS = 12;
+    private static final int CHUNK_SIZE = 1 << CHUNK_BITS;
+    private static final int CHUNK_MASK = CHUNK_SIZE - 1;
+    private static final FieldCell[] NO_CELLS = new FieldCell[0];
+
+    private final AtomicReferenceArray<AtomicReferenceArray<FieldCell[]>> siteCells =
+        new AtomicReferenceArray<>(1 << (31 - CHUNK_BITS));
+    private final ConcurrentHashMap<String, Integer> fieldIds = new ConcurrentHashMap<>();
+    private final AtomicInteger nextFieldId = new AtomicInteger();
+    private final ConcurrentHashMap<String, FieldCell> staticCells = new ConcurrentHashMap<>();
 
     @Getter
     private final Map<AllocationSite, Value> allocationSiteToValue = new HashMap<>();
@@ -21,101 +35,213 @@ public class PointsToGraph {
     }
 
     public PointsToSet get(Value v) {
-        PointsToSet s = nodeToPointsTo.get(v);
-        return s != null ? s : PointsToSet.EMPTY;
+        Object o = v.getPointsTo();
+        return o == null ? PointsToSet.EMPTY : (PointsToSet) o;
     }
 
-    public PointsToSet getIfPresent(Value v) { return nodeToPointsTo.get(v); }
-
-    public void set(Value v, PointsToSet pts) {
-        if (pts == null || pts.isEmpty()) { nodeToPointsTo.remove(v); return; }
-        nodeToPointsTo.put(v, pts);
-    }
-
-    public void addAll(Value v, PointsToSet pts) {
-        if (pts == null || pts.isEmpty()) return;
-        nodeToPointsTo.computeIfAbsent(v, k -> PointsToSet.shared()).addAll(pts);
+    public PointsToSet getIfPresent(Value v) {
+        return (PointsToSet) v.getPointsTo();
     }
 
     public void add(Value v, AllocationSite site) { addSite(v, site); }
 
     public boolean addSite(Value v, AllocationSite site) {
-        return nodeToPointsTo.computeIfAbsent(v, k -> PointsToSet.shared()).add(site);
+        return merge(v, site.singleton());
     }
 
     public boolean merge(Value v, PointsToSet pts) {
         if (pts == null || pts.isEmpty()) return false;
-        return nodeToPointsTo.computeIfAbsent(v, k -> PointsToSet.shared()).addAll(pts);
+        while (true) {
+            Object o = v.getPointsTo();
+            PointsToSet cur = o == null ? PointsToSet.EMPTY : (PointsToSet) o;
+            PointsToSet next = PointsToSet.union(cur, pts);
+            if (next == cur) return false;
+            if (v.compareAndSetPointsTo(o, next)) return true;
+        }
     }
 
-    public Map<Value, PointsToSet> getAll() { return nodeToPointsTo; }
+    public int fieldId(String field) {
+        Integer id = fieldIds.get(field);
+        if (id != null) return id;
+        return fieldIds.computeIfAbsent(field, k -> nextFieldId.getAndIncrement());
+    }
+
+    public int findFieldId(String field) {
+        Integer id = fieldIds.get(field);
+        return id == null ? -1 : id;
+    }
+
+    public FieldCell findFieldCell(int siteId, int fieldId) {
+        AtomicReferenceArray<FieldCell[]> chunk = siteCells.get(siteId >>> CHUNK_BITS);
+        if (chunk == null) return null;
+        FieldCell[] cells = chunk.get(siteId & CHUNK_MASK);
+        if (cells == null) return null;
+        int i = indexOf(cells, fieldId);
+        return i >= 0 ? cells[i] : null;
+    }
+
+    /** Binary search: cells are kept sorted by fieldId (wide sites such as statics have thousands). */
+    private static int indexOf(FieldCell[] cells, int fieldId) {
+        int lo = 0, hi = cells.length - 1;
+        while (lo <= hi) {
+            int mid = (lo + hi) >>> 1;
+            int id = cells[mid].fieldId();
+            if (id < fieldId) lo = mid + 1;
+            else if (id > fieldId) hi = mid - 1;
+            else return mid;
+        }
+        return -(lo + 1);
+    }
+
+    public FieldCell fieldCell(int siteId, int fieldId, String field) {
+        int chunkIndex = siteId >>> CHUNK_BITS;
+        AtomicReferenceArray<FieldCell[]> chunk = siteCells.get(chunkIndex);
+        if (chunk == null) {
+            AtomicReferenceArray<FieldCell[]> fresh = new AtomicReferenceArray<>(CHUNK_SIZE);
+            chunk = siteCells.compareAndExchange(chunkIndex, null, fresh);
+            if (chunk == null) chunk = fresh;
+        }
+        int slot = siteId & CHUNK_MASK;
+        FieldCell created = null;
+        while (true) {
+            FieldCell[] cells = chunk.get(slot);
+            if (cells == null) cells = NO_CELLS;
+            int at = indexOf(cells, fieldId);
+            if (at >= 0) return cells[at];
+            at = -at - 1;
+            if (created == null) created = new FieldCell(fieldId, field);
+            FieldCell[] grown = new FieldCell[cells.length + 1];
+            System.arraycopy(cells, 0, grown, 0, at);
+            grown[at] = created;
+            System.arraycopy(cells, at, grown, at + 1, cells.length - at);
+            if (chunk.compareAndSet(slot, cells == NO_CELLS ? null : cells, grown)) return created;
+        }
+    }
+
+    public FieldCell fieldCell(AllocationSite site, String field) {
+        return fieldCell(site.getId(), fieldId(field), field);
+    }
 
     public PointsToSet getFieldPointsTo(AllocationSite site, String field) {
-        Map<String, PointsToSet> m = fieldPointsTo.get(site);
-        if (m == null) return PointsToSet.EMPTY;
-        PointsToSet s = m.get(field);
-        return s != null ? s : PointsToSet.EMPTY;
+        int fid = findFieldId(field);
+        if (fid < 0) return PointsToSet.EMPTY;
+        FieldCell c = findFieldCell(site.getId(), fid);
+        return c == null ? PointsToSet.EMPTY : c.get();
     }
 
     public boolean mergeFieldPointsTo(AllocationSite site, String field, PointsToSet pts) {
         if (pts == null || pts.isEmpty()) return false;
-        Map<String, PointsToSet> perSite = fieldPointsTo.computeIfAbsent(
-            site, k -> new ConcurrentHashMap<>(4));
-        PointsToSet existing = perSite.computeIfAbsent(field, k -> PointsToSet.shared());
-        return existing.addAll(pts);
+        return fieldCell(site, field).merge(pts);
     }
 
     public boolean fieldContainsUnknown(AllocationSite site, String field) {
-        Map<String, PointsToSet> m = fieldPointsTo.get(site);
-        if (m == null) return false;
-        PointsToSet pts = m.get(field);
-        return pts != null && pts.containsUnknown();
+        return getFieldPointsTo(site, field).containsUnknown();
+    }
+
+    /** The site's field cells sorted by fieldId, without copying; callers must not modify the array. */
+    public FieldCell[] fieldCells(int siteId) {
+        AtomicReferenceArray<FieldCell[]> chunk = siteCells.get(siteId >>> CHUNK_BITS);
+        if (chunk == null) return NO_CELLS;
+        FieldCell[] cells = chunk.get(siteId & CHUNK_MASK);
+        return cells == null ? NO_CELLS : cells;
     }
 
     public Map<String, PointsToSet> getFieldPointsToMap(AllocationSite site) {
-        return fieldPointsTo.get(site);
+        int siteId = site.getId();
+        AtomicReferenceArray<FieldCell[]> chunk = siteCells.get(siteId >>> CHUNK_BITS);
+        if (chunk == null) return null;
+        FieldCell[] cells = chunk.get(siteId & CHUNK_MASK);
+        if (cells == null) return null;
+        Map<String, PointsToSet> out = null;
+        for (FieldCell c : cells) {
+            PointsToSet pts = c.get();
+            if (pts.isEmpty()) continue;
+            if (out == null) out = new LinkedHashMap<>(Math.max(4, cells.length * 2));
+            out.put(c.field(), pts);
+        }
+        return out == null ? null : Collections.unmodifiableMap(out);
     }
 
     public PointsToSet getFieldPointsToForSites(PointsToSet sites, String field) {
         if (sites == null || sites.isEmpty()) return PointsToSet.EMPTY;
-        PointsToSet result = null;
-        for (AllocationSite site : sites) {
-            Map<String, PointsToSet> m = fieldPointsTo.get(site);
-            if (m == null) continue;
-            PointsToSet ftp = m.get(field);
-            if (ftp == null || ftp.isEmpty()) continue;
-            if (result == null) result = PointsToSet.local();
-            result.addAll(ftp);
+        int fid = findFieldId(field);
+        if (fid < 0) return PointsToSet.EMPTY;
+        PointsToSet first = null;
+        SiteSetBuilder builder = null;
+        try {
+            for (int id : sites.rawIds()) {
+                FieldCell c = findFieldCell(id, fid);
+                if (c == null) continue;
+                PointsToSet pts = c.get();
+                if (pts.isEmpty() || pts == first) continue;
+                if (first == null) {
+                    first = pts;
+                } else {
+                    if (builder == null) {
+                        builder = SiteSetBuilder.acquire();
+                        builder.addAll(first);
+                    }
+                    builder.addAll(pts);
+                }
+            }
+            if (builder != null) return builder.buildOr(first);
+            return first == null ? PointsToSet.EMPTY : first;
+        } finally {
+            if (builder != null) builder.release();
         }
-        return result != null ? result : PointsToSet.EMPTY;
     }
 
     public PointsToSet getArrayElementPointsTo(AllocationSite site) {
-        return getFieldPointsTo(site, "[]");
+        return getFieldPointsTo(site, ARRAY_ELEMENT_FIELD);
     }
 
     public boolean mergeArrayElementPointsTo(AllocationSite site, PointsToSet pts) {
-        return mergeFieldPointsTo(site, "[]", pts);
+        return mergeFieldPointsTo(site, ARRAY_ELEMENT_FIELD, pts);
+    }
+
+    public FieldCell staticCell(String field) {
+        FieldCell c = staticCells.get(field);
+        if (c != null) return c;
+        return staticCells.computeIfAbsent(field, k -> new FieldCell(-1, k));
     }
 
     public PointsToSet getStaticFieldPointsTo(String field) {
-        PointsToSet s = staticFieldPointsTo.get(field);
-        return s != null ? s : PointsToSet.EMPTY;
+        FieldCell c = staticCells.get(field);
+        return c == null ? PointsToSet.EMPTY : c.get();
     }
 
     public boolean mergeStaticFieldPointsTo(String field, PointsToSet pts) {
         if (pts == null || pts.isEmpty()) return false;
-        return staticFieldPointsTo.computeIfAbsent(field, k -> PointsToSet.shared()).addAll(pts);
+        return staticCell(field).merge(pts);
     }
 
     public boolean staticFieldContainsUnknown(String field) {
-        PointsToSet pts = staticFieldPointsTo.get(field);
-        return pts != null && pts.containsUnknown();
+        return getStaticFieldPointsTo(field).containsUnknown();
     }
 
-    public Map<String, PointsToSet> getStaticFieldPointsToMap() { return staticFieldPointsTo; }
+    public Map<String, PointsToSet> getStaticFieldPointsToMap() {
+        Map<String, PointsToSet> out = new TreeMap<>();
+        for (Map.Entry<String, FieldCell> e : staticCells.entrySet()) {
+            PointsToSet pts = e.getValue().get();
+            if (!pts.isEmpty()) out.put(e.getKey(), pts);
+        }
+        return Collections.unmodifiableMap(out);
+    }
 
     public boolean mayAlias(Value a, Value b) {
         return get(a).intersects(get(b));
+    }
+
+    public void releaseSolverState() {
+        for (int ci = 0, n = siteCells.length(); ci < n; ci++) {
+            AtomicReferenceArray<FieldCell[]> chunk = siteCells.get(ci);
+            if (chunk == null) continue;
+            for (int s = 0; s < CHUNK_SIZE; s++) {
+                FieldCell[] cells = chunk.get(s);
+                if (cells == null) continue;
+                for (FieldCell c : cells) c.clearReaders();
+            }
+        }
+        for (FieldCell c : staticCells.values()) c.clearReaders();
     }
 }

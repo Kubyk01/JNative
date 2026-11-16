@@ -50,4 +50,32 @@ public final class TypeResolver {
         String ret = desc.substring(idx + 1);
         return descToIrType(ret);
     }
+
+    /** Descriptor of a primitive type ("I" for int); null for anything else. */
+    public static String primitiveDescriptor(Type t) {
+        if (t == Type.BOOLEAN) return "Z";
+        if (t == Type.BYTE)    return "B";
+        if (t == Type.SHORT)   return "S";
+        if (t == Type.CHAR)    return "C";
+        if (t == Type.INT)     return "I";
+        if (t == Type.LONG)    return "J";
+        if (t == Type.FLOAT)   return "F";
+        if (t == Type.DOUBLE)  return "D";
+        return null;
+    }
+
+    /** Boxed class of a primitive descriptor ("I" -> java/lang/Integer); null for anything else. */
+    public static String wrapperClassOf(String primitiveDesc) {
+        return switch (primitiveDesc) {
+            case "Z" -> "java/lang/Boolean";
+            case "B" -> "java/lang/Byte";
+            case "S" -> "java/lang/Short";
+            case "C" -> "java/lang/Character";
+            case "I" -> "java/lang/Integer";
+            case "J" -> "java/lang/Long";
+            case "F" -> "java/lang/Float";
+            case "D" -> "java/lang/Double";
+            default  -> null;
+        };
+    }
 }

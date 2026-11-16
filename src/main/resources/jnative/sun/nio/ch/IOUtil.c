@@ -75,6 +75,17 @@ int32_t __jnative_fn_sun_nio_ch_IOUtil_fdVal__Ljava_io_FileDescriptor__I(void* f
     return jnative_fd_of(fdo);
 }
 
+/*
+ * static native void setfdVal(FileDescriptor fd, int value);
+ *
+ * Without it IOUtil.newFD(int) returns a FileDescriptor still holding -1
+ * (EPollSelectorImpl's eventfd -> "Stream Closed" in configureBlocking).
+ */
+void __jnative_fn_sun_nio_ch_IOUtil_setfdVal__Ljava_io_FileDescriptor_I_V(void* fdo, int32_t value) {
+    if (fdo == NULL) __jnative_throw_null_pointer_exception();
+    *(int32_t*)((char*)fdo + FD_OFFSET) = value;
+}
+
 /* ============================================================================
  *  configureBlocking — put the fd into or out of non-blocking mode.
  *
@@ -200,20 +211,19 @@ void __jnative_fn_sun_nio_ch_IOUtil_initIDs___V(void) {
  *  write1 — write one byte.
  * ========================================================================== */
 
-int32_t __jnative_fn_sun_nio_ch_IOUtil_write1__Ljava_io_FileDescriptor_I_I(
-        void* fdo, int32_t b)
+int32_t __jnative_fn_sun_nio_ch_IOUtil_write1__IB_I(int32_t fd, int8_t b)
 {
-    int32_t fd = io_fdval(fdo);
-    uint8_t byte = (uint8_t)b;
-
 #if defined(_WIN32)
-    int n;
-    do {
-        n = _write(fd, &byte, 1);
-    } while (n < 0 && errno == EINTR);
-    if (n < 0) jn_throw_io_ctx("write1 failed", errno);
+    char c = (char)b;
+    int n = send((SOCKET)(uintptr_t)(intptr_t)fd, &c, 1, 0);
+    if (n == SOCKET_ERROR) {
+        int32_t e = WSAGetLastError();
+        if (e == WSAEWOULDBLOCK) return IOS_UNAVAILABLE;
+        jn_throw_io_ctx("write1 failed", e);
+    }
     return n;
 #else
+    uint8_t byte = (uint8_t)b;
     ssize_t n;
     do {
         n = write(fd, &byte, 1);
@@ -221,6 +231,58 @@ int32_t __jnative_fn_sun_nio_ch_IOUtil_write1__Ljava_io_FileDescriptor_I_I(
     if (n < 0) {
         if (jn_io_would_block(errno)) return IOS_UNAVAILABLE;
         jn_throw_io_ctx("write1 failed", errno);
+    }
+    return (int32_t)n;
+#endif
+}
+
+/* ============================================================================
+ *  drain / drain1 — empty a selector's wakeup pipe.
+ * ========================================================================== */
+
+int32_t __jnative_fn_sun_nio_ch_IOUtil_drain__I_Z(int32_t fd)
+{
+    char buf[16];
+    int32_t read_any = 0;
+    for (;;) {
+#if defined(_WIN32)
+        int n = recv((SOCKET)(uintptr_t)(intptr_t)fd, buf, (int)sizeof(buf), 0);
+        if (n == SOCKET_ERROR) {
+            int32_t e = WSAGetLastError();
+            if (e != WSAEWOULDBLOCK) jn_throw_io_ctx("drain failed", e);
+            return read_any;
+        }
+#else
+        ssize_t n = read(fd, buf, sizeof(buf));
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            if (!jn_io_would_block(errno)) jn_throw_io_ctx("drain failed", errno);
+            return read_any;
+        }
+#endif
+        if (n <= 0) return read_any;
+        read_any = 1;
+        if ((size_t)n < sizeof(buf)) return 1;
+    }
+}
+
+int32_t __jnative_fn_sun_nio_ch_IOUtil_drain1__I_I(int32_t fd)
+{
+    char buf[1];
+#if defined(_WIN32)
+    int n = recv((SOCKET)(uintptr_t)(intptr_t)fd, buf, 1, 0);
+    if (n == SOCKET_ERROR) {
+        int32_t e = WSAGetLastError();
+        if (e == WSAEWOULDBLOCK) return 0;
+        jn_throw_io_ctx("drain1 failed", e);
+    }
+    return n;
+#else
+    ssize_t n = read(fd, buf, 1);
+    if (n < 0) {
+        if (jn_io_would_block(errno)) return 0;
+        if (errno == EINTR) return IOS_INTERRUPTED;
+        jn_throw_io_ctx("drain1 failed", errno);
     }
     return (int32_t)n;
 #endif

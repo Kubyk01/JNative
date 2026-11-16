@@ -764,7 +764,8 @@ int __jnative_fn_java_lang_invoke_VarHandle_get___V_I(void **args) {
 /* ===========================================================================
  *  Generic single-Object accessors.
  *
- *  Read or write the first instance field (offset 8) of the receiver.
+ *  Read or write the single instance reference field of the receiver,
+ *  located through the reflection metadata of its runtime class.
  *  Used for AtomicXxx and other single-field containers whose
  *  VarHandle call site could not be resolved to a concrete field
  *  descriptor. The first argument is the target object, not the
@@ -773,29 +774,56 @@ int __jnative_fn_java_lang_invoke_VarHandle_get___V_I(void **args) {
 
 typedef void* VarHandlePolyArg;
 
+static void** var_handle_field_slot(void* target) {
+    JNativeVTable* vt = *(JNativeVTable**)target;
+    ReflectionClass* cls = (vt != NULL && vt->name != NULL) ? jnative_class_by_name(vt->name) : NULL;
+    int found = -1;
+    for (ReflectionClass* c = cls; c != NULL; c = c->superclass) {
+        for (int i = 0; c->fields != NULL && c->fields[i] != NULL; i++) {
+            ReflectionField* f = c->fields[i];
+            const char* d = (const char*)f->descriptor;
+            if ((f->modifiers & 0x0008) != 0 || d == NULL || (d[0] != 'L' && d[0] != '[')) continue;
+            if (found > 0 && found != f->offset) {
+                found = 0;
+                break;
+            }
+            if (found != 0) found = f->offset;
+        }
+        if (found == 0) break;
+    }
+    if (found <= 0) {
+        char msg[256];
+        snprintf(msg, sizeof(msg), "VarHandle access on %s: no unique reference field to resolve",
+                 (vt != NULL && vt->name != NULL) ? vt->name : "?");
+        __jnative_throw_exception(__jnative_construct_exception(
+            "vtable_java_lang_UnsupportedOperationException", msg));
+    }
+    return (void**)((char*)target + found);
+}
+
 static inline void* var_handle_read_field(void* target) {
     if (target == NULL) return NULL;
-    return *(void**)((char*)target + 8);
+    return *var_handle_field_slot(target);
 }
 
 static inline void* var_handle_read_field_acquire(void* target) {
     if (target == NULL) return NULL;
     void* v;
-    __atomic_load((void**)((char*)target + 8), &v, __ATOMIC_ACQUIRE);
+    __atomic_load(var_handle_field_slot(target), &v, __ATOMIC_ACQUIRE);
     return v;
 }
 
 static inline void* var_handle_read_field_volatile(void* target) {
     if (target == NULL) return NULL;
     void* v;
-    __atomic_load((void**)((char*)target + 8), &v, __ATOMIC_SEQ_CST);
+    __atomic_load(var_handle_field_slot(target), &v, __ATOMIC_SEQ_CST);
     return v;
 }
 
 static inline void* var_handle_read_field_opaque(void* target) {
     if (target == NULL) return NULL;
     void* v;
-    __atomic_load((void**)((char*)target + 8), &v, __ATOMIC_RELAXED);
+    __atomic_load(var_handle_field_slot(target), &v, __ATOMIC_RELAXED);
     return v;
 }
 
@@ -927,7 +955,7 @@ int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concur
 /* ===========================================================================
  *  java.lang.Thread.threadLocalRandomProbe
  *
- *  +36  int threadLocalRandomProbe
+ *  int threadLocalRandomProbe (offset resolved by name)
  * =========================================================================== */
 
 void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_lang_Thread_I_V(
@@ -935,7 +963,9 @@ void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_lang_Thread_I_V(
     if (thread == NULL) {
         __jnative_throw_null_pointer_exception();
     }
-    *(int32_t*)((char*)thread + 36) = value;
+    static int probe_off;
+    *(int32_t*)((char*)thread + jnative_cached_field_offset(&probe_off,
+        "java/lang/Thread", "threadLocalRandomProbe")) = value;
 }
 
 /* ===========================================================================
@@ -1465,10 +1495,12 @@ int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_lang_Void_L
  *
  *  Two concrete subclasses matter here:
  *
- *      NativeMemorySegmentImpl  +32 long min (absolute address)
+ *      NativeMemorySegmentImpl  long min (absolute address)
  *
- *      HeapMemorySegmentImpl    +32 long offset (byte offset in array)
- *                               +40 Object base (backing array)
+ *      HeapMemorySegmentImpl    long offset (byte offset in array)
+ *                               Object base (backing array)
+ *
+ *  Field offsets are resolved by name from the reflection metadata.
  * =========================================================================== */
 
 static void* segment_payload(void* segment) {
@@ -1480,18 +1512,25 @@ static void* segment_payload(void* segment) {
     if (name == NULL) {
         __jnative_throw_null_pointer_exception();
     }
-    if (strstr(name, "NativeMemorySegmentImpl") != NULL) {
-        int64_t min = *(int64_t*)((char*)segment + 32);
-        return (void*)(intptr_t)min;
-    }
-    if (strstr(name, "HeapMemorySegmentImpl") != NULL) {
-        int64_t offset = *(int64_t*)((char*)segment + 32);
-        void*   base   = *(void**)((char*)segment + 40);
+    ReflectionClass* seg_cls = jnative_class_by_name(name);
+    int base_off = jnative_field_offset_in(seg_cls, "base");
+    if (base_off > 0) {
+        int offset_off = jnative_field_offset_in(seg_cls, "offset");
+        if (offset_off <= 0) {
+            __jnative_throw_exception(__jnative_construct_exception("vtable_java_lang_InternalError",
+                "heap MemorySegment without an offset field"));
+        }
+        int64_t offset = *(int64_t*)((char*)segment + offset_off);
+        void*   base   = *(void**)((char*)segment + base_off);
         if (base == NULL) return NULL;
         return (char*)base + JAVA_ARR_HDR + offset;
     }
-    /* Unknown concrete subclass: assume native layout. */
-    int64_t min = *(int64_t*)((char*)segment + 32);
+    int min_off = jnative_field_offset_in(seg_cls, "min");
+    if (min_off <= 0) {
+        __jnative_throw_exception(__jnative_construct_exception("vtable_java_lang_InternalError",
+            "MemorySegment without a min or base field"));
+    }
+    int64_t min = *(int64_t*)((char*)segment + min_off);
     return (void*)(intptr_t)min;
 }
 

@@ -2,102 +2,80 @@
 #include "jnative_platform.h"
 #include <stdint.h>
 #include <stddef.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "jnative_runtime.h"
 
-/*
- * java.lang.StackTraceElement — native support for StackWalker frame
- * materialisation.
- *
- * Two entry points exist:
- *
- *   initStackTraceElements(StackTraceElement[] stes,
- *                          Object backtrace,
- *                          int depth)
- *
- *     Bulk-fills an array of StackTraceElement objects from a JVM-side
- *     backtrace record. Called by Throwable.getOurStackTrace and by the
- *     StackWalker traversal when it collects frames in batches.
- *
- *   initStackTraceElement(StackTraceElement ste,
- *                         StackFrameInfo frame)
- *
- *     Copies the field values of a single StackFrameInfo into a single
- *     StackTraceElement. Called from StackFrameInfo.toStackTraceElement()
- *     and from StackTraceElement.of(StackFrameInfo), which are the two
- *     public entry points for turning a live stack frame into a public
- *     element.
- *
- * Both natives are dead in this runtime, for the same reason: the
- * generated code has no per-frame metadata registered with any stack
- * walker. The JVM-side backtrace record that the bulk variant consumes
- * does not exist, and the StackFrameInfo instances that the single
- * variant consumes are only ever produced by a successful walk of the
- * native stack — a walk that StackStreamFactory.AbstractStackWalker's
- * native hooks refuse to perform (see the corresponding stubs in
- * StackStreamFactory.c, which unconditionally return "no frames").
- *
- * The single-variant native is nevertheless emitted as a direct call
- * from StackFrameInfo and StackTraceElement because both are reachable
- * at the class level (their <clinit> and constructors are pulled into
- * the module by the reachability analysis). The linker therefore needs
- * the symbol to exist even though no call site will ever execute it at
- * runtime.
- *
- * Leaving the target StackTraceElement at its Java-level zero value —
- * null declaringClass, null methodName, null fileName, 0 lineNumber — is
- * the truthful answer for a runtime that cannot see the native stack.
- * It matches the empty-frame walk that every other StackWalker entry
- * point in this runtime already produces, and it avoids the version
- * brittleness of hand-decoding the StackFrameInfo field layout (whose
- * field order and set have changed between JDK releases, and which is
- * computed by the LLVM backend from each individual build's class file).
- */
+extern int jnative_stack_frame_describe(void* sfi, ReflectionClass** out_cls,
+                                        void** out_name, int32_t* out_modifiers) JNATIVE_WEAK;
 
-/*
- * private static native void initStackTraceElement(StackTraceElement ste,
- *                                                  StackFrameInfo frame);
- *
- * No-op after the null check. A null receiver is a genuine programming
- * error at the Java level — the call sites both allocate a fresh
- * StackTraceElement immediately before invoking the native — so it must
- * still surface as an NPE rather than a silent success.
- *
- * The `frame` argument is unused: the runtime cannot reconstruct a
- * StackFrameInfo from native stack metadata, so there is nothing to
- * copy into the target element.
- */
+extern const int32_t JNATIVE_STE_DECLARING_CLASS_OBJECT_OFFSET JNATIVE_WEAK;
+extern const int32_t JNATIVE_STE_DECLARING_CLASS_OFFSET        JNATIVE_WEAK;
+extern const int32_t JNATIVE_STE_METHOD_NAME_OFFSET            JNATIVE_WEAK;
+extern const int32_t JNATIVE_STE_FILE_NAME_OFFSET              JNATIVE_WEAK;
+extern const int32_t JNATIVE_STE_LINE_NUMBER_OFFSET            JNATIVE_WEAK;
+
+#define STE_ACC_NATIVE 0x0100
+
+static int ste_offset_ok(const int32_t* offset) {
+    return (uintptr_t)offset != 0 && *offset >= 0;
+}
+
+static void* ste_binary_name(const char* cname) {
+    size_t n = strlen(cname);
+    char* buf = (char*)malloc(n + 1);
+    if (buf == NULL) __jnative_throw_out_of_memory_error_ctx("StackTraceElement");
+    for (size_t i = 0; i < n; i++) buf[i] = cname[i] == '/' ? '.' : cname[i];
+    buf[n] = '\0';
+    void* s = __jnative_make_string_obj(buf, (int32_t)n);
+    free(buf);
+    return s;
+}
+
 void __jnative_fn_java_lang_StackTraceElement_initStackTraceElement__Ljava_lang_StackTraceElement_Ljava_lang_StackFrameInfo__V(
         void* ste, void* frame)
 {
-    if (ste == NULL) {
+    if (ste == NULL || frame == NULL) {
         __jnative_throw_null_pointer_exception();
     }
-    (void)frame;
+    ReflectionClass* cls = NULL;
+    void* method_name = NULL;
+    int32_t modifiers = 0;
+    if (jnative_stack_frame_describe == NULL
+        || !jnative_stack_frame_describe(frame, &cls, &method_name, &modifiers)
+        || cls == NULL || cls->cname == NULL) {
+        __jnative_throw_exception(__jnative_construct_exception(
+            "vtable_java_lang_InternalError",
+            "StackTraceElement: frame was not filled by a stack walk"));
+    }
+    if (!ste_offset_ok(&JNATIVE_STE_DECLARING_CLASS_OBJECT_OFFSET)
+        || !ste_offset_ok(&JNATIVE_STE_DECLARING_CLASS_OFFSET)
+        || !ste_offset_ok(&JNATIVE_STE_METHOD_NAME_OFFSET)
+        || !ste_offset_ok(&JNATIVE_STE_FILE_NAME_OFFSET)
+        || !ste_offset_ok(&JNATIVE_STE_LINE_NUMBER_OFFSET)) {
+        __jnative_throw_exception(__jnative_construct_exception(
+            "vtable_java_lang_InternalError",
+            "StackTraceElement: field layout is unknown to the image"));
+    }
+
+    char* base = (char*)ste;
+    *(void**)(base + JNATIVE_STE_DECLARING_CLASS_OBJECT_OFFSET) = cls;
+    *(void**)(base + JNATIVE_STE_DECLARING_CLASS_OFFSET) = ste_binary_name(cls->cname);
+    *(void**)(base + JNATIVE_STE_METHOD_NAME_OFFSET) = method_name;
+    *(void**)(base + JNATIVE_STE_FILE_NAME_OFFSET) = NULL;
+    *(int32_t*)(base + JNATIVE_STE_LINE_NUMBER_OFFSET) =
+        (modifiers & STE_ACC_NATIVE) ? -2 : -1;
 }
 
-/*
- * private static native void initStackTraceElements(StackTraceElement[] stes,
- *                                                   Object backtrace,
- *                                                   int depth);
- *
- * No-op. Called from Throwable.getOurStackTrace and the batch-collection
- * path of StackWalker; both are reached only after a successful
- * VM-side backtrace capture, which this runtime never performs.
- *
- * All three arguments are deliberately unused. The bulk-fill path
- * relies on a JVM-side backtrace record that this runtime does not
- * produce, and on per-frame metadata that does not exist. There is no
- * meaningful way to populate the array, and silently leaving it at its
- * Java-level zero values is the only truthful answer.
- */
 void __jnative_fn_java_lang_StackTraceElement_initStackTraceElements___Ljava_lang_StackTraceElement_Ljava_lang_Object_I_V(
         void* stes,
         void* backtrace,
         int32_t depth)
 {
-    (void)stes;
+    if (stes == NULL) {
+        __jnative_throw_null_pointer_exception();
+    }
     (void)backtrace;
     (void)depth;
 }

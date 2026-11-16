@@ -5,8 +5,10 @@ import io.github.kubyk01.domain.ir.BasicBlock;
 import io.github.kubyk01.domain.ir.Constant;
 import io.github.kubyk01.domain.ir.Function;
 import io.github.kubyk01.domain.ir.Instruction;
+import io.github.kubyk01.domain.ir.InvokeDynamicInfo;
 import io.github.kubyk01.domain.ir.Opcode;
 import io.github.kubyk01.domain.ir.Parameter;
+import io.github.kubyk01.domain.ir.ResolvedCall;
 import io.github.kubyk01.domain.ir.Type;
 import io.github.kubyk01.domain.ir.Value;
 import reactor.core.publisher.Flux;
@@ -321,6 +323,16 @@ public class LlvmUtil {
             else return "java/lang/Object";
         }
         return "java/lang/Object";
+    }
+
+    public static List<Value> lambdaCaptures(Instruction inst) {
+        if (inst.getOpcode() != Opcode.INVOKEDYNAMIC
+                || !(inst.getInvokedynamicData() instanceof InvokeDynamicInfo info)
+                || info.resolvedCall() == null
+                || info.resolvedCall().getType() != ResolvedCall.Type.LAMBDA) {
+            return List.of();
+        }
+        return inst.getOperands();
     }
 
     public static boolean isAllocation(Opcode op) {

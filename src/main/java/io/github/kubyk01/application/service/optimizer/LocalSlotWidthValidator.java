@@ -10,6 +10,7 @@ import io.github.kubyk01.domain.ir.Type;
 import io.github.kubyk01.domain.ir.Value;
 
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -95,9 +96,32 @@ public final class LocalSlotWidthValidator {
      *         than every path reaching it wrote it.
      */
     public static void validate(Module module) {
+        validate(module, null);
+    }
+
+    /**
+     * Same check with functions validated in parallel on {@code scheduler}.
+     * A violation is rethrown as the original {@link IllegalStateException}.
+     */
+    public static void validate(Module module, reactor.core.scheduler.Scheduler scheduler) {
+        List<Function> live = new ArrayList<>();
         for (Function func : module.getFunctions()) {
-            if (func.getEntryBlock() == null) continue;
-            validateFunction(func);
+            if (func.getEntryBlock() != null) live.add(func);
+        }
+        if (scheduler == null) {
+            for (Function func : live) validateFunction(func);
+            return;
+        }
+        try {
+            io.github.kubyk01.util.LlvmUtil.parallelMapOrdered(live, scheduler, func -> {
+                validateFunction(func);
+                return null;
+            });
+        } catch (RuntimeException e) {
+            for (Throwable t = e; t != null; t = t.getCause()) {
+                if (t instanceof IllegalStateException ise) throw ise;
+            }
+            throw e;
         }
     }
 

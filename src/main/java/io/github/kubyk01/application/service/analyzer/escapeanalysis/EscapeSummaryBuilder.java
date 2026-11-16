@@ -22,23 +22,24 @@ import static io.github.kubyk01.util.LlvmUtil.extractFieldOwnerAndName;
 import static io.github.kubyk01.util.LlvmUtil.getCallArguments;
 import static io.github.kubyk01.util.LlvmUtil.isAllocation;
 import static io.github.kubyk01.util.LlvmUtil.isLazyClinitWrapper;
+import static io.github.kubyk01.util.LlvmUtil.lambdaCaptures;
 
 /**
  * Computes an EscapeSummary per function.
- *
+ * <p>
  * Adds transitive site containment (localPointsTo / localSiteContents /
  * sitesReachableFromParams) so that a nested site is visible to callers
  * of a constructor. The motivating chain:
- *
+ * <p>
  *   BufferedWriter.<init>  : this.cb = new char[8192]
  *   PrintStream.<init>     : this.textOut = new BufferedWriter(...)
  *   System.<clinit>        : System.out = new PrintStream(...)
- *
+ * <p>
  * Without the transitive tracking, the GLOBAL promotion at System.out
  * stopped at the BufferedWriter site and never reached cb, so cb stayed
  * HEAP and received a per-use destructor — the freed array then caused
  * "Cannot invoke String.getChars ... because <array> is null".
- *
+ * <p>
  * SCC fixed point: every member pre-filled with an empty summary (bottom
  * of the lattice), commits merge new into old (monotone), so the loop
  * converges in O(height) iterations instead of oscillating between the
@@ -797,7 +798,7 @@ public class EscapeSummaryBuilder {
             // ------------------------------------------------------------------
             case ASTORE: {
                 processAStore(inst, paramAliases, paramsEscaped,
-                        fieldsEscaped, localPointsTo, localSiteContents,
+                        fieldsEscaped, localToParams, localPointsTo, localSiteContents,
                         sitesReachableFromParams);
                 break;
             }
@@ -806,6 +807,21 @@ public class EscapeSummaryBuilder {
                 processCall(inst, paramAliases, paramsEscaped, paramsReturned,
                         paramsEscapedToStatic, flags, snapshot, paramEscapeEdges,
                         localPointsTo, localSiteContents);
+                break;
+            }
+
+            case INVOKEDYNAMIC: {
+                for (Value cap : lambdaCaptures(inst)) {
+                    Type t = cap == null ? null : cap.getType();
+                    if (cap instanceof Parameter p
+                            && (t == null || t.isReference() || t.isArray() || t.isUnknown())) {
+                        paramsEscaped.add(p.getOrdinal());
+                        addAliases(p.getOrdinal(), paramAliases, paramsEscaped);
+                        paramsEscapedToStatic.add(p.getOrdinal());
+                        addAliases(p.getOrdinal(), paramAliases, paramsEscapedToStatic);
+                        flags[1] = true;
+                    }
+                }
                 break;
             }
 
@@ -1014,6 +1030,7 @@ public class EscapeSummaryBuilder {
                                Map<Integer, Set<Integer>> paramAliases,
                                Set<Integer> paramsEscaped,
                                Set<String>  fieldsEscaped,
+                               Map<Value, Set<Integer>> localToParams,
                                Map<Value, Set<AllocationSite>> localPointsTo,
                                Map<AllocationSite, Set<AllocationSite>> localSiteContents,
                                Map<Integer, Set<AllocationSite>> sitesReachableFromParams) {
@@ -1028,9 +1045,12 @@ public class EscapeSummaryBuilder {
                 || vt.isNull()
                 || vt.isUnknown();
 
-        if (valueIsReference && value instanceof Parameter p) {
-            paramsEscaped.add(p.getOrdinal());
-            addAliases(p.getOrdinal(), paramAliases, paramsEscaped);
+        Set<Integer> valueParams = valueIsReference ? localToParams.get(value) : null;
+        if (valueParams != null) {
+            for (int prd : valueParams) {
+                paramsEscaped.add(prd);
+                addAliases(prd, paramAliases, paramsEscaped);
+            }
         }
         fieldsEscaped.add("[]");
 

@@ -19,7 +19,6 @@ public interface OrchestratorPort {
                  boolean noCompile,
                  boolean includeSystem,
                  String debugName,
-                 boolean showClassesGraph,
                  int cores,
                  int optimizationLevel,
                  TargetPlatform targetPlatform);

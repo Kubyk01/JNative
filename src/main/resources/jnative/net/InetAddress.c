@@ -37,26 +37,26 @@ static int __jnative_ipv6_probe_result = -1;
 static int __jnative_dual_stack_probe_result = -1;
 
 static int probe_ipv4_socket(void) {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) {
+    jn_socket_t fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd == JN_INVALID_SOCKET) {
         return 0;
     }
-    close(fd);
+    jn_close_socket(fd);
     return 1;
 }
 
 static int probe_ipv6_socket(void) {
-    int fd = socket(AF_INET6, SOCK_STREAM, 0);
-    if (fd < 0) {
+    jn_socket_t fd = socket(AF_INET6, SOCK_STREAM, 0);
+    if (fd == JN_INVALID_SOCKET) {
         return 0;
     }
-    close(fd);
+    jn_close_socket(fd);
     return 1;
 }
 
 static int probe_dual_stack_socket(void) {
-    int fd = socket(AF_INET6, SOCK_STREAM, 0);
-    if (fd < 0) {
+    jn_socket_t fd = socket(AF_INET6, SOCK_STREAM, 0);
+    if (fd == JN_INVALID_SOCKET) {
         return 0;
     }
     int v6only = 0;
@@ -65,7 +65,7 @@ static int probe_dual_stack_socket(void) {
     if (getsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, (char*)&v6only, &optlen) == 0) {
         result = (v6only == 0) ? 1 : 0;
     }
-    close(fd);
+    jn_close_socket(fd);
     return result;
 }
 

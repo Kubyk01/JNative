@@ -8,6 +8,7 @@ import io.github.kubyk01.domain.ir.Value;
 import io.github.kubyk01.domain.analyzer.lifetime.LifetimeAnalysisResult;
 import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
+import reactor.core.scheduler.Scheduler;
 
 import java.util.Map;
 
@@ -29,6 +30,8 @@ public class Optimizer {
     private boolean enableDestructorInlining = true;
     @Setter
     private boolean enableDeadDestructorElimination = true;
+    @Setter
+    private Scheduler scheduler;
 
     public Optimizer(Module module, AliasAnalysisResult aliasResult,
                      EscapeAnalysisResult escapeResult,
@@ -52,7 +55,7 @@ public class Optimizer {
         // after a narrow store. Failing fast is strictly better than
         // letting the malformed IR flow through the remaining passes
         // and surface as a subtly wrong value at runtime.
-        LocalSlotWidthValidator.validate(module);
+        LocalSlotWidthValidator.validate(module, scheduler);
 
         if (enableScalarReplacement) {
             log.info("Running scalar replacement...");

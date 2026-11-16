@@ -2,6 +2,8 @@ package io.github.kubyk01.application.service.analyzer.ssa;
 
 import io.github.kubyk01.domain.ir.BasicBlock;
 import io.github.kubyk01.domain.ir.Function;
+import io.github.kubyk01.domain.ir.Instruction;
+import io.github.kubyk01.domain.ir.Opcode;
 import io.github.kubyk01.domain.ir.Terminator;
 
 import java.util.*;
@@ -47,31 +49,21 @@ public class DominatorTree {
         // ------------------------------------------------------------------
         for (BasicBlock block : function.getBlocks()) {
             List<BasicBlock> preds = block.getPredecessors();
-            if (preds.isEmpty()) continue;
-
-            List<BasicBlock> stale = null;
-            for (BasicBlock pred : preds) {
-                boolean reaches = false;
-
-                Terminator t = pred.getTerminator();
-                if (t != null) {
-                    for (BasicBlock tt : t.getTargets()) {
-                        if (tt == block) { reaches = true; break; }
+            for (int i = preds.size() - 1; i >= 0; i--) {
+                if (reaches(preds.get(i), block)) continue;
+                preds.remove(i);
+                for (Instruction inst : block.getInstructions()) {
+                    if (inst.getOpcode() == Opcode.PHI && i < inst.getOperands().size()) {
+                        inst.getOperands().remove(i);
                     }
-                }
-                if (!reaches) {
-                    for (BasicBlock e : pred.getExceptionalSuccessors()) {
-                        if (e == block) { reaches = true; break; }
-                    }
-                }
-
-                if (!reaches) {
-                    if (stale == null) stale = new ArrayList<>();
-                    stale.add(pred);
                 }
             }
-            if (stale != null) {
-                preds.removeAll(stale);
+        }
+        for (BasicBlock block : function.getBlocks()) {
+            for (BasicBlock succ : block.getSuccessors()) {
+                if (!reaches(block, succ)) {
+                    block.removeSuccessor(succ);
+                }
             }
         }
 
@@ -163,6 +155,16 @@ public class DominatorTree {
 
         buildChildren();
         computeDominanceFrontiers(vertex, dfsNum);
+    }
+
+    private static boolean reaches(BasicBlock pred, BasicBlock block) {
+        Terminator t = pred.getTerminator();
+        if (t != null) {
+            for (BasicBlock tt : t.getTargets()) {
+                if (tt == block) return true;
+            }
+        }
+        return pred.getExceptionalSuccessors().contains(block);
     }
 
     private int eval(int v, int[] semi, int[] ancestor, int[] label) {

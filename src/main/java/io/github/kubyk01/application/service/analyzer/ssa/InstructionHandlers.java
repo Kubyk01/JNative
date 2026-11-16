@@ -223,15 +223,10 @@ public class InstructionHandlers {
         return declaring;
     }
 
-    public void getField(String owner, String name) {
+    public void getField(String owner, String name, String desc) {
         Value obj = frame.pop();
-        Type fieldType;
         FieldNode field = resolver.getField(owner, name);
-        if (field != null) {
-            fieldType = field.getType();
-        } else {
-            fieldType = Type.reference("java/lang/Object");
-        }
+        Type fieldType = field != null ? field.getType() : Type.fromDescriptor(desc);
 
         String declaringOwner = resolveDeclaringOwner(owner, name);
         String canonicalKey = declaringOwner + "." + name;
@@ -261,14 +256,9 @@ public class InstructionHandlers {
     //  Static field access
     // ------------------------------------------------------------------
 
-    public void getStatic(String owner, String name) {
-        Type fieldType;
+    public void getStatic(String owner, String name, String desc) {
         FieldNode field = resolver.getField(owner, name);
-        if (field != null) {
-            fieldType = field.getType();
-        } else {
-            fieldType = Type.reference("java/lang/Object");
-        }
+        Type fieldType = field != null ? field.getType() : Type.fromDescriptor(desc);
 
         String declaringOwner = resolveDeclaringOwner(owner, name);
         String canonicalKey = declaringOwner + "." + name;

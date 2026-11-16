@@ -138,8 +138,8 @@ static void* wnd_string(const WCHAR* wstr, size_t len) {
         uint8_t* data = (uint8_t*)value + JAVA_ARR_HDR;
         for (int32_t i = 0; i < n; i++) {
             uint16_t c = (uint16_t)wstr[i];
-            data[i * 2] = (uint8_t)(c >> 8);
-            data[i * 2 + 1] = (uint8_t)(c & 0xFF);
+            data[i * 2] = (uint8_t)(c & 0xFF);
+            data[i * 2 + 1] = (uint8_t)(c >> 8);
         }
         data[n * 2] = 0;
         data[n * 2 + 1] = 0;

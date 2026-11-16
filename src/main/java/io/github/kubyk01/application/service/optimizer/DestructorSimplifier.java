@@ -159,9 +159,9 @@ public class DestructorSimplifier {
 
         for (Function func : dead) {
             log.debug("Removing dead destructor: {}", func.getName());
-            module.removeFunction(func);
             destructors.remove(func);
         }
+        module.removeFunctions(dead);
     }
 
     private void collectCalls(Function func, Set<Function> accumulator) {
@@ -634,12 +634,6 @@ public class DestructorSimplifier {
             }
 
             BasicBlock tail = splitBlockAt(func, block, callIdx);
-            if (tail == null) {
-                log.warn("DestructorSimplifier: could not split block {} "
-                        + "at instruction {} — leaving destructor call intact",
-                    block.getLabel(), callIdx);
-                return;
-            }
 
             emitInlineBody(func, block, tail, obj, fields);
             block = tail;
@@ -826,11 +820,34 @@ public class DestructorSimplifier {
         isNull.setParent(block);
         block.addInstruction(isNull);
 
-        BasicBlock doFree = new BasicBlock(
-            block.getLabel() + "_inline_free_" + (++inlineSplitId));
+        int id = ++inlineSplitId;
+        BasicBlock ownerCheck = new BasicBlock(block.getLabel() + "_inline_owner_" + id);
+        BasicBlock doFree = new BasicBlock(block.getLabel() + "_inline_free_" + id);
+        func.addBlock(ownerCheck);
         func.addBlock(doFree);
 
-        block.setTerminator(new CondBranchTerminator(isNullRes, tail, doFree));
+        block.setTerminator(new CondBranchTerminator(isNullRes, tail, ownerCheck));
+
+        Instruction ownerCall = new Instruction(Opcode.STATIC_CALL);
+        ownerCall.addOperand(new Constant(
+            Type.reference("__jnative_release_owner"), "__jnative_release_owner"));
+        ownerCall.addOperand(obj);
+        Temporary ownerRes = new Temporary(Type.INT);
+        ownerCall.setResult(ownerRes);
+        ownerRes.setDefiningInstruction(ownerCall);
+        ownerCall.setParent(ownerCheck);
+        ownerCheck.addInstruction(ownerCall);
+
+        Instruction stillShared = new Instruction(Opcode.EQ);
+        stillShared.addOperand(ownerRes);
+        stillShared.addOperand(new Constant(Type.INT, 0));
+        Temporary stillSharedRes = new Temporary(Type.BOOLEAN);
+        stillShared.setResult(stillSharedRes);
+        stillSharedRes.setDefiningInstruction(stillShared);
+        stillShared.setParent(ownerCheck);
+        ownerCheck.addInstruction(stillShared);
+
+        ownerCheck.setTerminator(new CondBranchTerminator(stillSharedRes, tail, doFree));
 
         for (String fieldName : fields) {
             Instruction getField = new Instruction(Opcode.GET_FIELD);
@@ -843,7 +860,9 @@ public class DestructorSimplifier {
             getField.setParent(doFree);
             doFree.addInstruction(getField);
 
-            Instruction freeField = new Instruction(Opcode.FREE);
+            Instruction freeField = new Instruction(Opcode.STATIC_CALL);
+            freeField.addOperand(new Constant(
+                Type.reference("__jnative_free_owned"), "__jnative_free_owned"));
             freeField.addOperand(fieldVal);
             freeField.setParent(doFree);
             doFree.addInstruction(freeField);

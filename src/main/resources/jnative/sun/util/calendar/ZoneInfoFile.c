@@ -220,28 +220,16 @@ void* __jnative_override_sun_util_calendar_ZoneInfoFile_getZoneInfo0(
             "ZoneInfoFile.getZoneInfo0");
     }
 
-    /*
-     * Все записываемые смещения лежат в пределах object_size,
-     * вычисленного эмиттером для ZoneInfo. object_size считается как
-     * сумма размеров всех instance-полей без выравнивания, что для
-     * этого класса даёт 65 байт (8 заголовок + 8 ID + 4 TimeZone.rawOffset
-     * + 4 ZoneInfo.rawOffset + 4 dstSavings + 8 checksum + 8 transitions
-     * + 8 offsets + 8 simpleTimeZoneParams + 1 willGMTOffsetChange
-     * + 4 serialVersionOnStream). Последнее записываемое смещение —
-     * 64 (1 байт), что внутри границы.
-     *
-     * serialVersionOnStream (смещение 68) сознательно не пишется: его
-     * читает только десериализация, недостижимая в образе.
-     */
-    *(void**)((char*)zi + 8)  = zone_id_str;      /* TimeZone.ID           */
-    *(int32_t*)((char*)zi + 16) = raw_offset_ms;  /* TimeZone.rawOffset    */
-    *(int32_t*)((char*)zi + 20) = raw_offset_ms;  /* ZoneInfo.rawOffset    */
-    *(int32_t*)((char*)zi + 24) = 0;              /* dstSavings            */
-    *(int64_t*)((char*)zi + 32) = 0;              /* checksum              */
-    *(void**)((char*)zi + 40) = NULL;             /* transitions           */
-    *(void**)((char*)zi + 48) = NULL;             /* offsets               */
-    *(void**)((char*)zi + 56) = NULL;             /* simpleTimeZoneParams  */
-    *(uint8_t*)((char*)zi + 64) = 0;              /* willGMTOffsetChange   */
+    int id_off = jnative_field_offset_in(cls, "ID");
+    int raw_off = jnative_field_offset_in(cls, "rawOffset");
+    if (id_off < 0 || raw_off < 0) {
+        free(zi);
+        void* exc = __jnative_construct_exception("vtable_java_lang_InternalError",
+            "ZoneInfoFile.getZoneInfo0: ZoneInfo.ID / ZoneInfo.rawOffset missing from the reflection metadata");
+        __jnative_throw_exception(exc);
+    }
+    *(void**)((char*)zi + id_off) = zone_id_str;
+    *(int32_t*)((char*)zi + raw_off) = raw_offset_ms;
 
     return zi;
 }
