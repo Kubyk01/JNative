@@ -100,7 +100,7 @@ jnative analyze <file.jar|dir|.class> [options]
 
 Builds a native executable or, with `--no-compile`, generates LLVM IR only.
 
-Generated IR goes in `target/generated-jnative`. Running from `target` or one of its subdirectories reuses that directory instead of creating `target/target`; elsewhere within a Maven project, the nearest ancestor containing `pom.xml` supplies the project root. Temporary bodies stay in `target/generated-jnative/.jnative-spool` until generation finishes successfully. Native compiler workspaces, including extracted C sources and object files, are created under `target/generated-jnative/.temp` and removed after each build. Set the JVM property `-Djnative.llvmUnitBytes=<bytes>` before `-jar` to change the class-body grouping limit, or use `0` for one unit per class.
+Generated IR goes in `target/generated-jnative`, relative to the current working directory. Temporary bodies stay in `target/generated-jnative/.jnative-spool` until generation finishes successfully. Native compiler workspaces, including extracted C sources and object files, are created under `target/generated-jnative/.temp` and removed after each build. Set the JVM property `-Djnative.llvmUnitBytes=<bytes>` before `-jar` to change the class-body grouping limit, or use `0` for one unit per class.
 
 | Option | Description |
 | --- | --- |
@@ -117,10 +117,14 @@ Generated IR goes in `target/generated-jnative`. Running from `target` or one of
 | `--destructor` | Show destructor insertion. |
 | `--all` | Equivalent to `--classes --alias --escape --lifetime --destructor`. |
 | `--debug-name` | Restrict analysis output to items whose names contain this substring. |
-| `--cores` | Maximum CPU cores. `0` (default) uses `Runtime.availableProcessors()`. Controls parallel analysis, C compilation, and `--thinlto-jobs`. |
-| `-O` | Optimization level `0`–`3` (default: `2`), passed as `-O<level>` to IR-to-bitcode and ThinLTO linking. |
+| `--cores` | Maximum CPU cores. `0` (default) uses `Runtime.availableProcessors()`. Controls parallel analysis and compilation; linker workers are also capped automatically by free system memory. |
+| `-O` | Optimization level `0`–`3` (default: `2`), applied during compilation and explicitly to ThinLTO optimization. `-O0` disables LTO during both compilation and linking. |
 | `--target` | LLVM target triple; auto-detected from the build host if omitted. |
 | `--data-layout` | Override the data layout derived from `--target`. |
+
+Linker parallelism is chosen automatically immediately before linking, after compilation finishes. JNative reads free physical memory from the operating system, reserves the larger of 1 GiB or 25% of that memory, and budgets 2 GiB per worker from the remainder. The worker count is at least one and never exceeds `--cores`; if memory information is unavailable, it uses one worker. The build prints the selected count and available memory. These are conservative estimates, not a guarantee against out-of-memory failures for unusually large modules or changing system load.
+
+For Windows MSVC targets, JNative passes the worker count directly to `lld-link` through `/threads:N` and `/opt:lldltojobs=N`, and the LTO optimization level through `/opt:lldlto=N`. This avoids relying on Clang to forward `-flto-jobs` or `-O` to the MSVC linker; see [LLVM's ThinLTO parallelism documentation](https://clang.llvm.org/docs/ThinLTO.html#controlling-backend-parallelism). Java's `-Xmx` limits the JNative JVM heap; it does not set the separate LLVM linker's memory budget.
 
 ## What Works
 

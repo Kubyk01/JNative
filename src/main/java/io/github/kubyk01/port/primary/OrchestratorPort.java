@@ -21,5 +21,6 @@ public interface OrchestratorPort {
                  String debugName,
                  int cores,
                  int optimizationLevel,
+                 String ltoMode,
                  TargetPlatform targetPlatform);
 }

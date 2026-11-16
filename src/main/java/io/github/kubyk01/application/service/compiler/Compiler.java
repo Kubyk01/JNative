@@ -1,6 +1,5 @@
 package io.github.kubyk01.application.service.compiler;
 
-import io.github.kubyk01.application.service.GeneratedOutputDirectory;
 import io.github.kubyk01.application.service.analyzer.dependencyresolver.DependencyResolver;
 import io.github.kubyk01.application.service.codegen.llvm.LlvmRuntime;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.ClassNode;
@@ -16,6 +15,7 @@ import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.lang.management.ManagementFactory;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -53,6 +53,8 @@ public class Compiler implements CompilerPort {
 
     private static final int MIN_OPT_LEVEL = 0;
     private static final int MAX_OPT_LEVEL = 3;
+    private static final long GIB = 1L << 30;
+    private static final long ESTIMATED_LINK_WORKER_BYTES = 2 * GIB;
 
    // Todo remove hard-coded ways
     private static final String[] MINGW_ROOT_CANDIDATES_POSIX = {
@@ -103,11 +105,14 @@ public class Compiler implements CompilerPort {
                                DependencyResolver resolver,
                                int cores,
                                int optimizationLevel,
+                               String ltoMode,
                                TargetPlatform targetPlatform)
             throws IOException, InterruptedException {
 
         final int effectiveCores = (cores <= 0) ? 1 : cores;
         final int effectiveOptLevel = clampOptLevel(optimizationLevel);
+        final String ltoFlag = resolveLtoFlag(ltoMode);
+        final boolean ltoEnabled = !"-fno-lto".equals(ltoFlag);
         final TargetPlatform target = (targetPlatform != null)
                 ? targetPlatform
                 : TargetPlatform.detectFromBuildHost();
@@ -234,23 +239,15 @@ public class Compiler implements CompilerPort {
                     + threadCount + " thread(s) (target " + target.triple() + ")...");
 
             compileAll(compiler, tasks, tempDir, threadCount, effectiveOptLevel,
-                    target, sysroot, msvcToolchain);
+                    ltoFlag, target, sysroot, msvcToolchain);
 
             // ------------------------------------------------------------------
             // 5. Link.
             //
-            // ThinLTO is an LLVM-only feature: its parallel-backend option
-            // --thinlto-jobs is understood only by ld.lld. GNU ld (BFD and
-            // gold) does not implement ThinLTO at all and rejects both
-            // --threads and --thinlto-jobs. The linker must therefore be
-            // chosen by LINKER FLAVOUR, not by target OS:
-            //
-            //   MSVC -> lld-link (or link.exe), accepts --threads
-            //   GNU  -> ld.lld, accepts --thinlto-jobs
-            //
-            // x86_64-w64-windows-gnu is a Windows target built with the GNU
-            // toolchain, so it falls into the GNU branch. Forcing the LLVM
-            // linker here is the only portable fix.
+            // LTO needs LLVM's linker. Pass its worker/optimization
+            // settings directly: Clang's MSVC driver does not forward
+            // -flto-jobs or -O to lld-link. Linker workers have a separate
+            // limit because each LTO backend can consume substantial RAM.
             //
             // ld.lld, unlike the GCC driver, does not automatically add the
             // MinGW-w64 GCC runtime library directory to its search path.
@@ -269,21 +266,18 @@ public class Compiler implements CompilerPort {
             final boolean msvcLinker = target.triple()
                     .toLowerCase(Locale.ROOT).contains("-msvc");
 
-            linkCmd.add("-flto=thin");
-            linkCmd.add("-O" + effectiveOptLevel);
             linkCmd.add("-g");
 
             if (msvcLinker) {
                 if (!isAvailable("lld-link")) {
                     throw new IllegalStateException(
-                            "ThinLTO for target '" + target.triple() + "' requires the "
+                            "Linking for target '" + target.triple() + "' requires the "
                                     + "LLVM linker 'lld-link', but it was not found on PATH. "
                                     + "MSVC link.exe cannot consume LLVM bitcode objects. "
                                     + "Install LLVM with lld (e.g. `winget install LLVM.LLVM`) "
                                     + "and make sure its bin directory is on PATH.");
                 }
                 linkCmd.add("-fuse-ld=lld");
-                linkCmd.add("-flto-jobs=" + effectiveCores);
                 // MSVC-mode lld-link reports a symbol made weak in several objects as duplicate
                 // (MinGW mode allows it); the runtime relies on ELF-style weak, so allow it.
                 linkCmd.add("-Wl,-lld-allow-duplicate-weak");
@@ -291,7 +285,7 @@ public class Compiler implements CompilerPort {
                 // Windows doesn't append .exe to a name that already has an extension (".lld").
                 if (!isAvailable(TargetPlatform.detectFromBuildHost().isWindows() ? "ld.lld.exe" : "ld.lld")) {
                     throw new IllegalStateException(
-                            "ThinLTO for target '" + target.triple() + "' requires the "
+                            "Linking for target '" + target.triple() + "' requires the "
                                     + "LLVM linker 'ld.lld', but it was not found on PATH. "
                                     + "GNU ld does not support ThinLTO options "
                                     + "(both '--threads' and '--thinlto-jobs' are rejected). "
@@ -325,7 +319,6 @@ public class Compiler implements CompilerPort {
                 }
 
                 linkCmd.add("-fuse-ld=lld");
-                linkCmd.add("-Wl,--thinlto-jobs=" + effectiveCores);
             }
 
             if (target.isWindows()) {
@@ -347,7 +340,19 @@ public class Compiler implements CompilerPort {
 
             appendLinkerLibraries(linkCmd, target);
 
-            System.out.println("Linking for target " + target.triple() + "...");
+            // Sample after compilation and link-input preparation, when the
+            // compiler subprocesses have exited and released their memory.
+            long freeMemoryBytes = freeSystemMemoryBytes();
+            int effectiveLinkJobs = automaticLinkJobs(effectiveCores, freeMemoryBytes);
+            linkCmd.addAll(linkerOptimizationFlags(msvcLinker, effectiveOptLevel,
+                    effectiveLinkJobs, ltoFlag));
+            System.out.println("Linking for target " + target.triple() + " using "
+                    + effectiveLinkJobs + " worker(s) ("
+                    + (ltoEnabled ? ltoFlag + " -O" + effectiveOptLevel : "LTO disabled")
+                    + "; " + (freeMemoryBytes >= 0
+                    ? String.format(Locale.ROOT, "%.1f GiB free system memory", (double) freeMemoryBytes / GIB)
+                    : "free system memory unavailable; using one worker") + ")...");
+            log.debug("Link command: {}", linkCmd);
             ProcessBuilder linkBuilder = new ProcessBuilder(linkCmd);
             linkBuilder.inheritIO();
             int exit = linkBuilder.start().waitFor();
@@ -367,7 +372,7 @@ public class Compiler implements CompilerPort {
         }
 
         static BuildWorkspace create() throws IOException {
-            Path tempRoot = GeneratedOutputDirectory.resolve().resolve(".temp");
+            Path tempRoot = Paths.get("target", "generated-jnative", ".temp");
             Files.createDirectories(tempRoot);
             return new BuildWorkspace(Files.createTempDirectory(tempRoot, BUILD_ROOT_NAME));
         }
@@ -1092,11 +1097,60 @@ public class Compiler implements CompilerPort {
     }
 
     // =====================================================================
-    //  Optimization level
+    //  Optimization and linker memory budget
     // =====================================================================
 
     private static int clampOptLevel(int level) {
         return Math.max(MIN_OPT_LEVEL, Math.min(level, MAX_OPT_LEVEL));
+    }
+
+    private static long freeSystemMemoryBytes() {
+        try {
+            if (ManagementFactory.getOperatingSystemMXBean()
+                    instanceof com.sun.management.OperatingSystemMXBean os) {
+                return os.getFreeMemorySize();
+            }
+        } catch (UnsupportedOperationException | SecurityException e) {
+            log.debug("Cannot read free system memory; limiting linker to one worker", e);
+        }
+        return -1;
+    }
+
+    private static int automaticLinkJobs(int cores, long freeMemoryBytes) {
+        if (freeMemoryBytes <= 0) return 1;
+        // Reserve at least 1 GiB (or 25% of available RAM) for the linker
+        // index, JVM growth and other processes. Budget 2 GiB per backend.
+        // This is a conservative estimate, not a hard memory limit: a large
+        // individual IR module can still need more than a worker's budget.
+        long reserve = Math.max(GIB, freeMemoryBytes / 4);
+        long workerBudget = Math.max(0, freeMemoryBytes - reserve);
+        return (int) Math.max(1, Math.min(Math.max(1, cores),
+                workerBudget / ESTIMATED_LINK_WORKER_BYTES));
+    }
+
+    private static String resolveLtoFlag(String ltoMode) {
+        if (ltoMode == null || ltoMode.isBlank()) return "-fno-lto";
+        return ltoMode.startsWith("-") ? ltoMode : "-flto=" + ltoMode;
+    }
+
+    private static List<String> linkerOptimizationFlags(boolean msvc, int optimizationLevel,
+                                                        int jobs, String ltoFlag) {
+        List<String> flags = new ArrayList<>();
+        flags.add(ltoFlag);
+        flags.add("-O" + optimizationLevel);
+        flags.add(msvc ? "-Wl,/threads:" + jobs : "-Wl,--threads=" + jobs);
+        if (!"-fno-lto".equals(ltoFlag)) {
+            if (msvc) {
+                flags.add("-Wl,/opt:lldltojobs=" + jobs);
+                flags.add("-Wl,/opt:lldlto=" + optimizationLevel);
+            } else {
+                flags.add(ltoFlag.contains("thin")
+                        ? "-Wl,--thinlto-jobs=" + jobs
+                        : "-Wl,--lto-jobs=" + jobs);
+                flags.add("-Wl,--lto-O" + optimizationLevel);
+            }
+        }
+        return flags;
     }
 
     // =====================================================================
@@ -1116,7 +1170,7 @@ public class Compiler implements CompilerPort {
 
     private void compileAll(String compiler, List<CompileTask> tasks,
                             Path includeDir, int threadCount,
-                            int optimizationLevel, TargetPlatform target,
+                            int optimizationLevel, String ltoFlag, TargetPlatform target,
                             String sysroot, MsvcToolchain msvcToolchain)
             throws IOException, InterruptedException {
 
@@ -1131,7 +1185,7 @@ public class Compiler implements CompilerPort {
         if (threadCount <= 1 || tasks.size() <= 1) {
             for (CompileTask task : scheduledTasks) {
                 compileOne(compiler, task, includeDir, optimizationLevel,
-                        target, sysroot, msvcToolchain);
+                        ltoFlag, target, sysroot, msvcToolchain);
             }
             return;
         }
@@ -1152,7 +1206,7 @@ public class Compiler implements CompilerPort {
                 while ((idx = nextTask.getAndIncrement()) < scheduledTasks.size()) {
                     try {
                         compileOne(compiler, scheduledTasks.get(idx), includeDir,
-                                optimizationLevel, target, sysroot,
+                                optimizationLevel, ltoFlag, target, sysroot,
                                 msvcToolchain);
                     } catch (Throwable t) {
                         failures.add(t);
@@ -1186,7 +1240,7 @@ public class Compiler implements CompilerPort {
     }
 
     private void compileOne(String compiler, CompileTask task, Path includeDir,
-                            int optimizationLevel, TargetPlatform target,
+                            int optimizationLevel, String ltoFlag, TargetPlatform target,
                             String sysroot, MsvcToolchain msvcToolchain)
             throws IOException, InterruptedException {
 
@@ -1207,7 +1261,7 @@ public class Compiler implements CompilerPort {
         command.add("-x");
         command.add(task.kind == SourceKind.IR ? "ir" : "c");
         command.add("-O" + optimizationLevel);
-        command.add(optimizationLevel == 0 ? "-fno-lto" : "-flto=thin");
+        command.add(ltoFlag);
         command.add("-g");
         command.add("-fno-omit-frame-pointer");
 

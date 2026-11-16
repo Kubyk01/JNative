@@ -134,7 +134,8 @@ public class CLI implements Runnable {
         @CommandLine.Option(names = "--cores",
             description = "Maximum number of CPU cores this run may use. "
                 + "A value of 0 (the default) means: use every core "
-                + "reported by Runtime.getRuntime().availableProcessors().")
+                + "reported by Runtime.getRuntime().availableProcessors(). "
+                + "Linker workers are additionally limited automatically by free system memory.")
         int cores,
         @CommandLine.Option(names = "--target",
             description = "LLVM target triple. Determines the target triple "
@@ -157,11 +158,17 @@ public class CLI implements Runnable {
 
         @CommandLine.Option(names = "-O",
             description = "Native compiler optimization level (0-3, default: 2). "
-                + "Passed to clang as -O<level> for both the LLVM IR → bitcode "
-                + "compilation step and the ThinLTO link step. "
+                + "Applied during compilation and to LTO linking. "
                 + "Accepts both attached form (-O3) and separated form (-O 3).",
             defaultValue = "2")
-        int optimizationLevel) {
+        int optimizationLevel,
+
+        @CommandLine.Option(names = "-flto",
+            description = "LTO mode passed to clang as -flto=<mode> for both "
+                + "compilation and linking. Accepts both attached form "
+                + "(-flto=thin) and separated form (-flto thin). "
+                + "When omitted, clang is always invoked with -fno-lto.")
+        String ltoMode) {
 
         if (entryClass == null && file.isFile()
             && file.getName().toLowerCase().endsWith(".jar")) {
@@ -212,6 +219,6 @@ public class CLI implements Runnable {
         orchestrator.analyze(path, entryClass, entryMethod, descriptor,
             showClasses, showAlias, showEscape, showLifetime, showDestructor,
             outputFile, noCompile, includeSystem, debugName,
-            cores, optimizationLevel, platform);
+            cores, optimizationLevel, ltoMode, platform);
     }
 }

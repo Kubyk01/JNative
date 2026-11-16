@@ -18,6 +18,7 @@ public interface CompilerPort {
                         DependencyResolver resolver,
                         int cores,
                         int optimizationLevel,
+                        String ltoMode,
                         TargetPlatform targetPlatform)
         throws IOException, InterruptedException;
 

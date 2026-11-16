@@ -80,6 +80,7 @@ public class Orchestrator implements OrchestratorPort {
                         String debugName,
                         int cores,
                         int optimizationLevel,
+                        String ltoMode,
                         TargetPlatform targetPlatform) {
 
         final int effectiveCores = (cores <= 0)
@@ -101,7 +102,7 @@ public class Orchestrator implements OrchestratorPort {
             runAnalysis(path, entryClass, entryMethod, entryDescriptor,
                     showClasses, showAlias, showEscape, showLifetime, showDestructor,
                     outputFile, noCompile, includeSystem, debugName,
-                    effectiveCores, optimizationLevel, scheduler, targetPlatform);
+                    effectiveCores, optimizationLevel, ltoMode, scheduler, targetPlatform);
         } finally {
             scheduler.dispose();
         }
@@ -122,6 +123,7 @@ public class Orchestrator implements OrchestratorPort {
                              String debugName,
                              int effectiveCores,
                              int optimizationLevel,
+                             String ltoMode,
                              Scheduler scheduler,
                              TargetPlatform targetPlatform) {
 
@@ -143,7 +145,7 @@ public class Orchestrator implements OrchestratorPort {
         analysis.analyze();
         if (!noCompile) {
             try (RuntimeClasspath runtimeClasspath = RuntimeClasspath.create(path, resolver.getScannedJars(),
-                    GeneratedOutputDirectory.resolve().resolve(".jnative-spool"))) {
+                    Paths.get("target", "generated-jnative", ".jnative-spool"))) {
                 Map<String, byte[]> cglibClasses =
                     CglibPregenerator.generate(runtimeClasspath.entries(), analysis.annotatedApplicationClasses());
                 if (!cglibClasses.isEmpty()) {
@@ -388,7 +390,7 @@ public class Orchestrator implements OrchestratorPort {
         llvmGen.setEmbeddedResources(embedded);
         llvmGen.setTargetPlatform(targetPlatform);
 
-        Path genDir = GeneratedOutputDirectory.resolve();
+        Path genDir = Paths.get("target", "generated-jnative");
         try {
             if (Files.exists(genDir)) {
                 // A separate compiler process may still own a workspace here.
@@ -428,7 +430,7 @@ public class Orchestrator implements OrchestratorPort {
                 : defaultOutputPath(path, targetPlatform);
             try {
                 compiler.compileAndLink(llPaths, exePath, usedSystemClasses, module,
-                        resolver, effectiveCores, optimizationLevel, targetPlatform);
+                        resolver, effectiveCores, optimizationLevel, ltoMode, targetPlatform);
                 System.out.println("Native executable built successfully: "
                         + exePath.toAbsolutePath());
                 System.out.println("  target triple: " + targetPlatform.triple());
