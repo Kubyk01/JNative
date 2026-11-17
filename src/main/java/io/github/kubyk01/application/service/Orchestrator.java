@@ -3,6 +3,7 @@ package io.github.kubyk01.application.service;
 import io.github.kubyk01.application.service.analyzer.Analyzer;
 import io.github.kubyk01.application.service.analyzer.dependencyresolver.DependencyResolver;
 import io.github.kubyk01.application.service.analyzer.classanalysis.ClassAnalysis;
+import io.github.kubyk01.application.service.analyzer.reachabilityanalysis.ReachabilityAnalysis;
 import io.github.kubyk01.application.service.analyzer.ssa.BytecodeToIr;
 import io.github.kubyk01.application.service.analyzer.ssa.OutOfSsaPass;
 import io.github.kubyk01.application.service.analyzer.ssa.SSATransformer;
@@ -11,6 +12,7 @@ import io.github.kubyk01.application.service.codegen.NativeOverrideScanner;
 import io.github.kubyk01.application.service.codegen.ResourceEmbedder;
 import io.github.kubyk01.application.service.codegen.llvm.LlvmGenerator;
 import io.github.kubyk01.application.service.analyzer.classanalysis.annotation.cglib.CglibPregenerator;
+import io.github.kubyk01.application.service.compiler.Compiler;
 import io.github.kubyk01.application.service.compiler.RuntimeClasspath;
 import io.github.kubyk01.application.service.compiler.TargetJdk;
 import io.github.kubyk01.application.service.codegen.llvm.nativepolymorphicfunctionresolver.PolymorphicResolver;
@@ -42,9 +44,12 @@ import reactor.core.scheduler.Scheduler;
 import reactor.core.scheduler.Schedulers;
 
 import java.io.IOException;
+import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.SimpleFileVisitor;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashSet;
@@ -74,6 +79,8 @@ public class Orchestrator implements OrchestratorPort {
                         boolean showEscape,
                         boolean showLifetime,
                         boolean showDestructor,
+                        boolean enableReachability,
+                        boolean showReachability,
                         String outputFile,
                         boolean noCompile,
                         boolean includeSystem,
@@ -101,6 +108,7 @@ public class Orchestrator implements OrchestratorPort {
         try {
             runAnalysis(path, entryClass, entryMethod, entryDescriptor,
                     showClasses, showAlias, showEscape, showLifetime, showDestructor,
+                    enableReachability, showReachability,
                     outputFile, noCompile, includeSystem, debugName,
                     effectiveCores, optimizationLevel, ltoMode, scheduler, targetPlatform);
         } finally {
@@ -117,6 +125,8 @@ public class Orchestrator implements OrchestratorPort {
                              boolean showEscape,
                              boolean showLifetime,
                              boolean showDestructor,
+                             boolean enableReachability,
+                             boolean showReachability,
                              String outputFile,
                              boolean noCompile,
                              boolean includeSystem,
@@ -139,6 +149,16 @@ public class Orchestrator implements OrchestratorPort {
             return;
         }
         System.out.println("Parsed classes: " + resolver.getAllClasses().size());
+
+        if (enableReachability || showReachability) {
+            ReachabilityAnalysis reachability = new ReachabilityAnalysis(resolver);
+            reachability.setScheduler(scheduler);
+            reachability.analyzeFromEntry(entryClass, entryMethod, entryDescriptor);
+            reachability.applyMetadata(resolver.getReachabilityMetadata());
+            if (showReachability) {
+                printReachability(reachability, includeSystem, debugName);
+            }
+        }
 
         // --- 2. Class analysis --------------------------------------------
         ClassAnalysis analysis = new ClassAnalysis(resolver);
@@ -390,21 +410,57 @@ public class Orchestrator implements OrchestratorPort {
         llvmGen.setEmbeddedResources(embedded);
         llvmGen.setTargetPlatform(targetPlatform);
 
-        Path genDir = Paths.get("target", "generated-jnative");
+        Path genDir = Paths.get("target", "generated-jnative")
+                .toAbsolutePath().normalize();
+        Path thinLtoCacheRoot = Compiler.thinLtoCacheRoot();
+        Path compilerTempDir = genDir.resolve(".temp");
+        boolean preserveThinLtoCache = thinLtoCacheRoot.startsWith(genDir)
+                && !thinLtoCacheRoot.equals(genDir);
         try {
             if (Files.exists(genDir)) {
                 // A separate compiler process may still own a workspace here.
-                Path compilerTempDir = genDir.resolve(".temp");
-                try (var stream = Files.walk(genDir)) {
-                    stream.filter(p -> !p.equals(genDir) && !p.startsWith(compilerTempDir))
-                          .sorted(Comparator.reverseOrder()).forEach(p -> {
-                        try {
-                            Files.deleteIfExists(p);
-                        } catch (IOException ex) {
-                            log.warn("Could not delete stale generated file {}", p, ex);
+                Files.walkFileTree(genDir, new SimpleFileVisitor<>() {
+                    @Override
+                    public FileVisitResult preVisitDirectory(Path directory,
+                                                              BasicFileAttributes attributes) {
+                        if (!directory.equals(genDir)
+                                && (directory.startsWith(compilerTempDir)
+                                || (preserveThinLtoCache
+                                && directory.startsWith(thinLtoCacheRoot)))) {
+                            return FileVisitResult.SKIP_SUBTREE;
                         }
-                    });
-                }
+                        return FileVisitResult.CONTINUE;
+                    }
+
+                    @Override
+                    public FileVisitResult visitFile(Path file,
+                                                     BasicFileAttributes attributes) {
+                        try {
+                            Files.deleteIfExists(file);
+                        } catch (IOException ex) {
+                            log.warn("Could not delete stale generated file {}", file, ex);
+                        }
+                        return FileVisitResult.CONTINUE;
+                    }
+
+                    @Override
+                    public FileVisitResult postVisitDirectory(Path directory,
+                                                              IOException exception) throws IOException {
+                        if (exception != null) throw exception;
+                        boolean protectedDirectory = directory.startsWith(compilerTempDir)
+                                || (preserveThinLtoCache
+                                && (directory.startsWith(thinLtoCacheRoot)
+                                || thinLtoCacheRoot.startsWith(directory)));
+                        if (!directory.equals(genDir) && !protectedDirectory) {
+                            try {
+                                Files.deleteIfExists(directory);
+                            } catch (IOException ex) {
+                                log.warn("Could not delete stale generated directory {}", directory, ex);
+                            }
+                        }
+                        return FileVisitResult.CONTINUE;
+                    }
+                });
             }
             llvmGen.generate(genDir);
         } catch (IOException e) {
@@ -413,10 +469,28 @@ public class Orchestrator implements OrchestratorPort {
         }
 
         List<Path> llPaths = new ArrayList<>();
-        try (var stream = Files.walk(genDir)) {
-            stream.filter(p -> p.toString().endsWith(".ll"))
-                  .sorted()
-                  .forEach(llPaths::add);
+        try {
+            Files.walkFileTree(genDir, new SimpleFileVisitor<>() {
+                @Override
+                public FileVisitResult preVisitDirectory(Path directory,
+                                                          BasicFileAttributes attributes) {
+                    if (!directory.equals(genDir)
+                            && (directory.startsWith(compilerTempDir)
+                            || (preserveThinLtoCache
+                            && directory.startsWith(thinLtoCacheRoot)))) {
+                        return FileVisitResult.SKIP_SUBTREE;
+                    }
+                    return FileVisitResult.CONTINUE;
+                }
+
+                @Override
+                public FileVisitResult visitFile(Path file,
+                                                 BasicFileAttributes attributes) {
+                    if (file.toString().endsWith(".ll")) llPaths.add(file);
+                    return FileVisitResult.CONTINUE;
+                }
+            });
+            llPaths.sort(Comparator.naturalOrder());
         } catch (IOException e) {
             log.error("Failed to enumerate generated IR files under {}", genDir, e);
             return;
@@ -445,6 +519,30 @@ public class Orchestrator implements OrchestratorPort {
         } else {
             System.out.println("Skipping native compilation (--no-compile specified)");
         }
+    }
+
+    private void printReachability(ReachabilityAnalysis reachability,
+                                   boolean includeSystem,
+                                   String debugName) {
+        Set<String> classes = reachability.getReachableClasses().stream()
+                .filter(cls -> includeSystem || !LlvmUtil.isSystemClassName(cls))
+                .filter(cls -> matchesDebug(debugName, cls))
+                .collect(Collectors.toSet());
+        Set<MethodReference> methods = reachability.getReachableMethods().stream()
+                .filter(method -> includeSystem
+                        || !LlvmUtil.isSystemClassName(method.getOwner() + "." + method.getName()))
+                .filter(method -> matchesDebug(debugName, method.getOwner())
+                        || matchesDebug(debugName, method.getName()))
+                .collect(Collectors.toSet());
+
+        System.out.println("\n--- Reachability Analysis ---");
+        System.out.println("Reachable classes (" + classes.size() + "):");
+        classes.stream().sorted().forEach(cls -> System.out.println("  " + cls));
+        System.out.println("Reachable methods (" + methods.size() + "):");
+        methods.stream().sorted(Comparator.comparing(MethodReference::getOwner)
+                        .thenComparing(MethodReference::getName)
+                        .thenComparing(MethodReference::getDescriptor))
+                .forEach(method -> System.out.println("  " + method));
     }
 
     // =====================================================================

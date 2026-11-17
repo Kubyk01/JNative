@@ -15,6 +15,8 @@ public interface OrchestratorPort {
                  boolean showEscape,
                  boolean showLifetime,
                  boolean showDestructor,
+                 boolean enableReachability,
+                 boolean showReachability,
                  String outputFile,
                  boolean noCompile,
                  boolean includeSystem,

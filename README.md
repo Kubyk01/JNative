@@ -115,14 +115,18 @@ Generated IR goes in `target/generated-jnative`, relative to the current working
 | `--escape` | Show per-site escape status. |
 | `--lifetime` | Show destruction points. |
 | `--destructor` | Show destructor insertion. |
-| `--all` | Equivalent to `--classes --alias --escape --lifetime --destructor`. |
+| `--reachability` | Show classes and methods reachable from the selected entry point. |
+| `--reachability-enable` | Run reachability analysis without showing its results. |
+| `--all` | Equivalent to `--classes --alias --escape --lifetime --destructor --reachability`. |
 | `--debug-name` | Restrict analysis output to items whose names contain this substring. |
-| `--cores` | Maximum CPU cores. `0` (default) uses `Runtime.availableProcessors()`. Controls parallel analysis and compilation; linker workers are also capped automatically by free system memory. |
+| `--cores` | Maximum CPU cores. `0` (default) uses `Runtime.availableProcessors()`. Controls parallel analysis, compilation, and linking. |
 | `-O` | Optimization level `0`–`3` (default: `2`), applied during compilation and explicitly to ThinLTO optimization. `-O0` disables LTO during both compilation and linking. |
 | `--target` | LLVM target triple; auto-detected from the build host if omitted. |
 | `--data-layout` | Override the data layout derived from `--target`. |
 
-Linker parallelism is chosen automatically immediately before linking, after compilation finishes. JNative reads free physical memory from the operating system, reserves the larger of 1 GiB or 25% of that memory, and budgets 2 GiB per worker from the remainder. The worker count is at least one and never exceeds `--cores`; if memory information is unavailable, it uses one worker. The build prints the selected count and available memory. These are conservative estimates, not a guarantee against out-of-memory failures for unusually large modules or changing system load.
+Linker parallelism follows `--cores` (or `Runtime.availableProcessors()` when `--cores` is `0`); the build prints the selected worker count before linking. Keep `--cores` low if the linker runs out of memory on large LTO builds.
+
+ThinLTO links use a persistent LLD cache. By default, its root is `target/generated-jnative/.jnative-thinlto-cache`, which JNative preserves while clearing generated output. The root contains separate entries for each target triple and compiler identity. Set the JVM property `-Djnative.thinLtoCacheDir=<path>` before `-jar` to choose another cache root. LLD prunes the cache on links using `cache_size=25%` by default; set `-Djnative.thinLtoCachePolicy=<policy>` to use another [LLD cache policy](https://clang.llvm.org/docs/ThinLTO.html#cache-pruning). These settings apply to ThinLTO links only.
 
 For Windows MSVC targets, JNative passes the worker count directly to `lld-link` through `/threads:N` and `/opt:lldltojobs=N`, and the LTO optimization level through `/opt:lldlto=N`. This avoids relying on Clang to forward `-flto-jobs` or `-O` to the MSVC linker; see [LLVM's ThinLTO parallelism documentation](https://clang.llvm.org/docs/ThinLTO.html#controlling-backend-parallelism). Java's `-Xmx` limits the JNative JVM heap; it does not set the separate LLVM linker's memory budget.
 

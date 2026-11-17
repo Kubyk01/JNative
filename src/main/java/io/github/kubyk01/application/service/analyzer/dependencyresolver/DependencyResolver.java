@@ -1,12 +1,12 @@
 package io.github.kubyk01.application.service.analyzer.dependencyresolver;
 
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
+import io.github.kubyk01.application.service.analyzer.reachabilityanalysis.ReachabilityMetadataParser;
 import io.github.kubyk01.application.service.analyzer.ssa.TypeResolver;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.ClassNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.FieldNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.MethodParameterInfo;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.MethodNode;
+import io.github.kubyk01.domain.analyzer.reachability.ReachabilityMetadata;
 import io.github.kubyk01.domain.ir.Type;
 import io.github.kubyk01.util.JImage;
 import lombok.Getter;
@@ -96,6 +96,9 @@ public class DependencyResolver {
 
     @Getter
     private final List<List<String>> proxyInterfaces = new java.util.concurrent.CopyOnWriteArrayList<>();
+
+    @Getter
+    private final ReachabilityMetadata reachabilityMetadata = ReachabilityMetadata.builder().build();
 
     private JImage jdkImage;
 
@@ -643,12 +646,12 @@ public class DependencyResolver {
 
     private void parseMetadataStream(InputStream is, String fileName) {
         try {
-            JsonNode root = new ObjectMapper().readTree(is.readAllBytes());
-            for (JsonNode node : root.isObject() ? root.path("proxyInterfaces") : root) {
-                if (node.has("name") || !node.path("interfaces").isArray()) continue;
-                List<String> interfaces = new ArrayList<>();
-                node.get("interfaces").forEach(i -> interfaces.add(i.asText()));
-                if (!interfaces.isEmpty()) proxyInterfaces.add(interfaces);
+            ReachabilityMetadata metadata = ReachabilityMetadataParser.parse(is, fileName);
+            reachabilityMetadata.merge(metadata);
+            for (ReachabilityMetadata.ProxyInterface proxy : metadata.getProxyInterfaces()) {
+                if (!proxy.getInterfaces().isEmpty()) {
+                    proxyInterfaces.add(new ArrayList<>(proxy.getInterfaces()));
+                }
             }
         } catch (Exception e) {
             log.warn("Failed to parse metadata stream: {}", fileName, e);

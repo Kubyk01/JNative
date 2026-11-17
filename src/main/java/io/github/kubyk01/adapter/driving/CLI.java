@@ -114,8 +114,14 @@ public class CLI implements Runnable {
             description = "Show lifetime analysis") boolean showLifetime,
         @CommandLine.Option(names = "--destructor",
             description = "Show destructor insertion") boolean showDestructor,
+        @CommandLine.Option(names = "--reachability",
+            description = "Show reachable classes and methods from the entry point")
+        boolean showReachability,
+        @CommandLine.Option(names = "--reachability-enable",
+            description = "Run reachability analysis without showing its results")
+        boolean enableReachability,
         @CommandLine.Option(names = "--all",
-            description = "Show all analysis stages (default if none specified)")
+            description = "Show all analysis stages, including reachability")
         boolean showAll,
         @CommandLine.Option(names = "--output",
             description = "Output executable file name. When omitted, the executable "
@@ -134,8 +140,7 @@ public class CLI implements Runnable {
         @CommandLine.Option(names = "--cores",
             description = "Maximum number of CPU cores this run may use. "
                 + "A value of 0 (the default) means: use every core "
-                + "reported by Runtime.getRuntime().availableProcessors(). "
-                + "Linker workers are additionally limited automatically by free system memory.")
+                + "reported by Runtime.getRuntime().availableProcessors().")
         int cores,
         @CommandLine.Option(names = "--target",
             description = "LLVM target triple. Determines the target triple "
@@ -197,7 +202,10 @@ public class CLI implements Runnable {
 
         if (showAll) {
             showClasses = showAlias = showEscape = showLifetime = showDestructor = true;
+            showReachability = true;
+            enableReachability = true;
         }
+        if (showReachability) enableReachability = true;
 
         // Resolve the target platform from the two optional overrides and
         // the build host. The result is a self-consistent (triple,
@@ -218,6 +226,7 @@ public class CLI implements Runnable {
         Path path = file.toPath();
         orchestrator.analyze(path, entryClass, entryMethod, descriptor,
             showClasses, showAlias, showEscape, showLifetime, showDestructor,
+            enableReachability, showReachability,
             outputFile, noCompile, includeSystem, debugName,
             cores, optimizationLevel, ltoMode, platform);
     }

@@ -15,12 +15,13 @@ import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
-import java.lang.management.ManagementFactory;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -50,11 +51,13 @@ public class Compiler implements CompilerPort {
             PORTABILITY_DIR + "jnative_portability_windows.c";
     private static final String NATIVE_BASE_PATH = "jnative/";
     private static final String BUILD_ROOT_NAME = "jnative_build_";
+    private static final String THIN_LTO_CACHE_DIR_PROPERTY = "jnative.thinLtoCacheDir";
+    private static final String THIN_LTO_CACHE_POLICY_PROPERTY = "jnative.thinLtoCachePolicy";
+    private static final String DEFAULT_THIN_LTO_CACHE_POLICY = "cache_size=25%";
 
     private static final int MIN_OPT_LEVEL = 0;
     private static final int MAX_OPT_LEVEL = 3;
-    private static final long GIB = 1L << 30;
-    private static final long ESTIMATED_LINK_WORKER_BYTES = 2 * GIB;
+
 
    // Todo remove hard-coded ways
     private static final String[] MINGW_ROOT_CANDIDATES_POSIX = {
@@ -113,6 +116,7 @@ public class Compiler implements CompilerPort {
         final int effectiveOptLevel = clampOptLevel(optimizationLevel);
         final String ltoFlag = resolveLtoFlag(ltoMode);
         final boolean ltoEnabled = !"-fno-lto".equals(ltoFlag);
+        final boolean thinLtoEnabled = "-flto=thin".equals(ltoFlag);
         final TargetPlatform target = (targetPlatform != null)
                 ? targetPlatform
                 : TargetPlatform.detectFromBuildHost();
@@ -123,6 +127,10 @@ public class Compiler implements CompilerPort {
                      resolver.getInputPath(), resolver.getScannedJars(), workspace.path())) {
             Path tempDir = workspace.path();
             String compiler = detectCompiler(target);
+            Path thinLtoCacheDir = thinLtoEnabled
+                    ? resolveThinLtoCacheDir(compiler, target) : null;
+            String thinLtoCachePolicy = thinLtoEnabled
+                    ? resolveThinLtoCachePolicy() : null;
 
             MsvcToolchain msvcToolchain = null;
             String sysroot = null;
@@ -340,18 +348,18 @@ public class Compiler implements CompilerPort {
 
             appendLinkerLibraries(linkCmd, target);
 
-            // Sample after compilation and link-input preparation, when the
-            // compiler subprocesses have exited and released their memory.
-            long freeMemoryBytes = freeSystemMemoryBytes();
-            int effectiveLinkJobs = automaticLinkJobs(effectiveCores, freeMemoryBytes);
+            int effectiveLinkJobs = Math.max(1, effectiveCores);
+            if (thinLtoEnabled) {
+                Files.createDirectories(thinLtoCacheDir);
+                appendThinLtoCacheOptions(linkCmd, msvcLinker, target,
+                        thinLtoCacheDir, thinLtoCachePolicy);
+            }
             linkCmd.addAll(linkerOptimizationFlags(msvcLinker, effectiveOptLevel,
                     effectiveLinkJobs, ltoFlag));
             System.out.println("Linking for target " + target.triple() + " using "
                     + effectiveLinkJobs + " worker(s) ("
                     + (ltoEnabled ? ltoFlag + " -O" + effectiveOptLevel : "LTO disabled")
-                    + "; " + (freeMemoryBytes >= 0
-                    ? String.format(Locale.ROOT, "%.1f GiB free system memory", (double) freeMemoryBytes / GIB)
-                    : "free system memory unavailable; using one worker") + ")...");
+                    + ")...");
             log.debug("Link command: {}", linkCmd);
             ProcessBuilder linkBuilder = new ProcessBuilder(linkCmd);
             linkBuilder.inheritIO();
@@ -1097,40 +1105,101 @@ public class Compiler implements CompilerPort {
     }
 
     // =====================================================================
-    //  Optimization and linker memory budget
+    //  Optimization flags
     // =====================================================================
 
     private static int clampOptLevel(int level) {
         return Math.max(MIN_OPT_LEVEL, Math.min(level, MAX_OPT_LEVEL));
     }
 
-    private static long freeSystemMemoryBytes() {
-        try {
-            if (ManagementFactory.getOperatingSystemMXBean()
-                    instanceof com.sun.management.OperatingSystemMXBean os) {
-                return os.getFreeMemorySize();
-            }
-        } catch (UnsupportedOperationException | SecurityException e) {
-            log.debug("Cannot read free system memory; limiting linker to one worker", e);
-        }
-        return -1;
-    }
-
-    private static int automaticLinkJobs(int cores, long freeMemoryBytes) {
-        if (freeMemoryBytes <= 0) return 1;
-        // Reserve at least 1 GiB (or 25% of available RAM) for the linker
-        // index, JVM growth and other processes. Budget 2 GiB per backend.
-        // This is a conservative estimate, not a hard memory limit: a large
-        // individual IR module can still need more than a worker's budget.
-        long reserve = Math.max(GIB, freeMemoryBytes / 4);
-        long workerBudget = Math.max(0, freeMemoryBytes - reserve);
-        return (int) Math.max(1, Math.min(Math.max(1, cores),
-                workerBudget / ESTIMATED_LINK_WORKER_BYTES));
-    }
-
     private static String resolveLtoFlag(String ltoMode) {
         if (ltoMode == null || ltoMode.isBlank()) return "-fno-lto";
         return ltoMode.startsWith("-") ? ltoMode : "-flto=" + ltoMode;
+    }
+
+    public static Path thinLtoCacheRoot() {
+        String configuredPath = System.getProperty(THIN_LTO_CACHE_DIR_PROPERTY);
+        Path generatedOutput = Paths.get("target", "generated-jnative")
+                .toAbsolutePath().normalize();
+        Path root = configuredPath == null || configuredPath.isBlank()
+                ? generatedOutput.resolve(".jnative-thinlto-cache")
+                : Paths.get(configuredPath.trim()).toAbsolutePath().normalize();
+        if (root.equals(generatedOutput)
+                || root.startsWith(generatedOutput.resolve(".temp"))) {
+            throw new IllegalArgumentException(THIN_LTO_CACHE_DIR_PROPERTY
+                    + " must not point to the generated-output directory itself or its temporary workspace");
+        }
+        return root;
+    }
+
+    private static Path resolveThinLtoCacheDir(String compiler, TargetPlatform target)
+            throws IOException, InterruptedException {
+        return thinLtoCacheRoot()
+                .resolve(cachePathSegment(target.triple()))
+                .resolve(compilerCacheIdentity(compiler));
+    }
+
+    private static String resolveThinLtoCachePolicy() {
+        String policy = System.getProperty(THIN_LTO_CACHE_POLICY_PROPERTY,
+                DEFAULT_THIN_LTO_CACHE_POLICY).trim();
+        if (policy.isEmpty()) {
+            throw new IllegalArgumentException(THIN_LTO_CACHE_POLICY_PROPERTY
+                    + " must contain a valid LLD ThinLTO cache policy");
+        }
+        return policy;
+    }
+
+    private static String compilerCacheIdentity(String compiler)
+            throws IOException, InterruptedException {
+        Process process = new ProcessBuilder(compiler, "--version")
+                .redirectErrorStream(true)
+                .start();
+        String version;
+        try (InputStream input = process.getInputStream()) {
+            version = new String(input.readAllBytes(), StandardCharsets.UTF_8);
+        }
+        int exit = process.waitFor();
+        if (exit != 0 || version.isBlank()) {
+            throw new IOException("Could not determine compiler identity for ThinLTO cache: "
+                    + compiler);
+        }
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            digest.update(compiler.getBytes(StandardCharsets.UTF_8));
+            digest.update((byte) 0);
+            return HexFormat.of().formatHex(digest.digest(version.getBytes(StandardCharsets.UTF_8)));
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-256 is unavailable", e);
+        }
+    }
+
+    private static String cachePathSegment(String value) {
+        String segment = value.replaceAll("[^A-Za-z0-9._-]", "_");
+        return segment.isBlank() ? "unknown-target" : segment;
+    }
+
+    private static void appendThinLtoCacheOptions(List<String> command,
+                                                   boolean msvcLinker,
+                                                   TargetPlatform target,
+                                                   Path cacheDir,
+                                                   String cachePolicy) {
+        String cachePath = cacheDir.toString().replace('\\', '/');
+        if (msvcLinker) {
+            appendLinkerArgument(command, "/lldltocache:" + cachePath);
+            appendLinkerArgument(command, "/lldltocachepolicy:" + cachePolicy);
+        } else if (target.isDarwin()) {
+            appendLinkerArgument(command, "-cache_path_lto");
+            appendLinkerArgument(command, cachePath);
+            appendLinkerArgument(command, "--thinlto-cache-policy=" + cachePolicy);
+        } else {
+            appendLinkerArgument(command, "--thinlto-cache-dir=" + cachePath);
+            appendLinkerArgument(command, "--thinlto-cache-policy=" + cachePolicy);
+        }
+    }
+
+    private static void appendLinkerArgument(List<String> command, String argument) {
+        command.add("-Xlinker");
+        command.add(argument);
     }
 
     private static List<String> linkerOptimizationFlags(boolean msvc, int optimizationLevel,
