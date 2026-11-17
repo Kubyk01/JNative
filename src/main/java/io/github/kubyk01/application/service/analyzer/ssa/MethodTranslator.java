@@ -804,30 +804,36 @@ public class MethodTranslator extends MethodVisitor {
     @Override
     public void visitLdcInsn(Object value) {
         recordBlockOffset();
-        switch (value) {
-            case Integer i -> handlers.pushInt(i);
-            case Long l -> handlers.pushLong(l);
-            case Float v -> handlers.pushFloat(v);
-            case Double v -> handlers.pushDouble(v);
-            case String ignored -> frame.push(new Constant(Type.reference("java/lang/String"), value));
-            case org.objectweb.asm.Type asmType -> {
-                int sort = asmType.getSort();
-                if (sort == org.objectweb.asm.Type.OBJECT) {
-                    String internalName = asmType.getInternalName();
-                    lastLoadedClass = internalName;
-                    if (isClassMirrorAvailable(internalName)) {
-                        frame.push(new Constant(Type.reference("java/lang/Class"), internalName));
-                    } else {
-                        emitClassLiteralForMissingClass(internalName);
-                    }
-                } else if (sort == org.objectweb.asm.Type.ARRAY) {
-                    frame.push(new Constant(Type.reference("java/lang/Class"),
-                        asmType.getDescriptor()));
+        // Keep as instanceof chain: javac emits an invokedynamic type switch
+        // for pattern switches, which JNative cannot translate yet.
+        if (value instanceof Integer i) {
+            handlers.pushInt(i);
+        } else if (value instanceof Long l) {
+            handlers.pushLong(l);
+        } else if (value instanceof Float v) {
+            handlers.pushFloat(v);
+        } else if (value instanceof Double v) {
+            handlers.pushDouble(v);
+        } else if (value instanceof String) {
+            frame.push(new Constant(Type.reference("java/lang/String"), value));
+        } else if (value instanceof org.objectweb.asm.Type asmType) {
+            int sort = asmType.getSort();
+            if (sort == org.objectweb.asm.Type.OBJECT) {
+                String internalName = asmType.getInternalName();
+                lastLoadedClass = internalName;
+                if (isClassMirrorAvailable(internalName)) {
+                    frame.push(new Constant(Type.reference("java/lang/Class"), internalName));
                 } else {
-                    frame.push(new Constant(Type.NULL, null));
+                    emitClassLiteralForMissingClass(internalName);
                 }
+            } else if (sort == org.objectweb.asm.Type.ARRAY) {
+                frame.push(new Constant(Type.reference("java/lang/Class"),
+                    asmType.getDescriptor()));
+            } else {
+                frame.push(new Constant(Type.NULL, null));
             }
-            case null, default -> frame.push(new Constant(Type.UNKNOWN, value));
+        } else {
+            frame.push(new Constant(Type.UNKNOWN, value));
         }
     }
 

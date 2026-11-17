@@ -1880,20 +1880,26 @@ public class MethodBytecodeVisitor extends ClassVisitor {
         }
 
         void visitLdcInsn(Object value) {
-            switch (value) {
-                case Integer ignored -> push(TypedValue.fromConstant(INT, value));
-                case Long ignored -> push(TypedValue.fromConstant(LONG, value));
-                case Float ignored -> push(TypedValue.fromConstant(FLOAT, value));
-                case Double ignored -> push(TypedValue.fromConstant(DOUBLE, value));
-                case String ignored -> push(TypedValue.fromConstant(reference("java/lang/String"), value));
-                case org.objectweb.asm.Type asmType -> {
-                    if (asmType.getSort() == org.objectweb.asm.Type.OBJECT) {
-                        push(TypedValue.fromConstant(reference(asmType.getInternalName()), asmType.getInternalName()));
-                    } else {
-                        push(TypedValue.fromConstant(fromDescriptor(asmType.getDescriptor()), asmType.getDescriptor()));
-                    }
+            // Keep as instanceof chain: javac emits an invokedynamic type switch
+            // for pattern switches, which JNative cannot translate yet.
+            if (value instanceof Integer) {
+                push(TypedValue.fromConstant(INT, value));
+            } else if (value instanceof Long) {
+                push(TypedValue.fromConstant(LONG, value));
+            } else if (value instanceof Float) {
+                push(TypedValue.fromConstant(FLOAT, value));
+            } else if (value instanceof Double) {
+                push(TypedValue.fromConstant(DOUBLE, value));
+            } else if (value instanceof String) {
+                push(TypedValue.fromConstant(reference("java/lang/String"), value));
+            } else if (value instanceof org.objectweb.asm.Type asmType) {
+                if (asmType.getSort() == org.objectweb.asm.Type.OBJECT) {
+                    push(TypedValue.fromConstant(reference(asmType.getInternalName()), asmType.getInternalName()));
+                } else {
+                    push(TypedValue.fromConstant(fromDescriptor(asmType.getDescriptor()), asmType.getDescriptor()));
                 }
-                case null, default -> push(TypedValue.UNKNOWN);
+            } else {
+                push(TypedValue.UNKNOWN);
             }
         }
 

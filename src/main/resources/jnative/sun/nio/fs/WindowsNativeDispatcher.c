@@ -106,6 +106,25 @@ JNATIVE_NORETURN static void wnd_throw(DWORD last_error) {
     }
     char buf[96];
     snprintf(buf, sizeof(buf), "WindowsException (error %lu)", (unsigned long)last_error);
+
+    /* Mirror sun.nio.fs.WindowsException.translateToIOException: the JDK's
+       createDirectories/createTempDirectory only recover from these subtypes. */
+    const char* vtable;
+    switch (last_error) {
+        case ERROR_FILE_NOT_FOUND:
+        case ERROR_PATH_NOT_FOUND:
+            vtable = "vtable_java_nio_file_NoSuchFileException"; break;
+        case ERROR_FILE_EXISTS:
+        case ERROR_ALREADY_EXISTS:
+            vtable = "vtable_java_nio_file_FileAlreadyExistsException"; break;
+        case ERROR_ACCESS_DENIED:
+            vtable = "vtable_java_nio_file_AccessDeniedException"; break;
+        default:
+            vtable = "vtable_java_nio_file_FileSystemException"; break;
+    }
+    void* typed = __jnative_construct_exception(vtable, buf);
+    if (typed != NULL) __jnative_throw_exception_ctx(typed, "WindowsNativeDispatcher");
+
     __jnative_throw_io_ctx(buf, "WindowsNativeDispatcher");
 }
 
