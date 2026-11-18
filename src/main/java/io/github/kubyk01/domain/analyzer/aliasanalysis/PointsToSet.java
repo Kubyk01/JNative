@@ -2,7 +2,6 @@ package io.github.kubyk01.domain.analyzer.aliasanalysis;
 
 import java.lang.ref.WeakReference;
 import java.util.AbstractSet;
-import java.util.WeakHashMap;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Iterator;
@@ -13,45 +12,116 @@ public final class PointsToSet extends AbstractSet<AllocationSite> {
 
     private static final int[] NO_IDS = new int[0];
 
-    @SuppressWarnings("unchecked")
-    private static final WeakHashMap<PointsToSet, WeakReference<PointsToSet>>[] INTERNED = new WeakHashMap[256];
-
-    static {
-        for (int i = 0; i < INTERNED.length; i++) INTERNED[i] = new WeakHashMap<>();
+    private static final class Stripe {
+        @SuppressWarnings("unchecked")
+        WeakReference<PointsToSet>[] refs = new WeakReference[64];
+        int[] keys = new int[64];
+        int used;
     }
 
-    private static PointsToSet intern(PointsToSet s) {
-        if (s.ids.length < 2) return s;
-        int h = s.hashCode();
-        WeakHashMap<PointsToSet, WeakReference<PointsToSet>> stripe = INTERNED[(h ^ (h >>> 16)) & 255];
+    private static final Stripe[] INTERNED = new Stripe[256];
+
+    static {
+        for (int i = 0; i < INTERNED.length; i++) INTERNED[i] = new Stripe();
+    }
+
+    private static final ThreadLocal<int[][]> SCRATCH = ThreadLocal.withInitial(() -> new int[][]{new int[256]});
+
+    static int[] scratch(int capacity) {
+        int[][] holder = SCRATCH.get();
+        if (holder[0].length < capacity) holder[0] = new int[Math.max(capacity, holder[0].length << 1)];
+        return holder[0];
+    }
+
+    private static int keyOf(int[] a, int n) {
+        int h = n;
+        for (int i = 0; i < n; i++) h = h * 0x9E3779B1 + a[i];
+        return h ^ (h >>> 15);
+    }
+
+    private static boolean sameIds(int[] ids, int[] a, int n) {
+        if (ids.length != n) return false;
+        for (int i = 0; i < n; i++) {
+            if (ids[i] != a[i]) return false;
+        }
+        return true;
+    }
+
+    static PointsToSet intern(int[] a, int n, boolean owned) {
+        if (n == 0) return EMPTY;
+        if (n == 1) return AllocationSite.byId(a[0]).singleton();
+        int key = keyOf(a, n);
+        Stripe stripe = INTERNED[key & 255];
         synchronized (stripe) {
-            WeakReference<PointsToSet> ref = stripe.get(s);
-            PointsToSet existing = ref == null ? null : ref.get();
-            if (existing != null) return existing;
-            stripe.put(s, new WeakReference<>(s));
-            return s;
+            WeakReference<PointsToSet>[] refs = stripe.refs;
+            int[] keys = stripe.keys;
+            int mask = refs.length - 1;
+            int i = (key >>> 8) & mask;
+            int free = -1;
+            for (WeakReference<PointsToSet> r; (r = refs[i]) != null; i = (i + 1) & mask) {
+                PointsToSet e = r.get();
+                if (e == null) {
+                    if (free < 0) free = i;
+                } else if (keys[i] == key && sameIds(e.ids, a, n)) {
+                    return e;
+                }
+            }
+            PointsToSet created = new PointsToSet(owned && a.length == n ? a : Arrays.copyOf(a, n), key);
+            int slot = free >= 0 ? free : i;
+            refs[slot] = new WeakReference<>(created);
+            keys[slot] = key;
+            if (free < 0 && ++stripe.used * 2 > refs.length) rehash(stripe);
+            return created;
         }
     }
 
-    public static final PointsToSet EMPTY = new PointsToSet(NO_IDS);
+    @SuppressWarnings("unchecked")
+    private static void rehash(Stripe stripe) {
+        WeakReference<PointsToSet>[] old = stripe.refs;
+        int[] oldKeys = stripe.keys;
+        int live = 0;
+        for (WeakReference<PointsToSet> r : old) {
+            if (r != null && r.get() != null) live++;
+        }
+        int capacity = Math.max(64, Integer.highestOneBit(Math.max(1, live) * 4));
+        WeakReference<PointsToSet>[] refs = new WeakReference[capacity];
+        int[] keys = new int[capacity];
+        int mask = capacity - 1;
+        for (int j = 0; j < old.length; j++) {
+            WeakReference<PointsToSet> r = old[j];
+            if (r == null || r.get() == null) continue;
+            int i = (oldKeys[j] >>> 8) & mask;
+            while (refs[i] != null) i = (i + 1) & mask;
+            refs[i] = r;
+            keys[i] = oldKeys[j];
+        }
+        stripe.refs = refs;
+        stripe.keys = keys;
+        stripe.used = live;
+    }
+
+    public static final PointsToSet EMPTY = new PointsToSet(NO_IDS, 0);
 
     private final int[] ids;
+    private final int key;
     private int hash;
 
-    private PointsToSet(int[] ids) {
+    private PointsToSet(int[] ids, int key) {
         this.ids = ids;
+        this.key = key;
     }
 
     public static PointsToSet empty() { return EMPTY; }
 
     public static PointsToSet ofSortedUnique(int[] ids) {
-        return ids.length == 0 ? EMPTY : intern(new PointsToSet(ids));
+        if (ids.length == 1) return new PointsToSet(ids, keyOf(ids, 1));
+        return intern(ids, ids.length, true);
     }
 
     public static PointsToSet copyOf(Collection<AllocationSite> sites) {
         if (sites == null || sites.isEmpty()) return EMPTY;
         if (sites instanceof PointsToSet pts) return pts;
-        int[] a = new int[sites.size()];
+        int[] a = scratch(sites.size());
         int n = 0;
         for (AllocationSite s : sites) a[n++] = s.getId();
         Arrays.sort(a, 0, n);
@@ -59,8 +129,7 @@ public final class PointsToSet extends AbstractSet<AllocationSite> {
         for (int i = 0; i < n; i++) {
             if (w == 0 || a[w - 1] != a[i]) a[w++] = a[i];
         }
-        if (w == 1) return AllocationSite.byId(a[0]).singleton();
-        return intern(new PointsToSet(w == a.length ? a : Arrays.copyOf(a, w)));
+        return intern(a, w, false);
     }
 
     public int[] rawIds() { return ids; }
@@ -128,20 +197,20 @@ public final class PointsToSet extends AbstractSet<AllocationSite> {
         if (a == null || a.isEmpty()) return b;
         int[] x = a.ids, y = b.ids;
         int nx = x.length, ny = y.length;
-        if (x[nx - 1] < y[0]) return intern(new PointsToSet(concat(x, y)));
-        if (y[ny - 1] < x[0]) return intern(new PointsToSet(concat(y, x)));
         int i = 0, j = 0, n = 0;
-        while (i < nx && j < ny) {
-            int u = x[i], v = y[j];
-            if (u == v) { i++; j++; }
-            else if (u < v) i++;
-            else j++;
-            n++;
+        if (x[nx - 1] >= y[0] && y[ny - 1] >= x[0]) {
+            while (i < nx && j < ny) {
+                int u = x[i], v = y[j];
+                if (u == v) { i++; j++; }
+                else if (u < v) i++;
+                else j++;
+                n++;
+            }
         }
         n += (nx - i) + (ny - j);
         if (n == nx) return a;
         if (n == ny) return b;
-        int[] out = new int[n];
+        int[] out = scratch(n);
         i = 0; j = 0;
         int k = 0;
         while (i < nx && j < ny) {
@@ -152,13 +221,7 @@ public final class PointsToSet extends AbstractSet<AllocationSite> {
         }
         while (i < nx) out[k++] = x[i++];
         while (j < ny) out[k++] = y[j++];
-        return intern(new PointsToSet(out));
-    }
-
-    private static int[] concat(int[] lo, int[] hi) {
-        int[] out = Arrays.copyOf(lo, lo.length + hi.length);
-        System.arraycopy(hi, 0, out, lo.length, hi.length);
-        return out;
+        return intern(out, n, false);
     }
 
     public Set<AllocationSite> getSites() { return this; }

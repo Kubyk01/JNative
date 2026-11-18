@@ -142,6 +142,14 @@ public class DestructorInserter {
 
             AllocationSite site = entry.getKey();
 
+            if (lifetimeResult.getShallowSites().contains(site)) {
+                for (DestructionPoint dp : entry.getValue()) {
+                    byFunction.computeIfAbsent(dp.getBlock().getFunction(), k -> new ArrayList<>())
+                        .add(new PendingDestructor(site, dp, null));
+                }
+                continue;
+            }
+
             // STACK objects live in the stack frame; their fields are
             // released through the frame teardown, so a per-use
             // destructor is not needed for them.
@@ -186,7 +194,11 @@ public class DestructorInserter {
                 DestructionPoint dp = p.point();
                 if (!isLiveReference(dp.getObjectRef())) continue;
                 if (!objectRefAvailableAt(dp.getObjectRef(), dp.getBlock())) continue;
-                insertDestructorCall(p.site(), dp, p.dtor());
+                if (p.dtor() == null) {
+                    insertShallowFree(dp);
+                } else {
+                    insertDestructorCall(p.site(), dp, p.dtor());
+                }
             }
             return null;
         });
@@ -2245,6 +2257,20 @@ private void emitDestructionGuard(BasicBlock entry,
             nullOut.setParent(block);
             insts.add(insertIndex + 1, nullOut);
         }
+    }
+
+    private void insertShallowFree(DestructionPoint dp) {
+        BasicBlock block = dp.getBlock();
+        Value objRef = dp.getObjectRef();
+        List<Instruction> insts = block.getInstructions();
+        Instruction before = dp.getBeforeInstruction();
+        int index = before == null ? insts.size() : insts.indexOf(before);
+        if (index < 0) return;
+        if (!noLaterUse(objRef, block, index)) return;
+        Instruction free = new Instruction(Opcode.FREE);
+        free.addOperand(objRef);
+        free.setParent(block);
+        insts.add(index, free);
     }
 
     private static boolean isLiveReference(Value v) {

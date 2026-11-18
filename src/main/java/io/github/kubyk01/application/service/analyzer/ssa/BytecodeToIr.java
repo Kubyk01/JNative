@@ -29,6 +29,7 @@ import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -76,18 +77,26 @@ public class BytecodeToIr {
         //    the module itself is concurrent.
         ThreadLocal<IrBuilder> builders =
             ThreadLocal.withInitial(() -> new IrBuilder(module));
+        Map<String, List<MethodReference>> byOwner = new LinkedHashMap<>();
+        for (MethodReference ref : reachability.getMethods()) {
+            byOwner.computeIfAbsent(ref.getOwner(), k -> new ArrayList<>()).add(ref);
+        }
         LlvmUtil.parallelMapOrdered(
-            new ArrayList<>(reachability.getMethods()), scheduler, ref -> {
-                NativeOverride match = findOverride(ref);
-                if (match != null) {
-                    // Alias every reachable overload onto the single C function.
-                    String key = LlvmRuntime.mangleMethod(
-                        ref.getOwner(), ref.getName(), ref.getDescriptor());
-                    Function target = module.getFunction(match.getCFunctionName());
-                    module.registerAlias(key, target);
-                    return null;
+            new ArrayList<>(byOwner.values()), scheduler, refs -> {
+                List<MethodReference> translatable = new ArrayList<>(refs.size());
+                for (MethodReference ref : refs) {
+                    NativeOverride match = findOverride(ref);
+                    if (match != null) {
+                        // Alias every reachable overload onto the single C function.
+                        String key = LlvmRuntime.mangleMethod(
+                            ref.getOwner(), ref.getName(), ref.getDescriptor());
+                        Function target = module.getFunction(match.getCFunctionName());
+                        module.registerAlias(key, target);
+                    } else {
+                        translatable.add(ref);
+                    }
                 }
-                translateMethod(ref, builders.get());
+                translateMethods(refs.getFirst().getOwner(), translatable, builders.get());
                 return null;
             });
 
@@ -289,12 +298,75 @@ public class BytecodeToIr {
     }
 
     private void translateMethod(MethodReference methodRef, IrBuilder ir) {
+        translateMethods(methodRef.getOwner(), List.of(methodRef), ir);
+    }
+
+    private record PendingMethod(MethodReference ref, boolean isStatic, MethodTranslator translator) {}
+
+    private void translateMethods(String owner, List<MethodReference> refs, IrBuilder ir) {
+        Map<String, PendingMethod> pending = new LinkedHashMap<>();
+        for (MethodReference ref : refs) {
+            PendingMethod p = prepareMethod(ref, ir);
+            if (p != null) pending.putIfAbsent(ref.getName() + ref.getDescriptor(), p);
+        }
+        if (pending.isEmpty()) return;
+
+        byte[] bytes = resolver.getClassBytes(owner);
+        Map<String, Set<Integer>> deadCode = deadCodeMethods
+            .computeIfAbsent(owner, k -> DeadCodeFilter.scan(bytes));
+        MethodTranslator[] current = new MethodTranslator[1];
+        ClassReader reader = new ClassReader(bytes) {
+            @Override
+            protected void readBytecodeInstructionOffset(int bytecodeOffset) {
+                if (current[0] != null) current[0].setCurrentBytecodeOffset(bytecodeOffset);
+            }
+        };
+
+        Map<String, PendingMethod> remaining = new LinkedHashMap<>(pending);
+        Set<String> failed = new HashSet<>();
+        while (!remaining.isEmpty()) {
+            String[] active = new String[1];
+            try {
+                reader.accept(new ClassVisitor(Opcodes.ASM9) {
+                    @Override
+                    public MethodVisitor visitMethod(int access, String mName, String mDesc,
+                                                     String signature, String[] exceptions) {
+                        String key = mName + mDesc;
+                        PendingMethod p = remaining.remove(key);
+                        current[0] = p == null ? null : p.translator();
+                        active[0] = p == null ? null : key;
+                        return p == null ? null : DeadCodeFilter.wrap(p.translator(), deadCode.get(key));
+                    }
+                }, ClassReader.SKIP_DEBUG);
+                break;
+            } catch (Exception e) {
+                String key = active[0];
+                if (key == null) {
+                    log.warn("Failed to read class {}: {}", owner, e.getMessage());
+                    failed.addAll(remaining.keySet());
+                    break;
+                }
+                log.warn("Failed to translate method {}; falling back to external declaration: {}",
+                    pending.get(key).ref(), e.getMessage());
+                failed.add(key);
+            }
+        }
+
+        for (Map.Entry<String, PendingMethod> e : pending.entrySet()) {
+            PendingMethod p = e.getValue();
+            if (failed.contains(e.getKey()) || p.translator().getCurrentFunction() == null) {
+                createExternalFunction(p.ref(), p.isStatic(), ir);
+            }
+        }
+    }
+
+    private PendingMethod prepareMethod(MethodReference methodRef, IrBuilder ir) {
         if ("java/lang/Class".equals(methodRef.getOwner())
             && "getEnumConstantsShared".equals(methodRef.getName())
             && "()[Ljava/lang/Object;".equals(methodRef.getDescriptor())) {
             EnumConstantsSharedEmitter.emit(
                 methodRef, ir, resolver, reachability);
-            return;
+            return null;
         }
 
         MethodNode methodNode = null;
@@ -309,7 +381,7 @@ public class BytecodeToIr {
 
             if (classNode.isExternal()) {
                 createExternalFunction(methodRef, isStatic, ir);
-                return;
+                return null;
             }
 
             if (methodNode != null && methodNode.isNative()) {
@@ -390,7 +462,7 @@ public class BytecodeToIr {
                     ir.getModule().registerAlias(originalMangled, func);
                     ir.getModule().registerAlias("__jnative_" + originalMangled, func);
                 }
-                return;
+                return null;
             }
 
             if (methodNode == null || methodNode.isAbstract()) {
@@ -448,7 +520,7 @@ public class BytecodeToIr {
                         + "stub will be created; any vtable/itable reference "
                         + "will resolve to a diagnostic thunk at emission time",
                     methodRef);
-                return;
+                return null;
             }
 
             byte[] bytes = resolver.getClassBytes(owner);
@@ -467,58 +539,19 @@ public class BytecodeToIr {
                 log.warn("No bytecode for class {}; method {}.{}{} will "
                         + "be skipped (no body emitted)",
                     owner, owner, name, desc);
-                return;
+                return null;
             }
 
             MethodTranslator translator = new MethodTranslator(
                     methodRef, methodNode.isStatic(), ir, resolver);
 
-            // Override readBytecodeInstructionOffset so the translator can
-            // record, for every basic block, the bytecode offset of its
-            // first instruction. MethodTranslator.visitEnd() uses those
-            // offsets to compute each try-range's protected body from the
-            // bytecode interval [start, end) rather than from CFG
-            // reachability. See setCurrentBytecodeOffset / visitEnd() in
-            // MethodTranslator for the full rationale.
-            //
-            // The override is unconditional. On every ASM 9.x release this
-            // runtime targets, ClassReader calls readBytecodeInstructionOffset
-            // for every instruction it dispatches; if a future ASM release
-            // stops calling it, blockOffsets stays empty and MethodTranslator
-            // falls back to the previous reachability-based body, so the
-            // translator remains functional.
-            ClassReader reader = new ClassReader(bytes) {
-                @Override
-                protected void readBytecodeInstructionOffset(int bytecodeOffset) {
-                    translator.setCurrentBytecodeOffset(bytecodeOffset);
-                }
-            };
-
-            byte[] classBytes = bytes;
-            Set<Integer> liveLabels = deadCodeMethods
-                .computeIfAbsent(owner, k -> DeadCodeFilter.scan(classBytes))
-                .get(name + desc);
-            reader.accept(new ClassVisitor(Opcodes.ASM9) {
-                @Override
-                public MethodVisitor visitMethod(int access, String mName, String mDesc,
-                                                 String signature, String[] exceptions) {
-                    if (mName.equals(name) && mDesc.equals(desc)) {
-                        return DeadCodeFilter.wrap(translator, liveLabels);
-                    }
-                    return null;
-                }
-            }, ClassReader.SKIP_DEBUG);
-
-            Function func = translator.getCurrentFunction();
-            if (func != null) {
-            } else {
-                createExternalFunction(methodRef, isStatic, ir);
-            }
+            return new PendingMethod(methodRef, methodNode.isStatic(), translator);
         } catch (Exception e) {
             log.warn("Failed to translate method {}; falling back to external declaration: {}",
                 methodRef, e.getMessage());
             boolean isStatic = methodNode != null && methodNode.isStatic();
             createExternalFunction(methodRef, isStatic, ir);
+            return null;
         }
     }
 

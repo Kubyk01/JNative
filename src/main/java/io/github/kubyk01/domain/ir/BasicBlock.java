@@ -1,9 +1,11 @@
 package io.github.kubyk01.domain.ir;
 
+import lombok.AccessLevel;
 import lombok.Getter;
 import lombok.Setter;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 
 @Getter
@@ -16,6 +18,10 @@ public class BasicBlock {
     private final List<BasicBlock> predecessors = new ArrayList<>();
     private final List<BasicBlock> successors = new ArrayList<>();
     private final List<BasicBlock> exceptionalSuccessors = new ArrayList<>();
+    @Getter(AccessLevel.NONE)
+    private final List<BasicBlock> successorsView = Collections.unmodifiableList(successors);
+    @Getter(AccessLevel.NONE)
+    private List<BasicBlock> mergedSuccessors;
 
     public BasicBlock(String label) {
         this.label = label;
@@ -47,6 +53,7 @@ public class BasicBlock {
     public void addSuccessor(BasicBlock block) {
         if (successors.contains(block)) return;
         successors.add(block);
+        mergedSuccessors = null;
         if (!block.predecessors.contains(this)) {
             block.predecessors.add(this);
         }
@@ -55,6 +62,7 @@ public class BasicBlock {
     public void addExceptionalSuccessor(BasicBlock block) {
         if (exceptionalSuccessors.contains(block)) return;
         exceptionalSuccessors.add(block);
+        mergedSuccessors = null;
         if (!block.predecessors.contains(this)) {
             block.predecessors.add(this);
         }
@@ -62,6 +70,7 @@ public class BasicBlock {
 
     public void removeSuccessor(BasicBlock block) {
         if (successors.remove(block)) {
+            mergedSuccessors = null;
             // Predecessor link is dropped only when block is no longer a
             // successor via either path. The exceptional-successor list is a
             // separate relation; if it still contains `block`, the predecessor
@@ -73,16 +82,17 @@ public class BasicBlock {
     }
 
     public List<BasicBlock> getSuccessors() {
-        if (exceptionalSuccessors.isEmpty()) {
-            return new ArrayList<>(successors);
-        }
-        List<BasicBlock> all = new ArrayList<>(successors);
+        if (exceptionalSuccessors.isEmpty()) return successorsView;
+        List<BasicBlock> merged = mergedSuccessors;
+        if (merged != null) return merged;
+        List<BasicBlock> all = new ArrayList<>(successors.size() + exceptionalSuccessors.size());
+        all.addAll(successors);
         for (BasicBlock ex : exceptionalSuccessors) {
-            if (!all.contains(ex)) {
-                all.add(ex);
-            }
+            if (!all.contains(ex)) all.add(ex);
         }
-        return all;
+        merged = Collections.unmodifiableList(all);
+        mergedSuccessors = merged;
+        return merged;
     }
 
     @Override

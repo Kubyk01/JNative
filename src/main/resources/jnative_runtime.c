@@ -543,11 +543,12 @@ void __jnative_free_owned(void* p) {
  *  Monitor table
  * ====================================================================== */
 
-#define HASH_SIZE 1024
+#define HASH_SIZE 65536
 
 typedef struct MonitorEntry {
     void* obj;
     jn_mutex_t mutex;
+    int refs;
     struct MonitorEntry* next;
 } MonitorEntry;
 
@@ -555,60 +556,53 @@ static MonitorEntry* monitor_table[HASH_SIZE] = {0};
 static jn_mutex_t table_lock = JN_MUTEX_INITIALIZER;
 
 static uint32_t hash_ptr(void* p) {
-    return (uint32_t)((uintptr_t)p) % HASH_SIZE;
+    uint64_t h = (uint64_t)(uintptr_t)p;
+    h ^= h >> 33;
+    h *= 0xff51afd7ed558ccdULL;
+    h ^= h >> 33;
+    return (uint32_t)h & (HASH_SIZE - 1);
 }
 
-static jn_mutex_t* find_mutex(void* obj) {
-    uint32_t idx = hash_ptr(obj);
-    MonitorEntry* entry = monitor_table[idx];
-    while (entry) {
-        if (entry->obj == obj) return &entry->mutex;
-        entry = entry->next;
-    }
-    return NULL;
+static MonitorEntry** find_entry(void* obj) {
+    MonitorEntry** pp = &monitor_table[hash_ptr(obj)];
+    while (*pp && (*pp)->obj != obj) pp = &(*pp)->next;
+    return pp;
+}
+
+static void free_entry(MonitorEntry** pp) {
+    MonitorEntry* entry = *pp;
+    *pp = entry->next;
+    jn_mutex_destroy(&entry->mutex);
+    free(entry);
 }
 
 static jn_mutex_t* get_or_create_mutex(void* obj) {
     if (obj == NULL) return NULL;
-    uint32_t idx = hash_ptr(obj);
     jn_mutex_lock(&table_lock);
-    MonitorEntry* entry = monitor_table[idx];
-    while (entry) {
-        if (entry->obj == obj) {
+    MonitorEntry** pp = find_entry(obj);
+    MonitorEntry* entry = *pp;
+    if (entry == NULL) {
+        entry = malloc(sizeof(MonitorEntry));
+        if (entry == NULL) {
             jn_mutex_unlock(&table_lock);
-            return &entry->mutex;
+            return NULL;
         }
-        entry = entry->next;
+        entry->obj = obj;
+        entry->refs = 0;
+        jn_recmutex_init(&entry->mutex);
+        entry->next = NULL;
+        *pp = entry;
     }
-    MonitorEntry* new_entry = malloc(sizeof(MonitorEntry));
-    if (new_entry == NULL) {
-        jn_mutex_unlock(&table_lock);
-        return NULL;
-    }
-    new_entry->obj = obj;
-    /* Recursive mutex: Java monitors are re-entrant. */
-    jn_recmutex_init(&new_entry->mutex);
-    new_entry->next = monitor_table[idx];
-    monitor_table[idx] = new_entry;
+    entry->refs++;
     jn_mutex_unlock(&table_lock);
-    return &new_entry->mutex;
+    return &entry->mutex;
 }
 
 void __jnative_monitor_destroy(void* obj) {
     if (obj == NULL) return;
-    uint32_t idx = hash_ptr(obj);
     jn_mutex_lock(&table_lock);
-    MonitorEntry** pp = &monitor_table[idx];
-    while (*pp) {
-        MonitorEntry* entry = *pp;
-        if (entry->obj == obj) {
-            *pp = entry->next;
-            jn_mutex_destroy(&entry->mutex);
-            free(entry);
-            break;
-        }
-        pp = &entry->next;
-    }
+    MonitorEntry** pp = find_entry(obj);
+    if (*pp && (*pp)->refs == 0) free_entry(pp);
     jn_mutex_unlock(&table_lock);
 }
 
@@ -627,9 +621,13 @@ void __jnative_monitor_exit(void* obj) {
         return;
     }
     jn_mutex_lock(&table_lock);
-    jn_mutex_t* mtx = find_mutex(obj);
+    MonitorEntry** pp = find_entry(obj);
+    MonitorEntry* entry = *pp;
+    if (entry) {
+        jn_mutex_unlock(&entry->mutex);
+        if (--entry->refs == 0) free_entry(pp);
+    }
     jn_mutex_unlock(&table_lock);
-    if (mtx) jn_mutex_unlock(mtx);
 }
 
 /* ========================================================================

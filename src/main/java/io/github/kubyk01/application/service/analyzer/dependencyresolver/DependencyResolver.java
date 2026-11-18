@@ -1,5 +1,7 @@
 package io.github.kubyk01.application.service.analyzer.dependencyresolver;
 
+import io.github.kubyk01.domain.analyzer.Discoverable;
+
 import io.github.kubyk01.application.service.analyzer.reachabilityanalysis.ReachabilityMetadataParser;
 import io.github.kubyk01.application.service.analyzer.ssa.TypeResolver;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.ClassNode;
@@ -128,8 +130,19 @@ public class DependencyResolver {
     private static final String SERVICES_PREFIX = "META-INF/services/";
 
     private final Map<String, Set<String>> serviceProviders = new ConcurrentHashMap<>();
+    private static final String DISCOVERABLE = "L" + Discoverable.class.getName().replace('.', '/') + ";";
+    private final Set<String> discoverableContracts = ConcurrentHashMap.newKeySet();
 
     public Map<String, List<String>> getServiceProviders() {
+        for (String contract : discoverableContracts) {
+            Set<String> providers = providersOf(contract.replace('/', '.'));
+            for (String candidate : getSubclasses(contract)) {
+                ClassNode node = classMap.get(candidate);
+                if (node == null || node.isExternal() || node.isInterface()
+                        || (node.getAccess() & Opcodes.ACC_ABSTRACT) != 0) continue;
+                providers.add(candidate.replace('/', '.'));
+            }
+        }
         Map<String, List<String>> out = new LinkedHashMap<>();
         for (Map.Entry<String, Set<String>> e : new TreeMap<>(serviceProviders).entrySet()) {
             synchronized (e.getValue()) {
@@ -151,6 +164,7 @@ public class DependencyResolver {
     }
 
     private byte[] transformClass(byte[] bytes) {
+        if (BootstrapRewriter.needsRewrite(bytes)) bytes = BootstrapRewriter.rewrite(bytes);
         String className = new ClassReader(bytes).getClassName();
         if (ProxyRewriter.PROXY.equals(className)) return ProxyRewriter.rewrite(bytes);
         if (!ServiceLoaderRewriter.ITERATOR.equals(className)) return bytes;
@@ -917,6 +931,14 @@ public class DependencyResolver {
                             .signature(signature)
                             .isInterface((access & Opcodes.ACC_INTERFACE) != 0)
                             .isExternal(false);
+                }
+
+                @Override
+                public AnnotationVisitor visitAnnotation(String desc, boolean visible) {
+                    if (DISCOVERABLE.equals(desc) && currentClassName[0] != null) {
+                        discoverableContracts.add(currentClassName[0]);
+                    }
+                    return null;
                 }
 
                 @Override

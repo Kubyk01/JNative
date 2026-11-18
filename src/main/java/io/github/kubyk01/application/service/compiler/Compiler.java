@@ -348,16 +348,15 @@ public class Compiler implements CompilerPort {
 
             appendLinkerLibraries(linkCmd, target);
 
-            int effectiveLinkJobs = Math.max(1, effectiveCores);
             if (thinLtoEnabled) {
                 Files.createDirectories(thinLtoCacheDir);
                 appendThinLtoCacheOptions(linkCmd, msvcLinker, target,
                         thinLtoCacheDir, thinLtoCachePolicy);
             }
             linkCmd.addAll(linkerOptimizationFlags(msvcLinker, effectiveOptLevel,
-                    effectiveLinkJobs, ltoFlag));
+                effectiveCores, ltoFlag));
             System.out.println("Linking for target " + target.triple() + " using "
-                    + effectiveLinkJobs + " worker(s) ("
+                    + effectiveCores + " worker(s) ("
                     + (ltoEnabled ? ltoFlag + " -O" + effectiveOptLevel : "LTO disabled")
                     + ")...");
             log.debug("Link command: {}", linkCmd);
@@ -1610,8 +1609,11 @@ public class Compiler implements CompilerPort {
         // ------------------------------------------------------------------
         String prefix = target.triple().matches("i[3-6]86-.*") ? "_" : "";
         StringBuilder sb = new StringBuilder(
-                "#include <stdlib.h>\n#include <string.h>\n"
-                + "typedef struct { const char* n; const void* a; } JnSelfSym;\n");
+            """
+                #include <stdlib.h>
+                #include <string.h>
+                typedef struct { const char* n; const void* a; } JnSelfSym;
+                """);
         int i = 0;
         for (String sym : exports) {
             sb.append(definedFunctions.contains(sym) ? "extern void s" + i + "(void)" : "extern char s" + i)

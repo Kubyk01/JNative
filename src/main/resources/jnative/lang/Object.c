@@ -265,7 +265,10 @@ void *__jnative_fn_java_lang_Object_getClass___Ljava_lang_Class_(void *obj) {
 // public native int hashCode();
 int __jnative_fn_java_lang_Object_hashCode___I(void *obj) {
     if (!obj) return 0;
-    return (int)((uintptr_t)obj);
+    uint64_t h = (uint64_t)(uintptr_t)obj >> 4;
+    h = (h ^ (h >> 33)) * 0xff51afd7ed558ccdULL;
+    h ^= h >> 33;
+    return (int)h;
 }
 
 // protected native Object clone() throws CloneNotSupportedException;

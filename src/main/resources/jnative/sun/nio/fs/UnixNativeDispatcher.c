@@ -108,6 +108,8 @@
 #define LINUX_ENOTEMPTY    39
 #define LINUX_ENOTSUP      95
 
+extern void fn_sun_nio_fs_UnixException__init___I_V(void* self, int32_t errno_value);
+
 /* -------------------------------------------------------------------------
  *  UnixFileAttributes field offsets (JDK 21 layout):
  *
@@ -166,31 +168,33 @@ static void throw_unix_exception(int linux_errno) {
     if (cls != NULL) {
         void* exc = jnative_alloc_object(cls);
         if (exc != NULL) {
-            typedef void (*ctor_int_t)(void*, int32_t);
-            ctor_int_t ctor_i = (ctor_int_t)jn_dlsym_default(
-                "fn_sun_nio_fs_UnixException__init__I_V");
-            if (ctor_i != NULL) {
-                ctor_i(exc, linux_errno);
-                __jnative_throw_exception(exc);
-            }
-
-            char msg[96];
-            snprintf(msg, sizeof(msg), "UnixException (errno %d)", linux_errno);
-            void* msg_obj = __jnative_make_string_obj(msg, (int32_t)strlen(msg));
-            typedef void (*ctor_str_t)(void*, void*);
-            ctor_str_t ctor_s = (ctor_str_t)jn_dlsym_default(
-                "fn_sun_nio_fs_UnixException__init__Ljava_lang_String__V");
-            if (ctor_s != NULL) {
-                ctor_s(exc, msg_obj);
-                __jnative_throw_exception(exc);
-            }
-            free(msg_obj);
-            free(exc);
+            fn_sun_nio_fs_UnixException__init___I_V(exc, linux_errno);
+            __jnative_throw_exception(exc);
         }
     }
 
     char buf[96];
     snprintf(buf, sizeof(buf), "UnixNativeDispatcher (errno %d)", linux_errno);
+
+    const char* vtable;
+    switch (linux_errno) {
+        case LINUX_EACCES:
+            vtable = "vtable_java_nio_file_AccessDeniedException";
+            break;
+        case LINUX_ENOENT:
+            vtable = "vtable_java_nio_file_NoSuchFileException";
+            break;
+        case LINUX_EEXIST:
+            vtable = "vtable_java_nio_file_FileAlreadyExistsException";
+            break;
+        default:
+            vtable = "vtable_java_nio_file_FileSystemException";
+            break;
+    }
+    void* typed = __jnative_construct_exception(vtable, buf);
+    if (typed != NULL) {
+        __jnative_throw_exception_ctx(typed, "UnixNativeDispatcher");
+    }
     __jnative_throw_io_ctx(buf, "UnixNativeDispatcher");
 }
 

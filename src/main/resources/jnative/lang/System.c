@@ -229,7 +229,10 @@ void __jnative_fn_java_lang_System_arraycopy__int_ints(
 
 int32_t __jnative_fn_java_lang_System_identityHashCode__Ljava_lang_Object__I(void* obj) {
     if (obj == NULL) return 0;
-    return (int32_t)((uintptr_t)obj);
+    uint64_t h = (uint64_t)(uintptr_t)obj >> 4;
+    h = (h ^ (h >> 33)) * 0xff51afd7ed558ccdULL;
+    h ^= h >> 33;
+    return (int32_t)h;
 }
 
 /*

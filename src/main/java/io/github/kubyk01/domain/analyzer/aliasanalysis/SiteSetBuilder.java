@@ -54,7 +54,7 @@ public final class SiteSetBuilder {
 
     public PointsToSet build() {
         if (count == 0) return PointsToSet.EMPTY;
-        int[] out = new int[count];
+        int[] out = PointsToSet.scratch(count);
         Arrays.sort(touched, 0, touchedCount);
         int k = 0;
         for (int t = 0; t < touchedCount; t++) {
@@ -70,8 +70,7 @@ public final class SiteSetBuilder {
         }
         touchedCount = 0;
         count = 0;
-        if (out.length == 1) return AllocationSite.byId(out[0]).singleton();
-        return PointsToSet.ofSortedUnique(out);
+        return PointsToSet.intern(out, k, false);
     }
 
     public void clear() {

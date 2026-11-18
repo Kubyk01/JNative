@@ -86,11 +86,51 @@ static void runtime_remove(const char* path, int directory) {
     free(wide);
 }
 #else
+#include <dirent.h>
+#include <ftw.h>
+#include <sys/file.h>
+#include <time.h>
+
+static int runtime_lock_fd = -1;
+
+static int remove_tree_entry(const char* path, const struct stat* sb, int type, struct FTW* ftw) {
+    (void)sb; (void)ftw;
+    if (type == FTW_DP) rmdir(path);
+    else unlink(path);
+    return 0;
+}
+
+static void reap_stale_runtime_directories(const char* base) {
+    DIR* dir = opendir(base);
+    if (dir == NULL) return;
+    const char prefix[] = "jnative-runtime-";
+    struct dirent* entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (strncmp(entry->d_name, prefix, sizeof(prefix) - 1) != 0) continue;
+        size_t size = strlen(base) + strlen(entry->d_name) + sizeof("/" "/.lock");
+        char* path = malloc(size);
+        if (path == NULL) break;
+        snprintf(path, size, "%s/%s/.lock", base, entry->d_name);
+        int fd = open(path, O_RDONLY | O_CLOEXEC);
+        int stale = fd >= 0 ? flock(fd, LOCK_EX | LOCK_NB) == 0 : errno == ENOENT;
+        path[strlen(base) + 1 + strlen(entry->d_name)] = '\0';
+        struct stat attributes;
+        if (stale && lstat(path, &attributes) == 0 && S_ISDIR(attributes.st_mode)
+                && attributes.st_uid == getuid() && time(NULL) - attributes.st_mtime > 60) {
+            nftw(path, remove_tree_entry, 16, FTW_DEPTH | FTW_PHYS);
+        }
+        if (fd >= 0) close(fd);
+        free(path);
+    }
+    closedir(dir);
+}
+
 static char* create_runtime_directory(void) {
     const char* temporary = getenv("TMPDIR");
     if (temporary == NULL || temporary[0] == '\0') temporary = P_tmpdir;
     char* base = realpath(temporary, NULL);
     if (base == NULL) return NULL;
+    reap_stale_runtime_directories(base);
     const char suffix[] = "/jnative-runtime-XXXXXX";
     size_t size = strlen(base) + sizeof(suffix);
     char* path = malloc(size);
@@ -98,7 +138,28 @@ static char* create_runtime_directory(void) {
     free(base);
     if (path == NULL) return NULL;
     if (mkdtemp(path) == NULL) { free(path); return NULL; }
+    size_t lock_size = strlen(path) + sizeof("/.lock");
+    char* lock = malloc(lock_size);
+    if (lock != NULL) {
+        snprintf(lock, lock_size, "%s/.lock", path);
+        runtime_lock_fd = open(lock, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+        if (runtime_lock_fd >= 0) flock(runtime_lock_fd, LOCK_EX);
+        free(lock);
+    }
     return path;
+}
+
+static void remove_runtime_lock(void) {
+    if (runtime_lock_fd < 0) return;
+    size_t size = strlen(runtime_home) + sizeof("/.lock");
+    char* lock = malloc(size);
+    if (lock != NULL) {
+        snprintf(lock, size, "%s/.lock", runtime_home);
+        unlink(lock);
+        free(lock);
+    }
+    close(runtime_lock_fd);
+    runtime_lock_fd = -1;
 }
 
 static int runtime_mkdir(const char* path) {
@@ -157,6 +218,9 @@ static void cleanup_runtime_directory(void) {
         }
         free(path);
     }
+#if !defined(_WIN32)
+    remove_runtime_lock();
+#endif
     runtime_remove(runtime_home, 1);
     free(runtime_home);
     runtime_home = NULL;
