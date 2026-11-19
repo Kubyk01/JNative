@@ -128,17 +128,21 @@ public class ReachabilityAnalysis {
 
     public void registerClassLiterals(Module module) {
         if (module == null) return;
-        for (Function func : module.getFunctions()) {
+        List<? extends Function> jnLoop1 = module.getFunctions();
+        for (int jnIdx1 = 0; jnIdx1 < jnLoop1.size(); jnIdx1++) {
+            Function func = jnLoop1.get(jnIdx1);
             if (func.getEntryBlock() == null) continue;
-            for (BasicBlock block : func.getBlocks()) {
-                for (Instruction inst : block.getInstructions()) {
-                    for (Value op : inst.getOperands()) {
+            for (int blockIdx1 = 0; blockIdx1 < func.getBlocks().size(); blockIdx1++) { BasicBlock block = func.getBlocks().get(blockIdx1);
+                for (int instIdx2 = 0; instIdx2 < block.getInstructions().size(); instIdx2++) { Instruction inst = block.getInstructions().get(instIdx2);
+                    for (int opIdx3 = 0; opIdx3 < inst.getOperands().size(); opIdx3++) { Value op = inst.getOperands().get(opIdx3);
                         registerClassLiteralFromValue(op);
                     }
                 }
                 Terminator term = block.getTerminator();
                 if (term != null) {
-                    for (Value op : terminatorOperandsOf(term)) {
+                    List<? extends Value> jnLoop2 = terminatorOperandsOf(term);
+                    for (int jnIdx2 = 0; jnIdx2 < jnLoop2.size(); jnIdx2++) {
+                        Value op = jnLoop2.get(jnIdx2);
                         registerClassLiteralFromValue(op);
                     }
                 }
@@ -229,7 +233,9 @@ public class ReachabilityAnalysis {
         int applied = 0;
 
         // First pass — unconditional entries.
-        for (ReachabilityMetadata.ReflectClass rc : metadata.getReflectClasses()) {
+        List<? extends ReachabilityMetadata.ReflectClass> jnLoop4 = metadata.getReflectClasses();
+        for (int jnIdx4 = 0; jnIdx4 < jnLoop4.size(); jnIdx4++) {
+            ReachabilityMetadata.ReflectClass rc = jnLoop4.get(jnIdx4);
             String trigger = rc.getTypeReachable();
             if (trigger == null || trigger.isEmpty()) {
                 applyReflectEntry(rc);
@@ -256,7 +262,9 @@ public class ReachabilityAnalysis {
             List<ReachabilityMetadata.ReflectClass> stillPending =
                 new ArrayList<>(pending.size());
 
-            for (ReachabilityMetadata.ReflectClass rc : pending) {
+            List<? extends ReachabilityMetadata.ReflectClass> jnLoop5 = pending;
+            for (int jnIdx5 = 0; jnIdx5 < jnLoop5.size(); jnIdx5++) {
+                ReachabilityMetadata.ReflectClass rc = jnLoop5.get(jnIdx5);
                 if (isTriggerReachable(rc.getTypeReachable())) {
                     applyReflectEntry(rc);
                     applied++;
@@ -280,13 +288,17 @@ public class ReachabilityAnalysis {
         }
 
         // Proxy interfaces — unconditional.
-        for (ReachabilityMetadata.ProxyInterface pi : metadata.getProxyInterfaces()) {
+        List<? extends ReachabilityMetadata.ProxyInterface> jnLoop6 = metadata.getProxyInterfaces();
+        for (int jnIdx6 = 0; jnIdx6 < jnLoop6.size(); jnIdx6++) {
+            ReachabilityMetadata.ProxyInterface pi = jnLoop6.get(jnIdx6);
             for (String iface : pi.getInterfaces()) {
                 String className = iface.replace('.', '/');
                 addClassWithInit(className, true);
                 ClassNode classNode = resolver.getClassNode(className);
                 if (classNode != null && !classNode.isExternal()) {
-                    for (MethodNode m : classNode.getMethods()) {
+                    List<? extends MethodNode> jnLoop8 = classNode.getMethods();
+                    for (int jnIdx8 = 0; jnIdx8 < jnLoop8.size(); jnIdx8++) {
+                        MethodNode m = jnLoop8.get(jnIdx8);
                         addMethod(new MethodReference(className,
                             m.getName(), m.getDescriptor()), true);
                     }
@@ -295,7 +307,9 @@ public class ReachabilityAnalysis {
         }
 
         // JNI classes — unconditional.
-        for (ReachabilityMetadata.JniClass jc : metadata.getJniClasses()) {
+        List<? extends ReachabilityMetadata.JniClass> jnLoop9 = metadata.getJniClasses();
+        for (int jnIdx9 = 0; jnIdx9 < jnLoop9.size(); jnIdx9++) {
+            ReachabilityMetadata.JniClass jc = jnLoop9.get(jnIdx9);
             String className = jc.getName().replace('.', '/');
             addClassWithInit(className, true);
             instantiatedClasses.add(className);
@@ -333,7 +347,9 @@ public class ReachabilityAnalysis {
         }
         if (classNode != null && !classNode.isExternal()) {
             if (rc.isAllDeclaredMethods() || rc.isAllPublicMethods()) {
-                for (MethodNode m : classNode.getMethods()) {
+                List<? extends MethodNode> jnLoop10 = classNode.getMethods();
+                for (int jnIdx10 = 0; jnIdx10 < jnLoop10.size(); jnIdx10++) {
+                    MethodNode m = jnLoop10.get(jnIdx10);
                     if (!m.getName().equals("<init>")
                         && !m.getName().equals("<clinit>")) {
                         MethodReference ref = new MethodReference(
@@ -348,7 +364,9 @@ public class ReachabilityAnalysis {
                     String methodName = parenIdx > 0
                         ? methodSig.substring(0, parenIdx)
                         : methodSig;
-                    for (MethodNode m : classNode.getMethods()) {
+                    List<? extends MethodNode> jnLoop12 = classNode.getMethods();
+                    for (int jnIdx12 = 0; jnIdx12 < jnLoop12.size(); jnIdx12++) {
+                        MethodNode m = jnLoop12.get(jnIdx12);
                         if (m.getName().equals(methodName)
                             && !m.getName().equals("<init>")) {
                             MethodReference ref = new MethodReference(
@@ -374,7 +392,9 @@ public class ReachabilityAnalysis {
                 }
             }
             if (rc.isAllDeclaredConstructors() || rc.isAllPublicConstructors()) {
-                for (MethodNode m : classNode.getMethods()) {
+                List<? extends MethodNode> jnLoop14 = classNode.getMethods();
+                for (int jnIdx14 = 0; jnIdx14 < jnLoop14.size(); jnIdx14++) {
+                    MethodNode m = jnLoop14.get(jnIdx14);
                     if (m.getName().equals("<init>")) {
                         MethodReference ref = new MethodReference(
                             className, "<init>", m.getDescriptor());
@@ -384,7 +404,9 @@ public class ReachabilityAnalysis {
                 }
             } else {
                 for (String ctorSig : rc.getConstructors()) {
-                    for (MethodNode m : classNode.getMethods()) {
+                    List<? extends MethodNode> jnLoop16 = classNode.getMethods();
+                    for (int jnIdx16 = 0; jnIdx16 < jnLoop16.size(); jnIdx16++) {
+                        MethodNode m = jnLoop16.get(jnIdx16);
                         if (m.getName().equals("<init>")
                             && m.getDescriptor().equals(ctorSig)) {
                             MethodReference ref = new MethodReference(
@@ -443,7 +465,9 @@ public class ReachabilityAnalysis {
             boolean hasInitPhase1 = false;
             boolean hasInitPhase2 = false;
             boolean hasInitPhase3 = false;
-            for (MethodNode mn : systemNode.getMethods()) {
+            List<? extends MethodNode> jnLoop17 = systemNode.getMethods();
+            for (int jnIdx17 = 0; jnIdx17 < jnLoop17.size(); jnIdx17++) {
+                MethodNode mn = jnLoop17.get(jnIdx17);
                 String n = mn.getName();
                 String d = mn.getDescriptor();
                 if (n.equals("initPhase1") && d.equals("()V")) {
@@ -529,12 +553,16 @@ public class ReachabilityAnalysis {
             return false;
         }
         boolean added = false;
-        for (String cls : species) {
+        List<? extends String> jnLoop18 = species;
+        for (int jnIdx18 = 0; jnIdx18 < jnLoop18.size(); jnIdx18++) {
+            String cls = jnLoop18.get(jnIdx18);
             if (reachableClasses.contains(cls)) continue;
             addClassWithInit(cls, false);
             ClassNode cn = resolver.getClassNode(cls);
             if (cn == null || cn.isExternal()) continue;
-            for (MethodNode m : cn.getMethods()) {
+            List<? extends MethodNode> jnLoop19 = cn.getMethods();
+            for (int jnIdx19 = 0; jnIdx19 < jnLoop19.size(); jnIdx19++) {
+                MethodNode m = jnLoop19.get(jnIdx19);
                 addMethod(new MethodReference(cls, m.getName(), m.getDescriptor()), false);
             }
             added = true;
@@ -727,7 +755,9 @@ public class ReachabilityAnalysis {
         // during the loop as new classes are loaded; the worklist is what
         // drives that growth, so no additional snapshotting is required
         // beyond the initial one.
-        for (String cls : new ArrayList<>(resolver.getClassMap().keySet())) {
+        List<? extends String> jnLoop21 = new ArrayList<>(resolver.getClassMap().keySet());
+        for (int jnIdx21 = 0; jnIdx21 < jnLoop21.size(); jnIdx21++) {
+            String cls = jnLoop21.get(jnIdx21);
             if (cls != null && !cls.isEmpty() && cls.charAt(0) != '[') {
                 worklist.add(cls);
             }
@@ -742,16 +772,22 @@ public class ReachabilityAnalysis {
             ClassNode cn = resolver.getClassNode(cls);
             if (cn == null || cn.isExternal()) continue;
 
-            for (MethodNode mn : cn.getMethods()) {
+            List<? extends MethodNode> jnLoop22 = cn.getMethods();
+            for (int jnIdx22 = 0; jnIdx22 < jnLoop22.size(); jnIdx22++) {
+                MethodNode mn = jnLoop22.get(jnIdx22);
                 List<Type> params = mn.getParameterTypes();
                 if (params != null) {
-                    for (Type t : params) {
+                    List<? extends Type> jnLoop23 = params;
+                    for (int jnIdx23 = 0; jnIdx23 < jnLoop23.size(); jnIdx23++) {
+                        Type t = jnLoop23.get(jnIdx23);
                         enqueueDescriptorType(t, visited, worklist);
                     }
                 }
                 enqueueDescriptorType(mn.getReturnType(), visited, worklist);
             }
-            for (FieldNode fn : cn.getFields()) {
+            List<? extends FieldNode> jnLoop24 = cn.getFields();
+            for (int jnIdx24 = 0; jnIdx24 < jnLoop24.size(); jnIdx24++) {
+                FieldNode fn = jnLoop24.get(jnIdx24);
                 enqueueDescriptorType(fn.getType(), visited, worklist);
             }
         }
@@ -868,7 +904,9 @@ public class ReachabilityAnalysis {
             // Step 1: scan bytecode of every method not yet scanned for
             // virtual-dispatch sites. Methods are scanned exactly once.
             boolean scannedAny = false;
-            for (MethodReference ref : new ArrayList<>(reachableMethods)) {
+            List<? extends MethodReference> jnLoop25 = new ArrayList<>(reachableMethods);
+            for (int jnIdx25 = 0; jnIdx25 < jnLoop25.size(); jnIdx25++) {
+                MethodReference ref = jnLoop25.get(jnIdx25);
                 if (!dispatchScanDone.add(ref)) continue;
                 collectDispatchSitesFromMethod(ref);
                 scannedAny = true;
@@ -995,7 +1033,9 @@ public class ReachabilityAnalysis {
                             if (!ifaceNode.isInterface()) continue;
                             if (ifaceNode.isExternal()) continue;
 
-                            for (MethodNode im : ifaceNode.getMethods()) {
+                            List<? extends MethodNode> jnLoop28 = ifaceNode.getMethods();
+                            for (int jnIdx28 = 0; jnIdx28 < jnLoop28.size(); jnIdx28++) {
+                                MethodNode im = jnLoop28.get(jnIdx28);
                                 if (im.isStatic()) continue;
                                 String mName = im.getName();
                                 if (mName == null || mName.isEmpty()) continue;
@@ -1070,7 +1110,9 @@ public class ReachabilityAnalysis {
     private void collectAllInterfacesRec(ClassNode cls, Set<String> out) {
         if (cls == null) return;
 
-        for (String i : cls.getInterfaces()) {
+        List<? extends String> jnLoop30 = cls.getInterfaces();
+        for (int jnIdx30 = 0; jnIdx30 < jnLoop30.size(); jnIdx30++) {
+            String i = jnLoop30.get(jnIdx30);
             if (!out.add(i)) continue;
             ClassNode in = resolver.getClassNode(i);
             if (in != null && !in.isExternal()) {
@@ -1233,14 +1275,18 @@ public class ReachabilityAnalysis {
             return null;
         }
 
-        for (MethodNode m : classNode.getMethods()) {
+        List<? extends MethodNode> jnLoop32 = classNode.getMethods();
+        for (int jnIdx32 = 0; jnIdx32 < jnLoop32.size(); jnIdx32++) {
+            MethodNode m = jnLoop32.get(jnIdx32);
             if (m.getName().equals(name) && m.getDescriptor().equals(desc)) {
                 if (foundClassName != null) foundClassName[0] = classNode.getName();
                 return m;
             }
         }
 
-        for (MethodNode m : classNode.getMethods()) {
+        List<? extends MethodNode> jnLoop33 = classNode.getMethods();
+        for (int jnIdx33 = 0; jnIdx33 < jnLoop33.size(); jnIdx33++) {
+            MethodNode m = jnLoop33.get(jnIdx33);
             if (m.getName().equals(name) && m.isPolymorphicSignature()) {
                 if (foundClassName != null) foundClassName[0] = classNode.getName();
                 return m;
@@ -1262,7 +1308,9 @@ public class ReachabilityAnalysis {
             }
         }
 
-        for (String iface : classNode.getInterfaces()) {
+        List<? extends String> jnLoop34 = classNode.getInterfaces();
+        for (int jnIdx34 = 0; jnIdx34 < jnLoop34.size(); jnIdx34++) {
+            String iface = jnLoop34.get(jnIdx34);
             if (iface.equals(classNode.getName())) continue;
             ClassNode ifaceNode = resolver.getClassNode(iface);
             if (ifaceNode != null && ifaceNode != classNode) {
@@ -1442,7 +1490,9 @@ public class ReachabilityAnalysis {
         }
 
         boolean hasClinit = false;
-        for (MethodNode mn : cn.getMethods()) {
+        List<? extends MethodNode> jnLoop35 = cn.getMethods();
+        for (int jnIdx35 = 0; jnIdx35 < jnLoop35.size(); jnIdx35++) {
+            MethodNode mn = jnLoop35.get(jnIdx35);
             if (mn.getName().equals("<clinit>")) {
                 hasClinit = true;
                 break;
@@ -1496,7 +1546,9 @@ public class ReachabilityAnalysis {
         if ((cn.getAccess() & ACC_ENUM) == 0) return;
         if (!"java/lang/Enum".equals(cn.getSuperName())) return;
 
-        for (MethodNode mn : cn.getMethods()) {
+        List<? extends MethodNode> jnLoop36 = cn.getMethods();
+        for (int jnIdx36 = 0; jnIdx36 < jnLoop36.size(); jnIdx36++) {
+            MethodNode mn = jnLoop36.get(jnIdx36);
             if (!mn.isStatic()) continue;
 
             String name = mn.getName();

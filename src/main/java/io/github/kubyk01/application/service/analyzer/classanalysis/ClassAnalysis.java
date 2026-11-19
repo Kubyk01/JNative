@@ -77,13 +77,17 @@ public class ClassAnalysis {
         List<String> loaded = new ArrayList<>(resolver.getAllClasses());
         loaded.forEach(this::register);
 
-        for (String name : loaded) {
+        List<? extends String> jnLoop1 = loaded;
+        for (int jnIdx1 = 0; jnIdx1 < jnLoop1.size(); jnIdx1++) {
+            String name = jnLoop1.get(jnIdx1);
             if (classes.contains(name) && (resolver.getClassNode(name).getAccess() & Opcodes.ACC_ANNOTATION) != 0) {
                 addProxy(List.of(name));
             }
         }
         loaded.forEach(this::addCallSiteProxies);
-        for (List<String> interfaces : resolver.getProxyInterfaces()) {
+        List<? extends List<String>> jnLoop2 = resolver.getProxyInterfaces();
+        for (int jnIdx2 = 0; jnIdx2 < jnLoop2.size(); jnIdx2++) {
+            List<String> interfaces = jnLoop2.get(jnIdx2);
             addProxy(interfaces.stream().map(i -> i.replace('.', '/')).toList());
         }
         FRAMEWORK_PROXIES.forEach((trigger, interfaces) -> {
@@ -139,10 +143,12 @@ public class ClassAnalysis {
     }
 
     public void registerClassLiterals(Module module) {
-        for (Function func : module.getFunctions()) {
+        List<? extends Function> jnLoop5 = module.getFunctions();
+        for (int jnIdx5 = 0; jnIdx5 < jnLoop5.size(); jnIdx5++) {
+            Function func = jnLoop5.get(jnIdx5);
             if (func.getEntryBlock() == null) continue;
-            for (BasicBlock block : func.getBlocks()) {
-                for (Instruction inst : block.getInstructions()) {
+            for (int blockIdx1 = 0; blockIdx1 < func.getBlocks().size(); blockIdx1++) { BasicBlock block = func.getBlocks().get(blockIdx1);
+                for (int instIdx2 = 0; instIdx2 < block.getInstructions().size(); instIdx2++) { Instruction inst = block.getInstructions().get(instIdx2);
                     inst.getOperands().forEach(this::registerClassLiteral);
                 }
                 Terminator term = block.getTerminator();
@@ -172,10 +178,14 @@ public class ClassAnalysis {
         ReflectClassInfo info = reflectInfo.getOrCreateClassInfo(name);
         info.setSuperName(cn.getSuperName());
         info.getInterfaces().addAll(cn.getInterfaces());
-        for (FieldNode f : cn.getFields()) {
+        List<? extends FieldNode> jnLoop6 = cn.getFields();
+        for (int jnIdx6 = 0; jnIdx6 < jnLoop6.size(); jnIdx6++) {
+            FieldNode f = jnLoop6.get(jnIdx6);
             info.addField(new FieldReference(name, f.getName(), f.getDescriptor()));
         }
-        for (MethodNode m : cn.getMethods()) {
+        List<? extends MethodNode> jnLoop7 = cn.getMethods();
+        for (int jnIdx7 = 0; jnIdx7 < jnLoop7.size(); jnIdx7++) {
+            MethodNode m = jnLoop7.get(jnIdx7);
             MethodReference ref = new MethodReference(name, m.getName(), m.getDescriptor());
             if (!m.isAbstract()) methods.add(ref);
             if (m.getName().equals("<init>")) info.addConstructor(ref);
@@ -190,7 +200,9 @@ public class ClassAnalysis {
         new ClassReader(bytes).accept(cn, ClassReader.SKIP_DEBUG | ClassReader.SKIP_FRAMES);
         List<List<String>> sites = new ArrayList<>();
         Set<String> staticTypes = new LinkedHashSet<>();
-        for (org.objectweb.asm.tree.MethodNode mn : cn.methods) {
+        List<? extends org.objectweb.asm.tree.MethodNode> jnLoop8 = cn.methods;
+        for (int jnIdx8 = 0; jnIdx8 < jnLoop8.size(); jnIdx8++) {
+            org.objectweb.asm.tree.MethodNode mn = jnLoop8.get(jnIdx8);
             List<String> array = null;
             for (AbstractInsnNode insn : mn.instructions) {
                 if (insn.getOpcode() == Opcodes.ANEWARRAY && "java/lang/Class".equals(((TypeInsnNode) insn).desc)) {
@@ -207,11 +219,17 @@ public class ClassAnalysis {
                 }
             }
         }
-        for (List<String> site : sites) {
+        List<? extends List<String>> jnLoop10 = sites;
+        for (int jnIdx10 = 0; jnIdx10 < jnLoop10.size(); jnIdx10++) {
+            List<String> site = jnLoop10.get(jnIdx10);
             List<List<String>> combos = List.of(List.of());
-            for (String element : site) {
+            List<? extends String> jnLoop11 = site;
+            for (int jnIdx11 = 0; jnIdx11 < jnLoop11.size(); jnIdx11++) {
+                String element = jnLoop11.get(jnIdx11);
                 List<List<String>> next = new ArrayList<>();
-                for (List<String> combo : combos) {
+                List<? extends List<String>> jnLoop12 = combos;
+                for (int jnIdx12 = 0; jnIdx12 < jnLoop12.size(); jnIdx12++) {
+                    List<String> combo = jnLoop12.get(jnIdx12);
                     for (String candidate : element != null ? List.of(element) : staticTypes) {
                         if (combo.contains(candidate)) continue;
                         List<String> extended = new ArrayList<>(combo);
@@ -221,7 +239,9 @@ public class ClassAnalysis {
                 }
                 combos = next.size() > 64 ? List.of() : next;
             }
-            for (List<String> combo : combos) {
+            List<? extends List<String>> jnLoop14 = combos;
+            for (int jnIdx14 = 0; jnIdx14 < jnLoop14.size(); jnIdx14++) {
+                List<String> combo = jnLoop14.get(jnIdx14);
                 if (!combo.isEmpty() && combo.stream().allMatch(this::isInterface)) addProxy(combo);
             }
         }

@@ -113,7 +113,9 @@ public class Analyzer {
 
         List<Function> clinitFunctions = new ArrayList<>();
         List<Function> lazyClinits = new ArrayList<>();
-        for (Function func : module.getFunctions()) {
+        List<? extends Function> jnLoop1 = module.getFunctions();
+        for (int jnIdx1 = 0; jnIdx1 < jnLoop1.size(); jnIdx1++) {
+            Function func = jnLoop1.get(jnIdx1);
             if (!func.getName().endsWith("__clinit____V")) continue;
             if (lazyOnlyClasses.contains(func.getOwnerClass())) {
                 lazyClinits.add(func);
@@ -136,13 +138,17 @@ public class Analyzer {
 
         List<Function> clinitsToInstrument = new ArrayList<>();
         Set<String> scheduledNames = new HashSet<>();
-        for (ClinitScheduleEntry e : clinitSchedule) {
+        List<? extends ClinitScheduleEntry> jnLoop2 = clinitSchedule;
+        for (int jnIdx2 = 0; jnIdx2 < jnLoop2.size(); jnIdx2++) {
+            ClinitScheduleEntry e = jnLoop2.get(jnIdx2);
             if (e.bootstrapPhase()) continue;
             Function f = e.function();
             clinitsToInstrument.add(f);
             scheduledNames.add(f.getName());
         }
-        for (Function f : clinitFunctions) {
+        List<? extends Function> jnLoop3 = clinitFunctions;
+        for (int jnIdx3 = 0; jnIdx3 < jnLoop3.size(); jnIdx3++) {
+            Function f = jnLoop3.get(jnIdx3);
             if (deferredClinits.contains(f.getName())
                 && !scheduledNames.contains(f.getName())) {
                 clinitsToInstrument.add(f);
@@ -160,11 +166,13 @@ public class Analyzer {
         if (showAlias) {
             System.out.println("\n--- Alias Analysis ---");
             System.out.println("Alias analysis complete.");
-            for (Function func : module.getFunctions()) {
+            List<? extends Function> jnLoop4 = module.getFunctions();
+            for (int jnIdx4 = 0; jnIdx4 < jnLoop4.size(); jnIdx4++) {
+                Function func = jnLoop4.get(jnIdx4);
                 if (!includeSystem && !isUserFunction(func)) continue;
                 if (!matchesDebug(debugName, func)) continue;
-                for (BasicBlock block : func.getBlocks()) {
-                    for (Instruction inst : block.getInstructions()) {
+                for (int blockIdx1 = 0; blockIdx1 < func.getBlocks().size(); blockIdx1++) { BasicBlock block = func.getBlocks().get(blockIdx1);
+                    for (int instIdx2 = 0; instIdx2 < block.getInstructions().size(); instIdx2++) { Instruction inst = block.getInstructions().get(instIdx2);
                         if (inst.getResult() != null) {
                             PointsToSet pts = aliasResult.getPointsTo(inst.getResult());
                             if (!pts.isEmpty()) {
@@ -182,11 +190,13 @@ public class Analyzer {
         if (showEscape) {
             System.out.println("\n--- Escape Analysis ---");
             System.out.println("Escape analysis complete.");
-            for (Function func : module.getFunctions()) {
+            List<? extends Function> jnLoop5 = module.getFunctions();
+            for (int jnIdx5 = 0; jnIdx5 < jnLoop5.size(); jnIdx5++) {
+                Function func = jnLoop5.get(jnIdx5);
                 if (!includeSystem && !isUserFunction(func)) continue;
                 if (!matchesDebug(debugName, func)) continue;
-                for (BasicBlock block : func.getBlocks()) {
-                    for (Instruction inst : block.getInstructions()) {
+                for (int blockIdx3 = 0; blockIdx3 < func.getBlocks().size(); blockIdx3++) { BasicBlock block = func.getBlocks().get(blockIdx3);
+                    for (int instIdx4 = 0; instIdx4 < block.getInstructions().size(); instIdx4++) { Instruction inst = block.getInstructions().get(instIdx4);
                         if (isAllocation(inst.getOpcode()) && inst.getResult() != null) {
                             PointsToSet pts = aliasResult.getPointsTo(inst.getResult());
                             for (AllocationSite site : pts.getSites()) {
@@ -404,7 +414,9 @@ public class Analyzer {
 
     private InitGraph buildInitGraph(Module module, DependencyResolver resolver) {
         List<Function> live = new ArrayList<>();
-        for (Function f : module.getFunctions()) {
+        List<? extends Function> jnLoop14 = module.getFunctions();
+        for (int jnIdx14 = 0; jnIdx14 < jnLoop14.size(); jnIdx14++) {
+            Function f = jnLoop14.get(jnIdx14);
             if (f.getEntryBlock() != null) live.add(f);
         }
         int n = live.size();
@@ -425,8 +437,8 @@ public class Analyzer {
             Set<String> tr = new HashSet<>();
             Set<String> rd = new HashSet<>();
             Set<String> wr = new HashSet<>();
-            for (BasicBlock block : live.get(i).getBlocks()) {
-                for (Instruction inst : block.getInstructions()) {
+            for (int blockIdx5 = 0; blockIdx5 < live.get(i).getBlocks().size(); blockIdx5++) { BasicBlock block = live.get(i).getBlocks().get(blockIdx5);
+                for (int instIdx6 = 0; instIdx6 < block.getInstructions().size(); instIdx6++) { Instruction inst = block.getInstructions().get(instIdx6);
                     collectDirectCallees(inst, calls, module, resolver, index, directCache, virtualCache);
                     Opcode op = inst.getOpcode();
                     if (op == Opcode.NEW || op == Opcode.GET_STATIC
@@ -750,7 +762,9 @@ public class Analyzer {
                 if (cn.isExternal()) continue;
 
                 boolean declaresClinit = false;
-                for (MethodNode mn : cn.getMethods()) {
+                List<? extends MethodNode> jnLoop21 = cn.getMethods();
+                for (int jnIdx21 = 0; jnIdx21 < jnLoop21.size(); jnIdx21++) {
+                    MethodNode mn = jnLoop21.get(jnIdx21);
                     if (mn.getName().equals("<clinit>")
                         && mn.getDescriptor().equals("()V")) {
                         declaresClinit = true;
@@ -793,7 +807,9 @@ public class Analyzer {
                     if (cn == null || cn.isExternal()) continue;
                 }
                 boolean declaresClinit = false;
-                for (MethodNode mn : cn.getMethods()) {
+                List<? extends MethodNode> jnLoop23 = cn.getMethods();
+                for (int jnIdx23 = 0; jnIdx23 < jnLoop23.size(); jnIdx23++) {
+                    MethodNode mn = jnLoop23.get(jnIdx23);
                     if (mn.getName().equals("<clinit>")
                         && mn.getDescriptor().equals("()V")) {
                         declaresClinit = true;
@@ -820,10 +836,12 @@ public class Analyzer {
     private Set<String> collectTriggeredOwners(Module module, DependencyResolver resolver) {
         Set<String> owners = new HashSet<>();
 
-        for (Function f : module.getFunctions()) {
+        List<? extends Function> jnLoop24 = module.getFunctions();
+        for (int jnIdx24 = 0; jnIdx24 < jnLoop24.size(); jnIdx24++) {
+            Function f = jnLoop24.get(jnIdx24);
             if (f.getEntryBlock() == null) continue;
-            for (BasicBlock b : f.getBlocks()) {
-                for (Instruction inst : b.getInstructions()) {
+            for (int bIdx7 = 0; bIdx7 < f.getBlocks().size(); bIdx7++) { BasicBlock b = f.getBlocks().get(bIdx7);
+                for (int instIdx8 = 0; instIdx8 < b.getInstructions().size(); instIdx8++) { Instruction inst = b.getInstructions().get(instIdx8);
                     Opcode op = inst.getOpcode();
                     if (op == Opcode.GET_STATIC || op == Opcode.PUT_STATIC
                         || op == Opcode.NEW) {
@@ -914,10 +932,12 @@ public class Analyzer {
             changed = false;
 
             Set<String> callees = new HashSet<>();
-            for (Function f : new ArrayList<>(module.getFunctions())) {
+            List<? extends Function> jnLoop25 = new ArrayList<>(module.getFunctions());
+            for (int jnIdx25 = 0; jnIdx25 < jnLoop25.size(); jnIdx25++) {
+                Function f = jnLoop25.get(jnIdx25);
                 if (f.getEntryBlock() == null) continue;
-                for (BasicBlock b : f.getBlocks()) {
-                    for (Instruction inst : b.getInstructions()) {
+                for (int bIdx9 = 0; bIdx9 < f.getBlocks().size(); bIdx9++) { BasicBlock b = f.getBlocks().get(bIdx9);
+                    for (int instIdx10 = 0; instIdx10 < b.getInstructions().size(); instIdx10++) { Instruction inst = b.getInstructions().get(instIdx10);
                         Opcode op = inst.getOpcode();
                         if (op != Opcode.STATIC_CALL && op != Opcode.CALL) continue;
                         String callee = extractCalleeConstant(inst, 0);
@@ -976,7 +996,9 @@ public class Analyzer {
             log.warn("java.lang.System is not loaded; no bootstrap phases will be scheduled");
             return phases;
         }
-        for (MethodNode mn : systemNode.getMethods()) {
+        List<? extends MethodNode> jnLoop27 = systemNode.getMethods();
+        for (int jnIdx27 = 0; jnIdx27 < jnLoop27.size(); jnIdx27++) {
+            MethodNode mn = jnLoop27.get(jnIdx27);
             if (!mn.isStatic()) continue;
             String n = mn.getName();
             if (!n.startsWith("initPhase")) continue;
@@ -991,7 +1013,9 @@ public class Analyzer {
                                                  DependencyResolver resolver) {
         List<String> names = collectBootstrapPhaseFunctions(resolver);
         List<Function> result = new ArrayList<>(names.size());
-        for (String name : names) {
+        List<? extends String> jnLoop28 = names;
+        for (int jnIdx28 = 0; jnIdx28 < jnLoop28.size(); jnIdx28++) {
+            String name = jnLoop28.get(jnIdx28);
             Function f = module.getFunction(name);
             if (f != null && f.getEntryBlock() != null) result.add(f);
         }
@@ -1051,7 +1075,9 @@ public class Analyzer {
             if (idx != null) cut[idx] = true;
         }
         List<Integer> roots = new ArrayList<>(allInit.size());
-        for (Function init : allInit) {
+        List<? extends Function> jnLoop31 = allInit;
+        for (int jnIdx31 = 0; jnIdx31 < jnLoop31.size(); jnIdx31++) {
+            Function init = jnLoop31.get(jnIdx31);
             Integer idx = funcIndex.get(init.getName());
             if (idx != null) roots.add(idx);
         }
@@ -1136,7 +1162,9 @@ public class Analyzer {
         // Field writers/readers, as function indices per field id.
         IntArrayList[] fieldWriters = new IntArrayList[fieldList.size()];
         IntArrayList[] fieldReaders = new IntArrayList[fieldList.size()];
-        for (Function init : allInit) {
+        List<? extends Function> jnLoop34 = allInit;
+        for (int jnIdx34 = 0; jnIdx34 < jnLoop34.size(); jnIdx34++) {
+            Function init = jnLoop34.get(jnIdx34);
             Integer initIdxObj = funcIndex.get(init.getName());
             if (initIdxObj == null) continue;
             int initIdx = initIdxObj;
@@ -1172,7 +1200,9 @@ public class Analyzer {
 
         IntArrayList[] depsList = new IntArrayList[liveFunctions.size()];
         int baseEdges = 0;
-        for (Function f : allInit) {
+        List<? extends Function> jnLoop35 = allInit;
+        for (int jnIdx35 = 0; jnIdx35 < jnLoop35.size(); jnIdx35++) {
+            Function f = jnLoop35.get(jnIdx35);
             Integer idxObj = funcIndex.get(f.getName());
             if (idxObj == null) continue;
             int idx = idxObj;
@@ -1209,7 +1239,9 @@ public class Analyzer {
 
         int[][] deps = new int[liveFunctions.size()][];
         int finalEdges = 0;
-        for (Function f : allInit) {
+        List<? extends Function> jnLoop36 = allInit;
+        for (int jnIdx36 = 0; jnIdx36 < jnLoop36.size(); jnIdx36++) {
+            Function f = jnLoop36.get(jnIdx36);
             Integer idxObj = funcIndex.get(f.getName());
             if (idxObj == null) continue;
             int idx = idxObj;
@@ -1225,7 +1257,9 @@ public class Analyzer {
         }
 
         IntArrayList[] revList = new IntArrayList[liveFunctions.size()];
-        for (Function f : allInit) {
+        List<? extends Function> jnLoop37 = allInit;
+        for (int jnIdx37 = 0; jnIdx37 < jnLoop37.size(); jnIdx37++) {
+            Function f = jnLoop37.get(jnIdx37);
             Integer readerObj = funcIndex.get(f.getName());
             if (readerObj == null) continue;
             int reader = readerObj;
@@ -1246,7 +1280,9 @@ public class Analyzer {
             entryRoots(entryClass, entryMethod, entryDescriptor));
 
         Map<Function, Set<Function>> clinitDeps = new LinkedHashMap<>();
-        for (Function c : clinitFunctions) {
+        List<? extends Function> jnLoop39 = clinitFunctions;
+        for (int jnIdx39 = 0; jnIdx39 < jnLoop39.size(); jnIdx39++) {
+            Function c = jnLoop39.get(jnIdx39);
             Set<Function> filtered = new LinkedHashSet<>();
             Integer idxObj = funcIndex.get(c.getName());
             if (idxObj != null) {
@@ -1271,7 +1307,9 @@ public class Analyzer {
 
         Map<Function, Integer> afterMap  = new HashMap<>();
         Map<Function, Integer> beforeMap = new HashMap<>();
-        for (Function p : phaseOrder) {
+        List<? extends Function> jnLoop41 = phaseOrder;
+        for (int jnIdx41 = 0; jnIdx41 < jnLoop41.size(); jnIdx41++) {
+            Function p = jnLoop41.get(jnIdx41);
             int pIdx = funcIndex.get(p.getName());
             int after = 0;
             for (int d : transitiveClosureInt(deps, pIdx)) {
@@ -1304,7 +1342,9 @@ public class Analyzer {
                 + " <clinit>(s) to lazy initialization.");
 
             Set<Function> deferredSet = new HashSet<>();
-            for (Function c : clinitOrder) {
+            List<? extends Function> jnLoop44 = clinitOrder;
+            for (int jnIdx44 = 0; jnIdx44 < jnLoop44.size(); jnIdx44++) {
+                Function c = jnLoop44.get(jnIdx44);
                 if (deferred.contains(c.getName())) deferredSet.add(c);
             }
             clinitOrder.removeIf(deferredSet::contains);
@@ -1315,7 +1355,9 @@ public class Analyzer {
                 Integer idxObj = funcIndex.get(clinitOrder.get(i).getName());
                 if (idxObj != null) trimmedAfterDefer[idxObj] = i;
             }
-            for (Function p : phaseOrder) {
+            List<? extends Function> jnLoop45 = phaseOrder;
+            for (int jnIdx45 = 0; jnIdx45 < jnLoop45.size(); jnIdx45++) {
+                Function p = jnLoop45.get(jnIdx45);
                 int pIdx = funcIndex.get(p.getName());
                 int afterTrimmed = 0;
                 for (int d : transitiveClosureInt(deps, pIdx)) {
@@ -1348,7 +1390,9 @@ public class Analyzer {
             Integer idxObj = funcIndex.get(clinitOrder.get(i).getName());
             if (idxObj != null) trimmedIdx[idxObj] = i;
         }
-        for (Function p : phaseOrder) {
+        List<? extends Function> jnLoop48 = phaseOrder;
+        for (int jnIdx48 = 0; jnIdx48 < jnLoop48.size(); jnIdx48++) {
+            Function p = jnLoop48.get(jnIdx48);
             int pIdx = funcIndex.get(p.getName());
             int after = 0;
             for (int d : transitiveClosureInt(deps, pIdx)) {
@@ -1371,7 +1415,9 @@ public class Analyzer {
         int prevPhaseSlot = 0;
         int groupCounter = 0;
         int currentLevel = -2;
-        for (Function p : phaseOrder) {
+        List<? extends Function> jnLoop51 = phaseOrder;
+        for (int jnIdx51 = 0; jnIdx51 < jnLoop51.size(); jnIdx51++) {
+            Function p = jnLoop51.get(jnIdx51);
             int after  = afterMap.get(p);
             int before = beforeMap.get(p);
             int target = Math.max(after, prevPhaseSlot);
@@ -1521,10 +1567,12 @@ public class Analyzer {
         Set<Function> tainted = new HashSet<>();
         Deque<Function> work = new ArrayDeque<>();
 
-        for (Function f : module.getFunctions()) {
+        List<? extends Function> jnLoop53 = module.getFunctions();
+        for (int jnIdx53 = 0; jnIdx53 < jnLoop53.size(); jnIdx53++) {
+            Function f = jnLoop53.get(jnIdx53);
             if (f.getEntryBlock() == null) continue;
-            for (BasicBlock b : f.getBlocks()) {
-                for (Instruction inst : b.getInstructions()) {
+            for (int bIdx11 = 0; bIdx11 < f.getBlocks().size(); bIdx11++) { BasicBlock b = f.getBlocks().get(bIdx11);
+                for (int instIdx12 = 0; instIdx12 < b.getInstructions().size(); instIdx12++) { Instruction inst = b.getInstructions().get(instIdx12);
                     Opcode op = inst.getOpcode();
                     if (op != Opcode.CALL && op != Opcode.STATIC_CALL && op != Opcode.SPECIAL_CALL
                         && op != Opcode.VIRTUAL_CALL && op != Opcode.INTERFACE_CALL) continue;
@@ -1549,7 +1597,9 @@ public class Analyzer {
         }
 
         Set<String> result = new LinkedHashSet<>();
-        for (Function c : clinitOrder) {
+        List<? extends Function> jnLoop55 = clinitOrder;
+        for (int jnIdx55 = 0; jnIdx55 < jnLoop55.size(); jnIdx55++) {
+            Function c = jnLoop55.get(jnIdx55);
             if (tainted.contains(c)) result.add(c.getName());
         }
         if (!result.isEmpty()) {
@@ -1568,11 +1618,13 @@ public class Analyzer {
     private static Set<String> computeMissingClassClinits(List<Function> clinitOrder,
                                                           DependencyResolver resolver) {
         Set<String> result = new LinkedHashSet<>();
-        for (Function c : clinitOrder) {
+        List<? extends Function> jnLoop56 = clinitOrder;
+        for (int jnIdx56 = 0; jnIdx56 < jnLoop56.size(); jnIdx56++) {
+            Function c = jnLoop56.get(jnIdx56);
             if (c.getEntryBlock() == null) continue;
             scan:
-            for (BasicBlock b : c.getBlocks()) {
-                for (Instruction inst : b.getInstructions()) {
+            for (int bIdx13 = 0; bIdx13 < c.getBlocks().size(); bIdx13++) { BasicBlock b = c.getBlocks().get(bIdx13);
+                for (int instIdx14 = 0; instIdx14 < b.getInstructions().size(); instIdx14++) { Instruction inst = b.getInstructions().get(instIdx14);
                     Opcode op = inst.getOpcode();
                     List<String> owners = new ArrayList<>(3);
                     owners.add(extractTriggerOwner(inst));
@@ -1585,7 +1637,9 @@ public class Analyzer {
                             if (dot > 0 && (paren < 0 || dot < paren)) owners.add(callee.substring(0, dot));
                         }
                     }
-                    for (String owner : owners) {
+                    List<? extends String> jnLoop57 = owners;
+                    for (int jnIdx57 = 0; jnIdx57 < jnLoop57.size(); jnIdx57++) {
+                        String owner = jnLoop57.get(jnIdx57);
                         if (owner == null || owner.isEmpty() || owner.charAt(0) == '[') continue;
                         if (resolver.isMissingClass(owner)) {
                             result.add(c.getName());
@@ -1613,10 +1667,12 @@ public class Analyzer {
         int fieldWords) {
 
         Map<Function, long[]> phaseDirectReadBits = new HashMap<>();
-        for (Function p : phaseOrder) {
+        List<? extends Function> jnLoop58 = phaseOrder;
+        for (int jnIdx58 = 0; jnIdx58 < jnLoop58.size(); jnIdx58++) {
+            Function p = jnLoop58.get(jnIdx58);
             long[] bits = new long[fieldWords];
-            for (BasicBlock b : p.getBlocks()) {
-                for (Instruction inst : b.getInstructions()) {
+            for (int bIdx15 = 0; bIdx15 < p.getBlocks().size(); bIdx15++) { BasicBlock b = p.getBlocks().get(bIdx15);
+                for (int instIdx16 = 0; instIdx16 < b.getInstructions().size(); instIdx16++) { Instruction inst = b.getInstructions().get(instIdx16);
                     if (inst.getOpcode() != Opcode.GET_STATIC) continue;
                     String key = extractStaticFieldKey(inst);
                     if (key == null) continue;
@@ -1635,7 +1691,9 @@ public class Analyzer {
         while (changed && pass++ < MAX_PASSES) {
             changed = false;
 
-            for (Function p : phaseOrder) {
+            List<? extends Function> jnLoop59 = phaseOrder;
+            for (int jnIdx59 = 0; jnIdx59 < jnLoop59.size(); jnIdx59++) {
+                Function p = jnLoop59.get(jnIdx59);
                 int after = afterMap.getOrDefault(p, 0);
                 if (after <= 0) continue;
 
@@ -1670,10 +1728,14 @@ public class Analyzer {
             if (changed) {
                 Map<Function, Integer> trimmedIdx = new HashMap<>();
                 int k = 0;
-                for (Function c : clinitOrder) {
+                List<? extends Function> jnLoop60 = clinitOrder;
+                for (int jnIdx60 = 0; jnIdx60 < jnLoop60.size(); jnIdx60++) {
+                    Function c = jnLoop60.get(jnIdx60);
                     if (!deferred.contains(c.getName())) trimmedIdx.put(c, k++);
                 }
-                for (Function p : phaseOrder) {
+                List<? extends Function> jnLoop61 = phaseOrder;
+                for (int jnIdx61 = 0; jnIdx61 < jnLoop61.size(); jnIdx61++) {
+                    Function p = jnLoop61.get(jnIdx61);
                     Integer prev = afterMap.get(p);
                     if (prev != null && prev > trimmedIdx.size()) afterMap.put(p, trimmedIdx.size());
                 }
@@ -1710,7 +1772,9 @@ public class Analyzer {
         CountDownLatch latch = new CountDownLatch(items.size());
         AtomicReference<Throwable> failure = new AtomicReference<>();
 
-        for (T item : items) {
+        List<? extends T> jnLoop63 = items;
+        for (int jnIdx63 = 0; jnIdx63 < jnLoop63.size(); jnIdx63++) {
+            T item = jnLoop63.get(jnIdx63);
             scheduler.schedule(() -> {
                 try {
                     action.accept(item);
@@ -1826,7 +1890,9 @@ public class Analyzer {
         List<List<Function>> sccs = new ArrayList<>();
         int[] counter = {0};
 
-        for (Function c : clinitOrder) {
+        List<? extends Function> jnLoop65 = clinitOrder;
+        for (int jnIdx65 = 0; jnIdx65 < jnLoop65.size(); jnIdx65++) {
+            Function c = jnLoop65.get(jnIdx65);
             if (!index.containsKey(c)) {
                 strongConnect(c, clinitDeps, index, lowlink, stack, onStack, sccs, counter);
             }
@@ -1840,7 +1906,9 @@ public class Analyzer {
         Map<Integer, Integer> sccLevels = new HashMap<>();
         for (int i = 0; i < sccs.size(); i++) {
             int level = 0;
-            for (Function c : sccs.get(i)) {
+            List<? extends Function> jnLoop66 = sccs.get(i);
+            for (int jnIdx66 = 0; jnIdx66 < jnLoop66.size(); jnIdx66++) {
+                Function c = jnLoop66.get(jnIdx66);
                 Set<Function> deps = clinitDeps.get(c);
                 if (deps == null) continue;
                 for (Function d : deps) {
@@ -1853,11 +1921,15 @@ public class Analyzer {
             sccLevels.put(i, level);
         }
 
-        for (Function c : clinitOrder) {
+        List<? extends Function> jnLoop68 = clinitOrder;
+        for (int jnIdx68 = 0; jnIdx68 < jnLoop68.size(); jnIdx68++) {
+            Function c = jnLoop68.get(jnIdx68);
             Integer scc = clinitToScc.get(c);
             outLevels.put(c, scc != null ? sccLevels.getOrDefault(scc, 0) : 0);
         }
-        for (List<Function> scc : sccs) {
+        List<? extends List<Function>> jnLoop69 = sccs;
+        for (int jnIdx69 = 0; jnIdx69 < jnLoop69.size(); jnIdx69++) {
+            List<Function> scc = jnLoop69.get(jnIdx69);
             if (scc.size() > 1) outCyclic.addAll(scc);
         }
     }
@@ -1935,7 +2007,9 @@ public class Analyzer {
         List<List<Function>> sccs = new ArrayList<>();
         int[] counter = {0};
 
-        for (Function node : nodes) {
+        List<? extends Function> jnLoop70 = nodes;
+        for (int jnIdx70 = 0; jnIdx70 < jnLoop70.size(); jnIdx70++) {
+            Function node = jnLoop70.get(jnIdx70);
             if (!index.containsKey(node)) {
                 strongConnect(node, deps, index, lowlink, stack, onStack, sccs, counter);
             }
@@ -1953,7 +2027,9 @@ public class Analyzer {
 
         Set<Function> members = new HashSet<>(scc);
         Function entry = scc.getFirst();
-        for (Function candidate : scc) {
+        List<? extends Function> jnLoop71 = scc;
+        for (int jnIdx71 = 0; jnIdx71 < jnLoop71.size(); jnIdx71++) {
+            Function candidate = jnLoop71.get(jnIdx71);
             if (compareActivation(candidate, entry, activationDepth) < 0) entry = candidate;
         }
 
@@ -2054,7 +2130,9 @@ public class Analyzer {
         for (int i = 0; i < n; i++) position.put(sorted.get(i), i);
 
         int broken = 0;
-        for (Function f : sorted) {
+        List<? extends Function> jnLoop76 = sorted;
+        for (int jnIdx76 = 0; jnIdx76 < jnLoop76.size(); jnIdx76++) {
+            Function f = jnLoop76.get(jnIdx76);
             Set<Function> successors = deps.get(f);
             if (successors == null || successors.isEmpty()) continue;
             Integer fPos = position.get(f);

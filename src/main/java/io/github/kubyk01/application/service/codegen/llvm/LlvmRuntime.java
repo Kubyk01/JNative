@@ -1,5 +1,6 @@
 package io.github.kubyk01.application.service.codegen.llvm;
 
+import io.github.kubyk01.util.TripleKeyCache;
 import io.github.kubyk01.application.service.analyzer.ssa.TypeResolver;
 import io.github.kubyk01.domain.ir.Type;
 
@@ -44,8 +45,7 @@ public class LlvmRuntime {
     private static final ConcurrentHashMap<String, String> SANITIZE_CACHE =
         new ConcurrentHashMap<>();
 
-    private static final ConcurrentHashMap<String, String> MANGLED_METHOD_CACHE =
-        new ConcurrentHashMap<>();
+    private static final TripleKeyCache<String> MANGLED_METHOD_CACHE = new TripleKeyCache<>();
 
     private static String sanitizeToAsciiIdentifier(String s) {
         if (s == null) return "_";
@@ -120,6 +120,7 @@ public class LlvmRuntime {
             declare void @__jnative_free_fast(i8*)
             declare i32  @__jnative_release_owner(i8*)
             declare void @__jnative_free_owned(i8*)
+            declare void @__jnative_free_container(i8*)
             declare void @__jnative_destruct_dispatch(i8*)
             declare void @__jnative_destruct_dispatch_if_not_same(i8*, i8*)
 
@@ -398,14 +399,12 @@ public class LlvmRuntime {
      * memoises the result.</p>
      */
     public static String mangleMethod(String className, String methodName, String descriptor) {
-        String key = className + '\u0001' + methodName + '\u0001' + descriptor;
-        String cached = MANGLED_METHOD_CACHE.get(key);
+        String cached = MANGLED_METHOD_CACHE.get(className, methodName, descriptor);
         if (cached != null) return cached;
         String result = "fn_" + sanitizeToAsciiIdentifier(className)
             + "_" + sanitizeToAsciiIdentifier(methodName)
             + "_" + sanitizeToAsciiIdentifier(descriptor);
-        MANGLED_METHOD_CACHE.putIfAbsent(key, result);
-        return result;
+        return MANGLED_METHOD_CACHE.putIfAbsent(className, methodName, descriptor, result);
     }
 
     /**
@@ -454,7 +453,9 @@ public class LlvmRuntime {
         StringBuilder sb = new StringBuilder();
         sb.append(LlvmTypeMapper.toLlvmType(retType)).append(" (");
         sb.append(LlvmTypeMapper.toLlvmType(Type.reference(owner)));
-        for (Type pt : paramTypes) {
+        List<? extends Type> jnLoop3 = paramTypes;
+        for (int jnIdx3 = 0; jnIdx3 < jnLoop3.size(); jnIdx3++) {
+            Type pt = jnLoop3.get(jnIdx3);
             sb.append(", ");
             sb.append(LlvmTypeMapper.toLlvmType(LlvmTypeMapper.toCAbiType(pt)));
         }

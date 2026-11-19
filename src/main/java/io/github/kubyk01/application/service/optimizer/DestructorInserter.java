@@ -190,7 +190,9 @@ public class DestructorInserter {
             }
         }
         LlvmUtil.parallelMapOrdered(new ArrayList<>(byFunction.values()), scheduler, pending -> {
-            for (PendingDestructor p : pending) {
+            List<? extends PendingDestructor> jnLoop3 = pending;
+            for (int jnIdx3 = 0; jnIdx3 < jnLoop3.size(); jnIdx3++) {
+                PendingDestructor p = jnLoop3.get(jnIdx3);
                 DestructionPoint dp = p.point();
                 if (!isLiveReference(dp.getObjectRef())) continue;
                 if (!objectRefAvailableAt(dp.getObjectRef(), dp.getBlock())) continue;
@@ -283,7 +285,9 @@ public class DestructorInserter {
         }
 
         Deque<BasicBlock> pending = new ArrayDeque<>();
-        for (Function func : new ArrayList<>(module.getFunctions())) {
+        List<? extends Function> jnLoop6 = new ArrayList<>(module.getFunctions());
+        for (int jnIdx6 = 0; jnIdx6 < jnLoop6.size(); jnIdx6++) {
+            Function func = jnLoop6.get(jnIdx6);
             if (func.getEntryBlock() == null) continue;
             pending.addAll(new ArrayList<>(func.getBlocks()));
         }
@@ -664,7 +668,9 @@ public class DestructorInserter {
         func.addBlock(tail);
 
         List<Instruction> moved = new ArrayList<>(insts.subList(instIdx, insts.size()));
-        for (Instruction m : moved) {
+        List<? extends Instruction> jnLoop8 = moved;
+        for (int jnIdx8 = 0; jnIdx8 < jnLoop8.size(); jnIdx8++) {
+            Instruction m = jnLoop8.get(jnIdx8);
             tail.addInstruction(m);
         }
         while (insts.size() > instIdx) {
@@ -677,7 +683,7 @@ public class DestructorInserter {
             // The successor's PHI operands are indexed by that position, so
             // `tail` has to take `block`'s place rather than being appended.
             Map<BasicBlock, Integer> predIndex = new LinkedHashMap<>();
-            for (BasicBlock succ : oldTerm.getTargets()) {
+            for (int succIdx1 = 0; succIdx1 < oldTerm.getTargets().size(); succIdx1++) { BasicBlock succ = oldTerm.getTargets().get(succIdx1);
                 if (succ == null) continue;
                 int idx = succ.getPredecessors().indexOf(block);
                 if (idx >= 0) predIndex.put(succ, idx);
@@ -694,7 +700,9 @@ public class DestructorInserter {
         }
 
         // ---- 3. Copy exceptional successors and try-range membership ----
-        for (BasicBlock exc : new ArrayList<>(block.getExceptionalSuccessors())) {
+        List<? extends BasicBlock> jnLoop10 = new ArrayList<>(block.getExceptionalSuccessors());
+        for (int jnIdx10 = 0; jnIdx10 < jnLoop10.size(); jnIdx10++) {
+            BasicBlock exc = jnLoop10.get(jnIdx10);
             tail.addExceptionalSuccessor(exc);
 
             // ------------------------------------------------------------------
@@ -726,7 +734,9 @@ public class DestructorInserter {
         }
         List<TryCatchRange> ranges = func.getTryCatchRanges();
         if (ranges != null) {
-            for (TryCatchRange range : ranges) {
+            List<? extends TryCatchRange> jnLoop11 = ranges;
+            for (int jnIdx11 = 0; jnIdx11 < jnLoop11.size(); jnIdx11++) {
+                TryCatchRange range = jnLoop11.get(jnIdx11);
                 if (range.body != null
                     && range.body.contains(block)
                     && !range.body.contains(tail)) {
@@ -742,7 +752,9 @@ public class DestructorInserter {
         // entry per distinct destructor, ordered by first occurrence in
         // the field's points-to set.
         List<Type> chainTypes = new ArrayList<>();
-        for (Type t : destructorTypes) {
+        List<? extends Type> jnLoop12 = destructorTypes;
+        for (int jnIdx12 = 0; jnIdx12 < jnLoop12.size(); jnIdx12++) {
+            Type t = jnLoop12.get(jnIdx12);
             if (findDestructor(t) != null && dispatchKeyName(t) != null) {
                 chainTypes.add(t);
             }
@@ -1043,7 +1055,7 @@ public class DestructorInserter {
         int idx = insts.indexOf(putField);
         if (idx >= 0) {
             for (int i = idx + 1; i < insts.size(); i++) {
-                for (Value op : insts.get(i).getOperands()) {
+                for (int opIdx2 = 0; opIdx2 < insts.get(i).getOperands().size(); opIdx2++) { Value op = insts.get(i).getOperands().get(opIdx2);
                     if (op == null) continue;
                     if (operandReachesAnySite(op, fieldSites)) {
                         return false;
@@ -1053,7 +1065,9 @@ public class DestructorInserter {
         }
         Terminator term = block.getTerminator();
         if (term != null) {
-            for (Value op : terminatorOperands(term)) {
+            List<? extends Value> jnLoop15 = terminatorOperands(term);
+            for (int jnIdx15 = 0; jnIdx15 < jnLoop15.size(); jnIdx15++) {
+                Value op = jnLoop15.get(jnIdx15);
                 if (op == null) continue;
                 if (operandReachesAnySite(op, fieldSites)) {
                     return false;
@@ -1080,7 +1094,9 @@ public class DestructorInserter {
         int[] start = new int[n + 1];
         for (int src = 0; src < n; src++) {
             for (FieldCell cell : graph.fieldCells(src)) {
-                for (int dst : cell.get().rawIds()) {
+                PointsToSet pts = cell.get();
+                for (long c = pts.cursor(); pts.has(c); c = pts.next(c)) {
+                    int dst = pts.id(c);
                     if (destructible[dst]) start[dst + 1]++;
                 }
             }
@@ -1091,7 +1107,9 @@ public class DestructorInserter {
         int[] fields = new int[start[n]];
         for (int src = 0; src < n; src++) {
             for (FieldCell cell : graph.fieldCells(src)) {
-                for (int dst : cell.get().rawIds()) {
+                PointsToSet pts = cell.get();
+                for (long c = pts.cursor(); pts.has(c); c = pts.next(c)) {
+                    int dst = pts.id(c);
                     if (!destructible[dst]) continue;
                     int at = next[dst]++;
                     sources[at] = src;
@@ -1111,14 +1129,16 @@ public class DestructorInserter {
         PointsToGraph graph = aliasResult.getGraph();
         Set<Integer> destroyed = new HashSet<>();
         Deque<Integer> work = new ArrayDeque<>();
-        for (int id : roots.rawIds()) {
+        for (long c = roots.cursor(); roots.has(c); c = roots.next(c)) {
+            int id = roots.id(c);
             if (destroyed.add(id)) work.add(id);
         }
         while (!work.isEmpty()) {
             for (FieldCell cell : graph.fieldCells(work.poll())) {
                 PointsToSet pts = cell.get();
                 if (pts.containsUnknown()) return false;
-                for (int child : pts.rawIds()) {
+                for (long c = pts.cursor(); pts.has(c); c = pts.next(c)) {
+                    int child = pts.id(c);
                     if (isManagedType(AllocationSite.byId(child).getType()) && destroyed.add(child)) {
                         work.add(child);
                     }
@@ -1226,10 +1246,12 @@ public class DestructorInserter {
 
     private Set<Type> collectAllocatedTypes() {
         Set<Type> types = new LinkedHashSet<>();
-        for (Function func : module.getFunctions()) {
+        List<? extends Function> jnLoop25 = module.getFunctions();
+        for (int jnIdx25 = 0; jnIdx25 < jnLoop25.size(); jnIdx25++) {
+            Function func = jnLoop25.get(jnIdx25);
             if (func.getEntryBlock() == null) continue;
-            for (BasicBlock block : func.getBlocks()) {
-                for (Instruction inst : block.getInstructions()) {
+            for (int blockIdx3 = 0; blockIdx3 < func.getBlocks().size(); blockIdx3++) { BasicBlock block = func.getBlocks().get(blockIdx3);
+                for (int instIdx4 = 0; instIdx4 < block.getInstructions().size(); instIdx4++) { Instruction inst = block.getInstructions().get(instIdx4);
                     Opcode op = inst.getOpcode();
                     if (op != Opcode.NEW
                         && op != Opcode.NEW_ARRAY
@@ -1674,7 +1696,9 @@ private void emitDestructionGuard(BasicBlock entry,
         List<FieldNode> ownedFields = collectAllReferenceFields(classNode);
 
         // ---- Fast path: destroy children, then __jnative_free_fast ----
-        for (FieldNode field : ownedFields) {
+        List<? extends FieldNode> jnLoop26 = ownedFields;
+        for (int jnIdx26 = 0; jnIdx26 < jnLoop26.size(); jnIdx26++) {
+            FieldNode field = jnLoop26.get(jnIdx26);
             if ((field.getAccess() & Opcodes.ACC_STATIC) != 0) continue;
             Type fieldType = field.getType();
             if (!isManagedType(fieldType)) continue;
@@ -1704,7 +1728,9 @@ private void emitDestructionGuard(BasicBlock entry,
         bodyFast.setTerminator(new ReturnTerminator(null));
 
         // ---- Slow path: destroy children, unclaim, __jnative_free ----
-        for (FieldNode field : ownedFields) {
+        List<? extends FieldNode> jnLoop27 = ownedFields;
+        for (int jnIdx27 = 0; jnIdx27 < jnLoop27.size(); jnIdx27++) {
+            FieldNode field = jnLoop27.get(jnIdx27);
             if ((field.getAccess() & Opcodes.ACC_STATIC) != 0) continue;
             Type fieldType = field.getType();
             if (!isManagedType(fieldType)) continue;
@@ -1746,7 +1772,9 @@ private void emitDestructionGuard(BasicBlock entry,
                 result.addAll(collectAllReferenceFields(superNode));
             }
         }
-        for (FieldNode field : classNode.getFields()) {
+        List<? extends FieldNode> jnLoop28 = classNode.getFields();
+        for (int jnIdx28 = 0; jnIdx28 < jnLoop28.size(); jnIdx28++) {
+            FieldNode field = jnLoop28.get(jnIdx28);
             if ((field.getAccess() & Opcodes.ACC_STATIC) != 0) continue;
             if (isOuterInstanceField(field.getName())) continue;
             Type ft = field.getType();
@@ -2267,7 +2295,10 @@ private void emitDestructionGuard(BasicBlock entry,
         int index = before == null ? insts.size() : insts.indexOf(before);
         if (index < 0) return;
         if (!noLaterUse(objRef, block, index)) return;
-        Instruction free = new Instruction(Opcode.FREE);
+        Instruction free = new Instruction(Opcode.STATIC_CALL);
+        free.addOperand(new Constant(
+            Type.reference("__jnative_free_container"),
+            "__jnative_free_container"));
         free.addOperand(objRef);
         free.setParent(block);
         insts.add(index, free);
@@ -2341,7 +2372,7 @@ private void emitDestructionGuard(BasicBlock entry,
         if (objRef == null) return true;
         List<Instruction> insts = block.getInstructions();
         for (int i = fromIndex; i < insts.size(); i++) {
-            for (Value op : insts.get(i).getOperands()) {
+            for (int opIdx5 = 0; opIdx5 < insts.get(i).getOperands().size(); opIdx5++) { Value op = insts.get(i).getOperands().get(opIdx5);
                 if (op == objRef) return false;
             }
         }

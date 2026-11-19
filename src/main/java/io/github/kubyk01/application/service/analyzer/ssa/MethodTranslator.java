@@ -183,7 +183,9 @@ public class MethodTranslator extends MethodVisitor {
             slot++;
             ordinal++;
         }
-        for (Type pt : paramTypes) {
+        List<? extends Type> jnLoop1 = paramTypes;
+        for (int jnIdx1 = 0; jnIdx1 < jnLoop1.size(); jnIdx1++) {
+            Type pt = jnLoop1.get(jnIdx1);
             params.add(new Parameter(pt, slot, ordinal));
             slot += (pt == Type.LONG || pt == Type.DOUBLE) ? 2 : 1;
             ordinal++;
@@ -192,7 +194,9 @@ public class MethodTranslator extends MethodVisitor {
         currentFunction = builder.createFunctionWithSlots(mangledName, returnType, params);
         currentFunction.setOwnerClass(methodRef.getOwner());
 
-        for (Parameter p : params) {
+        List<? extends Parameter> jnLoop2 = params;
+        for (int jnIdx2 = 0; jnIdx2 < jnLoop2.size(); jnIdx2++) {
+            Parameter p = jnLoop2.get(jnIdx2);
             frame.setLocal(p.getIndex(), p);
         }
 
@@ -945,7 +949,9 @@ public class MethodTranslator extends MethodVisitor {
 
         Instruction inst = new Instruction(Opcode.INVOKEDYNAMIC);
         inst.setInvokedynamicData(info);
-        for (Value v : captured) {
+        List<? extends Value> jnLoop3 = captured;
+        for (int jnIdx3 = 0; jnIdx3 < jnLoop3.size(); jnIdx3++) {
+            Value v = jnLoop3.get(jnIdx3);
             inst.addOperand(v);
         }
 
@@ -1027,7 +1033,9 @@ public class MethodTranslator extends MethodVisitor {
             }
         }
 
-        for (IndirectBranchTerminator ibt : indirectBranches) {
+        List<? extends IndirectBranchTerminator> jnLoop4 = indirectBranches;
+        for (int jnIdx4 = 0; jnIdx4 < jnLoop4.size(); jnIdx4++) {
+            IndirectBranchTerminator ibt = jnLoop4.get(jnIdx4);
             int var = -1;
             if (ibt.getTargetBlock() instanceof Temporary t
                     && t.getDefiningInstruction() != null) {
@@ -1068,7 +1076,9 @@ public class MethodTranslator extends MethodVisitor {
         // where the offset hook did not fire, so the fix never makes
         // things worse.
         // ------------------------------------------------------------------
-        for (TryCatchRange range : tryCatchRanges) {
+        List<? extends TryCatchRange> jnLoop5 = tryCatchRanges;
+        for (int jnIdx5 = 0; jnIdx5 < jnLoop5.size(); jnIdx5++) {
+            TryCatchRange range = jnLoop5.get(jnIdx5);
             BasicBlock rangeStart   = labelToBlock.get(range.start);
             BasicBlock rangeEnd     = labelToBlock.get(range.end);
             BasicBlock rangeHandler = labelToBlock.get(range.handler);
@@ -1116,7 +1126,9 @@ public class MethodTranslator extends MethodVisitor {
     }
 
     private void addExceptionalEdges() {
-        for (TryCatchRange range : tryCatchRanges) {
+        List<? extends TryCatchRange> jnLoop7 = tryCatchRanges;
+        for (int jnIdx7 = 0; jnIdx7 < jnLoop7.size(); jnIdx7++) {
+            TryCatchRange range = jnLoop7.get(jnIdx7);
             BasicBlock handlerBlock = labelToBlock.get(range.handler);
             if (handlerBlock == null) continue;
 
@@ -1138,9 +1150,11 @@ public class MethodTranslator extends MethodVisitor {
                         startBlock, endBlock, handlerBlock);
             }
 
-            for (BasicBlock block : range.body) {
+            List<? extends BasicBlock> jnLoop8 = range.body;
+            for (int jnIdx8 = 0; jnIdx8 < jnLoop8.size(); jnIdx8++) {
+                BasicBlock block = jnLoop8.get(jnIdx8);
                 if (block == handlerBlock) continue;
-                for (Instruction inst : block.getInstructions()) {
+                for (int instIdx1 = 0; instIdx1 < block.getInstructions().size(); instIdx1++) { Instruction inst = block.getInstructions().get(instIdx1);
                     if (inst.canThrow()) {
                         block.addExceptionalSuccessor(handlerBlock);
                     }

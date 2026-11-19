@@ -41,7 +41,7 @@ public final class SiteSetBuilder {
     }
 
     public void addAll(PointsToSet s) {
-        for (int id : s.rawIds()) add(id);
+        for (long c = s.cursor(); s.has(c); c = s.next(c)) add(s.id(c));
     }
 
     public PointsToSet buildOr(PointsToSet base) {
@@ -49,11 +49,34 @@ public final class SiteSetBuilder {
             clear();
             return base;
         }
+        if (base != null && base.size() >= PointsToSet.DELTA_MIN_BASE && count > base.size() && containsAll(base)) {
+            for (long c = base.cursor(); base.has(c); c = base.next(c)) {
+                int id = base.id(c);
+                words[id >>> 6] &= ~(1L << id);
+            }
+            count -= base.size();
+            int k = drain();
+            return PointsToSet.plus(base, PointsToSet.scratch(0), k);
+        }
         return build();
+    }
+
+    private boolean containsAll(PointsToSet s) {
+        for (long c = s.cursor(); s.has(c); c = s.next(c)) {
+            int id = s.id(c);
+            int w = id >>> 6;
+            if (w >= words.length || (words[w] & (1L << id)) == 0) return false;
+        }
+        return true;
     }
 
     public PointsToSet build() {
         if (count == 0) return PointsToSet.EMPTY;
+        int k = drain();
+        return PointsToSet.intern(PointsToSet.scratch(0), k, false);
+    }
+
+    private int drain() {
         int[] out = PointsToSet.scratch(count);
         Arrays.sort(touched, 0, touchedCount);
         int k = 0;
@@ -70,7 +93,7 @@ public final class SiteSetBuilder {
         }
         touchedCount = 0;
         count = 0;
-        return PointsToSet.intern(out, k, false);
+        return k;
     }
 
     public void clear() {

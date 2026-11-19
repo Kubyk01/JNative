@@ -97,11 +97,11 @@ public final class FreshObjectOwnershipLifetimeStrategy implements LifetimeAnaly
             List<Instruction> roots = new ArrayList<>();
             for (int b = 0; b < n; b++) {
                 BasicBlock block = dom.blockAt(b);
-                for (BasicBlock ex : block.getExceptionalSuccessors()) {
+                for (int exIdx1 = 0; exIdx1 < block.getExceptionalSuccessors().size(); exIdx1++) { BasicBlock ex = block.getExceptionalSuccessors().get(exIdx1);
                     int h = dom.indexOf(ex);
                     if (h >= 0) handler[h] = true;
                 }
-                for (Instruction inst : block.getInstructions()) {
+                for (int instIdx2 = 0; instIdx2 < block.getInstructions().size(); instIdx2++) { Instruction inst = block.getInstructions().get(instIdx2);
                     if (isRoot(inst)) roots.add(inst);
                 }
             }
@@ -127,7 +127,7 @@ public final class FreshObjectOwnershipLifetimeStrategy implements LifetimeAnaly
             if (loadsBySlot == null) {
                 loadsBySlot = new java.util.HashMap<>();
                 for (int b = 0; b < n; b++) {
-                    for (Instruction inst : dom.blockAt(b).getInstructions()) {
+                    for (int instIdx3 = 0; instIdx3 < dom.blockAt(b).getInstructions().size(); instIdx3++) { Instruction inst = dom.blockAt(b).getInstructions().get(instIdx3);
                         if (inst.getOpcode() == Opcode.LOAD && inst.getLocalIndex() >= 0 && inst.getResult() != null) {
                             loadsBySlot.computeIfAbsent(inst.getLocalIndex(), k -> new ArrayList<>()).add(inst);
                         }
@@ -169,7 +169,7 @@ public final class FreshObjectOwnershipLifetimeStrategy implements LifetimeAnaly
                 List<Instruction> insts = block.getInstructions();
                 for (int i = 0; i < insts.size(); i++) {
                     Instruction inst = insts.get(i);
-                    for (Value op : inst.getOperands()) {
+                    for (int opIdx4 = 0; opIdx4 < inst.getOperands().size(); opIdx4++) { Value op = inst.getOperands().get(opIdx4);
                         if (op instanceof Temporary) uses.computeIfAbsent(op, k -> new ArrayList<>()).add(new Use(b, i, inst));
                     }
                 }
@@ -195,7 +195,6 @@ public final class FreshObjectOwnershipLifetimeStrategy implements LifetimeAnaly
                         case CAST, CHECKCAST -> {
                             Value r = inst.getResult();
                             if (r == null) continue;
-                            if (!(r instanceof Temporary)) { why = "r2"; return; }
                             if (!aliases.contains(r)) aliases.add(r);
                             if (aliases.size() > 63) { why = "r3"; return; }
                         }
@@ -216,7 +215,6 @@ public final class FreshObjectOwnershipLifetimeStrategy implements LifetimeAnaly
                                 if (CallShape.has(shape.retainedArgs(), j)) { why = "r7"; return; }
                                 Value r = inst.getResult();
                                 if (CallShape.has(shape.returnedArgs(), j) && r != null && isObject(r.getType())) {
-                                    if (!(r instanceof Temporary)) { why = "r8"; return; }
                                     if (!aliases.contains(r)) aliases.add(r);
                                 }
                             }
@@ -226,7 +224,6 @@ public final class FreshObjectOwnershipLifetimeStrategy implements LifetimeAnaly
                             if (slot < 0 || inst.getOperands().getFirst() != v) { why = "r9"; return; }
                             Value sr = inst.getResult();
                             if (sr != null) {
-                                if (!(sr instanceof Temporary)) { why = "r18"; return; }
                                 if (!aliases.contains(sr)) aliases.add(sr);
                             }
                             if (!slots.contains(slot)) {

@@ -60,10 +60,11 @@ public final class AllocatorLastUseLifetimeStrategy implements LifetimeAnalysisS
                 .sequential());
         LifetimeAnalysisResult result = new LifetimeAnalysisResult();
         if (parts == null) return result;
-        for (LifetimeAnalysisResult part : parts) {
+        {
+            for (int jnIdx2 = 0; jnIdx2 < parts.size(); jnIdx2++) { LifetimeAnalysisResult part = ((List<? extends LifetimeAnalysisResult>) parts).get(jnIdx2);
             result.getDestructionPoints().putAll(part.getDestructionPoints());
             result.getUnresolved().addAll(part.getUnresolved());
-        }
+        } }
         return result;
     }
 
@@ -79,20 +80,22 @@ public final class AllocatorLastUseLifetimeStrategy implements LifetimeAnalysisS
         if (dom == null) return out;
         Map<AllocationSite, Value> allocVals = new HashMap<>();
         List<AllocationSite> withValue = new ArrayList<>();
-        for (AllocationSite site : group) {
+        {
+            for (int jnIdx3 = 0; jnIdx3 < group.size(); jnIdx3++) { AllocationSite site = ((List<? extends AllocationSite>) group).get(jnIdx3);
             EscapeStatus status = escapeResult.getSiteStatus(site);
             if (status == EscapeStatus.GLOBAL || status == EscapeStatus.THREAD || status == EscapeStatus.RETURN) continue;
             Value allocVal = siteToValue.get(site);
             if (allocVal == null) continue;
             allocVals.put(site, allocVal);
             withValue.add(site);
-        }
+        } }
         if (withValue.isEmpty()) return out;
 
         Map<AllocationSite, Set<Value>> aliases = collectAliases(withValue, func, allocVals, aliasResult, liveness);
         Map<Value, List<LivenessAnalyzer.ValueLastUse>> uses = liveness.computeValueLastUses(func);
         Map<BasicBlock, Set<BasicBlock>> funcLoops = loops.getOrDefault(func, Map.of());
-        for (AllocationSite site : withValue) {
+        {
+            for (int jnIdx4 = 0; jnIdx4 < withValue.size(); jnIdx4++) { AllocationSite site = ((List<? extends AllocationSite>) withValue).get(jnIdx4);
             List<DestructionPoint> points = computeSite(site, func, dom, funcLoops, allocVals.get(site),
                     aliases.get(site), uses, liveness);
             if (points == null) {
@@ -100,7 +103,7 @@ public final class AllocatorLastUseLifetimeStrategy implements LifetimeAnalysisS
             } else {
                 out.getDestructionPoints().put(site, new HashSet<>(points));
             }
-        }
+        } }
         return out;
     }
 
@@ -123,13 +126,14 @@ public final class AllocatorLastUseLifetimeStrategy implements LifetimeAnalysisS
         }
 
         List<DestructionPoint> filtered = new ArrayList<>();
-        for (DestructionPoint p : points) {
+        {
+            for (int jnIdx6 = 0; jnIdx6 < points.size(); jnIdx6++) { DestructionPoint p = ((List<? extends DestructionPoint>) points).get(jnIdx6);
             if (!insideLiveLoop(loops, p.getBlock(), site, liveness)) filtered.add(p);
-        }
+        } }
         if (!filtered.isEmpty()) return dedup(filtered, dom);
 
         List<BasicBlock> returnBlocks = new ArrayList<>();
-        for (BasicBlock block : func.getBlocks()) {
+        for (int blockIdx1 = 0; blockIdx1 < func.getBlocks().size(); blockIdx1++) { BasicBlock block = func.getBlocks().get(blockIdx1);
             if (block.getTerminator() instanceof ReturnTerminator) returnBlocks.add(block);
         }
         if (returnBlocks.isEmpty()) return null;
@@ -176,8 +180,8 @@ public final class AllocatorLastUseLifetimeStrategy implements LifetimeAnalysisS
             aliases.add(allocVals.get(byIndex[i]));
             sets.add(aliases);
         }
-        for (BasicBlock block : func.getBlocks()) {
-            for (Instruction inst : block.getInstructions()) {
+        for (int blockIdx2 = 0; blockIdx2 < func.getBlocks().size(); blockIdx2++) { BasicBlock block = func.getBlocks().get(blockIdx2);
+            for (int instIdx3 = 0; instIdx3 < block.getInstructions().size(); instIdx3++) { Instruction inst = block.getInstructions().get(instIdx3);
                 addAlias(inst.getResult(), ids, sets, aliasResult);
                 for (Value op : inst.getOperands()) addAlias(op, ids, sets, aliasResult);
             }
@@ -197,8 +201,8 @@ public final class AllocatorLastUseLifetimeStrategy implements LifetimeAnalysisS
         PointsToSet pts = aliasResult.getPointsTo(v);
         if (pts.isEmpty()) return;
         if (pts.size() <= ids.length) {
-            for (int id : pts.rawIds()) {
-                int i = Arrays.binarySearch(ids, id);
+            for (long c = pts.cursor(); pts.has(c); c = pts.next(c)) {
+                int i = Arrays.binarySearch(ids, pts.id(c));
                 if (i >= 0) sets.get(i).add(v);
             }
         } else {
@@ -211,17 +215,19 @@ public final class AllocatorLastUseLifetimeStrategy implements LifetimeAnalysisS
     private List<DestructionPoint> dedup(List<DestructionPoint> points, DominatorTree dom) {
         List<DestructionPoint> kept = new ArrayList<>();
         Set<BasicBlock> seen = new HashSet<>();
-        for (DestructionPoint p : points) {
+        {
+            for (int jnIdx9 = 0; jnIdx9 < points.size(); jnIdx9++) { DestructionPoint p = ((List<? extends DestructionPoint>) points).get(jnIdx9);
             if (!seen.add(p.getBlock())) continue;
             boolean dominated = false;
-            for (DestructionPoint q : points) {
+            {
+                for (int jnIdx10 = 0; jnIdx10 < points.size(); jnIdx10++) { DestructionPoint q = ((List<? extends DestructionPoint>) points).get(jnIdx10);
                 if (q.getBlock() != p.getBlock() && dom.dominates(q.getBlock(), p.getBlock())) {
                     dominated = true;
                     break;
                 }
-            }
+            } }
             if (!dominated) kept.add(p);
-        }
+        } }
         return kept;
     }
 }

@@ -128,7 +128,9 @@ public final class NativeBodyEscapeAnalyzer {
         if (ownerNode == null) return allEscape();
 
         MethodNode method = null;
-        for (MethodNode m : ownerNode.getMethods()) {
+        List<? extends MethodNode> jnLoop1 = ownerNode.getMethods();
+        for (int jnIdx1 = 0; jnIdx1 < jnLoop1.size(); jnIdx1++) {
+            MethodNode m = jnLoop1.get(jnIdx1);
             if (m.getName().equals(name) && m.getDescriptor().equals(desc)) {
                 method = m;
                 break;
@@ -355,7 +357,9 @@ public final class NativeBodyEscapeAnalyzer {
 
     private static void parseParamsInto(CFunction cf, String params) {
         int index = 0;
-        for (String raw : splitArguments(params)) {
+        List<? extends String> jnLoop2 = splitArguments(params);
+        for (int jnIdx2 = 0; jnIdx2 < jnLoop2.size(); jnIdx2++) {
+            String raw = jnLoop2.get(jnIdx2);
             String p = raw.trim();
             if (p.isEmpty() || p.equals("void")) continue;
 
@@ -554,7 +558,9 @@ public final class NativeBodyEscapeAnalyzer {
             List<String> args = splitArguments(calls.group(2));
 
             boolean anyParameterInArgs = false;
-            for (String arg : args) {
+            List<? extends String> jnLoop5 = args;
+            for (int jnIdx5 = 0; jnIdx5 < jnLoop5.size(); jnIdx5++) {
+                String arg = jnLoop5.get(jnIdx5);
                 for (String paramName : function.paramIndex.keySet()) {
                     if (containsIdentifier(arg, paramName)) {
                         anyParameterInArgs = true;
@@ -569,7 +575,9 @@ public final class NativeBodyEscapeAnalyzer {
                     resolveHelperSummary(functions, owner, callee);
 
             if (calleeSummary == null) {
-                for (String arg : args) {
+                List<? extends String> jnLoop7 = args;
+                for (int jnIdx7 = 0; jnIdx7 < jnLoop7.size(); jnIdx7++) {
+                    String arg = jnLoop7.get(jnIdx7);
                     for (Map.Entry<String, Integer> p
                             : function.paramIndex.entrySet()) {
                         if (containsIdentifier(arg, p.getKey())) {

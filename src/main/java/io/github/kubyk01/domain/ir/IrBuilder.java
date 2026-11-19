@@ -42,9 +42,10 @@ public class IrBuilder {
      */
     public Function createFunctionWithSlots(String name, Type returnType, List<Parameter> params) {
         Function func = new Function(name, returnType);
-        for (Parameter p : params) {
+        {
+            for (int jnIdx1 = 0; jnIdx1 < params.size(); jnIdx1++) { Parameter p = ((List<? extends Parameter>) params).get(jnIdx1);
             func.addParameter(p);
-        }
+        } }
         module.addFunction(func);
         currentFunction = func;
         return func;

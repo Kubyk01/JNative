@@ -29,7 +29,7 @@ public class BasicBlock {
 
     public void setTerminator(Terminator terminator) {
         if (this.terminator != null) {
-            for (BasicBlock oldTarget : this.terminator.getTargets()) {
+            for (int oldTargetIdx1 = 0; oldTargetIdx1 < this.terminator.getTargets().size(); oldTargetIdx1++) { BasicBlock oldTarget = this.terminator.getTargets().get(oldTargetIdx1);
                 if (oldTarget != null) {
                     removeSuccessor(oldTarget);
                 }
@@ -38,7 +38,7 @@ public class BasicBlock {
         this.terminator = terminator;
         if (terminator == null) return;
         terminator.setBlock(this);
-        for (BasicBlock target : terminator.getTargets()) {
+        for (int targetIdx2 = 0; targetIdx2 < terminator.getTargets().size(); targetIdx2++) { BasicBlock target = terminator.getTargets().get(targetIdx2);
             if (target != null) {
                 addSuccessor(target);
             }
@@ -87,7 +87,9 @@ public class BasicBlock {
         if (merged != null) return merged;
         List<BasicBlock> all = new ArrayList<>(successors.size() + exceptionalSuccessors.size());
         all.addAll(successors);
-        for (BasicBlock ex : exceptionalSuccessors) {
+        List<? extends BasicBlock> jnLoop1 = exceptionalSuccessors;
+        for (int jnIdx1 = 0; jnIdx1 < jnLoop1.size(); jnIdx1++) {
+            BasicBlock ex = jnLoop1.get(jnIdx1);
             if (!all.contains(ex)) all.add(ex);
         }
         merged = Collections.unmodifiableList(all);
@@ -100,7 +102,9 @@ public class BasicBlock {
         StringBuilder sb = new StringBuilder();
         sb.append(label).append(":\n");
         int idx = 0;
-        for (Instruction inst : instructions) {
+        List<? extends Instruction> jnLoop2 = instructions;
+        for (int jnIdx2 = 0; jnIdx2 < jnLoop2.size(); jnIdx2++) {
+            Instruction inst = jnLoop2.get(jnIdx2);
             sb.append("  ").append(idx++).append(": ").append(inst).append("\n");
         }
         if (terminator != null) {

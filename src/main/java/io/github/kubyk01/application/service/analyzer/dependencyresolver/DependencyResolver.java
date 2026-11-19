@@ -1,5 +1,6 @@
 package io.github.kubyk01.application.service.analyzer.dependencyresolver;
 
+import io.github.kubyk01.util.TripleKeyCache;
 import io.github.kubyk01.domain.analyzer.Discoverable;
 
 import io.github.kubyk01.application.service.analyzer.reachabilityanalysis.ReachabilityMetadataParser;
@@ -22,6 +23,7 @@ import org.objectweb.asm.FieldVisitor;
 import org.objectweb.asm.MethodVisitor;
 import org.objectweb.asm.Opcodes;
 
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.io.InputStream;
@@ -58,9 +60,8 @@ import java.util.zip.ZipInputStream;
 @RequiredArgsConstructor
 public class DependencyResolver {
 
-    private record MethodKey(String owner, String name, String desc) {}
     private record MethodResult(MethodNode method, String foundOwner) {}
-    private final Map<MethodKey, MethodResult> methodCache = new ConcurrentHashMap<>();
+    private final TripleKeyCache<MethodResult> methodCache = new TripleKeyCache<>();
 
     private static final String NATIVE_IMAGE_METADATA_PREFIX = "META-INF/native-image/";
 
@@ -562,7 +563,9 @@ public class DependencyResolver {
             if (!dependencyJars.isEmpty()) {
                 System.out.println("Loading " + dependencyJars.size()
                         + " Maven dependency jar(s) declared in META-INF/maven/*/pom.xml");
-                for (Path depJar : dependencyJars) {
+                List<? extends Path> jnLoop13 = dependencyJars;
+                for (int jnIdx13 = 0; jnIdx13 < jnLoop13.size(); jnIdx13++) {
+                    Path depJar = jnLoop13.get(jnIdx13);
                     System.out.println("  " + depJar.getFileName());
                     // Load the dependency's classes, skipping any class whose name
                     // is already in the map — the input jar must always win.
@@ -573,7 +576,9 @@ public class DependencyResolver {
                 if (!referencedJars.isEmpty()) {
                     System.out.println("Loading " + referencedJars.size()
                             + " additional jar(s) that provide classes referenced by the application");
-                    for (Path extraJar : referencedJars) {
+                    List<? extends Path> jnLoop14 = referencedJars;
+                    for (int jnIdx14 = 0; jnIdx14 < jnLoop14.size(); jnIdx14++) {
+                        Path extraJar = jnLoop14.get(jnIdx14);
                         System.out.println("  " + extraJar.getFileName());
                         scanJar(extraJar, true);
                     }
@@ -662,7 +667,9 @@ public class DependencyResolver {
         try {
             ReachabilityMetadata metadata = ReachabilityMetadataParser.parse(is, fileName);
             reachabilityMetadata.merge(metadata);
-            for (ReachabilityMetadata.ProxyInterface proxy : metadata.getProxyInterfaces()) {
+            List<? extends ReachabilityMetadata.ProxyInterface> jnLoop15 = metadata.getProxyInterfaces();
+            for (int jnIdx15 = 0; jnIdx15 < jnLoop15.size(); jnIdx15++) {
+                ReachabilityMetadata.ProxyInterface proxy = jnLoop15.get(jnIdx15);
                 if (!proxy.getInterfaces().isEmpty()) {
                     proxyInterfaces.add(new ArrayList<>(proxy.getInterfaces()));
                 }
@@ -701,7 +708,7 @@ public class DependencyResolver {
                     manifest = zis.readAllBytes();
                 } else if (entryName.startsWith(NATIVE_IMAGE_METADATA_PREFIX)
                         && entryName.endsWith(".json")) {
-                    parseMetadataStream(zis, nestedName + "!/" + entryName);
+                    parseMetadataStream(new ByteArrayInputStream(zis.readAllBytes()), nestedName + "!/" + entryName);
                 } else if (entryName.startsWith(SERVICES_PREFIX) && !entry.isDirectory()) {
                     addServiceFile(entryName, zis.readAllBytes());
                 }
@@ -711,7 +718,9 @@ public class DependencyResolver {
         } catch (IOException e) {
             log.warn("Failed to index nested jar {}: {}", nestedName, e.getMessage());
         }
-        for (String internalName : nestedClasses) {
+        List<? extends String> jnLoop16 = nestedClasses;
+        for (int jnIdx16 = 0; jnIdx16 < jnLoop16.size(); jnIdx16++) {
+            String internalName = jnLoop16.get(jnIdx16);
             recordPackageSource(internalName, location, manifest);
         }
     }
@@ -745,7 +754,9 @@ public class DependencyResolver {
         int before = classBytes.size();
         try {
             JImage image = jdkImage();
-            for (String name : image.classNames()) {
+            List<? extends String> jnLoop17 = image.classNames();
+            for (int jnIdx17 = 0; jnIdx17 < jnLoop17.size(); jnIdx17++) {
+                String name = jnLoop17.get(jnIdx17);
                 if (classBytes.containsKey(name)) continue;
                 try {
                     parseClassBytes(name, image.readClass(name));
@@ -864,7 +875,9 @@ public class DependencyResolver {
             if (cn.getSuperName() != null) {
                 indexSubtype(cn.getSuperName(), cn.getName());
             }
-            for (String iface : cn.getInterfaces()) {
+            List<? extends String> jnLoop20 = cn.getInterfaces();
+            for (int jnIdx20 = 0; jnIdx20 < jnLoop20.size(); jnIdx20++) {
+                String iface = jnLoop20.get(jnIdx20);
                 indexSubtype(iface, cn.getName());
             }
         }
@@ -1018,7 +1031,9 @@ public class DependencyResolver {
             indexSubtype(classNode.getSuperName(), name);
         }
         if (!isArrayTypeName(name)) {
-            for (String iface : classNode.getInterfaces()) {
+            List<? extends String> jnLoop21 = classNode.getInterfaces();
+            for (int jnIdx21 = 0; jnIdx21 < jnLoop21.size(); jnIdx21++) {
+                String iface = jnLoop21.get(jnIdx21);
                 indexSubtype(iface, name);
             }
         }
@@ -1027,7 +1042,9 @@ public class DependencyResolver {
     public MethodNode getMethodNode(String className, String methodName, String descriptor) {
         ClassNode cn = classMap.get(className);
         if (cn == null) return null;
-        for (MethodNode mn : cn.getMethods()) {
+        List<? extends MethodNode> jnLoop22 = cn.getMethods();
+        for (int jnIdx22 = 0; jnIdx22 < jnLoop22.size(); jnIdx22++) {
+            MethodNode mn = jnLoop22.get(jnIdx22);
             if (mn.getName().equals(methodName) && mn.getDescriptor().equals(descriptor)) {
                 return mn;
             }
@@ -1043,11 +1060,10 @@ public class DependencyResolver {
     }
 
     private MethodResult resolveMethod(String className, String methodName, String descriptor) {
-        MethodKey key = new MethodKey(className, methodName, descriptor);
-        MethodResult cached = methodCache.get(key);
+        MethodResult cached = methodCache.get(className, methodName, descriptor);
         if (cached != null) return cached;
         MethodResult result = resolveMethodUncached(className, methodName, descriptor);
-        if (result != null) methodCache.put(key, result);
+        if (result != null) methodCache.putIfAbsent(className, methodName, descriptor, result);
         return result;
     }
 
@@ -1058,12 +1074,16 @@ public class DependencyResolver {
             cn = classMap.get(className);
             if (cn == null) return null;
         }
-        for (MethodNode mn : cn.getMethods()) {
+        List<? extends MethodNode> jnLoop23 = cn.getMethods();
+        for (int jnIdx23 = 0; jnIdx23 < jnLoop23.size(); jnIdx23++) {
+            MethodNode mn = jnLoop23.get(jnIdx23);
             if (mn.getName().equals(methodName) && mn.getDescriptor().equals(descriptor)) {
                 return new MethodResult(mn, className);
             }
         }
-        for (MethodNode mn : cn.getMethods()) {
+        List<? extends MethodNode> jnLoop24 = cn.getMethods();
+        for (int jnIdx24 = 0; jnIdx24 < jnLoop24.size(); jnIdx24++) {
+            MethodNode mn = jnLoop24.get(jnIdx24);
             if (mn.getName().equals(methodName) && mn.isPolymorphicSignature()) {
                 return new MethodResult(mn, className);
             }
@@ -1076,7 +1096,9 @@ public class DependencyResolver {
             best = resolveMethod("java/lang/Object", methodName, descriptor);
         }
         if (best != null && !classMap.get(best.foundOwner()).isInterface()) return best;
-        for (String iface : cn.getInterfaces()) {
+        List<? extends String> jnLoop25 = cn.getInterfaces();
+        for (int jnIdx25 = 0; jnIdx25 < jnLoop25.size(); jnIdx25++) {
+            String iface = jnLoop25.get(jnIdx25);
             if (iface.equals(className)) continue;
             MethodResult r = resolveMethod(iface, methodName, descriptor);
             if (r == null) continue;
@@ -1092,7 +1114,9 @@ public class DependencyResolver {
     private boolean extendsInterface(String sub, String sup) {
         ClassNode cn = classMap.get(sub);
         if (cn == null) return false;
-        for (String iface : cn.getInterfaces()) {
+        List<? extends String> jnLoop26 = cn.getInterfaces();
+        for (int jnIdx26 = 0; jnIdx26 < jnLoop26.size(); jnIdx26++) {
+            String iface = jnLoop26.get(jnIdx26);
             if (iface.equals(sup) || extendsInterface(iface, sup)) return true;
         }
         return false;
@@ -1108,7 +1132,9 @@ public class DependencyResolver {
             if (cn == null) return null;
         }
 
-        for (FieldNode f : cn.getFields()) {
+        List<? extends FieldNode> jnLoop27 = cn.getFields();
+        for (int jnIdx27 = 0; jnIdx27 < jnLoop27.size(); jnIdx27++) {
+            FieldNode f = jnLoop27.get(jnIdx27);
             if (f.getName().equals(fieldName)) {
                 if (f.getOwner() == null) {
                     f.setOwner(cn.getName());
@@ -1123,7 +1149,9 @@ public class DependencyResolver {
             if (inherited != null) return inherited;
         }
 
-        for (String iface : cn.getInterfaces()) {
+        List<? extends String> jnLoop28 = cn.getInterfaces();
+        for (int jnIdx28 = 0; jnIdx28 < jnLoop28.size(); jnIdx28++) {
+            String iface = jnLoop28.get(jnIdx28);
             FieldNode ifaceField = getField(iface, fieldName);
             if (ifaceField != null) return ifaceField;
         }

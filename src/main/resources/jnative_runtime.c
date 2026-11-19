@@ -539,6 +539,100 @@ void __jnative_free_owned(void* p) {
     if (__jnative_release_owner(p)) __jnative_free(p);
 }
 
+enum {
+    JN_BOX_ARRAY_FIELD,
+    JN_BOX_HASH_TABLE
+};
+
+typedef struct {
+    const char* class_name;
+    const char* field_name;
+    int         kind;
+    void*       vtable;
+    int         offset;
+} JNativeContainerKind;
+
+static JNativeContainerKind jnative_containers[] = {
+    { "java/util/ArrayList",       "elementData", JN_BOX_ARRAY_FIELD, NULL, -1 },
+    { "java/util/ArrayDeque",      "elements",    JN_BOX_ARRAY_FIELD, NULL, -1 },
+    { "java/util/PriorityQueue",   "queue",       JN_BOX_ARRAY_FIELD, NULL, -1 },
+    { "java/util/IdentityHashMap", "table",       JN_BOX_ARRAY_FIELD, NULL, -1 },
+    { "java/lang/StringBuilder",   "value",       JN_BOX_ARRAY_FIELD, NULL, -1 },
+    { "java/util/HashMap",         "table",       JN_BOX_HASH_TABLE,  NULL, -1 },
+    { "java/util/LinkedHashMap",   "table",       JN_BOX_HASH_TABLE,  NULL, -1 },
+};
+
+#define JN_CONTAINER_COUNT ((int)(sizeof(jnative_containers) / sizeof(jnative_containers[0])))
+
+static jn_once_t jnative_containers_once = JN_ONCE_INIT;
+static int       jnative_node_next_offset = -1;
+
+static void jnative_containers_init(void) {
+    for (int i = 0; i < JN_CONTAINER_COUNT; i++) {
+        JNativeContainerKind* k = &jnative_containers[i];
+        ReflectionClass* cls = jnative_class_by_name(k->class_name);
+        if (cls == NULL) continue;
+        int off = jnative_field_offset_in(cls, k->field_name);
+        if (off <= 0) continue;
+        void* vt = jnative_lookup_class_vtable(cls);
+        if (vt == NULL) continue;
+        k->offset = off;
+        k->vtable = vt;
+    }
+    int next = jnative_field_offset_in(jnative_class_by_name("java/util/HashMap$Node"), "next");
+    if (next > 0) {
+        jnative_node_next_offset = next;
+    } else {
+        for (int i = 0; i < JN_CONTAINER_COUNT; i++) {
+            if (jnative_containers[i].kind == JN_BOX_HASH_TABLE) jnative_containers[i].vtable = NULL;
+        }
+    }
+}
+
+static void jnative_free_array_storage(void* arr) {
+    if (arr == NULL) return;
+    if (*(int32_t*)((char*)arr + JAVA_ARR_LENGTH_OFFSET) <= 0) return;
+    __jnative_free(arr);
+}
+
+static void jnative_free_hash_table(void* table) {
+    if (table == NULL) return;
+    int32_t len = *(int32_t*)((char*)table + JAVA_ARR_LENGTH_OFFSET);
+    if (len <= 0) return;
+    void** slots = (void**)((char*)table + JAVA_ARR_HDR);
+    for (int32_t i = 0; i < len; i++) {
+        void* node = slots[i];
+        while (node != NULL) {
+            void* next = *(void**)((char*)node + jnative_node_next_offset);
+            __jnative_free(node);
+            node = next;
+        }
+    }
+    __jnative_free(table);
+}
+
+void __jnative_free_container(void* p) {
+    if (p == NULL) return;
+    uintptr_t addr = (uintptr_t)p;
+    if (jnative_static_low != 0 && jnative_static_high != 0
+        && addr >= jnative_static_low && addr < jnative_static_high) {
+        return;
+    }
+    void* vt = *(void**)p;
+    if (vt != NULL) {
+        jn_once(&jnative_containers_once, jnative_containers_init);
+        for (int i = 0; i < JN_CONTAINER_COUNT; i++) {
+            JNativeContainerKind* k = &jnative_containers[i];
+            if (k->vtable != vt) continue;
+            void* inner = *(void**)((char*)p + k->offset);
+            if (k->kind == JN_BOX_HASH_TABLE) jnative_free_hash_table(inner);
+            else jnative_free_array_storage(inner);
+            break;
+        }
+    }
+    __jnative_free(p);
+}
+
 /* ========================================================================
  *  Monitor table
  * ====================================================================== */

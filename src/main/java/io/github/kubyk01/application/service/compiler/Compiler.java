@@ -218,7 +218,9 @@ public class Compiler implements CompilerPort {
             tasks.add(new CompileTask(runtimeImage.table(), cDir.resolve("jnative_runtime_files.o"), SourceKind.C));
             tasks.add(new CompileTask(runtimeImage.assembly(), cDir.resolve("jnative_runtime_image.o"), SourceKind.ASSEMBLY));
 
-            for (Path src : extraSources) {
+            List<? extends Path> jnLoop1 = extraSources;
+            for (int jnIdx1 = 0; jnIdx1 < jnLoop1.size(); jnIdx1++) {
+                Path src = jnLoop1.get(jnIdx1);
                 Path rel = tempDir.relativize(src);
                 Path objWithPath = cDir.resolve(
                         rel.toString().replaceAll("\\.c$", ".o"));
@@ -232,7 +234,9 @@ public class Compiler implements CompilerPort {
             }
 
             int irIndex = 0;
-            for (Path ll : llPaths) {
+            List<? extends Path> jnLoop2 = llPaths;
+            for (int jnIdx2 = 0; jnIdx2 < jnLoop2.size(); jnIdx2++) {
+                Path ll = jnLoop2.get(jnIdx2);
                 String base = sanitizeForObjName(ll.getFileName().toString());
                 Path obj = tempDir.resolve("ir")
                         .resolve(String.format("%05d_%s.o", irIndex++, base));
@@ -317,7 +321,9 @@ public class Compiler implements CompilerPort {
                 // storm.
                 if (target.isWindows()) {
                     List<Path> gccRuntimeDirs = findGccRuntimeLibDirs(target);
-                    for (Path dir : gccRuntimeDirs) {
+                    List<? extends Path> jnLoop3 = gccRuntimeDirs;
+                    for (int jnIdx3 = 0; jnIdx3 < jnLoop3.size(); jnIdx3++) {
+                        Path dir = jnLoop3.get(jnIdx3);
                         linkCmd.add("-L" + dir);
                     }
                     Path ehFallbackDir = ensureLibgccEh(target, gccRuntimeDirs, tempDir);
@@ -336,7 +342,9 @@ public class Compiler implements CompilerPort {
             }
 
             List<String> objectLines = new ArrayList<>(tasks.size());
-            for (CompileTask task : tasks) {
+            List<? extends CompileTask> jnLoop4 = tasks;
+            for (int jnIdx4 = 0; jnIdx4 < jnLoop4.size(); jnIdx4++) {
+                CompileTask task = jnLoop4.get(jnIdx4);
                 String objPath = task.obj.toAbsolutePath().toString().replace('\\', '/');
                 objectLines.add("\"" + objPath + "\"");
             }
@@ -391,7 +399,9 @@ public class Compiler implements CompilerPort {
         @Override
         public void close() throws IOException {
             try (var paths = Files.walk(path)) {
-                for (Path entry : paths.sorted(Comparator.reverseOrder()).toList()) {
+                List<? extends Path> jnLoop5 = paths.sorted(Comparator.reverseOrder()).toList();
+                for (int jnIdx5 = 0; jnIdx5 < jnLoop5.size(); jnIdx5++) {
+                    Path entry = jnLoop5.get(jnIdx5);
                     Files.deleteIfExists(entry);
                 }
             }
@@ -481,7 +491,9 @@ public class Compiler implements CompilerPort {
                                        List<Path> gccRuntimeDirs,
                                        Path tempDir) {
         Path firstLibgcc = null;
-        for (Path dir : gccRuntimeDirs) {
+        List<? extends Path> jnLoop7 = gccRuntimeDirs;
+        for (int jnIdx7 = 0; jnIdx7 < jnLoop7.size(); jnIdx7++) {
+            Path dir = jnLoop7.get(jnIdx7);
             Path eh = dir.resolve("libgcc_eh.a");
             if (Files.isRegularFile(eh)) {
                 return null;
@@ -982,7 +994,9 @@ public class Compiler implements CompilerPort {
                 Path mingwW64Root = Paths.get(pf, "mingw-w64");
                 if (!Files.isDirectory(mingwW64Root)) continue;
                 try (var stream = Files.list(mingwW64Root)) {
-                    for (Path sub : stream.toList()) {
+                    List<? extends Path> jnLoop12 = stream.toList();
+                    for (int jnIdx12 = 0; jnIdx12 < jnLoop12.size(); jnIdx12++) {
+                        Path sub = jnLoop12.get(jnIdx12);
                         if (!Files.isDirectory(sub)) continue;
                         for (String triple : new String[]{
                                 "mingw64", "mingw32", "x86_64-w64-mingw32" }) {
@@ -1244,14 +1258,18 @@ public class Compiler implements CompilerPort {
 
         List<CompileTask> scheduledTasks = new ArrayList<>(tasks);
         Map<Path, Long> sourceSizes = new HashMap<>();
-        for (CompileTask task : scheduledTasks) {
+        List<? extends CompileTask> jnLoop15 = scheduledTasks;
+        for (int jnIdx15 = 0; jnIdx15 < jnLoop15.size(); jnIdx15++) {
+            CompileTask task = jnLoop15.get(jnIdx15);
             sourceSizes.put(task.src, Files.size(task.src));
         }
         scheduledTasks.sort(Comparator.comparingLong(
                 (CompileTask task) -> sourceSizes.get(task.src)).reversed());
 
         if (threadCount <= 1 || tasks.size() <= 1) {
-            for (CompileTask task : scheduledTasks) {
+            List<? extends CompileTask> jnLoop16 = scheduledTasks;
+            for (int jnIdx16 = 0; jnIdx16 < jnLoop16.size(); jnIdx16++) {
+                CompileTask task = jnLoop16.get(jnIdx16);
                 compileOne(compiler, task, includeDir, optimizationLevel,
                         ltoFlag, target, sysroot, msvcToolchain);
             }
@@ -1285,7 +1303,9 @@ public class Compiler implements CompilerPort {
 
         pool.shutdown();
         try {
-            for (Future<?> f : futures) {
+            List<? extends Future<?>> jnLoop17 = futures;
+            for (int jnIdx17 = 0; jnIdx17 < jnLoop17.size(); jnIdx17++) {
+                Future<?> f = jnLoop17.get(jnIdx17);
                 try { f.get(); }
                 catch (ExecutionException ee) {
                     failures.add(ee.getCause() != null ? ee.getCause() : ee);
@@ -1503,7 +1523,9 @@ public class Compiler implements CompilerPort {
         //    bare `declare` and has no body to export.
         // ------------------------------------------------------------------
         Set<String> definedFunctions = new HashSet<>();
-        for (Function f : module.getFunctions()) {
+        List<? extends Function> jnLoop19 = module.getFunctions();
+        for (int jnIdx19 = 0; jnIdx19 < jnLoop19.size(); jnIdx19++) {
+            Function f = jnLoop19.get(jnIdx19);
             if (f.getEntryBlock() == null) continue;
             definedFunctions.add(f.getName());
         }
@@ -1519,7 +1541,9 @@ public class Compiler implements CompilerPort {
         // ------------------------------------------------------------------
         Set<String> definedGlobals = new HashSet<>();
         boolean moduleFound = false;
-        for (Path ll : llPaths) {
+        List<? extends Path> jnLoop20 = llPaths;
+        for (int jnIdx20 = 0; jnIdx20 < jnLoop20.size(); jnIdx20++) {
+            Path ll = jnLoop20.get(jnIdx20);
             String fileName = ll.getFileName().toString();
             if (!fileName.equals("_module.ll") && !fileName.startsWith("_globals")) continue;
             moduleFound = true;
@@ -1824,7 +1848,9 @@ public class Compiler implements CompilerPort {
                                               TargetPlatform target, Path extractDir) throws IOException {
 
         boolean usesJni = false;
-        for (io.github.kubyk01.domain.ir.Function f : module.getFunctions()) {
+        List<? extends io.github.kubyk01.domain.ir.Function> jnLoop26 = module.getFunctions();
+        for (int jnIdx26 = 0; jnIdx26 < jnLoop26.size(); jnIdx26++) {
+            io.github.kubyk01.domain.ir.Function f = jnLoop26.get(jnIdx26);
             if (f.isJniNative()) {
                 usesJni = true;
                 break;
@@ -1916,7 +1942,9 @@ public class Compiler implements CompilerPort {
         String[] tokens = entry.toLowerCase(Locale.ROOT).split("[/\\\\.\\-_]");
         boolean sawOs = false;
         for (Map.Entry<String, List<String>> o : OS_ALIASES.entrySet()) {
-            for (String alias : o.getValue()) {
+            List<? extends String> jnLoop29 = o.getValue();
+            for (int jnIdx29 = 0; jnIdx29 < jnLoop29.size(); jnIdx29++) {
+                String alias = jnLoop29.get(jnIdx29);
                 for (String t : tokens) {
                     if (!t.equals(alias)) continue;
                     if (o.getKey().equals(os)) {
@@ -2000,7 +2028,9 @@ public class Compiler implements CompilerPort {
         String[] tokens = entry.toLowerCase(Locale.ROOT).split("[/\\\\.-]");
         String matched = null;
         for (Map.Entry<String, List<String>> a : ARCH_ALIASES.entrySet()) {
-            for (String alias : a.getValue()) {
+            List<? extends String> jnLoop33 = a.getValue();
+            for (int jnIdx33 = 0; jnIdx33 < jnLoop33.size(); jnIdx33++) {
+                String alias = jnLoop33.get(jnIdx33);
                 for (String t : tokens) {
                     if (t.equals(alias) || t.endsWith("_" + alias)) {
                         if (a.getKey().equals(arch)) return true;
@@ -2018,13 +2048,17 @@ public class Compiler implements CompilerPort {
 
     private List<Path> resolveNativeLoadOrder(List<Path> roots, TargetPlatform target) {
         Set<Path> dirs = new LinkedHashSet<>();
-        for (Path lib : roots) {
+        List<? extends Path> jnLoop35 = roots;
+        for (int jnIdx35 = 0; jnIdx35 < jnLoop35.size(); jnIdx35++) {
+            Path lib = jnLoop35.get(jnIdx35);
             Path parent = lib.toAbsolutePath().getParent();
             if (parent != null) dirs.add(parent);
         }
         LinkedHashSet<Path> ordered = new LinkedHashSet<>();
         Set<Path> visiting = new HashSet<>();
-        for (Path lib : roots) {
+        List<? extends Path> jnLoop36 = roots;
+        for (int jnIdx36 = 0; jnIdx36 < jnLoop36.size(); jnIdx36++) {
+            Path lib = jnLoop36.get(jnIdx36);
             visitNativeLibrary(lib.toAbsolutePath(), dirs, target, ordered, visiting);
         }
         return new ArrayList<>(ordered);
@@ -2076,11 +2110,15 @@ public class Compiler implements CompilerPort {
     private Set<String> collectReferencedNativeClasses(Module module,
                                                        DependencyResolver resolver) {
         Set<String> result = new HashSet<>();
-        for (String cls : new ArrayList<>(resolver.getClassMap().keySet())) {
+        List<? extends String> jnLoop39 = new ArrayList<>(resolver.getClassMap().keySet());
+        for (int jnIdx39 = 0; jnIdx39 < jnLoop39.size(); jnIdx39++) {
+            String cls = jnLoop39.get(jnIdx39);
             if (!hasNativeSupport(cls)) continue;
             ClassNode cn = resolver.getClassNode(cls);
             if (cn == null || cn.isExternal()) continue;
-            for (MethodNode mn : cn.getMethods()) {
+            List<? extends MethodNode> jnLoop40 = cn.getMethods();
+            for (int jnIdx40 = 0; jnIdx40 < jnLoop40.size(); jnIdx40++) {
+                MethodNode mn = jnLoop40.get(jnIdx40);
                 if (!mn.isNative()) continue;
                 String nativeName = "__jnative_" + LlvmRuntime.mangleMethod(
                         cls, mn.getName(), mn.getDescriptor());

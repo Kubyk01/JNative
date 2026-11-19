@@ -30,6 +30,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.LockSupport;
+import java.util.function.IntConsumer;
 
 import static io.github.kubyk01.util.LlvmUtil.canonicalCalleeKey;
 import static io.github.kubyk01.util.LlvmUtil.extractCalleeName;
@@ -84,6 +85,7 @@ public class InterproceduralPointsTo {
     private final AtomicLong nextProgress = new AtomicLong(PROGRESS_LOG_INTERVAL);
     private final AtomicReference<Throwable> failure = new AtomicReference<>();
     private volatile boolean aborted;
+    private final IntConsumer enqueuer = this::enqueueById;
 
     private Map<Function, FnState> stateOf;
     private FnState[] states;
@@ -171,7 +173,9 @@ public class InterproceduralPointsTo {
         collectAllocationSites();
 
         List<Function> live = new ArrayList<>();
-        for (Function func : module.getFunctions()) {
+        List<? extends Function> jnLoop1 = module.getFunctions();
+        for (int jnIdx1 = 0; jnIdx1 < jnLoop1.size(); jnIdx1++) {
+            Function func = jnLoop1.get(jnIdx1);
             if (func.getEntryBlock() != null) live.add(func);
         }
         states = new FnState[live.size()];
@@ -219,11 +223,13 @@ public class InterproceduralPointsTo {
     }
 
     private void collectAllocationSites() {
-        for (Function func : module.getFunctions()) {
+        List<? extends Function> jnLoop2 = module.getFunctions();
+        for (int jnIdx2 = 0; jnIdx2 < jnLoop2.size(); jnIdx2++) {
+            Function func = jnLoop2.get(jnIdx2);
             if (func.getEntryBlock() == null) continue;
             int idx = 0;
-            for (BasicBlock block : func.getBlocks()) {
-                for (Instruction inst : block.getInstructions()) {
+            for (int blockIdx1 = 0; blockIdx1 < func.getBlocks().size(); blockIdx1++) { BasicBlock block = func.getBlocks().get(blockIdx1);
+                for (int instIdx2 = 0; instIdx2 < block.getInstructions().size(); instIdx2++) { Instruction inst = block.getInstructions().get(instIdx2);
                     if (isAllocation(inst.getOpcode())) {
                         AllocationSite site = AllocationSite.fromInstruction(
                             inst, func.getName(), idx);
@@ -297,8 +303,8 @@ public class InterproceduralPointsTo {
         List<Object> infos = new ArrayList<>();
         int loads = 0;
 
-        for (BasicBlock block : fn.getBlocks()) {
-            for (Instruction inst : block.getInstructions()) {
+        for (int blockIdx3 = 0; blockIdx3 < fn.getBlocks().size(); blockIdx3++) { BasicBlock block = fn.getBlocks().get(blockIdx3);
+            for (int instIdx4 = 0; instIdx4 < block.getInstructions().size(); instIdx4++) { Instruction inst = block.getInstructions().get(instIdx4);
                 Opcode op = inst.getOpcode();
                 List<Value> ops = inst.getOperands();
                 Value res = inst.getResult();
@@ -593,7 +599,7 @@ public class InterproceduralPointsTo {
                     if (rhs == last[o]) continue;
                     last[o] = rhs;
                     FieldCell cell = (FieldCell) f.info[i];
-                    if (cell.merge(rhs)) cell.forEachReader(this::enqueueById);
+                    if (cell.merge(rhs)) cell.forEachReader(enqueuer);
                 }
                 case K_CALL -> {
                     if (evalCall(f, i, inst, last, o)) local = true;
@@ -656,7 +662,8 @@ public class InterproceduralPointsTo {
         PointsToSet single = null;
         SiteSetBuilder builder = null;
         try {
-            for (int id : base.rawIds()) {
+            for (long pos = base.cursor(); base.has(pos); pos = base.next(pos)) {
+                int id = base.id(pos);
                 PointsToSet s;
                 if (id == unknownId) {
                     s = unknownSet;
@@ -685,20 +692,21 @@ public class InterproceduralPointsTo {
     }
 
     private void registerReaders(FnState f, PointsToSet base, PointsToSet prev, int fieldId, String field) {
-        int[] now = base.rawIds();
         int capacity = states.length;
-        int[] old = prev == null ? NO_INTS : prev.rawIds();
-        int j = 0;
-        for (int id : now) {
+        PointsToSet old = prev == null ? PointsToSet.EMPTY : prev;
+        long j = old.cursor();
+        for (long c = base.cursor(); base.has(c); c = base.next(c)) {
+            int id = base.id(c);
             if (id == unknownId) continue;
-            while (j < old.length && old[j] < id) j++;
-            if (j < old.length && old[j] == id) continue;
+            while (old.has(j) && old.id(j) < id) j = old.next(j);
+            if (old.has(j) && old.id(j) == id) continue;
             graph.fieldCell(id, fieldId, field).addReader(f.id, capacity);
         }
     }
 
     private boolean anyCellNewer(PointsToSet base, int fieldId, long since) {
-        for (int id : base.rawIds()) {
+        for (long cur = base.cursor(); base.has(cur); cur = base.next(cur)) {
+            int id = base.id(cur);
             if (id == unknownId) continue;
             FieldCell c = graph.findFieldCell(id, fieldId);
             if (c != null && c.version() > since) return true;
@@ -717,15 +725,16 @@ public class InterproceduralPointsTo {
         int fieldId = f.aux[i];
         String field = (String) f.info[i];
         if (rhs == lastRhs) {
-            int[] old = lastBase == null ? NO_INTS : lastBase.rawIds();
-            int j = 0;
-            for (int id : base.rawIds()) {
-                while (j < old.length && old[j] < id) j++;
-                if (j < old.length && old[j] == id) continue;
+            PointsToSet old = lastBase == null ? PointsToSet.EMPTY : lastBase;
+            long j = old.cursor();
+            for (long c = base.cursor(); base.has(c); c = base.next(c)) {
+                int id = base.id(c);
+                while (old.has(j) && old.id(j) < id) j = old.next(j);
+                if (old.has(j) && old.id(j) == id) continue;
                 writeField(id, fieldId, field, rhs);
             }
         } else {
-            for (int id : base.rawIds()) writeField(id, fieldId, field, rhs);
+            for (long c = base.cursor(); base.has(c); c = base.next(c)) writeField(base.id(c), fieldId, field, rhs);
             if ((f.flags[i] & F_UNKNOWN_FALLBACK) != 0) writeField(unknownId, fieldId, field, rhs);
         }
         last[o] = base;
@@ -736,7 +745,7 @@ public class InterproceduralPointsTo {
         FieldCell cell = graph.fieldCell(siteId, fieldId, field);
         if (cell.merge(rhs)) {
             cell.advanceVersion(epoch.incrementAndGet());
-            cell.forEachReader(this::enqueueById);
+            cell.forEachReader(enqueuer);
         }
     }
 
@@ -755,7 +764,7 @@ public class InterproceduralPointsTo {
         if ((flags & F_STATIC_WRITES_DONE) == 0) {
             flags |= F_STATIC_WRITES_DONE;
             for (FieldCell cell : ci.staticWrites) {
-                if (!cell.get().containsUnknown() && cell.merge(unknownSet)) cell.forEachReader(this::enqueueById);
+                if (!cell.get().containsUnknown() && cell.merge(unknownSet)) cell.forEachReader(enqueuer);
             }
         }
         if (res != null && (flags & F_RETURNED_DONE) == 0) {

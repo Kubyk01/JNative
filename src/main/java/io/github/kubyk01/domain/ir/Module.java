@@ -58,8 +58,10 @@ public class Module {
     public String toString() {
         StringBuilder sb = new StringBuilder();
         sb.append("module {\n");
-        for (Function f : functions) {
-            sb.append(f);
+        {
+            for (Function f : functions) {
+                sb.append(f);
+            }
         }
         sb.append("}\n");
         return sb.toString();

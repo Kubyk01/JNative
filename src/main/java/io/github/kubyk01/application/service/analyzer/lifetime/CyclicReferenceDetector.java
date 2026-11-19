@@ -3,6 +3,7 @@ package io.github.kubyk01.application.service.analyzer.lifetime;
 import io.github.kubyk01.domain.analyzer.aliasanalysis.AllocationSite;
 import io.github.kubyk01.domain.analyzer.aliasanalysis.FieldCell;
 import io.github.kubyk01.domain.analyzer.aliasanalysis.PointsToGraph;
+import io.github.kubyk01.domain.analyzer.aliasanalysis.PointsToSet;
 import lombok.RequiredArgsConstructor;
 
 import java.util.Arrays;
@@ -42,58 +43,71 @@ public class CyclicReferenceDetector {
         int[] sccStack = new int[n];
         int[] fNode = new int[n];
         int[] fCell = new int[n];
-        int[] fPos = new int[n];
+        long[] fPos = new long[n];
         Set<AllocationSite> cyclic = new HashSet<>();
         int counter = 0, ssp = 0;
 
-        for (AllocationSite startSite : allSites) {
-            int start = startSite.getId();
-            if (index[start] >= 0) continue;
-            int fsp = 0;
-            index[start] = low[start] = counter++;
-            sccStack[ssp++] = start;
-            onStack[start] = true;
-            fNode[fsp] = start; fCell[fsp] = 0; fPos[fsp] = 0; fsp++;
+        {
+            for (AllocationSite startSite : allSites) {
+                int start = startSite.getId();
+                if (index[start] >= 0) continue;
+                int fsp = 0;
+                index[start] = low[start] = counter++;
+                sccStack[ssp++] = start;
+                onStack[start] = true;
+                fNode[fsp] = start;
+                fCell[fsp] = 0;
+                fPos[fsp] = 0;
+                fsp++;
 
-            while (fsp > 0) {
-                int f = fsp - 1;
-                int v = fNode[f];
-                FieldCell[] cells = pointsToGraph.fieldCells(v);
-                boolean descended = false;
-                while (fCell[f] < cells.length) {
-                    int[] ids = cells[fCell[f]].get().rawIds();
-                    if (fPos[f] >= ids.length) { fCell[f]++; fPos[f] = 0; continue; }
-                    int w = ids[fPos[f]++];
-                    if (w == unknown) continue;
-                    if (index[w] < 0) {
-                        index[w] = low[w] = counter++;
-                        sccStack[ssp++] = w;
-                        onStack[w] = true;
-                        fNode[fsp] = w; fCell[fsp] = 0; fPos[fsp] = 0; fsp++;
-                        descended = true;
-                        break;
+                while (fsp > 0) {
+                    int f = fsp - 1;
+                    int v = fNode[f];
+                    FieldCell[] cells = pointsToGraph.fieldCells(v);
+                    boolean descended = false;
+                    while (fCell[f] < cells.length) {
+                        PointsToSet ids = cells[fCell[f]].get();
+                        if (!ids.has(fPos[f])) {
+                            fCell[f]++;
+                            fPos[f] = 0;
+                            continue;
+                        }
+                        int w = ids.id(fPos[f]);
+                        fPos[f] = ids.next(fPos[f]);
+                        if (w == unknown) continue;
+                        if (index[w] < 0) {
+                            index[w] = low[w] = counter++;
+                            sccStack[ssp++] = w;
+                            onStack[w] = true;
+                            fNode[fsp] = w;
+                            fCell[fsp] = 0;
+                            fPos[fsp] = 0;
+                            fsp++;
+                            descended = true;
+                            break;
+                        }
+                        if (onStack[w]) low[v] = Math.min(low[v], index[w]);
                     }
-                    if (onStack[w]) low[v] = Math.min(low[v], index[w]);
-                }
-                if (descended) continue;
+                    if (descended) continue;
 
-                fsp--;
-                if (fsp > 0) {
-                    int parent = fNode[fsp - 1];
-                    low[parent] = Math.min(low[parent], low[v]);
-                }
-                if (low[v] != index[v]) continue;
+                    fsp--;
+                    if (fsp > 0) {
+                        int parent = fNode[fsp - 1];
+                        low[parent] = Math.min(low[parent], low[v]);
+                    }
+                    if (low[v] != index[v]) continue;
 
-                int size = 0, w;
-                do {
-                    w = sccStack[--ssp];
-                    onStack[w] = false;
-                    size++;
-                } while (w != v);
-                if (size > 1) {
-                    for (int k = ssp; k < ssp + size; k++) cyclic.add(AllocationSite.byId(sccStack[k]));
-                } else if (hasSelfLoop(v)) {
-                    cyclic.add(AllocationSite.byId(v));
+                    int size = 0, w;
+                    do {
+                        w = sccStack[--ssp];
+                        onStack[w] = false;
+                        size++;
+                    } while (w != v);
+                    if (size > 1) {
+                        for (int k = ssp; k < ssp + size; k++) cyclic.add(AllocationSite.byId(sccStack[k]));
+                    } else if (hasSelfLoop(v)) {
+                        cyclic.add(AllocationSite.byId(v));
+                    }
                 }
             }
         }

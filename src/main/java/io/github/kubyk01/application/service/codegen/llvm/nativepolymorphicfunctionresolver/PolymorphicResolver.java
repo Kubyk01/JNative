@@ -98,7 +98,8 @@ public class PolymorphicResolver {
         NativeMethodInfo returnMatch = null;
         NativeMethodInfo voidMatch = null;
 
-        for (NativeMethodInfo info : candidates) {
+        {
+            for (int jnIdx2 = 0; jnIdx2 < candidates.size(); jnIdx2++) { NativeMethodInfo info = ((List<? extends NativeMethodInfo>) candidates).get(jnIdx2);
             if (!info.getMethodName().equals(methodName)) continue;
 
             String infoDescriptor = info.getDescriptor().trim();
@@ -117,7 +118,7 @@ public class PolymorphicResolver {
                     voidMatch = info;
                 }
             }
-        }
+        } }
 
         if (exactMatch != null) return exactMatch;
         if (returnMatch != null) return returnMatch;
@@ -134,9 +135,10 @@ public class PolymorphicResolver {
     private String buildDescriptor(Type returnType, List<Type> paramTypes) {
         StringBuilder sb = new StringBuilder();
         sb.append('(');
-        for (Type pt : paramTypes) {
+        {
+            for (int jnIdx3 = 0; jnIdx3 < paramTypes.size(); jnIdx3++) { Type pt = ((List<? extends Type>) paramTypes).get(jnIdx3);
             sb.append(typeToFullDescriptor(pt));
-        }
+        } }
         sb.append(')');
         sb.append(typeToFullDescriptor(returnType));
         return sb.toString();

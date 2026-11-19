@@ -55,9 +55,10 @@ public class BytecodeToIr {
                         List<NativeOverride> nativeOverrides) {
         this.resolver = resolver;
         this.reachability = reachability;
-        for (NativeOverride o : nativeOverrides) {
+        {
+            for (int jnIdx1 = 0; jnIdx1 < nativeOverrides.size(); jnIdx1++) { NativeOverride o = ((List<? extends NativeOverride>) nativeOverrides).get(jnIdx1);
             overrides.put(mangledKey(o), o);
-        }
+        } }
     }
 
     public void setScheduler(Scheduler scheduler) {
@@ -84,7 +85,8 @@ public class BytecodeToIr {
         LlvmUtil.parallelMapOrdered(
             new ArrayList<>(byOwner.values()), scheduler, refs -> {
                 List<MethodReference> translatable = new ArrayList<>(refs.size());
-                for (MethodReference ref : refs) {
+                {
+                    for (int jnIdx3 = 0; jnIdx3 < refs.size(); jnIdx3++) { MethodReference ref = ((List<? extends MethodReference>) refs).get(jnIdx3);
                     NativeOverride match = findOverride(ref);
                     if (match != null) {
                         // Alias every reachable overload onto the single C function.
@@ -95,7 +97,7 @@ public class BytecodeToIr {
                     } else {
                         translatable.add(ref);
                     }
-                }
+                } }
                 translateMethods(refs.getFirst().getOwner(), translatable, builders.get());
                 return null;
             });
@@ -147,8 +149,8 @@ public class BytecodeToIr {
             Function func = worklist.poll();
             if (!processed.add(func) || func.getEntryBlock() == null) continue;
 
-            for (BasicBlock block : func.getBlocks()) {
-                for (Instruction inst : block.getInstructions()) {
+            for (int blockIdx1 = 0; blockIdx1 < func.getBlocks().size(); blockIdx1++) { BasicBlock block = func.getBlocks().get(blockIdx1);
+                for (int instIdx2 = 0; instIdx2 < block.getInstructions().size(); instIdx2++) { Instruction inst = block.getInstructions().get(instIdx2);
                     Opcode op = inst.getOpcode();
                     if (op != Opcode.CALL && op != Opcode.STATIC_CALL
                         && op != Opcode.VIRTUAL_CALL && op != Opcode.INTERFACE_CALL
@@ -241,14 +243,18 @@ public class BytecodeToIr {
      */
     public void closeOverIrCalleesWithSsa() {
         Set<String> preexisting = new HashSet<>();
-        for (Function f : builder.getModule().getFunctions()) {
+        List<? extends Function> jnLoop4 = builder.getModule().getFunctions();
+        for (int jnIdx4 = 0; jnIdx4 < jnLoop4.size(); jnIdx4++) {
+            Function f = jnLoop4.get(jnIdx4);
             preexisting.add(f.getName());
         }
 
         closeOverIrCallees();
 
         SSATransformer ssa = new SSATransformer();
-        for (Function f : builder.getModule().getFunctions()) {
+        List<? extends Function> jnLoop5 = builder.getModule().getFunctions();
+        for (int jnIdx5 = 0; jnIdx5 < jnLoop5.size(); jnIdx5++) {
+            Function f = jnLoop5.get(jnIdx5);
             if (preexisting.contains(f.getName())) continue;
             if (f.getEntryBlock() == null) continue;
             try {
@@ -278,7 +284,9 @@ public class BytecodeToIr {
         for (NativeOverride o : overrides.values()) {
             if (module.getFunction(o.getCFunctionName()) == null) {
                 Function f = new Function(o.getCFunctionName(), o.getReturnType());
-                for (Parameter p : o.toParameters()) {
+                List<? extends Parameter> jnLoop8 = o.toParameters();
+                for (int jnIdx8 = 0; jnIdx8 < jnLoop8.size(); jnIdx8++) {
+                    Parameter p = jnLoop8.get(jnIdx8);
                     f.addParameter(p);
                 }
                 module.addFunction(f);
@@ -305,10 +313,11 @@ public class BytecodeToIr {
 
     private void translateMethods(String owner, List<MethodReference> refs, IrBuilder ir) {
         Map<String, PendingMethod> pending = new LinkedHashMap<>();
-        for (MethodReference ref : refs) {
+        {
+            for (int jnIdx9 = 0; jnIdx9 < refs.size(); jnIdx9++) { MethodReference ref = ((List<? extends MethodReference>) refs).get(jnIdx9);
             PendingMethod p = prepareMethod(ref, ir);
             if (p != null) pending.putIfAbsent(ref.getName() + ref.getDescriptor(), p);
-        }
+        } }
         if (pending.isEmpty()) return;
 
         byte[] bytes = resolver.getClassBytes(owner);
@@ -603,7 +612,9 @@ public class BytecodeToIr {
             return 1;
         }
         int n = 0;
-        for (MethodNode mn : cn.getMethods()) {
+        List<? extends MethodNode> jnLoop11 = cn.getMethods();
+        for (int jnIdx11 = 0; jnIdx11 < jnLoop11.size(); jnIdx11++) {
+            MethodNode mn = jnLoop11.get(jnIdx11);
             if (mn.getName().equals(name)) {
                 n++;
             }
@@ -612,7 +623,9 @@ public class BytecodeToIr {
     }
 
     private MethodNode findMethod(ClassNode classNode, String name, String desc) {
-        for (MethodNode m : classNode.getMethods()) {
+        List<? extends MethodNode> jnLoop12 = classNode.getMethods();
+        for (int jnIdx12 = 0; jnIdx12 < jnLoop12.size(); jnIdx12++) {
+            MethodNode m = jnLoop12.get(jnIdx12);
             if (m.getName().equals(name) && m.getDescriptor().equals(desc)) {
                 return m;
             }

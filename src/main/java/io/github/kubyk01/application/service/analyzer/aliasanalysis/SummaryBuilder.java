@@ -58,7 +58,9 @@ public class SummaryBuilder {
 
     public Map<String, FunctionSummary> build() {
         List<Function> allLive = new ArrayList<>();
-        for (Function f : module.getFunctions()) {
+        List<? extends Function> jnLoop1 = module.getFunctions();
+        for (int jnIdx1 = 0; jnIdx1 < jnLoop1.size(); jnIdx1++) {
+            Function f = jnLoop1.get(jnIdx1);
             if (f.getEntryBlock() != null) {
                 allLive.add(f);
             }
@@ -84,18 +86,20 @@ public class SummaryBuilder {
         // not cascade into its tens of thousands of trigger sites. See
         // LlvmUtil.isLazyClinitWrapper.
         Map<String, Function> byName = new HashMap<>(allLive.size() * 2);
-        for (Function f : allLive) {
+        {
+            for (int jnIdx2 = 0; jnIdx2 < allLive.size(); jnIdx2++) { Function f = ((List<? extends Function>) allLive).get(jnIdx2);
             byName.put(f.getName(), f);
-        }
+        } }
 
         Map<Function, List<Function>> callees = new HashMap<>(allLive.size() * 2);
         Map<String, Set<Function>> callers = new HashMap<>(allLive.size() * 2);
 
-        for (Function f : allLive) {
+        {
+            for (int jnIdx3 = 0; jnIdx3 < allLive.size(); jnIdx3++) { Function f = ((List<? extends Function>) allLive).get(jnIdx3);
             List<Function> out = new ArrayList<>();
             Set<String> seen = new HashSet<>();
-            for (BasicBlock block : f.getBlocks()) {
-                for (Instruction inst : block.getInstructions()) {
+            for (int blockIdx1 = 0; blockIdx1 < f.getBlocks().size(); blockIdx1++) { BasicBlock block = f.getBlocks().get(blockIdx1);
+                for (int instIdx2 = 0; instIdx2 < block.getInstructions().size(); instIdx2++) { Instruction inst = block.getInstructions().get(instIdx2);
                     String calleeName = extractCalleeName(inst);
                     if (calleeName == null) {
                         continue;
@@ -124,7 +128,7 @@ public class SummaryBuilder {
                 }
             }
             callees.put(f, out);
-        }
+        } }
 
         // ---- SCCs in reverse topological order -------------------------
         //
@@ -138,10 +142,11 @@ public class SummaryBuilder {
         // ---- Process SCCs bottom-up -----------------------------------
         int totalProcessed = 0;
         int maxSccSize = 0;
-        for (List<Function> scc : sccs) {
+        {
+            for (int jnIdx4 = 0; jnIdx4 < sccs.size(); jnIdx4++) { List<Function> scc = ((List<? extends List<Function>>) sccs).get(jnIdx4);
             if (scc.size() > maxSccSize) maxSccSize = scc.size();
             totalProcessed += processSCC(scc, callers);
-        }
+        } }
 
         System.out.println("SummaryBuilder: converged after " + sccs.size()
             + " SCC(s) (largest " + maxSccSize + " function(s)), "
@@ -207,9 +212,10 @@ public class SummaryBuilder {
         // the fixed point is reached in O(lattice height) iterations. The
         // per-function height is a small constant, so the total is well
         // below the limit.
-        for (Function f : scc) {
+        {
+            for (int jnIdx5 = 0; jnIdx5 < scc.size(); jnIdx5++) { Function f = ((List<? extends Function>) scc).get(jnIdx5);
             summaries.putIfAbsent(f.getName(), FunctionSummary.builder().build());
-        }
+        } }
 
         final int maxIterations = Math.max(MAX_SCC_ITERATIONS, 4 * scc.size());
 
@@ -322,7 +328,8 @@ public class SummaryBuilder {
         List<List<Function>> sccs = new ArrayList<>();
         int[] counter = {0};
 
-        for (Function start : functions) {
+        {
+            for (int jnIdx7 = 0; jnIdx7 < functions.size(); jnIdx7++) { Function start = ((List<? extends Function>) functions).get(jnIdx7);
             if (index.containsKey(start)) {
                 continue;
             }
@@ -384,7 +391,7 @@ public class SummaryBuilder {
                     sccs.add(scc);
                 }
             }
-        }
+        } }
 
         return sccs;
     }
@@ -418,7 +425,7 @@ public class SummaryBuilder {
         Map<Value, Set<AllocationSite>> localPointsTo = new HashMap<>();
         Map<Integer, Set<AllocationSite>> paramPointsTo = new HashMap<>();
         Map<Integer, Integer> slotToOrdinal = new HashMap<>();
-        for (Parameter p : func.getParameters()) {
+        for (int pIdx3 = 0; pIdx3 < func.getParameters().size(); pIdx3++) { Parameter p = func.getParameters().get(pIdx3);
             // paramPointsTo keyed by SLOT — this is what LOAD/STORE use.
             paramPointsTo.put(p.getIndex(), new HashSet<>());
             // slotToOrdinal — this is what "does this LOAD read a parameter?"
@@ -428,8 +435,8 @@ public class SummaryBuilder {
 
         // Phase 1: seed allocation sites.
         int idx = 0;
-        for (BasicBlock block : func.getBlocks()) {
-            for (Instruction inst : block.getInstructions()) {
+        for (int blockIdx4 = 0; blockIdx4 < func.getBlocks().size(); blockIdx4++) { BasicBlock block = func.getBlocks().get(blockIdx4);
+            for (int instIdx5 = 0; instIdx5 < block.getInstructions().size(); instIdx5++) { Instruction inst = block.getInstructions().get(instIdx5);
                 if (isAllocation(inst.getOpcode())) {
                     AllocationSite site = AllocationSite.fromInstruction(
                         inst, func.getName(), idx);
@@ -457,8 +464,8 @@ public class SummaryBuilder {
         Set<String> staticFieldWrites = new HashSet<>();
 
         // Phase 2: instruction walk.
-        for (BasicBlock block : func.getBlocks()) {
-            for (Instruction inst : block.getInstructions()) {
+        for (int blockIdx6 = 0; blockIdx6 < func.getBlocks().size(); blockIdx6++) { BasicBlock block = func.getBlocks().get(blockIdx6);
+            for (int instIdx7 = 0; instIdx7 < block.getInstructions().size(); instIdx7++) { Instruction inst = block.getInstructions().get(instIdx7);
                 processInstruction(inst, func, localPointsTo, paramPointsTo,
                     slotToOrdinal,
                     paramsRead, paramsWritten, paramsEscaped, paramsReturned,
@@ -714,11 +721,12 @@ public class SummaryBuilder {
             // External or not-yet-analyzed callee: conservatively assume
             // every argument escapes and the return value is an object.
             List<Value> args = getCallArguments(callInst);
-            for (Value arg : args) {
+            {
+                for (int jnIdx10 = 0; jnIdx10 < args.size(); jnIdx10++) { Value arg = ((List<? extends Value>) args).get(jnIdx10);
                 if (arg instanceof Parameter p) {
                     paramsEscaped.add(p.getOrdinal());
                 }
-            }
+            } }
             if (callInst.getResult() != null) {
                 flags[0] = true;
             }

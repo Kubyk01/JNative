@@ -2,6 +2,8 @@ package io.github.kubyk01.domain.analyzer.escapeanalysis.strategies;
 
 import io.github.kubyk01.application.service.analyzer.dependencyresolver.DependencyResolver;
 import io.github.kubyk01.domain.analyzer.aliasanalysis.AliasAnalysisResult;
+import io.github.kubyk01.domain.analyzer.aliasanalysis.AllocationSite;
+import io.github.kubyk01.domain.analyzer.aliasanalysis.PointsToSet;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.ClassNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.MethodNode;
 import io.github.kubyk01.domain.analyzer.escapeanalysis.EscapeAnalysisResult;
@@ -26,7 +28,9 @@ import reactor.core.publisher.Flux;
 import reactor.core.scheduler.Scheduler;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -46,7 +50,7 @@ public final class CallShapeEscapeStrategy implements EscapeAnalysisStrategies {
 
     private record Target(int[] functions, boolean unknown) {}
 
-    private record Site(Instruction inst, Target target) {}
+    private record Site(Instruction inst, Target target, boolean exact) {}
 
     private static final class Scratch {
         final ScratchIdentityMap<Value, Long> bits = new ScratchIdentityMap<>();
@@ -112,6 +116,7 @@ public final class CallShapeEscapeStrategy implements EscapeAnalysisStrategies {
         private final Map<Function, Integer> index = new IdentityHashMap<>();
         private final Map<String, Target> directTargets = new ConcurrentHashMap<>();
         private final Map<String, Target> dispatchTargets = new ConcurrentHashMap<>();
+        private final Map<String, Integer> implCache = new ConcurrentHashMap<>();
         private AtomicReferenceArray<Site[]> sites;
         private AtomicLongArray retained;
         private AtomicLongArray returned;
@@ -125,7 +130,9 @@ public final class CallShapeEscapeStrategy implements EscapeAnalysisStrategies {
         }
 
         EscapeAnalysisResult solve() {
-            for (Function f : module.getFunctions()) {
+            List<? extends Function> jnLoop1 = module.getFunctions();
+            for (int jnIdx1 = 0; jnIdx1 < jnLoop1.size(); jnIdx1++) {
+                Function f = jnLoop1.get(jnIdx1);
                 if (f.getEntryBlock() == null || index.containsKey(f)) continue;
                 index.put(f, bodies.size());
                 bodies.add(f);
@@ -163,6 +170,15 @@ public final class CallShapeEscapeStrategy implements EscapeAnalysisStrategies {
             }
             directTargets.forEach((callee, t) -> result.putCallShape(false, callee, shapeOf(t)));
             dispatchTargets.forEach((callee, t) -> result.putCallShape(true, callee, shapeOf(t)));
+            int exact = 0;
+            for (int i = 0; i < n; i++) {
+                for (Site s : sites.get(i)) {
+                    if (!s.exact()) continue;
+                    result.putSiteShape(s.inst(), shapeOf(s.target()));
+                    exact++;
+                }
+            }
+            System.out.println("Escape: " + exact + " dispatch call(s) narrowed by receiver points-to");
             int freshCount = 0;
             for (int i = 0; i < n; i++) if (fresh.get(i) != 0 && returnsReference(bodies.get(i))) freshCount++;
             System.out.println("Escape: call shapes for " + (directTargets.size() + dispatchTargets.size())
@@ -211,10 +227,12 @@ public final class CallShapeEscapeStrategy implements EscapeAnalysisStrategies {
 
         private Site[] collectSites(Function f) {
             List<Site> out = new ArrayList<>();
-            for (BasicBlock block : f.getBlocks()) {
-                for (Instruction inst : block.getInstructions()) {
+            for (int blockIdx1 = 0; blockIdx1 < f.getBlocks().size(); blockIdx1++) { BasicBlock block = f.getBlocks().get(blockIdx1);
+                for (int instIdx2 = 0; instIdx2 < block.getInstructions().size(); instIdx2++) { Instruction inst = block.getInstructions().get(instIdx2);
                     if (!isCall(inst.getOpcode())) continue;
-                    out.add(new Site(inst, targetOf(inst)));
+                    Target t = targetOf(inst);
+                    Target narrow = isDispatch(inst.getOpcode()) ? narrowed(inst, t) : t;
+                    out.add(new Site(inst, narrow, narrow != t));
                 }
             }
             return out.toArray(new Site[0]);
@@ -265,6 +283,65 @@ public final class CallShapeEscapeStrategy implements EscapeAnalysisStrategies {
             return new Target(fs, false);
         }
 
+        private Target narrowed(Instruction inst, Target cha) {
+            if (!cha.unknown() && cha.functions().length <= 1) return cha;
+            String callee = extractCalleeName(inst);
+            List<Value> ops = inst.getOperands();
+            if (callee == null || ops.isEmpty()) return cha;
+            Value recv = ops.getFirst();
+            if (recv == null || !(recv.getPointsTo() instanceof PointsToSet pts)) return cha;
+            if (pts.isEmpty() || pts.containsUnknown()) return cha;
+            int paren = callee.indexOf('(');
+            int dot = paren < 0 ? -1 : callee.lastIndexOf('.', paren);
+            if (dot <= 0) return cha;
+            String name = callee.substring(dot + 1, paren);
+            String descriptor = callee.substring(paren);
+            int[] allowed = cha.functions().clone();
+            Arrays.sort(allowed);
+            int[] found = new int[Math.max(allowed.length, 4)];
+            int k = 0;
+            Set<String> seen = new HashSet<>();
+            for (long c = pts.cursor(); pts.has(c); c = pts.next(c)) {
+                Type t = AllocationSite.byId(pts.id(c)).getType();
+                String cls = t == null ? null : t.isArray() ? "java/lang/Object" : t.isReference() ? t.getClassName() : null;
+                if (cls == null || cls.isEmpty()) return cha;
+                if (!seen.add(cls)) continue;
+                int g = implIndex(cls, name, descriptor);
+                if (g < 0 || (!cha.unknown() && Arrays.binarySearch(allowed, g) < 0)) return cha;
+                boolean dup = false;
+                for (int q = 0; q < k; q++) {
+                    if (found[q] == g) {
+                        dup = true;
+                        break;
+                    }
+                }
+                if (dup) continue;
+                if (k == found.length) found = Arrays.copyOf(found, k << 1);
+                found[k++] = g;
+            }
+            if (k == 0 || (!cha.unknown() && k >= allowed.length)) return cha;
+            return new Target(Arrays.copyOf(found, k), false);
+        }
+
+        private int implIndex(String cls, String name, String descriptor) {
+            String key = cls + '.' + name + descriptor;
+            Integer cached = implCache.get(key);
+            if (cached != null) return cached;
+            int r = -1;
+            ClassNode node = resolver.getClassNode(cls);
+            if (node != null && !node.isInterface() && (node.getAccess() & Opcodes.ACC_ABSTRACT) == 0) {
+                String[] holder = new String[1];
+                MethodNode impl = resolver.findMethodInHierarchy(cls, name, descriptor, holder);
+                if (impl != null && holder[0] != null && !impl.isAbstract()) {
+                    Function g = module.getFunction(canonicalCalleeKey(holder[0] + "." + name + descriptor));
+                    Integer gi = g == null ? null : index.get(g);
+                    if (gi != null) r = gi;
+                }
+            }
+            implCache.putIfAbsent(key, r);
+            return r;
+        }
+
         private boolean retains(Target t, int j) {
             if (t.unknown()) return true;
             for (int g : t.functions()) if (CallShape.has(retained.get(g), j)) return true;
@@ -299,7 +376,7 @@ public final class CallShapeEscapeStrategy implements EscapeAnalysisStrategies {
             Scratch scratch = SCRATCH.get();
             ScratchIdentityMap<Value, Long> bits = scratch.bits;
             bits.clear();
-            for (Parameter p : f.getParameters()) {
+            for (int pIdx3 = 0; pIdx3 < f.getParameters().size(); pIdx3++) { Parameter p = f.getParameters().get(pIdx3);
                 if (p.getOrdinal() >= 0) bits.put(p, CallShape.bit(p.getOrdinal()));
             }
             Map<Integer, Long> slots = scratch.slots;
@@ -311,8 +388,8 @@ public final class CallShapeEscapeStrategy implements EscapeAnalysisStrategies {
             boolean changed = true;
             while (changed) {
                 changed = false;
-                for (BasicBlock block : f.getBlocks()) {
-                    for (Instruction inst : block.getInstructions()) {
+                for (int blockIdx4 = 0; blockIdx4 < f.getBlocks().size(); blockIdx4++) { BasicBlock block = f.getBlocks().get(blockIdx4);
+                    for (int instIdx5 = 0; instIdx5 < block.getInstructions().size(); instIdx5++) { Instruction inst = block.getInstructions().get(instIdx5);
                         Value res = inst.getResult();
                         long add = 0;
                         switch (inst.getOpcode()) {
@@ -355,8 +432,8 @@ public final class CallShapeEscapeStrategy implements EscapeAnalysisStrategies {
 
             long ret = 0;
             long keep = 0;
-            for (BasicBlock block : f.getBlocks()) {
-                for (Instruction inst : block.getInstructions()) {
+            for (int blockIdx6 = 0; blockIdx6 < f.getBlocks().size(); blockIdx6++) { BasicBlock block = f.getBlocks().get(blockIdx6);
+                for (int instIdx7 = 0; instIdx7 < block.getInstructions().size(); instIdx7++) { Instruction inst = block.getInstructions().get(instIdx7);
                     List<Value> ops = inst.getOperands();
                     switch (inst.getOpcode()) {
                         case CAST, CHECKCAST, PHI, SELECT, STORE, LOAD, GET_FIELD, GET_STATIC, ARRAYLENGTH,
@@ -405,8 +482,8 @@ public final class CallShapeEscapeStrategy implements EscapeAnalysisStrategies {
         }
 
         private static boolean loadsSlot(Function f, int slot) {
-            for (BasicBlock block : f.getBlocks()) {
-                for (Instruction inst : block.getInstructions()) {
+            for (int blockIdx8 = 0; blockIdx8 < f.getBlocks().size(); blockIdx8++) { BasicBlock block = f.getBlocks().get(blockIdx8);
+                for (int instIdx9 = 0; instIdx9 < block.getInstructions().size(); instIdx9++) { Instruction inst = block.getInstructions().get(instIdx9);
                     if (inst.getOpcode() == Opcode.LOAD && inst.getLocalIndex() == slot) return true;
                 }
             }
@@ -435,8 +512,8 @@ public final class CallShapeEscapeStrategy implements EscapeAnalysisStrategies {
             for (Site s : sites.get(i)) targets.put(s.inst(), s.target());
             ScratchIdentityMap<Value, Boolean> derived = scratch.derived;
             derived.clear();
-            for (BasicBlock block : f.getBlocks()) {
-                for (Instruction inst : block.getInstructions()) {
+            for (int blockIdx10 = 0; blockIdx10 < f.getBlocks().size(); blockIdx10++) { BasicBlock block = f.getBlocks().get(blockIdx10);
+                for (int instIdx11 = 0; instIdx11 < block.getInstructions().size(); instIdx11++) { Instruction inst = block.getInstructions().get(instIdx11);
                     Value res = inst.getResult();
                     if (res == null) continue;
                     switch (inst.getOpcode()) {
@@ -454,16 +531,16 @@ public final class CallShapeEscapeStrategy implements EscapeAnalysisStrategies {
             boolean changed = true;
             while (changed) {
                 changed = false;
-                for (BasicBlock block : f.getBlocks()) {
-                    for (Instruction inst : block.getInstructions()) {
+                for (int blockIdx12 = 0; blockIdx12 < f.getBlocks().size(); blockIdx12++) { BasicBlock block = f.getBlocks().get(blockIdx12);
+                    for (int instIdx13 = 0; instIdx13 < block.getInstructions().size(); instIdx13++) { Instruction inst = block.getInstructions().get(instIdx13);
                         Value res = inst.getResult();
-                        if (res == null || !isDerived(derived, res)) continue;
+                        if (!isDerived(derived, res)) continue;
                         Opcode op = inst.getOpcode();
                         boolean ok = switch (op) {
                             case CAST, CHECKCAST, STORE -> isDerived(derived, inst.getOperands().getFirst());
                             case PHI, SELECT -> {
                                 boolean all = true;
-                                for (Value v : inst.getOperands()) {
+                                for (int vIdx14 = 0; vIdx14 < inst.getOperands().size(); vIdx14++) { Value v = inst.getOperands().get(vIdx14);
                                     if (!isReference(v) || isNullConstant(v)) continue;
                                     if (!isDerived(derived, v)) {
                                         all = false;
@@ -482,13 +559,13 @@ public final class CallShapeEscapeStrategy implements EscapeAnalysisStrategies {
                 }
             }
 
-            for (BasicBlock block : f.getBlocks()) {
-                for (Instruction inst : block.getInstructions()) {
+            for (int blockIdx15 = 0; blockIdx15 < f.getBlocks().size(); blockIdx15++) { BasicBlock block = f.getBlocks().get(blockIdx15);
+                for (int instIdx16 = 0; instIdx16 < block.getInstructions().size(); instIdx16++) { Instruction inst = block.getInstructions().get(instIdx16);
                     List<Value> ops = inst.getOperands();
                     Opcode op = inst.getOpcode();
                     for (int k = 0; k < ops.size(); k++) {
                         Value v = ops.get(k);
-                        if (v == null || !isDerived(derived, v)) continue;
+                        if (!isDerived(derived, v)) continue;
                         if (!usageKeepsFresh(inst, op, k, v, targets, derived)) return false;
                     }
                 }

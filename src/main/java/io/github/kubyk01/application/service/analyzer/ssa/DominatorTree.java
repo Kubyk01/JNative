@@ -80,20 +80,25 @@ public class DominatorTree {
 
     private static void pruneUnreachableEdges(Function function) {
         List<BasicBlock> blocks = function.getBlocks();
-        for (BasicBlock block : blocks) {
-            List<BasicBlock> preds = block.getPredecessors();
-            for (int i = preds.size() - 1; i >= 0; i--) {
-                if (reaches(preds.get(i), block)) continue;
-                preds.remove(i);
-                List<Instruction> insts = block.getInstructions();
-                for (Instruction inst : insts) {
-                    if (inst.getOpcode() == Opcode.PHI && i < inst.getOperands().size()) {
-                        inst.getOperands().remove(i);
+        {
+            for (BasicBlock block : blocks) {
+                List<BasicBlock> preds = block.getPredecessors();
+                for (int i = preds.size() - 1; i >= 0; i--) {
+                    if (reaches(preds.get(i), block)) continue;
+                    preds.remove(i);
+                    List<Instruction> insts = block.getInstructions();
+                    {
+                        for (Instruction inst : insts) {
+                            if (inst.getOpcode() == Opcode.PHI && i < inst.getOperands().size()) {
+                                inst.getOperands().remove(i);
+                            }
+                        }
                     }
                 }
             }
         }
-        for (BasicBlock block : blocks) {
+        {
+            for (int jnIdx3 = 0; jnIdx3 < blocks.size(); jnIdx3++) { BasicBlock block = ((List<? extends BasicBlock>) blocks).get(jnIdx3);
             List<BasicBlock> succs = block.getSuccessors();
             for (int i = succs.size() - 1; i >= 0; i--) {
                 if (i >= succs.size()) continue;
@@ -103,13 +108,13 @@ public class DominatorTree {
                     succs = block.getSuccessors();
                 }
             }
-        }
+        } }
     }
 
     private static boolean reaches(BasicBlock pred, BasicBlock block) {
         Terminator t = pred.getTerminator();
         if (t != null) {
-            for (BasicBlock tt : t.getTargets()) {
+            for (int ttIdx1 = 0; ttIdx1 < t.getTargets().size(); ttIdx1++) { BasicBlock tt = t.getTargets().get(ttIdx1);
                 if (tt == block) return true;
             }
         }
@@ -168,12 +173,13 @@ public class DominatorTree {
         }
         for (int i = n - 1; i >= 1; i--) {
             List<BasicBlock> preds = vertex[i].getPredecessors();
-            for (BasicBlock pred : preds) {
+            {
+                for (int jnIdx4 = 0; jnIdx4 < preds.size(); jnIdx4++) { BasicBlock pred = ((List<? extends BasicBlock>) preds).get(jnIdx4);
                 int pi = index.get(pred);
                 if (pi < 0) continue;
                 int u = eval(pi, semi, ancestor, label);
                 if (semi[u] < semi[i]) semi[i] = semi[u];
-            }
+            } }
             bucketNext[i] = bucketHead[semi[i]];
             bucketHead[semi[i]] = i;
 
@@ -237,7 +243,8 @@ public class DominatorTree {
             List<BasicBlock> preds = vertex[b].getPredecessors();
             if (preds.size() < 2) continue;
             int stop = idom[b];
-            for (BasicBlock pred : preds) {
+            {
+                for (int jnIdx5 = 0; jnIdx5 < preds.size(); jnIdx5++) { BasicBlock pred = ((List<? extends BasicBlock>) preds).get(jnIdx5);
                 int runner = index.get(pred);
                 if (runner < 0) continue;
                 while (runner >= 0 && runner != stop) {
@@ -252,7 +259,7 @@ public class DominatorTree {
                     }
                     runner = idom[runner];
                 }
-            }
+            } }
         }
         int edges = count >>> 1;
         if (frontierStart.length < n + 1) frontierStart = new int[n + 1];

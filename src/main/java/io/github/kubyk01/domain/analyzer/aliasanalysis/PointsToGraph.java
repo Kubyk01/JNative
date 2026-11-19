@@ -169,7 +169,8 @@ public class PointsToGraph {
         PointsToSet first = null;
         SiteSetBuilder builder = null;
         try {
-            for (int id : sites.rawIds()) {
+            for (long cur = sites.cursor(); sites.has(cur); cur = sites.next(cur)) {
+                int id = sites.id(cur);
                 FieldCell c = findFieldCell(id, fid);
                 if (c == null) continue;
                 PointsToSet pts = c.get();

@@ -92,8 +92,8 @@ public class VarHandleTargetResolver {
     private Target resolveLocalSlot(Instruction load, int depth, Set<Instruction> visited) {
         if (load.getParent() == null || load.getParent().getFunction() == null) return null;
         List<Value> stored = new ArrayList<>();
-        for (BasicBlock block : load.getParent().getFunction().getBlocks()) {
-            for (Instruction inst : block.getInstructions()) {
+        for (int blockIdx1 = 0; blockIdx1 < load.getParent().getFunction().getBlocks().size(); blockIdx1++) { BasicBlock block = load.getParent().getFunction().getBlocks().get(blockIdx1);
+            for (int instIdx2 = 0; instIdx2 < block.getInstructions().size(); instIdx2++) { Instruction inst = block.getInstructions().get(instIdx2);
                 if (inst.getOpcode() == Opcode.STORE
                         && inst.getLocalIndex() == load.getLocalIndex()
                         && !inst.getOperands().isEmpty()) {
@@ -106,7 +106,9 @@ public class VarHandleTargetResolver {
 
     private Target resolveAll(List<Value> values, int depth, Set<Instruction> visited) {
         Target common = null;
-        for (Value incoming : values) {
+        List<? extends Value> jnLoop1 = values;
+        for (int jnIdx1 = 0; jnIdx1 < jnLoop1.size(); jnIdx1++) {
+            Value incoming = jnLoop1.get(jnIdx1);
             Target target = resolveReceiver(incoming, depth + 1, new HashSet<>(visited));
             if (target == null || (common != null && !common.equals(target))) return null;
             common = target;

@@ -25,6 +25,7 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.HexFormat;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.stream.Stream;
@@ -56,7 +57,7 @@ public final class TargetJdk {
         Files.createDirectories(root.getParent());
         Path lockPath = root.resolveSibling(root.getFileName() + ".lock");
         try (FileChannel channel = FileChannel.open(lockPath, StandardOpenOption.CREATE, StandardOpenOption.WRITE);
-             FileLock lock = channel.lock()) {
+             FileLock ignored = channel.lock()) {
             if (Files.exists(root.resolve(".complete"))) {
                 try {
                     Path home = findJavaHome(root);
@@ -143,7 +144,9 @@ public final class TargetJdk {
 
     private static boolean keep(String entry) {
         if (entry.endsWith("/release")) return true;
-        for (String directory : RuntimeImageEmbedder.DIRECTORIES) {
+        List<? extends String> jnLoop1 = RuntimeImageEmbedder.DIRECTORIES;
+        for (int jnIdx1 = 0; jnIdx1 < jnLoop1.size(); jnIdx1++) {
+            String directory = jnLoop1.get(jnIdx1);
             if (entry.contains("/" + directory + "/") || entry.endsWith("/" + directory)) return true;
         }
         return false;

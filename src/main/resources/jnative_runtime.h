@@ -955,6 +955,7 @@ extern void __jnative_free_fast(void* p);
 extern void    __jnative_share(void* p);
 extern int32_t __jnative_release_owner(void* p);
 extern void    __jnative_free_owned(void* p);
+extern void    __jnative_free_container(void* p);
 
 /* ---- Exception construction and throwers --------------------------- */
 

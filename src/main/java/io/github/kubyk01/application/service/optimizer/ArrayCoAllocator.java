@@ -80,7 +80,9 @@ public class ArrayCoAllocator {
             if (c == null) continue;
             List<Site> sites = new ArrayList<>();
             boolean ok = true;
-            for (Instruction n : e.getValue()) {
+            List<? extends Instruction> jnLoop2 = e.getValue();
+            for (int jnIdx2 = 0; jnIdx2 < jnLoop2.size(); jnIdx2++) {
+                Instruction n = jnLoop2.get(jnIdx2);
                 Site s = matchSite(n, c);
                 if (s == null) { ok = false; break; }
                 sites.add(s);
@@ -100,10 +102,12 @@ public class ArrayCoAllocator {
     }
 
     private void scanModule() {
-        for (Function f : module.getFunctions()) {
-            for (BasicBlock b : f.getBlocks()) {
-                for (Instruction inst : b.getInstructions()) {
-                    for (Value op : inst.getOperands()) {
+        List<? extends Function> jnLoop3 = module.getFunctions();
+        for (int jnIdx3 = 0; jnIdx3 < jnLoop3.size(); jnIdx3++) {
+            Function f = jnLoop3.get(jnIdx3);
+            for (int bIdx1 = 0; bIdx1 < f.getBlocks().size(); bIdx1++) { BasicBlock b = f.getBlocks().get(bIdx1);
+                for (int instIdx2 = 0; instIdx2 < b.getInstructions().size(); instIdx2++) { Instruction inst = b.getInstructions().get(instIdx2);
+                    for (int opIdx3 = 0; opIdx3 < inst.getOperands().size(); opIdx3++) { Value op = inst.getOperands().get(opIdx3);
                         uses.computeIfAbsent(op, k -> new ArrayList<>()).add(inst);
                     }
                     if (inst.getOpcode() == Opcode.NEW && !inst.getOperands().isEmpty()
@@ -156,7 +160,9 @@ public class ArrayCoAllocator {
         if (cn.getInterfaces() != null && cn.getInterfaces().contains("java/lang/Cloneable")) return null;
 
         MethodNode ctorNode = null;
-        for (MethodNode m : cn.getMethods()) {
+        List<? extends MethodNode> jnLoop6 = cn.getMethods();
+        for (int jnIdx6 = 0; jnIdx6 < jnLoop6.size(); jnIdx6++) {
+            MethodNode m = jnLoop6.get(jnIdx6);
             if ("<clinit>".equals(m.getName())) return null;
             if ("<init>".equals(m.getName())) {
                 if (ctorNode != null) return null;
@@ -171,8 +177,8 @@ public class ArrayCoAllocator {
         Parameter thisParam = ctor.getParameters().getFirst();
         String ctorCallee = className + ".<init>" + ctorNode.getDescriptor();
 
-        for (BasicBlock b : ctor.getBlocks()) {
-            for (Instruction put : b.getInstructions()) {
+        for (int bIdx4 = 0; bIdx4 < ctor.getBlocks().size(); bIdx4++) { BasicBlock b = ctor.getBlocks().get(bIdx4);
+            for (int putIdx5 = 0; putIdx5 < b.getInstructions().size(); putIdx5++) { Instruction put = b.getInstructions().get(putIdx5);
                 if (put.getOpcode() != Opcode.PUT_FIELD || put.getOperands().size() < 3) continue;
                 if (put.getOperands().get(0) != thisParam) continue;
                 if (!(put.getOperands().get(1) instanceof Constant keyConst)) continue;
@@ -218,7 +224,9 @@ public class ArrayCoAllocator {
 
     private static FieldNode findField(ClassNode cn, String name) {
         if (cn.getFields() == null) return null;
-        for (FieldNode f : cn.getFields()) {
+        List<? extends FieldNode> jnLoop8 = cn.getFields();
+        for (int jnIdx8 = 0; jnIdx8 < jnLoop8.size(); jnIdx8++) {
+            FieldNode f = jnLoop8.get(jnIdx8);
             if (name.equals(f.getName())) return f;
         }
         return null;
@@ -234,7 +242,7 @@ public class ArrayCoAllocator {
         Instruction def = t.getDefiningInstruction();
         if (def == null || def.getParent() == null || def.getParent().getFunction() != ctor) return false;
         if (PURE_OPS.contains(def.getOpcode())) {
-            for (Value op : def.getOperands()) {
+            for (int opIdx6 = 0; opIdx6 < def.getOperands().size(); opIdx6++) { Value op = def.getOperands().get(opIdx6);
                 if (!isPure(op, ctor, seen)) return false;
             }
             return true;
@@ -264,7 +272,9 @@ public class ArrayCoAllocator {
 
     private boolean onlyArrayAccess(Value v, Instruction allowedPut) {
         if (terminatorValues.contains(v)) return false;
-        for (Instruction use : uses.getOrDefault(v, List.of())) {
+        List<? extends Instruction> jnLoop9 = uses.getOrDefault(v, List.of());
+        for (int jnIdx9 = 0; jnIdx9 < jnLoop9.size(); jnIdx9++) {
+            Instruction use = jnLoop9.get(jnIdx9);
             List<Value> ops = use.getOperands();
             if (use == allowedPut) {
                 if (ops.get(0) == v || ops.get(1) == v || ops.get(2) != v) return false;
@@ -287,9 +297,11 @@ public class ArrayCoAllocator {
     }
 
     private boolean fieldOnlyWrittenBy(String fieldKey, Instruction put) {
-        for (Function f : module.getFunctions()) {
-            for (BasicBlock b : f.getBlocks()) {
-                for (Instruction inst : b.getInstructions()) {
+        List<? extends Function> jnLoop10 = module.getFunctions();
+        for (int jnIdx10 = 0; jnIdx10 < jnLoop10.size(); jnIdx10++) {
+            Function f = jnLoop10.get(jnIdx10);
+            for (int bIdx7 = 0; bIdx7 < f.getBlocks().size(); bIdx7++) { BasicBlock b = f.getBlocks().get(bIdx7);
+                for (int instIdx8 = 0; instIdx8 < b.getInstructions().size(); instIdx8++) { Instruction inst = b.getInstructions().get(instIdx8);
                     if (inst == put || inst.getOpcode() != Opcode.PUT_FIELD) continue;
                     if (inst.getOperands().size() >= 2
                         && inst.getOperands().get(1) instanceof Constant c
@@ -301,9 +313,11 @@ public class ArrayCoAllocator {
     }
 
     private boolean fieldReadsOnlyArrayAccess(String fieldKey) {
-        for (Function f : module.getFunctions()) {
-            for (BasicBlock b : f.getBlocks()) {
-                for (Instruction inst : b.getInstructions()) {
+        List<? extends Function> jnLoop11 = module.getFunctions();
+        for (int jnIdx11 = 0; jnIdx11 < jnLoop11.size(); jnIdx11++) {
+            Function f = jnLoop11.get(jnIdx11);
+            for (int bIdx9 = 0; bIdx9 < f.getBlocks().size(); bIdx9++) { BasicBlock b = f.getBlocks().get(bIdx9);
+                for (int instIdx10 = 0; instIdx10 < b.getInstructions().size(); instIdx10++) { Instruction inst = b.getInstructions().get(instIdx10);
                     if (inst.getOpcode() != Opcode.GET_FIELD) continue;
                     if (inst.getOperands().size() < 2
                         || !(inst.getOperands().get(1) instanceof Constant c)
@@ -372,7 +386,7 @@ public class ArrayCoAllocator {
         copy.setLocalIndex(def.getLocalIndex());
         copy.setInvokedynamicData(def.getInvokedynamicData());
         copy.setPolymorphicSignature(def.isPolymorphicSignature());
-        for (Value op : def.getOperands()) {
+        for (int opIdx11 = 0; opIdx11 < def.getOperands().size(); opIdx11++) { Value op = def.getOperands().get(opIdx11);
             copy.addOperand(cloneExpr(op, call, memo, out));
         }
         Temporary result = new Temporary(t.getType());

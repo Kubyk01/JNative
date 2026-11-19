@@ -52,7 +52,9 @@ public final class ProxyClassGenerator implements Opcodes {
             if (cn == null || cn.isExternal()) {
                 throw new IllegalStateException("proxy interface not available: " + iface);
             }
-            for (MethodNode m : cn.getMethods()) {
+            List<? extends MethodNode> jnLoop1 = cn.getMethods();
+            for (int jnIdx1 = 0; jnIdx1 < jnLoop1.size(); jnIdx1++) {
+                MethodNode m = jnLoop1.get(jnIdx1);
                 if (m.isStatic() || m.getName().startsWith("<")) continue;
                 if ((m.getAccess() & ACC_PRIVATE) != 0) continue;
                 String key = m.getName() + m.getDescriptor();
@@ -106,7 +108,9 @@ public final class ProxyClassGenerator implements Opcodes {
         Label start = new Label(), end = new Label(), rethrow = new Label(), wrap = new Label();
         mv.visitTryCatchBlock(start, end, rethrow, "java/lang/RuntimeException");
         mv.visitTryCatchBlock(start, end, rethrow, "java/lang/Error");
-        for (String e : pm.exceptions()) {
+        List<? extends String> jnLoop2 = pm.exceptions();
+        for (int jnIdx2 = 0; jnIdx2 < jnLoop2.size(); jnIdx2++) {
+            String e = jnLoop2.get(jnIdx2);
             mv.visitTryCatchBlock(start, end, rethrow, e);
         }
         mv.visitTryCatchBlock(start, end, wrap, "java/lang/Throwable");

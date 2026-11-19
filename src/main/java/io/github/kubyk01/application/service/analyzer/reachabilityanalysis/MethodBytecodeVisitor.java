@@ -994,7 +994,9 @@ public class MethodBytecodeVisitor extends ClassVisitor {
                 List<MethodReference> registered = new ArrayList<>();
 
                 if (paramsFullyResolved) {
-                    for (MethodNode mn : cn.getMethods()) {
+                    List<? extends MethodNode> jnLoop2 = cn.getMethods();
+                    for (int jnIdx2 = 0; jnIdx2 < jnLoop2.size(); jnIdx2++) {
+                        MethodNode mn = jnLoop2.get(jnIdx2);
                         if (!mn.getName().equals(methodName)) continue;
                         if (mn.getName().equals("<clinit>")) continue;
                         if (mn.getName().equals("<init>")) continue;
@@ -1169,7 +1171,9 @@ public class MethodBytecodeVisitor extends ClassVisitor {
                 if (targetClass != null) {
                     ClassNode cn = resolver.getClassNode(targetClass);
                     if (cn != null && !cn.isExternal()) {
-                        for (MethodNode mn : cn.getMethods()) {
+                        List<? extends MethodNode> jnLoop7 = cn.getMethods();
+                        for (int jnIdx7 = 0; jnIdx7 < jnLoop7.size(); jnIdx7++) {
+                            MethodNode mn = jnLoop7.get(jnIdx7);
                             if (mn.getName().equals("<init>") && mn.getDescriptor().equals("()V")) {
                                 MethodReference ref = new MethodReference(targetClass, "<init>", "()V");
                                 reflectInfo.addConstructor(targetClass, ref);
@@ -1342,7 +1346,9 @@ public class MethodBytecodeVisitor extends ClassVisitor {
             List<MethodReference> registered = new ArrayList<>();
 
             if ("<init>".equals(methodName)) {
-                for (MethodNode mn : cn.getMethods()) {
+                List<? extends MethodNode> jnLoop8 = cn.getMethods();
+                for (int jnIdx8 = 0; jnIdx8 < jnLoop8.size(); jnIdx8++) {
+                    MethodNode mn = jnLoop8.get(jnIdx8);
                     if (!mn.getName().equals("<init>")) continue;
                     MethodReference ref = new MethodReference(
                         targetClass, mn.getName(), mn.getDescriptor());
@@ -1366,7 +1372,9 @@ public class MethodBytecodeVisitor extends ClassVisitor {
                 && visited.add(current.getName())) {
 
                 boolean found = false;
-                for (MethodNode mn : current.getMethods()) {
+                List<? extends MethodNode> jnLoop9 = current.getMethods();
+                for (int jnIdx9 = 0; jnIdx9 < jnLoop9.size(); jnIdx9++) {
+                    MethodNode mn = jnLoop9.get(jnIdx9);
                     if (!mn.getName().equals(methodName)) continue;
                     if (mn.getName().equals("<clinit>")) continue;
                     if (mn.getName().equals("<init>")) continue;
@@ -1428,7 +1436,9 @@ public class MethodBytecodeVisitor extends ClassVisitor {
          * VarHandle fields).</p>
          */
         private void registerAllFieldsByName(String targetClass, ClassNode cn, String fieldName) {
-            for (FieldNode f : cn.getFields()) {
+            List<? extends FieldNode> jnLoop10 = cn.getFields();
+            for (int jnIdx10 = 0; jnIdx10 < jnLoop10.size(); jnIdx10++) {
+                FieldNode f = jnLoop10.get(jnIdx10);
                 if (!f.getName().equals(fieldName)) continue;
                 FieldReference ref = new FieldReference(
                     targetClass, fieldName, f.getDescriptor());

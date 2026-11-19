@@ -2,7 +2,6 @@ package io.github.kubyk01.application.service.analyzer.classanalysis.annotation.
 
 import lombok.extern.slf4j.Slf4j;
 
-import java.io.IOException;
 import java.lang.reflect.AnnotatedElement;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
@@ -33,13 +32,14 @@ public final class CglibPregenerator {
     public static Map<String, byte[]> generate(List<Path> classpath, Collection<String> candidates) {
         Map<String, byte[]> generated = new LinkedHashMap<>();
         List<URL> urls = new ArrayList<>();
-        for (Path p : classpath) {
+        {
+            for (int jnIdx1 = 0; jnIdx1 < classpath.size(); jnIdx1++) { Path p = ((List<? extends Path>) classpath).get(jnIdx1);
             try {
                 urls.add(p.toUri().toURL());
             } catch (MalformedURLException e) {
                 log.warn("Skipping classpath entry {}: {}", p, e.getMessage());
             }
-        }
+        } }
         try (URLClassLoader loader = new URLClassLoader("jnative-cglib", urls.toArray(new URL[0]),
                 ClassLoader.getPlatformClassLoader())) {
             Class<?> enhancerClass;
@@ -83,8 +83,8 @@ public final class CglibPregenerator {
                     log.debug("CGLIB pre-generation skipped for {}: {}", candidate, t.toString());
                 }
             }
-        } catch (IOException | ReflectiveOperationException | LinkageError e) {
-            log.warn("CGLIB pre-generation failed: {}", e.toString());
+        } catch (Exception | LinkageError e) {
+            log.warn("CGLIB pre-generation failed, @Configuration proxies are not pre-generated: {}", e.toString());
         }
         return generated;
     }

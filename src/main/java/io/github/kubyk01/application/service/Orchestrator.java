@@ -295,7 +295,9 @@ public class Orchestrator implements OrchestratorPort {
         List<NativeOverride> nativeOverrides = collectNativeOverrides(analysis);
 
         System.out.println("Native overrides discovered: " + nativeOverrides.size());
-        for (NativeOverride o : nativeOverrides) {
+        List<? extends NativeOverride> jnLoop1 = nativeOverrides;
+        for (int jnIdx1 = 0; jnIdx1 < jnLoop1.size(); jnIdx1++) {
+            NativeOverride o = jnLoop1.get(jnIdx1);
             System.out.println("  " + o.getClassName() + "." + o.getMethodName()
                     + (o.getDescriptor() != null ? o.getDescriptor() : "(all overloads)")
                     + " -> " + o.getCFunctionName());
@@ -597,7 +599,9 @@ public class Orchestrator implements OrchestratorPort {
         }
 
         Map<String, NativeOverride> byKey = new LinkedHashMap<>();
-        for (NativeOverride o : discovered) {
+        List<? extends NativeOverride> jnLoop3 = discovered;
+        for (int jnIdx3 = 0; jnIdx3 < jnLoop3.size(); jnIdx3++) {
+            NativeOverride o = jnLoop3.get(jnIdx3);
             String key = o.getClassName() + "." + o.getMethodName()
                     + "#" + o.getDescriptor();
             byKey.put(key, o);
@@ -677,12 +681,14 @@ public class Orchestrator implements OrchestratorPort {
      *                       is used as a fallback
      */
     private static void releasePointsTo(Module module) {
-        for (Function function : module.getFunctions()) {
+        List<? extends Function> jnLoop4 = module.getFunctions();
+        for (int jnIdx4 = 0; jnIdx4 < jnLoop4.size(); jnIdx4++) {
+            Function function = jnLoop4.get(jnIdx4);
             for (Parameter p : function.getParameters()) p.clearPointsTo();
-            for (BasicBlock block : function.getBlocks()) {
-                for (Instruction inst : block.getInstructions()) {
+            for (int blockIdx1 = 0; blockIdx1 < function.getBlocks().size(); blockIdx1++) { BasicBlock block = function.getBlocks().get(blockIdx1);
+                for (int instIdx2 = 0; instIdx2 < block.getInstructions().size(); instIdx2++) { Instruction inst = block.getInstructions().get(instIdx2);
                     if (inst.getResult() != null) inst.getResult().clearPointsTo();
-                    for (Value v : inst.getOperands()) {
+                    for (int vIdx3 = 0; vIdx3 < inst.getOperands().size(); vIdx3++) { Value v = inst.getOperands().get(vIdx3);
                         if (v != null) v.clearPointsTo();
                     }
                 }

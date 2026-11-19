@@ -52,6 +52,7 @@ public final class PointsToSet extends AbstractSet<AllocationSite> {
         if (n == 1) return AllocationSite.byId(a[0]).singleton();
         int key = keyOf(a, n);
         Stripe stripe = INTERNED[key & 255];
+        // todo remove synchronized
         synchronized (stripe) {
             WeakReference<PointsToSet>[] refs = stripe.refs;
             int[] keys = stripe.keys;
@@ -102,12 +103,21 @@ public final class PointsToSet extends AbstractSet<AllocationSite> {
 
     public static final PointsToSet EMPTY = new PointsToSet(NO_IDS, 0);
 
+    static final int DELTA_MIN_BASE = 512;
+    private static final int DELTA_MAX = 1024;
+
     private final int[] ids;
+    private final int[] extra;
     private final int key;
     private int hash;
 
     private PointsToSet(int[] ids, int key) {
+        this(ids, NO_IDS, key);
+    }
+
+    private PointsToSet(int[] ids, int[] extra, int key) {
         this.ids = ids;
+        this.extra = extra;
         this.key = key;
     }
 
@@ -132,13 +142,32 @@ public final class PointsToSet extends AbstractSet<AllocationSite> {
         return intern(a, w, false);
     }
 
-    public int[] rawIds() { return ids; }
+    public long cursor() { return 0L; }
+
+    public boolean has(long c) {
+        return (int) (c >>> 32) < ids.length || (int) c < extra.length;
+    }
+
+    public int id(long c) {
+        int i = (int) (c >>> 32);
+        int j = (int) c;
+        if (i >= ids.length) return extra[j];
+        if (j >= extra.length) return ids[i];
+        return Math.min(ids[i], extra[j]);
+    }
+
+    public long next(long c) {
+        int i = (int) (c >>> 32);
+        int j = (int) c;
+        if (j >= extra.length || (i < ids.length && ids[i] < extra[j])) return ((long) (i + 1) << 32) | j;
+        return ((long) i << 32) | (j + 1);
+    }
 
     @Override
-    public int size() { return ids.length; }
+    public int size() { return ids.length + extra.length; }
 
     @Override
-    public boolean isEmpty() { return ids.length == 0; }
+    public boolean isEmpty() { return ids.length == 0 && extra.length == 0; }
 
     @Override
     public boolean contains(Object o) {
@@ -146,7 +175,10 @@ public final class PointsToSet extends AbstractSet<AllocationSite> {
     }
 
     public boolean containsId(int id) {
-        int[] a = ids;
+        return containsIn(ids, id) || (extra.length != 0 && containsIn(extra, id));
+    }
+
+    private static boolean containsIn(int[] a, int id) {
         int n = a.length;
         if (n <= 8) {
             for (int v : a) {
@@ -162,17 +194,18 @@ public final class PointsToSet extends AbstractSet<AllocationSite> {
 
     @Override
     public Iterator<AllocationSite> iterator() {
-        int[] a = ids;
         return new Iterator<>() {
-            private int i;
+            private long c = cursor();
 
             @Override
-            public boolean hasNext() { return i < a.length; }
+            public boolean hasNext() { return has(c); }
 
             @Override
             public AllocationSite next() {
-                if (i >= a.length) throw new NoSuchElementException();
-                return AllocationSite.byId(a[i++]);
+                if (!has(c)) throw new NoSuchElementException();
+                AllocationSite s = AllocationSite.byId(id(c));
+                c = PointsToSet.this.next(c);
+                return s;
             }
         };
     }
@@ -182,12 +215,12 @@ public final class PointsToSet extends AbstractSet<AllocationSite> {
     public boolean intersects(PointsToSet other) {
         if (other == null || isEmpty() || other.isEmpty()) return false;
         if (other == this) return true;
-        int[] a = ids, b = other.ids;
-        int i = 0, j = 0;
-        while (i < a.length && j < b.length) {
-            int x = a[i], y = b[j];
+        long ca = cursor();
+        long cb = other.cursor();
+        while (has(ca) && other.has(cb)) {
+            int x = id(ca), y = other.id(cb);
             if (x == y) return true;
-            if (x < y) i++; else j++;
+            if (x < y) ca = next(ca); else cb = other.next(cb);
         }
         return false;
     }
@@ -195,6 +228,18 @@ public final class PointsToSet extends AbstractSet<AllocationSite> {
     public static PointsToSet union(PointsToSet a, PointsToSet b) {
         if (a == b || b == null || b.isEmpty()) return a == null ? EMPTY : a;
         if (a == null || a.isEmpty()) return b;
+        PointsToSet big = a.size() >= b.size() ? a : b;
+        PointsToSet small = big == a ? b : a;
+        if (big.size() >= DELTA_MIN_BASE) {
+            int[] out = scratch(small.size());
+            int n = 0;
+            for (long c = small.cursor(); small.has(c); c = small.next(c)) {
+                int id = small.id(c);
+                if (!big.containsId(id)) out[n++] = id;
+            }
+            if (n == 0) return big;
+            return plus(big, out, n);
+        }
         int[] x = a.ids, y = b.ids;
         int nx = x.length, ny = y.length;
         int i = 0, j = 0, n = 0;
@@ -224,20 +269,60 @@ public final class PointsToSet extends AbstractSet<AllocationSite> {
         return intern(out, n, false);
     }
 
+    static PointsToSet plus(PointsToSet big, int[] add, int n) {
+        if (n == 0) return big;
+        int[] base = big.ids;
+        int[] ex = big.extra;
+        int total = ex.length + n;
+        if (base.length >= DELTA_MIN_BASE && total <= Math.min(base.length >>> 2, DELTA_MAX)) {
+            int[] merged = new int[total];
+            int i = 0, j = 0, k = 0;
+            while (i < ex.length && j < n) merged[k++] = ex[i] < add[j] ? ex[i++] : add[j++];
+            while (i < ex.length) merged[k++] = ex[i++];
+            while (j < n) merged[k++] = add[j++];
+            return new PointsToSet(base, merged, 0);
+        }
+        int[] flat = new int[base.length + total];
+        int i = 0, j = 0, k = 0, w = 0;
+        while (true) {
+            int u = i < base.length ? base[i] : Integer.MAX_VALUE;
+            int v = j < ex.length ? ex[j] : Integer.MAX_VALUE;
+            int x = k < n ? add[k] : Integer.MAX_VALUE;
+            int m = Math.min(u, Math.min(v, x));
+            if (m == Integer.MAX_VALUE) break;
+            flat[w++] = m;
+            if (u == m) i++;
+            if (v == m) j++;
+            if (x == m) k++;
+        }
+        return intern(flat, w, true);
+    }
+
     public Set<AllocationSite> getSites() { return this; }
 
     @Override
     public boolean equals(Object o) {
         if (o == this) return true;
-        if (o instanceof PointsToSet other) return Arrays.equals(ids, other.ids);
+        if (o instanceof PointsToSet other) {
+            if (size() != other.size()) return false;
+            if (extra.length == 0 && other.extra.length == 0) return Arrays.equals(ids, other.ids);
+            long ca = cursor();
+            long cb = other.cursor();
+            while (has(ca)) {
+                if (id(ca) != other.id(cb)) return false;
+                ca = next(ca);
+                cb = other.next(cb);
+            }
+            return true;
+        }
         return super.equals(o);
     }
 
     @Override
     public int hashCode() {
         int h = hash;
-        if (h == 0 && ids.length != 0) {
-            for (int id : ids) h += AllocationSite.byId(id).hashCode();
+        if (h == 0 && !isEmpty()) {
+            for (long c = cursor(); has(c); c = next(c)) h += AllocationSite.byId(id(c)).hashCode();
             hash = h;
         }
         return h;

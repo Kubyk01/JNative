@@ -19,7 +19,14 @@ public class CondBranchTerminator extends Terminator {
     }
 
     @Override
-    public List<BasicBlock> getTargets() { return List.of(trueTarget, falseTarget); }
+    public List<BasicBlock> getTargets() {
+        List<BasicBlock> t = targets;
+        if (t == null) targets = t = List.of(trueTarget, falseTarget);
+        return t;
+    }
+
+    @Getter(lombok.AccessLevel.NONE)
+    private List<BasicBlock> targets;
 
     @Override
     public String toString() {

@@ -29,7 +29,9 @@ public final class RuntimeImageEmbedder {
                 throw new IOException("Target JDK runtime data is missing or unreadable: " + file);
             }
         }
-        for (String relative : List.of("conf", "lib", "conf/security/policy")) {
+        List<? extends String> jnLoop1 = List.of("conf", "lib", "conf/security/policy");
+        for (int jnIdx1 = 0; jnIdx1 < jnLoop1.size(); jnIdx1++) {
+            String relative = jnLoop1.get(jnIdx1);
             if (!Files.isDirectory(javaHome.resolve(relative))) {
                 throw new IOException("Target JDK runtime directory is missing: " + javaHome.resolve(relative));
             }
@@ -43,11 +45,15 @@ public final class RuntimeImageEmbedder {
         Files.createDirectories(output);
         Map<String, Path> files = new TreeMap<>();
         addFile(files, "release", root.resolve("release"));
-        for (String directory : DIRECTORIES) {
+        List<? extends String> jnLoop2 = DIRECTORIES;
+        for (int jnIdx2 = 0; jnIdx2 < jnLoop2.size(); jnIdx2++) {
+            String directory = jnLoop2.get(jnIdx2);
             Path source = root.resolve(directory);
             if (!Files.exists(source)) continue;
             try (var entries = Files.walk(source, FileVisitOption.FOLLOW_LINKS)) {
-                for (Path entry : entries.toList()) {
+                List<? extends Path> jnLoop3 = entries.toList();
+                for (int jnIdx3 = 0; jnIdx3 < jnLoop3.size(); jnIdx3++) {
+                    Path entry = jnLoop3.get(jnIdx3);
                     if (Files.isDirectory(entry)) continue;
                     if (!Files.isRegularFile(entry) || !Files.isReadable(entry)) {
                         throw new IOException("Cannot embed target JDK runtime file: " + entry);
@@ -57,17 +63,19 @@ public final class RuntimeImageEmbedder {
             }
         }
         List<String> classpathNames = new ArrayList<>();
-        for (Path entry : classpath) {
+        {
+            for (int jnIdx4 = 0; jnIdx4 < classpath.size(); jnIdx4++) { Path entry = ((List<? extends Path>) classpath).get(jnIdx4);
             String name = "classpath/" + classpathNames.size() + "/" + entry.getFileName();
             addFile(files, name, entry);
             classpathNames.add(name);
-        }
+        } }
         List<String> libraryNames = new ArrayList<>();
-        for (Path library : libraries) {
+        {
+            for (int jnIdx5 = 0; jnIdx5 < libraries.size(); jnIdx5++) { Path library = ((List<? extends Path>) libraries).get(jnIdx5);
             String name = "native/" + library.getFileName();
             addFile(files, name, library);
             libraryNames.add(name);
-        }
+        } }
         Path data = output.resolve("jnative_runtime_image.bin");
         Path table = output.resolve("jnative_runtime_files.c");
         long offset = 0;

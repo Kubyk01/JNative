@@ -204,7 +204,7 @@ public class LazyClinitInstrumenter {
             .doOnNext(func -> {
                 String ownerClass = clinitNameToClass.get(func.getName());
                 int local = 0;
-                for (BasicBlock block : func.getBlocks()) {
+                for (int blockIdx1 = 0; blockIdx1 < func.getBlocks().size(); blockIdx1++) { BasicBlock block = func.getBlocks().get(blockIdx1);
                     local += instrumentBlock(block, ownerClass);
                 }
                 if (local > 0) {
