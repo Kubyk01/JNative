@@ -333,6 +333,7 @@ void *__jnative_fn_java_lang_Object_clone___Ljava_lang_Object_(void *obj) {
     }
 
     memcpy(clone, obj, (size_t)size);
+    __jnative_container_detach_clone(clone);
     for (struct ReflectionClass *c = cls; c != NULL; c = c->superclass) {
         if (c->fields == NULL) continue;
         for (struct ReflectionField **fp = c->fields; *fp != NULL; fp++) {

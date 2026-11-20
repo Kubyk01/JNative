@@ -121,6 +121,9 @@ public class LlvmRuntime {
             declare i32  @__jnative_release_owner(i8*)
             declare void @__jnative_free_owned(i8*)
             declare void @__jnative_free_container(i8*)
+            declare void @__jnative_borrow_enter(i8*)
+            declare void @__jnative_borrow_exit()
+            declare void @__jnative_replace_array(i8*, i8*, i8*, i32)
             declare void @__jnative_destruct_dispatch(i8*)
             declare void @__jnative_destruct_dispatch_if_not_same(i8*, i8*)
 
@@ -453,9 +456,8 @@ public class LlvmRuntime {
         StringBuilder sb = new StringBuilder();
         sb.append(LlvmTypeMapper.toLlvmType(retType)).append(" (");
         sb.append(LlvmTypeMapper.toLlvmType(Type.reference(owner)));
-        List<? extends Type> jnLoop3 = paramTypes;
-        for (int jnIdx3 = 0; jnIdx3 < jnLoop3.size(); jnIdx3++) {
-            Type pt = jnLoop3.get(jnIdx3);
+        for (int jnIdx3 = 0; jnIdx3 < paramTypes.size(); jnIdx3++) {
+            Type pt = ((List<? extends Type>) paramTypes).get(jnIdx3);
             sb.append(", ");
             sb.append(LlvmTypeMapper.toLlvmType(LlvmTypeMapper.toCAbiType(pt)));
         }

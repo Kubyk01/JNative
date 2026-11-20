@@ -17,6 +17,7 @@ import io.github.kubyk01.domain.ir.Module;
 import io.github.kubyk01.domain.ir.Opcode;
 import io.github.kubyk01.domain.ir.Parameter;
 import io.github.kubyk01.domain.ir.ReturnTerminator;
+import io.github.kubyk01.domain.ir.Temporary;
 import io.github.kubyk01.domain.ir.Terminator;
 import io.github.kubyk01.domain.ir.ThrowTerminator;
 import io.github.kubyk01.domain.ir.Type;
@@ -27,6 +28,7 @@ import org.objectweb.asm.Opcodes;
 import reactor.core.publisher.Flux;
 import reactor.core.scheduler.Scheduler;
 
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
@@ -47,6 +49,16 @@ public final class CallShapeEscapeStrategy implements EscapeAnalysisStrategies {
 
     private static final int[] NONE = new int[0];
     private static final Target UNKNOWN = new Target(NONE, true);
+    private static final Target PURE_NATIVE = new Target(NONE, false);
+    private static final Target FRESH_NATIVE = new Target(NONE, false);
+    private static final Set<String> FRESH_NATIVES = Set.of(
+        "java/lang/reflect/Array.newArray(Ljava/lang/Class;I)Ljava/lang/Object;",
+        "java/lang/reflect/Array.multiNewArray(Ljava/lang/Class;[I)Ljava/lang/Object;",
+        "java/lang/Object.clone()Ljava/lang/Object;");
+    private static final Set<String> PURE_NATIVES = Set.of(
+        "java/lang/System.arraycopy(Ljava/lang/Object;ILjava/lang/Object;II)V",
+        "java/lang/Object.hashCode()I",
+        "java/lang/System.identityHashCode(Ljava/lang/Object;)I");
 
     private record Target(int[] functions, boolean unknown) {}
 
@@ -54,7 +66,6 @@ public final class CallShapeEscapeStrategy implements EscapeAnalysisStrategies {
 
     private static final class Scratch {
         final ScratchIdentityMap<Value, Long> bits = new ScratchIdentityMap<>();
-        final ScratchIdentityMap<Value, Boolean> derived = new ScratchIdentityMap<>();
         final ScratchIdentityMap<Instruction, Target> targets = new ScratchIdentityMap<>();
         final Map<Integer, Long> slots = new HashMap<>();
     }
@@ -250,7 +261,25 @@ public final class CallShapeEscapeStrategy implements EscapeAnalysisStrategies {
         private Target direct(String callee) {
             Function g = module.getFunction(canonicalCalleeKey(callee));
             Integer gi = g == null ? null : index.get(g);
-            return gi == null ? UNKNOWN : new Target(new int[]{gi}, false);
+            if (gi != null) return new Target(new int[]{gi}, false);
+            Target nt = nativeTarget(callee);
+            return nt != null ? nt : UNKNOWN;
+        }
+
+        private Target nativeTarget(String callee) {
+            if (FRESH_NATIVES.contains(callee)) return FRESH_NATIVE;
+            if (PURE_NATIVES.contains(callee)) return PURE_NATIVE;
+            int paren = callee.indexOf('(');
+            int dot = paren < 0 ? -1 : callee.lastIndexOf('.', paren);
+            if (dot <= 0) return null;
+            String owner = callee.substring(0, dot);
+            String name = callee.substring(dot + 1, paren);
+            String descriptor = callee.substring(paren);
+            if (owner.startsWith("[") && name.equals("clone") && descriptor.equals("()Ljava/lang/Object;")) return FRESH_NATIVE;
+            if (descriptor.indexOf('L') >= 0 || descriptor.indexOf('[') >= 0) return null;
+            String[] holder = new String[1];
+            MethodNode m = resolver.findMethodInHierarchy(owner, name, descriptor, holder);
+            return m != null && m.isNative() && m.isStatic() ? PURE_NATIVE : null;
         }
 
         private Target dispatch(String callee) {
@@ -260,9 +289,14 @@ public final class CallShapeEscapeStrategy implements EscapeAnalysisStrategies {
             String owner = callee.substring(0, dot);
             String name = callee.substring(dot + 1, paren);
             String descriptor = callee.substring(paren);
+            if (owner.startsWith("[")) {
+                Target nt = nativeTarget(callee);
+                return nt != null ? nt : UNKNOWN;
+            }
             Set<String> types = new LinkedHashSet<>(resolver.getSubclasses(owner));
             types.add(owner);
             Set<Integer> found = new LinkedHashSet<>();
+            boolean sawPure = false;
             for (String type : types) {
                 ClassNode node = resolver.getClassNode(type);
                 if (node == null || node.isInterface() || (node.getAccess() & Opcodes.ACC_ABSTRACT) != 0) continue;
@@ -273,10 +307,16 @@ public final class CallShapeEscapeStrategy implements EscapeAnalysisStrategies {
                 Function g = module.getFunction(canonicalCalleeKey(holder[0] + "." + name + descriptor));
                 if (g == null) continue;
                 Integer gi = index.get(g);
-                if (gi == null) return UNKNOWN;
+                if (gi == null) {
+                    if (nativeTarget(holder[0] + "." + name + descriptor) == PURE_NATIVE) {
+                        sawPure = true;
+                        continue;
+                    }
+                    return UNKNOWN;
+                }
                 found.add(gi);
             }
-            if (found.isEmpty()) return UNKNOWN;
+            if (found.isEmpty()) return sawPure ? PURE_NATIVE : UNKNOWN;
             int[] fs = new int[found.size()];
             int k = 0;
             for (int g : found) fs[k++] = g;
@@ -355,6 +395,7 @@ public final class CallShapeEscapeStrategy implements EscapeAnalysisStrategies {
         }
 
         private boolean freshTarget(Target t) {
+            if (t == FRESH_NATIVE) return true;
             if (t.unknown() || t.functions().length == 0) return false;
             for (int g : t.functions()) if (fresh.get(g) == 0) return false;
             return true;
@@ -377,7 +418,7 @@ public final class CallShapeEscapeStrategy implements EscapeAnalysisStrategies {
             ScratchIdentityMap<Value, Long> bits = scratch.bits;
             bits.clear();
             for (int pIdx3 = 0; pIdx3 < f.getParameters().size(); pIdx3++) { Parameter p = f.getParameters().get(pIdx3);
-                if (p.getOrdinal() >= 0) bits.put(p, CallShape.bit(p.getOrdinal()));
+                if (p.getOrdinal() >= 0 && isReference(p)) bits.put(p, CallShape.bit(p.getOrdinal()));
             }
             Map<Integer, Long> slots = scratch.slots;
             slots.clear();
@@ -481,15 +522,6 @@ public final class CallShapeEscapeStrategy implements EscapeAnalysisStrategies {
             return b == null ? 0 : b;
         }
 
-        private static boolean loadsSlot(Function f, int slot) {
-            for (int blockIdx8 = 0; blockIdx8 < f.getBlocks().size(); blockIdx8++) { BasicBlock block = f.getBlocks().get(blockIdx8);
-                for (int instIdx9 = 0; instIdx9 < block.getInstructions().size(); instIdx9++) { Instruction inst = block.getInstructions().get(instIdx9);
-                    if (inst.getOpcode() == Opcode.LOAD && inst.getLocalIndex() == slot) return true;
-                }
-            }
-            return false;
-        }
-
         private static boolean returnsReference(Function f) {
             Type t = f.getReturnType();
             return t != null && (t.isReference() || t.isArray());
@@ -510,95 +542,147 @@ public final class CallShapeEscapeStrategy implements EscapeAnalysisStrategies {
             ScratchIdentityMap<Instruction, Target> targets = scratch.targets;
             targets.clear();
             for (Site s : sites.get(i)) targets.put(s.inst(), s.target());
-            ScratchIdentityMap<Value, Boolean> derived = scratch.derived;
-            derived.clear();
-            for (int blockIdx10 = 0; blockIdx10 < f.getBlocks().size(); blockIdx10++) { BasicBlock block = f.getBlocks().get(blockIdx10);
-                for (int instIdx11 = 0; instIdx11 < block.getInstructions().size(); instIdx11++) { Instruction inst = block.getInstructions().get(instIdx11);
-                    Value res = inst.getResult();
-                    if (res == null) continue;
-                    switch (inst.getOpcode()) {
-                        case NEW, NEW_ARRAY, MULTI_NEW_ARRAY, CAST, CHECKCAST, PHI, SELECT -> derived.put(res, Boolean.TRUE);
-                        case STORE -> {
-                            if (!loadsSlot(f, inst.getLocalIndex())) derived.put(res, Boolean.TRUE);
-                        }
-                        case CALL, VIRTUAL_CALL, INTERFACE_CALL, STATIC_CALL, SPECIAL_CALL -> {
-                            if (freshTarget(targets.get(inst))) derived.put(res, Boolean.TRUE);
-                        }
-                        default -> { }
-                    }
-                }
+            Map<Integer, List<Instruction>> stores = new HashMap<>();
+            Map<Integer, List<Instruction>> loads = new HashMap<>();
+            Map<Value, List<Instruction>> users = new IdentityHashMap<>();
+            Set<Integer> paramSlots = new HashSet<>();
+            for (int pIdx = 0; pIdx < f.getParameters().size(); pIdx++) {
+                paramSlots.add(f.getParameters().get(pIdx).getIndex());
             }
-            boolean changed = true;
-            while (changed) {
-                changed = false;
-                for (int blockIdx12 = 0; blockIdx12 < f.getBlocks().size(); blockIdx12++) { BasicBlock block = f.getBlocks().get(blockIdx12);
-                    for (int instIdx13 = 0; instIdx13 < block.getInstructions().size(); instIdx13++) { Instruction inst = block.getInstructions().get(instIdx13);
-                        Value res = inst.getResult();
-                        if (!isDerived(derived, res)) continue;
-                        Opcode op = inst.getOpcode();
-                        boolean ok = switch (op) {
-                            case CAST, CHECKCAST, STORE -> isDerived(derived, inst.getOperands().getFirst());
-                            case PHI, SELECT -> {
-                                boolean all = true;
-                                for (int vIdx14 = 0; vIdx14 < inst.getOperands().size(); vIdx14++) { Value v = inst.getOperands().get(vIdx14);
-                                    if (!isReference(v) || isNullConstant(v)) continue;
-                                    if (!isDerived(derived, v)) {
-                                        all = false;
-                                        break;
-                                    }
-                                }
-                                yield all;
-                            }
-                            default -> true;
-                        };
-                        if (!ok) {
-                            derived.put(res, Boolean.FALSE);
-                            changed = true;
-                        }
-                    }
-                }
-            }
-
-            for (int blockIdx15 = 0; blockIdx15 < f.getBlocks().size(); blockIdx15++) { BasicBlock block = f.getBlocks().get(blockIdx15);
-                for (int instIdx16 = 0; instIdx16 < block.getInstructions().size(); instIdx16++) { Instruction inst = block.getInstructions().get(instIdx16);
+            List<Value> returns = new ArrayList<>();
+            List<Value> thrown = new ArrayList<>();
+            for (int blockIdx = 0; blockIdx < f.getBlocks().size(); blockIdx++) {
+                BasicBlock block = f.getBlocks().get(blockIdx);
+                for (int instIdx = 0; instIdx < block.getInstructions().size(); instIdx++) {
+                    Instruction inst = block.getInstructions().get(instIdx);
                     List<Value> ops = inst.getOperands();
-                    Opcode op = inst.getOpcode();
+                    int slot = inst.getLocalIndex();
+                    if (inst.getOpcode() == Opcode.STORE && slot >= 0 && !ops.isEmpty() && isReference(ops.getFirst())) {
+                        stores.computeIfAbsent(slot, k -> new ArrayList<>()).add(inst);
+                    } else if (inst.getOpcode() == Opcode.LOAD && slot >= 0 && inst.getResult() != null) {
+                        loads.computeIfAbsent(slot, k -> new ArrayList<>()).add(inst);
+                    }
                     for (int k = 0; k < ops.size(); k++) {
                         Value v = ops.get(k);
-                        if (!isDerived(derived, v)) continue;
-                        if (!usageKeepsFresh(inst, op, k, v, targets, derived)) return false;
+                        if (v != null && !(v instanceof Constant)) users.computeIfAbsent(v, x -> new ArrayList<>()).add(inst);
                     }
                 }
                 Terminator term = block.getTerminator();
                 if (term instanceof ReturnTerminator rt) {
                     Value v = rt.getValue();
-                    if (v != null && !isNullConstant(v) && !isDerived(derived, v)) return false;
-                } else if (term instanceof ThrowTerminator tt) {
-                    if (isDerived(derived, tt.getException())) return false;
+                    if (v != null && !isNullConstant(v)) returns.add(v);
+                } else if (term instanceof ThrowTerminator tt && tt.getException() != null) {
+                    thrown.add(tt.getException());
                 }
+            }
+
+            Set<Value> origin = java.util.Collections.newSetFromMap(new IdentityHashMap<>());
+            Set<Integer> loadedSlots = new HashSet<>();
+            ArrayDeque<Value> work = new ArrayDeque<>(returns);
+            while (!work.isEmpty()) {
+                Value v = work.pop();
+                if (isNullConstant(v) || !origin.add(v)) continue;
+                if (!(v instanceof Temporary t) || t.getDefiningInstruction() == null) {
+                    return false;
+                }
+                Instruction def = t.getDefiningInstruction();
+                List<Value> ops = def.getOperands();
+                switch (def.getOpcode()) {
+                    case NEW, NEW_ARRAY, MULTI_NEW_ARRAY -> { }
+                    case CAST, CHECKCAST, STORE -> work.push(ops.getFirst());
+                    case PHI, SELECT -> {
+                        for (int k = 0; k < ops.size(); k++) {
+                            Value op = ops.get(k);
+                            if (isReference(op)) work.push(op);
+                        }
+                    }
+                    case LOAD -> {
+                        int slot = def.getLocalIndex();
+                        List<Instruction> st = stores.get(slot);
+                        if (slot < 0 || paramSlots.contains(slot) || st == null) {
+                            return false;
+                        }
+                        if (loadedSlots.add(slot)) {
+                            for (int k = 0; k < st.size(); k++) work.push(st.get(k).getOperands().getFirst());
+                        }
+                    }
+                    case CALL, VIRTUAL_CALL, INTERFACE_CALL, STATIC_CALL, SPECIAL_CALL -> {
+                        Target target = targets.get(def);
+                        if (!freshTarget(target)) {
+                            return false;
+                        }
+                        int argc = argCount(def);
+                        for (int j = 0; j < argc; j++) {
+                            if (returnsArg(target, j)) work.push(arg(def, j));
+                        }
+                    }
+                    default -> {
+                        return false;
+                    }
+                }
+            }
+
+            Set<Value> alias = java.util.Collections.newSetFromMap(new IdentityHashMap<>());
+            work = new ArrayDeque<>(origin);
+            while (!work.isEmpty()) {
+                Value v = work.pop();
+                if (isNullConstant(v) || !alias.add(v)) continue;
+                List<Instruction> us = users.get(v);
+                if (us == null) continue;
+                for (int u = 0; u < us.size(); u++) {
+                    Instruction inst = us.get(u);
+                    Value res = inst.getResult();
+                    switch (inst.getOpcode()) {
+                        case CAST, CHECKCAST, PHI, SELECT -> {
+                            if (res != null) work.push(res);
+                        }
+                        case STORE -> {
+                            if (res != null) work.push(res);
+                            List<Instruction> ld = loads.get(inst.getLocalIndex());
+                            if (ld != null && inst.getOperands().getFirst() == v) {
+                                for (int k = 0; k < ld.size(); k++) work.push(ld.get(k).getResult());
+                            }
+                        }
+                        case CALL, VIRTUAL_CALL, INTERFACE_CALL, STATIC_CALL, SPECIAL_CALL -> {
+                            Target target = targets.get(inst);
+                            int argc = argCount(inst);
+                            for (int j = 0; j < argc; j++) {
+                                if (arg(inst, j) == v && returnsArg(target, j) && isReference(res)) work.push(res);
+                            }
+                        }
+                        default -> { }
+                    }
+                }
+            }
+
+            for (Value v : alias) {
+                List<Instruction> us = users.get(v);
+                if (us == null) continue;
+                for (int u = 0; u < us.size(); u++) {
+                    Instruction inst = us.get(u);
+                    List<Value> ops = inst.getOperands();
+                    for (int k = 0; k < ops.size(); k++) {
+                        if (ops.get(k) != v || keepsFresh(inst, k, v, targets)) continue;
+                        return false;
+                    }
+                }
+            }
+            for (int k = 0; k < thrown.size(); k++) {
+                if (alias.contains(thrown.get(k))) return false;
             }
             return true;
         }
 
-        private static boolean isDerived(ScratchIdentityMap<Value, Boolean> derived, Value v) {
-            return v != null && derived.get(v) == Boolean.TRUE;
-        }
-
-        private boolean usageKeepsFresh(Instruction inst, Opcode op, int k, Value v,
-                                        ScratchIdentityMap<Instruction, Target> targets,
-                                        ScratchIdentityMap<Value, Boolean> derived) {
-            return switch (op) {
-                case GET_FIELD, ALOAD, ARRAYLENGTH, INSTANCEOF, EQ, NE, MONITOR_ENTER, MONITOR_EXIT -> true;
+        private boolean keepsFresh(Instruction inst, int k, Value v, ScratchIdentityMap<Instruction, Target> targets) {
+            return switch (inst.getOpcode()) {
+                case GET_FIELD, ALOAD, ARRAYLENGTH, INSTANCEOF, EQ, NE, MONITOR_ENTER, MONITOR_EXIT,
+                     CAST, CHECKCAST, PHI, SELECT, STORE -> true;
                 case PUT_FIELD, ASTORE -> k == 0;
-                case CAST, CHECKCAST, PHI, SELECT, STORE -> inst.getResult() != null && isDerived(derived, inst.getResult());
                 case CALL, VIRTUAL_CALL, INTERFACE_CALL, STATIC_CALL, SPECIAL_CALL -> {
-                    Target t = targets.get(inst);
+                    Target target = targets.get(inst);
                     int argc = argCount(inst);
                     for (int j = 0; j < argc; j++) {
-                        if (arg(inst, j) != v) continue;
-                        if (retains(t, j)) yield false;
-                        Value res = inst.getResult();
-                        if (returnsArg(t, j) && isReference(res) && !isDerived(derived, res)) yield false;
+                        if (arg(inst, j) == v && retains(target, j)) yield false;
                     }
                     yield true;
                 }

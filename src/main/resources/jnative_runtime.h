@@ -956,6 +956,10 @@ extern void    __jnative_share(void* p);
 extern int32_t __jnative_release_owner(void* p);
 extern void    __jnative_free_owned(void* p);
 extern void    __jnative_free_container(void* p);
+extern void    __jnative_borrow_enter(void* owner);
+extern void    __jnative_borrow_exit(void);
+extern void    __jnative_replace_array(void* owner, void* old, void* replacement, int32_t mode);
+extern void    __jnative_container_detach_clone(void* clone);
 
 /* ---- Exception construction and throwers --------------------------- */
 

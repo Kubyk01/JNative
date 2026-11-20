@@ -611,6 +611,192 @@ static void jnative_free_hash_table(void* table) {
     __jnative_free(table);
 }
 
+typedef struct {
+    void*     owner;
+    uintptr_t frame;
+} JNativeBorrow;
+
+typedef struct {
+    void* owner;
+    void* array;
+} JNativeRetired;
+
+#define JN_DEATH_BUCKETS 65536
+
+typedef struct JNativeDeathNode {
+    void* owner;
+    void* array;
+    struct JNativeDeathNode* next;
+} JNativeDeathNode;
+
+static jn_mutex_t         jnative_death_lock = JN_MUTEX_INITIALIZER;
+static JNativeDeathNode** jnative_death;
+static int64_t            jnative_death_live;
+
+static __thread JNativeBorrow*  jnative_borrows;
+static __thread int             jnative_borrow_n;
+static __thread int             jnative_borrow_cap;
+static __thread JNativeRetired* jnative_retired;
+static __thread int             jnative_retired_n;
+static __thread int             jnative_retired_cap;
+
+static void jnative_drop_borrows_below(uintptr_t frame, int inclusive) {
+    int w = 0;
+    for (int i = 0; i < jnative_borrow_n; i++) {
+        uintptr_t f = jnative_borrows[i].frame;
+        if (f < frame || (inclusive && f == frame)) continue;
+        jnative_borrows[w++] = jnative_borrows[i];
+    }
+    jnative_borrow_n = w;
+}
+
+static int jnative_borrowed(void* owner) {
+    for (int i = 0; i < jnative_borrow_n; i++) {
+        if (jnative_borrows[i].owner == owner) return 1;
+    }
+    return 0;
+}
+
+static void jnative_free_unborrowed_retired(void) {
+    int w = 0;
+    for (int i = 0; i < jnative_retired_n; i++) {
+        JNativeRetired r = jnative_retired[i];
+        if (!jnative_borrowed(r.owner)) __jnative_free(r.array);
+        else jnative_retired[w++] = r;
+    }
+    jnative_retired_n = w;
+}
+
+static void jnative_defer_until_death(void* owner, void* array) {
+    JNativeDeathNode* node = (JNativeDeathNode*)malloc(sizeof(JNativeDeathNode));
+    if (node == NULL) return;
+    node->owner = owner;
+    node->array = array;
+    size_t b = (size_t)(jnative_mix((uintptr_t)owner) & (JN_DEATH_BUCKETS - 1));
+    jn_mutex_lock(&jnative_death_lock);
+    if (jnative_death == NULL) {
+        jnative_death = (JNativeDeathNode**)calloc(JN_DEATH_BUCKETS, sizeof(JNativeDeathNode*));
+        if (jnative_death == NULL) {
+            jn_mutex_unlock(&jnative_death_lock);
+            free(node);
+            return;
+        }
+    }
+    node->next = jnative_death[b];
+    jnative_death[b] = node;
+    __atomic_add_fetch(&jnative_death_live, 1, __ATOMIC_RELEASE);
+    jn_mutex_unlock(&jnative_death_lock);
+}
+
+__attribute__((noinline)) void __jnative_borrow_enter(void* owner) {
+    if (owner == NULL) return;
+    uintptr_t frame = (uintptr_t)__builtin_frame_address(0);
+    jnative_drop_borrows_below(frame, 0);
+    for (int i = jnative_borrow_n - 1; i >= 0; i--) {
+        if (jnative_borrows[i].frame == frame && jnative_borrows[i].owner == owner) return;
+    }
+    if (jnative_borrow_n == jnative_borrow_cap) {
+        int cap = jnative_borrow_cap == 0 ? 16 : jnative_borrow_cap * 2;
+        JNativeBorrow* grown = (JNativeBorrow*)realloc(jnative_borrows, (size_t)cap * sizeof(JNativeBorrow));
+        if (grown == NULL) return;
+        jnative_borrows = grown;
+        jnative_borrow_cap = cap;
+    }
+    jnative_borrows[jnative_borrow_n].owner = owner;
+    jnative_borrows[jnative_borrow_n].frame = frame;
+    jnative_borrow_n++;
+}
+
+__attribute__((noinline)) void __jnative_borrow_exit(void) {
+    if (jnative_borrow_n == 0 && jnative_retired_n == 0) return;
+    uintptr_t frame = (uintptr_t)__builtin_frame_address(0);
+    jnative_drop_borrows_below(frame, 1);
+    if (jnative_retired_n != 0) jnative_free_unborrowed_retired();
+}
+
+__attribute__((noinline)) void __jnative_replace_array(void* owner, void* old, void* replacement, int32_t mode) {
+    if (old == NULL || old == replacement) return;
+    uintptr_t addr = (uintptr_t)old;
+    if (jnative_static_low != 0 && jnative_static_high != 0
+        && addr >= jnative_static_low && addr < jnative_static_high) {
+        return;
+    }
+    if (*(int32_t*)((char*)old + JAVA_ARR_LENGTH_OFFSET) <= 0) return;
+    if (!__jnative_release_owner(old)) return;
+    uintptr_t frame = (uintptr_t)__builtin_frame_address(0);
+    jnative_drop_borrows_below(frame, 0);
+    if (mode == 0) {
+        jnative_defer_until_death(owner, old);
+        return;
+    }
+    if (!jnative_borrowed(owner)) {
+        __jnative_free(old);
+        return;
+    }
+    if (jnative_retired_n == jnative_retired_cap) {
+        int cap = jnative_retired_cap == 0 ? 16 : jnative_retired_cap * 2;
+        JNativeRetired* grown = (JNativeRetired*)realloc(jnative_retired, (size_t)cap * sizeof(JNativeRetired));
+        if (grown == NULL) return;
+        jnative_retired = grown;
+        jnative_retired_cap = cap;
+    }
+    jnative_retired[jnative_retired_n].owner = owner;
+    jnative_retired[jnative_retired_n].array = old;
+    jnative_retired_n++;
+}
+
+static void jnative_release_retired(void* owner) {
+    if (jnative_retired_n != 0) {
+        int w = 0;
+        for (int i = 0; i < jnative_retired_n; i++) {
+            if (jnative_retired[i].owner == owner) __jnative_free(jnative_retired[i].array);
+            else jnative_retired[w++] = jnative_retired[i];
+        }
+        jnative_retired_n = w;
+    }
+    if (__atomic_load_n(&jnative_death_live, __ATOMIC_ACQUIRE) == 0) return;
+    size_t b = (size_t)(jnative_mix((uintptr_t)owner) & (JN_DEATH_BUCKETS - 1));
+    JNativeDeathNode* found = NULL;
+    jn_mutex_lock(&jnative_death_lock);
+    JNativeDeathNode** pp = &jnative_death[b];
+    while (*pp != NULL) {
+        JNativeDeathNode* n = *pp;
+        if (n->owner == owner) {
+            *pp = n->next;
+            n->next = found;
+            found = n;
+            __atomic_sub_fetch(&jnative_death_live, 1, __ATOMIC_RELEASE);
+        } else {
+            pp = &n->next;
+        }
+    }
+    jn_mutex_unlock(&jnative_death_lock);
+    while (found != NULL) {
+        JNativeDeathNode* next = found->next;
+        __jnative_free(found->array);
+        free(found);
+        found = next;
+    }
+}
+
+void __jnative_container_detach_clone(void* clone) {
+    if (clone == NULL) return;
+    void* vt = *(void**)clone;
+    if (vt == NULL) return;
+    jn_once(&jnative_containers_once, jnative_containers_init);
+    JNativeVTable* v = (JNativeVTable*)vt;
+    ReflectionClass* cls = v->name != NULL ? jnative_class_by_name(v->name) : NULL;
+    for (; cls != NULL; cls = cls->superclass) {
+        if (cls->cname == NULL) continue;
+        for (int i = 0; i < JN_CONTAINER_COUNT; i++) {
+            JNativeContainerKind* k = &jnative_containers[i];
+            if (k->offset > 0 && strcmp(k->class_name, cls->cname) == 0) {
+                *(void**)((char*)clone + k->offset) = NULL;
+            }
+        }
+    }
+}
+
 void __jnative_free_container(void* p) {
     if (p == NULL) return;
     uintptr_t addr = (uintptr_t)p;
@@ -627,6 +813,7 @@ void __jnative_free_container(void* p) {
             void* inner = *(void**)((char*)p + k->offset);
             if (k->kind == JN_BOX_HASH_TABLE) jnative_free_hash_table(inner);
             else jnative_free_array_storage(inner);
+            jnative_release_retired(p);
             break;
         }
     }
