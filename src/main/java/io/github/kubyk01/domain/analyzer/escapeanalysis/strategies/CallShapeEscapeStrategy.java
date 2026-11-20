@@ -5,6 +5,7 @@ import io.github.kubyk01.domain.analyzer.aliasanalysis.AliasAnalysisResult;
 import io.github.kubyk01.domain.analyzer.aliasanalysis.AllocationSite;
 import io.github.kubyk01.domain.analyzer.aliasanalysis.PointsToSet;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.ClassNode;
+import io.github.kubyk01.domain.analyzer.dependencyresolver.FieldNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.MethodNode;
 import io.github.kubyk01.domain.analyzer.escapeanalysis.EscapeAnalysisResult;
 import io.github.kubyk01.domain.analyzer.escapeanalysis.EscapeAnalysisResult.CallShape;
@@ -13,9 +14,11 @@ import io.github.kubyk01.domain.ir.BasicBlock;
 import io.github.kubyk01.domain.ir.Constant;
 import io.github.kubyk01.domain.ir.Function;
 import io.github.kubyk01.domain.ir.Instruction;
+import io.github.kubyk01.domain.ir.InvokeDynamicInfo;
 import io.github.kubyk01.domain.ir.Module;
 import io.github.kubyk01.domain.ir.Opcode;
 import io.github.kubyk01.domain.ir.Parameter;
+import io.github.kubyk01.domain.ir.ResolvedCall;
 import io.github.kubyk01.domain.ir.ReturnTerminator;
 import io.github.kubyk01.domain.ir.Temporary;
 import io.github.kubyk01.domain.ir.Terminator;
@@ -44,6 +47,7 @@ import java.util.concurrent.atomic.AtomicReferenceArray;
 
 import static io.github.kubyk01.util.LlvmUtil.canonicalCalleeKey;
 import static io.github.kubyk01.util.LlvmUtil.extractCalleeName;
+import static io.github.kubyk01.util.LlvmUtil.extractFieldName;
 
 public final class CallShapeEscapeStrategy implements EscapeAnalysisStrategies {
 
@@ -58,6 +62,14 @@ public final class CallShapeEscapeStrategy implements EscapeAnalysisStrategies {
     private static final Set<String> PURE_NATIVES = Set.of(
         "java/lang/System.arraycopy(Ljava/lang/Object;ILjava/lang/Object;II)V",
         "java/lang/Object.hashCode()I",
+        "java/lang/Object.getClass()Ljava/lang/Class;",
+        "java/lang/Class.isArray()Z",
+        "java/lang/Class.isPrimitive()Z",
+        "java/lang/Class.isInterface()Z",
+        "java/lang/Class.isHidden()Z",
+        "java/lang/Class.getModifiers()I",
+        "java/lang/Class.isInstance(Ljava/lang/Object;)Z",
+        "java/lang/Class.isAssignableFrom(Ljava/lang/Class;)Z",
         "java/lang/System.identityHashCode(Ljava/lang/Object;)I");
 
     private record Target(int[] functions, boolean unknown) {}
@@ -119,6 +131,21 @@ public final class CallShapeEscapeStrategy implements EscapeAnalysisStrategies {
         return v instanceof Constant c && c.getValue() == null;
     }
 
+    static boolean isStringLiteral(Value v) {
+        if (!(v instanceof Constant c) || !(c.getValue() instanceof String)) return false;
+        Type t = c.getType();
+        return t != null && t.isReference() && "java/lang/String".equals(t.getClassName());
+    }
+
+    public static boolean concatReadsOnly(Instruction inst, Value v) {
+        if (inst.getOpcode() != Opcode.INVOKEDYNAMIC || v == null) return false;
+        if (!(inst.getInvokedynamicData() instanceof InvokeDynamicInfo info)) return false;
+        ResolvedCall call = info.resolvedCall();
+        if (call == null || call.getType() != ResolvedCall.Type.CONCAT) return false;
+        Type t = v.getType();
+        return t != null && t.isReference() && "java/lang/String".equals(t.getClassName());
+    }
+
     private static final class Solver {
         private final Module module;
         private final DependencyResolver resolver;
@@ -167,17 +194,44 @@ public final class CallShapeEscapeStrategy implements EscapeAnalysisStrategies {
             while (dirty.length > 0) dirty = callersOf(parallel(dirty, this::updateMasks));
             dirty = all;
             while (dirty.length > 0) dirty = callersOf(parallel(dirty, this::updateFresh));
+            int refined = refineByReturnClasses();
+            if (refined > 0) {
+                for (int i = 0; i < n; i++) {
+                    retained.set(i, 0L);
+                    returned.set(i, 0L);
+                    fresh.set(i, 1L);
+                }
+                buildCallers(n);
+                dirty = all;
+                while (dirty.length > 0) dirty = callersOf(parallel(dirty, this::updateMasks));
+                dirty = all;
+                while (dirty.length > 0) dirty = callersOf(parallel(dirty, this::updateFresh));
+            }
+            System.out.println("Escape: " + refined + " dispatch call(s) narrowed by allocated return classes");
 
             EscapeAnalysisResult result = new EscapeAnalysisResult();
-            if (System.getenv("JN_OWN_DEBUG") != null) {
+            String dbgFilter = System.getenv("JN_OWN_DEBUG");
+            if (dbgFilter != null) {
                 for (int i = 0; i < n; i++) {
                     String nm = bodies.get(i).getName();
-                    if (nm.contains("Own_") || nm.equals("fn_java_lang_Object__init____V")) {
-                        System.out.println("DBG fn " + nm + " retained=" + Long.toHexString(retained.get(i))
-                            + " returned=" + Long.toHexString(returned.get(i)) + " fresh=" + fresh.get(i));
+                    if (!nm.contains(dbgFilter)) continue;
+                    System.out.println("DBG fn " + nm + " retained=" + Long.toHexString(retained.get(i))
+                        + " returned=" + Long.toHexString(returned.get(i)) + " fresh=" + fresh.get(i));
+                    for (Site s : sites.get(i)) {
+                        CallShape sh = shapeOf(s.target());
+                        Value r0 = s.inst().getOperands().isEmpty() ? null : s.inst().getOperands().getFirst();
+                        Object rp = r0 == null ? null : r0.getPointsTo();
+                        String rdesc = rp instanceof PointsToSet ps
+                            ? ("pts size=" + ps.size() + " unknown=" + ps.containsUnknown() + " first="
+                                + (ps.isEmpty() ? "-" : AllocationSite.byId(ps.id(ps.cursor())).getType()))
+                            : "pts none";
+                        System.out.println("DBG     receiver " + rdesc);
+                        System.out.println("DBG   call " + extractCalleeName(s.inst()) + " unknown=" + s.target().unknown()
+                            + " targets=" + s.target().functions().length + " exact=" + s.exact()
+                            + " retained=" + Long.toHexString(sh.retainedArgs()) + " returned=" + Long.toHexString(sh.returnedArgs())
+                            + " fresh=" + sh.freshReturn());
                     }
                 }
-                directTargets.forEach((c, t) -> { if (c.startsWith("Own") || c.startsWith("java/lang/Object.<init>")) System.out.println("DBG direct " + c + " unknown=" + t.unknown() + " fns=" + t.functions().length); });
             }
             directTargets.forEach((callee, t) -> result.putCallShape(false, callee, shapeOf(t)));
             dispatchTargets.forEach((callee, t) -> result.putCallShape(true, callee, shapeOf(t)));
@@ -242,11 +296,25 @@ public final class CallShapeEscapeStrategy implements EscapeAnalysisStrategies {
                 for (int instIdx2 = 0; instIdx2 < block.getInstructions().size(); instIdx2++) { Instruction inst = block.getInstructions().get(instIdx2);
                     if (!isCall(inst.getOpcode())) continue;
                     Target t = targetOf(inst);
+                    if (isArrayClone(inst)) {
+                        out.add(new Site(inst, FRESH_NATIVE, true));
+                        continue;
+                    }
                     Target narrow = isDispatch(inst.getOpcode()) ? narrowed(inst, t) : t;
                     out.add(new Site(inst, narrow, narrow != t));
                 }
             }
             return out.toArray(new Site[0]);
+        }
+
+        private static boolean isArrayClone(Instruction inst) {
+            if (!isDispatch(inst.getOpcode()) || inst.getOperands().isEmpty()) return false;
+            String callee = extractCalleeName(inst);
+            if (callee == null || !callee.endsWith(".clone()Ljava/lang/Object;")) return false;
+            if (callee.startsWith("[")) return true;
+            if (!callee.equals("java/lang/Object.clone()Ljava/lang/Object;")) return false;
+            Value recv = inst.getOperands().getFirst();
+            return recv != null && recv.getType() != null && recv.getType().isArray();
         }
 
         private Target targetOf(Instruction inst) {
@@ -269,6 +337,7 @@ public final class CallShapeEscapeStrategy implements EscapeAnalysisStrategies {
         private Target nativeTarget(String callee) {
             if (FRESH_NATIVES.contains(callee)) return FRESH_NATIVE;
             if (PURE_NATIVES.contains(callee)) return PURE_NATIVE;
+            if (callee.startsWith("__jnative_fn_java_lang_System_arraycopy__")) return PURE_NATIVE;
             int paren = callee.indexOf('(');
             int dot = paren < 0 ? -1 : callee.lastIndexOf('.', paren);
             if (dot <= 0) return null;
@@ -325,12 +394,24 @@ public final class CallShapeEscapeStrategy implements EscapeAnalysisStrategies {
 
         private Target narrowed(Instruction inst, Target cha) {
             if (!cha.unknown() && cha.functions().length <= 1) return cha;
-            String callee = extractCalleeName(inst);
             List<Value> ops = inst.getOperands();
-            if (callee == null || ops.isEmpty()) return cha;
+            if (ops.isEmpty()) return cha;
             Value recv = ops.getFirst();
             if (recv == null || !(recv.getPointsTo() instanceof PointsToSet pts)) return cha;
             if (pts.isEmpty() || pts.containsUnknown()) return cha;
+            Set<String> classes = new LinkedHashSet<>();
+            for (long c = pts.cursor(); pts.has(c); c = pts.next(c)) {
+                Type t = AllocationSite.byId(pts.id(c)).getType();
+                String cls = t == null ? null : t.isArray() ? "java/lang/Object" : t.isReference() ? t.getClassName() : null;
+                if (cls == null || cls.isEmpty()) return cha;
+                classes.add(cls);
+            }
+            return narrowTo(inst, cha, classes);
+        }
+
+        private Target narrowTo(Instruction inst, Target cha, Set<String> classes) {
+            String callee = extractCalleeName(inst);
+            if (callee == null) return cha;
             int paren = callee.indexOf('(');
             int dot = paren < 0 ? -1 : callee.lastIndexOf('.', paren);
             if (dot <= 0) return cha;
@@ -340,12 +421,7 @@ public final class CallShapeEscapeStrategy implements EscapeAnalysisStrategies {
             Arrays.sort(allowed);
             int[] found = new int[Math.max(allowed.length, 4)];
             int k = 0;
-            Set<String> seen = new HashSet<>();
-            for (long c = pts.cursor(); pts.has(c); c = pts.next(c)) {
-                Type t = AllocationSite.byId(pts.id(c)).getType();
-                String cls = t == null ? null : t.isArray() ? "java/lang/Object" : t.isReference() ? t.getClassName() : null;
-                if (cls == null || cls.isEmpty()) return cha;
-                if (!seen.add(cls)) continue;
+            for (String cls : classes) {
                 int g = implIndex(cls, name, descriptor);
                 if (g < 0 || (!cha.unknown() && Arrays.binarySearch(allowed, g) < 0)) return cha;
                 boolean dup = false;
@@ -361,6 +437,192 @@ public final class CallShapeEscapeStrategy implements EscapeAnalysisStrategies {
             }
             if (k == 0 || (!cha.unknown() && k >= allowed.length)) return cha;
             return new Target(Arrays.copyOf(found, k), false);
+        }
+
+        private int refineByReturnClasses() {
+            Map<Integer, Set<String>> memo = new HashMap<>();
+            Set<Integer> failed = new HashSet<>();
+            int refined = 0;
+            for (int i = 0; i < bodies.size(); i++) {
+                Site[] ss = sites.get(i);
+                Map<Instruction, Target> local = null;
+                for (int k = 0; k < ss.length; k++) {
+                    Site s = ss[k];
+                    if (s.exact() || !isDispatch(s.inst().getOpcode())) continue;
+                    if (!s.target().unknown() && s.target().functions().length <= 1) continue;
+                    List<Value> ops = s.inst().getOperands();
+                    if (ops.isEmpty()) continue;
+                    if (local == null) {
+                        local = new IdentityHashMap<>();
+                        for (int q = 0; q < ss.length; q++) local.put(ss[q].inst(), ss[q].target());
+                    }
+                    ArrayDeque<Value> work = new ArrayDeque<>();
+                    work.push(ops.getFirst());
+                    Set<String> classes = allocatedClasses(work, local, memo, failed);
+                    if (classes == null || classes.isEmpty()) continue;
+                    Target t = narrowTo(s.inst(), s.target(), classes);
+                    if (t == s.target()) continue;
+                    ss[k] = new Site(s.inst(), t, true);
+                    local.put(s.inst(), t);
+                    refined++;
+                }
+            }
+            return refined;
+        }
+
+        private Map<String, List<Instruction>> fieldStores;
+        private final Map<String, Set<String>> fieldClassMemo = new HashMap<>();
+        private final Set<String> fieldClassBusy = new HashSet<>();
+        private final Set<String> fieldClassFailed = new HashSet<>();
+
+        private String canonicalField(String raw) {
+            if (raw == null) return null;
+            int dot = raw.lastIndexOf('.');
+            if (dot <= 0) return null;
+            FieldNode fn = resolver.getField(raw.substring(0, dot), raw.substring(dot + 1));
+            if (fn == null || fn.getOwner() == null) return null;
+            if ((fn.getAccess() & Opcodes.ACC_FINAL) == 0 || (fn.getAccess() & Opcodes.ACC_STATIC) != 0) return null;
+            if (serializable(fn.getOwner())) return null;
+            return fn.getOwner() + "." + fn.getName();
+        }
+
+        private boolean serializable(String cls) {
+            ArrayDeque<String> work = new ArrayDeque<>();
+            Set<String> seen = new HashSet<>();
+            work.add(cls);
+            while (!work.isEmpty()) {
+                String c = work.poll();
+                if (c == null || !seen.add(c)) continue;
+                if (c.equals("java/io/Serializable")) return true;
+                ClassNode node = resolver.getClassNode(c);
+                if (node == null) return true;
+                if (node.getSuperName() != null) work.add(node.getSuperName());
+                if (node.getInterfaces() != null) work.addAll(node.getInterfaces());
+            }
+            return false;
+        }
+
+        private Set<String> fieldClasses(String raw, Map<Integer, Set<String>> memo, Set<Integer> failed) {
+            String key = canonicalField(raw);
+            if (key == null) return null;
+            Set<String> known = fieldClassMemo.get(key);
+            if (known != null) return known;
+            if (fieldClassFailed.contains(key) || !fieldClassBusy.add(key)) return null;
+            if (fieldStores == null) {
+                fieldStores = new HashMap<>();
+                for (int b = 0; b < bodies.size(); b++) {
+                    Function f = bodies.get(b);
+                    for (int bi = 0; bi < f.getBlocks().size(); bi++) {
+                        List<Instruction> insts = f.getBlocks().get(bi).getInstructions();
+                        for (int ii = 0; ii < insts.size(); ii++) {
+                            Instruction inst = insts.get(ii);
+                            if (inst.getOpcode() != Opcode.PUT_FIELD || inst.getOperands().size() < 3) continue;
+                            String k = canonicalField(extractFieldName(inst));
+                            if (k != null) fieldStores.computeIfAbsent(k, x -> new ArrayList<>()).add(inst);
+                        }
+                    }
+                }
+            }
+            Set<String> out = new LinkedHashSet<>();
+            List<Instruction> stores = fieldStores.getOrDefault(key, List.of());
+            for (int i = 0; i < stores.size() && out != null; i++) {
+                Instruction put = stores.get(i);
+                Integer g = index.get(put.getParent().getFunction());
+                if (g == null) {
+                    out = null;
+                    break;
+                }
+                Map<Instruction, Target> local = new IdentityHashMap<>();
+                Site[] ss = sites.get(g);
+                for (int q = 0; q < ss.length; q++) local.put(ss[q].inst(), ss[q].target());
+                ArrayDeque<Value> work = new ArrayDeque<>();
+                work.push(put.getOperands().get(2));
+                Set<String> c = allocatedClasses(work, local, memo, failed);
+                if (c == null) out = null;
+                else out.addAll(c);
+            }
+            fieldClassBusy.remove(key);
+            if (out == null || out.isEmpty()) {
+                fieldClassFailed.add(key);
+                return null;
+            }
+            fieldClassMemo.put(key, out);
+            return out;
+        }
+
+        private Set<String> returnClasses(int g, Map<Integer, Set<String>> memo, Set<Integer> failed) {
+            Set<String> known = memo.get(g);
+            if (known != null) return known;
+            if (!failed.add(g)) return null;
+            Function f = bodies.get(g);
+            Map<Instruction, Target> local = new IdentityHashMap<>();
+            Site[] ss = sites.get(g);
+            for (int q = 0; q < ss.length; q++) local.put(ss[q].inst(), ss[q].target());
+            ArrayDeque<Value> work = new ArrayDeque<>();
+            for (int b = 0; b < f.getBlocks().size(); b++) {
+                Terminator term = f.getBlocks().get(b).getTerminator();
+                if (term instanceof ReturnTerminator rt && rt.getValue() != null) work.push(rt.getValue());
+            }
+            Set<String> out = allocatedClasses(work, local, memo, failed);
+            if (out == null || out.isEmpty()) return null;
+            failed.remove(g);
+            memo.put(g, out);
+            return out;
+        }
+
+        private Set<String> allocatedClasses(ArrayDeque<Value> work, Map<Instruction, Target> local,
+                                             Map<Integer, Set<String>> memo, Set<Integer> failed) {
+            Set<String> out = new LinkedHashSet<>();
+            Set<Value> seen = java.util.Collections.newSetFromMap(new IdentityHashMap<>());
+            while (!work.isEmpty()) {
+                Value v = work.pop();
+                if (isNullConstant(v) || !seen.add(v)) continue;
+                if (isStringLiteral(v)) {
+                    out.add("java/lang/String");
+                    continue;
+                }
+                if (!(v instanceof Temporary t) || t.getDefiningInstruction() == null) return null;
+                Instruction def = t.getDefiningInstruction();
+                List<Value> ops = def.getOperands();
+                switch (def.getOpcode()) {
+                    case NEW -> {
+                        if (ops.isEmpty() || !(ops.getFirst() instanceof Constant c)
+                            || c.getValue() == null || !c.getType().isReference()) return null;
+                        String cls = c.getValue().toString();
+                        if (cls.isEmpty() || cls.charAt(0) == '[') return null;
+                        out.add(cls);
+                    }
+                    case NEW_ARRAY, MULTI_NEW_ARRAY -> out.add("java/lang/Object");
+                    case GET_FIELD -> {
+                        Set<String> fc = fieldClasses(extractFieldName(def), memo, failed);
+                        if (fc == null) return null;
+                        out.addAll(fc);
+                    }
+                    case CAST, CHECKCAST, STORE -> {
+                        if (ops.isEmpty()) return null;
+                        work.push(ops.getFirst());
+                    }
+                    case PHI, SELECT -> {
+                        for (int k = 0; k < ops.size(); k++) {
+                            Value op = ops.get(k);
+                            if (isReference(op)) work.push(op);
+                        }
+                    }
+                    case CALL, VIRTUAL_CALL, INTERFACE_CALL, STATIC_CALL, SPECIAL_CALL -> {
+                        Target target = local.get(def);
+                        if (target == null || target.unknown() || target.functions().length == 0) return null;
+                        for (int g : target.functions()) {
+                            Set<String> rc = returnClasses(g, memo, failed);
+                            if (rc == null) return null;
+                            out.addAll(rc);
+                        }
+                    }
+                    default -> {
+                        return null;
+                    }
+                }
+            }
+            return out;
         }
 
         private int implIndex(String cls, String name, String descriptor) {
@@ -422,6 +684,10 @@ public final class CallShapeEscapeStrategy implements EscapeAnalysisStrategies {
             }
             Map<Integer, Long> slots = scratch.slots;
             slots.clear();
+            for (int pIdx = 0; pIdx < f.getParameters().size(); pIdx++) {
+                Parameter p = f.getParameters().get(pIdx);
+                if (p.getOrdinal() >= 0 && isReference(p)) slots.merge(p.getIndex(), CallShape.bit(p.getOrdinal()), (a, b) -> a | b);
+            }
             ScratchIdentityMap<Instruction, Target> targets = scratch.targets;
             targets.clear();
             for (Site s : sites.get(i)) targets.put(s.inst(), s.target());
@@ -485,6 +751,9 @@ public final class CallShapeEscapeStrategy implements EscapeAnalysisStrategies {
                         }
                         case PUT_STATIC -> {
                             for (Value v : ops) keep |= get(bits, v);
+                        }
+                        case INVOKEDYNAMIC -> {
+                            for (Value v : ops) if (!concatReadsOnly(inst, v)) keep |= get(bits, v);
                         }
                         case CALL, VIRTUAL_CALL, INTERFACE_CALL, STATIC_CALL, SPECIAL_CALL -> {
                             Target t = targets.get(inst);
@@ -582,6 +851,7 @@ public final class CallShapeEscapeStrategy implements EscapeAnalysisStrategies {
             while (!work.isEmpty()) {
                 Value v = work.pop();
                 if (isNullConstant(v) || !origin.add(v)) continue;
+                if (isStringLiteral(v)) continue;
                 if (!(v instanceof Temporary t) || t.getDefiningInstruction() == null) {
                     return false;
                 }
@@ -678,6 +948,7 @@ public final class CallShapeEscapeStrategy implements EscapeAnalysisStrategies {
                 case GET_FIELD, ALOAD, ARRAYLENGTH, INSTANCEOF, EQ, NE, MONITOR_ENTER, MONITOR_EXIT,
                      CAST, CHECKCAST, PHI, SELECT, STORE -> true;
                 case PUT_FIELD, ASTORE -> k == 0;
+                case INVOKEDYNAMIC -> concatReadsOnly(inst, v);
                 case CALL, VIRTUAL_CALL, INTERFACE_CALL, STATIC_CALL, SPECIAL_CALL -> {
                     Target target = targets.get(inst);
                     int argc = argCount(inst);

@@ -956,10 +956,17 @@ extern void    __jnative_share(void* p);
 extern int32_t __jnative_release_owner(void* p);
 extern void    __jnative_free_owned(void* p);
 extern void    __jnative_free_container(void* p);
+extern void    __jnative_free_container_storage(void* p);
 extern void    __jnative_borrow_enter(void* owner);
 extern void    __jnative_borrow_exit(void);
 extern void    __jnative_replace_array(void* owner, void* old, void* replacement, int32_t mode);
 extern void    __jnative_container_detach_clone(void* clone);
+extern void    __jnative_ebr_pin(void);
+extern void    __jnative_ebr_unpin(void);
+extern void    __jnative_ebr_retire(void* old);
+extern void    __jnative_ebr_retire_if(int32_t ok, void* old);
+extern void    __jnative_ebr_retire_if_same(void* witness, void* old);
+extern void    __jnative_ebr_discard_if(int32_t published, void* unpublished);
 
 /* ---- Exception construction and throwers --------------------------- */
 

@@ -7,6 +7,7 @@ import io.github.kubyk01.domain.analyzer.aliasanalysis.AllocationSite;
 import io.github.kubyk01.domain.analyzer.escapeanalysis.EscapeAnalysisResult;
 import io.github.kubyk01.domain.analyzer.escapeanalysis.EscapeAnalysisResult.CallShape;
 import io.github.kubyk01.domain.analyzer.escapeanalysis.EscapeStatus;
+import io.github.kubyk01.domain.analyzer.escapeanalysis.strategies.CallShapeEscapeStrategy;
 import io.github.kubyk01.domain.analyzer.lifetime.DestructionPoint;
 import io.github.kubyk01.domain.analyzer.lifetime.LifetimeAnalysisResult;
 import io.github.kubyk01.domain.ir.BasicBlock;
@@ -36,9 +37,16 @@ public final class FreshObjectOwnershipLifetimeStrategy implements LifetimeAnaly
 
     private static final AllocationSite OWNED =
         AllocationSite.of("<owned>", -1, "java/lang/Object", Type.reference("java/lang/Object"));
+    private static final AllocationSite FRAME =
+        AllocationSite.of("<owned-frame>", -1, "java/lang/Object", Type.reference("java/lang/Object"));
+    private static final int NONE = 0;
+    private static final int HEAP = 1;
+    private static final int STACK_FRAME = 2;
     private static final int MAX_REGION = 4096;
 
     private record Use(int block, int index, Instruction inst) {}
+
+    private record Death(DestructionPoint point, boolean frame) {}
 
     @Override
     public int priority() {
@@ -55,21 +63,25 @@ public final class FreshObjectOwnershipLifetimeStrategy implements LifetimeAnaly
         for (Function f : module.getFunctions()) {
             if (f.getEntryBlock() != null && domTrees.containsKey(f)) live.add(f);
         }
-        List<List<DestructionPoint>> parts = LlvmUtil.awaitFlux(Flux.fromIterable(live)
+        List<List<Death>> parts = LlvmUtil.awaitFlux(Flux.fromIterable(live)
             .parallel()
             .runOn(scheduler)
-            .map(f -> new FunctionOwnership(f, domTrees.get(f), aliasResult, escapeResult, liveness).deaths())
+            .map(f -> new FunctionOwnership(f, domTrees.get(f), aliasResult, escapeResult, liveness, loops).deaths())
             .filter(l -> !l.isEmpty())
             .sequential());
         LifetimeAnalysisResult result = new LifetimeAnalysisResult();
         if (parts == null || parts.isEmpty()) return result;
-        Set<DestructionPoint> all = result.getDestructionPoints().computeIfAbsent(OWNED, k -> new HashSet<>());
         int roots = 0;
-        for (List<DestructionPoint> part : parts) {
-            all.addAll(part);
+        for (List<Death> part : parts) {
+            for (int k = 0; k < part.size(); k++) {
+                Death d = part.get(k);
+                result.getDestructionPoints().computeIfAbsent(d.frame() ? FRAME : OWNED, x -> new HashSet<>()).add(d.point());
+            }
             roots += part.size();
         }
         result.getShallowSites().add(OWNED);
+        result.getShallowSites().add(FRAME);
+        result.getFrameSites().add(FRAME);
         System.out.println("Lifetime: " + roots + " free point(s) for fresh owned objects");
         return result;
     }
@@ -82,19 +94,23 @@ public final class FreshObjectOwnershipLifetimeStrategy implements LifetimeAnaly
         private final int n;
         private final Map<Value, List<Use>> uses = new IdentityHashMap<>();
         private final boolean[] handler;
+        private final Map<Function, Map<BasicBlock, Set<BasicBlock>>> loops;
 
         FunctionOwnership(Function function, DominatorTree dom, AliasAnalysisResult alias,
-                          EscapeAnalysisResult escape, LivenessAnalyzer liveness) {
+                          EscapeAnalysisResult escape, LivenessAnalyzer liveness,
+                          Map<Function, Map<BasicBlock, Set<BasicBlock>>> loops) {
             this.dom = dom;
             this.alias = alias;
             this.escape = escape;
             this.liveness = liveness;
+            this.loops = loops;
             this.n = dom.size();
             this.handler = new boolean[n];
         }
 
-        List<DestructionPoint> deaths() {
+        List<Death> deaths() {
             List<Instruction> roots = new ArrayList<>();
+            List<Boolean> frames = new ArrayList<>();
             for (int b = 0; b < n; b++) {
                 BasicBlock block = dom.blockAt(b);
                 for (int exIdx1 = 0; exIdx1 < block.getExceptionalSuccessors().size(); exIdx1++) { BasicBlock ex = block.getExceptionalSuccessors().get(exIdx1);
@@ -102,19 +118,25 @@ public final class FreshObjectOwnershipLifetimeStrategy implements LifetimeAnaly
                     if (h >= 0) handler[h] = true;
                 }
                 for (int instIdx2 = 0; instIdx2 < block.getInstructions().size(); instIdx2++) { Instruction inst = block.getInstructions().get(instIdx2);
-                    if (isRoot(inst)) roots.add(inst);
+                    int kind = rootKind(inst);
+                    if (kind == NONE) continue;
+                    roots.add(inst);
+                    frames.add(kind == STACK_FRAME);
                 }
             }
             if (roots.isEmpty()) return List.of();
             indexUses();
-            List<DestructionPoint> out = new ArrayList<>();
+            List<Death> out = new ArrayList<>();
+            List<DestructionPoint> points = new ArrayList<>();
             boolean dbg = System.getenv("JN_OWN_DEBUG") != null && dom.blockAt(0).getFunction() != null
-                && dom.blockAt(0).getFunction().getName().contains("Own_work");
+                && dom.blockAt(0).getFunction().getName().contains(System.getenv("JN_OWN_DEBUG"));
             dbgOn = dbg;
-            for (Instruction root : roots) {
-                int before = out.size();
-                placeDeaths(root, out);
-                if (dbg) System.out.println("DBG root " + root.getOpcode() + " " + extractCalleeName(root) + " deaths=" + (out.size() - before) + " why=" + why);
+            for (int r = 0; r < roots.size(); r++) {
+                Instruction root = roots.get(r);
+                points.clear();
+                placeDeaths(root, points);
+                for (int k = 0; k < points.size(); k++) out.add(new Death(points.get(k), frames.get(r)));
+                if (dbg) System.out.println("DBG root " + root.getOpcode() + " " + extractCalleeName(root) + " deaths=" + points.size() + " why=" + why);
             }
             return out;
         }
@@ -137,24 +159,74 @@ public final class FreshObjectOwnershipLifetimeStrategy implements LifetimeAnaly
             return loadsBySlot.getOrDefault(slot, List.of());
         }
 
-        private boolean isRoot(Instruction inst) {
+        private int rootKind(Instruction inst) {
             Value res = inst.getResult();
-            if (!(res instanceof Temporary) || !isObject(res.getType())) return false;
+            if (res == null || !isObject(res.getType())) return NONE;
             Opcode op = inst.getOpcode();
             if (op == Opcode.NEW) {
                 Type t = res.getType();
                 String cls = t.isReference() ? t.getClassName() : null;
-                if (cls == null || cls.isEmpty() || !LlvmUtil.isSystemClassName(cls)) return false;
-                return !mayBeStack(res);
+                if (cls == null || cls.isEmpty() || !LlvmUtil.isSystemClassName(cls)) return NONE;
+                return placement(res, true);
             }
-            if (!CallShapes.isCall(op)) return false;
+            if (op == Opcode.NEW_ARRAY || op == Opcode.MULTI_NEW_ARRAY) {
+                Set<AllocationSite> sites = alias.getPointsTo(res).getSites();
+                if (sites.isEmpty()) return NONE;
+                for (AllocationSite site : sites) {
+                    if (escape.getSiteStatus(site) != EscapeStatus.STACK || sitePlacement(site) != HEAP) return NONE;
+                }
+                return HEAP;
+            }
+            if (!CallShapes.isCall(op)) return NONE;
             CallShape shape = escape.getCallShape(inst, extractCalleeName(inst));
-            return shape != null && shape.freshReturn() && !mayBeStack(res);
+            return shape != null && shape.freshReturn() && placement(res, false) == HEAP ? HEAP : NONE;
         }
 
-        private boolean mayBeStack(Value v) {
-            for (AllocationSite site : alias.getPointsTo(v).getSites()) {
-                if (escape.getSiteStatus(site) == EscapeStatus.STACK) return true;
+        private int placement(Value v, boolean own) {
+            Set<AllocationSite> sites = alias.getPointsTo(v).getSites();
+            boolean frame = false;
+            boolean heap = false;
+            for (AllocationSite site : sites) {
+                if (escape.getSiteStatus(site) != EscapeStatus.STACK) {
+                    heap = true;
+                    continue;
+                }
+                if (own && alias.getAllocationSiteToValue().get(site) != v) return NONE;
+                int p = sitePlacement(site);
+                if (p == NONE) return NONE;
+                if (p == STACK_FRAME) frame = true;
+                else heap = true;
+            }
+            if (frame) return heap ? NONE : STACK_FRAME;
+            return HEAP;
+        }
+
+        private int sitePlacement(AllocationSite site) {
+            Value v = alias.getAllocationSiteToValue().get(site);
+            if (!(v instanceof Temporary t) || t.getDefiningInstruction() == null) return NONE;
+            Instruction def = t.getDefiningInstruction();
+            Opcode op = def.getOpcode();
+            if (op == Opcode.NEW_ARRAY || op == Opcode.MULTI_NEW_ARRAY) return HEAP;
+            BasicBlock block = def.getParent();
+            Function fn = block == null ? null : block.getFunction();
+            Map<BasicBlock, Set<BasicBlock>> fl = fn == null ? null : loops.get(fn);
+            if (op != Opcode.NEW || fl == null || !usedAsCallOperand(def, fn)) return NONE;
+            for (Set<BasicBlock> body : fl.values()) {
+                if (body.contains(block)) return HEAP;
+            }
+            return STACK_FRAME;
+        }
+
+        private static boolean usedAsCallOperand(Instruction def, Function fn) {
+            Value res = def.getResult();
+            if (res == null) return false;
+            for (int b = 0; b < fn.getBlocks().size(); b++) {
+                List<Instruction> insts = fn.getBlocks().get(b).getInstructions();
+                for (int i = 0; i < insts.size(); i++) {
+                    Instruction inst = insts.get(i);
+                    if (inst == def || !CallShapes.isCall(inst.getOpcode())) continue;
+                    if (inst.getOperands().contains(res)) return true;
+                }
             }
             return false;
         }
@@ -198,6 +270,9 @@ public final class FreshObjectOwnershipLifetimeStrategy implements LifetimeAnaly
                             if (!aliases.contains(r)) aliases.add(r);
                             if (aliases.size() > 63) { why = "r3"; return; }
                         }
+                        case INVOKEDYNAMIC -> {
+                            if (!CallShapeEscapeStrategy.concatReadsOnly(inst, v)) { why = "r18"; return; }
+                        }
                         case GET_FIELD, ALOAD, ARRAYLENGTH, INSTANCEOF, EQ, NE, MONITOR_ENTER, MONITOR_EXIT -> {
                             if (inst.getOperands().getFirst() != v && inst.getOpcode() != Opcode.EQ
                                 && inst.getOpcode() != Opcode.NE) { why = "r4"; return; }
@@ -230,7 +305,7 @@ public final class FreshObjectOwnershipLifetimeStrategy implements LifetimeAnaly
                                 slots.add(slot);
                                 for (Instruction load : loads(slot)) {
                                     Value r = load.getResult();
-                                    if (!(r instanceof Temporary)) { why = "r16"; return; }
+                                    if (r == null) { why = "r16"; return; }
                                     if (!aliases.contains(r)) aliases.add(r);
                                 }
                             }
@@ -304,7 +379,6 @@ public final class FreshObjectOwnershipLifetimeStrategy implements LifetimeAnaly
             long[] liveIn = new long[m];
             long[] liveOut = new long[m];
             int[][] succ = new int[m][];
-            boolean[] leaves = new boolean[m];
             for (int k = 0; k < m; k++) {
                 List<BasicBlock> ss = dom.blockAt(region[k]).getSuccessors();
                 int[] s = new int[ss.size()];

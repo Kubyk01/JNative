@@ -779,6 +779,153 @@ static void jnative_release_retired(void* owner) {
     }
 }
 
+typedef struct JnEbrThread {
+    uint64_t epoch;
+    int32_t active;
+    struct JnEbrThread* next;
+} JnEbrThread;
+
+typedef struct {
+    void* ptr;
+    uint64_t epoch;
+} JnEbrRetired;
+
+static JnEbrThread*            jn_ebr_threads;
+static uint64_t                jn_ebr_global = 2;
+static __thread JnEbrThread*   jn_ebr_self;
+static __thread uintptr_t*     jn_ebr_frames;
+static __thread int            jn_ebr_frame_n;
+static __thread int            jn_ebr_frame_cap;
+static __thread JnEbrRetired*  jn_ebr_retired;
+static __thread int            jn_ebr_retired_n;
+static __thread int            jn_ebr_retired_cap;
+static __thread uint32_t       jn_ebr_ticks;
+
+static JnEbrThread* jn_ebr_thread(void) {
+    JnEbrThread* t = jn_ebr_self;
+    if (t != NULL) return t;
+    t = (JnEbrThread*)calloc(1, sizeof(JnEbrThread));
+    if (t == NULL) __jnative_throw_out_of_memory_error_ctx("__jnative_ebr");
+    JnEbrThread* head = __atomic_load_n(&jn_ebr_threads, __ATOMIC_ACQUIRE);
+    do {
+        t->next = head;
+    } while (!__atomic_compare_exchange_n(&jn_ebr_threads, &head, t, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE));
+    jn_ebr_self = t;
+    return t;
+}
+
+static void jn_ebr_drop_frames(uintptr_t frame, int inclusive) {
+    int w = 0;
+    for (int i = 0; i < jn_ebr_frame_n; i++) {
+        uintptr_t f = jn_ebr_frames[i];
+        if (f < frame || (inclusive && f == frame)) continue;
+        jn_ebr_frames[w++] = f;
+    }
+    jn_ebr_frame_n = w;
+}
+
+static void jn_ebr_collect(void) {
+    uint64_t g = __atomic_load_n(&jn_ebr_global, __ATOMIC_SEQ_CST);
+    int blocked = 0;
+    for (JnEbrThread* t = __atomic_load_n(&jn_ebr_threads, __ATOMIC_ACQUIRE); t != NULL; t = t->next) {
+        if (__atomic_load_n(&t->active, __ATOMIC_SEQ_CST) && __atomic_load_n(&t->epoch, __ATOMIC_SEQ_CST) != g) {
+            blocked = 1;
+            break;
+        }
+    }
+    if (!blocked) {
+        uint64_t expected = g;
+        __atomic_compare_exchange_n(&jn_ebr_global, &expected, g + 1, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    }
+    g = __atomic_load_n(&jn_ebr_global, __ATOMIC_SEQ_CST);
+    int w = 0;
+    for (int i = 0; i < jn_ebr_retired_n; i++) {
+        JnEbrRetired r = jn_ebr_retired[i];
+        if (r.epoch + 2 <= g) __jnative_free(r.ptr);
+        else jn_ebr_retired[w++] = r;
+    }
+    jn_ebr_retired_n = w;
+}
+
+__attribute__((noinline)) void __jnative_ebr_pin(void) {
+    uintptr_t frame = (uintptr_t)__builtin_frame_address(0);
+    JnEbrThread* t = jn_ebr_thread();
+    jn_ebr_drop_frames(frame, 0);
+    for (int i = jn_ebr_frame_n - 1; i >= 0; i--) {
+        if (jn_ebr_frames[i] == frame) return;
+    }
+    if (jn_ebr_frame_n == jn_ebr_frame_cap) {
+        int cap = jn_ebr_frame_cap == 0 ? 16 : jn_ebr_frame_cap * 2;
+        uintptr_t* grown = (uintptr_t*)realloc(jn_ebr_frames, (size_t)cap * sizeof(uintptr_t));
+        if (grown == NULL) __jnative_throw_out_of_memory_error_ctx("__jnative_ebr_pin");
+        jn_ebr_frames = grown;
+        jn_ebr_frame_cap = cap;
+    }
+    jn_ebr_frames[jn_ebr_frame_n++] = frame;
+    if (!__atomic_load_n(&t->active, __ATOMIC_RELAXED)) {
+        __atomic_store_n(&t->epoch, __atomic_load_n(&jn_ebr_global, __ATOMIC_SEQ_CST), __ATOMIC_SEQ_CST);
+        __atomic_store_n(&t->active, 1, __ATOMIC_SEQ_CST);
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        __atomic_store_n(&t->epoch, __atomic_load_n(&jn_ebr_global, __ATOMIC_SEQ_CST), __ATOMIC_SEQ_CST);
+    }
+}
+
+__attribute__((noinline)) void __jnative_ebr_unpin(void) {
+    JnEbrThread* t = jn_ebr_self;
+    if (t == NULL) return;
+    uintptr_t frame = (uintptr_t)__builtin_frame_address(0);
+    jn_ebr_drop_frames(frame, 1);
+    if (jn_ebr_frame_n == 0 && __atomic_load_n(&t->active, __ATOMIC_RELAXED)) {
+        __atomic_store_n(&t->active, 0, __ATOMIC_SEQ_CST);
+        if (jn_ebr_retired_n != 0 && (++jn_ebr_ticks & 63) == 0) jn_ebr_collect();
+    }
+}
+
+static void jn_ebr_retire(void* p) {
+    if (p == NULL) return;
+    uintptr_t addr = (uintptr_t)p;
+    if (jnative_static_low != 0 && jnative_static_high != 0
+        && addr >= jnative_static_low && addr < jnative_static_high) {
+        return;
+    }
+    if (*(int32_t*)((char*)p + JAVA_ARR_LENGTH_OFFSET) <= 0) return;
+    if (!__jnative_release_owner(p)) return;
+    jn_ebr_thread();
+    if (jn_ebr_retired_n == jn_ebr_retired_cap) {
+        int cap = jn_ebr_retired_cap == 0 ? 64 : jn_ebr_retired_cap * 2;
+        JnEbrRetired* grown = (JnEbrRetired*)realloc(jn_ebr_retired, (size_t)cap * sizeof(JnEbrRetired));
+        if (grown == NULL) return;
+        jn_ebr_retired = grown;
+        jn_ebr_retired_cap = cap;
+    }
+    jn_ebr_retired[jn_ebr_retired_n].ptr = p;
+    jn_ebr_retired[jn_ebr_retired_n].epoch = __atomic_load_n(&jn_ebr_global, __ATOMIC_SEQ_CST);
+    jn_ebr_retired_n++;
+    if (jn_ebr_retired_n >= 64 && (jn_ebr_retired_n & 31) == 0) jn_ebr_collect();
+}
+
+__attribute__((noinline)) void __jnative_ebr_retire_if(int32_t ok, void* old) {
+    if (ok) jn_ebr_retire(old);
+}
+
+__attribute__((noinline)) void __jnative_ebr_retire_if_same(void* witness, void* old) {
+    if (witness == old) jn_ebr_retire(old);
+}
+
+__attribute__((noinline)) void __jnative_ebr_retire(void* old) {
+    jn_ebr_retire(old);
+}
+
+__attribute__((noinline)) void __jnative_ebr_discard_if(int32_t published, void* unpublished) {
+    if (published || unpublished == NULL) return;
+    uintptr_t addr = (uintptr_t)unpublished;
+    if (jnative_static_low != 0 && jnative_static_high != 0
+        && addr >= jnative_static_low && addr < jnative_static_high) {
+        return;
+    }
+    if (__jnative_release_owner(unpublished)) __jnative_free(unpublished);
+}
+
 void __jnative_container_detach_clone(void* clone) {
     if (clone == NULL) return;
     void* vt = *(void**)clone;
@@ -818,6 +965,23 @@ void __jnative_free_container(void* p) {
         }
     }
     __jnative_free(p);
+}
+
+void __jnative_free_container_storage(void* p) {
+    if (p == NULL) return;
+    void* vt = *(void**)p;
+    if (vt == NULL) return;
+    jn_once(&jnative_containers_once, jnative_containers_init);
+    for (int i = 0; i < JN_CONTAINER_COUNT; i++) {
+        JNativeContainerKind* k = &jnative_containers[i];
+        if (k->vtable != vt) continue;
+        void* inner = *(void**)((char*)p + k->offset);
+        *(void**)((char*)p + k->offset) = NULL;
+        if (k->kind == JN_BOX_HASH_TABLE) jnative_free_hash_table(inner);
+        else jnative_free_array_storage(inner);
+        jnative_release_retired(p);
+        return;
+    }
 }
 
 /* ========================================================================

@@ -115,6 +115,7 @@ public class LifetimeAnalyzer {
                 result.getDestructionPoints().computeIfAbsent(site, k -> new HashSet<>()).addAll(points);
             });
             result.getShallowSites().addAll(part.getShallowSites());
+            result.getFrameSites().addAll(part.getFrameSites());
         } }
         for (AllocationSite site : unresolvedCandidates) {
             if (!result.getDestructionPoints().containsKey(site)) result.getUnresolved().add(site);
