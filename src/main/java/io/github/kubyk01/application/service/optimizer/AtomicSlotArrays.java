@@ -9,6 +9,7 @@ import io.github.kubyk01.domain.analyzer.dependencyresolver.ClassNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.MethodNode;
 import io.github.kubyk01.domain.analyzer.escapeanalysis.EscapeAnalysisResult;
 import io.github.kubyk01.domain.analyzer.escapeanalysis.EscapeAnalysisResult.CallShape;
+import io.github.kubyk01.domain.analyzer.reflection.ReflectInfo;
 import io.github.kubyk01.domain.ir.BasicBlock;
 import io.github.kubyk01.domain.ir.Constant;
 import io.github.kubyk01.domain.ir.Function;
@@ -79,7 +80,11 @@ final class AtomicSlotArrays {
         final Set<Value> thrown = Collections.newSetFromMap(new IdentityHashMap<>());
     }
 
-    AtomicSlotArrays(Module module, DependencyResolver resolver, AliasAnalysisResult alias, EscapeAnalysisResult escape) {
+    private final ReflectInfo reflectInfo;
+
+    AtomicSlotArrays(Module module, DependencyResolver resolver, AliasAnalysisResult alias, EscapeAnalysisResult escape,
+                     ReflectInfo reflectInfo) {
+        this.reflectInfo = reflectInfo;
         this.module = module;
         this.resolver = resolver;
         this.alias = alias;
@@ -110,7 +115,7 @@ final class AtomicSlotArrays {
             String where = "unresolved static field write " + extractCalleeName(w) + " in " + w.getParent().getFunction().getName();
             for (String fam : staticFamilies) invalid.putIfAbsent("field " + fam, where);
         }
-        for (int i = 0; i < ops.size(); i++) checkWrite(ops.get(i));
+        for (Op value : ops) checkWrite(value);
         for (Op op : ops) {
             Value borrowed = borrowedValue(op);
             if (borrowed == null) continue;
@@ -157,8 +162,8 @@ final class AtomicSlotArrays {
             }
         }
         Set<String> families = new HashSet<>(fieldFamilies);
-        for (int i = 0; i < ops.size(); i++) {
-            String fam = familyOfWrite(ops.get(i));
+        for (Op op : ops) {
+            String fam = familyOfWrite(op);
             if (fam != null && !fam.equals(UNKNOWN_FAMILY)) families.add(fam);
         }
         int valid = 0;
@@ -189,7 +194,8 @@ final class AtomicSlotArrays {
                     if (!isCall(op)) continue;
                     List<Function> ts = resolveTargets(inst);
                     targets.put(inst, ts);
-                    for (int t = 0; t < ts.size(); t++) callSitesOf.computeIfAbsent(ts.get(t), k -> new ArrayList<>()).add(inst);
+                    for (Function function : ts)
+                        callSitesOf.computeIfAbsent(function, k -> new ArrayList<>()).add(inst);
                     if (!intrinsicOwner) calls.add(inst);
                 }
             }
@@ -212,7 +218,7 @@ final class AtomicSlotArrays {
         String n = f.getOwnerClass();
         return ARA.equals(n) || AR.equals(n) || "jdk/internal/misc/Unsafe".equals(n) || "sun/misc/Unsafe".equals(n)
             || (n != null && n.startsWith(ARFU))
-            || VH.equals(n) || (n != null && n.startsWith("java/lang/invoke/VarHandle"));
+            || (n != null && n.startsWith("java/lang/invoke/VarHandle"));
     }
 
     private void classify(Instruction inst) {
@@ -250,7 +256,10 @@ final class AtomicSlotArrays {
             Value obj = argc > 1 ? arg(inst, 1) : null;
             boolean resolved = ts != null && !other;
             for (int i = 0; resolved && i < ts.size(); i++) {
-                if (ts.get(i).kind() != VarHandleTargetResolver.Kind.INSTANCE_FIELD) resolved = false;
+                if (ts.get(i).kind() != VarHandleTargetResolver.Kind.INSTANCE_FIELD) {
+                    resolved = false;
+                    break;
+                }
             }
             if (!resolved) {
                 if (k != Kind.READ) {
@@ -270,14 +279,17 @@ final class AtomicSlotArrays {
             Kind k = unsafeKind(name);
             if (k == null) return;
             if (k != Kind.READ && !(argc > 1 && isReference(arg(inst, argc - 1)))) return;
-            if (argc > 2 && staticOffset(arg(inst, 2))) {
+            if (argc > 2 && (staticOffset(arg(inst, 2)) || staticBase(arg(inst, 1)))) {
                 if (k != Kind.READ) staticWrites.add(inst);
                 return;
             }
             List<VarHandleTargetResolver.Target> ts = argc > 2 ? handleTargets(arg(inst, 2), inst.getParent().getFunction()) : null;
             boolean resolved = ts != null;
             for (int i = 0; resolved && i < ts.size(); i++) {
-                if (ts.get(i).kind() != VarHandleTargetResolver.Kind.INSTANCE_FIELD) resolved = false;
+                if (ts.get(i).kind() != VarHandleTargetResolver.Kind.INSTANCE_FIELD) {
+                    resolved = false;
+                    break;
+                }
             }
             if (!resolved) {
                 if (k != Kind.READ) ops.add(new Op(inst, Kind.UNKNOWN_WRITE, null, arg(inst, 1), null, arg(inst, argc - 1)));
@@ -337,14 +349,14 @@ final class AtomicSlotArrays {
         work.push(handle);
         while (!work.isEmpty()) {
             Value v = work.pop();
-            if (v == null || !seen.add(v)) continue;
+            if (!seen.add(v)) continue;
             if (isNullConstant(v)) continue;
             VarHandleTargetResolver.Target direct = handles.resolveHandleValue(v);
             if (direct != null) {
                 out.put(direct.kind() + ":" + direct.owner() + "." + direct.fieldName() + ":" + direct.valueType(), direct);
                 continue;
             }
-            int ordinal = -1;
+            int ordinal;
             if (v instanceof Parameter p) {
                 ordinal = p.getOrdinal();
             } else if (v instanceof Temporary t && t.getDefiningInstruction() != null) {
@@ -454,23 +466,58 @@ final class AtomicSlotArrays {
     private final Set<String> staticFamilies = new HashSet<>();
 
     private boolean staticOffset(Value offset) {
+        return producedBy(offset, ".staticFieldOffset(");
+    }
+
+    private boolean staticBase(Value base) {
+        return producedBy(base, ".staticFieldBase(");
+    }
+
+    private boolean producedBy(Value value, String method) {
         Set<Value> seen = Collections.newSetFromMap(new IdentityHashMap<>());
-        Value v = offset;
-        while (v instanceof Temporary t && t.getDefiningInstruction() != null && seen.add(v)) {
+        ArrayDeque<Value> work = new ArrayDeque<>();
+        work.push(value);
+        boolean found = false;
+        while (!work.isEmpty()) {
+            Value v = work.pop();
+            if (!seen.add(v)) continue;
+            if (!(v instanceof Temporary t) || t.getDefiningInstruction() == null) return false;
             Instruction def = t.getDefiningInstruction();
             switch (def.getOpcode()) {
-                case CAST, STORE -> v = def.getOperands().getFirst();
+                case CAST, CHECKCAST, STORE -> work.push(def.getOperands().getFirst());
+                case PHI, SELECT -> {
+                    for (Value o : def.getOperands()) {
+                        if (o == null || o.getType() == null || o.getType() == Type.BOOLEAN || o.getType().isBlock()) continue;
+                        work.push(o);
+                    }
+                }
+                case LOAD -> {
+                    Function f = def.getParent().getFunction();
+                    if (isParamSlot(f, def.getLocalIndex())) return false;
+                    List<Instruction> st = index(f).stores.getOrDefault(def.getLocalIndex(), List.of());
+                    if (st.isEmpty()) return false;
+                    for (Instruction store : st) work.push(store.getOperands().getFirst());
+                }
                 case CALL, VIRTUAL_CALL, INTERFACE_CALL, STATIC_CALL, SPECIAL_CALL -> {
                     String callee = extractCalleeName(def);
-                    return callee != null && (callee.startsWith("jdk/internal/misc/Unsafe.staticFieldOffset(")
-                        || callee.startsWith("sun/misc/Unsafe.staticFieldOffset("));
+                    if (!isStaticFieldAccessor(callee, method)) return false;
+                    found = true;
                 }
                 default -> {
                     return false;
                 }
             }
         }
-        return false;
+        return found;
+    }
+
+    private static boolean isStaticFieldAccessor(String callee, String method) {
+        if (callee == null) return false;
+        int at = callee.indexOf(method);
+        if (at <= 0) return false;
+        String owner = callee.substring(0, at);
+        return owner.equals("jdk/internal/misc/Unsafe") || owner.equals("sun/misc/Unsafe")
+            || owner.equals("java/lang/invoke/MethodHandleNatives");
     }
 
     private static Kind unsafeKind(String name) {
@@ -536,14 +583,19 @@ final class AtomicSlotArrays {
                 return;
             }
             String where = "unresolved atomic write " + extractCalleeName(op.inst()) + " in " + op.inst().getParent().getFunction().getName();
+            boolean reflective = reflectiveAccessor(op);
             for (String fam : fieldFamilies) {
                 String owner = fam.substring(0, fam.lastIndexOf('.'));
                 if ((serialization && !serializableBelow(owner)) || staticOnly) continue;
+                if (reflective) {
+                    if (reflectiveMayWrite(owner)) invalid.putIfAbsent("field " + fam, where);
+                    continue;
+                }
                 if (op.receiver() == null || mayBeInstanceOf(op.receiver(), owner)) {
                     invalid.putIfAbsent("field " + fam, where);
                 }
             }
-            if (!serialization && !staticOnly && (op.receiver() == null || valueMayBeArray(op.receiver())) && (v == null || valueMayBeArray(v))) {
+            if (!serialization && !staticOnly && !reflective && (op.receiver() == null || valueMayBeArray(op.receiver())) && (v == null || valueMayBeArray(v))) {
                 invalid.putIfAbsent(UNKNOWN_FAMILY, where);
                 markAllSlotFamiliesUnsafe(op, where);
             }
@@ -581,11 +633,43 @@ final class AtomicSlotArrays {
     private String untypedConflict(String fam) {
         if (untypedOps.isEmpty()) return null;
         Set<String> containers = familyContainers(fam);
+        PointsToSet sites = familySites(fam);
+        String dbg = System.getenv("JN_OWN_DEBUG");
+        boolean debug = dbg != null && fam.contains(dbg);
+        if (debug) System.out.println("DBG slot " + fam + " sites=" + (sites == null ? "null" : sites.size() + (sites.containsUnknown() ? "+unknown" : ""))
+            + " containers=" + containers);
         for (int i = 0; i < untypedOps.size(); i++) {
             Op op = untypedOps.get(i);
+            if (debug) {
+                PointsToSet r = op.receiver() == null ? null : alias.getPointsTo(op.receiver());
+                System.out.println("DBG   untyped " + untypedWhy.get(i) + " recv=" + (r == null ? "null" : r.size() + (r.containsUnknown() ? "+unknown" : ""))
+                    + " recvContainers=" + (op.receiver() == null ? null : containerClasses(op.receiver())));
+            }
+            if (sites != null && op.receiver() != null) {
+                PointsToSet r = alias.getPointsTo(op.receiver());
+                if (r != null && !r.isEmpty() && !r.containsUnknown() && !r.intersects(sites)) continue;
+            }
             if (containers == null || op.receiver() == null || mayHoldContainer(op.receiver(), containers)) return untypedWhy.get(i);
         }
         return null;
+    }
+
+    private final Map<String, PointsToSet> familySiteCache = new HashMap<>();
+
+    private PointsToSet familySites(String fam) {
+        if (familySiteCache.containsKey(fam)) return familySiteCache.get(fam);
+        PointsToSet out = PointsToSet.EMPTY;
+        for (int i = 0; i < ops.size() && out != null; i++) {
+            Op op = ops.get(i);
+            boolean member = fam.equals(familyOfWrite(op))
+                || (op.kind() == Kind.READ && fam.equals(pendingBorrows.get(op.inst())));
+            if (!member) continue;
+            PointsToSet r = op.receiver() == null ? null : alias.getPointsTo(op.receiver());
+            if (r == null || r.isEmpty() || r.containsUnknown()) out = null;
+            else out = PointsToSet.union(out, r);
+        }
+        familySiteCache.put(fam, out);
+        return out;
     }
 
     private final Map<Instruction, String> siteIds = new IdentityHashMap<>();
@@ -629,6 +713,12 @@ final class AtomicSlotArrays {
                 break;
             }
             Set<String> c = containerClasses(op.receiver());
+            String dbg = System.getenv("JN_OWN_DEBUG");
+            if (dbg != null && fam.contains(dbg)) {
+                PointsToSet r = alias.getPointsTo(op.receiver());
+                System.out.println("DBG   member " + op.kind() + " in " + op.inst().getParent().getFunction().getName()
+                    + " recvPts=" + r.size() + (r.containsUnknown() ? "+unknown" : "") + " containers=" + c);
+            }
             if (c == null) out = null;
             else out.addAll(c);
         }
@@ -643,7 +733,12 @@ final class AtomicSlotArrays {
         work.push(v);
         while (!work.isEmpty()) {
             Value cur = work.pop();
-            if (cur == null || isNullConstant(cur) || !seen.add(cur)) continue;
+            if (isNullConstant(cur) || !seen.add(cur)) continue;
+            if (cur instanceof Parameter param) {
+                Function pf = parameterOwner(param);
+                if (pf == null || !pushArguments(pf, param.getIndex(), work)) return null;
+                continue;
+            }
             if (!(cur instanceof Temporary t) || t.getDefiningInstruction() == null) return null;
             Instruction def = t.getDefiningInstruction();
             List<Value> o = def.getOperands();
@@ -654,14 +749,15 @@ final class AtomicSlotArrays {
                 }
                 case CAST, CHECKCAST, STORE -> work.push(o.getFirst());
                 case PHI, SELECT -> {
-                    for (int k = 0; k < o.size(); k++) if (isReference(o.get(k))) work.push(o.get(k));
+                    for (Value value : o) if (isReference(value)) work.push(value);
                 }
                 case LOAD -> {
                     Function f = def.getParent().getFunction();
-                    if (isParamSlot(f, def.getLocalIndex())) return null;
+                    boolean param = isParamSlot(f, def.getLocalIndex());
+                    if (param && !pushArguments(f, def.getLocalIndex(), work)) return null;
                     List<Instruction> st = index(f).stores.getOrDefault(def.getLocalIndex(), List.of());
-                    if (st.isEmpty()) return null;
-                    for (int k = 0; k < st.size(); k++) work.push(st.get(k).getOperands().getFirst());
+                    if (st.isEmpty() && !param) return null;
+                    for (Instruction instruction : st) work.push(instruction.getOperands().getFirst());
                 }
                 case GET_FIELD -> {
                     Set<String> fc = finalFieldClasses(extractFieldName(def));
@@ -694,20 +790,26 @@ final class AtomicSlotArrays {
         while (!work.isEmpty()) {
             Value cur = work.pop();
             if (cur == null || isNullConstant(cur) || !seen.add(cur)) continue;
+            if (cur instanceof Parameter param) {
+                Function pf = parameterOwner(param);
+                if (pf == null || !pushArguments(pf, param.getIndex(), work)) return null;
+                continue;
+            }
             if (!(cur instanceof Temporary t) || t.getDefiningInstruction() == null) return null;
             Instruction def = t.getDefiningInstruction();
             List<Value> o = def.getOperands();
             switch (def.getOpcode()) {
                 case CAST, CHECKCAST, STORE -> work.push(o.getFirst());
                 case PHI, SELECT -> {
-                    for (int k = 0; k < o.size(); k++) if (isReference(o.get(k))) work.push(o.get(k));
+                    for (Value value : o) if (isReference(value)) work.push(value);
                 }
                 case LOAD -> {
                     Function f = def.getParent().getFunction();
-                    if (isParamSlot(f, def.getLocalIndex())) return null;
+                    boolean param = isParamSlot(f, def.getLocalIndex());
+                    if (param && !pushArguments(f, def.getLocalIndex(), work)) return null;
                     List<Instruction> st = index(f).stores.getOrDefault(def.getLocalIndex(), List.of());
-                    if (st.isEmpty()) return null;
-                    for (int k = 0; k < st.size(); k++) work.push(st.get(k).getOperands().getFirst());
+                    if (st.isEmpty() && !param) return null;
+                    for (Instruction instruction : st) work.push(instruction.getOperands().getFirst());
                 }
                 case GET_FIELD -> {
                     String key = finalFieldKey(extractFieldName(def));
@@ -771,6 +873,10 @@ final class AtomicSlotArrays {
             if (serialization || staticAccessor(op)) continue;
             if (updaterWrites.contains(op.inst())) {
                 if (updaterMayWrite(key)) ok = false;
+                continue;
+            }
+            if (reflectiveAccessor(op)) {
+                if (reflectiveMayWrite(owner)) ok = false;
                 continue;
             }
             if (op.receiver() == null || mayBeInstanceOf(op.receiver(), owner)) ok = false;
@@ -844,12 +950,12 @@ final class AtomicSlotArrays {
                 case NEW, NEW_ARRAY, MULTI_NEW_ARRAY -> { }
                 case CAST, CHECKCAST, STORE -> work.push(o.getFirst());
                 case PHI, SELECT -> {
-                    for (int k = 0; k < o.size(); k++) if (isReference(o.get(k))) work.push(o.get(k));
+                    for (Value value : o) if (isReference(value)) work.push(value);
                 }
                 case LOAD -> {
                     List<Instruction> st = idx.stores.getOrDefault(def.getLocalIndex(), List.of());
                     if (isParamSlot(f, def.getLocalIndex())) return "atomic write of a parameter slot in " + f.getName();
-                    for (int k = 0; k < st.size(); k++) work.push(st.get(k).getOperands().getFirst());
+                    for (Instruction instruction : st) work.push(instruction.getOperands().getFirst());
                 }
                 case CALL, VIRTUAL_CALL, INTERFACE_CALL, STATIC_CALL, SPECIAL_CALL -> {
                     CallShape s = escape.getCallShape(def, extractCalleeName(def));
@@ -884,8 +990,8 @@ final class AtomicSlotArrays {
                 if (why != null) return why;
             }
             List<Instruction> us = idx.users.getOrDefault(a, List.of());
-            for (int u = 0; u < us.size(); u++) {
-                String why = escapeUse(f, us.get(u), a, false);
+            for (Instruction instruction : us) {
+                String why = escapeUse(f, instruction, a, false);
                 if (why != null) return "slot value " + why + " in " + f.getName();
             }
         }
@@ -950,7 +1056,7 @@ final class AtomicSlotArrays {
     private final Map<Instruction, Op> opIndex = new IdentityHashMap<>();
 
     private Op opOf(Instruction inst) {
-        if (opIndex.isEmpty()) for (int i = 0; i < ops.size(); i++) opIndex.put(ops.get(i).inst(), ops.get(i));
+        if (opIndex.isEmpty()) for (Op op : ops) opIndex.put(op.inst(), op);
         return opIndex.get(inst);
     }
 
@@ -996,8 +1102,8 @@ final class AtomicSlotArrays {
     }
 
     private static void pushSuccessors(BasicBlock b, ArrayDeque<BasicBlock> work) {
-        for (int i = 0; i < b.getSuccessors().size(); i++) work.add(b.getSuccessors().get(i));
-        for (int i = 0; i < b.getExceptionalSuccessors().size(); i++) work.add(b.getExceptionalSuccessors().get(i));
+        work.addAll(b.getSuccessors());
+        work.addAll(b.getExceptionalSuccessors());
     }
 
     private Type useType(Function f, Value v) {
@@ -1041,7 +1147,7 @@ final class AtomicSlotArrays {
                         if (isParamSlot(f, def.getLocalIndex())) return null;
                         List<Instruction> st = index(f).stores.getOrDefault(def.getLocalIndex(), List.of());
                         if (st.isEmpty()) return null;
-                        for (int k = 0; k < st.size(); k++) work.push(st.get(k).getOperands().getFirst());
+                        for (Instruction instruction : st) work.push(instruction.getOperands().getFirst());
                     }
                     case PHI, SELECT -> {
                         for (int k = 0; k < def.getOperands().size(); k++) {
@@ -1127,6 +1233,51 @@ final class AtomicSlotArrays {
         return false;
     }
 
+    private boolean reflectiveAccessor(Op op) {
+        String owner = op.inst().getParent().getFunction().getOwnerClass();
+        return owner != null && owner.startsWith("jdk/internal/reflect/") && owner.endsWith("FieldAccessorImpl");
+    }
+
+    private static final String FIELD_SET = "java/lang/reflect/Field.set(Ljava/lang/Object;Ljava/lang/Object;)V";
+
+    private PointsToSet reflectiveTargets;
+    private final Set<String> reflectiveTypes = new HashSet<>();
+
+    private void computeReflectiveTargets() {
+        if (reflectiveTargets != null) return;
+        PointsToSet out = PointsToSet.EMPTY;
+        for (Instruction call : targets.keySet()) {
+            String callee = extractCalleeName(call);
+            if (!FIELD_SET.equals(callee) || argCount(call) < 2) continue;
+            Value obj = arg(call, 1);
+            if (isNullConstant(obj)) continue;
+            PointsToSet pts = alias.getPointsTo(obj);
+            if (pts.isEmpty() || pts.containsUnknown()) {
+                Type t = obj.getType();
+                reflectiveTypes.add(t == null || t.isUnknown() || !t.isReference() || t.getClassName() == null
+                    ? "java/lang/Object" : t.getClassName());
+            }
+            out = PointsToSet.union(out, pts);
+        }
+        reflectiveTargets = out;
+    }
+
+    private boolean reflectiveMayWrite(String owner) {
+        computeReflectiveTargets();
+        PointsToSet pts = reflectiveTargets;
+        for (long c = pts.cursor(); pts.has(c); c = pts.next(c)) {
+            Type t = AllocationSite.byId(pts.id(c)).getType();
+            if (t == null || t.isUnknown()) return true;
+            if (t.isReference() && !t.isArray() && t.getClassName() != null && isSubtype(t.getClassName(), owner)) return true;
+        }
+        for (String t : reflectiveTypes) {
+            if (t.equals("java/lang/Object") || isSubtype(owner, t) || isSubtype(t, owner)) return true;
+            ClassNode node = resolver.getClassNode(t);
+            if (node == null || (node.isInterface() && (implementsInterface(owner, t) || anySubclassImplements(owner, t)))) return true;
+        }
+        return false;
+    }
+
     private static boolean staticAccessor(Op op) {
         String owner = op.inst().getParent().getFunction().getOwnerClass();
         return owner != null && owner.startsWith("jdk/internal/reflect/Unsafe") && owner.contains("Static")
@@ -1173,9 +1324,37 @@ final class AtomicSlotArrays {
         return false;
     }
 
+    private static final int MAX_ARGUMENT_SITES = 64;
+    private Map<Parameter, Function> parameterOwners;
+
+    private Function parameterOwner(Parameter p) {
+        if (parameterOwners == null) {
+            parameterOwners = new IdentityHashMap<>();
+            for (Function f : module.getFunctions()) {
+                for (Parameter q : f.getParameters()) parameterOwners.put(q, f);
+            }
+        }
+        return parameterOwners.get(p);
+    }
+
+    private boolean pushArguments(Function f, int slot, ArrayDeque<Value> work) {
+        int ordinal = -1;
+        for (Parameter p : f.getParameters()) {
+            if (p.getIndex() == slot) ordinal = p.getOrdinal();
+        }
+        if (ordinal < 0) return false;
+        List<Instruction> sites = callSitesOf.get(f);
+        if (sites == null || sites.isEmpty() || sites.size() > MAX_ARGUMENT_SITES) return false;
+        for (Instruction site : sites) {
+            if (argCount(site) <= ordinal) return false;
+            work.push(arg(site, ordinal));
+        }
+        return true;
+    }
+
     private boolean isParamSlot(Function f, int slot) {
         List<Parameter> ps = f.getParameters();
-        for (int i = 0; i < ps.size(); i++) if (ps.get(i).getIndex() == slot) return true;
+        for (Parameter p : ps) if (p.getIndex() == slot) return true;
         return false;
     }
 
@@ -1219,7 +1398,7 @@ final class AtomicSlotArrays {
             if (isNullConstant(v) || !out.add(v)) continue;
             if (v instanceof Parameter p) {
                 List<Instruction> ld = idx.loads.getOrDefault(p.getIndex(), List.of());
-                for (int k = 0; k < ld.size(); k++) work.push(ld.get(k).getResult());
+                for (Instruction instruction : ld) work.push(instruction.getResult());
             }
             List<Instruction> us = idx.users.getOrDefault(v, List.of());
             for (Instruction inst : us) {
@@ -1231,7 +1410,7 @@ final class AtomicSlotArrays {
                     case STORE -> {
                         if (res != null) work.push(res);
                         List<Instruction> ld = idx.loads.getOrDefault(inst.getLocalIndex(), List.of());
-                        for (int k = 0; k < ld.size(); k++) work.push(ld.get(k).getResult());
+                        for (Instruction instruction : ld) work.push(instruction.getResult());
                     }
                     case CALL, VIRTUAL_CALL, INTERFACE_CALL, STATIC_CALL, SPECIAL_CALL -> {
                         if (!isReference(res) || isAtomicOp(inst)) continue;

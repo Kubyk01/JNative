@@ -1036,7 +1036,9 @@ static void jn_SetObjectField(void* env, jobject obj, jfieldID fid, jobject v) {
     ENV_UNUSED;
     JNIFieldID* f = (JNIFieldID*)fid;
     if (f == NULL || obj == NULL) return;
-    *(void**)((char*)obj + f->rf->offset) = v;
+    void* old = __atomic_exchange_n((void**)((char*)obj + f->rf->offset), v, __ATOMIC_ACQ_REL);
+    __jnative_rc_inc(v);
+    __jnative_rc_dec(old);
 }
 static void jn_SetStaticObjectField(void* env, jclass cls, jfieldID fid, jobject v) {
     ENV_UNUSED; (void)cls;
@@ -1045,7 +1047,9 @@ static void jn_SetStaticObjectField(void* env, jclass cls, jfieldID fid, jobject
     void* addr = jnative_static_field_address(f->owner_cname,
                                               (const char*)f->rf->name);
     if (addr == NULL) return;
-    *(void**)addr = v;
+    void* old = __atomic_exchange_n((void**)addr, v, __ATOMIC_ACQ_REL);
+    __jnative_rc_inc(v);
+    __jnative_rc_dec(old);
 }
 
 /* ---- String creation / access ------------------------------------- */
@@ -1201,7 +1205,9 @@ static void jn_SetObjectArrayElement(void* env, jobjectArray arr, jsize i,
                                       jobject v) {
     ENV_UNUSED;
     if (arr == NULL) return;
-    ((void**)jnative_array_data(arr))[i] = v;
+    void* old = __atomic_exchange_n(&((void**)jnative_array_data(arr))[i], v, __ATOMIC_ACQ_REL);
+    __jnative_rc_inc(v);
+    __jnative_rc_dec(old);
 }
 
 #define IMPL_ELEMS(Type, ELEM_SIZE)                                                 \

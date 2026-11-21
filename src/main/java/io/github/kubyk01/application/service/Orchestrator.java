@@ -295,8 +295,7 @@ public class Orchestrator implements OrchestratorPort {
         List<NativeOverride> nativeOverrides = collectNativeOverrides(analysis);
 
         System.out.println("Native overrides discovered: " + nativeOverrides.size());
-        List<? extends NativeOverride> jnLoop1 = nativeOverrides;
-        for (NativeOverride o : jnLoop1) {
+        for (NativeOverride o : nativeOverrides) {
             System.out.println("  " + o.getClassName() + "." + o.getMethodName()
                     + (o.getDescriptor() != null ? o.getDescriptor() : "(all overloads)")
                     + " -> " + o.getCFunctionName());
@@ -336,6 +335,7 @@ public class Orchestrator implements OrchestratorPort {
         DestructorInserter inserter = new DestructorInserter(module, resolver, lifetimeResult,
                 aliasResult.getAllocationSiteToValue(), aliasResult, escapeResult);
         inserter.setCoAllocatedFields(coAllocatedFields);
+        inserter.setReflectInfo(analysis.getReflectInfo());
         inserter.setScheduler(scheduler);
         inserter.insert();
 
@@ -598,8 +598,7 @@ public class Orchestrator implements OrchestratorPort {
         }
 
         Map<String, NativeOverride> byKey = new LinkedHashMap<>();
-        List<? extends NativeOverride> jnLoop3 = discovered;
-        for (NativeOverride o : jnLoop3) {
+        for (NativeOverride o : discovered) {
             String key = o.getClassName() + "." + o.getMethodName()
                     + "#" + o.getDescriptor();
             byKey.put(key, o);

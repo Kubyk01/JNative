@@ -51,7 +51,7 @@ int64_t __jnative_fn_jdk_internal_misc_Unsafe_getLong__Ljava_lang_Object_J_J(voi
 }
 void* __jnative_fn_jdk_internal_misc_Unsafe_getReference__Ljava_lang_Object_J_Ljava_lang_Object_(void* this_unsafe, void* obj, int64_t offset) {
     (void)this_unsafe;
-    return *(void**)effective_address(obj, offset);
+    return __jnative_rc_load_ret((void**)effective_address(obj, offset));
 }
 int32_t __jnative_fn_jdk_internal_misc_Unsafe_getBoolean__Ljava_lang_Object_J_Z(void* this_unsafe, void* obj, int64_t offset) {
     (void)this_unsafe;
@@ -89,7 +89,9 @@ void __jnative_fn_jdk_internal_misc_Unsafe_putLong__Ljava_lang_Object_JJ_V(void*
 }
 void __jnative_fn_jdk_internal_misc_Unsafe_putReference__Ljava_lang_Object_JLjava_lang_Object__V(void* this_unsafe, void* obj, int64_t offset, void* x) {
     (void)this_unsafe;
-    *(void**)effective_address(obj, offset) = x;
+    void* old = __atomic_exchange_n((void**)effective_address(obj, offset), x, __ATOMIC_RELAXED);
+    __jnative_rc_inc(x);
+    __jnative_rc_dec(old);
 }
 void __jnative_fn_jdk_internal_misc_Unsafe_putBoolean__Ljava_lang_Object_JZ_V(void* this_unsafe, void* obj, int64_t offset, int32_t x) {
     (void)this_unsafe;
@@ -127,7 +129,7 @@ int64_t __jnative_fn_jdk_internal_misc_Unsafe_getLongVolatile__Ljava_lang_Object
 }
 void* __jnative_fn_jdk_internal_misc_Unsafe_getReferenceVolatile__Ljava_lang_Object_J_Ljava_lang_Object_(void* this_unsafe, void* obj, int64_t offset) {
     (void)this_unsafe;
-    void* v; __atomic_load((void**)effective_address(obj, offset), &v, __ATOMIC_SEQ_CST); return v;
+    return __jnative_rc_load_ret((void**)effective_address(obj, offset));
 }
 int32_t __jnative_fn_jdk_internal_misc_Unsafe_getBooleanVolatile__Ljava_lang_Object_J_Z(void* this_unsafe, void* obj, int64_t offset) {
     (void)this_unsafe;
@@ -165,7 +167,9 @@ void __jnative_fn_jdk_internal_misc_Unsafe_putLongVolatile__Ljava_lang_Object_JJ
 }
 void __jnative_fn_jdk_internal_misc_Unsafe_putReferenceVolatile__Ljava_lang_Object_JLjava_lang_Object__V(void* this_unsafe, void* obj, int64_t offset, void* x) {
     (void)this_unsafe;
-    __atomic_store((void**)effective_address(obj, offset), &x, __ATOMIC_SEQ_CST);
+    void* old = __atomic_exchange_n((void**)effective_address(obj, offset), x, __ATOMIC_SEQ_CST);
+    __jnative_rc_inc(x);
+    __jnative_rc_dec(old);
 }
 void __jnative_fn_jdk_internal_misc_Unsafe_putBooleanVolatile__Ljava_lang_Object_JZ_V(void* this_unsafe, void* obj, int64_t offset, int32_t x) {
     (void)this_unsafe;
@@ -204,7 +208,9 @@ void __jnative_fn_jdk_internal_misc_Unsafe_putOrderedLong__Ljava_lang_Object_JJ_
 }
 void __jnative_fn_jdk_internal_misc_Unsafe_putOrderedObject__Ljava_lang_Object_JLjava_lang_Object__V(void* this_unsafe, void* obj, int64_t offset, void* x) {
     (void)this_unsafe;
-    __atomic_store((void**)effective_address(obj, offset), &x, __ATOMIC_RELEASE);
+    void* old = __atomic_exchange_n((void**)effective_address(obj, offset), x, __ATOMIC_ACQ_REL);
+    __jnative_rc_inc(x);
+    __jnative_rc_dec(old);
 }
 
 /* ---- CAS ---- */
@@ -221,7 +227,10 @@ int32_t __jnative_fn_jdk_internal_misc_Unsafe_compareAndSetLong__Ljava_lang_Obje
 int32_t __jnative_fn_jdk_internal_misc_Unsafe_compareAndSetReference__Ljava_lang_Object_JLjava_lang_Object_Ljava_lang_Object__Z(void* this_unsafe, void* obj, int64_t offset, void* expected, void* x) {
     (void)this_unsafe;
     void* exp = expected;
-    return __atomic_compare_exchange_n((void**)effective_address(obj, offset), &exp, x, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;
+    if (!__atomic_compare_exchange_n((void**)effective_address(obj, offset), &exp, x, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) return 0;
+    __jnative_rc_inc(x);
+    __jnative_rc_dec(expected);
+    return 1;
 }
 int32_t __jnative_fn_jdk_internal_misc_Unsafe_compareAndSetByte__Ljava_lang_Object_JBB_Z(void* this_unsafe, void* obj, int64_t offset, int8_t expected, int8_t x) {
     (void)this_unsafe;
@@ -266,9 +275,7 @@ int64_t __jnative_fn_jdk_internal_misc_Unsafe_compareAndExchangeLong__Ljava_lang
 }
 void* __jnative_fn_jdk_internal_misc_Unsafe_compareAndExchangeReference__Ljava_lang_Object_JLjava_lang_Object_Ljava_lang_Object__Ljava_lang_Object_(void* this_unsafe, void* obj, int64_t offset, void* expected, void* x) {
     (void)this_unsafe;
-    void* witness = expected;
-    __atomic_compare_exchange_n((void**)effective_address(obj, offset), &witness, x, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
-    return witness;
+    return __jnative_rc_cae((void**)effective_address(obj, offset), expected, x, __jnative_rc_ret_slot());
 }
 int8_t __jnative_fn_jdk_internal_misc_Unsafe_compareAndExchangeByte__Ljava_lang_Object_JBB_B(void* this_unsafe, void* obj, int64_t offset, int8_t expected, int8_t x) {
     (void)this_unsafe;
@@ -344,6 +351,9 @@ void* __jnative_fn_jdk_internal_misc_Unsafe_getAndSetReference__Ljava_lang_Objec
     (void)this_unsafe;
     void* old;
     __atomic_exchange((void**)effective_address(obj, offset), &newValue, &old, __ATOMIC_SEQ_CST);
+    __atomic_store_n(__jnative_rc_ret_slot(), old, __ATOMIC_SEQ_CST);
+    __jnative_rc_inc(newValue);
+    __jnative_rc_dec(old);
     return old;
 }
 int8_t __jnative_fn_jdk_internal_misc_Unsafe_getAndSetByte__Ljava_lang_Object_JB_B(void* this_unsafe, void* obj, int64_t offset, int8_t newValue) {
@@ -404,11 +414,13 @@ void __jnative_fn_jdk_internal_misc_Unsafe_putLongRelease__Ljava_lang_Object_JJ_
 }
 void* __jnative_fn_jdk_internal_misc_Unsafe_getReferenceAcquire__Ljava_lang_Object_J_Ljava_lang_Object_(void* this_unsafe, void* obj, int64_t offset) {
     (void)this_unsafe;
-    void* v; __atomic_load((void**)effective_address(obj, offset), &v, __ATOMIC_ACQUIRE); return v;
+    return __jnative_rc_load_ret((void**)effective_address(obj, offset));
 }
 void __jnative_fn_jdk_internal_misc_Unsafe_putReferenceRelease__Ljava_lang_Object_JLjava_lang_Object__V(void* this_unsafe, void* obj, int64_t offset, void* x) {
     (void)this_unsafe;
-    __atomic_store((void**)effective_address(obj, offset), &x, __ATOMIC_RELEASE);
+    void* old = __atomic_exchange_n((void**)effective_address(obj, offset), x, __ATOMIC_ACQ_REL);
+    __jnative_rc_inc(x);
+    __jnative_rc_dec(old);
 }
 int32_t __jnative_fn_jdk_internal_misc_Unsafe_getBooleanAcquire__Ljava_lang_Object_J_Z(void* this_unsafe, void* obj, int64_t offset) {
     (void)this_unsafe;

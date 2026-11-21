@@ -27,6 +27,9 @@ public class Function {
     @Setter
     private String ownerClass;
 
+    @Setter
+    private int rcHolds;
+
     /**
      * True when this function is an external JNI native that must be
      * invoked through the JNI calling convention: a thread-local

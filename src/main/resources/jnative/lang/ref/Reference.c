@@ -24,7 +24,7 @@ void* __jnative_fn_java_lang_ref_Reference_get0___Ljava_lang_Object_(void* this_
         __jnative_throw_null_pointer_exception();
         return NULL;
     }
-    return *referent_slot(this_ref);
+    return __jnative_rc_load_ret(referent_slot(this_ref));
 }
 
 void __jnative_fn_java_lang_ref_Reference_clear0___V(void* this_ref) {
@@ -32,7 +32,8 @@ void __jnative_fn_java_lang_ref_Reference_clear0___V(void* this_ref) {
         __jnative_throw_null_pointer_exception();
         return;
     }
-    *referent_slot(this_ref) = NULL;
+    void* old = __atomic_exchange_n(referent_slot(this_ref), NULL, __ATOMIC_ACQ_REL);
+    __jnative_rc_weak(this_ref, old, NULL);
 }
 
 int32_t __jnative_fn_java_lang_ref_Reference_hasReferencePendingList___Z(void) {

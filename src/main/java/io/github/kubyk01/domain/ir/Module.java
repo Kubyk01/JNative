@@ -18,6 +18,9 @@ public class Module {
     @Getter
     private final FunctionList functions = new FunctionList();
     private final Map<String, Function> functionMap = new ConcurrentHashMap<>();
+    @Getter
+    @lombok.Setter
+    private io.github.kubyk01.domain.analyzer.lifetime.RefCountPlan refCountPlan;
 
     public void addFunction(Function func) {
         if (functionMap.putIfAbsent(func.getName(), func) == null) {

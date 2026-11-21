@@ -76,6 +76,9 @@ final class ContainerArrayBorrows {
     private final Map<String, Borrow> paramBorrows = new HashMap<>();
     private final Map<Instruction, Value> enters = new IdentityHashMap<>();
     private final Set<Function> exitFunctions = Collections.newSetFromMap(new IdentityHashMap<>());
+    private final Map<Instruction, Value> deaths = new IdentityHashMap<>();
+    private final Map<Instruction, BitSet> deathWrites = new IdentityHashMap<>();
+    private final Map<String, String> transferFailures = new HashMap<>();
 
     private record Borrow(Function fn, String key, Value seed, Instruction origin, Value owner) {}
 
@@ -141,6 +144,15 @@ final class ContainerArrayBorrows {
 
     boolean needsExit(Function f) {
         return exitFunctions.contains(f);
+    }
+
+    Map<String, List<String>> ownedArrayFields() {
+        Map<String, List<String>> out = new HashMap<>();
+        for (String key : puts.keySet()) {
+            if (excluded.containsKey(key)) continue;
+            out.computeIfAbsent(key.substring(0, key.lastIndexOf('.')), k -> new ArrayList<>()).add(key);
+        }
+        return out;
     }
 
     void compute() {
@@ -249,8 +261,10 @@ final class ContainerArrayBorrows {
         writersCache.clear();
     }
 
+    static final String STORAGE_PREFIX = "__jnative_storage_";
+
     static boolean isDestructor(Function f) {
-        return f.getName().startsWith("__destruct_");
+        return f.getName().startsWith("__destruct_") || f.getName().startsWith(STORAGE_PREFIX);
     }
 
     private static String paramId(Function f, int ordinal, String key) {
@@ -275,11 +289,12 @@ final class ContainerArrayBorrows {
                         case CALL, VIRTUAL_CALL, INTERFACE_CALL, STATIC_CALL, SPECIAL_CALL -> {
                             List<Function> ts = resolveTargets(inst);
                             targets.put(inst, ts);
-                            for (int t = 0; t < ts.size(); t++) {
-                                callers.computeIfAbsent(ts.get(t), k -> new ArrayList<>()).add(f);
-                                callSitesOf.computeIfAbsent(ts.get(t), k -> new ArrayList<>()).add(inst);
+                            for (Function function : ts) {
+                                callers.computeIfAbsent(function, k -> new ArrayList<>()).add(f);
+                                callSitesOf.computeIfAbsent(function, k -> new ArrayList<>()).add(inst);
                             }
                             noteClone(inst);
+                            noteDeath(inst);
                         }
                         default -> { }
                     }
@@ -325,6 +340,81 @@ final class ContainerArrayBorrows {
         }
     }
 
+    private void noteDeath(Instruction inst) {
+        if (inst.getOpcode() != Opcode.STATIC_CALL || inst.getOperands().size() < 2) return;
+        String callee = extractCalleeName(inst);
+        if (callee == null) return;
+        if (callee.equals("__jnative_free_container") || callee.equals("__jnative_free_container_storage")
+            || callee.equals("__jnative_free_owned") || callee.equals("__jnative_destruct_dispatch")
+            || callee.startsWith("__destruct_")) {
+            deaths.put(inst, inst.getOperands().get(1));
+        }
+    }
+
+    private BitSet deathKeys(Value freed) {
+        PointsToSet pts = alias.getPointsTo(freed);
+        if (!pts.isEmpty() && !pts.containsUnknown()) {
+            BitSet out = new BitSet();
+            boolean exact = true;
+            for (long c = pts.cursor(); pts.has(c) && exact; c = pts.next(c)) {
+                Type t = AllocationSite.byId(pts.id(c)).getType();
+                if (t == null || t.isUnknown()) exact = false;
+                else if (t.isReference() && !t.isArray() && t.getClassName() != null) out.or(keysOfInstance(t.getClassName()));
+            }
+            if (exact) return out;
+        }
+        Type st = freed.getType();
+        if (st != null && st.isArray()) return new BitSet();
+        String cls = st != null && st.isReference() && !st.isUnknown() ? st.getClassName() : null;
+        ClassNode node = cls == null ? null : resolver.getClassNode(cls);
+        if (cls == null || cls.equals("java/lang/Object") || node == null || node.isInterface()) return allKeys();
+        return keysOfDeclared(cls);
+    }
+
+    private final Map<String, BitSet> instanceKeys = new HashMap<>();
+    private final Map<String, BitSet> declaredKeys = new HashMap<>();
+    private Map<String, BitSet> keysByOwner;
+    private BitSet allKeys;
+
+    private BitSet allKeys() {
+        if (allKeys == null) {
+            allKeys = new BitSet();
+            for (int id : keyIds.values()) allKeys.set(id);
+        }
+        return allKeys;
+    }
+
+    private BitSet keysOfInstance(String cls) {
+        BitSet cached = instanceKeys.get(cls);
+        if (cached != null) return cached;
+        if (keysByOwner == null) {
+            keysByOwner = new HashMap<>();
+            for (Map.Entry<String, Integer> e : keyIds.entrySet()) {
+                String owner = e.getKey().substring(0, e.getKey().lastIndexOf('.'));
+                keysByOwner.computeIfAbsent(owner, k -> new BitSet()).set(e.getValue());
+            }
+        }
+        BitSet out = new BitSet();
+        Set<String> seen = new HashSet<>();
+        for (String c = cls; c != null && seen.add(c); ) {
+            BitSet own = keysByOwner.get(c);
+            if (own != null) out.or(own);
+            ClassNode n = resolver.getClassNode(c);
+            c = n == null ? null : n.getSuperName();
+        }
+        instanceKeys.put(cls, out);
+        return out;
+    }
+
+    private BitSet keysOfDeclared(String cls) {
+        BitSet cached = declaredKeys.get(cls);
+        if (cached != null) return cached;
+        BitSet out = (BitSet) keysOfInstance(cls).clone();
+        for (String sub : resolver.getSubclasses(cls)) out.or(keysOfInstance(sub));
+        declaredKeys.put(cls, out);
+        return out;
+    }
+
     private final Map<String, Boolean> cloneableCache = new HashMap<>();
 
     private boolean isCloneable(String cls) {
@@ -334,7 +424,7 @@ final class ContainerArrayBorrows {
         ArrayDeque<String> work = new ArrayDeque<>();
         Set<String> seen = new HashSet<>();
         work.add(cls);
-        while (!work.isEmpty() && !result) {
+        while (!work.isEmpty()) {
             String c = work.poll();
             if (c == null || !seen.add(c)) continue;
             if (c.equals("java/lang/Cloneable")) {
@@ -368,20 +458,27 @@ final class ContainerArrayBorrows {
     }
 
     private void checkStore(String key, Instruction put) {
-        Function f = put.getParent().getFunction();
-        Value stored = put.getOperands().get(2);
-        if (stored == null || isNullConstant(stored)) return;
+        String why = ownedValue(put.getParent().getFunction(), put.getOperands().get(2), put, false, new HashSet<>());
+        if (why != null) excluded.put(key, why);
+    }
+
+    private String ownedValue(Function f, Value stored, Instruction sink, boolean transfer, Set<String> visiting) {
+        if (stored == null || isNullConstant(stored)) return null;
         FnIndex idx = index(f);
         List<Instruction> defs = new ArrayList<>();
+        List<Parameter> params = new ArrayList<>();
         Set<Value> seen = Collections.newSetFromMap(new IdentityHashMap<>());
         ArrayDeque<Value> work = new ArrayDeque<>();
         work.push(stored);
         while (!work.isEmpty()) {
             Value v = work.pop();
             if (isNullConstant(v) || !seen.add(v)) continue;
+            if (v instanceof Parameter param) {
+                if (!params.contains(param)) params.add(param);
+                continue;
+            }
             if (!(v instanceof Temporary t) || t.getDefiningInstruction() == null) {
-                excluded.put(key, "stores a parameter or constant in " + f.getName());
-                return;
+                return "stores a parameter or constant in " + f.getName();
             }
             Instruction def = t.getDefiningInstruction();
             List<Value> ops = def.getOperands();
@@ -389,67 +486,110 @@ final class ContainerArrayBorrows {
                 case NEW_ARRAY, MULTI_NEW_ARRAY -> defs.add(def);
                 case CAST, CHECKCAST, STORE -> work.push(ops.getFirst());
                 case PHI, SELECT -> {
-                    for (int k = 0; k < ops.size(); k++) if (isReference(ops.get(k))) work.push(ops.get(k));
+                    for (Value op : ops) if (isReference(op)) work.push(op);
                 }
                 case LOAD -> {
                     if (loadSeesEntry(idx, def)) {
-                        excluded.put(key, "stores a value loaded from a parameter slot in " + f.getName());
-                        return;
+                        Parameter param = paramAtSlot(f, def.getLocalIndex());
+                        if (param == null) return "stores a value loaded from a parameter slot in " + f.getName();
+                        if (!params.contains(param)) params.add(param);
                     }
                     List<Instruction> st = reachingStores(idx, def);
-                    for (int k = 0; k < st.size(); k++) work.push(st.get(k).getOperands().getFirst());
+                    for (Instruction instruction : st) work.push(instruction.getOperands().getFirst());
                 }
                 case GET_STATIC -> {
                     if (!isEmptySentinel(extractFieldName(def))) {
-                        excluded.put(key, "stores static " + extractFieldName(def) + " in " + f.getName());
-                        return;
+                        return "stores static " + extractFieldName(def) + " in " + f.getName();
                     }
                 }
                 case CALL, VIRTUAL_CALL, INTERFACE_CALL, STATIC_CALL, SPECIAL_CALL -> {
                     CallShape s = escape.getCallShape(def, extractCalleeName(def));
                     if (s == null || !s.freshReturn()) {
-                        excluded.put(key, "stores non-fresh result of " + extractCalleeName(def) + " in " + f.getName());
-                        return;
+                        return "stores non-fresh result of " + extractCalleeName(def) + " in " + f.getName();
                     }
                     defs.add(def);
                     int argc = argCount(def);
                     for (int j = 0; j < argc; j++) if (CallShape.has(s.returnedArgs(), j)) work.push(arg(def, j));
                 }
                 default -> {
-                    excluded.put(key, "stores " + def.getOpcode() + " result in " + f.getName());
-                    return;
+                    return "stores " + def.getOpcode() + " result in " + f.getName();
                 }
             }
         }
-        if (reaches(idx, put, put)) {
+        if (reaches(idx, sink, sink)) {
+            if (!params.isEmpty()) return "store inside a loop of a parameter in " + f.getName();
             for (Instruction def : defs) {
-                if (def.getParent() != put.getParent() || idx.position.get(def) > idx.position.get(put)) {
-                    excluded.put(key, "store inside a loop of a value allocated outside it in " + f.getName());
-                    return;
+                if (def.getParent() != sink.getParent() || idx.position.get(def) > idx.position.get(sink)) {
+                    return "store inside a loop of a value allocated outside it in " + f.getName();
                 }
             }
         }
-        for (Value v : aliasesOf(f, stored)) {
-            List<Instruction> us = idx.users.getOrDefault(v, List.of());
-            for (Instruction inst : us) {
-                if (inst == put) continue;
-                Opcode op = inst.getOpcode();
-                List<Value> ops = inst.getOperands();
-                boolean storedElsewhere = (op == Opcode.PUT_FIELD || op == Opcode.ASTORE) && ops.size() > 2 && ops.get(2) == v;
-                boolean retained = false;
-                if (isCall(op)) {
-                    CallShape s = escape.getCallShape(inst, extractCalleeName(inst));
-                    int argc = argCount(inst);
-                    for (int j = 0; j < argc; j++) {
-                        if (arg(inst, j) == v && (s == null || CallShape.has(s.retainedArgs(), j))) retained = true;
+        List<Value> heads = new ArrayList<>();
+        heads.add(stored);
+        heads.addAll(params);
+        for (Value head : heads) {
+            for (Value v : aliasesOf(f, head)) {
+                if (idx.thrown.contains(v)) return "stored array also kept elsewhere in " + f.getName();
+                if (transfer && idx.returnedIn.containsKey(v)) return "array returned after it is passed on in " + f.getName();
+                List<Instruction> us = idx.users.getOrDefault(v, List.of());
+                for (Instruction inst : us) {
+                    if (inst == sink) continue;
+                    Opcode op = inst.getOpcode();
+                    List<Value> ops = inst.getOperands();
+                    boolean storedElsewhere = (op == Opcode.PUT_FIELD || op == Opcode.ASTORE) && ops.size() > 2 && ops.get(2) == v;
+                    boolean retained = false;
+                    if (isCall(op)) {
+                        CallShape s = escape.getCallShape(inst, extractCalleeName(inst));
+                        int argc = argCount(inst);
+                        for (int j = 0; j < argc; j++) {
+                            if (arg(inst, j) == v && (s == null || CallShape.has(s.retainedArgs(), j))) retained = true;
+                        }
                     }
-                }
-                if (storedElsewhere || retained || idx.thrown.contains(v)) {
-                    excluded.put(key, "stored array also kept elsewhere in " + f.getName());
-                    return;
+                    if (storedElsewhere || retained) return "stored array also kept elsewhere in " + f.getName();
+                    if (transfer && reaches(idx, sink, inst)) return "array used after it is passed on in " + f.getName();
                 }
             }
         }
+        for (Parameter param : params) {
+            String why = transferredParam(f, param.getOrdinal(), visiting);
+            if (why != null) return why;
+        }
+        return null;
+    }
+
+    private String transferredParam(Function f, int ordinal, Set<String> visiting) {
+        String id = f.getName() + "#" + ordinal;
+        String failed = transferFailures.get(id);
+        if (failed != null) return failed;
+        if (!visiting.add(id)) return null;
+        String why = null;
+        List<Instruction> sites = callSitesOf.getOrDefault(f, List.of());
+        if (sites.isEmpty()) why = "stores a parameter of " + f.getName() + " that has no known caller";
+        for (int i = 0; i < sites.size() && why == null; i++) {
+            Instruction site = sites.get(i);
+            String callee = extractCalleeName(site);
+            boolean direct = site.getOpcode() == Opcode.STATIC_CALL
+                || (site.getOpcode() == Opcode.SPECIAL_CALL && callee != null && callee.contains(".<init>("));
+            if (!direct) {
+                why = "stores a parameter of " + f.getName() + " that may be dispatched virtually";
+                break;
+            }
+            if (argCount(site) <= ordinal) {
+                why = "stores a parameter of " + f.getName() + " not passed by a caller";
+                break;
+            }
+            why = ownedValue(site.getParent().getFunction(), arg(site, ordinal), site, true, visiting);
+        }
+        visiting.remove(id);
+        if (why != null) transferFailures.put(id, why);
+        return why;
+    }
+
+    private static Parameter paramAtSlot(Function f, int slot) {
+        for (Parameter param : f.getParameters()) {
+            if (param.getIndex() == slot) return param;
+        }
+        return null;
     }
 
     private Set<Value> aliasesOf(Function f, Value v) {
@@ -536,11 +676,19 @@ final class ContainerArrayBorrows {
             Integer id = keyIds.get(e.getKey());
             if (id == null) continue;
             List<Instruction> ps = e.getValue();
-            for (int i = 0; i < ps.size(); i++) {
-                Function f = ps.get(i).getParent().getFunction();
+            for (Instruction p : ps) {
+                Function f = p.getParent().getFunction();
                 writes.computeIfAbsent(f, k -> new BitSet()).set(id);
                 if (queued.add(f)) work.add(f);
             }
+        }
+        for (Map.Entry<Instruction, Value> e : deaths.entrySet()) {
+            BitSet bits = deathKeys(e.getValue());
+            if (bits.isEmpty()) continue;
+            deathWrites.put(e.getKey(), bits);
+            Function f = e.getKey().getParent().getFunction();
+            writes.computeIfAbsent(f, k -> new BitSet()).or(bits);
+            if (queued.add(f)) work.add(f);
         }
         BitSet scratch = new BitSet();
         while (!work.isEmpty()) {
@@ -565,9 +713,11 @@ final class ContainerArrayBorrows {
         Integer boxed = keyIds.get(key);
         if (boxed == null) return false;
         int id = boxed;
+        BitSet died = deathWrites.get(inst);
+        if (died != null) return died.get(id);
         List<Function> ts = targets.getOrDefault(inst, List.of());
-        for (int t = 0; t < ts.size(); t++) {
-            BitSet bs = writes.get(ts.get(t));
+        for (Function function : ts) {
+            BitSet bs = writes.get(function);
             if (bs != null && bs.get(id)) return true;
         }
         return false;
@@ -620,7 +770,7 @@ final class ContainerArrayBorrows {
                     if (arg(inst, j) != v) continue;
                     if (CallShape.has(s.retainedArgs(), j)) return "array retained by " + extractCalleeName(inst);
                     List<Function> ts = targets.getOrDefault(inst, List.of());
-                    for (int t = 0; t < ts.size(); t++) borrowParam(ts.get(t), j, b.key(), work);
+                    for (Function function : ts) borrowParam(function, j, b.key(), work);
                 }
                 return null;
             }
@@ -684,8 +834,8 @@ final class ContainerArrayBorrows {
                     if (use != writer && reaches(idx, writer, use)) return true;
                 }
                 List<BasicBlock> rets = idx.returnedIn.getOrDefault(v, List.of());
-                for (int r = 0; r < rets.size(); r++) {
-                    if (reachesBlockEnd(idx, writer, rets.get(r))) return true;
+                for (BasicBlock ret : rets) {
+                    if (reachesBlockEnd(idx, writer, ret)) return true;
                 }
             }
         }
@@ -700,8 +850,8 @@ final class ContainerArrayBorrows {
         List<Function> ts = targets.getOrDefault(call, List.of());
         for (int j = 0; j < argc; j++) {
             if (arg(call, j) != v) continue;
-            for (int t = 0; t < ts.size(); t++) {
-                String pid = paramId(ts.get(t), j, key);
+            for (Function function : ts) {
+                String pid = paramId(function, j, key);
                 if (heldParams.contains(pid)) return true;
                 if (currentDependent != null && paramBorrows.containsKey(pid)) {
                     dependents.computeIfAbsent(pid, k -> new ArrayList<>()).add(currentDependent);
@@ -758,12 +908,12 @@ final class ContainerArrayBorrows {
         work.push(b.seed());
         while (!work.isEmpty()) {
             Value v = work.pop();
-            if (v == null || isNullConstant(v) || !out.add(v)) continue;
+            if (isNullConstant(v) || !out.add(v)) continue;
             if (v instanceof Parameter param) {
                 List<Instruction> ld = idx.loads.get(param.getIndex());
                 if (ld != null) {
-                    for (int k = 0; k < ld.size(); k++) {
-                        if (loadSeesEntry(idx, ld.get(k))) work.push(ld.get(k).getResult());
+                    for (Instruction instruction : ld) {
+                        if (loadSeesEntry(idx, instruction)) work.push(instruction.getResult());
                     }
                 }
             }
@@ -779,8 +929,8 @@ final class ContainerArrayBorrows {
                         if (res != null) work.push(res);
                         List<Instruction> ld = idx.loads.get(inst.getLocalIndex());
                         if (ld != null && inst.getOperands().getFirst() == v) {
-                            for (int k = 0; k < ld.size(); k++) {
-                                if (reachingStores(idx, ld.get(k)).contains(inst)) work.push(ld.get(k).getResult());
+                            for (Instruction instruction : ld) {
+                                if (reachingStores(idx, instruction).contains(inst)) work.push(instruction.getResult());
                             }
                         }
                     }

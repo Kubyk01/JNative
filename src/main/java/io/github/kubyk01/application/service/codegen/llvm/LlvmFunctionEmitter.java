@@ -93,6 +93,7 @@ public class LlvmFunctionEmitter {
     private final Set<Value> tryCrossingValues = new HashSet<>();
 
     private int tmpCounter = 0;
+    private int rcHoldCount;
     private int labelCounter = 0;
     private BasicBlock currentEntryBlock;
     private String currentFunctionName;
@@ -177,6 +178,7 @@ public class LlvmFunctionEmitter {
         }
 
         currentEntryBlock = func.getEntryBlock();
+        rcHoldCount = func.getRcHolds();
         buildTryCatchInfo(func);
         computeTryRegions(func);
         tryCrossingValues.addAll(computeTryCrossingValues(func));
@@ -223,9 +225,11 @@ public class LlvmFunctionEmitter {
             }
         }
 
-        List<? extends String> jnLoop4 = pendingSlotDeclarations;
-        for (String decl : jnLoop4) {
+        for (String decl : pendingSlotDeclarations) {
             sb.append(decl);
+        }
+        if (rcHoldCount > 0) {
+            sb.append("  %jn_holds = call i8** @__jnative_rc_frame_enter(i32 ").append(rcHoldCount).append(")\n");
         }
 
         sb.append(bodies.get(entryIdx));
@@ -305,8 +309,7 @@ public class LlvmFunctionEmitter {
         }
 
         int ordinal = 0;
-        List<? extends TryCatchRange> jnLoop6 = ranges;
-        for (TryCatchRange range : jnLoop6) {
+        for (TryCatchRange range : ranges) {
             BasicBlock handlerBlock = byLabel.get("L" + range.handler);
             if (handlerBlock == null) continue;
 
@@ -336,8 +339,7 @@ public class LlvmFunctionEmitter {
             return List.of();
         }
         List<TryCatchRange> filtered = new ArrayList<>(all.size());
-        List<? extends TryCatchRange> jnLoop8 = all;
-        for (TryCatchRange r : jnLoop8) {
+        for (TryCatchRange r : all) {
             BasicBlock h = handlerBlockByRange.get(r);
             if (h == block) continue;
             filtered.add(r);
@@ -393,8 +395,7 @@ public class LlvmFunctionEmitter {
             tryRegionExit.put(block, isExit);
         }
 
-        List<BasicBlock> snapshot = new ArrayList<>(func.getBlocks());
-        List<? extends BasicBlock> jnLoop9 = snapshot;
+        List<? extends BasicBlock> jnLoop9 = new ArrayList<>(func.getBlocks());
         for (BasicBlock block : jnLoop9) {
             List<TryCatchRange> myRanges = effectiveRangesFor(block);
             if (myRanges.isEmpty()) continue;
@@ -601,9 +602,24 @@ public class LlvmFunctionEmitter {
             }
         }
 
+        List<Instruction> pendingPhiHolds = new ArrayList<>();
         for (Instruction inst : block.getInstructions()) {
+            if (inst.getOpcode() != Opcode.PHI && !pendingPhiHolds.isEmpty()) {
+                for (Instruction phi : pendingPhiHolds) emitHold(sb, phi, phi.getResult());
+                pendingPhiHolds.clear();
+            }
             sb.append(emitInstruction(inst, List.of()));
+            if (inst.getRcHold() < 0 || rcHoldCount == 0) continue;
+            switch (inst.getOpcode()) {
+                case PHI -> pendingPhiHolds.add(inst);
+                case STORE -> emitHold(sb, inst, inst.getOperands().getFirst());
+                case GET_FIELD, ALOAD, GET_STATIC -> { }
+                default -> {
+                    if (!(inst.isPolymorphicSignature() && heldInline.contains(inst))) emitHold(sb, inst, inst.getResult());
+                }
+            }
         }
+        for (Instruction phi : pendingPhiHolds) emitHold(sb, phi, phi.getResult());
 
         Map<BasicBlock, String> targetRedirects = Collections.emptyMap();
         if (isExit && !ranges.isEmpty()) {
@@ -635,6 +651,7 @@ public class LlvmFunctionEmitter {
             sb.append(emitTerminator(term, List.of(), targetRedirects));
         } else {
             Type retType = block.getFunction().getReturnType();
+            sb.append(rcExit(sb, null));
             if (retType.isVoid()) {
                 sb.append("  ret void\n");
             } else {
@@ -644,6 +661,43 @@ public class LlvmFunctionEmitter {
             }
         }
         return sb.toString();
+    }
+
+    private final Set<Instruction> heldInline = Collections.newSetFromMap(new IdentityHashMap<>());
+
+    private String holdPointer(StringBuilder sb, Instruction inst) {
+        if (rcHoldCount == 0 || inst.getRcHold() < 0) return null;
+        String hp = newAux("rc_hp");
+        sb.append("  ").append(hp).append(" = getelementptr i8*, i8** %jn_holds, i64 ").append(inst.getRcHold()).append("\n");
+        return hp;
+    }
+
+    private void emitHold(StringBuilder sb, Instruction inst, Value value) {
+        if (value == null || value.getType() == null) return;
+        Type t = value.getType();
+        if (!(t.isReference() || t.isArray() || t.isNull() || t.isUnknown())) return;
+        String ref = castValueToType(sb, getLlvmValue(sb, value), t, Type.reference("java/lang/Object"));
+        String hp = holdPointer(sb, inst);
+        if (hp == null) return;
+        sb.append("  store atomic i8* ").append(ref).append(", i8** ").append(hp).append(" release, align 8\n");
+    }
+
+    private boolean emitHeldLoad(StringBuilder sb, Instruction inst, String resultName, String llvmType, String typedPointer) {
+        if (!"i8*".equals(llvmType)) return false;
+        String hp = holdPointer(sb, inst);
+        if (hp == null) return false;
+        sb.append("  ").append(resultName).append(" = call i8* @__jnative_rc_load(i8** ").append(typedPointer)
+                .append(", i8** ").append(hp).append(")\n");
+        return true;
+    }
+
+    private String rcExit(StringBuilder sb, Value retVal) {
+        if (rcHoldCount == 0) return "";
+        String ret = "null";
+        if (retVal != null && retVal.getType() != null && (retVal.getType().isReference() || retVal.getType().isArray())) {
+            ret = castValueToType(sb, getLlvmValue(sb, retVal), retVal.getType(), Type.reference("java/lang/Object"));
+        }
+        return "  call void @__jnative_rc_frame_exit(i8** %jn_holds, i32 " + rcHoldCount + ", i8* " + ret + ")\n";
     }
 
     private String getZeroValue(Type type) {
@@ -1069,6 +1123,7 @@ public class LlvmFunctionEmitter {
                     String ptrCast = newAux("ptrcast");
                     sb.append("  ").append(ptrCast).append(" = bitcast i8* ").append(gep)
                             .append(" to ").append(fieldLlvm).append("*\n");
+                    if (emitHeldLoad(sb, inst, resultName, fieldLlvm, ptrCast)) break;
                     sb.append("  ").append(resultName).append(" = load ").append(fieldLlvm)
                             .append(", ").append(fieldLlvm).append("* ").append(ptrCast).append("\n");
                     break;
@@ -1102,6 +1157,7 @@ public class LlvmFunctionEmitter {
                 String ptrCast = newAux("ptrcast");
                 sb.append("  ").append(ptrCast).append(" = bitcast i8* ").append(gep)
                         .append(" to ").append(fieldLlvm).append("*\n");
+                if (emitHeldLoad(sb, inst, resultName, fieldLlvm, ptrCast)) break;
                 sb.append("  ").append(resultName).append(" = load ").append(fieldLlvm)
                         .append(", ").append(fieldLlvm).append("* ").append(ptrCast).append("\n");
                 break;
@@ -1134,6 +1190,10 @@ public class LlvmFunctionEmitter {
                     String ptrCast = newAux("ptrcast");
                     sb.append("  ").append(ptrCast).append(" = bitcast i8* ").append(gep)
                             .append(" to ").append(fieldLlvm).append("*\n");
+                    if (inst.isRcStore() && "i8*".equals(fieldLlvm)) {
+                        emitCountedStore(sb, "i8** " + ptrCast, rhsConverted);
+                        break;
+                    }
                     sb.append("  store ").append(fieldLlvm).append(" ").append(rhsConverted)
                             .append(", ").append(fieldLlvm).append("* ").append(ptrCast).append("\n");
                     break;
@@ -1172,6 +1232,10 @@ public class LlvmFunctionEmitter {
                 String ptrCast = newAux("ptrcast");
                 sb.append("  ").append(ptrCast).append(" = bitcast i8* ").append(gep)
                         .append(" to ").append(fieldLlvm).append("*\n");
+                if (inst.isRcStore() && "i8*".equals(fieldLlvm)) {
+                    emitCountedStore(sb, "i8** " + ptrCast, rhsConverted);
+                    break;
+                }
                 sb.append("  store ").append(fieldLlvm).append(" ").append(rhsConverted)
                         .append(", ").append(fieldLlvm).append("* ").append(ptrCast).append("\n");
                 break;
@@ -1211,6 +1275,7 @@ public class LlvmFunctionEmitter {
                     fieldType = inst.getResult().getType();
                 }
                 String llvmType = LlvmTypeMapper.toLlvmType(fieldType);
+                if (emitHeldLoad(sb, inst, resultName, llvmType, "@" + globalName)) break;
                 sb.append("  ").append(resultName).append(" = load ")
                         .append(llvmType).append(", ")
                         .append(llvmType).append("* @").append(globalName).append("\n");
@@ -1252,6 +1317,10 @@ public class LlvmFunctionEmitter {
                     String rhsConverted = castValueToType(sb, rhsRef, rhs.getType(), fieldType);
                     String llvmType = LlvmTypeMapper.toLlvmType(fieldType);
 
+                    if (inst.isRcStore() && "i8*".equals(llvmType)) {
+                        emitCountedStore(sb, "i8** @" + globalName, rhsConverted);
+                        break;
+                    }
                     sb.append("  store ").append(llvmType).append(" ").append(rhsConverted)
                             .append(", ").append(llvmType).append("* @").append(globalName).append("\n");
                 }
@@ -2616,6 +2685,7 @@ public class LlvmFunctionEmitter {
                 String llvmType = LlvmTypeMapper.toLlvmType(elemType);
                 sb.append("  ").append(ptrCast).append(" = bitcast i8* ").append(elemPtr)
                         .append(" to ").append(llvmType).append("*\n");
+                if (emitHeldLoad(sb, inst, resultName, llvmType, ptrCast)) break;
                 sb.append("  ").append(resultName).append(" = load ").append(llvmType)
                         .append(", ").append(llvmType).append("* ").append(ptrCast).append("\n");
                 break;
@@ -2658,6 +2728,10 @@ public class LlvmFunctionEmitter {
                     String valConverted = castValueToType(sb, valRef, val.getType(), elemType);
                     sb.append("  ").append(ptrCast).append(" = bitcast i8* ").append(elemPtr)
                             .append(" to ").append(llvmType).append("*\n");
+                    if (inst.isRcStore() && "i8*".equals(llvmType)) {
+                        emitCountedStore(sb, "i8** " + ptrCast, valConverted);
+                        break;
+                    }
                     sb.append("  store ").append(llvmType).append(" ").append(valConverted)
                             .append(", ").append(llvmType).append("* ").append(ptrCast).append("\n");
                 }
@@ -2881,7 +2955,8 @@ public class LlvmFunctionEmitter {
                     case "getAndBitwiseOr" -> rmwOp = (isRef || isFloat) ? null : "or";
                     case "getAndBitwiseAnd" -> rmwOp = (isRef || isFloat) ? null : "and";
                     case "getAndBitwiseXor" -> rmwOp = (isRef || isFloat) ? null : "xor";
-                    default -> rmwOp = null;
+                    default -> {
+                    }
                 }
                 if (rmwOp == null) return false;
                 valueCount = 1;
@@ -2952,13 +3027,34 @@ public class LlvmFunctionEmitter {
         String out = null;
         Type outType = vt;
 
-        if (loadOrder != null) {
+        if (loadOrder != null && "i8*".equals(memTy) && inst.getRcHold() >= 0 && rcHoldCount > 0) {
+            String ptr = vhTypedPointer(sb, slot, memTy);
+            String loaded = newAux("vh_load");
+            emitHeldLoad(sb, inst, loaded, memTy, ptr);
+            heldInline.add(inst);
+            out = loaded;
+        } else if (casSuccess != null && exchange && "i8*".equals(casTy)) {
+            String ptr = vhTypedPointer(sb, slot, casTy);
+            String expected = vhMemoryToCas(sb, vhToMemory(sb, values.get(0), vt), memTy, casTy);
+            String desired = vhMemoryToCas(sb, vhToMemory(sb, values.get(1), vt), memTy, casTy);
+            String hp = holdPointer(sb, inst);
+            String witness = newAux("vh_witness");
+            sb.append("  ").append(witness).append(" = call i8* @__jnative_rc_cae(i8** ").append(ptr)
+                    .append(", i8* ").append(expected).append(", i8* ").append(desired)
+                    .append(", i8** ").append(hp == null ? "null" : hp).append(")\n");
+            if (hp != null) heldInline.add(inst);
+            out = witness;
+        } else if (loadOrder != null) {
             String ptr = vhTypedPointer(sb, slot, memTy);
             String loaded = newAux("vh_load");
             sb.append("  ").append(loaded).append(" = load atomic ").append(memTy).append(", ")
                     .append(memTy).append("* ").append(ptr).append(" ").append(loadOrder)
                     .append(", align ").append(align).append("\n");
             out = vhFromMemory(sb, loaded, vt);
+        } else if (storeOrder != null && "i8*".equals(memTy)) {
+            String ptr = vhTypedPointer(sb, slot, memTy);
+            String v = vhToMemory(sb, values.getFirst(), vt);
+            emitCountedStore(sb, "i8** " + ptr, v);
         } else if (storeOrder != null) {
             String ptr = vhTypedPointer(sb, slot, memTy);
             String v = vhToMemory(sb, values.getFirst(), vt);
@@ -2977,6 +3073,15 @@ public class LlvmFunctionEmitter {
                     .append(", ").append(casTy).append(" ").append(desired)
                     .append(" ").append(casSuccess).append(" ").append(casFailure)
                     .append(", align ").append(align).append("\n");
+            if ("i8*".equals(casTy)) {
+                String swapped = newAux("vh_swapped");
+                sb.append("  ").append(swapped).append(" = extractvalue { ").append(casTy)
+                        .append(", i1 } ").append(pair).append(", 1\n");
+                String swappedI32 = newAux("vh_swapped32");
+                sb.append("  ").append(swappedI32).append(" = zext i1 ").append(swapped).append(" to i32\n");
+                sb.append("  call void @__jnative_rc_cas(i32 ").append(swappedI32).append(", i8* ").append(desired)
+                        .append(", i8* ").append(expected).append(")\n");
+            }
             if (exchange) {
                 String witness = newAux("vh_witness");
                 sb.append("  ").append(witness).append(" = extractvalue { ").append(casTy)
@@ -2996,6 +3101,15 @@ public class LlvmFunctionEmitter {
             sb.append("  ").append(old).append(" = atomicrmw ").append(rmwOp).append(" ")
                     .append(memTy).append("* ").append(ptr).append(", ").append(memTy).append(" ").append(v)
                     .append(" ").append(rmwOrder).append(", align ").append(align).append("\n");
+            if ("i8*".equals(memTy)) {
+                String hp = holdPointer(sb, inst);
+                if (hp != null) {
+                    sb.append("  store atomic i8* ").append(old).append(", i8** ").append(hp).append(" seq_cst, align 8\n");
+                    heldInline.add(inst);
+                }
+                sb.append("  call void @__jnative_rc_inc(i8* ").append(v).append(")\n");
+                sb.append("  call void @__jnative_rc_dec(i8* ").append(old).append(")\n");
+            }
             out = vhFromMemory(sb, old, vt);
         }
 
@@ -3003,6 +3117,20 @@ public class LlvmFunctionEmitter {
             valueMapper.setValue(inst.getResult(), castValueToType(sb, out, outType, retType));
         }
         return true;
+    }
+
+    private void emitCountedStore(StringBuilder sb, String typedPointer, String value) {
+        String slot = newAux("rc_slot");
+        sb.append("  ").append(slot).append(" = bitcast ").append(typedPointer).append(" to i64*\n");
+        String fresh = newAux("rc_new");
+        sb.append("  ").append(fresh).append(" = ptrtoint i8* ").append(value).append(" to i64\n");
+        String old = newAux("rc_old");
+        sb.append("  ").append(old).append(" = atomicrmw xchg i64* ").append(slot).append(", i64 ").append(fresh)
+                .append(" seq_cst\n");
+        String oldPtr = newAux("rc_oldp");
+        sb.append("  ").append(oldPtr).append(" = inttoptr i64 ").append(old).append(" to i8*\n");
+        sb.append("  call void @__jnative_rc_inc(i8* ").append(value).append(")\n");
+        sb.append("  call void @__jnative_rc_dec(i8* ").append(oldPtr).append(")\n");
     }
 
     private String vhTypedPointer(StringBuilder sb, String slot, String ty) {
@@ -3162,8 +3290,7 @@ public class LlvmFunctionEmitter {
     private String buildDescriptor(Type returnType, List<Type> paramTypes) {
         StringBuilder sb = new StringBuilder();
         sb.append('(');
-        List<? extends Type> jnLoop15 = paramTypes;
-        for (Type pt : jnLoop15) {
+        for (Type pt : paramTypes) {
             sb.append(typeToFullDescriptor(pt));
         }
         sb.append(')');
@@ -3266,8 +3393,7 @@ public class LlvmFunctionEmitter {
                 .append(objVtableSlot).append("\n");
 
         int offset = 8;
-        List<? extends Value> jnLoop16 = captured;
-        for (Value cap : jnLoop16) {
+        for (Value cap : captured) {
             String fieldLlvm = LlvmTypeMapper.toLlvmType(cap.getType());
             String fieldPtr = newAux("cap_ptr");
             sb.append("  ").append(fieldPtr).append(" = getelementptr i8, i8* ").append(alloc)
@@ -3296,8 +3422,7 @@ public class LlvmFunctionEmitter {
         int dynIdx = 0;
 
         if (recipe == null) {
-            List<? extends Value> jnLoop17 = dynamicArgs;
-            for (Value arg : jnLoop17) {
+            for (Value arg : dynamicArgs) {
                 parts.add(convertArgToString(sb, arg));
             }
         } else {
@@ -3331,8 +3456,7 @@ public class LlvmFunctionEmitter {
         sb.append("  ").append(concatResult)
                 .append(" = call i8* @__jnative_concat_strings(i32 ")
                 .append(parts.size());
-        List<? extends String> jnLoop18 = parts;
-        for (String p : jnLoop18) {
+        for (String p : parts) {
             sb.append(", i8* ").append(p);
         }
         sb.append(")\n");
@@ -3664,6 +3788,7 @@ public class LlvmFunctionEmitter {
         if (term instanceof ReturnTerminator rt) {
             Value retVal = rt.getValue();
             Type funcRetType = term.getBlock().getFunction().getReturnType();
+            sb.append(rcExit(sb, retVal));
             if (retVal != null) {
                 String valRef = getLlvmValue(sb, retVal);
                 valRef = castValueToType(sb, valRef, retVal.getType(), funcRetType);
@@ -4308,7 +4433,7 @@ public class LlvmFunctionEmitter {
         if (internalName == null || internalName.isEmpty()) return false;
         ClassLoader cl = Thread.currentThread().getContextClassLoader();
         String candidate = internalName;
-        while (candidate != null && !candidate.isEmpty()) {
+        while (!candidate.isEmpty()) {
             String base = candidate.startsWith("java/")
                     ? "jnative/" + candidate.substring("java/".length())
                     : "jnative/" + candidate;

@@ -305,6 +305,7 @@ void *__jnative_fn_java_lang_Object_clone___Ljava_lang_Object_(void *obj) {
             void **elems = (void **)((char *)copy + JAVA_ARR_HDR);
             for (int32_t i = 0; i < length; i++) __jnative_share(elems[i]);
         }
+        __jnative_rc_cloned(copy);
         return copy;
     }
 
@@ -345,6 +346,7 @@ void *__jnative_fn_java_lang_Object_clone___Ljava_lang_Object_(void *obj) {
             __jnative_share(*(void **)((char *)clone + f->offset));
         }
     }
+    __jnative_rc_cloned(clone);
     return clone;
 }
 

@@ -44,6 +44,10 @@ public class DestructorInserter {
 
     private AtomicSlotArrays atomicSlots;
 
+    private final Set<Instruction> deathStores = ConcurrentHashMap.newKeySet();
+
+    private RefCountPlanner refCounts;
+
     @Setter
     private Scheduler scheduler;
 
@@ -67,7 +71,12 @@ public class DestructorInserter {
     @Setter
     private Set<String> coAllocatedFields = Collections.emptySet();
 
+    @Setter
+    private io.github.kubyk01.domain.analyzer.reflection.ReflectInfo reflectInfo;
+
     public void insert() {
+        refCounts = new RefCountPlanner(module, resolver, aliasResult, lifetimeResult);
+        refCounts.compute();
         this.allocatedTypes = collectAllocatedTypes();
         log.debug("DestructorInserter: {} distinct allocated type(s)",
             allocatedTypes.size());
@@ -118,18 +127,6 @@ public class DestructorInserter {
         // the module.
         // ------------------------------------------------------------------
         System.out.println("DestructorInserter: " + generated + " destructor(s) generated");
-        containerBorrows = new ContainerArrayBorrows(module, resolver, aliasResult, escapeResult);
-        containerBorrows.compute();
-        instrumentContainerArrays();
-        atomicSlots = new AtomicSlotArrays(module, resolver, aliasResult, escapeResult);
-        atomicSlots.compute();
-        instrumentAtomicSlots();
-        int instrumented = instrumentFieldOverwrites(lifetimeResult.getLiveOut());
-        if (instrumented > 0) {
-            log.info("DestructorInserter: instrumented {} field-overwrite release(s)",
-                instrumented);
-        }
-
         // ------------------------------------------------------------------
         // Insert a destructor call at every destruction point. The call
         // is a direct STATIC_CALL to the site type's destructor — the
@@ -215,6 +212,20 @@ public class DestructorInserter {
             }
             return null;
         });
+        containerBorrows = new ContainerArrayBorrows(module, resolver, aliasResult, escapeResult);
+        containerBorrows.compute();
+        createStorageReleases();
+        instrumentContainerArrays();
+        atomicSlots = new AtomicSlotArrays(module, resolver, aliasResult, escapeResult, reflectInfo);
+        atomicSlots.compute();
+        instrumentAtomicSlots();
+        instrumentWeakReferents();
+        int instrumented = instrumentFieldOverwrites(lifetimeResult.getLiveOut());
+        if (instrumented > 0) {
+            log.info("DestructorInserter: instrumented {} field-overwrite release(s)",
+                instrumented);
+        }
+
         log.info("Destructor insertion: {} destructor(s) generated",
             generated);
     }
@@ -329,6 +340,9 @@ public class DestructorInserter {
         while (i < insts.size()) {
             Instruction inst = insts.get(i);
             if (inst.getOpcode() != Opcode.PUT_FIELD
+                || inst.isRcStore()
+                || refCounts.isWeakStore(inst)
+                || deathStores.contains(inst)
                 || (containerBorrows != null && containerBorrows.instrumentedKey(inst) != null)
                 || !shouldInstrumentPutField(inst)
                 || !oldValueIsDead(inst, block, liveOut)) {
@@ -382,6 +396,92 @@ public class DestructorInserter {
      *                                user-class destructor from being called
      *                                on a system-class instance
      */
+    private void instrumentWeakReferents() {
+        for (Function f : module.getFunctions()) {
+            if (f.getEntryBlock() == null || ContainerArrayBorrows.isDestructor(f)) continue;
+            for (BasicBlock block : f.getBlocks()) {
+                List<Instruction> insts = block.getInstructions();
+                for (int i = 0; i < insts.size(); i++) {
+                    Instruction inst = insts.get(i);
+                    if (inst.getOpcode() != Opcode.PUT_FIELD || !refCounts.isWeakStore(inst)) continue;
+                    Value base = inst.getOperands().get(0);
+                    Value rhs = inst.getOperands().get(2);
+                    Instruction get = new Instruction(Opcode.GET_FIELD);
+                    get.addOperand(base);
+                    get.addOperand(inst.getOperands().get(1));
+                    Temporary old = new Temporary(resolveFieldType(inst, rhs));
+                    get.setResult(old);
+                    old.setDefiningInstruction(get);
+                    get.setParent(block);
+                    insts.add(i, get);
+                    i++;
+                    insts.add(i + 1, runtimeCall(block, "__jnative_rc_weak", base, old, rhs));
+                    i++;
+                }
+            }
+        }
+    }
+
+    private void createStorageReleases() {
+        Map<String, List<String>> owned = containerBorrows.ownedArrayFields();
+        Set<String> instantiated = new HashSet<>();
+        for (int id = 0, n = AllocationSite.count(); id < n; id++) {
+            Type t = AllocationSite.byId(id).getType();
+            if (t != null && t.isReference() && !t.isArray() && !t.isUnknown() && t.getClassName() != null) {
+                instantiated.add(t.getClassName());
+            }
+        }
+        Set<String> classes = new TreeSet<>();
+        for (String owner : owned.keySet()) {
+            if (instantiated.contains(owner)) classes.add(owner);
+            for (String sub : resolver.getSubclasses(owner)) if (instantiated.contains(sub)) classes.add(sub);
+        }
+        int made = 0;
+        for (String cls : classes) {
+            ClassNode node = resolver.getClassNode(cls);
+            if (node == null || node.isExternal() || node.isInterface() || (node.getAccess() & Opcodes.ACC_ABSTRACT) != 0) continue;
+            List<FieldNode> fields = new ArrayList<>();
+            Set<String> seen = new HashSet<>();
+            for (String c = cls; c != null && seen.add(c); ) {
+                for (String key : owned.getOrDefault(c, List.of())) {
+                    if (coAllocatedFields.contains(key)) continue;
+                    int dot = key.lastIndexOf('.');
+                    FieldNode f = resolver.getField(key.substring(0, dot), key.substring(dot + 1));
+                    if (f != null && f.getType() != null && f.getType().isArray()) fields.add(f);
+                }
+                ClassNode n = resolver.getClassNode(c);
+                c = n == null || n.getSuperName() == null || n.getSuperName().equals(c) ? null : n.getSuperName();
+            }
+            if (fields.isEmpty()) continue;
+            String name = ContainerArrayBorrows.STORAGE_PREFIX + cls.replace('/', '_').replace('.', '_');
+            if (module.getFunction(name) != null) continue;
+            Function func = new Function(name, Type.VOID);
+            func.setOwnerClass(cls);
+            Parameter self = new Parameter(Type.reference(cls), 0);
+            func.addParameter(self);
+            BasicBlock body = new BasicBlock(name + "_entry");
+            func.addBlock(body);
+            func.setEntryBlock(body);
+            for (FieldNode f : fields) {
+                String key = f.getOwner() + "." + f.getName();
+                Instruction get = new Instruction(Opcode.GET_FIELD);
+                get.addOperand(self);
+                get.addOperand(new Constant(Type.reference(key), key));
+                Temporary value = new Temporary(f.getType());
+                get.setResult(value);
+                value.setDefiningInstruction(get);
+                get.setParent(body);
+                body.addInstruction(get);
+                body.addInstruction(runtimeCall(body, "__jnative_replace_array", self, value,
+                    new Constant(Type.NULL, null), new Constant(Type.INT, 1)));
+            }
+            body.setTerminator(new ReturnTerminator(null));
+            module.addFunction(func);
+            made++;
+        }
+        System.out.println("DestructorInserter: " + made + " owned-array release function(s) generated");
+    }
+
     private void instrumentContainerArrays() {
         List<? extends Function> fns = module.getFunctions();
         for (Function f : fns) {
@@ -397,7 +497,7 @@ public class DestructorInserter {
                         i++;
                         continue;
                     }
-                    if (inst.getOpcode() != Opcode.PUT_FIELD || inst.getOperands().size() < 3) continue;
+                    if (inst.getOpcode() != Opcode.PUT_FIELD || inst.getOperands().size() < 3 || deathStores.contains(inst)) continue;
                     String key = containerBorrows.instrumentedKey(inst);
                     if (key == null) continue;
                     Value base = inst.getOperands().get(0);
@@ -1791,6 +1891,15 @@ private void emitDestructionGuard(BasicBlock entry,
         Parameter thisParam = new Parameter(Type.reference(className), 0);
         func.addParameter(thisParam);
 
+        if (refCounts != null && refCounts.plan().isCounted(className)) {
+            BasicBlock only = new BasicBlock(funcName + "_entry");
+            func.addBlock(only);
+            func.setEntryBlock(only);
+            only.addInstruction(runtimeCall(only, "__jnative_rc_dec", thisParam));
+            only.setTerminator(new ReturnTerminator(null));
+            return func;
+        }
+
         BasicBlock entry       = new BasicBlock(funcName + "_entry");
         BasicBlock returnBlock = new BasicBlock(funcName + "_return");
         BasicBlock bodyFast    = new BasicBlock(funcName + "_body_fast");
@@ -2373,9 +2482,10 @@ private void emitDestructionGuard(BasicBlock entry,
         // the site's type — never a runtime dispatch. The site's type is
         // always a concrete class (an abstract class cannot have a NEW)
         // or an array type, so the call is well-typed.
+        boolean countedSite = refCounts.isCountedType(site.getType());
+        String target = countedSite ? "__jnative_rc_drop" : dtor.getName();
         Instruction call = new Instruction(Opcode.STATIC_CALL);
-        call.addOperand(new Constant(
-            Type.reference(dtor.getName()), dtor.getName()));
+        call.addOperand(new Constant(Type.reference(target), target));
         call.addOperand(objRef);
         call.setParent(block);
         insts.add(insertIndex, call);
@@ -2391,7 +2501,9 @@ private void emitDestructionGuard(BasicBlock entry,
             nullOut.addOperand(lastStore.getOperands().get(1));  // field name
             nullOut.addOperand(new Constant(Type.NULL, null));
             nullOut.setParent(block);
+            if (countedSite) nullOut.setRcStore(true);
             insts.add(insertIndex + 1, nullOut);
+            deathStores.add(nullOut);
         }
     }
 
