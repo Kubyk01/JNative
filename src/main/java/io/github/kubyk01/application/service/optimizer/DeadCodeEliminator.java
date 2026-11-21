@@ -100,8 +100,7 @@ public class DeadCodeEliminator {
     private void removeEmptyClinitFunctions() {
         Set<String> emptyClinits = new HashSet<>();
         List<? extends Function> jnLoop1 = module.getFunctions();
-        for (int jnIdx1 = 0; jnIdx1 < jnLoop1.size(); jnIdx1++) {
-            Function func = jnLoop1.get(jnIdx1);
+        for (Function func : jnLoop1) {
             String name = func.getName();
             if (!name.contains("__clinit__")) continue;
             if (isEffectivelyEmpty(func)) {
@@ -112,8 +111,7 @@ public class DeadCodeEliminator {
         if (emptyClinits.isEmpty()) return;
 
         List<? extends Function> jnLoop2 = module.getFunctions();
-        for (int jnIdx2 = 0; jnIdx2 < jnLoop2.size(); jnIdx2++) {
-            Function func = jnLoop2.get(jnIdx2);
+        for (Function func : jnLoop2) {
             if (emptyClinits.contains(func.getName())) continue;
             for (int blockIdx1 = 0; blockIdx1 < func.getBlocks().size(); blockIdx1++) {
                 BasicBlock block = func.getBlocks().get(blockIdx1);
@@ -123,8 +121,7 @@ public class DeadCodeEliminator {
 
         Set<Function> doomed = new HashSet<>();
         List<? extends Function> jnLoop3 = module.getFunctions();
-        for (int jnIdx3 = 0; jnIdx3 < jnLoop3.size(); jnIdx3++) {
-            Function func = jnLoop3.get(jnIdx3);
+        for (Function func : jnLoop3) {
             if (emptyClinits.contains(func.getName())) doomed.add(func);
         }
         module.removeFunctions(doomed);
@@ -134,8 +131,8 @@ public class DeadCodeEliminator {
 
     private boolean isEffectivelyEmpty(Function func) {
         if (func.getEntryBlock() == null) return true;
-        for (int blockIdx2 = 0; blockIdx2 < func.getBlocks().size(); blockIdx2++) { BasicBlock block = func.getBlocks().get(blockIdx2);
-            for (int instIdx3 = 0; instIdx3 < block.getInstructions().size(); instIdx3++) { Instruction inst = block.getInstructions().get(instIdx3);
+        for (BasicBlock block : func.getBlocks()) {
+            for (Instruction inst : block.getInstructions()) {
                 Opcode op = inst.getOpcode();
                 if (op == Opcode.NOP) continue;
                 if (op == Opcode.PHI) continue;

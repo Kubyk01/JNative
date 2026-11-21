@@ -202,15 +202,13 @@ public final class MavenDependencyLoader {
         Set<String> known = new HashSet<>();
         Set<String> referenced = new HashSet<>();
         List<? extends Path> jnLoop1 = scanned;
-        for (int jnIdx1 = 0; jnIdx1 < jnLoop1.size(); jnIdx1++) {
-            Path jar = jnLoop1.get(jnIdx1);
+        for (Path jar : jnLoop1) {
             collectClasses(jar, known, referenced);
         }
 
         Map<String, Path> loadedByKey = new LinkedHashMap<>();
         List<? extends Path> jnLoop2 = loadedJars;
-        for (int jnIdx2 = 0; jnIdx2 < jnLoop2.size(); jnIdx2++) {
-            Path jar = jnLoop2.get(jnIdx2);
+        for (Path jar : jnLoop2) {
             String key = artifactKey(repository, jar);
             if (key != null) loadedByKey.put(key, jar);
         }
@@ -233,8 +231,7 @@ public final class MavenDependencyLoader {
                 PomModel pom = readPomModel(ref.pom(), repository, new HashSet<>());
                 if (pom == null) continue;
                 List<? extends DepNode> jnLoop3 = pom.dependencies;
-                for (int jnIdx3 = 0; jnIdx3 < jnLoop3.size(); jnIdx3++) {
-                    DepNode dep = jnLoop3.get(jnIdx3);
+                for (DepNode dep : jnLoop3) {
                     String scope = dep.scope == null ? "compile" : dep.scope.trim();
                     if (scope.equals("test") || scope.equals("system")) continue;
                     if (!ref.includeOptional() && (dep.optional || scope.equals("provided"))) continue;
@@ -247,8 +244,7 @@ public final class MavenDependencyLoader {
             }
 
             List<? extends Candidate> jnLoop4 = new ArrayList<>(candidates);
-            for (int jnIdx4 = 0; jnIdx4 < jnLoop4.size(); jnIdx4++) {
-                Candidate c = jnLoop4.get(jnIdx4);
+            for (Candidate c : jnLoop4) {
                 String key = c.groupId + ":" + c.artifactId;
                 if (loadedByKey.containsKey(key) || attempted.contains(key)) continue;
                 List<String> download = isPlausibleProvider(c.groupId, missing) ? mavenCommand : null;
@@ -257,8 +253,7 @@ public final class MavenDependencyLoader {
                 attempted.add(key);
                 acceptArtifact(key, jar, loadedByKey, added, known, referenced, pomQueue);
                 List<? extends Candidate> jnLoop5 = candidates;
-                for (int jnIdx5 = 0; jnIdx5 < jnLoop5.size(); jnIdx5++) {
-                    Candidate sibling = jnLoop5.get(jnIdx5);
+                for (Candidate sibling : jnLoop5) {
                     String skey = sibling.groupId + ":" + sibling.artifactId;
                     if (!sibling.groupId.equals(c.groupId) || !sibling.artifactId.startsWith("native")) continue;
                     if (loadedByKey.containsKey(skey) || !attempted.add(skey)) continue;
@@ -535,8 +530,7 @@ public final class MavenDependencyLoader {
         candidates.add(Paths.get("/usr/share/maven/bin/mvn"));
 
         List<? extends Path> jnLoop10 = candidates;
-        for (int jnIdx10 = 0; jnIdx10 < jnLoop10.size(); jnIdx10++) {
-            Path candidate = jnLoop10.get(jnIdx10);
+        for (Path candidate : jnLoop10) {
             if (Files.isExecutable(candidate)) {
                 return List.of(candidate.toAbsolutePath().toString());
             }
@@ -710,8 +704,7 @@ public final class MavenDependencyLoader {
         Deque<DepRequest> queue = new ArrayDeque<>();
 
         List<? extends DepNode> jnLoop13 = root.dependencies;
-        for (int jnIdx13 = 0; jnIdx13 < jnLoop13.size(); jnIdx13++) {
-            DepNode dep = jnLoop13.get(jnIdx13);
+        for (DepNode dep : jnLoop13) {
             if (!isRuntimeDependency(dep)) continue;
             queue.add(new DepRequest(dep, root));
         }
@@ -756,8 +749,7 @@ public final class MavenDependencyLoader {
             if (child == null) continue;
 
             List<? extends DepNode> jnLoop14 = child.dependencies;
-            for (int jnIdx14 = 0; jnIdx14 < jnLoop14.size(); jnIdx14++) {
-                DepNode transitive = jnLoop14.get(jnIdx14);
+            for (DepNode transitive : jnLoop14) {
                 if (!isRuntimeDependency(transitive)) continue;
                 if (isExcluded(transitive, dep.exclusions)) continue;
                 queue.add(new DepRequest(transitive, child));
@@ -925,8 +917,7 @@ public final class MavenDependencyLoader {
         if (mgmtStart >= 0 && mgmtEnd > mgmtStart) {
             String mgmtBlock = content.substring(mgmtStart, mgmtEnd);
             List<? extends DepNode> jnLoop17 = parseDependencies(mgmtBlock);
-            for (int jnIdx17 = 0; jnIdx17 < jnLoop17.size(); jnIdx17++) {
-                DepNode node = jnLoop17.get(jnIdx17);
+            for (DepNode node : jnLoop17) {
                 if (node.version != null) {
                     model.managedVersions.put(
                         node.groupId + ":" + node.artifactId,
@@ -941,8 +932,7 @@ public final class MavenDependencyLoader {
         if (depsStart >= 0 && depsEnd > depsStart) {
             String depsBlock = content.substring(depsStart, depsEnd + "</dependencies>".length());
             List<? extends DepNode> jnLoop18 = parseDependencies(depsBlock);
-            for (int jnIdx18 = 0; jnIdx18 < jnLoop18.size(); jnIdx18++) {
-                DepNode node = jnLoop18.get(jnIdx18);
+            for (DepNode node : jnLoop18) {
                 // Fill in a missing version from dependencyManagement.
                 if (node.version == null || node.version.isBlank()) {
                     node.version = model.managedVersions.get(

@@ -224,8 +224,7 @@ public class LlvmFunctionEmitter {
         }
 
         List<? extends String> jnLoop4 = pendingSlotDeclarations;
-        for (int jnIdx4 = 0; jnIdx4 < jnLoop4.size(); jnIdx4++) {
-            String decl = jnLoop4.get(jnIdx4);
+        for (String decl : jnLoop4) {
             sb.append(decl);
         }
 
@@ -282,11 +281,11 @@ public class LlvmFunctionEmitter {
         List<BasicBlock> out = new ArrayList<>();
         Terminator term = block.getTerminator();
         if (term != null) {
-            for (int tIdx1 = 0; tIdx1 < term.getTargets().size(); tIdx1++) { BasicBlock t = term.getTargets().get(tIdx1);
+            for (BasicBlock t : term.getTargets()) {
                 if (t != null && !out.contains(t)) out.add(t);
             }
         }
-        for (int sIdx2 = 0; sIdx2 < block.getSuccessors().size(); sIdx2++) { BasicBlock s = block.getSuccessors().get(sIdx2);
+        for (BasicBlock s : block.getSuccessors()) {
             if (s != null && !out.contains(s)) out.add(s);
         }
         return out;
@@ -301,14 +300,13 @@ public class LlvmFunctionEmitter {
         if (ranges == null || ranges.isEmpty()) return;
 
         Map<String, BasicBlock> byLabel = new HashMap<>();
-        for (int bIdx3 = 0; bIdx3 < func.getBlocks().size(); bIdx3++) { BasicBlock b = func.getBlocks().get(bIdx3);
+        for (BasicBlock b : func.getBlocks()) {
             byLabel.put(b.getLabel(), b);
         }
 
         int ordinal = 0;
         List<? extends TryCatchRange> jnLoop6 = ranges;
-        for (int jnIdx6 = 0; jnIdx6 < jnLoop6.size(); jnIdx6++) {
-            TryCatchRange range = jnLoop6.get(jnIdx6);
+        for (TryCatchRange range : jnLoop6) {
             BasicBlock handlerBlock = byLabel.get("L" + range.handler);
             if (handlerBlock == null) continue;
 
@@ -322,8 +320,7 @@ public class LlvmFunctionEmitter {
             }
 
             List<? extends BasicBlock> jnLoop7 = body;
-            for (int jnIdx7 = 0; jnIdx7 < jnLoop7.size(); jnIdx7++) {
-                BasicBlock b = jnLoop7.get(jnIdx7);
+            for (BasicBlock b : jnLoop7) {
                 if (b == handlerBlock) continue;
                 blockToTryRanges.computeIfAbsent(b, x -> new ArrayList<>()).add(range);
             }
@@ -340,8 +337,7 @@ public class LlvmFunctionEmitter {
         }
         List<TryCatchRange> filtered = new ArrayList<>(all.size());
         List<? extends TryCatchRange> jnLoop8 = all;
-        for (int jnIdx8 = 0; jnIdx8 < jnLoop8.size(); jnIdx8++) {
-            TryCatchRange r = jnLoop8.get(jnIdx8);
+        for (TryCatchRange r : jnLoop8) {
             BasicBlock h = handlerBlockByRange.get(r);
             if (h == block) continue;
             filtered.add(r);
@@ -363,7 +359,7 @@ public class LlvmFunctionEmitter {
     }
 
     private void computeTryRegions(Function func) {
-        for (int blockIdx4 = 0; blockIdx4 < func.getBlocks().size(); blockIdx4++) { BasicBlock block = func.getBlocks().get(blockIdx4);
+        for (BasicBlock block : func.getBlocks()) {
             List<TryCatchRange> myRanges = effectiveRangesFor(block);
             if (myRanges.isEmpty()) {
                 tryRegionEntry.put(block, false);
@@ -372,7 +368,7 @@ public class LlvmFunctionEmitter {
             }
             boolean isEntry = block.getPredecessors().isEmpty();
             if (!isEntry) {
-                for (int predIdx5 = 0; predIdx5 < block.getPredecessors().size(); predIdx5++) { BasicBlock pred = block.getPredecessors().get(predIdx5);
+                for (BasicBlock pred : block.getPredecessors()) {
                     if (!sameRanges(effectiveRangesFor(pred), myRanges)) {
                         isEntry = true;
                         break;
@@ -382,12 +378,12 @@ public class LlvmFunctionEmitter {
             tryRegionEntry.put(block, isEntry);
         }
 
-        for (int blockIdx6 = 0; blockIdx6 < func.getBlocks().size(); blockIdx6++) { BasicBlock block = func.getBlocks().get(blockIdx6);
+        for (BasicBlock block : func.getBlocks()) {
             List<TryCatchRange> myRanges = effectiveRangesFor(block);
             if (myRanges.isEmpty()) continue;
             boolean isExit = block.getTerminator() instanceof ReturnTerminator;
             if (!isExit) {
-                for (int succIdx7 = 0; succIdx7 < block.getSuccessors().size(); succIdx7++) { BasicBlock succ = block.getSuccessors().get(succIdx7);
+                for (BasicBlock succ : block.getSuccessors()) {
                     if (leavesRegion(succ, myRanges)) {
                         isExit = true;
                         break;
@@ -399,8 +395,7 @@ public class LlvmFunctionEmitter {
 
         List<BasicBlock> snapshot = new ArrayList<>(func.getBlocks());
         List<? extends BasicBlock> jnLoop9 = snapshot;
-        for (int jnIdx9 = 0; jnIdx9 < jnLoop9.size(); jnIdx9++) {
-            BasicBlock block = jnLoop9.get(jnIdx9);
+        for (BasicBlock block : jnLoop9) {
             List<TryCatchRange> myRanges = effectiveRangesFor(block);
             if (myRanges.isEmpty()) continue;
             if (!tryRegionExit.getOrDefault(block, false)) continue;
@@ -410,14 +405,14 @@ public class LlvmFunctionEmitter {
 
             boolean hasInsideNormalSucc  = false;
             boolean hasOutsideNormalSucc = false;
-            for (int succIdx8 = 0; succIdx8 < term.getTargets().size(); succIdx8++) { BasicBlock succ = term.getTargets().get(succIdx8);
+            for (BasicBlock succ : term.getTargets()) {
                 if (!leavesRegion(succ, myRanges)) hasInsideNormalSucc  = true;
                 else                               hasOutsideNormalSucc = true;
             }
             if (!hasInsideNormalSucc || !hasOutsideNormalSucc) continue;
 
             Map<BasicBlock, BasicBlock> redirects = new HashMap<>();
-            for (int succIdx9 = 0; succIdx9 < term.getTargets().size(); succIdx9++) { BasicBlock succ = term.getTargets().get(succIdx9);
+            for (BasicBlock succ : term.getTargets()) {
                 if (!leavesRegion(succ, myRanges)) continue;
 
                 BasicBlock tramp = new BasicBlock(
@@ -458,23 +453,21 @@ public class LlvmFunctionEmitter {
                 BasicBlock cur = worklist.poll();
                 if (!catchReachable.add(cur)) continue;
                 List<? extends BasicBlock> jnLoop11 = successorsOf(cur);
-                for (int jnIdx11 = 0; jnIdx11 < jnLoop11.size(); jnIdx11++) {
-                    BasicBlock succ = jnLoop11.get(jnIdx11);
+                for (BasicBlock succ : jnLoop11) {
                     if (!catchReachable.contains(succ)) worklist.add(succ);
                 }
             }
 
             for (BasicBlock useBlock : catchReachable) {
-                for (int instIdx10 = 0; instIdx10 < useBlock.getInstructions().size(); instIdx10++) { Instruction inst = useBlock.getInstructions().get(instIdx10);
-                    for (int opIdx11 = 0; opIdx11 < inst.getOperands().size(); opIdx11++) { Value op = inst.getOperands().get(opIdx11);
+                for (Instruction inst : useBlock.getInstructions()) {
+                    for (Value op : inst.getOperands()) {
                         addIfCrossing(result, op, useBlock, catchReachable, entry, entryHasBodyLabel);
                     }
                 }
                 Terminator term = useBlock.getTerminator();
                 if (term != null) {
                     List<? extends Value> jnLoop13 = terminatorOperands(term);
-                    for (int jnIdx13 = 0; jnIdx13 < jnLoop13.size(); jnIdx13++) {
-                        Value op = jnLoop13.get(jnIdx13);
+                    for (Value op : jnLoop13) {
                         addIfCrossing(result, op, useBlock, catchReachable, entry, entryHasBodyLabel);
                     }
                 }
@@ -522,8 +515,8 @@ public class LlvmFunctionEmitter {
 
     private Set<Integer> collectUsedLocals(Function func) {
         Set<Integer> locals = new HashSet<>();
-        for (int blockIdx12 = 0; blockIdx12 < func.getBlocks().size(); blockIdx12++) { BasicBlock block = func.getBlocks().get(blockIdx12);
-            for (int instIdx13 = 0; instIdx13 < block.getInstructions().size(); instIdx13++) { Instruction inst = block.getInstructions().get(instIdx13);
+        for (BasicBlock block : func.getBlocks()) {
+            for (Instruction inst : block.getInstructions()) {
                 if (inst.getOpcode() == Opcode.LOAD || inst.getOpcode() == Opcode.STORE) {
                     locals.add(inst.getLocalIndex());
                 }
@@ -572,10 +565,10 @@ public class LlvmFunctionEmitter {
         }
 
         if (term != null) {
-            for (int succIdx14 = 0; succIdx14 < term.getTargets().size(); succIdx14++) { BasicBlock succ = term.getTargets().get(succIdx14);
+            for (BasicBlock succ : term.getTargets()) {
                 int predIdx = succ.getPredecessors().indexOf(block);
                 if (predIdx < 0) continue;
-                for (int succInstIdx15 = 0; succInstIdx15 < succ.getInstructions().size(); succInstIdx15++) { Instruction succInst = succ.getInstructions().get(succInstIdx15);
+                for (Instruction succInst : succ.getInstructions()) {
                     if (succInst.getOpcode() != Opcode.PHI) continue;
                     if (predIdx >= succInst.getOperands().size()) continue;
                     Value phiOp = succInst.getOperands().get(predIdx);
@@ -608,7 +601,7 @@ public class LlvmFunctionEmitter {
             }
         }
 
-        for (int instIdx16 = 0; instIdx16 < block.getInstructions().size(); instIdx16++) { Instruction inst = block.getInstructions().get(instIdx16);
+        for (Instruction inst : block.getInstructions()) {
             sb.append(emitInstruction(inst, List.of()));
         }
 
@@ -619,7 +612,7 @@ public class LlvmFunctionEmitter {
             boolean hasInsideNormalSucc  = false;
             boolean hasOutsideNormalSucc = false;
             if (!isReturn) {
-                for (int succIdx17 = 0; succIdx17 < term.getTargets().size(); succIdx17++) { BasicBlock succ = term.getTargets().get(succIdx17);
+                for (BasicBlock succ : term.getTargets()) {
                     if (!leavesRegion(succ, ranges)) hasInsideNormalSucc  = true;
                     else                             hasOutsideNormalSucc = true;
                 }
@@ -3170,8 +3163,7 @@ public class LlvmFunctionEmitter {
         StringBuilder sb = new StringBuilder();
         sb.append('(');
         List<? extends Type> jnLoop15 = paramTypes;
-        for (int jnIdx15 = 0; jnIdx15 < jnLoop15.size(); jnIdx15++) {
-            Type pt = jnLoop15.get(jnIdx15);
+        for (Type pt : jnLoop15) {
             sb.append(typeToFullDescriptor(pt));
         }
         sb.append(')');
@@ -3275,8 +3267,7 @@ public class LlvmFunctionEmitter {
 
         int offset = 8;
         List<? extends Value> jnLoop16 = captured;
-        for (int jnIdx16 = 0; jnIdx16 < jnLoop16.size(); jnIdx16++) {
-            Value cap = jnLoop16.get(jnIdx16);
+        for (Value cap : jnLoop16) {
             String fieldLlvm = LlvmTypeMapper.toLlvmType(cap.getType());
             String fieldPtr = newAux("cap_ptr");
             sb.append("  ").append(fieldPtr).append(" = getelementptr i8, i8* ").append(alloc)
@@ -3306,8 +3297,7 @@ public class LlvmFunctionEmitter {
 
         if (recipe == null) {
             List<? extends Value> jnLoop17 = dynamicArgs;
-            for (int jnIdx17 = 0; jnIdx17 < jnLoop17.size(); jnIdx17++) {
-                Value arg = jnLoop17.get(jnIdx17);
+            for (Value arg : jnLoop17) {
                 parts.add(convertArgToString(sb, arg));
             }
         } else {
@@ -3342,8 +3332,7 @@ public class LlvmFunctionEmitter {
                 .append(" = call i8* @__jnative_concat_strings(i32 ")
                 .append(parts.size());
         List<? extends String> jnLoop18 = parts;
-        for (int jnIdx18 = 0; jnIdx18 < jnLoop18.size(); jnIdx18++) {
-            String p = jnLoop18.get(jnIdx18);
+        for (String p : jnLoop18) {
             sb.append(", i8* ").append(p);
         }
         sb.append(")\n");
@@ -4356,8 +4345,7 @@ public class LlvmFunctionEmitter {
         }
         int n = 0;
         List<? extends MethodNode> jnLoop21 = cn.getMethods();
-        for (int jnIdx21 = 0; jnIdx21 < jnLoop21.size(); jnIdx21++) {
-            MethodNode mn = jnLoop21.get(jnIdx21);
+        for (MethodNode mn : jnLoop21) {
             if (mn.getName().equals(methodName)) {
                 n++;
             }
@@ -4373,8 +4361,7 @@ public class LlvmFunctionEmitter {
         java.util.Set<String> seen = new java.util.HashSet<>();
         while (cur != null && !cur.isExternal() && seen.add(cur.getName())) {
             List<? extends FieldNode> jnLoop22 = cur.getFields();
-            for (int jnIdx22 = 0; jnIdx22 < jnLoop22.size(); jnIdx22++) {
-                FieldNode f = jnLoop22.get(jnIdx22);
+            for (FieldNode f : jnLoop22) {
                 if ((f.getAccess() & org.objectweb.asm.Opcodes.ACC_STATIC) != 0) continue;
                 if ((f.getAccess() & org.objectweb.asm.Opcodes.ACC_FINAL) == 0) return false;
             }

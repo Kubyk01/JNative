@@ -70,8 +70,7 @@ public class DestructorSimplifier {
 
     public void simplify() {
         List<? extends Function> jnLoop1 = module.getFunctions();
-        for (int jnIdx1 = 0; jnIdx1 < jnLoop1.size(); jnIdx1++) {
-            Function func = jnLoop1.get(jnIdx1);
+        for (Function func : jnLoop1) {
             if (func.getName().startsWith("__destruct_")
                 || func.getName().startsWith("__destruct_array_")) {
                 destructors.add(func);
@@ -99,11 +98,10 @@ public class DestructorSimplifier {
         boolean dispatchUsed = false;
         List<? extends Function> jnLoop2 = module.getFunctions();
         outer:
-        for (int jnIdx2 = 0; jnIdx2 < jnLoop2.size(); jnIdx2++) {
-            Function func = jnLoop2.get(jnIdx2);
+        for (Function func : jnLoop2) {
             if (func.getEntryBlock() == null) continue;
-            for (int blockIdx1 = 0; blockIdx1 < func.getBlocks().size(); blockIdx1++) { BasicBlock block = func.getBlocks().get(blockIdx1);
-                for (int instIdx2 = 0; instIdx2 < block.getInstructions().size(); instIdx2++) { Instruction inst = block.getInstructions().get(instIdx2);
+            for (BasicBlock block : func.getBlocks()) {
+                for (Instruction inst : block.getInstructions()) {
                     if (inst.getOpcode() != Opcode.STATIC_CALL) continue;
                     if (inst.getOperands().isEmpty()) continue;
                     Value callee = inst.getOperands().getFirst();
@@ -125,8 +123,7 @@ public class DestructorSimplifier {
 
         Set<Function> called = new LinkedHashSet<>();
         List<? extends Function> jnLoop3 = new ArrayList<>(module.getFunctions());
-        for (int jnIdx3 = 0; jnIdx3 < jnLoop3.size(); jnIdx3++) {
-            Function func = jnLoop3.get(jnIdx3);
+        for (Function func : jnLoop3) {
             if (func.getEntryBlock() == null) continue;
             collectCalls(func, called);
         }
@@ -148,8 +145,7 @@ public class DestructorSimplifier {
             for (Function f : dead) deadNames.add(f.getName());
 
             List<? extends Function> jnLoop4 = module.getFunctions();
-            for (int jnIdx4 = 0; jnIdx4 < jnLoop4.size(); jnIdx4++) {
-                Function func = jnLoop4.get(jnIdx4);
+            for (Function func : jnLoop4) {
                 if (dead.contains(func)) continue;
                 if (func.getEntryBlock() == null) continue;
                 for (int blockIdx3 = 0; blockIdx3 < func.getBlocks().size(); blockIdx3++) { BasicBlock block = func.getBlocks().get(blockIdx3);
@@ -173,8 +169,8 @@ public class DestructorSimplifier {
     }
 
     private void collectCalls(Function func, Set<Function> accumulator) {
-        for (int blockIdx4 = 0; blockIdx4 < func.getBlocks().size(); blockIdx4++) { BasicBlock block = func.getBlocks().get(blockIdx4);
-            for (int instIdx5 = 0; instIdx5 < block.getInstructions().size(); instIdx5++) { Instruction inst = block.getInstructions().get(instIdx5);
+        for (BasicBlock block : func.getBlocks()) {
+            for (Instruction inst : block.getInstructions()) {
                 if (inst.getOpcode() == Opcode.STATIC_CALL
                     && !inst.getOperands().isEmpty()) {
                     Value callee = inst.getOperands().getFirst();
@@ -213,8 +209,8 @@ public class DestructorSimplifier {
     }
 
     private boolean isTrivialDestructor(Function func) {
-        for (int blockIdx6 = 0; blockIdx6 < func.getBlocks().size(); blockIdx6++) { BasicBlock block = func.getBlocks().get(blockIdx6);
-            for (int instIdx7 = 0; instIdx7 < block.getInstructions().size(); instIdx7++) { Instruction inst = block.getInstructions().get(instIdx7);
+        for (BasicBlock block : func.getBlocks()) {
+            for (Instruction inst : block.getInstructions()) {
                 Opcode op = inst.getOpcode();
                 if (op == Opcode.EQ || op == Opcode.COND_BRANCH
                     || op == Opcode.FREE || op == Opcode.RETURN) {
@@ -241,8 +237,7 @@ public class DestructorSimplifier {
         List<BasicBlock> toRemove = new ArrayList<>(func.getBlocks());
         toRemove.remove(entry);
         List<? extends BasicBlock> jnLoop7 = toRemove;
-        for (int jnIdx7 = 0; jnIdx7 < jnLoop7.size(); jnIdx7++) {
-            BasicBlock block = jnLoop7.get(jnIdx7);
+        for (BasicBlock block : jnLoop7) {
             func.getBlocks().remove(block);
         }
         log.debug("Simplified destructor: {}", func.getName());
@@ -403,7 +398,7 @@ public class DestructorSimplifier {
 
         // Locate the fast-path body emitted by DestructorInserter.
         BasicBlock bodyFast = null;
-        for (int bIdx8 = 0; bIdx8 < dtor.getBlocks().size(); bIdx8++) { BasicBlock b = dtor.getBlocks().get(bIdx8);
+        for (BasicBlock b : dtor.getBlocks()) {
             if (b.getLabel().endsWith("_body_fast")) {
                 bodyFast = b;
                 break;
@@ -415,7 +410,7 @@ public class DestructorSimplifier {
         List<String> fieldNames = new ArrayList<>();
         int selfFreeCount = 0;
 
-        for (int instIdx9 = 0; instIdx9 < bodyFast.getInstructions().size(); instIdx9++) { Instruction inst = bodyFast.getInstructions().get(instIdx9);
+        for (Instruction inst : bodyFast.getInstructions()) {
             Opcode op = inst.getOpcode();
             switch (op) {
                 case GET_FIELD -> {
@@ -526,8 +521,7 @@ public class DestructorSimplifier {
 
         List<Function> allFuncs = new ArrayList<>(module.getFunctions());
         List<? extends Function> jnLoop10 = allFuncs;
-        for (int jnIdx10 = 0; jnIdx10 < jnLoop10.size(); jnIdx10++) {
-            Function func = jnLoop10.get(jnIdx10);
+        for (Function func : jnLoop10) {
             if (func.getEntryBlock() == null) continue;
             inlineInFunction(func);
         }
@@ -541,11 +535,10 @@ public class DestructorSimplifier {
     private int countInlineableCallSites() {
         int n = 0;
         List<? extends Function> jnLoop11 = module.getFunctions();
-        for (int jnIdx11 = 0; jnIdx11 < jnLoop11.size(); jnIdx11++) {
-            Function f = jnLoop11.get(jnIdx11);
+        for (Function f : jnLoop11) {
             if (f.getEntryBlock() == null) continue;
-            for (int bIdx10 = 0; bIdx10 < f.getBlocks().size(); bIdx10++) { BasicBlock b = f.getBlocks().get(bIdx10);
-                for (int iIdx11 = 0; iIdx11 < b.getInstructions().size(); iIdx11++) { Instruction i = b.getInstructions().get(iIdx11);
+            for (BasicBlock b : f.getBlocks()) {
+                for (Instruction i : b.getInstructions()) {
                     if (i.getOpcode() != Opcode.STATIC_CALL) continue;
                     if (i.getOperands().size() < 2) continue;
                     Value calleeVal = i.getOperands().getFirst();
@@ -671,8 +664,7 @@ public class DestructorSimplifier {
         List<TryCatchRange> ranges = func.getTryCatchRanges();
         if (ranges == null || ranges.isEmpty()) return false;
         List<? extends TryCatchRange> jnLoop12 = ranges;
-        for (int jnIdx12 = 0; jnIdx12 < jnLoop12.size(); jnIdx12++) {
-            TryCatchRange range = jnLoop12.get(jnIdx12);
+        for (TryCatchRange range : jnLoop12) {
             List<BasicBlock> body = range.body;
             if (body == null) {
                 // Body was not precomputed for this range; the emitter
@@ -753,7 +745,7 @@ public class DestructorSimplifier {
         if (oldTerm != null) {
             // ---- Step 1: capture each successor's current index of `block` ----
             Map<BasicBlock, Integer> oldIndices = new HashMap<>();
-            for (int succIdx12 = 0; succIdx12 < oldTerm.getTargets().size(); succIdx12++) { BasicBlock succ = oldTerm.getTargets().get(succIdx12);
+            for (BasicBlock succ : oldTerm.getTargets()) {
                 if (succ == null) continue;
                 int pi = succ.getPredecessors().indexOf(block);
                 if (pi >= 0) oldIndices.put(succ, pi);
@@ -793,8 +785,7 @@ public class DestructorSimplifier {
             // handler. The prefix keeps its edges untouched; the suffix
             // needs its own.
             List<? extends BasicBlock> jnLoop14 = new ArrayList<>(block.getExceptionalSuccessors());
-            for (int jnIdx14 = 0; jnIdx14 < jnLoop14.size(); jnIdx14++) {
-                BasicBlock exc = jnLoop14.get(jnIdx14);
+            for (BasicBlock exc : jnLoop14) {
                 tail.addExceptionalSuccessor(exc);
             }
         }
@@ -868,8 +859,7 @@ public class DestructorSimplifier {
         ownerCheck.setTerminator(new CondBranchTerminator(stillSharedRes, tail, doFree));
 
         List<? extends String> jnLoop15 = fields;
-        for (int jnIdx15 = 0; jnIdx15 < jnLoop15.size(); jnIdx15++) {
-            String fieldName = jnLoop15.get(jnIdx15);
+        for (String fieldName : jnLoop15) {
             Instruction getField = new Instruction(Opcode.GET_FIELD);
             getField.addOperand(obj);
             getField.addOperand(new Constant(

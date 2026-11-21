@@ -72,8 +72,7 @@ final class LinuxSysroot {
         Path tmp = Files.createTempDirectory(root.getParent(), root.getFileName() + ".tmp");
         Map<Path, String> symlinks = new LinkedHashMap<>();
         List<? extends String> jnLoop1 = PACKAGES;
-        for (int jnIdx1 = 0; jnIdx1 < jnLoop1.size(); jnIdx1++) {
-            String pkg = jnLoop1.get(jnIdx1);
+        for (String pkg : jnLoop1) {
             String[] info = debs.get(pkg);
             if (info == null) throw new IOException("Package '" + pkg + "' not found in Debian " + RELEASE + " " + debArch);
             System.out.println("  " + pkg);
@@ -259,8 +258,7 @@ final class LinuxSysroot {
                     .forEach(scripts::add);
         }
         List<? extends Path> jnLoop2 = scripts;
-        for (int jnIdx2 = 0; jnIdx2 < jnLoop2.size(); jnIdx2++) {
-            Path p = jnLoop2.get(jnIdx2);
+        for (Path p : jnLoop2) {
             if (Files.size(p) > 4096) continue; // real ELF shared objects are far larger
             String text = new String(Files.readAllBytes(p), StandardCharsets.ISO_8859_1);
             if (!text.contains("GNU ld script")) continue;

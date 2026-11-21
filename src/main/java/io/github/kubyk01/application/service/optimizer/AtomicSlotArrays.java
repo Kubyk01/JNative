@@ -43,6 +43,7 @@ final class AtomicSlotArrays {
     private static final String ARA = "java/util/concurrent/atomic/AtomicReferenceArray";
     private static final String AR = "java/util/concurrent/atomic/AtomicReference";
     private static final String VH = "java/lang/invoke/VarHandle";
+    private static final String ARFU = "java/util/concurrent/atomic/AtomicReferenceFieldUpdater";
     private static final String UNKNOWN_FAMILY = "?";
 
     enum Kind { READ, CAS_BOOL, CAS_WITNESS, GET_AND_SET, SET, UNKNOWN_WRITE }
@@ -105,9 +106,12 @@ final class AtomicSlotArrays {
     void compute() {
         long started = System.nanoTime();
         scan();
+        for (Instruction w : staticWrites) {
+            String where = "unresolved static field write " + extractCalleeName(w) + " in " + w.getParent().getFunction().getName();
+            for (String fam : staticFamilies) invalid.putIfAbsent("field " + fam, where);
+        }
         for (int i = 0; i < ops.size(); i++) checkWrite(ops.get(i));
-        for (int i = 0; i < ops.size(); i++) {
-            Op op = ops.get(i);
+        for (Op op : ops) {
             Value borrowed = borrowedValue(op);
             if (borrowed == null) continue;
             String fam = familyOfRead(op, borrowed);
@@ -122,21 +126,33 @@ final class AtomicSlotArrays {
             pinBefore.add(e.getKey());
             pinned.add(e.getKey().getParent().getFunction());
         }
+        Map<Instruction, List<Op>> byInst = new IdentityHashMap<>();
+        for (Op op : ops) byInst.computeIfAbsent(op.inst(), k -> new ArrayList<>()).add(op);
         int retires = 0;
         int discards = 0;
-        for (int i = 0; i < ops.size(); i++) {
-            Op op = ops.get(i);
-            String fam = familyOfWrite(op);
-            if (fam == null || fam.equals(UNKNOWN_FAMILY) || invalid.containsKey(fam)) continue;
-            if (retirable(op, fam)) {
-                retireAfter.put(op.inst(), op.inst());
-                pinBefore.add(op.inst());
-                pinned.add(op.inst().getParent().getFunction());
+        for (Map.Entry<Instruction, List<Op>> e : byInst.entrySet()) {
+            List<Op> group = e.getValue();
+            boolean allRetirable = true;
+            boolean allValid = true;
+            for (Op op : group) {
+                String fam = familyOfWrite(op);
+                if (fam == null || fam.equals(UNKNOWN_FAMILY) || invalid.containsKey(fam)) {
+                    allRetirable = false;
+                    allValid = false;
+                    break;
+                }
+                if (!retirable(op, fam)) allRetirable = false;
+            }
+            Op first = group.getFirst();
+            if (allRetirable) {
+                retireAfter.put(e.getKey(), e.getKey());
+                pinBefore.add(e.getKey());
+                pinned.add(e.getKey().getParent().getFunction());
                 retires++;
             }
-            if (op.kind() == Kind.CAS_BOOL && op.inst().getResult() != null && op.newValue() != null
-                && definiteArray(op.newValue()) && unusedAfter(op, op.newValue())) {
-                discardAfter.put(op.inst(), op.newValue());
+            if (allValid && first.kind() == Kind.CAS_BOOL && e.getKey().getResult() != null && first.newValue() != null
+                && definiteArray(first.newValue()) && unusedAfter(first, first.newValue())) {
+                discardAfter.put(e.getKey(), first.newValue());
                 discards++;
             }
         }
@@ -159,14 +175,12 @@ final class AtomicSlotArrays {
     private void scan() {
         List<? extends Function> fns = module.getFunctions();
         List<Instruction> plain = new ArrayList<>();
-        for (int fi = 0; fi < fns.size(); fi++) {
-            Function f = fns.get(fi);
+        List<Instruction> calls = new ArrayList<>();
+        for (Function f : fns) {
             if (f.getEntryBlock() == null || ContainerArrayBorrows.isDestructor(f)) continue;
             boolean intrinsicOwner = isAtomicHolder(f);
-            for (int bi = 0; bi < f.getBlocks().size(); bi++) {
-                BasicBlock block = f.getBlocks().get(bi);
-                for (int ii = 0; ii < block.getInstructions().size(); ii++) {
-                    Instruction inst = block.getInstructions().get(ii);
+            for (BasicBlock block : f.getBlocks()) {
+                for (Instruction inst : block.getInstructions()) {
                     Opcode op = inst.getOpcode();
                     if (op == Opcode.GET_FIELD || op == Opcode.PUT_FIELD) {
                         plain.add(inst);
@@ -176,12 +190,13 @@ final class AtomicSlotArrays {
                     List<Function> ts = resolveTargets(inst);
                     targets.put(inst, ts);
                     for (int t = 0; t < ts.size(); t++) callSitesOf.computeIfAbsent(ts.get(t), k -> new ArrayList<>()).add(inst);
-                    if (!intrinsicOwner) classify(inst);
+                    if (!intrinsicOwner) calls.add(inst);
                 }
             }
         }
-        for (int i = 0; i < plain.size(); i++) {
-            Instruction inst = plain.get(i);
+        for (Instruction inst : calls) noteUpdaterCreation(inst);
+        for (Instruction inst : calls) classify(inst);
+        for (Instruction inst : plain) {
             String key = extractFieldName(inst);
             if (!fieldFamilies.contains(key)) continue;
             List<Value> o = inst.getOperands();
@@ -196,6 +211,7 @@ final class AtomicSlotArrays {
     private boolean isAtomicHolder(Function f) {
         String n = f.getOwnerClass();
         return ARA.equals(n) || AR.equals(n) || "jdk/internal/misc/Unsafe".equals(n) || "sun/misc/Unsafe".equals(n)
+            || (n != null && n.startsWith(ARFU))
             || VH.equals(n) || (n != null && n.startsWith("java/lang/invoke/VarHandle"));
     }
 
@@ -225,39 +241,200 @@ final class AtomicSlotArrays {
             addValueOp(inst, k, null, recv, base, argc);
             return;
         }
+        if (owner.startsWith(ARFU)) {
+            Kind k = kindOf(name);
+            boolean other = k == null && !name.equals("<init>") && (name.contains("Update") || name.contains("Accumulate")
+                || name.startsWith("update") || name.startsWith("accumulate"));
+            if (k == null && !other) return;
+            List<VarHandleTargetResolver.Target> ts = argc > 0 ? handleTargets(arg(inst, 0), inst.getParent().getFunction()) : null;
+            Value obj = argc > 1 ? arg(inst, 1) : null;
+            boolean resolved = ts != null && !other;
+            for (int i = 0; resolved && i < ts.size(); i++) {
+                if (ts.get(i).kind() != VarHandleTargetResolver.Kind.INSTANCE_FIELD) resolved = false;
+            }
+            if (!resolved) {
+                if (k != Kind.READ) {
+                    ops.add(new Op(inst, Kind.UNKNOWN_WRITE, null, obj, null, argc > 2 ? arg(inst, argc - 1) : null));
+                    updaterWrites.add(inst);
+                }
+                return;
+            }
+            for (VarHandleTargetResolver.Target t : ts) {
+                String key = t.owner() + "." + t.fieldName();
+                fieldFamilies.add(key);
+                addValueOp(inst, k, key, obj, 2, argc);
+            }
+            return;
+        }
+        if ((owner.equals("jdk/internal/misc/Unsafe") || owner.equals("sun/misc/Unsafe")) && name.contains("Reference")) {
+            Kind k = unsafeKind(name);
+            if (k == null) return;
+            if (k != Kind.READ && !(argc > 1 && isReference(arg(inst, argc - 1)))) return;
+            if (argc > 2 && staticOffset(arg(inst, 2))) {
+                if (k != Kind.READ) staticWrites.add(inst);
+                return;
+            }
+            List<VarHandleTargetResolver.Target> ts = argc > 2 ? handleTargets(arg(inst, 2), inst.getParent().getFunction()) : null;
+            boolean resolved = ts != null;
+            for (int i = 0; resolved && i < ts.size(); i++) {
+                if (ts.get(i).kind() != VarHandleTargetResolver.Kind.INSTANCE_FIELD) resolved = false;
+            }
+            if (!resolved) {
+                if (k != Kind.READ) ops.add(new Op(inst, Kind.UNKNOWN_WRITE, null, arg(inst, 1), null, arg(inst, argc - 1)));
+                return;
+            }
+            for (VarHandleTargetResolver.Target t : ts) {
+                if (t.valueType() != null && t.valueType().isPrimitive()) continue;
+                String key = t.owner() + "." + t.fieldName();
+                fieldFamilies.add(key);
+                addValueOp(inst, k, key, arg(inst, 1), 3, argc);
+            }
+            return;
+        }
         if (owner.equals(VH) && inst.isPolymorphicSignature()) {
             Kind k = kindOf(name);
             if (k == null) return;
-            VarHandleTargetResolver.Target t = handles.resolveCallSite(inst);
-            if (t == null) {
+            VarHandleTargetResolver.Target single = handles.resolveCallSite(inst);
+            List<VarHandleTargetResolver.Target> ts = single != null ? List.of(single)
+                : handleTargets(inst.getOperands().getFirst(), inst.getParent().getFunction());
+            if (ts == null) {
                 Value written = argc > 1 ? arg(inst, argc - 1) : null;
                 if (k != Kind.READ && isReference(written)) ops.add(new Op(inst, Kind.UNKNOWN_WRITE, null, arg(inst, 1), null,
                     arg(inst, argc - 1)));
                 return;
             }
-            if (t.valueType() != null && t.valueType().isPrimitive()) return;
-            final String s = t.owner() + "." + t.fieldName();
-            switch (t.kind()) {
-                case INSTANCE_FIELD -> {
-                    String key = s;
-                    fieldFamilies.add(key);
-                    addValueOp(inst, k, key, arg(inst, 1), 2, argc);
-                }
-                case STATIC_FIELD -> {
-                    String key = s;
-                    fieldFamilies.add(key);
-                    addValueOp(inst, k, key, null, 1, argc);
-                }
-                case ARRAY_ELEMENT -> addValueOp(inst, k, null, arg(inst, 1), 3, argc);
+            for (VarHandleTargetResolver.Target t : ts) classifyHandle(inst, k, t, argc);
+        }
+    }
+
+    private void classifyHandle(Instruction inst, Kind k, VarHandleTargetResolver.Target t, int argc) {
+        if (t.valueType() != null && t.valueType().isPrimitive()) return;
+        String key = t.owner() + "." + t.fieldName();
+        switch (t.kind()) {
+            case INSTANCE_FIELD -> {
+                fieldFamilies.add(key);
+                addValueOp(inst, k, key, arg(inst, 1), 2, argc);
             }
+            case STATIC_FIELD -> {
+                fieldFamilies.add(key);
+                staticFamilies.add(key);
+                addValueOp(inst, k, key, null, 1, argc);
+            }
+            case ARRAY_ELEMENT -> addValueOp(inst, k, null, arg(inst, 1), 3, argc);
+        }
+    }
+
+    private List<VarHandleTargetResolver.Target> handleTargets(Value handle, Function f) {
+        Map<String, VarHandleTargetResolver.Target> out = new HashMap<>();
+        return collectHandleTargets(handle, f, out, new HashSet<>(), 0) ? new ArrayList<>(out.values()) : null;
+    }
+
+    private boolean collectHandleTargets(Value handle, Function f, Map<String, VarHandleTargetResolver.Target> out,
+                                         Set<String> visiting, int depth) {
+        if (depth > 16) return false;
+        Set<Value> seen = Collections.newSetFromMap(new IdentityHashMap<>());
+        ArrayDeque<Value> work = new ArrayDeque<>();
+        work.push(handle);
+        while (!work.isEmpty()) {
+            Value v = work.pop();
+            if (v == null || !seen.add(v)) continue;
+            if (isNullConstant(v)) continue;
+            VarHandleTargetResolver.Target direct = handles.resolveHandleValue(v);
+            if (direct != null) {
+                out.put(direct.kind() + ":" + direct.owner() + "." + direct.fieldName() + ":" + direct.valueType(), direct);
+                continue;
+            }
+            int ordinal = -1;
+            if (v instanceof Parameter p) {
+                ordinal = p.getOrdinal();
+            } else if (v instanceof Temporary t && t.getDefiningInstruction() != null) {
+                Instruction def = t.getDefiningInstruction();
+                List<Value> o = def.getOperands();
+                switch (def.getOpcode()) {
+                    case CAST, CHECKCAST, STORE -> {
+                        work.push(o.getFirst());
+                        continue;
+                    }
+                    case PHI, SELECT -> {
+                        for (Value x : o) if (isReference(x)) work.push(x);
+                        continue;
+                    }
+                    case LOAD -> {
+                        int slot = def.getLocalIndex();
+                        for (Parameter p : f.getParameters()) {
+                            if (p.getIndex() == slot) work.push(p);
+                        }
+                        for (Instruction st : index(f).stores.getOrDefault(slot, List.of())) work.push(st.getOperands().getFirst());
+                        if (!isParamSlot(f, slot) && index(f).stores.getOrDefault(slot, List.of()).isEmpty()) return false;
+                        continue;
+                    }
+                    default -> {
+                        return false;
+                    }
+                }
+            } else {
+                return false;
+            }
+            if (ordinal < 0) return false;
+            String key = f.getName() + "#" + ordinal;
+            if (!visiting.add(key)) continue;
+            List<Instruction> sites = callSitesOf.getOrDefault(f, List.of());
+            if (sites.isEmpty()) return false;
+            for (Instruction call : sites) {
+                if (ordinal >= argCount(call)) return false;
+                if (!collectHandleTargets(arg(call, ordinal), call.getParent().getFunction(), out, visiting, depth + 1)) return false;
+            }
+        }
+        return true;
+    }
+
+    private static final String NEW_UPDATER = ARFU + ".newUpdater(Ljava/lang/Class;Ljava/lang/Class;Ljava/lang/String;)"
+        + "Ljava/util/concurrent/atomic/AtomicReferenceFieldUpdater;";
+    private final Set<Instruction> updaterWrites = Collections.newSetFromMap(new IdentityHashMap<>());
+    private final Set<String> updaterUniverse = new HashSet<>();
+    private boolean updaterUniverseUnknown;
+
+    private void noteUpdaterCreation(Instruction inst) {
+        if (!NEW_UPDATER.equals(extractCalleeName(inst))) return;
+        Object cls = constantOf(arg(inst, 0));
+        Object name = constantOf(arg(inst, 2));
+        if (!(cls instanceof String c) || !(name instanceof String n)) {
+            updaterUniverseUnknown = true;
             return;
         }
-        if ((owner.equals("jdk/internal/misc/Unsafe") || owner.equals("sun/misc/Unsafe")) && name.contains("Reference")
-            && argc > 1 && isReference(arg(inst, argc - 1))
-            && (name.startsWith("put") || name.startsWith("compareAndSet") || name.startsWith("compareAndExchange")
-                || name.startsWith("weakCompareAndSet") || name.startsWith("getAndSet"))) {
-            ops.add(new Op(inst, Kind.UNKNOWN_WRITE, null, argc > 1 ? arg(inst, 1) : null, null, arg(inst, argc - 1)));
+        io.github.kubyk01.domain.analyzer.dependencyresolver.FieldNode fn = resolver.getField(c, n);
+        if (fn == null || fn.getOwner() == null) {
+            updaterUniverseUnknown = true;
+            return;
         }
+        updaterUniverse.add(fn.getOwner() + "." + fn.getName());
+    }
+
+    private Object constantOf(Value v) {
+        Set<Value> seen = Collections.newSetFromMap(new IdentityHashMap<>());
+        while (v != null && seen.add(v)) {
+            if (v instanceof Constant c) return c.getValue();
+            if (!(v instanceof Temporary t) || t.getDefiningInstruction() == null) return null;
+            Instruction def = t.getDefiningInstruction();
+            switch (def.getOpcode()) {
+                case CAST, CHECKCAST, STORE -> v = def.getOperands().getFirst();
+                case LOAD -> {
+                    Function f = def.getParent().getFunction();
+                    if (isParamSlot(f, def.getLocalIndex())) return null;
+                    List<Instruction> st = index(f).stores.getOrDefault(def.getLocalIndex(), List.of());
+                    if (st.size() != 1) return null;
+                    v = st.getFirst().getOperands().getFirst();
+                }
+                default -> {
+                    return null;
+                }
+            }
+        }
+        return null;
+    }
+
+    private boolean updaterMayWrite(String fieldKey) {
+        return updaterUniverseUnknown || updaterUniverse.contains(fieldKey);
     }
 
     private void addValueOp(Instruction inst, Kind k, String field, Value recv, int firstValue, int argc) {
@@ -271,6 +448,38 @@ final class AtomicSlotArrays {
             }
             default -> { }
         }
+    }
+
+    private final Set<Instruction> staticWrites = Collections.newSetFromMap(new IdentityHashMap<>());
+    private final Set<String> staticFamilies = new HashSet<>();
+
+    private boolean staticOffset(Value offset) {
+        Set<Value> seen = Collections.newSetFromMap(new IdentityHashMap<>());
+        Value v = offset;
+        while (v instanceof Temporary t && t.getDefiningInstruction() != null && seen.add(v)) {
+            Instruction def = t.getDefiningInstruction();
+            switch (def.getOpcode()) {
+                case CAST, STORE -> v = def.getOperands().getFirst();
+                case CALL, VIRTUAL_CALL, INTERFACE_CALL, STATIC_CALL, SPECIAL_CALL -> {
+                    String callee = extractCalleeName(def);
+                    return callee != null && (callee.startsWith("jdk/internal/misc/Unsafe.staticFieldOffset(")
+                        || callee.startsWith("sun/misc/Unsafe.staticFieldOffset("));
+                }
+                default -> {
+                    return false;
+                }
+            }
+        }
+        return false;
+    }
+
+    private static Kind unsafeKind(String name) {
+        if (name.startsWith("getAndSet")) return Kind.GET_AND_SET;
+        if (name.startsWith("get")) return Kind.READ;
+        if (name.startsWith("put")) return Kind.SET;
+        if (name.startsWith("compareAndSet") || name.startsWith("weakCompareAndSet")) return Kind.CAS_BOOL;
+        if (name.startsWith("compareAndExchange")) return Kind.CAS_WITNESS;
+        return null;
     }
 
     private static Kind kindOf(String name) {
@@ -318,17 +527,25 @@ final class AtomicSlotArrays {
             Value v = op.newValue();
             if (isNullConstant(v)) return;
             boolean serialization = "java/io/ObjectStreamClass$FieldReflector".equals(op.inst().getParent().getFunction().getOwnerClass());
+            boolean staticOnly = staticAccessor(op);
+            if (updaterWrites.contains(op.inst())) {
+                String where = "unresolved field updater write " + extractCalleeName(op.inst()) + " in " + op.inst().getParent().getFunction().getName();
+                for (String fam : fieldFamilies) {
+                    if (updaterMayWrite(fam)) invalid.putIfAbsent("field " + fam, where);
+                }
+                return;
+            }
             String where = "unresolved atomic write " + extractCalleeName(op.inst()) + " in " + op.inst().getParent().getFunction().getName();
             for (String fam : fieldFamilies) {
                 String owner = fam.substring(0, fam.lastIndexOf('.'));
-                if (serialization && !serializableBelow(owner)) continue;
+                if ((serialization && !serializableBelow(owner)) || staticOnly) continue;
                 if (op.receiver() == null || mayBeInstanceOf(op.receiver(), owner)) {
                     invalid.putIfAbsent("field " + fam, where);
                 }
             }
-            if (!serialization && (v == null || valueMayBeArray(v))) {
+            if (!serialization && !staticOnly && (op.receiver() == null || valueMayBeArray(op.receiver())) && (v == null || valueMayBeArray(v))) {
                 invalid.putIfAbsent(UNKNOWN_FAMILY, where);
-                markAllSlotFamiliesUnsafe(v, where);
+                markAllSlotFamiliesUnsafe(op, where);
             }
             return;
         }
@@ -338,7 +555,7 @@ final class AtomicSlotArrays {
         if (v == null || isNullConstant(v)) return;
         Function f = op.inst().getParent().getFunction();
         if (fam.equals(UNKNOWN_FAMILY)) {
-            if (valueMayBeArray(v)) markAllSlotFamiliesUnsafe(v, "atomic write of an untyped value in " + f.getName());
+            if (valueMayBeArray(v)) markAllSlotFamiliesUnsafe(op, "atomic write of an untyped value in " + f.getName());
             return;
         }
         String why = freshExclusive(f, op, v);
@@ -347,16 +564,259 @@ final class AtomicSlotArrays {
         else allArrays.putIfAbsent(fam, true);
     }
 
-    private final List<String> untypedWrites = new ArrayList<>();
+    private final List<Op> untypedOps = new ArrayList<>();
+    private final List<String> untypedWhy = new ArrayList<>();
+    private final Map<String, Set<String>> familyContainerCache = new HashMap<>();
+    private final Map<String, Set<String>> fieldClassCache = new HashMap<>();
+    private final Set<String> fieldClassBusy = new HashSet<>();
+    private final Map<String, Set<String>> slotClassCache = new HashMap<>();
+    private final Set<String> slotClassBusy = new HashSet<>();
+    private Map<String, List<Instruction>> putsByField;
 
-    private void markAllSlotFamiliesUnsafe(Value v, String why) {
-        untypedWrites.add(why);
+    private void markAllSlotFamiliesUnsafe(Op op, String why) {
+        untypedOps.add(op);
+        untypedWhy.add(why);
+    }
+
+    private String untypedConflict(String fam) {
+        if (untypedOps.isEmpty()) return null;
+        Set<String> containers = familyContainers(fam);
+        for (int i = 0; i < untypedOps.size(); i++) {
+            Op op = untypedOps.get(i);
+            if (containers == null || op.receiver() == null || mayHoldContainer(op.receiver(), containers)) return untypedWhy.get(i);
+        }
+        return null;
+    }
+
+    private final Map<Instruction, String> siteIds = new IdentityHashMap<>();
+
+    private String siteId(Instruction def, String cls) {
+        return siteIds.computeIfAbsent(def, d -> cls + "#" + siteIds.size());
+    }
+
+    private static String siteClass(String site) {
+        return site.substring(0, site.lastIndexOf('#'));
+    }
+
+    private boolean mayHoldContainer(Value receiver, Set<String> containerSites) {
+        Set<String> own = containerClasses(receiver);
+        if (own != null) {
+            for (String c : own) if (containerSites.contains(c)) return true;
+            return false;
+        }
+        Set<String> containers = new HashSet<>();
+        for (String site : containerSites) containers.add(siteClass(site));
+        Type t = receiver.getType();
+        if (t == null || t.isUnknown() || !t.isReference() || t.isArray()) return t == null || t.isUnknown();
+        String r = t.getClassName();
+        if (r == null || r.equals("java/lang/Object")) return true;
+        for (String c : containers) {
+            if (isSubtype(c, r) || implementsInterface(c, r)) return true;
+        }
+        return false;
+    }
+
+    private Set<String> familyContainers(String fam) {
+        if (familyContainerCache.containsKey(fam)) return familyContainerCache.get(fam);
+        Set<String> out = new HashSet<>();
+        for (int i = 0; i < ops.size() && out != null; i++) {
+            Op op = ops.get(i);
+            boolean member = fam.equals(familyOfWrite(op))
+                || (op.kind() == Kind.READ && fam.equals(pendingBorrows.get(op.inst())));
+            if (!member) continue;
+            if (op.receiver() == null) {
+                out = null;
+                break;
+            }
+            Set<String> c = containerClasses(op.receiver());
+            if (c == null) out = null;
+            else out.addAll(c);
+        }
+        familyContainerCache.put(fam, out);
+        return out;
+    }
+
+    private Set<String> containerClasses(Value v) {
+        Set<String> out = new HashSet<>();
+        Set<Value> seen = Collections.newSetFromMap(new IdentityHashMap<>());
+        ArrayDeque<Value> work = new ArrayDeque<>();
+        work.push(v);
+        while (!work.isEmpty()) {
+            Value cur = work.pop();
+            if (cur == null || isNullConstant(cur) || !seen.add(cur)) continue;
+            if (!(cur instanceof Temporary t) || t.getDefiningInstruction() == null) return null;
+            Instruction def = t.getDefiningInstruction();
+            List<Value> o = def.getOperands();
+            switch (def.getOpcode()) {
+                case NEW -> {
+                    if (o.isEmpty() || !(o.getFirst() instanceof Constant c) || c.getValue() == null) return null;
+                    out.add(siteId(def, c.getValue().toString()));
+                }
+                case CAST, CHECKCAST, STORE -> work.push(o.getFirst());
+                case PHI, SELECT -> {
+                    for (int k = 0; k < o.size(); k++) if (isReference(o.get(k))) work.push(o.get(k));
+                }
+                case LOAD -> {
+                    Function f = def.getParent().getFunction();
+                    if (isParamSlot(f, def.getLocalIndex())) return null;
+                    List<Instruction> st = index(f).stores.getOrDefault(def.getLocalIndex(), List.of());
+                    if (st.isEmpty()) return null;
+                    for (int k = 0; k < st.size(); k++) work.push(st.get(k).getOperands().getFirst());
+                }
+                case GET_FIELD -> {
+                    Set<String> fc = finalFieldClasses(extractFieldName(def));
+                    if (fc == null) return null;
+                    out.addAll(fc);
+                }
+                case CALL, VIRTUAL_CALL, INTERFACE_CALL, STATIC_CALL, SPECIAL_CALL -> {
+                    Op read = opOf(def);
+                    if (read == null || read.field() != null || read.receiver() == null
+                        || !(read.kind() == Kind.READ || read.kind() == Kind.CAS_WITNESS || read.kind() == Kind.GET_AND_SET)) return null;
+                    String key = provenance(read.receiver());
+                    if (key == null) return null;
+                    Set<String> sc = slotClasses(key);
+                    if (sc == null) return null;
+                    out.addAll(sc);
+                }
+                default -> {
+                    return null;
+                }
+            }
+        }
+        return out;
+    }
+
+    private String provenance(Value v) {
+        String found = null;
+        Set<Value> seen = Collections.newSetFromMap(new IdentityHashMap<>());
+        ArrayDeque<Value> work = new ArrayDeque<>();
+        work.push(v);
+        while (!work.isEmpty()) {
+            Value cur = work.pop();
+            if (cur == null || isNullConstant(cur) || !seen.add(cur)) continue;
+            if (!(cur instanceof Temporary t) || t.getDefiningInstruction() == null) return null;
+            Instruction def = t.getDefiningInstruction();
+            List<Value> o = def.getOperands();
+            switch (def.getOpcode()) {
+                case CAST, CHECKCAST, STORE -> work.push(o.getFirst());
+                case PHI, SELECT -> {
+                    for (int k = 0; k < o.size(); k++) if (isReference(o.get(k))) work.push(o.get(k));
+                }
+                case LOAD -> {
+                    Function f = def.getParent().getFunction();
+                    if (isParamSlot(f, def.getLocalIndex())) return null;
+                    List<Instruction> st = index(f).stores.getOrDefault(def.getLocalIndex(), List.of());
+                    if (st.isEmpty()) return null;
+                    for (int k = 0; k < st.size(); k++) work.push(st.get(k).getOperands().getFirst());
+                }
+                case GET_FIELD -> {
+                    String key = finalFieldKey(extractFieldName(def));
+                    if (key == null || (found != null && !found.equals(key))) return null;
+                    found = key;
+                }
+                default -> {
+                    return null;
+                }
+            }
+        }
+        return found;
+    }
+
+    private Set<String> slotClasses(String key) {
+        if (slotClassCache.containsKey(key)) return slotClassCache.get(key);
+        if (!slotClassBusy.add(key)) return null;
+        Set<String> out = new HashSet<>();
+        for (int i = 0; i < ops.size() && out != null; i++) {
+            Op op = ops.get(i);
+            if (op.field() != null || op.kind() == Kind.READ) continue;
+            if (op.kind() == Kind.UNKNOWN_WRITE) {
+                if (op.receiver() == null || key.equals(provenance(op.receiver()))) out = null;
+                continue;
+            }
+            if (op.receiver() == null || !key.equals(provenance(op.receiver()))) continue;
+            Value nv = op.newValue();
+            if (nv == null || isNullConstant(nv)) continue;
+            Set<String> c = containerClasses(nv);
+            if (c == null) out = null;
+            else out.addAll(c);
+        }
+        slotClassBusy.remove(key);
+        slotClassCache.put(key, out);
+        return out;
+    }
+
+    private String finalFieldKey(String raw) {
+        if (raw == null) return null;
+        int dot = raw.lastIndexOf('.');
+        if (dot <= 0) return null;
+        io.github.kubyk01.domain.analyzer.dependencyresolver.FieldNode fn = resolver.getField(raw.substring(0, dot), raw.substring(dot + 1));
+        if (fn == null || fn.getOwner() == null) return null;
+        if ((fn.getAccess() & Opcodes.ACC_STATIC) != 0) return null;
+        if (serializableBelow(fn.getOwner())) return null;
+        String key = fn.getOwner() + "." + fn.getName();
+        if ((fn.getAccess() & Opcodes.ACC_FINAL) == 0 && !writesComplete(key, fn.getOwner())) return null;
+        return key;
+    }
+
+    private final Map<String, Boolean> completeCache = new HashMap<>();
+
+    private boolean writesComplete(String key, String owner) {
+        Boolean cached = completeCache.get(key);
+        if (cached != null) return cached;
+        boolean ok = !fieldFamilies.contains(key);
+        for (int i = 0; i < ops.size() && ok; i++) {
+            Op op = ops.get(i);
+            if (op.kind() != Kind.UNKNOWN_WRITE) continue;
+            boolean serialization = "java/io/ObjectStreamClass$FieldReflector".equals(op.inst().getParent().getFunction().getOwnerClass());
+            if (serialization || staticAccessor(op)) continue;
+            if (updaterWrites.contains(op.inst())) {
+                if (updaterMayWrite(key)) ok = false;
+                continue;
+            }
+            if (op.receiver() == null || mayBeInstanceOf(op.receiver(), owner)) ok = false;
+        }
+        completeCache.put(key, ok);
+        return ok;
+    }
+
+    private Set<String> finalFieldClasses(String raw) {
+        String key = finalFieldKey(raw);
+        if (key == null) return null;
+        if (fieldClassCache.containsKey(key)) return fieldClassCache.get(key);
+        if (!fieldClassBusy.add(key)) return null;
+        if (putsByField == null) {
+            putsByField = new HashMap<>();
+            for (Function f : module.getFunctions()) {
+                if (f.getEntryBlock() == null) continue;
+                for (BasicBlock b : f.getBlocks()) {
+                    for (Instruction inst : b.getInstructions()) {
+                        if (inst.getOpcode() != Opcode.PUT_FIELD || inst.getOperands().size() < 3) continue;
+                        String k = finalFieldKey(extractFieldName(inst));
+                        if (k != null) putsByField.computeIfAbsent(k, x -> new ArrayList<>()).add(inst);
+                    }
+                }
+            }
+        }
+        Set<String> out = new HashSet<>();
+        List<Instruction> stores = putsByField.getOrDefault(key, List.of());
+        for (int i = 0; i < stores.size() && out != null; i++) {
+            Set<String> c = containerClasses(stores.get(i).getOperands().get(2));
+            if (c == null) out = null;
+            else out.addAll(c);
+        }
+        if (out != null && out.isEmpty()) out = null;
+        fieldClassBusy.remove(key);
+        fieldClassCache.put(key, out);
+        return out;
     }
 
     private boolean retirable(Op op, String fam) {
-        if (fam.startsWith("slot ") && !untypedWrites.isEmpty()) {
-            invalid.putIfAbsent(fam, untypedWrites.getFirst());
-            return false;
+        if (fam.startsWith("slot ")) {
+            String conflict = untypedConflict(fam);
+            if (conflict != null) {
+                invalid.putIfAbsent(fam, conflict);
+                return false;
+            }
         }
         if (op.inst().getResult() == null) return false;
         return switch (op.kind()) {
@@ -404,8 +864,7 @@ final class AtomicSlotArrays {
         }
         for (Value a : aliases(f, v)) {
             List<Instruction> us = idx.users.getOrDefault(a, List.of());
-            for (int u = 0; u < us.size(); u++) {
-                Instruction inst = us.get(u);
+            for (Instruction inst : us) {
                 if (inst == op.inst()) continue;
                 String why = escapeUse(f, inst, a, true);
                 if (why != null) return "published value " + why + " in " + f.getName();
@@ -436,8 +895,7 @@ final class AtomicSlotArrays {
     private String propagateReturn(Function f, String fam) {
         if (!returnPropagated.add(fam + "|" + f.getName())) return null;
         List<Instruction> sites = callSitesOf.getOrDefault(f, List.of());
-        for (int i = 0; i < sites.size(); i++) {
-            Instruction call = sites.get(i);
+        for (Instruction call : sites) {
             if (call.getResult() == null) continue;
             pendingBorrows.putIfAbsent(call, fam);
             String why = checkBorrow(call.getParent().getFunction(), call.getResult(), fam);
@@ -499,7 +957,7 @@ final class AtomicSlotArrays {
     private boolean isAtomicOp(Instruction inst) {
         String callee = extractCalleeName(inst);
         if (callee == null) return false;
-        return callee.startsWith(ARA + ".") || callee.startsWith(AR + ".") || callee.startsWith(VH + ".")
+        return callee.startsWith(ARA + ".") || callee.startsWith(AR + ".") || callee.startsWith(VH + ".") || callee.startsWith(ARFU)
             || callee.startsWith("jdk/internal/misc/Unsafe.") || callee.startsWith("sun/misc/Unsafe.");
     }
 
@@ -509,8 +967,7 @@ final class AtomicSlotArrays {
         for (Value a : aliases(f, v)) {
             if (idx.returnedIn.containsKey(a) || idx.thrown.contains(a)) return false;
             List<Instruction> us = idx.users.getOrDefault(a, List.of());
-            for (int u = 0; u < us.size(); u++) {
-                Instruction inst = us.get(u);
+            for (Instruction inst : us) {
                 if (inst == op.inst()) continue;
                 Opcode o = inst.getOpcode();
                 if (o == Opcode.CAST || o == Opcode.CHECKCAST || o == Opcode.PHI || o == Opcode.SELECT
@@ -550,8 +1007,7 @@ final class AtomicSlotArrays {
         Type found = null;
         for (Value a : aliases(f, v)) {
             List<Instruction> us = idx.users.getOrDefault(a, List.of());
-            for (int u = 0; u < us.size(); u++) {
-                Instruction inst = us.get(u);
+            for (Instruction inst : us) {
                 if (inst.getOpcode() != Opcode.CHECKCAST || inst.getResult() == null) continue;
                 Type t = inst.getResult().getType();
                 if (t == null) return null;
@@ -671,6 +1127,12 @@ final class AtomicSlotArrays {
         return false;
     }
 
+    private static boolean staticAccessor(Op op) {
+        String owner = op.inst().getParent().getFunction().getOwnerClass();
+        return owner != null && owner.startsWith("jdk/internal/reflect/Unsafe") && owner.contains("Static")
+            && owner.endsWith("FieldAccessorImpl");
+    }
+
     private boolean anySubclassImplements(String owner, String iface) {
         for (String sub : resolver.getSubclasses(owner)) {
             if (implementsInterface(sub, iface)) return true;
@@ -721,11 +1183,9 @@ final class AtomicSlotArrays {
         Index idx = indexes.get(f);
         if (idx != null) return idx;
         idx = new Index();
-        for (int bi = 0; bi < f.getBlocks().size(); bi++) {
-            BasicBlock block = f.getBlocks().get(bi);
+        for (BasicBlock block : f.getBlocks()) {
             List<Instruction> insts = block.getInstructions();
-            for (int ii = 0; ii < insts.size(); ii++) {
-                Instruction inst = insts.get(ii);
+            for (Instruction inst : insts) {
                 int slot = inst.getLocalIndex();
                 if (inst.getOpcode() == Opcode.LOAD && slot >= 0 && inst.getResult() != null) {
                     idx.loads.computeIfAbsent(slot, k -> new ArrayList<>()).add(inst);
@@ -734,8 +1194,7 @@ final class AtomicSlotArrays {
                     idx.stores.computeIfAbsent(slot, k -> new ArrayList<>()).add(inst);
                 }
                 List<Value> o = inst.getOperands();
-                for (int k = 0; k < o.size(); k++) {
-                    Value v = o.get(k);
+                for (Value v : o) {
                     if (v != null && !(v instanceof Constant)) idx.users.computeIfAbsent(v, x -> new ArrayList<>()).add(inst);
                 }
             }
@@ -763,8 +1222,7 @@ final class AtomicSlotArrays {
                 for (int k = 0; k < ld.size(); k++) work.push(ld.get(k).getResult());
             }
             List<Instruction> us = idx.users.getOrDefault(v, List.of());
-            for (int u = 0; u < us.size(); u++) {
-                Instruction inst = us.get(u);
+            for (Instruction inst : us) {
                 Value res = inst.getResult();
                 switch (inst.getOpcode()) {
                     case CAST, CHECKCAST, PHI, SELECT -> {

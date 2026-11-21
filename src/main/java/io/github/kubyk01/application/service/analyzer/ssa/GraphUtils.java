@@ -50,7 +50,7 @@ public final class GraphUtils {
             if (b == excluded) continue;      // belt-and-braces
             result.add(b);
             if (b == end) break;
-            for (int succIdx1 = 0; succIdx1 < b.getSuccessors().size(); succIdx1++) { BasicBlock succ = b.getSuccessors().get(succIdx1);
+            for (BasicBlock succ : b.getSuccessors()) {
                 if (succ == excluded) continue;
                 if (!visited.contains(succ)) {
                     visited.add(succ);

@@ -197,8 +197,7 @@ public class LlvmGenerator implements LlvmGeneratorPort {
         Map<String, GlobalDecl> knownGlobals = new HashMap<>();
         List<Path> globalSpools = new ArrayList<>();
         List<? extends java.util.function.Supplier<String>> jnLoop1 = globalEmitter.globalDefinitionParts();
-        for (int jnIdx1 = 0; jnIdx1 < jnLoop1.size(); jnIdx1++) {
-            java.util.function.Supplier<String> part = jnLoop1.get(jnIdx1);
+        for (java.util.function.Supplier<String> part : jnLoop1) {
             String text = part.get();
             knownGlobals.putAll(parseGlobalDecls(text));
             Path spool = spoolDir.resolve(".globals" + globalSpools.size());
@@ -233,8 +232,7 @@ public class LlvmGenerator implements LlvmGeneratorPort {
         //         so the heap never holds the whole program's IR text. ----
         List<Function> toEmit = new ArrayList<>();
         List<? extends Function> jnLoop2 = module.getFunctions();
-        for (int jnIdx2 = 0; jnIdx2 < jnLoop2.size(); jnIdx2++) {
-            Function f = jnLoop2.get(jnIdx2);
+        for (Function f : jnLoop2) {
             if (f.getEntryBlock() != null) toEmit.add(f);
         }
         toEmit.sort(Comparator.comparing(f ->
@@ -327,8 +325,7 @@ public class LlvmGenerator implements LlvmGeneratorPort {
         } }
         boolean jniResolveDeclared = false;
         List<? extends Function> jnLoop4 = new ArrayList<>(module.getFunctions());
-        for (int jnIdx4 = 0; jnIdx4 < jnLoop4.size(); jnIdx4++) {
-            Function func = jnLoop4.get(jnIdx4);
+        for (Function func : jnLoop4) {
             if (func.getEntryBlock() == null
                 && func.isJniNative()
                 && func.getJniMethodName() != null
@@ -419,8 +416,7 @@ public class LlvmGenerator implements LlvmGeneratorPort {
                 if (out.getParent() != null) Files.createDirectories(out.getParent());
                 writeLl(out, prelude, externs, body);
                 List<? extends Path> jnLoop5 = unit.bodies();
-                for (int jnIdx5 = 0; jnIdx5 < jnLoop5.size(); jnIdx5++) {
-                    Path source = jnLoop5.get(jnIdx5);
+                for (Path source : jnLoop5) {
                     Files.deleteIfExists(source);
                 }
             } catch (IOException ex) {
@@ -982,7 +978,7 @@ public class LlvmGenerator implements LlvmGeneratorPort {
 
             String ret = LlvmTypeMapper.toLlvmType(func.getReturnType());
             List<String> types = new ArrayList<>();
-            for (int pIdx1 = 0; pIdx1 < func.getParameters().size(); pIdx1++) { Parameter p = func.getParameters().get(pIdx1);
+            for (Parameter p : func.getParameters()) {
                 types.add(LlvmTypeMapper.toLlvmType(LlvmTypeMapper.toCAbiType(p.getType())));
             }
             StringBuilder params = new StringBuilder();
@@ -1188,8 +1184,7 @@ public class LlvmGenerator implements LlvmGeneratorPort {
             "__jnative_override_Class_getResourceAsStream");
 
         List<? extends Map.Entry<String, byte[]>> jnLoop13 = embeddedResources;
-        for (int jnIdx13 = 0; jnIdx13 < jnLoop13.size(); jnIdx13++) {
-            Map.Entry<String, byte[]> e = jnLoop13.get(jnIdx13);
+        for (Map.Entry<String, byte[]> e : jnLoop13) {
             globalEmitter.addEmbeddedResource(e.getKey(), e.getValue());
         }
 
@@ -1233,8 +1228,7 @@ public class LlvmGenerator implements LlvmGeneratorPort {
         info.getInterfaces().addAll(cn.getInterfaces());
 
         List<? extends FieldNode> jnLoop14 = cn.getFields();
-        for (int jnIdx14 = 0; jnIdx14 < jnLoop14.size(); jnIdx14++) {
-            FieldNode field = jnLoop14.get(jnIdx14);
+        for (FieldNode field : jnLoop14) {
             if ((field.getAccess() & Opcodes.ACC_STATIC) == 0) {
                 FieldReference ref = new FieldReference(
                     className, field.getName(), field.getDescriptor());
@@ -1243,8 +1237,7 @@ public class LlvmGenerator implements LlvmGeneratorPort {
         }
 
         List<? extends MethodNode> jnLoop15 = cn.getMethods();
-        for (int jnIdx15 = 0; jnIdx15 < jnLoop15.size(); jnIdx15++) {
-            MethodNode mn = jnLoop15.get(jnIdx15);
+        for (MethodNode mn : jnLoop15) {
             if (mn.getName().equals("<init>")) {
                 MethodReference ref = new MethodReference(
                     className, mn.getName(), mn.getDescriptor());
@@ -1262,7 +1255,7 @@ public class LlvmGenerator implements LlvmGeneratorPort {
         List<String> types = new ArrayList<>();
         types.add("i8*");
         if (func.isStaticJniNative()) types.add("i8*");
-        for (int pIdx2 = 0; pIdx2 < func.getParameters().size(); pIdx2++) { Parameter p = func.getParameters().get(pIdx2);
+        for (Parameter p : func.getParameters()) {
             types.add(LlvmTypeMapper.toLlvmType(LlvmTypeMapper.toCAbiType(p.getType())));
         }
         return types;
@@ -1945,10 +1938,9 @@ public class LlvmGenerator implements LlvmGeneratorPort {
     private void generateLambdaAdaptors() {
         List<Instruction> lambdaInsts = new ArrayList<>();
         List<? extends Function> jnLoop19 = module.getFunctions();
-        for (int jnIdx19 = 0; jnIdx19 < jnLoop19.size(); jnIdx19++) {
-            Function func = jnLoop19.get(jnIdx19);
-            for (int blockIdx3 = 0; blockIdx3 < func.getBlocks().size(); blockIdx3++) { BasicBlock block = func.getBlocks().get(blockIdx3);
-                for (int instIdx4 = 0; instIdx4 < block.getInstructions().size(); instIdx4++) { Instruction inst = block.getInstructions().get(instIdx4);
+        for (Function func : jnLoop19) {
+            for (BasicBlock block : func.getBlocks()) {
+                for (Instruction inst : block.getInstructions()) {
                     if (inst.getOpcode() == Opcode.INVOKEDYNAMIC) {
                         InvokeDynamicInfo info = (InvokeDynamicInfo) inst.getInvokedynamicData();
                         ResolvedCall call = info.resolvedCall();

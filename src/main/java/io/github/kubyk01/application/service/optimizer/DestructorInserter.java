@@ -297,8 +297,7 @@ public class DestructorInserter {
 
         Deque<BasicBlock> pending = new ArrayDeque<>();
         List<? extends Function> jnLoop6 = new ArrayList<>(module.getFunctions());
-        for (int jnIdx6 = 0; jnIdx6 < jnLoop6.size(); jnIdx6++) {
-            Function func = jnLoop6.get(jnIdx6);
+        for (Function func : jnLoop6) {
             if (func.getEntryBlock() == null) continue;
             pending.addAll(new ArrayList<>(func.getBlocks()));
         }
@@ -385,12 +384,10 @@ public class DestructorInserter {
      */
     private void instrumentContainerArrays() {
         List<? extends Function> fns = module.getFunctions();
-        for (int fi = 0; fi < fns.size(); fi++) {
-            Function f = fns.get(fi);
+        for (Function f : fns) {
             if (f.getEntryBlock() == null || ContainerArrayBorrows.isDestructor(f)) continue;
             boolean exits = containerBorrows.needsExit(f);
-            for (int bi = 0; bi < f.getBlocks().size(); bi++) {
-                BasicBlock block = f.getBlocks().get(bi);
+            for (BasicBlock block : f.getBlocks()) {
                 List<Instruction> insts = block.getInstructions();
                 for (int i = 0; i < insts.size(); i++) {
                     Instruction inst = insts.get(i);
@@ -428,12 +425,10 @@ public class DestructorInserter {
 
     private void instrumentAtomicSlots() {
         List<? extends Function> fns = module.getFunctions();
-        for (int fi = 0; fi < fns.size(); fi++) {
-            Function f = fns.get(fi);
+        for (Function f : fns) {
             if (f.getEntryBlock() == null || ContainerArrayBorrows.isDestructor(f)) continue;
             boolean exits = atomicSlots.unpinsAtExit(f);
-            for (int bi = 0; bi < f.getBlocks().size(); bi++) {
-                BasicBlock block = f.getBlocks().get(bi);
+            for (BasicBlock block : f.getBlocks()) {
                 List<Instruction> insts = block.getInstructions();
                 for (int i = 0; i < insts.size(); i++) {
                     Instruction inst = insts.get(i);
@@ -804,7 +799,7 @@ public class DestructorInserter {
             // The successor's PHI operands are indexed by that position, so
             // `tail` has to take `block`'s place rather than being appended.
             Map<BasicBlock, Integer> predIndex = new LinkedHashMap<>();
-            for (int succIdx1 = 0; succIdx1 < oldTerm.getTargets().size(); succIdx1++) { BasicBlock succ = oldTerm.getTargets().get(succIdx1);
+            for (BasicBlock succ : oldTerm.getTargets()) {
                 if (succ == null) continue;
                 int idx = succ.getPredecessors().indexOf(block);
                 if (idx >= 0) predIndex.put(succ, idx);
@@ -822,8 +817,7 @@ public class DestructorInserter {
 
         // ---- 3. Copy exceptional successors and try-range membership ----
         List<? extends BasicBlock> jnLoop10 = new ArrayList<>(block.getExceptionalSuccessors());
-        for (int jnIdx10 = 0; jnIdx10 < jnLoop10.size(); jnIdx10++) {
-            BasicBlock exc = jnLoop10.get(jnIdx10);
+        for (BasicBlock exc : jnLoop10) {
             tail.addExceptionalSuccessor(exc);
 
             // ------------------------------------------------------------------
@@ -1174,7 +1168,7 @@ public class DestructorInserter {
         int idx = insts.indexOf(putField);
         if (idx >= 0) {
             for (int i = idx + 1; i < insts.size(); i++) {
-                for (int opIdx2 = 0; opIdx2 < insts.get(i).getOperands().size(); opIdx2++) { Value op = insts.get(i).getOperands().get(opIdx2);
+                for (Value op : insts.get(i).getOperands()) {
                     if (op == null) continue;
                     if (operandReachesAnySite(op, fieldSites)) {
                         return false;
@@ -1185,8 +1179,7 @@ public class DestructorInserter {
         Terminator term = block.getTerminator();
         if (term != null) {
             List<? extends Value> jnLoop15 = terminatorOperands(term);
-            for (int jnIdx15 = 0; jnIdx15 < jnLoop15.size(); jnIdx15++) {
-                Value op = jnLoop15.get(jnIdx15);
+            for (Value op : jnLoop15) {
                 if (op == null) continue;
                 if (operandReachesAnySite(op, fieldSites)) {
                     return false;
@@ -1366,11 +1359,10 @@ public class DestructorInserter {
     private Set<Type> collectAllocatedTypes() {
         Set<Type> types = new LinkedHashSet<>();
         List<? extends Function> jnLoop25 = module.getFunctions();
-        for (int jnIdx25 = 0; jnIdx25 < jnLoop25.size(); jnIdx25++) {
-            Function func = jnLoop25.get(jnIdx25);
+        for (Function func : jnLoop25) {
             if (func.getEntryBlock() == null) continue;
             for (int blockIdx3 = 0; blockIdx3 < func.getBlocks().size(); blockIdx3++) { BasicBlock block = func.getBlocks().get(blockIdx3);
-                for (int instIdx4 = 0; instIdx4 < block.getInstructions().size(); instIdx4++) { Instruction inst = block.getInstructions().get(instIdx4);
+                for (Instruction inst : block.getInstructions()) {
                     Opcode op = inst.getOpcode();
                     if (op != Opcode.NEW
                         && op != Opcode.NEW_ARRAY
@@ -1890,8 +1882,7 @@ private void emitDestructionGuard(BasicBlock entry,
             }
         }
         List<? extends FieldNode> jnLoop28 = classNode.getFields();
-        for (int jnIdx28 = 0; jnIdx28 < jnLoop28.size(); jnIdx28++) {
-            FieldNode field = jnLoop28.get(jnIdx28);
+        for (FieldNode field : jnLoop28) {
             if ((field.getAccess() & Opcodes.ACC_STATIC) != 0) continue;
             if (isOuterInstanceField(field.getName())) continue;
             Type ft = field.getType();
@@ -2487,7 +2478,7 @@ private void emitDestructionGuard(BasicBlock entry,
         if (objRef == null) return true;
         List<Instruction> insts = block.getInstructions();
         for (int i = fromIndex; i < insts.size(); i++) {
-            for (int opIdx5 = 0; opIdx5 < insts.get(i).getOperands().size(); opIdx5++) { Value op = insts.get(i).getOperands().get(opIdx5);
+            for (Value op : insts.get(i).getOperands()) {
                 if (op == objRef) return false;
             }
         }

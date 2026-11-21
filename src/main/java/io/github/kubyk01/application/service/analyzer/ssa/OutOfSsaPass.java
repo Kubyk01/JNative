@@ -137,8 +137,7 @@ public final class OutOfSsaPass {
     public static void transform(Module module, reactor.core.scheduler.Scheduler scheduler) {
         List<Function> live = new ArrayList<>();
         List<? extends Function> jnLoop1 = module.getFunctions();
-        for (int jnIdx1 = 0; jnIdx1 < jnLoop1.size(); jnIdx1++) {
-            Function func = jnLoop1.get(jnIdx1);
+        for (Function func : jnLoop1) {
             if (func.getEntryBlock() != null) live.add(func);
         }
         if (scheduler == null) {
@@ -190,11 +189,11 @@ public final class OutOfSsaPass {
                                                       BasicBlock target) {
         Terminator term = pred.getTerminator();
         if (term != null) {
-            for (int tIdx1 = 0; tIdx1 < term.getTargets().size(); tIdx1++) { BasicBlock t = term.getTargets().get(tIdx1);
+            for (BasicBlock t : term.getTargets()) {
                 if (t == target) return true;
             }
         }
-        for (int excIdx2 = 0; excIdx2 < pred.getExceptionalSuccessors().size(); excIdx2++) { BasicBlock exc = pred.getExceptionalSuccessors().get(excIdx2);
+        for (BasicBlock exc : pred.getExceptionalSuccessors()) {
             if (exc == target) return true;
         }
         return false;
@@ -220,7 +219,7 @@ public final class OutOfSsaPass {
         // ------------------------------------------------------------------
         Set<BasicBlock> reachable = computeReachable(func);
 
-        for (int blockIdx3 = 0; blockIdx3 < func.getBlocks().size(); blockIdx3++) { BasicBlock block = func.getBlocks().get(blockIdx3);
+        for (BasicBlock block : func.getBlocks()) {
             if (!reachable.contains(block)) continue;
 
             List<BasicBlock> preds = block.getPredecessors();
@@ -229,8 +228,7 @@ public final class OutOfSsaPass {
             // 1. Identify the stale predecessors.
             List<BasicBlock> stale = new ArrayList<>();
             List<? extends BasicBlock> jnLoop2 = preds;
-            for (int jnIdx2 = 0; jnIdx2 < jnLoop2.size(); jnIdx2++) {
-                BasicBlock pred = jnLoop2.get(jnIdx2);
+            for (BasicBlock pred : jnLoop2) {
                 if (!predecessorActuallyReaches(pred, block)) {
                     stale.add(pred);
                 }
@@ -240,7 +238,7 @@ public final class OutOfSsaPass {
             // 2. Capture the current binding (predecessor -> operand)
             //    before mutating the predecessor list.
             Map<Instruction, Map<BasicBlock, Value>> bindings = new HashMap<>();
-            for (int instIdx4 = 0; instIdx4 < block.getInstructions().size(); instIdx4++) { Instruction inst = block.getInstructions().get(instIdx4);
+            for (Instruction inst : block.getInstructions()) {
                 if (inst.getOpcode() != Opcode.PHI) continue;
                 Map<BasicBlock, Value> binding = new HashMap<>();
                 List<Value> ops = inst.getOperands();
@@ -261,8 +259,7 @@ public final class OutOfSsaPass {
                 List<Value> ops = phi.getOperands();
                 ops.clear();
                 List<? extends BasicBlock> jnLoop4 = preds;
-                for (int jnIdx4 = 0; jnIdx4 < jnLoop4.size(); jnIdx4++) {
-                    BasicBlock pred = jnLoop4.get(jnIdx4);
+                for (BasicBlock pred : jnLoop4) {
                     Value v = binding.get(pred);
                     if (v == null) {
                         throw new IllegalStateException(
@@ -302,10 +299,10 @@ public final class OutOfSsaPass {
         // missing version is left as UndefinedValue so the verification loop
         // below still fails on it as a genuine bug (the ProtectionDomain case).
         // ------------------------------------------------------------------
-        for (int blockIdx5 = 0; blockIdx5 < func.getBlocks().size(); blockIdx5++) { BasicBlock block = func.getBlocks().get(blockIdx5);
+        for (BasicBlock block : func.getBlocks()) {
             if (!reachable.contains(block)) continue;
             List<BasicBlock> preds = block.getPredecessors();
-            for (int instIdx6 = 0; instIdx6 < block.getInstructions().size(); instIdx6++) { Instruction inst = block.getInstructions().get(instIdx6);
+            for (Instruction inst : block.getInstructions()) {
                 if (inst.getOpcode() != Opcode.PHI) continue;
                 List<Value> ops = inst.getOperands();
                 for (int i = 0; i < ops.size() && i < preds.size(); i++) {
@@ -315,7 +312,7 @@ public final class OutOfSsaPass {
                     boolean isNormalTarget = false;
                     Terminator term = pred.getTerminator();
                     if (term != null) {
-                        for (int tIdx7 = 0; tIdx7 < term.getTargets().size(); tIdx7++) { BasicBlock t = term.getTargets().get(tIdx7);
+                        for (BasicBlock t : term.getTargets()) {
                             if (t == block) { isNormalTarget = true; break; }
                         }
                     }
@@ -336,9 +333,9 @@ public final class OutOfSsaPass {
         // operand becomes the literal `null` in the LLVM emitter and leaks
         // into the runtime as a null base of PUT_FIELD/GET_FIELD.
         // ------------------------------------------------------------------
-        for (int blockIdx8 = 0; blockIdx8 < func.getBlocks().size(); blockIdx8++) { BasicBlock block = func.getBlocks().get(blockIdx8);
+        for (BasicBlock block : func.getBlocks()) {
             if (!reachable.contains(block)) continue;
-            for (int instIdx9 = 0; instIdx9 < block.getInstructions().size(); instIdx9++) { Instruction inst = block.getInstructions().get(instIdx9);
+            for (Instruction inst : block.getInstructions()) {
                 if (inst.getOpcode() != Opcode.PHI) continue;
                 List<Value> ops = inst.getOperands();
                 for (int i = 0; i < ops.size(); i++) {
@@ -382,8 +379,8 @@ public final class OutOfSsaPass {
         // ---- Existing out-of-SSA lowering ----
 
         int maxLocal = -1;
-        for (int blockIdx10 = 0; blockIdx10 < func.getBlocks().size(); blockIdx10++) { BasicBlock block = func.getBlocks().get(blockIdx10);
-            for (int instIdx11 = 0; instIdx11 < block.getInstructions().size(); instIdx11++) { Instruction inst = block.getInstructions().get(instIdx11);
+        for (BasicBlock block : func.getBlocks()) {
+            for (Instruction inst : block.getInstructions()) {
                 Opcode op = inst.getOpcode();
                 if (op == Opcode.LOAD || op == Opcode.STORE) {
                     if (inst.getLocalIndex() > maxLocal) {
@@ -395,8 +392,8 @@ public final class OutOfSsaPass {
         int nextLocal = maxLocal + 1;
 
         Map<Instruction, Integer> phiSlot = new HashMap<>();
-        for (int blockIdx12 = 0; blockIdx12 < func.getBlocks().size(); blockIdx12++) { BasicBlock block = func.getBlocks().get(blockIdx12);
-            for (int instIdx13 = 0; instIdx13 < block.getInstructions().size(); instIdx13++) { Instruction inst = block.getInstructions().get(instIdx13);
+        for (BasicBlock block : func.getBlocks()) {
+            for (Instruction inst : block.getInstructions()) {
                 if (inst.getOpcode() == Opcode.PHI) {
                     phiSlot.put(inst, nextLocal++);
                 }
@@ -442,7 +439,7 @@ public final class OutOfSsaPass {
         }
 
         // ---- Replace every PHI with a LOAD from the same slot ----------
-        for (int blockIdx14 = 0; blockIdx14 < func.getBlocks().size(); blockIdx14++) { BasicBlock block = func.getBlocks().get(blockIdx14);
+        for (BasicBlock block : func.getBlocks()) {
             List<Instruction> instrs = block.getInstructions();
             for (int i = 0; i < instrs.size(); i++) {
                 Instruction phi = instrs.get(i);
@@ -488,7 +485,7 @@ public final class OutOfSsaPass {
         reachable.add(entry);
         while (!work.isEmpty()) {
             BasicBlock b = work.pop();
-            for (int sIdx15 = 0; sIdx15 < b.getSuccessors().size(); sIdx15++) { BasicBlock s = b.getSuccessors().get(sIdx15);
+            for (BasicBlock s : b.getSuccessors()) {
                 if (reachable.add(s)) work.push(s);
             }
         }
@@ -500,8 +497,8 @@ public final class OutOfSsaPass {
     // =====================================================================
 
     private static void replaceUses(Function func, Value oldVal, Value newVal) {
-        for (int blockIdx16 = 0; blockIdx16 < func.getBlocks().size(); blockIdx16++) { BasicBlock block = func.getBlocks().get(blockIdx16);
-            for (int instIdx17 = 0; instIdx17 < block.getInstructions().size(); instIdx17++) { Instruction inst = block.getInstructions().get(instIdx17);
+        for (BasicBlock block : func.getBlocks()) {
+            for (Instruction inst : block.getInstructions()) {
                 List<Value> ops = inst.getOperands();
                 for (int i = 0; i < ops.size(); i++) {
                     if (ops.get(i) == oldVal) {

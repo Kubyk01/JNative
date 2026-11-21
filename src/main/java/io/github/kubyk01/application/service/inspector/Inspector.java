@@ -64,14 +64,12 @@ public class Inspector implements InspectorPort {
                 System.out.println("  Super: " + info.getSuperName());
                 System.out.println("  Fields:");
                 List<? extends FieldInfo> jnLoop1 = info.getFields();
-                for (int jnIdx1 = 0; jnIdx1 < jnLoop1.size(); jnIdx1++) {
-                    FieldInfo f = jnLoop1.get(jnIdx1);
+                for (FieldInfo f : jnLoop1) {
                     System.out.println("    " + f.getDescriptor() + " " + f.getName());
                 }
                 System.out.println("  Methods:");
                 List<? extends MethodInfo> jnLoop2 = info.getMethods();
-                for (int jnIdx2 = 0; jnIdx2 < jnLoop2.size(); jnIdx2++) {
-                    MethodInfo m = jnLoop2.get(jnIdx2);
+                for (MethodInfo m : jnLoop2) {
                     System.out.println("    " + m.getDescriptor() + " " + m.getName());
                     if (showBytecode && m.getBytecode() != null && !m.getBytecode().isEmpty()) {
                         System.out.println("      Bytecode:");
@@ -125,8 +123,7 @@ public class Inspector implements InspectorPort {
                             StringWriter sw = new StringWriter();
                             PrintWriter pw = new PrintWriter(sw);
                             List<?> jnLoop3 = textifier.getText();
-                            for (int jnIdx3 = 0; jnIdx3 < jnLoop3.size(); jnIdx3++) {
-                                Object o = jnLoop3.get(jnIdx3);
+                            for (Object o : jnLoop3) {
                                 pw.print(o.toString());
                             }
                             pw.flush();

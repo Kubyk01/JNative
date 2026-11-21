@@ -498,8 +498,7 @@ public class LlvmGlobalEmitter {
             all.sort(Comparator.comparing(ClassNode::getName));
 
             List<? extends ClassNode> jnLoop2 = all;
-            for (int jnIdx2 = 0; jnIdx2 < jnLoop2.size(); jnIdx2++) {
-                ClassNode cn = jnLoop2.get(jnIdx2);
+            for (ClassNode cn : jnLoop2) {
                 if (cn.isExternal()) continue;
                 if (cn.isInterface()) continue;
                 getOrBuildClassLayout(cn.getName());
@@ -509,18 +508,16 @@ public class LlvmGlobalEmitter {
             Set<String> needed = new LinkedHashSet<>();
 
             List<? extends ClassNode> jnLoop3 = all;
-            for (int jnIdx3 = 0; jnIdx3 < jnLoop3.size(); jnIdx3++) {
-                ClassNode cn = jnLoop3.get(jnIdx3);
+            for (ClassNode cn : jnLoop3) {
                 if (cn.isExternal()) continue;
                 if (cn.isInterface()) continue;
                 collectAllInterfacesRec(cn, needed);
             }
 
             List<? extends Function> jnLoop4 = module.getFunctions();
-            for (int jnIdx4 = 0; jnIdx4 < jnLoop4.size(); jnIdx4++) {
-                Function func = jnLoop4.get(jnIdx4);
-                for (int blockIdx1 = 0; blockIdx1 < func.getBlocks().size(); blockIdx1++) { BasicBlock block = func.getBlocks().get(blockIdx1);
-                    for (int instIdx2 = 0; instIdx2 < block.getInstructions().size(); instIdx2++) { Instruction inst = block.getInstructions().get(instIdx2);
+            for (Function func : jnLoop4) {
+                for (BasicBlock block : func.getBlocks()) {
+                    for (Instruction inst : block.getInstructions()) {
                         if (inst.getOpcode() != Opcode.INTERFACE_CALL) continue;
                         if (inst.getOperands().size() < 2) continue;
                         Value callee = inst.getOperands().get(1);
@@ -545,8 +542,7 @@ public class LlvmGlobalEmitter {
             interfaceIds.clear();
             nextInterfaceId = 0;
             List<? extends String> jnLoop5 = ifaceNames;
-            for (int jnIdx5 = 0; jnIdx5 < jnLoop5.size(); jnIdx5++) {
-                String name = jnLoop5.get(jnIdx5);
+            for (String name : jnLoop5) {
                 ClassNode cn = resolver.getClassNode(name);
                 if (cn == null || !cn.isInterface()) continue;
                 interfaceIds.put(name, nextInterfaceId++);
@@ -598,8 +594,7 @@ public class LlvmGlobalEmitter {
 
             if (!cn.isExternal()) {
                 List<? extends MethodNode> jnLoop6 = cn.getMethods();
-                for (int jnIdx6 = 0; jnIdx6 < jnLoop6.size(); jnIdx6++) {
-                    MethodNode mn = jnLoop6.get(jnIdx6);
+                for (MethodNode mn : jnLoop6) {
                     if (!isVtableVirtual(mn)) continue;
 
                     int access = getAccess(className, mn, cn);
@@ -663,13 +658,11 @@ public class LlvmGlobalEmitter {
             interfaceLayouts.put(ifaceName, layout);
 
             List<? extends String> jnLoop7 = cn.getInterfaces();
-            for (int jnIdx7 = 0; jnIdx7 < jnLoop7.size(); jnIdx7++) {
-                String parent = jnLoop7.get(jnIdx7);
+            for (String parent : jnLoop7) {
                 if (parent.equals(ifaceName)) continue;
                 VtableLayout parentLayout = getOrBuildInterfaceLayout(parent);
                 List<? extends String> jnLoop8 = parentLayout.slots;
-                for (int jnIdx8 = 0; jnIdx8 < jnLoop8.size(); jnIdx8++) {
-                    String sig = jnLoop8.get(jnIdx8);
+                for (String sig : jnLoop8) {
                     if (!layout.slotBySignature.containsKey(sig)) {
                         layout.slotBySignature.put(sig, layout.slots.size());
                         layout.slots.add(sig);
@@ -679,8 +672,7 @@ public class LlvmGlobalEmitter {
 
             if (!cn.isExternal()) {
                 List<? extends MethodNode> jnLoop9 = cn.getMethods();
-                for (int jnIdx9 = 0; jnIdx9 < jnLoop9.size(); jnIdx9++) {
-                    MethodNode mn = jnLoop9.get(jnIdx9);
+                for (MethodNode mn : jnLoop9) {
                     if (!isVtableVirtual(mn)) continue;
                     String sig = mn.getName() + mn.getDescriptor();
                     if (!layout.slotBySignature.containsKey(sig)) {
@@ -1048,8 +1040,7 @@ public class LlvmGlobalEmitter {
         StringBuilder init = new StringBuilder();
         init.append("i8* bitcast (%JNativeVTable* ").append(vtableName).append(" to i8*)");
         List<? extends FieldNode> jnLoop10 = collectInstanceFields(moduleNode);
-        for (int jnIdx10 = 0; jnIdx10 < jnLoop10.size(); jnIdx10++) {
-            FieldNode f = jnLoop10.get(jnIdx10);
+        for (FieldNode f : jnLoop10) {
             Type ft = f.getType();
             init.append(", ").append(LlvmTypeMapper.toLlvmType(ft))
                 .append(" ").append(zeroLiteralFor(ft));
@@ -1233,8 +1224,7 @@ public class LlvmGlobalEmitter {
             params.append(LlvmTypeMapper.toLlvmType(Type.reference(overrideOwner[0])));
             boolean overrideCAbi = module.getFunction(overrideName).getEntryBlock() == null;
             List<? extends Type> jnLoop12 = mn.getParameterTypes();
-            for (int jnIdx12 = 0; jnIdx12 < jnLoop12.size(); jnIdx12++) {
-                Type pt = jnLoop12.get(jnIdx12);
+            for (Type pt : jnLoop12) {
                 params.append(", ").append(LlvmTypeMapper.toLlvmType(overrideCAbi ? LlvmTypeMapper.toCAbiType(pt) : pt));
             }
             String ret = LlvmTypeMapper.toLlvmType(mn.getReturnType());
@@ -1377,8 +1367,7 @@ public class LlvmGlobalEmitter {
         Function resolved = module.getFunction(funcName);
         boolean cAbi = resolved == null || resolved.getEntryBlock() == null;
         List<? extends Type> jnLoop13 = mn.getParameterTypes();
-        for (int jnIdx13 = 0; jnIdx13 < jnLoop13.size(); jnIdx13++) {
-            Type pt = jnLoop13.get(jnIdx13);
+        for (Type pt : jnLoop13) {
             params.append(", ").append(LlvmTypeMapper.toLlvmType(cAbi ? LlvmTypeMapper.toCAbiType(pt) : pt));
         }
         return new ResolvedFn(funcName, ret + " (" + params + ")*");
@@ -1444,8 +1433,7 @@ public class LlvmGlobalEmitter {
         }
 
         List<? extends ClassNode> jnLoop15 = allClasses;
-        for (int jnIdx15 = 0; jnIdx15 < jnLoop15.size(); jnIdx15++) {
-            ClassNode cls = jnLoop15.get(jnIdx15);
+        for (ClassNode cls : jnLoop15) {
             if (cls.isExternal()) continue;
             if (cls.isInterface()) continue;
 
@@ -1475,8 +1463,7 @@ public class LlvmGlobalEmitter {
         }
 
         List<? extends ClassNode> jnLoop16 = allClasses;
-        for (int jnIdx16 = 0; jnIdx16 < jnLoop16.size(); jnIdx16++) {
-            ClassNode cls = jnLoop16.get(jnIdx16);
+        for (ClassNode cls : jnLoop16) {
             if (cls.isExternal() || cls.isInterface()) continue;
             String className = cls.getName();
 
@@ -1572,8 +1559,7 @@ public class LlvmGlobalEmitter {
     private void collectAllInterfacesRec(ClassNode cls, Set<String> out) {
         if (cls == null) return;
         List<? extends String> jnLoop18 = cls.getInterfaces();
-        for (int jnIdx18 = 0; jnIdx18 < jnLoop18.size(); jnIdx18++) {
-            String i = jnLoop18.get(jnIdx18);
+        for (String i : jnLoop18) {
             if (out.add(i)) {
                 ClassNode in = resolver.getClassNode(i);
                 if (in != null) collectAllInterfacesRec(in, out);
@@ -1596,8 +1582,7 @@ public class LlvmGlobalEmitter {
 
         StringBuilder fields = new StringBuilder("{ i8*");
         List<? extends Type> jnLoop19 = capturedTypes;
-        for (int jnIdx19 = 0; jnIdx19 < jnLoop19.size(); jnIdx19++) {
-            Type t = jnLoop19.get(jnIdx19);
+        for (Type t : jnLoop19) {
             fields.append(", ").append(LlvmTypeMapper.toLlvmType(t));
         }
         fields.append(" }");
@@ -1692,8 +1677,7 @@ public class LlvmGlobalEmitter {
             collectLambdaSuperInterfaces(samInterface, superIfaces);
             if (markerInterfaces != null) {
                 List<? extends String> jnLoop20 = markerInterfaces;
-                for (int jnIdx20 = 0; jnIdx20 < jnLoop20.size(); jnIdx20++) {
-                    String marker = jnLoop20.get(jnIdx20);
+                for (String marker : jnLoop20) {
                     ClassNode markerNode = resolver.getClassNode(marker);
                     if (markerNode == null || !markerNode.isInterface()) continue;
                     collectLambdaSuperInterfaces(marker, superIfaces);
@@ -1710,8 +1694,7 @@ public class LlvmGlobalEmitter {
              * references its ancestors.
              */
             List<? extends String> jnLoop21 = superIfacesList;
-            for (int jnIdx21 = 0; jnIdx21 < jnLoop21.size(); jnIdx21++) {
-                String iface = jnLoop21.get(jnIdx21);
+            for (String iface : jnLoop21) {
                 if (!interfaceIds.containsKey(iface)) {
                     interfaceIds.put(iface, nextInterfaceId++);
                 }
@@ -1759,8 +1742,7 @@ public class LlvmGlobalEmitter {
         ClassNode cn = resolver.getClassNode(ifaceName);
         if (cn == null) return;
         List<? extends String> jnLoop22 = cn.getInterfaces();
-        for (int jnIdx22 = 0; jnIdx22 < jnLoop22.size(); jnIdx22++) {
-            String parent = jnLoop22.get(jnIdx22);
+        for (String parent : jnLoop22) {
             collectLambdaSuperInterfaces(parent, out);
         }
     }
@@ -1849,8 +1831,7 @@ public class LlvmGlobalEmitter {
             List<Integer> itableLens  = new ArrayList<>(ifaceNames.size());
 
             List<? extends String> jnLoop24 = ifaceNames;
-            for (int jnIdx24 = 0; jnIdx24 < jnLoop24.size(); jnIdx24++) {
-                String iface = jnLoop24.get(jnIdx24);
+            for (String iface : jnLoop24) {
                 Integer ifaceId = interfaceIds.get(iface);
                 if (ifaceId == null) {
                     throw new IllegalStateException(
@@ -1984,10 +1965,9 @@ public class LlvmGlobalEmitter {
     private String generateStructs() {
         Set<String> newClassNames = new HashSet<>();
         List<? extends Function> jnLoop25 = module.getFunctions();
-        for (int jnIdx25 = 0; jnIdx25 < jnLoop25.size(); jnIdx25++) {
-            Function func = jnLoop25.get(jnIdx25);
-            for (int blockIdx3 = 0; blockIdx3 < func.getBlocks().size(); blockIdx3++) { BasicBlock block = func.getBlocks().get(blockIdx3);
-                for (int instIdx4 = 0; instIdx4 < block.getInstructions().size(); instIdx4++) { Instruction inst = block.getInstructions().get(instIdx4);
+        for (Function func : jnLoop25) {
+            for (BasicBlock block : func.getBlocks()) {
+                for (Instruction inst : block.getInstructions()) {
                     if (inst.getOpcode() == Opcode.NEW && !inst.getOperands().isEmpty()) {
                         Value v = inst.getOperands().getFirst();
                         if (v instanceof Constant c && c.getType().isReference()) {
@@ -2009,8 +1989,7 @@ public class LlvmGlobalEmitter {
         List<ClassNode> allClasses = new ArrayList<>(resolver.getClassMap().values());
         allClasses.sort(Comparator.comparing(ClassNode::getName));
         List<? extends ClassNode> jnLoop26 = allClasses;
-        for (int jnIdx26 = 0; jnIdx26 < jnLoop26.size(); jnIdx26++) {
-            ClassNode cls = jnLoop26.get(jnIdx26);
+        for (ClassNode cls : jnLoop26) {
             if (cls.isExternal()) continue;
             if (structNames.containsKey(cls.getName())) continue;
 
@@ -2019,8 +1998,7 @@ public class LlvmGlobalEmitter {
 
             List<FieldNode> allFields = collectInstanceFields(cls);
             List<? extends FieldNode> jnLoop27 = allFields;
-            for (int jnIdx27 = 0; jnIdx27 < jnLoop27.size(); jnIdx27++) {
-                FieldNode field = jnLoop27.get(jnIdx27);
+            for (FieldNode field : jnLoop27) {
                 sb.append(", ").append(LlvmTypeMapper.toLlvmType(field.getType()));
             }
             sb.append(" }\n");
@@ -2050,8 +2028,7 @@ public class LlvmGlobalEmitter {
             }
         }
         List<? extends FieldNode> jnLoop29 = cls.getFields();
-        for (int jnIdx29 = 0; jnIdx29 < jnLoop29.size(); jnIdx29++) {
-            FieldNode f = jnLoop29.get(jnIdx29);
+        for (FieldNode f : jnLoop29) {
             if ((f.getAccess() & Opcodes.ACC_STATIC) == 0) {
                 result.add(f);
             }
@@ -2074,10 +2051,9 @@ public class LlvmGlobalEmitter {
     private Map<String, List<FieldNode>> collectPhantomFields() {
         Map<String, Set<String>> names = new TreeMap<>();
         List<? extends Function> jnLoop30 = module.getFunctions();
-        for (int jnIdx30 = 0; jnIdx30 < jnLoop30.size(); jnIdx30++) {
-            Function function = jnLoop30.get(jnIdx30);
-            for (int blockIdx5 = 0; blockIdx5 < function.getBlocks().size(); blockIdx5++) { BasicBlock block = function.getBlocks().get(blockIdx5);
-                for (int instIdx6 = 0; instIdx6 < block.getInstructions().size(); instIdx6++) { Instruction inst = block.getInstructions().get(instIdx6);
+        for (Function function : jnLoop30) {
+            for (BasicBlock block : function.getBlocks()) {
+                for (Instruction inst : block.getInstructions()) {
                     Opcode op = inst.getOpcode();
                     String owner;
                     String field;
@@ -2139,8 +2115,7 @@ public class LlvmGlobalEmitter {
         Set<String> seen = new HashSet<>();
         while (seen.add(cn.getName())) {
             List<? extends FieldNode> jnLoop33 = cn.getFields();
-            for (int jnIdx33 = 0; jnIdx33 < jnLoop33.size(); jnIdx33++) {
-                FieldNode f = jnLoop33.get(jnIdx33);
+            for (FieldNode f : jnLoop33) {
                 if ((f.getAccess() & Opcodes.ACC_STATIC) == 0 && f.getName().equals(field)) return null;
             }
             String sup = cn.getSuperName();
@@ -2157,8 +2132,7 @@ public class LlvmGlobalEmitter {
         if (fields == null) return -1;
         int offset = OBJECT_HEADER_SIZE;
         List<? extends FieldNode> jnLoop34 = fields;
-        for (int jnIdx34 = 0; jnIdx34 < jnLoop34.size(); jnIdx34++) {
-            FieldNode f = jnLoop34.get(jnIdx34);
+        for (FieldNode f : jnLoop34) {
             int align = fieldAlignment(f.getType());
             offset = (offset + align - 1) & -align;
             if (f.getName().equals(fieldName)) return offset;
@@ -2181,10 +2155,9 @@ public class LlvmGlobalEmitter {
         }
 
         List<? extends Function> jnLoop35 = module.getFunctions();
-        for (int jnIdx35 = 0; jnIdx35 < jnLoop35.size(); jnIdx35++) {
-            Function function = jnLoop35.get(jnIdx35);
-            for (int blockIdx7 = 0; blockIdx7 < function.getBlocks().size(); blockIdx7++) { BasicBlock block = function.getBlocks().get(blockIdx7);
-                for (int instIdx8 = 0; instIdx8 < block.getInstructions().size(); instIdx8++) { Instruction inst = block.getInstructions().get(instIdx8);
+        for (Function function : jnLoop35) {
+            for (BasicBlock block : function.getBlocks()) {
+                for (Instruction inst : block.getInstructions()) {
                     Opcode op = inst.getOpcode();
                     if (op == Opcode.VIRTUAL_CALL) {
                         VarHandleTargetResolver.Target vh = getVarHandleTargets().resolveCallSite(inst);
@@ -2324,17 +2297,15 @@ public class LlvmGlobalEmitter {
         }
 
         List<? extends Function> jnLoop38 = module.getFunctions();
-        for (int jnIdx38 = 0; jnIdx38 < jnLoop38.size(); jnIdx38++) {
-            Function func = jnLoop38.get(jnIdx38);
+        for (Function func : jnLoop38) {
             String fn = func.getName();
             if (fn != null && !fn.isEmpty()) names.add(fn);
         }
 
         List<? extends Function> jnLoop39 = module.getFunctions();
-        for (int jnIdx39 = 0; jnIdx39 < jnLoop39.size(); jnIdx39++) {
-            Function func = jnLoop39.get(jnIdx39);
-            for (int blockIdx9 = 0; blockIdx9 < func.getBlocks().size(); blockIdx9++) { BasicBlock block = func.getBlocks().get(blockIdx9);
-                for (int instIdx10 = 0; instIdx10 < block.getInstructions().size(); instIdx10++) { Instruction inst = block.getInstructions().get(instIdx10);
+        for (Function func : jnLoop39) {
+            for (BasicBlock block : func.getBlocks()) {
+                for (Instruction inst : block.getInstructions()) {
                     collectStringConstantsFromInstruction(inst, names);
                 }
                 Terminator term = block.getTerminator();
@@ -2346,8 +2317,7 @@ public class LlvmGlobalEmitter {
         List<String> sorted = new ArrayList<>(names);
         Collections.sort(sorted);
         List<? extends String> jnLoop40 = sorted;
-        for (int jnIdx40 = 0; jnIdx40 < jnLoop40.size(); jnIdx40++) {
-            String name = jnLoop40.get(jnIdx40);
+        for (String name : jnLoop40) {
             if (emittedStringConstants.add(name)) {
                 sb.append(LlvmRuntime.typeStringConstant(name));
             }
@@ -2378,8 +2348,7 @@ public class LlvmGlobalEmitter {
         StringBuilder body = new StringBuilder();
         boolean any = false;
         List<? extends String> jnLoop41 = snapshot;
-        for (int jnIdx41 = 0; jnIdx41 < jnLoop41.size(); jnIdx41++) {
-            String s = jnLoop41.get(jnIdx41);
+        for (String s : jnLoop41) {
             if (emittedStringConstants.add(s)) {
                 body.append(LlvmRuntime.typeStringConstant(s));
                 any = true;
@@ -2396,7 +2365,7 @@ public class LlvmGlobalEmitter {
 
     private void collectStringConstantsFromInstruction(Instruction inst, Set<String> names) {
         Opcode op = inst.getOpcode();
-        for (int vIdx11 = 0; vIdx11 < inst.getOperands().size(); vIdx11++) { Value v = inst.getOperands().get(vIdx11);
+        for (Value v : inst.getOperands()) {
             if (v instanceof Constant c
                 && c.getType().isReference()
                 && c.getValue() instanceof String s) {
@@ -2449,11 +2418,10 @@ public class LlvmGlobalEmitter {
     private Set<String> collectJavaStringLiterals() {
         Set<String> result = new LinkedHashSet<>(staticFieldStringConstants);
         List<? extends Function> jnLoop42 = module.getFunctions();
-        for (int jnIdx42 = 0; jnIdx42 < jnLoop42.size(); jnIdx42++) {
-            Function func = jnLoop42.get(jnIdx42);
-            for (int blockIdx12 = 0; blockIdx12 < func.getBlocks().size(); blockIdx12++) { BasicBlock block = func.getBlocks().get(blockIdx12);
-                for (int instIdx13 = 0; instIdx13 < block.getInstructions().size(); instIdx13++) { Instruction inst = block.getInstructions().get(instIdx13);
-                    for (int vIdx14 = 0; vIdx14 < inst.getOperands().size(); vIdx14++) { Value v = inst.getOperands().get(vIdx14);
+        for (Function func : jnLoop42) {
+            for (BasicBlock block : func.getBlocks()) {
+                for (Instruction inst : block.getInstructions()) {
+                    for (Value v : inst.getOperands()) {
                         if (v instanceof Constant c
                             && c.getType().isReference()
                             && "java/lang/String".equals(c.getType().getClassName())
@@ -2489,8 +2457,7 @@ public class LlvmGlobalEmitter {
                 Terminator term = block.getTerminator();
                 if (term != null) {
                     List<? extends Value> jnLoop43 = terminatorOperands(term);
-                    for (int jnIdx43 = 0; jnIdx43 < jnLoop43.size(); jnIdx43++) {
-                        Value v = jnLoop43.get(jnIdx43);
+                    for (Value v : jnLoop43) {
                         if (v instanceof Constant c
                             && c.getType().isReference()
                             && "java/lang/String".equals(c.getType().getClassName())
@@ -2569,8 +2536,7 @@ public class LlvmGlobalEmitter {
         Collections.sort(literals);
 
         List<? extends String> jnLoop44 = literals;
-        for (int jnIdx44 = 0; jnIdx44 < jnLoop44.size(); jnIdx44++) {
-            String s = jnLoop44.get(jnIdx44);
+        for (String s : jnLoop44) {
             /*
              * Decide which of the two compact-string encodings the literal
              * must use.
@@ -2781,8 +2747,7 @@ public class LlvmGlobalEmitter {
         // includes C itself — see collectSuperclasses(), which always adds cls.getName()
         // to the accumulator.
         List<? extends ClassNode> jnLoop46 = allClasses;
-        for (int jnIdx46 = 0; jnIdx46 < jnLoop46.size(); jnIdx46++) {
-            ClassNode cls = jnLoop46.get(jnIdx46);
+        for (ClassNode cls : jnLoop46) {
             if (cls.isExternal()) continue;
 
             String className = cls.getName();
@@ -2825,8 +2790,7 @@ public class LlvmGlobalEmitter {
             if (lambdaVtable == null) continue;
 
             List<? extends String> jnLoop49 = linfo.superInterfaces;
-            for (int jnIdx49 = 0; jnIdx49 < jnLoop49.size(); jnIdx49++) {
-                String iface = jnLoop49.get(jnIdx49);
+            for (String iface : jnLoop49) {
                 instancesOf
                     .computeIfAbsent(iface, k -> new LinkedHashSet<>())
                     .add(lambdaVtable);
@@ -2845,8 +2809,7 @@ public class LlvmGlobalEmitter {
         // there, which caused find_class_by_vtable() to mis-identify an object
         // of class MemberName as an instance of the interface java.lang.reflect.Member.
         List<? extends ClassNode> jnLoop50 = allClasses;
-        for (int jnIdx50 = 0; jnIdx50 < jnLoop50.size(); jnIdx50++) {
-            ClassNode cls = jnLoop50.get(jnIdx50);
+        for (ClassNode cls : jnLoop50) {
             if (cls.isExternal()) continue;
             if (cls.getName().startsWith("[")) continue;
 
@@ -2886,8 +2849,7 @@ public class LlvmGlobalEmitter {
         }
         Collections.sort(lambdaNames);
         List<? extends String> jnLoop52 = lambdaNames;
-        for (int jnIdx52 = 0; jnIdx52 < jnLoop52.size(); jnIdx52++) {
-            String lambdaClassName = jnLoop52.get(jnIdx52);
+        for (String lambdaClassName : jnLoop52) {
             String typeInfoName = "@__type_info_" + LlvmTypeMapper.sanitizeIdentifier(lambdaClassName);
             if (typeInfoNames.putIfAbsent(lambdaClassName, typeInfoName) != null) continue;
             sb.append(typeInfoName).append(" = constant [2 x i8*] [i8* bitcast (%JNativeVTable* ")
@@ -2915,8 +2877,7 @@ public class LlvmGlobalEmitter {
         if (cls == null) return;
 
         List<? extends String> jnLoop53 = cls.getInterfaces();
-        for (int jnIdx53 = 0; jnIdx53 < jnLoop53.size(); jnIdx53++) {
-            String iface = jnLoop53.get(jnIdx53);
+        for (String iface : jnLoop53) {
             if (accumulator.add(iface)) {
                 ClassNode ifaceNode = resolver.getClassNode(iface);
                 if (ifaceNode != null && !ifaceNode.isExternal()) {
@@ -3020,8 +2981,7 @@ public class LlvmGlobalEmitter {
         int offset = OBJECT_HEADER_SIZE;
         int foundOffset = -1;
         List<? extends FieldNode> jnLoop54 = allFields;
-        for (int jnIdx54 = 0; jnIdx54 < jnLoop54.size(); jnIdx54++) {
-            FieldNode f = jnLoop54.get(jnIdx54);
+        for (FieldNode f : jnLoop54) {
             Type ft = f.getType();
             int align = fieldAlignment(ft);
             offset = (offset + align - 1) & -align;
@@ -3128,8 +3088,7 @@ public class LlvmGlobalEmitter {
         }
         int offset = OBJECT_HEADER_SIZE;
         List<? extends FieldNode> jnLoop55 = collectInstanceFields(cls);
-        for (int jnIdx55 = 0; jnIdx55 < jnLoop55.size(); jnIdx55++) {
-            FieldNode f = jnLoop55.get(jnIdx55);
+        for (FieldNode f : jnLoop55) {
             int align = fieldAlignment(f.getType());
             int size  = fieldSize(f.getType());
             offset = (offset + align - 1) & -align;
@@ -3159,8 +3118,7 @@ public class LlvmGlobalEmitter {
         }
         int offset = OBJECT_HEADER_SIZE;
         List<? extends Type> jnLoop57 = linfo.capturedTypes;
-        for (int jnIdx57 = 0; jnIdx57 < jnLoop57.size(); jnIdx57++) {
-            Type capType = jnLoop57.get(jnIdx57);
+        for (Type capType : jnLoop57) {
             int align = fieldAlignment(capType);
             int size  = fieldSize(capType);
             offset = (offset + align - 1) & -align;
@@ -3179,8 +3137,7 @@ public class LlvmGlobalEmitter {
         Set<String> present = new HashSet<>();
         for (MethodReference m : info.getMethods()) present.add(m.getName() + m.getDescriptor());
         List<? extends MethodNode> jnLoop58 = cn.getMethods();
-        for (int jnIdx58 = 0; jnIdx58 < jnLoop58.size(); jnIdx58++) {
-            MethodNode mn = jnLoop58.get(jnIdx58);
+        for (MethodNode mn : jnLoop58) {
             if (mn.getName().equals("<init>") || mn.getName().equals("<clinit>")) continue;
             if (mn.getDescriptor() == null || mn.getDescriptor().isEmpty()) continue;
             if (present.add(mn.getName() + mn.getDescriptor())) {
@@ -3307,10 +3264,9 @@ public class LlvmGlobalEmitter {
         // the module's own instructions rather than guessed.
         // ------------------------------------------------------------------
         List<? extends Function> jnLoop66 = module.getFunctions();
-        for (int jnIdx66 = 0; jnIdx66 < jnLoop66.size(); jnIdx66++) {
-            Function func = jnLoop66.get(jnIdx66);
-            for (int blockIdx15 = 0; blockIdx15 < func.getBlocks().size(); blockIdx15++) { BasicBlock block = func.getBlocks().get(blockIdx15);
-                for (int instIdx16 = 0; instIdx16 < block.getInstructions().size(); instIdx16++) { Instruction inst = block.getInstructions().get(instIdx16);
+        for (Function func : jnLoop66) {
+            for (BasicBlock block : func.getBlocks()) {
+                for (Instruction inst : block.getInstructions()) {
                     if (inst.getOpcode() == Opcode.NEW_ARRAY
                         && inst.getOperands().size() >= 2
                         && inst.getOperands().get(1) instanceof Constant c) {
@@ -3408,16 +3364,14 @@ public class LlvmGlobalEmitter {
 
         Map<String, String> classVarNames = new HashMap<>();
         List<? extends String> jnLoop68 = classNames;
-        for (int jnIdx68 = 0; jnIdx68 < jnLoop68.size(); jnIdx68++) {
-            String className = jnLoop68.get(jnIdx68);
+        for (String className : jnLoop68) {
             classVarNames.put(className, getRefClassGlobalName(className));
         }
 
         List<String> classPtrs = new ArrayList<>();
 
         List<? extends String> jnLoop69 = classNames;
-        for (int jnIdx69 = 0; jnIdx69 < jnLoop69.size(); jnIdx69++) {
-            String className = jnLoop69.get(jnIdx69);
+        for (String className : jnLoop69) {
             boolean isPrimitive = PRIMITIVE_TYPE_NAMES.contains(className);
             boolean isArrayPseudoClass = className.charAt(0) == '[';
             boolean isLambdaPseudoClass = isLambdaPseudoClassName(className);
@@ -3438,8 +3392,7 @@ public class LlvmGlobalEmitter {
                 if (classNode != null && !classNode.isExternal() && !isArrayPseudoClass) {
                     Map<String, FieldNode> mostDerivedByName = new LinkedHashMap<>();
                     List<? extends FieldNode> jnLoop70 = collectInstanceFields(classNode);
-                    for (int jnIdx70 = 0; jnIdx70 < jnLoop70.size(); jnIdx70++) {
-                        FieldNode f = jnLoop70.get(jnIdx70);
+                    for (FieldNode f : jnLoop70) {
                         if ((f.getAccess() & Opcodes.ACC_STATIC) != 0) continue;
                         if (phantomNodes.contains(f)) continue;
                         mostDerivedByName.put(f.getName(), f);
@@ -3589,8 +3542,7 @@ public class LlvmGlobalEmitter {
                      */
                     objectSize = OBJECT_HEADER_SIZE;
                     List<? extends FieldNode> jnLoop72 = collectInstanceFields(classNode);
-                    for (int jnIdx72 = 0; jnIdx72 < jnLoop72.size(); jnIdx72++) {
-                        FieldNode f = jnLoop72.get(jnIdx72);
+                    for (FieldNode f : jnLoop72) {
                         Type ft = f.getType();
                         int align = fieldAlignment(ft);
                         int size  = fieldSize(ft);
@@ -3607,8 +3559,7 @@ public class LlvmGlobalEmitter {
             List<String> methodPtrs = new ArrayList<>();
             int methodSlot = 0;
             List<? extends MethodReference> jnLoop73 = sortedMethods;
-            for (int jnIdx73 = 0; jnIdx73 < jnLoop73.size(); jnIdx73++) {
-                MethodReference method = jnLoop73.get(jnIdx73);
+            for (MethodReference method : jnLoop73) {
                 int currentMethodSlot = methodSlot++;
                 String methodName = method.getName();
                 String desc = method.getDescriptor();
@@ -3721,8 +3672,7 @@ public class LlvmGlobalEmitter {
             {
                 Map<String, FieldReference> byName = new LinkedHashMap<>();
                 List<? extends FieldReference> jnLoop74 = sortedFields;
-                for (int jnIdx74 = 0; jnIdx74 < jnLoop74.size(); jnIdx74++) {
-                    FieldReference fr = jnLoop74.get(jnIdx74);
+                for (FieldReference fr : jnLoop74) {
                     FieldReference existing = byName.get(fr.getName());
                     if (existing == null) {
                         byName.put(fr.getName(), fr);
@@ -3800,8 +3750,7 @@ public class LlvmGlobalEmitter {
                 }
                 List<MethodReference> moduleCtorAdditions = new ArrayList<>();
                 List<? extends MethodNode> jnLoop77 = classNode.getMethods();
-                for (int jnIdx77 = 0; jnIdx77 < jnLoop77.size(); jnIdx77++) {
-                    MethodNode mn = jnLoop77.get(jnIdx77);
+                for (MethodNode mn : jnLoop77) {
                     if (!mn.getName().equals("<init>")) continue;
                     String desc = mn.getDescriptor();
                     if (desc == null || desc.isEmpty()) continue;
@@ -3814,8 +3763,7 @@ public class LlvmGlobalEmitter {
                     }
                 }
                 List<? extends MethodReference> jnLoop78 = moduleCtorAdditions;
-                for (int jnIdx78 = 0; jnIdx78 < jnLoop78.size(); jnIdx78++) {
-                    MethodReference ctor = jnLoop78.get(jnIdx78);
+                for (MethodReference ctor : jnLoop78) {
                     info.addConstructor(ctor);
                 }
             }
@@ -3826,8 +3774,7 @@ public class LlvmGlobalEmitter {
             List<String> ctorPtrs = new ArrayList<>();
             int constructorSlot = 0;
             List<? extends MethodReference> jnLoop79 = sortedCtors;
-            for (int jnIdx79 = 0; jnIdx79 < jnLoop79.size(); jnIdx79++) {
-                MethodReference ctor = jnLoop79.get(jnIdx79);
+            for (MethodReference ctor : jnLoop79) {
                 int currentConstructorSlot = constructorSlot++;
                 String desc = ctor.getDescriptor();
                 // Same null-descriptor guard as for methods above. A null
@@ -3899,8 +3846,7 @@ public class LlvmGlobalEmitter {
             List<String> sortedIfaces = new ArrayList<>(info.getInterfaces());
             Collections.sort(sortedIfaces);
             List<? extends String> jnLoop80 = sortedIfaces;
-            for (int jnIdx80 = 0; jnIdx80 < jnLoop80.size(); jnIdx80++) {
-                String iface = jnLoop80.get(jnIdx80);
+            for (String iface : jnLoop80) {
                 String ifaceVar = classVarNames.get(iface);
                 if (ifaceVar != null) ifacePtrs.add(ifaceVar);
             }
@@ -4080,8 +4026,7 @@ public class LlvmGlobalEmitter {
 
         List<Function> allFuncs = new ArrayList<>();
         List<? extends Function> jnLoop81 = module.getFunctions();
-        for (int jnIdx81 = 0; jnIdx81 < jnLoop81.size(); jnIdx81++) {
-            Function f = jnLoop81.get(jnIdx81);
+        for (Function f : jnLoop81) {
             if (f.getEntryBlock() != null && hasFunctionIndexSignature(f)) {
                 allFuncs.add(f);
             }
@@ -4102,8 +4047,7 @@ public class LlvmGlobalEmitter {
         List<String> infoLines = new ArrayList<>(allFuncs.size());
         Map<String, Map<String, MethodNode>> methodsByMangled = new HashMap<>();
         List<? extends Function> jnLoop82 = allFuncs;
-        for (int jnIdx82 = 0; jnIdx82 < jnLoop82.size(); jnIdx82++) {
-            Function f = jnLoop82.get(jnIdx82);
+        for (Function f : jnLoop82) {
             MethodNode mn = methodForFunction(f, methodsByMangled);
             if (mn != null) {
                 infoLines.add("  { i8*, i8*, i32 } { i8* " + ensureStringConstantPtr(strConsts, mn.getName())
@@ -4154,8 +4098,7 @@ public class LlvmGlobalEmitter {
             ClassNode cn = resolver.getClassNode(k);
             if (cn != null && cn.getMethods() != null) {
                 List<? extends MethodNode> jnLoop83 = cn.getMethods();
-                for (int jnIdx83 = 0; jnIdx83 < jnLoop83.size(); jnIdx83++) {
-                    MethodNode mn = jnLoop83.get(jnIdx83);
+                for (MethodNode mn : jnLoop83) {
                     m.putIfAbsent(LlvmRuntime.mangleMethod(k, mn.getName(), mn.getDescriptor()), mn);
                 }
             }
@@ -4269,8 +4212,7 @@ public class LlvmGlobalEmitter {
 
         Set<String> classes = new TreeSet<>();
         List<? extends Function> jnLoop85 = module.getFunctions();
-        for (int jnIdx85 = 0; jnIdx85 < jnLoop85.size(); jnIdx85++) {
-            Function fn = jnLoop85.get(jnIdx85);
+        for (Function fn : jnLoop85) {
             if (!LlvmUtil.isLazyClinitWrapper(fn.getName())) continue;
             String owner = fn.getOwnerClass();
             if (owner == null || owner.isEmpty()) continue;
@@ -4341,8 +4283,7 @@ public class LlvmGlobalEmitter {
             if (!classVarNames.containsKey(className)) continue;
 
             List<? extends MethodNode> jnLoop88 = cn.getMethods();
-            for (int jnIdx88 = 0; jnIdx88 < jnLoop88.size(); jnIdx88++) {
-                MethodNode mn = jnLoop88.get(jnIdx88);
+            for (MethodNode mn : jnLoop88) {
                 String base = LlvmRuntime.mangleMethod(
                     className, mn.getName(), mn.getDescriptor());
 
@@ -4454,8 +4395,7 @@ public class LlvmGlobalEmitter {
             String classAnns = annotationBlob(data, "@__jnative_annot_c_" + id, annotations.getClassAnnotations());
             List<String> memberRows = new ArrayList<>();
             List<? extends ClassFileAnnotations.Member> jnLoop95 = annotations.getMembers();
-            for (int jnIdx95 = 0; jnIdx95 < jnLoop95.size(); jnIdx95++) {
-                ClassFileAnnotations.Member m = jnLoop95.get(jnIdx95);
+            for (ClassFileAnnotations.Member m : jnLoop95) {
                 String anns = annotationBlob(data, "@__jnative_annot_b_" + blob++, m.annotations());
                 String params = annotationBlob(data, "@__jnative_annot_b_" + blob++, m.parameterAnnotations());
                 String dflt = annotationBlob(data, "@__jnative_annot_b_" + blob++, m.annotationDefault());
@@ -4549,8 +4489,7 @@ public class LlvmGlobalEmitter {
         ClassNode cn = resolver.getClassNode(className);
         if (cn != null && cn.getFields() != null) {
             List<? extends FieldNode> jnLoop98 = cn.getFields();
-            for (int jnIdx98 = 0; jnIdx98 < jnLoop98.size(); jnIdx98++) {
-                FieldNode f = jnLoop98.get(jnIdx98);
+            for (FieldNode f : jnLoop98) {
                 int required = Opcodes.ACC_STATIC | Opcodes.ACC_FINAL;
                 if ((f.getAccess() & required) != required) continue;
                 if (!(f.getConstantValue() instanceof Integer value)) continue;
@@ -4666,8 +4605,7 @@ public class LlvmGlobalEmitter {
             if (className.charAt(0) == '[') continue;
 
             List<? extends MethodNode> jnLoop105 = cn.getMethods();
-            for (int jnIdx105 = 0; jnIdx105 < jnLoop105.size(); jnIdx105++) {
-                MethodNode mn = jnLoop105.get(jnIdx105);
+            for (MethodNode mn : jnLoop105) {
                 if (!mn.isCallerSensitive()) continue;
 
                 String base = LlvmRuntime.mangleMethod(
@@ -4991,8 +4929,7 @@ public class LlvmGlobalEmitter {
     private MethodNode findMethod(ClassNode classNode, String name, String descriptor) {
         if (classNode == null || classNode.isExternal()) return null;
         List<? extends MethodNode> jnLoop107 = classNode.getMethods();
-        for (int jnIdx107 = 0; jnIdx107 < jnLoop107.size(); jnIdx107++) {
-            MethodNode m = jnLoop107.get(jnIdx107);
+        for (MethodNode m : jnLoop107) {
             if (m.getName().equals(name) && m.getDescriptor().equals(descriptor)) return m;
         }
         if (classNode.getSuperName() != null && !classNode.getSuperName().equals("java/lang/Object")) {

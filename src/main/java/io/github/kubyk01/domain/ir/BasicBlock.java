@@ -29,7 +29,7 @@ public class BasicBlock {
 
     public void setTerminator(Terminator terminator) {
         if (this.terminator != null) {
-            for (int oldTargetIdx1 = 0; oldTargetIdx1 < this.terminator.getTargets().size(); oldTargetIdx1++) { BasicBlock oldTarget = this.terminator.getTargets().get(oldTargetIdx1);
+            for (BasicBlock oldTarget : this.terminator.getTargets()) {
                 if (oldTarget != null) {
                     removeSuccessor(oldTarget);
                 }
@@ -38,7 +38,7 @@ public class BasicBlock {
         this.terminator = terminator;
         if (terminator == null) return;
         terminator.setBlock(this);
-        for (int targetIdx2 = 0; targetIdx2 < terminator.getTargets().size(); targetIdx2++) { BasicBlock target = terminator.getTargets().get(targetIdx2);
+        for (BasicBlock target : terminator.getTargets()) {
             if (target != null) {
                 addSuccessor(target);
             }
@@ -88,8 +88,7 @@ public class BasicBlock {
         List<BasicBlock> all = new ArrayList<>(successors.size() + exceptionalSuccessors.size());
         all.addAll(successors);
         List<? extends BasicBlock> jnLoop1 = exceptionalSuccessors;
-        for (int jnIdx1 = 0; jnIdx1 < jnLoop1.size(); jnIdx1++) {
-            BasicBlock ex = jnLoop1.get(jnIdx1);
+        for (BasicBlock ex : jnLoop1) {
             if (!all.contains(ex)) all.add(ex);
         }
         merged = Collections.unmodifiableList(all);
@@ -103,8 +102,7 @@ public class BasicBlock {
         sb.append(label).append(":\n");
         int idx = 0;
         List<? extends Instruction> jnLoop2 = instructions;
-        for (int jnIdx2 = 0; jnIdx2 < jnLoop2.size(); jnIdx2++) {
-            Instruction inst = jnLoop2.get(jnIdx2);
+        for (Instruction inst : jnLoop2) {
             sb.append("  ").append(idx++).append(": ").append(inst).append("\n");
         }
         if (terminator != null) {

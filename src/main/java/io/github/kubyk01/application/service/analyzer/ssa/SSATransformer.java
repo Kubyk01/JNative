@@ -147,12 +147,10 @@ public class SSATransformer {
         List<Instruction> phis = new ArrayList<>();
         List<BasicBlock> blockList1 = function.getBlocks();
         List<? extends BasicBlock> jnLoop1 = blockList1;
-        for (int jnIdx1 = 0; jnIdx1 < jnLoop1.size(); jnIdx1++) {
-            BasicBlock block = jnLoop1.get(jnIdx1);
+        for (BasicBlock block : jnLoop1) {
             List<Instruction> instList2 = block.getInstructions();
             List<? extends Instruction> jnLoop2 = instList2;
-            for (int jnIdx2 = 0; jnIdx2 < jnLoop2.size(); jnIdx2++) {
-                Instruction inst = jnLoop2.get(jnIdx2);
+            for (Instruction inst : jnLoop2) {
                 if (inst.getOpcode() == Opcode.PHI
                     && inst.getResult() != null
                     && typeBucket(inst.getResult().getType()) == BUCKET_REF) {
@@ -165,13 +163,11 @@ public class SSATransformer {
         for (int round = 0; changed && round < 64; round++) {
             changed = false;
             List<? extends Instruction> jnLoop3 = phis;
-            for (int jnIdx3 = 0; jnIdx3 < jnLoop3.size(); jnIdx3++) {
-                Instruction phi = jnLoop3.get(jnIdx3);
+            for (Instruction phi : jnLoop3) {
                 Type joined = null;
                 List<Value> incomingList4 = phi.getOperands();
                 List<? extends Value> jnLoop4 = incomingList4;
-                for (int jnIdx4 = 0; jnIdx4 < jnLoop4.size(); jnIdx4++) {
-                    Value incoming = jnLoop4.get(jnIdx4);
+                for (Value incoming : jnLoop4) {
                     if (incoming == null || incoming == phi.getResult()) continue;
                     Type t = incoming.getType();
                     if (t == null || t.isNull() || t.isUnknown()) continue;
@@ -192,14 +188,12 @@ public class SSATransformer {
     private void markUnsafeLocals(Function function) {
         List<BasicBlock> blocks = function.getBlocks();
         List<? extends BasicBlock> jnLoop5 = blocks;
-        for (int jnIdx5 = 0; jnIdx5 < jnLoop5.size(); jnIdx5++) {
-            BasicBlock block = jnLoop5.get(jnIdx5);
+        for (BasicBlock block : jnLoop5) {
             if (block.getExceptionalSuccessors().isEmpty()) continue;
             boolean seenThrowing = false;
             List<Instruction> insts = block.getInstructions();
             List<? extends Instruction> jnLoop6 = insts;
-            for (int jnIdx6 = 0; jnIdx6 < jnLoop6.size(); jnIdx6++) {
-                Instruction inst = jnLoop6.get(jnIdx6);
+            for (Instruction inst : jnLoop6) {
                 if (seenThrowing
                     && inst.getOpcode() == Opcode.STORE
                     && inst.getLocalIndex() >= 0) {
@@ -240,8 +234,7 @@ public class SSATransformer {
         BasicBlock entry = function.getEntryBlock();
         List<Parameter> paramList5 = function.getParameters();
         List<? extends Parameter> jnLoop7 = paramList5;
-        for (int jnIdx7 = 0; jnIdx7 < jnLoop7.size(); jnIdx7++) {
-            Parameter param = jnLoop7.get(jnIdx7);
+        for (Parameter param : jnLoop7) {
             int idx = param.getIndex();
             int bucket = typeBucket(param.getType());
             Value version = param;
@@ -341,8 +334,7 @@ public class SSATransformer {
         int maxSlot = 0;
         for (int i = 0; i < n; i++) {
             List<Instruction> insts = domTree.blockAt(i).getInstructions();
-            for (int k = 0; k < insts.size(); k++) {
-                Instruction inst = insts.get(k);
+            for (Instruction inst : insts) {
                 Opcode op = inst.getOpcode();
                 if ((op == Opcode.LOAD || op == Opcode.STORE) && inst.getLocalIndex() > maxSlot) {
                     maxSlot = inst.getLocalIndex();
@@ -351,8 +343,7 @@ public class SSATransformer {
         }
         List<Parameter> params = function.getParameters();
         List<? extends Parameter> jnLoop8 = params;
-        for (int jnIdx8 = 0; jnIdx8 < jnLoop8.size(); jnIdx8++) {
-            Parameter param = jnLoop8.get(jnIdx8);
+        for (Parameter param : jnLoop8) {
             if (param.getIndex() > maxSlot) maxSlot = param.getIndex();
         }
         int words = (((maxSlot + 1) << 3) + 63) >>> 6;
@@ -369,8 +360,7 @@ public class SSATransformer {
             int base = i * words;
             List<Instruction> insts = domTree.blockAt(i).getInstructions();
             List<? extends Instruction> jnLoop9 = insts;
-            for (int jnIdx9 = 0; jnIdx9 < jnLoop9.size(); jnIdx9++) {
-                Instruction inst = jnLoop9.get(jnIdx9);
+            for (Instruction inst : jnLoop9) {
                 Opcode op = inst.getOpcode();
                 if (op != Opcode.LOAD && op != Opcode.STORE) continue;
                 int idx = inst.getLocalIndex();
@@ -388,8 +378,7 @@ public class SSATransformer {
             }
         }
         List<? extends Parameter> jnLoop10 = params;
-        for (int jnIdx10 = 0; jnIdx10 < jnLoop10.size(); jnIdx10++) {
-            Parameter p = jnLoop10.get(jnIdx10);
+        for (Parameter p : jnLoop10) {
             if (p.getIndex() < 0 || isUnsafe(p.getIndex())) continue;
             int bit = (p.getIndex() << 3) | typeBucket(p.getType());
             defRows[bit >>> 6] |= 1L << (bit & 63);
@@ -404,8 +393,7 @@ public class SSATransformer {
                 succList = Arrays.copyOf(succList, Math.max(edges + ss.size(), succList.length << 1));
             }
             List<? extends BasicBlock> jnLoop11 = ss;
-            for (int jnIdx11 = 0; jnIdx11 < jnLoop11.size(); jnIdx11++) {
-                BasicBlock s = jnLoop11.get(jnIdx11);
+            for (BasicBlock s : jnLoop11) {
                 int j = domTree.indexOf(s);
                 if (j >= 0) succList[edges++] = j;
             }
@@ -495,8 +483,7 @@ public class SSATransformer {
             case BUCKET_REF: {
                 List<Parameter> pList6 = func.getParameters();
                 List<? extends Parameter> jnLoop12 = pList6;
-                for (int jnIdx12 = 0; jnIdx12 < jnLoop12.size(); jnIdx12++) {
-                    Parameter p = jnLoop12.get(jnIdx12);
+                for (Parameter p : jnLoop12) {
                     if (p.getIndex() == localIndex
                         && typeBucket(p.getType()) == BUCKET_REF) {
                         return p.getType();
@@ -504,12 +491,10 @@ public class SSATransformer {
                 }
                 List<BasicBlock> blockList7 = func.getBlocks();
                 List<? extends BasicBlock> jnLoop13 = blockList7;
-                for (int jnIdx13 = 0; jnIdx13 < jnLoop13.size(); jnIdx13++) {
-                    BasicBlock block = jnLoop13.get(jnIdx13);
+                for (BasicBlock block : jnLoop13) {
                     List<Instruction> instList8 = block.getInstructions();
                     List<? extends Instruction> jnLoop14 = instList8;
-                    for (int jnIdx14 = 0; jnIdx14 < jnLoop14.size(); jnIdx14++) {
-                        Instruction inst = jnLoop14.get(jnIdx14);
+                    for (Instruction inst : jnLoop14) {
                         Opcode op = inst.getOpcode();
                         if ((op != Opcode.STORE && op != Opcode.LOAD)
                             || inst.getLocalIndex() != localIndex
@@ -563,8 +548,7 @@ public class SSATransformer {
         // --- PHI ---
         List<Instruction> instList9 = block.getInstructions();
         List<? extends Instruction> jnLoop15 = instList9;
-        for (int jnIdx15 = 0; jnIdx15 < jnLoop15.size(); jnIdx15++) {
-            Instruction inst = jnLoop15.get(jnIdx15);
+        for (Instruction inst : jnLoop15) {
             if (inst.getOpcode() != Opcode.PHI) continue;
             int idx = inst.getLocalIndex();
             if (idx < 0) continue;
@@ -585,8 +569,7 @@ public class SSATransformer {
         // --- remaining instructions ---
         List<Instruction> instList10 = block.getInstructions();
         List<? extends Instruction> jnLoop16 = instList10;
-        for (int jnIdx16 = 0; jnIdx16 < jnLoop16.size(); jnIdx16++) {
-            Instruction inst = jnLoop16.get(jnIdx16);
+        for (Instruction inst : jnLoop16) {
             Opcode op = inst.getOpcode();
             if (op == Opcode.PHI) continue;
 
@@ -700,16 +683,14 @@ public class SSATransformer {
         // --- incoming PHI values of the successors ---
         List<BasicBlock> succList11 = block.getSuccessors();
         List<? extends BasicBlock> jnLoop17 = succList11;
-        for (int jnIdx17 = 0; jnIdx17 < jnLoop17.size(); jnIdx17++) {
-            BasicBlock succ = jnLoop17.get(jnIdx17);
+        for (BasicBlock succ : jnLoop17) {
             int predIdx = succ.getPredecessors().indexOf(block);
             if (predIdx < 0) continue;
 
             List<Instruction> instList = succ.getInstructions();
 
             List<? extends Instruction> jnLoop18 = instList;
-            for (int jnIdx18 = 0; jnIdx18 < jnLoop18.size(); jnIdx18++) {
-                Instruction inst = jnLoop18.get(jnIdx18);
+            for (Instruction inst : jnLoop18) {
 
                 if (inst.getOpcode() != Opcode.PHI) continue;
                 int idx = inst.getLocalIndex();
@@ -783,8 +764,7 @@ public class SSATransformer {
                     if (predTerm != null) {
                         List<BasicBlock> tList12 = predTerm.getTargets();
                         List<? extends BasicBlock> jnLoop19 = tList12;
-                        for (int jnIdx19 = 0; jnIdx19 < jnLoop19.size(); jnIdx19++) {
-                            BasicBlock t = jnLoop19.get(jnIdx19);
+                        for (BasicBlock t : jnLoop19) {
                             if (t == succ) {
                                 predIsNormalTarget = true;
                                 break;
@@ -962,13 +942,11 @@ public class SSATransformer {
     private void padPhiOperands(Function function) {
         List<BasicBlock> blockList13 = function.getBlocks();
         List<? extends BasicBlock> jnLoop20 = blockList13;
-        for (int jnIdx20 = 0; jnIdx20 < jnLoop20.size(); jnIdx20++) {
-            BasicBlock block = jnLoop20.get(jnIdx20);
+        for (BasicBlock block : jnLoop20) {
             int preds = block.getPredecessors().size();
             List<Instruction> instList14 = block.getInstructions();
             List<? extends Instruction> jnLoop21 = instList14;
-            for (int jnIdx21 = 0; jnIdx21 < jnLoop21.size(); jnIdx21++) {
-                Instruction inst = jnLoop21.get(jnIdx21);
+            for (Instruction inst : jnLoop21) {
                 if (inst.getOpcode() == Opcode.PHI) ensurePhiOperandCount(inst, preds);
             }
         }
@@ -991,13 +969,11 @@ public class SSATransformer {
         List<BasicBlock> blockList = function.getBlocks();
 
         List<? extends BasicBlock> jnLoop22 = blockList;
-        for (int jnIdx22 = 0; jnIdx22 < jnLoop22.size(); jnIdx22++) {
-            BasicBlock block = jnLoop22.get(jnIdx22);
+        for (BasicBlock block : jnLoop22) {
 
             List<Instruction> instList15 = block.getInstructions();
             List<? extends Instruction> jnLoop23 = instList15;
-            for (int jnIdx23 = 0; jnIdx23 < jnLoop23.size(); jnIdx23++) {
-                Instruction inst = jnLoop23.get(jnIdx23);
+            for (Instruction inst : jnLoop23) {
                 if (inst.getOpcode() != Opcode.PHI) continue;
                 if (inst.getOperands().isEmpty()) {
                     continue;
@@ -1021,12 +997,10 @@ public class SSATransformer {
             Value replacement = replacementMap.valueAt(r);
             List<BasicBlock> blockList16 = function.getBlocks();
             List<? extends BasicBlock> jnLoop24 = blockList16;
-            for (int jnIdx24 = 0; jnIdx24 < jnLoop24.size(); jnIdx24++) {
-                BasicBlock block = jnLoop24.get(jnIdx24);
+            for (BasicBlock block : jnLoop24) {
                 List<Instruction> instList17 = block.getInstructions();
                 List<? extends Instruction> jnLoop25 = instList17;
-                for (int jnIdx25 = 0; jnIdx25 < jnLoop25.size(); jnIdx25++) {
-                    Instruction inst = jnLoop25.get(jnIdx25);
+                for (Instruction inst : jnLoop25) {
                     for (int i = 0; i < inst.getOperands().size(); i++) {
                         if (inst.getOperands().get(i) == phi.getResult()) {
                             inst.getOperands().set(i, replacement);
@@ -1066,17 +1040,14 @@ public class SSATransformer {
         used.clear();
         List<BasicBlock> blocks = function.getBlocks();
         List<? extends BasicBlock> jnLoop26 = blocks;
-        for (int jnIdx26 = 0; jnIdx26 < jnLoop26.size(); jnIdx26++) {
-            BasicBlock block = jnLoop26.get(jnIdx26);
+        for (BasicBlock block : jnLoop26) {
             List<Instruction> insts = block.getInstructions();
             List<? extends Instruction> jnLoop27 = insts;
-            for (int jnIdx27 = 0; jnIdx27 < jnLoop27.size(); jnIdx27++) {
-                Instruction inst = jnLoop27.get(jnIdx27);
+            for (Instruction inst : jnLoop27) {
                 if (inst.getOpcode() == Opcode.PHI) continue;
                 List<Value> ops = inst.getOperands();
                 List<? extends Value> jnLoop28 = ops;
-                for (int jnIdx28 = 0; jnIdx28 < jnLoop28.size(); jnIdx28++) {
-                    Value op = jnLoop28.get(jnIdx28);
+                for (Value op : jnLoop28) {
                     if (op != null) used.put(op, Boolean.TRUE);
                 }
             }
@@ -1098,19 +1069,16 @@ public class SSATransformer {
         while (changed) {
             changed = false;
             List<? extends BasicBlock> jnLoop29 = blocks;
-            for (int jnIdx29 = 0; jnIdx29 < jnLoop29.size(); jnIdx29++) {
-                BasicBlock block = jnLoop29.get(jnIdx29);
+            for (BasicBlock block : jnLoop29) {
                 List<Instruction> insts = block.getInstructions();
                 List<? extends Instruction> jnLoop30 = insts;
-                for (int jnIdx30 = 0; jnIdx30 < jnLoop30.size(); jnIdx30++) {
-                    Instruction inst = jnLoop30.get(jnIdx30);
+                for (Instruction inst : jnLoop30) {
                     if (inst.getOpcode() != Opcode.PHI) continue;
                     if (inst.getResult() == null) continue;
                     if (!used.containsKey(inst.getResult())) continue;
                     List<Value> ops = inst.getOperands();
                     List<? extends Value> jnLoop31 = ops;
-                    for (int jnIdx31 = 0; jnIdx31 < jnLoop31.size(); jnIdx31++) {
-                        Value op = jnLoop31.get(jnIdx31);
+                    for (Value op : jnLoop31) {
                         if (op != null && used.put(op, Boolean.TRUE)) changed = true;
                     }
                 }
@@ -1118,8 +1086,7 @@ public class SSATransformer {
         }
 
         List<? extends BasicBlock> jnLoop32 = blocks;
-        for (int jnIdx32 = 0; jnIdx32 < jnLoop32.size(); jnIdx32++) {
-            BasicBlock block = jnLoop32.get(jnIdx32);
+        for (BasicBlock block : jnLoop32) {
             List<Instruction> insts = block.getInstructions();
             int w = 0;
             for (int i = 0; i < insts.size(); i++) {
@@ -1142,8 +1109,7 @@ public class SSATransformer {
     private void cleanupNops(Function function) {
         List<BasicBlock> blocks = function.getBlocks();
         List<? extends BasicBlock> jnLoop33 = blocks;
-        for (int jnIdx33 = 0; jnIdx33 < jnLoop33.size(); jnIdx33++) {
-            BasicBlock block = jnLoop33.get(jnIdx33);
+        for (BasicBlock block : jnLoop33) {
             List<Instruction> insts = block.getInstructions();
             int w = 0;
             for (int i = 0; i < insts.size(); i++) {

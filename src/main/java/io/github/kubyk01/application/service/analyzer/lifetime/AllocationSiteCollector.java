@@ -50,8 +50,7 @@ public class AllocationSiteCollector {
     public List<AllocationSite> collect() {
         List<Function> live = new ArrayList<>();
         List<? extends Function> jnLoop1 = module.getFunctions();
-        for (int jnIdx1 = 0; jnIdx1 < jnLoop1.size(); jnIdx1++) {
-            Function func = jnLoop1.get(jnIdx1);
+        for (Function func : jnLoop1) {
             if (func.getEntryBlock() != null) live.add(func);
         }
         if (live.isEmpty()) return List.of();
@@ -63,8 +62,8 @@ public class AllocationSiteCollector {
                 .parallel()
                 .runOn(scheduler)
                 .doOnNext(func -> {
-                    for (int blockIdx1 = 0; blockIdx1 < func.getBlocks().size(); blockIdx1++) { BasicBlock block = func.getBlocks().get(blockIdx1);
-                        for (int instIdx2 = 0; instIdx2 < block.getInstructions().size(); instIdx2++) { Instruction inst = block.getInstructions().get(instIdx2);
+                    for (BasicBlock block : func.getBlocks()) {
+                        for (Instruction inst : block.getInstructions()) {
                             if (!isAllocation(inst.getOpcode())) continue;
                             if (inst.getResult() == null) continue;
                             sites.addAll(

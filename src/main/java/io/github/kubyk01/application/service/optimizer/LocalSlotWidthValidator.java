@@ -106,8 +106,7 @@ public final class LocalSlotWidthValidator {
     public static void validate(Module module, reactor.core.scheduler.Scheduler scheduler) {
         List<Function> live = new ArrayList<>();
         List<? extends Function> jnLoop1 = module.getFunctions();
-        for (int jnIdx1 = 0; jnIdx1 < jnLoop1.size(); jnIdx1++) {
-            Function func = jnLoop1.get(jnIdx1);
+        for (Function func : jnLoop1) {
             if (func.getEntryBlock() != null) live.add(func);
         }
         if (scheduler == null) {
@@ -130,7 +129,7 @@ public final class LocalSlotWidthValidator {
     private static void validateFunction(Function func) {
         Map<BasicBlock, Map<Integer, Integer>> inStates = computeInStates(func);
 
-        for (int blockIdx1 = 0; blockIdx1 < func.getBlocks().size(); blockIdx1++) { BasicBlock block = func.getBlocks().get(blockIdx1);
+        for (BasicBlock block : func.getBlocks()) {
             Map<Integer, Integer> state = copyOf(inStates.get(block));
             List<Instruction> insts = block.getInstructions();
             for (int i = 0; i < insts.size(); i++) {
@@ -167,7 +166,7 @@ public final class LocalSlotWidthValidator {
         // prologue before the entry block's body runs, so its width is
         // live everywhere the entry block is.
         Map<Integer, Integer> entryState = new HashMap<>();
-        for (int pIdx2 = 0; pIdx2 < func.getParameters().size(); pIdx2++) { Parameter p = func.getParameters().get(pIdx2);
+        for (Parameter p : func.getParameters()) {
             entryState.put(p.getIndex(), llvmWidthBytes(p.getType()));
         }
         inStates.put(entry, entryState);
@@ -182,14 +181,14 @@ public final class LocalSlotWidthValidator {
             queued.remove(block);
 
             Map<Integer, Integer> outState = copyOf(inStates.get(block));
-            for (int instIdx3 = 0; instIdx3 < block.getInstructions().size(); instIdx3++) { Instruction inst = block.getInstructions().get(instIdx3);
+            for (Instruction inst : block.getInstructions()) {
                 if (inst.getOpcode() != Opcode.STORE) continue;
                 int idx = inst.getLocalIndex();
                 if (idx < 0) continue;
                 outState.put(idx, accessWidthBytes(inst));
             }
 
-            for (int succIdx4 = 0; succIdx4 < block.getSuccessors().size(); succIdx4++) { BasicBlock succ = block.getSuccessors().get(succIdx4);
+            for (BasicBlock succ : block.getSuccessors()) {
                 Map<Integer, Integer> succState =
                     inStates.computeIfAbsent(succ, k -> new HashMap<>());
                 if (join(succState, outState) && queued.add(succ)) {

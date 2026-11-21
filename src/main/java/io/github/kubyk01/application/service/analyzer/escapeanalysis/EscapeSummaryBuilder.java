@@ -110,8 +110,7 @@ public class EscapeSummaryBuilder {
     public Map<String, EscapeSummary> build() {
         List<Function> live = new ArrayList<>();
         List<? extends Function> jnLoop1 = module.getFunctions();
-        for (int jnIdx1 = 0; jnIdx1 < jnLoop1.size(); jnIdx1++) {
-            Function f = jnLoop1.get(jnIdx1);
+        for (Function f : jnLoop1) {
             if (f.getEntryBlock() != null) live.add(f);
         }
         if (live.isEmpty()) return summaries;
@@ -119,8 +118,7 @@ public class EscapeSummaryBuilder {
         // ---- Call graph ------------------------------------------------
         Map<String, Function> byName = new HashMap<>(live.size() * 2);
         List<? extends Function> jnLoop2 = live;
-        for (int jnIdx2 = 0; jnIdx2 < jnLoop2.size(); jnIdx2++) {
-            Function f = jnLoop2.get(jnIdx2);
+        for (Function f : jnLoop2) {
             byName.put(f.getName(), f);
         }
 
@@ -128,12 +126,11 @@ public class EscapeSummaryBuilder {
         Map<String, Set<Function>> callersOf = new HashMap<>(live.size() * 2);
 
         List<? extends Function> jnLoop3 = live;
-        for (int jnIdx3 = 0; jnIdx3 < jnLoop3.size(); jnIdx3++) {
-            Function f = jnLoop3.get(jnIdx3);
+        for (Function f : jnLoop3) {
             List<Function> out = new ArrayList<>();
             Set<String> seen = new HashSet<>();
-            for (int bIdx1 = 0; bIdx1 < f.getBlocks().size(); bIdx1++) { BasicBlock b = f.getBlocks().get(bIdx1);
-                for (int instIdx2 = 0; instIdx2 < b.getInstructions().size(); instIdx2++) { Instruction inst = b.getInstructions().get(instIdx2);
+            for (BasicBlock b : f.getBlocks()) {
+                for (Instruction inst : b.getInstructions()) {
                     String callee = extractCalleeName(inst);
                     if (callee == null) continue;
                     String calleeKey = canonicalCalleeKey(callee);
@@ -156,8 +153,7 @@ public class EscapeSummaryBuilder {
         int totalProcessed = 0;
         int maxSccSize = 0;
         List<? extends List<Function>> jnLoop4 = sccs;
-        for (int jnIdx4 = 0; jnIdx4 < jnLoop4.size(); jnIdx4++) {
-            List<Function> scc = jnLoop4.get(jnIdx4);
+        for (List<Function> scc : jnLoop4) {
             if (scc.size() > maxSccSize) maxSccSize = scc.size();
             totalProcessed += processSCC(scc, callersOf);
         }
@@ -195,8 +191,7 @@ public class EscapeSummaryBuilder {
         int iteration = 0;
 
         List<? extends Function> jnLoop5 = scc;
-        for (int jnIdx5 = 0; jnIdx5 < jnLoop5.size(); jnIdx5++) {
-            Function f = jnLoop5.get(jnIdx5);
+        for (Function f : jnLoop5) {
             summaries.putIfAbsent(f.getName(), EscapeSummary.builder().build());
         }
 
@@ -280,8 +275,7 @@ public class EscapeSummaryBuilder {
         int[] counter = {0};
 
         List<? extends Function> jnLoop7 = functions;
-        for (int jnIdx7 = 0; jnIdx7 < jnLoop7.size(); jnIdx7++) {
-            Function start = jnLoop7.get(jnIdx7);
+        for (Function start : jnLoop7) {
             if (index.containsKey(start)) {
                 continue;
             }
@@ -375,7 +369,7 @@ public class EscapeSummaryBuilder {
         Map<Value, Set<Integer>> map = new HashMap<>();
         Map<Integer, Set<Integer>> slotMap = new HashMap<>();
 
-        for (int pIdx3 = 0; pIdx3 < func.getParameters().size(); pIdx3++) { Parameter p = func.getParameters().get(pIdx3);
+        for (Parameter p : func.getParameters()) {
             if (!isReferenceLike(p.getType())) continue;
             Set<Integer> s = new HashSet<>();
             s.add(p.getOrdinal());
@@ -387,8 +381,8 @@ public class EscapeSummaryBuilder {
         for (int iter = 0; iter < maxIterations; iter++) {
             boolean changed = false;
 
-            for (int blockIdx4 = 0; blockIdx4 < func.getBlocks().size(); blockIdx4++) { BasicBlock block = func.getBlocks().get(blockIdx4);
-                for (int instIdx5 = 0; instIdx5 < block.getInstructions().size(); instIdx5++) { Instruction inst = block.getInstructions().get(instIdx5);
+            for (BasicBlock block : func.getBlocks()) {
+                for (Instruction inst : block.getInstructions()) {
                     Opcode op = inst.getOpcode();
 
                     if (op == Opcode.LOAD) {
@@ -417,7 +411,7 @@ public class EscapeSummaryBuilder {
                         if (result == null) continue;
                         Set<Integer> cur = map.computeIfAbsent(result, k -> new HashSet<>());
                         int before = cur.size();
-                        for (int operandIdx6 = 0; operandIdx6 < inst.getOperands().size(); operandIdx6++) { Value operand = inst.getOperands().get(operandIdx6);
+                        for (Value operand : inst.getOperands()) {
                             if (operand == null) continue;
                             Set<Integer> sp = map.get(operand);
                             if (sp != null) cur.addAll(sp);
@@ -590,8 +584,8 @@ public class EscapeSummaryBuilder {
 
         // ---- Phase 1: seed allocation sites ----
         int idx = 0;
-        for (int blockIdx7 = 0; blockIdx7 < func.getBlocks().size(); blockIdx7++) { BasicBlock block = func.getBlocks().get(blockIdx7);
-            for (int instIdx8 = 0; instIdx8 < block.getInstructions().size(); instIdx8++) { Instruction inst = block.getInstructions().get(instIdx8);
+        for (BasicBlock block : func.getBlocks()) {
+            for (Instruction inst : block.getInstructions()) {
                 if (isAllocation(inst.getOpcode()) && inst.getResult() != null) {
                     AllocationSite site = AllocationSite.fromInstruction(
                             inst, func.getName(), idx);
@@ -604,8 +598,8 @@ public class EscapeSummaryBuilder {
         }
 
         // ---- Phase 2: walk instructions ----
-        for (int blockIdx9 = 0; blockIdx9 < func.getBlocks().size(); blockIdx9++) { BasicBlock block = func.getBlocks().get(blockIdx9);
-            for (int instIdx10 = 0; instIdx10 < block.getInstructions().size(); instIdx10++) { Instruction inst = block.getInstructions().get(instIdx10);
+        for (BasicBlock block : func.getBlocks()) {
+            for (Instruction inst : block.getInstructions()) {
                 processInstruction(inst, paramAliases, paramsEscaped,
                         paramsReturned, paramsEscapedToStatic, fieldsEscaped, flags,
                         snapshot, valueOrigin, paramEscapeEdges, localToParams,
@@ -747,7 +741,7 @@ public class EscapeSummaryBuilder {
                 Value result = inst.getResult();
                 if (result == null) break;
                 Set<AllocationSite> pts = new HashSet<>();
-                for (int operandIdx11 = 0; operandIdx11 < inst.getOperands().size(); operandIdx11++) { Value operand = inst.getOperands().get(operandIdx11);
+                for (Value operand : inst.getOperands()) {
                     if (operand == null) continue;
                     Set<AllocationSite> opPts = localPointsTo.get(operand);
                     if (opPts != null) pts.addAll(opPts);
@@ -824,8 +818,7 @@ public class EscapeSummaryBuilder {
 
             case INVOKEDYNAMIC: {
                 List<? extends Value> jnLoop10 = lambdaCaptures(inst);
-                for (int jnIdx10 = 0; jnIdx10 < jnLoop10.size(); jnIdx10++) {
-                    Value cap = jnLoop10.get(jnIdx10);
+                for (Value cap : jnLoop10) {
                     Type t = cap == null ? null : cap.getType();
                     if (cap instanceof Parameter p
                             && (t == null || t.isReference() || t.isArray() || t.isUnknown())) {
@@ -1160,8 +1153,7 @@ public class EscapeSummaryBuilder {
                 || calleeName.startsWith("java/lang/Thread.start()V")) {
             flags[2] = true;
             List<? extends Value> jnLoop20 = getCallArguments(inst);
-            for (int jnIdx20 = 0; jnIdx20 < jnLoop20.size(); jnIdx20++) {
-                Value arg = jnLoop20.get(jnIdx20);
+            for (Value arg : jnLoop20) {
                 if (arg instanceof Parameter p) {
                     paramsEscaped.add(p.getOrdinal());
                     addAliases(p.getOrdinal(), paramAliases, paramsEscaped);
@@ -1185,8 +1177,7 @@ public class EscapeSummaryBuilder {
                 // Unknown callee: conservatively assume every reference
                 // argument may be stored anywhere the callee has access to.
                 List<? extends Value> jnLoop21 = getCallArguments(inst);
-                for (int jnIdx21 = 0; jnIdx21 < jnLoop21.size(); jnIdx21++) {
-                    Value arg = jnLoop21.get(jnIdx21);
+                for (Value arg : jnLoop21) {
                     if (arg instanceof Parameter p) {
                         paramsEscaped.add(p.getOrdinal());
                         addAliases(p.getOrdinal(), paramAliases, paramsEscaped);

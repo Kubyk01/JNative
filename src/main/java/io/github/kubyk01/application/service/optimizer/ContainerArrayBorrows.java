@@ -168,8 +168,7 @@ final class ContainerArrayBorrows {
         for (Map.Entry<String, List<Instruction>> e : gets.entrySet()) {
             if (!puts.containsKey(e.getKey()) || excluded.containsKey(e.getKey())) continue;
             List<Instruction> gs = e.getValue();
-            for (int i = 0; i < gs.size(); i++) {
-                Instruction g = gs.get(i);
+            for (Instruction g : gs) {
                 if (g.getResult() == null) continue;
                 roots.add(new Borrow(g.getParent().getFunction(), e.getKey(), g.getResult(), g, g.getOperands().getFirst()));
             }
@@ -191,14 +190,12 @@ final class ContainerArrayBorrows {
             if (!h) continue;
             heldParams.add(id);
             List<String> deps = dependents.getOrDefault(id, List.of());
-            for (int i = 0; i < deps.size(); i++) {
-                String d = deps.get(i);
+            for (String d : deps) {
                 if (!heldParams.contains(d) && queued.add(d)) pending.add(paramBorrows.get(d));
             }
         }
         long rootsStart = System.nanoTime();
-        for (int i = 0; i < roots.size(); i++) {
-            Borrow b = roots.get(i);
+        for (Borrow b : roots) {
             if (held(b)) {
                 if (b.owner() == null) {
                     retireOnly.putIfAbsent(b.key(), "borrowed array returned by a static call in " + b.fn().getName());
@@ -262,13 +259,10 @@ final class ContainerArrayBorrows {
 
     private void scan() {
         List<? extends Function> fns = module.getFunctions();
-        for (int fi = 0; fi < fns.size(); fi++) {
-            Function f = fns.get(fi);
+        for (Function f : fns) {
             if (f.getEntryBlock() == null || isDestructor(f)) continue;
-            for (int bi = 0; bi < f.getBlocks().size(); bi++) {
-                BasicBlock block = f.getBlocks().get(bi);
-                for (int ii = 0; ii < block.getInstructions().size(); ii++) {
-                    Instruction inst = block.getInstructions().get(ii);
+            for (BasicBlock block : f.getBlocks()) {
+                for (Instruction inst : block.getInstructions()) {
                     switch (inst.getOpcode()) {
                         case PUT_FIELD -> {
                             String key = keyOf(inst);
@@ -428,8 +422,7 @@ final class ContainerArrayBorrows {
             }
         }
         if (reaches(idx, put, put)) {
-            for (int d = 0; d < defs.size(); d++) {
-                Instruction def = defs.get(d);
+            for (Instruction def : defs) {
                 if (def.getParent() != put.getParent() || idx.position.get(def) > idx.position.get(put)) {
                     excluded.put(key, "store inside a loop of a value allocated outside it in " + f.getName());
                     return;
@@ -438,8 +431,7 @@ final class ContainerArrayBorrows {
         }
         for (Value v : aliasesOf(f, stored)) {
             List<Instruction> us = idx.users.getOrDefault(v, List.of());
-            for (int u = 0; u < us.size(); u++) {
-                Instruction inst = us.get(u);
+            for (Instruction inst : us) {
                 if (inst == put) continue;
                 Opcode op = inst.getOpcode();
                 List<Value> ops = inst.getOperands();
@@ -594,13 +586,12 @@ final class ContainerArrayBorrows {
             }
             List<Instruction> us = idx.users.get(v);
             if (us == null) continue;
-            for (int u = 0; u < us.size(); u++) {
-                Instruction inst = us.get(u);
+            for (Instruction inst : us) {
                 List<Value> ops = inst.getOperands();
                 for (int k = 0; k < ops.size(); k++) {
                     if (ops.get(k) != v) continue;
                     String why = escapes(b, inst, k, v, work);
-                    if (why != null) {
+                    if (why != null && !(b.seed() instanceof Parameter)) {
                         retireOnly.putIfAbsent(key, why + " in " + b.fn().getName());
                         return;
                     }
@@ -642,8 +633,7 @@ final class ContainerArrayBorrows {
     private void propagateReturn(Function f, String key, ArrayDeque<Borrow> work) {
         if (!returnPropagated.add(key + "|" + f.getName())) return;
         List<Instruction> sites = callSitesOf.getOrDefault(f, List.of());
-        for (int i = 0; i < sites.size(); i++) {
-            Instruction call = sites.get(i);
+        for (Instruction call : sites) {
             if (call.getResult() == null) continue;
             Opcode op = call.getOpcode();
             Value owner = op == Opcode.VIRTUAL_CALL || op == Opcode.INTERFACE_CALL || op == Opcode.SPECIAL_CALL
@@ -657,8 +647,7 @@ final class ContainerArrayBorrows {
     private void borrowParam(Function callee, int ordinal, String key, ArrayDeque<Borrow> work) {
         String id = paramId(callee, ordinal, key);
         if (paramBorrows.containsKey(id)) return;
-        for (int p = 0; p < callee.getParameters().size(); p++) {
-            Parameter param = callee.getParameters().get(p);
+        for (Parameter param : callee.getParameters()) {
             if (param.getOrdinal() == ordinal) {
                 Borrow nb = new Borrow(callee, key, param, null, null);
                 paramBorrows.put(id, nb);
@@ -677,8 +666,7 @@ final class ContainerArrayBorrows {
             writers = new ArrayList<>();
             for (int bi = 0; bi < f.getBlocks().size(); bi++) {
                 List<Instruction> insts = f.getBlocks().get(bi).getInstructions();
-                for (int ii = 0; ii < insts.size(); ii++) {
-                    Instruction inst = insts.get(ii);
+                for (Instruction inst : insts) {
                     if (writesKey(inst, b.key())) writers.add(inst);
                 }
             }
@@ -686,16 +674,13 @@ final class ContainerArrayBorrows {
         }
         for (Value v : as) {
             List<Instruction> us = idx.users.getOrDefault(v, List.of());
-            for (int u = 0; u < us.size(); u++) {
-                Instruction use = us.get(u);
+            for (Instruction use : us) {
                 if (isCall(use.getOpcode()) && passesToHeldParam(use, v, b.key())) return true;
             }
             if (writers.isEmpty()) continue;
-            for (int w = 0; w < writers.size(); w++) {
-                Instruction writer = writers.get(w);
+            for (Instruction writer : writers) {
                 if (b.origin() != null && !reaches(idx, b.origin(), writer)) continue;
-                for (int u = 0; u < us.size(); u++) {
-                    Instruction use = us.get(u);
+                for (Instruction use : us) {
                     if (use != writer && reaches(idx, writer, use)) return true;
                 }
                 List<BasicBlock> rets = idx.returnedIn.getOrDefault(v, List.of());
@@ -743,8 +728,7 @@ final class ContainerArrayBorrows {
                 if (inst.getOpcode() == Opcode.LOAD && slot >= 0 && inst.getResult() != null) {
                     idx.loads.computeIfAbsent(slot, k -> new ArrayList<>()).add(inst);
                 }
-                for (int k = 0; k < ops.size(); k++) {
-                    Value v = ops.get(k);
+                for (Value v : ops) {
                     if (v != null && !(v instanceof Constant)) idx.users.computeIfAbsent(v, x -> new ArrayList<>()).add(inst);
                 }
             }
@@ -785,8 +769,7 @@ final class ContainerArrayBorrows {
             }
             List<Instruction> us = idx.users.get(v);
             if (us == null) continue;
-            for (int u = 0; u < us.size(); u++) {
-                Instruction inst = us.get(u);
+            for (Instruction inst : us) {
                 Value res = inst.getResult();
                 switch (inst.getOpcode()) {
                     case CAST, CHECKCAST, PHI, SELECT -> {
@@ -917,8 +900,7 @@ final class ContainerArrayBorrows {
             last[bi] = -1;
             all[bi] = new BitSet();
             List<Instruction> insts = f.getBlocks().get(bi).getInstructions();
-            for (int ii = 0; ii < insts.size(); ii++) {
-                Instruction inst = insts.get(ii);
+            for (Instruction inst : insts) {
                 if (inst.getOpcode() == Opcode.STORE && inst.getLocalIndex() == slot) {
                     last[bi] = d.stores.size();
                     all[bi].set(d.stores.size());

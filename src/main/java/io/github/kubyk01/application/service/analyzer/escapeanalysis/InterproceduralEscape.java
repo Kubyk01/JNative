@@ -126,13 +126,10 @@ public class InterproceduralEscape {
         // that intraprocedural analysis starts from.
         // ------------------------------------------------------------------
         List<? extends Function> jnLoop1 = module.getFunctions();
-        for (int jnIdx1 = 0; jnIdx1 < jnLoop1.size(); jnIdx1++) {
-            Function func = jnLoop1.get(jnIdx1);
+        for (Function func : jnLoop1) {
             if (func.getEntryBlock() == null) continue;
-            for (int blockIdx1 = 0; blockIdx1 < func.getBlocks().size(); blockIdx1++) {
-                BasicBlock block = func.getBlocks().get(blockIdx1);
-                for (int instIdx2 = 0; instIdx2 < block.getInstructions().size(); instIdx2++) {
-                    Instruction inst = block.getInstructions().get(instIdx2);
+            for (BasicBlock block : func.getBlocks()) {
+                for (Instruction inst : block.getInstructions()) {
                     if (isAllocation(inst.getOpcode()) && inst.getResult() != null) {
                         PointsToSet pts = aliasResult.getPointsTo(inst.getResult());
                         for (AllocationSite site : pts.getSites()) {
@@ -145,8 +142,7 @@ public class InterproceduralEscape {
 
         List<Function> live = new ArrayList<>();
         List<? extends Function> jnLoop3 = module.getFunctions();
-        for (int jnIdx3 = 0; jnIdx3 < jnLoop3.size(); jnIdx3++) {
-            Function f = jnLoop3.get(jnIdx3);
+        for (Function f : jnLoop3) {
             if (f.getEntryBlock() != null) live.add(f);
         }
         if (live.isEmpty()) return globalStatus;
@@ -163,8 +159,8 @@ public class InterproceduralEscape {
         Map<String, Set<Function>> callersOf = new HashMap<>();
         {
             for (int jnIdx4 = 0; jnIdx4 < live.size(); jnIdx4++) { Function f = ((List<? extends Function>) live).get(jnIdx4);
-            for (int bIdx3 = 0; bIdx3 < f.getBlocks().size(); bIdx3++) { BasicBlock b = f.getBlocks().get(bIdx3);
-                for (int instIdx4 = 0; instIdx4 < b.getInstructions().size(); instIdx4++) { Instruction inst = b.getInstructions().get(instIdx4);
+            for (BasicBlock b : f.getBlocks()) {
+                for (Instruction inst : b.getInstructions()) {
                     String callee = extractCalleeName(inst);
                     if (callee == null) continue;
                     String calleeKey = canonicalCalleeKey(callee);

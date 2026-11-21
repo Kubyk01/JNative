@@ -155,8 +155,8 @@ public class IntraproceduralEscape {
         // GLOBAL, the site is promoted to GLOBAL by the very first read of
         // getMaxStatus.
         // ------------------------------------------------------------------
-        for (int blockIdx1 = 0; blockIdx1 < function.getBlocks().size(); blockIdx1++) { BasicBlock block = function.getBlocks().get(blockIdx1);
-            for (int instIdx2 = 0; instIdx2 < block.getInstructions().size(); instIdx2++) { Instruction inst = block.getInstructions().get(instIdx2);
+        for (BasicBlock block : function.getBlocks()) {
+            for (Instruction inst : block.getInstructions()) {
                 if (isAllocation(inst.getOpcode()) && inst.getResult() != null) {
                     PointsToSet pts = aliasResult.getPointsTo(inst.getResult());
                     for (AllocationSite site : pts.getSites()) {
@@ -171,8 +171,8 @@ public class IntraproceduralEscape {
         final int MAX_ITERATIONS = 64;
         for (int i = 0; i < MAX_ITERATIONS; i++) {
             changed = false;
-            for (int blockIdx3 = 0; blockIdx3 < function.getBlocks().size(); blockIdx3++) { BasicBlock block = function.getBlocks().get(blockIdx3);
-                for (int instIdx4 = 0; instIdx4 < block.getInstructions().size(); instIdx4++) { Instruction inst = block.getInstructions().get(instIdx4);
+            for (BasicBlock block : function.getBlocks()) {
+                for (Instruction inst : block.getInstructions()) {
                     processInstruction(inst);
                 }
                 Terminator term = block.getTerminator();
@@ -406,8 +406,7 @@ public class IntraproceduralEscape {
                 || calleeName.startsWith("java/util/concurrent/CompletableFuture.supplyAsync")
                 || calleeName.startsWith("java/lang/Thread.start()V")) {
             List<? extends Value> jnLoop9 = getCallArguments(callInst);
-            for (int jnIdx9 = 0; jnIdx9 < jnLoop9.size(); jnIdx9++) {
-                Value arg = jnLoop9.get(jnIdx9);
+            for (Value arg : jnLoop9) {
                 markEscaped(arg, EscapeStatus.THREAD);
             }
             Value ret = callInst.getResult();
@@ -426,8 +425,7 @@ public class IntraproceduralEscape {
                 // Unknown callee: conservatively assume every reference
                 // argument may be stored anywhere the callee has access to.
                 List<? extends Value> jnLoop10 = getCallArguments(callInst);
-                for (int jnIdx10 = 0; jnIdx10 < jnLoop10.size(); jnIdx10++) {
-                    Value arg = jnLoop10.get(jnIdx10);
+                for (Value arg : jnLoop10) {
                     markEscaped(arg, EscapeStatus.HEAP);
                 }
                 Value ret = callInst.getResult();

@@ -174,8 +174,7 @@ public class InterproceduralPointsTo {
 
         List<Function> live = new ArrayList<>();
         List<? extends Function> jnLoop1 = module.getFunctions();
-        for (int jnIdx1 = 0; jnIdx1 < jnLoop1.size(); jnIdx1++) {
-            Function func = jnLoop1.get(jnIdx1);
+        for (Function func : jnLoop1) {
             if (func.getEntryBlock() != null) live.add(func);
         }
         states = new FnState[live.size()];
@@ -224,12 +223,11 @@ public class InterproceduralPointsTo {
 
     private void collectAllocationSites() {
         List<? extends Function> jnLoop2 = module.getFunctions();
-        for (int jnIdx2 = 0; jnIdx2 < jnLoop2.size(); jnIdx2++) {
-            Function func = jnLoop2.get(jnIdx2);
+        for (Function func : jnLoop2) {
             if (func.getEntryBlock() == null) continue;
             int idx = 0;
-            for (int blockIdx1 = 0; blockIdx1 < func.getBlocks().size(); blockIdx1++) { BasicBlock block = func.getBlocks().get(blockIdx1);
-                for (int instIdx2 = 0; instIdx2 < block.getInstructions().size(); instIdx2++) { Instruction inst = block.getInstructions().get(instIdx2);
+            for (BasicBlock block : func.getBlocks()) {
+                for (Instruction inst : block.getInstructions()) {
                     if (isAllocation(inst.getOpcode())) {
                         AllocationSite site = AllocationSite.fromInstruction(
                             inst, func.getName(), idx);
@@ -303,8 +301,8 @@ public class InterproceduralPointsTo {
         List<Object> infos = new ArrayList<>();
         int loads = 0;
 
-        for (int blockIdx3 = 0; blockIdx3 < fn.getBlocks().size(); blockIdx3++) { BasicBlock block = fn.getBlocks().get(blockIdx3);
-            for (int instIdx4 = 0; instIdx4 < block.getInstructions().size(); instIdx4++) { Instruction inst = block.getInstructions().get(instIdx4);
+        for (BasicBlock block : fn.getBlocks()) {
+            for (Instruction inst : block.getInstructions()) {
                 Opcode op = inst.getOpcode();
                 List<Value> ops = inst.getOperands();
                 Value res = inst.getResult();

@@ -149,8 +149,8 @@ public class BytecodeToIr {
             Function func = worklist.poll();
             if (!processed.add(func) || func.getEntryBlock() == null) continue;
 
-            for (int blockIdx1 = 0; blockIdx1 < func.getBlocks().size(); blockIdx1++) { BasicBlock block = func.getBlocks().get(blockIdx1);
-                for (int instIdx2 = 0; instIdx2 < block.getInstructions().size(); instIdx2++) { Instruction inst = block.getInstructions().get(instIdx2);
+            for (BasicBlock block : func.getBlocks()) {
+                for (Instruction inst : block.getInstructions()) {
                     Opcode op = inst.getOpcode();
                     if (op != Opcode.CALL && op != Opcode.STATIC_CALL
                         && op != Opcode.VIRTUAL_CALL && op != Opcode.INTERFACE_CALL
@@ -244,8 +244,7 @@ public class BytecodeToIr {
     public void closeOverIrCalleesWithSsa() {
         Set<String> preexisting = new HashSet<>();
         List<? extends Function> jnLoop4 = builder.getModule().getFunctions();
-        for (int jnIdx4 = 0; jnIdx4 < jnLoop4.size(); jnIdx4++) {
-            Function f = jnLoop4.get(jnIdx4);
+        for (Function f : jnLoop4) {
             preexisting.add(f.getName());
         }
 
@@ -253,8 +252,7 @@ public class BytecodeToIr {
 
         SSATransformer ssa = new SSATransformer();
         List<? extends Function> jnLoop5 = builder.getModule().getFunctions();
-        for (int jnIdx5 = 0; jnIdx5 < jnLoop5.size(); jnIdx5++) {
-            Function f = jnLoop5.get(jnIdx5);
+        for (Function f : jnLoop5) {
             if (preexisting.contains(f.getName())) continue;
             if (f.getEntryBlock() == null) continue;
             try {
@@ -285,8 +283,7 @@ public class BytecodeToIr {
             if (module.getFunction(o.getCFunctionName()) == null) {
                 Function f = new Function(o.getCFunctionName(), o.getReturnType());
                 List<? extends Parameter> jnLoop8 = o.toParameters();
-                for (int jnIdx8 = 0; jnIdx8 < jnLoop8.size(); jnIdx8++) {
-                    Parameter p = jnLoop8.get(jnIdx8);
+                for (Parameter p : jnLoop8) {
                     f.addParameter(p);
                 }
                 module.addFunction(f);
@@ -613,8 +610,7 @@ public class BytecodeToIr {
         }
         int n = 0;
         List<? extends MethodNode> jnLoop11 = cn.getMethods();
-        for (int jnIdx11 = 0; jnIdx11 < jnLoop11.size(); jnIdx11++) {
-            MethodNode mn = jnLoop11.get(jnIdx11);
+        for (MethodNode mn : jnLoop11) {
             if (mn.getName().equals(name)) {
                 n++;
             }
@@ -624,8 +620,7 @@ public class BytecodeToIr {
 
     private MethodNode findMethod(ClassNode classNode, String name, String desc) {
         List<? extends MethodNode> jnLoop12 = classNode.getMethods();
-        for (int jnIdx12 = 0; jnIdx12 < jnLoop12.size(); jnIdx12++) {
-            MethodNode m = jnLoop12.get(jnIdx12);
+        for (MethodNode m : jnLoop12) {
             if (m.getName().equals(name) && m.getDescriptor().equals(desc)) {
                 return m;
             }

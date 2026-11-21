@@ -72,8 +72,7 @@ public class LifetimeAnalyzer {
         // -------- 4. Dominator trees + natural loops, in parallel --------
         List<Function> live = new ArrayList<>();
         List<? extends Function> jnLoop1 = module.getFunctions();
-        for (int jnIdx1 = 0; jnIdx1 < jnLoop1.size(); jnIdx1++) {
-            Function f = jnLoop1.get(jnIdx1);
+        for (Function f : jnLoop1) {
             if (f.getEntryBlock() != null) live.add(f);
         }
 
@@ -130,8 +129,8 @@ public class LifetimeAnalyzer {
     private Map<BasicBlock, Set<BasicBlock>> detectNaturalLoops(Function func,
                                                                 DominatorTree domTree) {
         Map<BasicBlock, Set<BasicBlock>> loops = new HashMap<>();
-        for (int blockIdx1 = 0; blockIdx1 < func.getBlocks().size(); blockIdx1++) { BasicBlock block = func.getBlocks().get(blockIdx1);
-            for (int predIdx2 = 0; predIdx2 < block.getPredecessors().size(); predIdx2++) { BasicBlock pred = block.getPredecessors().get(predIdx2);
+        for (BasicBlock block : func.getBlocks()) {
+            for (BasicBlock pred : block.getPredecessors()) {
                 if (domTree.dominates(block, pred)) {
                     Set<BasicBlock> body = new HashSet<>();
                     findLoopBody(block, pred, body);
@@ -150,7 +149,7 @@ public class LifetimeAnalyzer {
         while (!stack.isEmpty()) {
             BasicBlock block = stack.pop();
             if (!body.add(block)) continue;
-            for (int predIdx3 = 0; predIdx3 < block.getPredecessors().size(); predIdx3++) { BasicBlock pred = block.getPredecessors().get(predIdx3);
+            for (BasicBlock pred : block.getPredecessors()) {
                 if (!body.contains(pred)) stack.push(pred);
             }
         }

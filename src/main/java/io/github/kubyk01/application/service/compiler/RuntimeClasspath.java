@@ -96,8 +96,7 @@ public final class RuntimeClasspath implements AutoCloseable {
             try (JarOutputStream out = new JarOutputStream(Files.newOutputStream(classes))) {
                 Set<String> written = new HashSet<>();
                 List<? extends JarEntry> jnLoop2 = jar.stream().toList();
-                for (int jnIdx2 = 0; jnIdx2 < jnLoop2.size(); jnIdx2++) {
-                    JarEntry entry = jnLoop2.get(jnIdx2);
+                for (JarEntry entry : jnLoop2) {
                     if (entry.isDirectory() || !entry.getName().startsWith(BOOT_CLASSES)) continue;
                     try (InputStream in = jar.getInputStream(entry)) {
                         writeEntry(out, written, entry.getName().substring(BOOT_CLASSES.length()), in);
@@ -106,8 +105,7 @@ public final class RuntimeClasspath implements AutoCloseable {
             }
             entries.add(classes);
             List<? extends String> jnLoop3 = libraryOrder(jar);
-            for (int jnIdx3 = 0; jnIdx3 < jnLoop3.size(); jnIdx3++) {
-                String name = jnLoop3.get(jnIdx3);
+            for (String name : jnLoop3) {
                 JarEntry entry = jar.getJarEntry(name);
                 if (entry == null || entry.isDirectory()) throw new IOException("Missing classpath entry: " + name);
                 Path directory = staging.resolve(Integer.toString(entries.size()));
@@ -160,8 +158,7 @@ public final class RuntimeClasspath implements AutoCloseable {
             }
         }
         List<? extends JarEntry> jnLoop6 = jar.stream().toList();
-        for (int jnIdx6 = 0; jnIdx6 < jnLoop6.size(); jnIdx6++) {
-            JarEntry entry = jnLoop6.get(jnIdx6);
+        for (JarEntry entry : jnLoop6) {
             String name = entry.getName();
             if (!entry.isDirectory() && name.startsWith(BOOT_LIB) && name.endsWith(".jar")) order.add(name);
         }

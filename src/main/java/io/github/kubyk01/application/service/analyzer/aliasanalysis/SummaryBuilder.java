@@ -59,8 +59,7 @@ public class SummaryBuilder {
     public Map<String, FunctionSummary> build() {
         List<Function> allLive = new ArrayList<>();
         List<? extends Function> jnLoop1 = module.getFunctions();
-        for (int jnIdx1 = 0; jnIdx1 < jnLoop1.size(); jnIdx1++) {
-            Function f = jnLoop1.get(jnIdx1);
+        for (Function f : jnLoop1) {
             if (f.getEntryBlock() != null) {
                 allLive.add(f);
             }
@@ -98,8 +97,8 @@ public class SummaryBuilder {
             for (int jnIdx3 = 0; jnIdx3 < allLive.size(); jnIdx3++) { Function f = ((List<? extends Function>) allLive).get(jnIdx3);
             List<Function> out = new ArrayList<>();
             Set<String> seen = new HashSet<>();
-            for (int blockIdx1 = 0; blockIdx1 < f.getBlocks().size(); blockIdx1++) { BasicBlock block = f.getBlocks().get(blockIdx1);
-                for (int instIdx2 = 0; instIdx2 < block.getInstructions().size(); instIdx2++) { Instruction inst = block.getInstructions().get(instIdx2);
+            for (BasicBlock block : f.getBlocks()) {
+                for (Instruction inst : block.getInstructions()) {
                     String calleeName = extractCalleeName(inst);
                     if (calleeName == null) {
                         continue;
@@ -425,7 +424,7 @@ public class SummaryBuilder {
         Map<Value, Set<AllocationSite>> localPointsTo = new HashMap<>();
         Map<Integer, Set<AllocationSite>> paramPointsTo = new HashMap<>();
         Map<Integer, Integer> slotToOrdinal = new HashMap<>();
-        for (int pIdx3 = 0; pIdx3 < func.getParameters().size(); pIdx3++) { Parameter p = func.getParameters().get(pIdx3);
+        for (Parameter p : func.getParameters()) {
             // paramPointsTo keyed by SLOT — this is what LOAD/STORE use.
             paramPointsTo.put(p.getIndex(), new HashSet<>());
             // slotToOrdinal — this is what "does this LOAD read a parameter?"
@@ -435,8 +434,8 @@ public class SummaryBuilder {
 
         // Phase 1: seed allocation sites.
         int idx = 0;
-        for (int blockIdx4 = 0; blockIdx4 < func.getBlocks().size(); blockIdx4++) { BasicBlock block = func.getBlocks().get(blockIdx4);
-            for (int instIdx5 = 0; instIdx5 < block.getInstructions().size(); instIdx5++) { Instruction inst = block.getInstructions().get(instIdx5);
+        for (BasicBlock block : func.getBlocks()) {
+            for (Instruction inst : block.getInstructions()) {
                 if (isAllocation(inst.getOpcode())) {
                     AllocationSite site = AllocationSite.fromInstruction(
                         inst, func.getName(), idx);
@@ -464,8 +463,8 @@ public class SummaryBuilder {
         Set<String> staticFieldWrites = new HashSet<>();
 
         // Phase 2: instruction walk.
-        for (int blockIdx6 = 0; blockIdx6 < func.getBlocks().size(); blockIdx6++) { BasicBlock block = func.getBlocks().get(blockIdx6);
-            for (int instIdx7 = 0; instIdx7 < block.getInstructions().size(); instIdx7++) { Instruction inst = block.getInstructions().get(instIdx7);
+        for (BasicBlock block : func.getBlocks()) {
+            for (Instruction inst : block.getInstructions()) {
                 processInstruction(inst, func, localPointsTo, paramPointsTo,
                     slotToOrdinal,
                     paramsRead, paramsWritten, paramsEscaped, paramsReturned,

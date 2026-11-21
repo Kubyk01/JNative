@@ -133,7 +133,7 @@ public final class AllocatorLastUseLifetimeStrategy implements LifetimeAnalysisS
         if (!filtered.isEmpty()) return dedup(filtered, dom);
 
         List<BasicBlock> returnBlocks = new ArrayList<>();
-        for (int blockIdx1 = 0; blockIdx1 < func.getBlocks().size(); blockIdx1++) { BasicBlock block = func.getBlocks().get(blockIdx1);
+        for (BasicBlock block : func.getBlocks()) {
             if (block.getTerminator() instanceof ReturnTerminator) returnBlocks.add(block);
         }
         if (returnBlocks.isEmpty()) return null;
@@ -180,8 +180,8 @@ public final class AllocatorLastUseLifetimeStrategy implements LifetimeAnalysisS
             aliases.add(allocVals.get(byIndex[i]));
             sets.add(aliases);
         }
-        for (int blockIdx2 = 0; blockIdx2 < func.getBlocks().size(); blockIdx2++) { BasicBlock block = func.getBlocks().get(blockIdx2);
-            for (int instIdx3 = 0; instIdx3 < block.getInstructions().size(); instIdx3++) { Instruction inst = block.getInstructions().get(instIdx3);
+        for (BasicBlock block : func.getBlocks()) {
+            for (Instruction inst : block.getInstructions()) {
                 addAlias(inst.getResult(), ids, sets, aliasResult);
                 for (Value op : inst.getOperands()) addAlias(op, ids, sets, aliasResult);
             }

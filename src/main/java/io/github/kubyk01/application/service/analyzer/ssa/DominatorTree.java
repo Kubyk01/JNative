@@ -114,7 +114,7 @@ public class DominatorTree {
     private static boolean reaches(BasicBlock pred, BasicBlock block) {
         Terminator t = pred.getTerminator();
         if (t != null) {
-            for (int ttIdx1 = 0; ttIdx1 < t.getTargets().size(); ttIdx1++) { BasicBlock tt = t.getTargets().get(ttIdx1);
+            for (BasicBlock tt : t.getTargets()) {
                 if (tt == block) return true;
             }
         }

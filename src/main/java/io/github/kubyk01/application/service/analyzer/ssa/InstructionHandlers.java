@@ -416,8 +416,7 @@ public class InstructionHandlers {
         if (receiver != null) callInst.addOperand(receiver);
         callInst.addOperand(new Constant(Type.reference(callee), callee));
         List<? extends Value> jnLoop1 = args;
-        for (int jnIdx1 = 0; jnIdx1 < jnLoop1.size(); jnIdx1++) {
-            Value arg = jnLoop1.get(jnIdx1);
+        for (Value arg : jnLoop1) {
             callInst.addOperand(arg);
         }
 

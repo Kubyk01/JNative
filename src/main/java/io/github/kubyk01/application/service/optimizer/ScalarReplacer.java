@@ -79,8 +79,7 @@ public class ScalarReplacer {
 
     public void replace() {
         List<? extends Function> jnLoop1 = module.getFunctions();
-        for (int jnIdx1 = 0; jnIdx1 < jnLoop1.size(); jnIdx1++) {
-            Function func = jnLoop1.get(jnIdx1);
+        for (Function func : jnLoop1) {
             if (func.getEntryBlock() == null) continue;
 
             // Loop blocks are computed once per function, not per NEW.
@@ -96,8 +95,8 @@ public class ScalarReplacer {
             // loop body: the entry-block alloca would then be shared by
             // every iteration.
             // ------------------------------------------------------------------
-            for (int blockIdx1 = 0; blockIdx1 < func.getBlocks().size(); blockIdx1++) { BasicBlock block = func.getBlocks().get(blockIdx1);
-                for (int instIdx2 = 0; instIdx2 < block.getInstructions().size(); instIdx2++) { Instruction inst = block.getInstructions().get(instIdx2);
+            for (BasicBlock block : func.getBlocks()) {
+                for (Instruction inst : block.getInstructions()) {
                     if (inst.getOpcode() != Opcode.NEW) continue;
                     Value result = inst.getResult();
                     if (result == null) continue;
@@ -141,8 +140,7 @@ public class ScalarReplacer {
                 List<Instruction> instructions = block.getInstructions();
                 List<Instruction> newInstructions = new ArrayList<>();
                 List<? extends Instruction> jnLoop3 = instructions;
-                for (int jnIdx3 = 0; jnIdx3 < jnLoop3.size(); jnIdx3++) {
-                    Instruction inst = jnLoop3.get(jnIdx3);
+                for (Instruction inst : jnLoop3) {
                     if (processInstruction(inst, candidates)) {
                         // Instruction was replaced or removed.
                     } else {
@@ -187,8 +185,8 @@ public class ScalarReplacer {
         DominatorTree dom = new DominatorTree(func);
         Set<BasicBlock> loopBlocks = new HashSet<>();
 
-        for (int headerIdx4 = 0; headerIdx4 < func.getBlocks().size(); headerIdx4++) { BasicBlock header = func.getBlocks().get(headerIdx4);
-            for (int predIdx5 = 0; predIdx5 < header.getPredecessors().size(); predIdx5++) { BasicBlock pred = header.getPredecessors().get(predIdx5);
+        for (BasicBlock header : func.getBlocks()) {
+            for (BasicBlock pred : header.getPredecessors()) {
                 if (!dom.dominates(header, pred)) continue;
 
                 // Back edge pred -> header. Natural loop = header plus
@@ -202,7 +200,7 @@ public class ScalarReplacer {
                 while (!worklist.isEmpty()) {
                     BasicBlock cur = worklist.poll();
                     if (!loopBlocks.add(cur)) continue;
-                    for (int pIdx6 = 0; pIdx6 < cur.getPredecessors().size(); pIdx6++) { BasicBlock p = cur.getPredecessors().get(pIdx6);
+                    for (BasicBlock p : cur.getPredecessors()) {
                         if (p != header && !loopBlocks.contains(p)) {
                             worklist.add(p);
                         }
@@ -257,7 +255,7 @@ public class ScalarReplacer {
 
                 // Every operand, including the receiver slot at index 0 for
                 // VIRTUAL_CALL / INTERFACE_CALL / SPECIAL_CALL.
-                for (int operandIdx9 = 0; operandIdx9 < inst.getOperands().size(); operandIdx9++) { Value operand = inst.getOperands().get(operandIdx9);
+                for (Value operand : inst.getOperands()) {
                     if (operand == result) return true;
                 }
             }
@@ -267,8 +265,8 @@ public class ScalarReplacer {
 
     private Set<AllocationSite> collectCandidates(Function func) {
         Set<AllocationSite> candidates = new HashSet<>();
-        for (int blockIdx10 = 0; blockIdx10 < func.getBlocks().size(); blockIdx10++) { BasicBlock block = func.getBlocks().get(blockIdx10);
-            for (int instIdx11 = 0; instIdx11 < block.getInstructions().size(); instIdx11++) { Instruction inst = block.getInstructions().get(instIdx11);
+        for (BasicBlock block : func.getBlocks()) {
+            for (Instruction inst : block.getInstructions()) {
                 Opcode op = inst.getOpcode();
 
                 if (op == Opcode.NEW_ARRAY || op == Opcode.MULTI_NEW_ARRAY) {
@@ -367,8 +365,7 @@ public class ScalarReplacer {
     private void replaceUses(Value oldVal, Value newVal) {
         // Find all instructions using oldVal and replace their operands with newVal
         List<? extends Function> jnLoop8 = module.getFunctions();
-        for (int jnIdx8 = 0; jnIdx8 < jnLoop8.size(); jnIdx8++) {
-            Function func = jnLoop8.get(jnIdx8);
+        for (Function func : jnLoop8) {
             if (func.getEntryBlock() == null) continue;
             for (int blockIdx12 = 0; blockIdx12 < func.getBlocks().size(); blockIdx12++) { BasicBlock block = func.getBlocks().get(blockIdx12);
                 for (int instIdx13 = 0; instIdx13 < block.getInstructions().size(); instIdx13++) { Instruction inst = block.getInstructions().get(instIdx13);

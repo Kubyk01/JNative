@@ -145,8 +145,7 @@ public final class TargetJdk {
     private static boolean keep(String entry) {
         if (entry.endsWith("/release")) return true;
         List<? extends String> jnLoop1 = RuntimeImageEmbedder.DIRECTORIES;
-        for (int jnIdx1 = 0; jnIdx1 < jnLoop1.size(); jnIdx1++) {
-            String directory = jnLoop1.get(jnIdx1);
+        for (String directory : jnLoop1) {
             if (entry.contains("/" + directory + "/") || entry.endsWith("/" + directory)) return true;
         }
         return false;

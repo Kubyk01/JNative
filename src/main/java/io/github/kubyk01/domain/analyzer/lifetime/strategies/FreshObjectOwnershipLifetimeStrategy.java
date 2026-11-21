@@ -73,8 +73,7 @@ public final class FreshObjectOwnershipLifetimeStrategy implements LifetimeAnaly
         if (parts == null || parts.isEmpty()) return result;
         int roots = 0;
         for (List<Death> part : parts) {
-            for (int k = 0; k < part.size(); k++) {
-                Death d = part.get(k);
+            for (Death d : part) {
                 result.getDestructionPoints().computeIfAbsent(d.frame() ? FRAME : OWNED, x -> new HashSet<>()).add(d.point());
             }
             roots += part.size();
@@ -113,11 +112,11 @@ public final class FreshObjectOwnershipLifetimeStrategy implements LifetimeAnaly
             List<Boolean> frames = new ArrayList<>();
             for (int b = 0; b < n; b++) {
                 BasicBlock block = dom.blockAt(b);
-                for (int exIdx1 = 0; exIdx1 < block.getExceptionalSuccessors().size(); exIdx1++) { BasicBlock ex = block.getExceptionalSuccessors().get(exIdx1);
+                for (BasicBlock ex : block.getExceptionalSuccessors()) {
                     int h = dom.indexOf(ex);
                     if (h >= 0) handler[h] = true;
                 }
-                for (int instIdx2 = 0; instIdx2 < block.getInstructions().size(); instIdx2++) { Instruction inst = block.getInstructions().get(instIdx2);
+                for (Instruction inst : block.getInstructions()) {
                     int kind = rootKind(inst);
                     if (kind == NONE) continue;
                     roots.add(inst);
@@ -149,7 +148,7 @@ public final class FreshObjectOwnershipLifetimeStrategy implements LifetimeAnaly
             if (loadsBySlot == null) {
                 loadsBySlot = new java.util.HashMap<>();
                 for (int b = 0; b < n; b++) {
-                    for (int instIdx3 = 0; instIdx3 < dom.blockAt(b).getInstructions().size(); instIdx3++) { Instruction inst = dom.blockAt(b).getInstructions().get(instIdx3);
+                    for (Instruction inst : dom.blockAt(b).getInstructions()) {
                         if (inst.getOpcode() == Opcode.LOAD && inst.getLocalIndex() >= 0 && inst.getResult() != null) {
                             loadsBySlot.computeIfAbsent(inst.getLocalIndex(), k -> new ArrayList<>()).add(inst);
                         }
@@ -222,8 +221,7 @@ public final class FreshObjectOwnershipLifetimeStrategy implements LifetimeAnaly
             if (res == null) return false;
             for (int b = 0; b < fn.getBlocks().size(); b++) {
                 List<Instruction> insts = fn.getBlocks().get(b).getInstructions();
-                for (int i = 0; i < insts.size(); i++) {
-                    Instruction inst = insts.get(i);
+                for (Instruction inst : insts) {
                     if (inst == def || !CallShapes.isCall(inst.getOpcode())) continue;
                     if (inst.getOperands().contains(res)) return true;
                 }
@@ -241,7 +239,7 @@ public final class FreshObjectOwnershipLifetimeStrategy implements LifetimeAnaly
                 List<Instruction> insts = block.getInstructions();
                 for (int i = 0; i < insts.size(); i++) {
                     Instruction inst = insts.get(i);
-                    for (int opIdx4 = 0; opIdx4 < inst.getOperands().size(); opIdx4++) { Value op = inst.getOperands().get(opIdx4);
+                    for (Value op : inst.getOperands()) {
                         if (op instanceof Temporary) uses.computeIfAbsent(op, k -> new ArrayList<>()).add(new Use(b, i, inst));
                     }
                 }

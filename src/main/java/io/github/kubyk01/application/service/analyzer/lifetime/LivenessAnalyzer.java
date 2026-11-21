@@ -55,8 +55,7 @@ public class LivenessAnalyzer {
 
         List<Function> live = new ArrayList<>();
         List<? extends Function> jnLoop1 = module.getFunctions();
-        for (int jnIdx1 = 0; jnIdx1 < jnLoop1.size(); jnIdx1++) {
-            Function f = jnLoop1.get(jnIdx1);
+        for (Function f : jnLoop1) {
             if (f.getEntryBlock() != null) live.add(f);
         }
         liveIn = new ConcurrentHashMap<>();
@@ -97,7 +96,7 @@ public class LivenessAnalyzer {
             BasicBlock block = blocks.get(i);
             BitSet u = new BitSet();
             BitSet d = new BitSet();
-            for (int instIdx1 = 0; instIdx1 < block.getInstructions().size(); instIdx1++) { Instruction inst = block.getInstructions().get(instIdx1);
+            for (Instruction inst : block.getInstructions()) {
                 collectUses(inst, u, localToGlobal);
                 collectDefs(inst, d, localToGlobal);
             }
@@ -199,8 +198,8 @@ public class LivenessAnalyzer {
         seen.clear();
         {
             for (int jnIdx4 = 0; jnIdx4 < blocks.size(); jnIdx4++) { BasicBlock block = ((List<? extends BasicBlock>) blocks).get(jnIdx4);
-            for (int instIdx2 = 0; instIdx2 < block.getInstructions().size(); instIdx2++) { Instruction inst = block.getInstructions().get(instIdx2);
-                for (int operandIdx3 = 0; operandIdx3 < inst.getOperands().size(); operandIdx3++) { Value operand = inst.getOperands().get(operandIdx3);
+            for (Instruction inst : block.getInstructions()) {
+                for (Value operand : inst.getOperands()) {
                     if (operand != null) markTracked(getPointsTo(operand), seen);
                 }
             }
@@ -229,7 +228,7 @@ public class LivenessAnalyzer {
     }
 
     private void collectUses(Instruction inst, BitSet out, int[] localToGlobal) {
-        for (int operandIdx4 = 0; operandIdx4 < inst.getOperands().size(); operandIdx4++) { Value operand = inst.getOperands().get(operandIdx4);
+        for (Value operand : inst.getOperands()) {
             if (operand != null) setSites(getPointsTo(operand), out, localToGlobal);
         }
     }
@@ -295,12 +294,12 @@ public class LivenessAnalyzer {
     /** Uses of every value of {@code func}, in block/instruction order. Not cached: callers compute it once per function. */
     public Map<Value, List<ValueLastUse>> computeValueLastUses(Function func) {
         Map<Value, List<ValueLastUse>> lastUses = new HashMap<>();
-        for (int blockIdx5 = 0; blockIdx5 < func.getBlocks().size(); blockIdx5++) { BasicBlock block = func.getBlocks().get(blockIdx5);
+        for (BasicBlock block : func.getBlocks()) {
             List<Instruction> insts = block.getInstructions();
             for (int i = 0; i < insts.size(); i++) {
                 Instruction inst = insts.get(i);
                 if (inst.getOpcode() == Opcode.PHI) continue;
-                for (int operandIdx6 = 0; operandIdx6 < inst.getOperands().size(); operandIdx6++) { Value operand = inst.getOperands().get(operandIdx6);
+                for (Value operand : inst.getOperands()) {
                     if (operand == null) continue;
                     lastUses.computeIfAbsent(operand, k -> new ArrayList<>())
                         .add(new ValueLastUse(block, i, operand));
@@ -309,8 +308,7 @@ public class LivenessAnalyzer {
             Terminator term = block.getTerminator();
             if (term != null) {
                 List<? extends Value> jnLoop7 = terminatorOperands(term);
-                for (int jnIdx7 = 0; jnIdx7 < jnLoop7.size(); jnIdx7++) {
-                    Value operand = jnLoop7.get(jnIdx7);
+                for (Value operand : jnLoop7) {
                     if (operand == null) continue;
                     lastUses.computeIfAbsent(operand, k -> new ArrayList<>())
                         .add(new ValueLastUse(block, insts.size(), operand));
