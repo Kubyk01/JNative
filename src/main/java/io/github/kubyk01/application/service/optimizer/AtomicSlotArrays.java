@@ -630,6 +630,43 @@ final class AtomicSlotArrays {
         untypedWhy.add(why);
     }
 
+    private final Map<Value, Value> slotReceiverCache = new IdentityHashMap<>();
+
+    private Value slotReceiver(Value v) {
+        if (v == null) return null;
+        if (slotReceiverCache.containsKey(v)) return slotReceiverCache.get(v);
+        Value result = v;
+        Value cur = v;
+        Set<Value> seen = Collections.newSetFromMap(new IdentityHashMap<>());
+        while (cur instanceof Temporary t && t.getDefiningInstruction() != null && seen.add(cur)) {
+            Instruction def = t.getDefiningInstruction();
+            if (def.getOpcode() == Opcode.CAST || def.getOpcode() == Opcode.CHECKCAST || def.getOpcode() == Opcode.STORE) {
+                cur = def.getOperands().getFirst();
+                continue;
+            }
+            Op read = opOf(def);
+            if (read == null || (read.kind() != Kind.READ && read.kind() != Kind.CAS_WITNESS
+                && read.kind() != Kind.GET_AND_SET) || read.receiver() == null) break;
+            Value holder = read.receiver();
+            PointsToSet pts = alias.getPointsTo(holder);
+            if (pts != null && !pts.isEmpty() && !pts.containsUnknown()) {
+                result = holder;
+                break;
+            }
+            cur = holder;
+        }
+        slotReceiverCache.put(v, result);
+        return result;
+    }
+
+    private PointsToSet slotSites(Value v) {
+        return v == null ? null : alias.getPointsTo(slotReceiver(v));
+    }
+
+    private Set<String> slotContainers(Value v) {
+        return v == null ? null : containerClasses(slotReceiver(v));
+    }
+
     private String untypedConflict(String fam) {
         if (untypedOps.isEmpty()) return null;
         Set<String> containers = familyContainers(fam);
@@ -641,15 +678,15 @@ final class AtomicSlotArrays {
         for (int i = 0; i < untypedOps.size(); i++) {
             Op op = untypedOps.get(i);
             if (debug) {
-                PointsToSet r = op.receiver() == null ? null : alias.getPointsTo(op.receiver());
+                PointsToSet r = slotSites(op.receiver());
                 System.out.println("DBG   untyped " + untypedWhy.get(i) + " recv=" + (r == null ? "null" : r.size() + (r.containsUnknown() ? "+unknown" : ""))
-                    + " recvContainers=" + (op.receiver() == null ? null : containerClasses(op.receiver())));
+                    + " recvContainers=" + slotContainers(op.receiver()));
             }
             if (sites != null && op.receiver() != null) {
-                PointsToSet r = alias.getPointsTo(op.receiver());
+                PointsToSet r = slotSites(op.receiver());
                 if (r != null && !r.isEmpty() && !r.containsUnknown() && !r.intersects(sites)) continue;
             }
-            if (containers == null || op.receiver() == null || mayHoldContainer(op.receiver(), containers)) return untypedWhy.get(i);
+            if (containers == null || op.receiver() == null || mayHoldContainer(slotReceiver(op.receiver()), containers)) return untypedWhy.get(i);
         }
         return null;
     }
@@ -664,7 +701,7 @@ final class AtomicSlotArrays {
             boolean member = fam.equals(familyOfWrite(op))
                 || (op.kind() == Kind.READ && fam.equals(pendingBorrows.get(op.inst())));
             if (!member) continue;
-            PointsToSet r = op.receiver() == null ? null : alias.getPointsTo(op.receiver());
+            PointsToSet r = slotSites(op.receiver());
             if (r == null || r.isEmpty() || r.containsUnknown()) out = null;
             else out = PointsToSet.union(out, r);
         }
@@ -712,10 +749,10 @@ final class AtomicSlotArrays {
                 out = null;
                 break;
             }
-            Set<String> c = containerClasses(op.receiver());
+            Set<String> c = slotContainers(op.receiver());
             String dbg = System.getenv("JN_OWN_DEBUG");
             if (dbg != null && fam.contains(dbg)) {
-                PointsToSet r = alias.getPointsTo(op.receiver());
+                PointsToSet r = slotSites(op.receiver());
                 System.out.println("DBG   member " + op.kind() + " in " + op.inst().getParent().getFunction().getName()
                     + " recvPts=" + r.size() + (r.containsUnknown() ? "+unknown" : "") + " containers=" + c);
             }
