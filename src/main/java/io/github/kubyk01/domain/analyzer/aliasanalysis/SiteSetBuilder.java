@@ -1,6 +1,7 @@
 package io.github.kubyk01.domain.analyzer.aliasanalysis;
 
 import java.util.Arrays;
+import java.util.IdentityHashMap;
 
 public final class SiteSetBuilder {
 
@@ -11,6 +12,7 @@ public final class SiteSetBuilder {
     private int touchedCount;
     private int count;
     private boolean busy;
+    private IdentityHashMap<PointsToSet, Boolean> addedLargeSets;
 
     public static SiteSetBuilder acquire() {
         SiteSetBuilder b = LOCAL.get();
@@ -41,7 +43,11 @@ public final class SiteSetBuilder {
     }
 
     public void addAll(PointsToSet s) {
-        for (long c = s.cursor(); s.has(c); c = s.next(c)) add(s.id(c));
+        if (s.size() >= PointsToSet.DELTA_MIN_BASE) {
+            if (addedLargeSets == null) addedLargeSets = new IdentityHashMap<>();
+            if (addedLargeSets.put(s, Boolean.TRUE) != null) return;
+        }
+        s.addTo(this);
     }
 
     public PointsToSet buildOr(PointsToSet base) {
@@ -93,6 +99,7 @@ public final class SiteSetBuilder {
         }
         touchedCount = 0;
         count = 0;
+        if (addedLargeSets != null) addedLargeSets.clear();
         return k;
     }
 
@@ -100,5 +107,6 @@ public final class SiteSetBuilder {
         for (int t = 0; t < touchedCount; t++) words[touched[t]] = 0;
         touchedCount = 0;
         count = 0;
+        if (addedLargeSets != null) addedLargeSets.clear();
     }
 }

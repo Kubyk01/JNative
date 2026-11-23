@@ -563,9 +563,8 @@ public class DependencyResolver {
             if (!dependencyJars.isEmpty()) {
                 System.out.println("Loading " + dependencyJars.size()
                         + " Maven dependency jar(s) declared in META-INF/maven/*/pom.xml");
-                List<? extends Path> jnLoop13 = dependencyJars;
-                for (int jnIdx13 = 0; jnIdx13 < jnLoop13.size(); jnIdx13++) {
-                    Path depJar = jnLoop13.get(jnIdx13);
+                for (int jnIdx13 = 0; jnIdx13 < dependencyJars.size(); jnIdx13++) {
+                    Path depJar = ((List<? extends Path>) dependencyJars).get(jnIdx13);
                     System.out.println("  " + depJar.getFileName());
                     // Load the dependency's classes, skipping any class whose name
                     // is already in the map — the input jar must always win.
@@ -576,8 +575,7 @@ public class DependencyResolver {
                 if (!referencedJars.isEmpty()) {
                     System.out.println("Loading " + referencedJars.size()
                             + " additional jar(s) that provide classes referenced by the application");
-                    List<? extends Path> jnLoop14 = referencedJars;
-                    for (Path extraJar : jnLoop14) {
+                    for (Path extraJar : referencedJars) {
                         System.out.println("  " + extraJar.getFileName());
                         scanJar(extraJar, true);
                     }
@@ -716,8 +714,7 @@ public class DependencyResolver {
         } catch (IOException e) {
             log.warn("Failed to index nested jar {}: {}", nestedName, e.getMessage());
         }
-        List<? extends String> jnLoop16 = nestedClasses;
-        for (String internalName : jnLoop16) {
+        for (String internalName : nestedClasses) {
             recordPackageSource(internalName, location, manifest);
         }
     }
@@ -743,6 +740,15 @@ public class DependencyResolver {
         if (entry == null) return null;
         try (InputStream is = jar.getInputStream(entry)) {
             return is.readAllBytes();
+        }
+    }
+
+    public void loadReachableClassIndex() {
+        loadAllNestedClasses();
+        try {
+            jdkImage();
+        } catch (IOException e) {
+            throw new UncheckedIOException("Cannot read the JDK module image", e);
         }
     }
 

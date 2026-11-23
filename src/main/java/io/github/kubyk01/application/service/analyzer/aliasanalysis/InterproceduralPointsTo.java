@@ -643,31 +643,44 @@ public class InterproceduralPointsTo {
     private boolean evalGetField(FnState f, int i, Instruction inst, PointsToSet[] last, int o) {
         PointsToSet base = graph.get(inst.getOperands().getFirst());
         PointsToSet prev = last[o];
+        if (base.isEmpty()) return false;
         int fieldId = f.aux[i];
         int lo = f.loadOrdinal[i];
         long e0 = epoch.get();
-        boolean baseChanged = base != prev;
-        if (baseChanged) {
-            registerReaders(f, base, prev, fieldId, (String) f.info[i]);
-            last[o] = base;
-        }
-        if (base.isEmpty()) return false;
-        if (!baseChanged && !anyCellNewer(base, fieldId, f.loadEpoch[lo])) return false;
+        long since = f.loadEpoch[lo];
         f.loadEpoch[lo] = e0;
+        last[o] = base;
 
         Value res = inst.getResult();
         PointsToSet cur = graph.get(res);
+        PointsToSet old = prev == null ? PointsToSet.EMPTY : prev;
+        long oldPosition = old.cursor();
         PointsToSet single = null;
         SiteSetBuilder builder = null;
         try {
             for (long pos = base.cursor(); base.has(pos); pos = base.next(pos)) {
                 int id = base.id(pos);
+                boolean known = base == prev;
+                if (!known) {
+                    while (old.has(oldPosition) && old.id(oldPosition) < id) oldPosition = old.next(oldPosition);
+                    known = old.has(oldPosition) && old.id(oldPosition) == id;
+                }
                 PointsToSet s;
                 if (id == unknownId) {
+                    if (known) continue;
                     s = unknownSet;
                 } else {
-                    FieldCell c = graph.findFieldCell(id, fieldId);
-                    if (c == null) continue;
+                    FieldCell c;
+                    if (known) {
+                        c = graph.findFieldCell(id, fieldId);
+                        // The result already includes everything observed by the previous load.
+                        if (c == null || c.version() <= since) continue;
+                    } else {
+                        c = graph.fieldCell(id, fieldId, (String) f.info[i]);
+                        // Register before reading so a concurrent write either reaches this load
+                        // or schedules another evaluation.
+                        c.addReader(f.id, states.length);
+                    }
                     s = c.get();
                 }
                 if (s.isEmpty() || s == cur || s == single) continue;
@@ -689,29 +702,6 @@ public class InterproceduralPointsTo {
         }
     }
 
-    private void registerReaders(FnState f, PointsToSet base, PointsToSet prev, int fieldId, String field) {
-        int capacity = states.length;
-        PointsToSet old = prev == null ? PointsToSet.EMPTY : prev;
-        long j = old.cursor();
-        for (long c = base.cursor(); base.has(c); c = base.next(c)) {
-            int id = base.id(c);
-            if (id == unknownId) continue;
-            while (old.has(j) && old.id(j) < id) j = old.next(j);
-            if (old.has(j) && old.id(j) == id) continue;
-            graph.fieldCell(id, fieldId, field).addReader(f.id, capacity);
-        }
-    }
-
-    private boolean anyCellNewer(PointsToSet base, int fieldId, long since) {
-        for (long cur = base.cursor(); base.has(cur); cur = base.next(cur)) {
-            int id = base.id(cur);
-            if (id == unknownId) continue;
-            FieldCell c = graph.findFieldCell(id, fieldId);
-            if (c != null && c.version() > since) return true;
-        }
-        return false;
-    }
-
     private void evalPutField(FnState f, int i, Instruction inst, PointsToSet[] last, int o) {
         List<Value> ops = inst.getOperands();
         PointsToSet rhs = graph.get(ops.get(2));
@@ -722,26 +712,28 @@ public class InterproceduralPointsTo {
         if (base == lastBase && rhs == lastRhs) return;
         int fieldId = f.aux[i];
         String field = (String) f.info[i];
-        if (rhs == lastRhs) {
-            PointsToSet old = lastBase == null ? PointsToSet.EMPTY : lastBase;
-            long j = old.cursor();
-            for (long c = base.cursor(); base.has(c); c = base.next(c)) {
-                int id = base.id(c);
-                while (old.has(j) && old.id(j) < id) j = old.next(j);
-                if (old.has(j) && old.id(j) == id) continue;
-                writeField(id, fieldId, field, rhs);
-            }
-        } else {
-            for (long c = base.cursor(); base.has(c); c = base.next(c)) writeField(base.id(c), fieldId, field, rhs);
-            if ((f.flags[i] & F_UNKNOWN_FALLBACK) != 0) writeField(unknownId, fieldId, field, rhs);
+        boolean fallback = (f.flags[i] & F_UNKNOWN_FALLBACK) != 0;
+        PointsToSet old = lastBase == null ? PointsToSet.EMPTY : lastBase;
+        PointsToSet added = lastRhs == null || (old.isEmpty() && !fallback) ? rhs : rhs.minus(lastRhs);
+        long previous = old.cursor();
+        for (long position = base.cursor(); base.has(position); position = base.next(position)) {
+            int id = base.id(position);
+            while (old.has(previous) && old.id(previous) < id) previous = old.next(previous);
+            boolean known = old.has(previous) && old.id(previous) == id;
+            if (!known) writeField(id, fieldId, field, rhs, null, null);
+            else if (!added.isEmpty()) writeField(id, fieldId, field, added, lastRhs, rhs);
+        }
+        if (fallback && !added.isEmpty()) {
+            writeField(unknownId, fieldId, field, added, lastRhs, rhs);
         }
         last[o] = base;
         last[o + 1] = rhs;
     }
 
-    private void writeField(int siteId, int fieldId, String field, PointsToSet rhs) {
+    private void writeField(int siteId, int fieldId, String field, PointsToSet added,
+                            PointsToSet previous, PointsToSet current) {
         FieldCell cell = graph.fieldCell(siteId, fieldId, field);
-        if (cell.merge(rhs)) {
+        if (cell.merge(added, previous, current)) {
             cell.advanceVersion(epoch.incrementAndGet());
             cell.forEachReader(enqueuer);
         }

@@ -230,8 +230,6 @@ public class LlvmGlobalEmitter {
     private final Set<String> deferredStrings =
         Collections.synchronizedSet(new LinkedHashSet<>());
 
-    private final Set<String> emittedVtableThunks = ConcurrentHashMap.newKeySet();
-
     /**
      * Internal class names for which {@link #generateReflectionData()} has
      * emitted a {@code @refclass_*} mirror. Populated at the end of that
@@ -1375,7 +1373,8 @@ public class LlvmGlobalEmitter {
                                    String ifaceOrNull,
                                    String sig,
                                    ResolvedFn fn,
-                                   StringBuilder sb) {
+                                   StringBuilder sb,
+                                   Set<String> emittedThunks) {
         if (fn != null) {
             return "i8* bitcast (" + fn.type + " @" + fn.name + " to i8*)";
         }
@@ -1388,7 +1387,7 @@ public class LlvmGlobalEmitter {
 
         String thunkName = "__jnative_vtable_missing_" + slotId;
 
-        if (!emittedVtableThunks.add(thunkName)) {
+        if (!emittedThunks.add(thunkName)) {
             return "i8* bitcast (i8* (...)* @" + thunkName + " to i8*)";
         }
 
@@ -1416,6 +1415,7 @@ public class LlvmGlobalEmitter {
     private String generateVtables() {
         prepareLayouts();
         StringBuilder sb = new StringBuilder();
+        Set<String> emittedThunks = new HashSet<>();
         sb.append("\n; ----- Vtables (hierarchy-local slots) -----\n");
 
         List<ClassNode> allClasses = new ArrayList<>(resolver.getClassMap().values());
@@ -1444,7 +1444,7 @@ public class LlvmGlobalEmitter {
             for (int i = 0; i < layout.slots.size(); i++) {
                 String sig = layout.slots.get(i);
                 ResolvedFn fn = resolveVtableEntry(className, sig);
-                entries.set(i, vtableSlotEntry(className, null, sig, fn, sb));
+                entries.set(i, vtableSlotEntry(className, null, sig, fn, sb, emittedThunks));
             }
 
             String methodsName = "@vtable_methods_" + LlvmTypeMapper.sanitizeIdentifier(className);
@@ -1481,7 +1481,7 @@ public class LlvmGlobalEmitter {
                 for (int i = 0; i < ifaceLayout.slots.size(); i++) {
                     String sig = ifaceLayout.slots.get(i);
                     ResolvedFn fn = resolveVtableEntry(className, sig);
-                    entries.set(i, vtableSlotEntry(className, iface, sig, fn, sb));
+                    entries.set(i, vtableSlotEntry(className, iface, sig, fn, sb, emittedThunks));
                 }
 
                 String itableName = "@itable_"
@@ -1543,6 +1543,8 @@ public class LlvmGlobalEmitter {
             vtableNames.put(className, vtableName);
         }
 
+        // Lambda vtables can refer to the same unresolved Object slots as class vtables.
+        emitLambdaVtables(sb, emittedThunks);
         return sb.toString();
     }
 
@@ -1740,9 +1742,7 @@ public class LlvmGlobalEmitter {
         }
     }
 
-    public String emitLambdaVtables() {
-        prepareLayouts();
-        StringBuilder sb = new StringBuilder();
+    private void emitLambdaVtables(StringBuilder sb, Set<String> emittedThunks) {
         sb.append("\n; ----- Lambda vtables -----\n");
 
         VtableLayout objectLayout = getOrBuildClassLayout("java/lang/Object");
@@ -1757,7 +1757,7 @@ public class LlvmGlobalEmitter {
             for (int i = 0; i < objectLayout.slots.size(); i++) {
                 String sig = objectLayout.slots.get(i);
                 ResolvedFn fn = resolveVtableEntry("java/lang/Object", sig);
-                methodEntries.set(i, vtableSlotEntry("java/lang/Object", null, sig, fn, sb));
+                methodEntries.set(i, vtableSlotEntry("java/lang/Object", null, sig, fn, sb, emittedThunks));
             }
 
             String methodsName = "@vtable_methods_"
@@ -1881,7 +1881,7 @@ public class LlvmGlobalEmitter {
                         }
                     }
 
-                    entries.add(vtableSlotEntry(lambdaClassName, iface, sig, fn, sb));
+                    entries.add(vtableSlotEntry(lambdaClassName, iface, sig, fn, sb, emittedThunks));
                 }
 
                 // Bind the SAM slot to the lambda's own adaptor. The
@@ -1947,7 +1947,6 @@ public class LlvmGlobalEmitter {
 
             vtableLengths.put(lambdaClassName, methodLen);
         }
-        return sb.toString();
     }
 
     // =========================================================================
@@ -2081,7 +2080,42 @@ public class LlvmGlobalEmitter {
         for (List<String> defs : lines.values()) {
             if (defs.size() == 1) sb.append(defs.getFirst()).append("\n");
         }
+        if (countsLambdaCaptures()) {
+            for (LambdaInfo lambda : lambdaRegistry.values()) {
+                int[] offsets = lambdaCaptureOffsets(lambda.capturedTypes);
+                List<Integer> references = new ArrayList<>();
+                for (int i = 0; i < offsets.length; i++) {
+                    if ("i8*".equals(LlvmTypeMapper.toLlvmType(lambda.capturedTypes.get(i)))) {
+                        references.add(offsets[i]);
+                    }
+                }
+                if (references.isEmpty()) continue;
+                sb.append("@__jnative_rcfields_").append(RefCountPlan.symbolName(lambda.lambdaClassName))
+                    .append(" = constant [").append(references.size() + 1).append(" x i32] [i32 ")
+                    .append(references.size());
+                for (int offset : references) sb.append(", i32 ").append(offset);
+                sb.append("]\n");
+            }
+        }
         return sb.toString();
+    }
+
+    boolean countsLambdaCaptures() {
+        RefCountPlan plan = module.getRefCountPlan();
+        return plan != null && !plan.getCountedClasses().isEmpty();
+    }
+
+    static int[] lambdaCaptureOffsets(List<Type> capturedTypes) {
+        int[] offsets = new int[capturedTypes.size()];
+        int offset = OBJECT_HEADER_SIZE;
+        for (int i = 0; i < offsets.length; i++) {
+            Type type = capturedTypes.get(i);
+            int align = fieldAlignment(type);
+            offset = (offset + align - 1) & -align;
+            offsets[i] = offset;
+            offset += fieldSize(type);
+        }
+        return offsets;
     }
 
     private volatile Map<String, List<FieldNode>> phantomFields;

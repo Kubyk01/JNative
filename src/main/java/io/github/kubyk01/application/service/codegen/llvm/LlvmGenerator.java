@@ -51,7 +51,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
-import static io.github.kubyk01.util.LlvmUtil.getElementSizeOfType;
 
 @Slf4j
 public class LlvmGenerator implements LlvmGeneratorPort {
@@ -206,8 +205,6 @@ public class LlvmGenerator implements LlvmGeneratorPort {
             }
             globalSpools.add(spool);
         }
-        String lambdaVts    = globalEmitter.emitLambdaVtables();
-
         // The lambda struct text and the reflection ABI types take part in the
         // per-file prelude filtering, so they are materialised once here.
         StringBuilder extraBuf = new StringBuilder();
@@ -303,11 +300,7 @@ public class LlvmGenerator implements LlvmGeneratorPort {
         // ---- 2. Deferred strings are now fully known. Collect them. ----
         String deferred = globalEmitter.generateDeferredStringConstants();
 
-        // ---- 3. knownGlobals = every definition that lives in _module.ll,
-        //         deferred strings included. ----
-        // Parsed one by one rather than concatenated: globalDefs is the
-        // largest string in the generator and a joined copy doubles it.
-        knownGlobals.putAll(parseGlobalDecls(lambdaVts));
+        // ---- 3. Index the deferred string definitions as well. ----
         knownGlobals.putAll(parseGlobalDecls(deferred));
 
         // ---- 4. Functions without bodies: declarations for _module.ll. ----
@@ -358,8 +351,7 @@ public class LlvmGenerator implements LlvmGeneratorPort {
         // ---- 5. Write _module.ll. ----
         //
         // Order: the filtered prelude, then the externs, then the tail
-        // (globalDefs + lambdaVts + deferred + owner-less bodies +
-        // moduleDecls + runInit + main).
+        // (deferred + owner-less bodies + moduleDecls + runInit + main).
         //
         // The tail is assembled into a single string first, so the prelude
         // filter and the extern pass both see exactly the same content and do
@@ -371,8 +363,7 @@ public class LlvmGenerator implements LlvmGeneratorPort {
             : "";
         Files.deleteIfExists(moduleSpool);
 
-        String moduleTail = lambdaVts
-            + "\n" + deferred
+        String moduleTail = deferred
             + "\n" + moduleBodies
             + moduleDecls
             + runInit
@@ -2020,21 +2011,20 @@ public class LlvmGenerator implements LlvmGeneratorPort {
         /* -------- load captured fields from the lambda object --------- */
         List<Type>  capturedTypes = call.getCapturedTypes();
         List<Value> loadedCaptures = new ArrayList<>(capturedTypes.size());
-        int offset = 8;
+        int[] offsets = LlvmGlobalEmitter.lambdaCaptureOffsets(capturedTypes);
         Parameter lambdaObj = adaptorFunc.getParameters().getFirst();
 
-        {
-            for (int jnIdx21 = 0; jnIdx21 < capturedTypes.size(); jnIdx21++) { Type capType = ((List<? extends Type>) capturedTypes).get(jnIdx21);
+        for (int i = 0; i < capturedTypes.size(); i++) {
+            Type capType = capturedTypes.get(i);
             Instruction getField = new Instruction(Opcode.GET_FIELD);
             getField.addOperand(lambdaObj);
-            getField.addOperand(new Constant(Type.INT, offset));
+            getField.addOperand(new Constant(Type.INT, offsets[i]));
             Temporary tmp = builder.newTemporary(capType);
             getField.setResult(tmp);
             tmp.setDefiningInstruction(getField);
             entry.addInstruction(getField);
             loadedCaptures.add(tmp);
-            offset += getElementSizeOfType(capType);
-        } }
+        }
 
         /* -------- SAM parameters (skip the lambda receiver at slot 0) - */
         List<Value> samArgs = new ArrayList<>();

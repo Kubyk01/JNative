@@ -150,18 +150,23 @@ public class Orchestrator implements OrchestratorPort {
         }
         System.out.println("Parsed classes: " + resolver.getAllClasses().size());
 
+        ReachabilityAnalysis reachabilityObj = null;
         if (enableReachability || showReachability) {
             ReachabilityAnalysis reachability = new ReachabilityAnalysis(resolver);
+            reachabilityObj = reachability;
             reachability.setScheduler(scheduler);
             reachability.analyzeFromEntry(entryClass, entryMethod, entryDescriptor);
             reachability.applyMetadata(resolver.getReachabilityMetadata());
+            reachability.expandClassMapToDescriptorClosure();
+            reachability.ensureSuperclassClinitsReachable();
+            reachability.ensureInterfaceImplementationsReachable();
             if (showReachability) {
                 printReachability(reachability, includeSystem, debugName);
             }
         }
 
         // --- 2. Class analysis --------------------------------------------
-        ClassAnalysis analysis = new ClassAnalysis(resolver);
+        ClassAnalysis analysis = new ClassAnalysis(resolver, reachabilityObj);
         analysis.analyze();
         if (!noCompile) {
             try (RuntimeClasspath runtimeClasspath = RuntimeClasspath.create(path, resolver.getScannedJars(),

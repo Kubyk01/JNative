@@ -212,6 +212,11 @@ public final class PointsToSet extends AbstractSet<AllocationSite> {
 
     public PointsToSet copy() { return this; }
 
+    void addTo(SiteSetBuilder builder) {
+        for (int id : ids) builder.add(id);
+        for (int id : extra) builder.add(id);
+    }
+
     public boolean intersects(PointsToSet other) {
         if (other == null || isEmpty() || other.isEmpty()) return false;
         if (other == this) return true;
@@ -223,6 +228,20 @@ public final class PointsToSet extends AbstractSet<AllocationSite> {
             if (x < y) ca = next(ca); else cb = other.next(cb);
         }
         return false;
+    }
+
+    public PointsToSet minus(PointsToSet other) {
+        if (this == other) return EMPTY;
+        if (other.isEmpty()) return this;
+        int[] out = scratch(size());
+        int n = 0;
+        long previous = other.cursor();
+        for (long position = cursor(); has(position); position = next(position)) {
+            int id = id(position);
+            while (other.has(previous) && other.id(previous) < id) previous = other.next(previous);
+            if (!other.has(previous) || other.id(previous) != id) out[n++] = id;
+        }
+        return n == size() ? this : intern(out, n, false);
     }
 
     public static PointsToSet union(PointsToSet a, PointsToSet b) {
