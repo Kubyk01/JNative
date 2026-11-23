@@ -219,7 +219,6 @@ public class DestructorInserter {
         atomicSlots = new AtomicSlotArrays(module, resolver, aliasResult, escapeResult, reflectInfo);
         atomicSlots.compute();
         instrumentAtomicSlots();
-        instrumentWeakReferents();
         int instrumented = instrumentFieldOverwrites(lifetimeResult.getLiveOut());
         if (instrumented > 0) {
             log.info("DestructorInserter: instrumented {} field-overwrite release(s)",
@@ -341,7 +340,7 @@ public class DestructorInserter {
             Instruction inst = insts.get(i);
             if (inst.getOpcode() != Opcode.PUT_FIELD
                 || inst.isRcStore()
-                || refCounts.isWeakStore(inst)
+                || inst.isRcWeak()
                 || deathStores.contains(inst)
                 || (containerBorrows != null && containerBorrows.instrumentedKey(inst) != null)
                 || !shouldInstrumentPutField(inst)
@@ -379,47 +378,6 @@ public class DestructorInserter {
             }
         }
         return null;
-    }
-
-    /**
-     * Result of {@link #collectDestructorTypes(Instruction)}.
-     *
-     * @param types                   distinct destructor targets, one entry
-     *                                per unique {@code __destruct_*} symbol,
-     *                                in deterministic insertion order
-     * @param hasFilteredSystemTypes  true when at least one site in the
-     *                                field's points-to set was a system-class
-     *                                reference (which has no destructor and
-     *                                was therefore dropped from {@code types});
-     *                                forces the polymorphic path so that
-     *                                runtime vtable checks prevent a
-     *                                user-class destructor from being called
-     *                                on a system-class instance
-     */
-    private void instrumentWeakReferents() {
-        for (Function f : module.getFunctions()) {
-            if (f.getEntryBlock() == null || ContainerArrayBorrows.isDestructor(f)) continue;
-            for (BasicBlock block : f.getBlocks()) {
-                List<Instruction> insts = block.getInstructions();
-                for (int i = 0; i < insts.size(); i++) {
-                    Instruction inst = insts.get(i);
-                    if (inst.getOpcode() != Opcode.PUT_FIELD || !refCounts.isWeakStore(inst)) continue;
-                    Value base = inst.getOperands().get(0);
-                    Value rhs = inst.getOperands().get(2);
-                    Instruction get = new Instruction(Opcode.GET_FIELD);
-                    get.addOperand(base);
-                    get.addOperand(inst.getOperands().get(1));
-                    Temporary old = new Temporary(resolveFieldType(inst, rhs));
-                    get.setResult(old);
-                    old.setDefiningInstruction(get);
-                    get.setParent(block);
-                    insts.add(i, get);
-                    i++;
-                    insts.add(i + 1, runtimeCall(block, "__jnative_rc_weak", base, old, rhs));
-                    i++;
-                }
-            }
-        }
     }
 
     private void createStorageReleases() {
@@ -588,6 +546,21 @@ public class DestructorInserter {
         return call;
     }
 
+    /**
+     * Result of {@link #collectDestructorTypes(Instruction)}.
+     *
+     * @param types                   distinct destructor targets, one entry
+     *                                per unique {@code __destruct_*} symbol,
+     *                                in deterministic insertion order
+     * @param hasFilteredSystemTypes  true when at least one site in the
+     *                                field's points-to set was a system-class
+     *                                reference (which has no destructor and
+     *                                was therefore dropped from {@code types});
+     *                                forces the polymorphic path so that
+     *                                runtime vtable checks prevent a
+     *                                user-class destructor from being called
+     *                                on a system-class instance
+     */
     private record DtorCollection(List<Type> types,
                                   boolean hasFilteredSystemTypes) {}
 
@@ -1914,6 +1887,13 @@ private void emitDestructionGuard(BasicBlock entry,
         emitDestructionGuard(entry, thisParam, returnBlock, bodyFast, bodySlow);
 
         List<FieldNode> ownedFields = collectAllReferenceFields(classNode);
+        for (FieldNode field : ownedFields) {
+            if (RefCountPlanner.WEAK_OWNER.equals(field.getOwner()) && RefCountPlanner.WEAK_FIELD.equals(field.getName())) {
+                bodyFast.addInstruction(runtimeCall(bodyFast, "__jnative_weak_forget", thisParam));
+                bodySlow.addInstruction(runtimeCall(bodySlow, "__jnative_weak_forget", thisParam));
+                break;
+            }
+        }
 
         // ---- Fast path: destroy children, then __jnative_free_fast ----
         for (int jnIdx26 = 0; jnIdx26 < ownedFields.size(); jnIdx26++) {

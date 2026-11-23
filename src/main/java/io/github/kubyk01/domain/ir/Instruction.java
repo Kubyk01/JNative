@@ -26,6 +26,8 @@ public class Instruction {
     @Setter
     private boolean rcStore;
     @Setter
+    private boolean rcWeak;
+    @Setter
     private int rcHold = -1;
 
     public Instruction(Opcode opcode) {

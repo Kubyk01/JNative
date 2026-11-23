@@ -3,20 +3,14 @@
 
 #include "jnative_runtime.h"
 
-#define REFERENT_OFFSET OBJECT_HEADER_SIZE
-
 static jn_mutex_t reference_wait_mutex = JN_MUTEX_INITIALIZER;
 static jn_cond_t  reference_wait_cond  = JN_COND_INITIALIZER;
-
-static inline void** referent_slot(void* ref) {
-    return (void**)((char*)ref + REFERENT_OFFSET);
-}
 
 int32_t __jnative_fn_java_lang_ref_Reference_refersTo0__Ljava_lang_Object__Z(
         void* this_ref, void* o)
 {
     if (this_ref == NULL) return 0;
-    return (*referent_slot(this_ref) == o) ? 1 : 0;
+    return __atomic_load_n(__jnative_referent_slot(this_ref), __ATOMIC_ACQUIRE) == o;
 }
 
 void* __jnative_fn_java_lang_ref_Reference_get0___Ljava_lang_Object_(void* this_ref) {
@@ -24,7 +18,7 @@ void* __jnative_fn_java_lang_ref_Reference_get0___Ljava_lang_Object_(void* this_
         __jnative_throw_null_pointer_exception();
         return NULL;
     }
-    return __jnative_rc_load_ret(referent_slot(this_ref));
+    return __jnative_weak_load(__jnative_referent_slot(this_ref), __jnative_rc_ret_slot());
 }
 
 void __jnative_fn_java_lang_ref_Reference_clear0___V(void* this_ref) {
@@ -32,8 +26,7 @@ void __jnative_fn_java_lang_ref_Reference_clear0___V(void* this_ref) {
         __jnative_throw_null_pointer_exception();
         return;
     }
-    void* old = __atomic_exchange_n(referent_slot(this_ref), NULL, __ATOMIC_ACQ_REL);
-    __jnative_rc_weak(this_ref, old, NULL);
+    __jnative_weak_store(__jnative_referent_slot(this_ref), NULL);
 }
 
 int32_t __jnative_fn_java_lang_ref_Reference_hasReferencePendingList___Z(void) {

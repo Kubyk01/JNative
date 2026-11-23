@@ -956,7 +956,6 @@ static void jnative_release_retired(void* owner) {
     }
 }
 
-static void jn_rc_reclaim(void* p);
 static void jnative_release_storage(void* p);
 
 typedef struct JnEbrThread {
@@ -1034,9 +1033,7 @@ static void jn_ebr_collect(void) {
     }
     jn_ebr_retired_n = w;
     for (int i = 0; i < due_n; i++) {
-        uintptr_t tagged = (uintptr_t)due[i].ptr;
-        if (tagged & 1) jn_rc_reclaim((void*)(tagged & ~(uintptr_t)1));
-        else jnative_free_array_rc(due[i].ptr);
+        jnative_free_array_rc(due[i].ptr);
     }
     free(due);
 }
@@ -1120,23 +1117,9 @@ __attribute__((noinline)) void __jnative_ebr_discard_if(int32_t published, void*
     if (__jnative_release_owner(unpublished)) jnative_free_array_rc(unpublished);
 }
 
-static void jn_ebr_retire_tagged(void* tagged) {
-    jn_ebr_thread();
-    if (jn_ebr_retired_n == jn_ebr_retired_cap) {
-        int cap = jn_ebr_retired_cap == 0 ? 64 : jn_ebr_retired_cap * 2;
-        JnEbrRetired* grown = (JnEbrRetired*)realloc(jn_ebr_retired, (size_t)cap * sizeof(JnEbrRetired));
-        if (grown == NULL) return;
-        jn_ebr_retired = grown;
-        jn_ebr_retired_cap = cap;
-    }
-    jn_ebr_retired[jn_ebr_retired_n].ptr = tagged;
-    jn_ebr_retired[jn_ebr_retired_n].epoch = __atomic_load_n(&jn_ebr_global, __ATOMIC_SEQ_CST);
-    jn_ebr_retired_n++;
-    if (jn_ebr_retired_n >= 64 && (jn_ebr_retired_n & 31) == 0) jn_ebr_collect();
-}
-
 #define JN_RC_RETIRED   0x80000000u
-#define JN_RC_COUNT     0x7fffffffu
+#define JN_RC_RECHECK   0x40000000u
+#define JN_RC_COUNT     0x3fffffffu
 #define JN_RC_REF_ARRAY 1
 #define JN_RC_REFERENCE 2
 #define JN_RC_SLOTS     16384
@@ -1150,7 +1133,7 @@ typedef struct {
 
 typedef struct JnWeakNode {
     void*              referent;
-    void*              ref;
+    void**             slot;
     struct JnWeakNode* next;
 } JnWeakNode;
 
@@ -1159,13 +1142,17 @@ static JnRcInfo*  jn_rc_vals[JN_RC_SLOTS];
 static jn_mutex_t jn_rc_lock = JN_MUTEX_INITIALIZER;
 static JnRcInfo   jn_rc_plain = { -1, 0, NULL };
 static JnWeakNode* jn_weak[JN_WEAK_BUCKETS];
-static jn_mutex_t jn_weak_locks[64];
-static jn_once_t  jn_weak_once = JN_ONCE_INIT;
-static int        jn_referent_offset = -1;
+static jn_mutex_t jn_weak_mutex = JN_MUTEX_INITIALIZER;
 
-static void jn_weak_init(void) {
-    for (int i = 0; i < 64; i++) jn_mutex_init(&jn_weak_locks[i], NULL);
-    jn_referent_offset = jnative_field_offset_in(jnative_class_by_name("java/lang/ref/Reference"), "referent");
+void** __jnative_referent_slot(void* ref) {
+    static int offset;
+    int off = __atomic_load_n(&offset, __ATOMIC_ACQUIRE);
+    if (off == 0) {
+        off = jnative_field_offset_in(jnative_class_by_name("java/lang/ref/Reference"), "referent");
+        if (off <= 0) off = OBJECT_HEADER_SIZE;
+        __atomic_store_n(&offset, off, __ATOMIC_RELEASE);
+    }
+    return (void**)((char*)ref + off);
 }
 
 static int jn_rc_in_static(void* p) {
@@ -1263,74 +1250,67 @@ static JnRcInfo* jn_rc_of(void* p) {
     return jn_rc_info(vt);
 }
 
-static jn_mutex_t* jn_weak_lock(void* referent) {
-    return &jn_weak_locks[(size_t)(jnative_mix((uintptr_t)referent) >> 3) & 63];
+static size_t jn_weak_bucket(void* referent) {
+    return (size_t)(jnative_mix((uintptr_t)referent) & (JN_WEAK_BUCKETS - 1));
 }
 
-static void jn_weak_remove(void* ref, void* referent) {
-    if (referent == NULL) return;
-    size_t b = (size_t)(jnative_mix((uintptr_t)referent) & (JN_WEAK_BUCKETS - 1));
-    jn_mutex_t* lock = jn_weak_lock(referent);
-    jn_mutex_lock(lock);
-    JnWeakNode** pp = &jn_weak[b];
-    while (*pp != NULL) {
-        JnWeakNode* n = *pp;
-        if (n->ref == ref && n->referent == referent) {
-            *pp = n->next;
-            free(n);
-            break;
-        }
-        pp = &n->next;
-    }
-    jn_mutex_unlock(lock);
-}
-
-static void jn_weak_clear_all(void* referent) {
-    jn_once(&jn_weak_once, jn_weak_init);
-    if (jn_referent_offset <= 0) return;
-    size_t b = (size_t)(jnative_mix((uintptr_t)referent) & (JN_WEAK_BUCKETS - 1));
-    jn_mutex_t* lock = jn_weak_lock(referent);
-    jn_mutex_lock(lock);
-    JnWeakNode** pp = &jn_weak[b];
-    while (*pp != NULL) {
-        JnWeakNode* n = *pp;
-        if (n->referent == referent) {
-            void** slot = (void**)((char*)n->ref + jn_referent_offset);
-            void* expected = referent;
-            __atomic_compare_exchange_n(slot, &expected, NULL, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
-            *pp = n->next;
-            free(n);
+/* All registry operations and promotions share the lock with the hold snapshot. */
+static void jn_weak_clear_locked(void* referent) {
+    JnWeakNode** link = &jn_weak[jn_weak_bucket(referent)];
+    while (*link != NULL) {
+        JnWeakNode* node = *link;
+        if (node->referent == referent) {
+            __atomic_store_n(node->slot, NULL, __ATOMIC_RELEASE);
+            *link = node->next;
+            free(node);
         } else {
-            pp = &n->next;
+            link = &node->next;
         }
     }
-    jn_mutex_unlock(lock);
 }
 
-void __jnative_rc_weak(void* ref, void* old, void* referent) {
-    if (ref == NULL) return;
-    jn_once(&jn_weak_once, jn_weak_init);
-    if (old != NULL && old != referent) jn_weak_remove(ref, old);
-    if (referent == NULL || referent == old) return;
+void __jnative_weak_store(void** slot, void* referent) {
     JnRcInfo* info = jn_rc_of(referent);
-    if (info == NULL || info->offset < 0) return;
-    JnWeakNode* node = (JnWeakNode*)malloc(sizeof(JnWeakNode));
-    if (node == NULL) return;
-    node->referent = referent;
-    node->ref = ref;
-    size_t b = (size_t)(jnative_mix((uintptr_t)referent) & (JN_WEAK_BUCKETS - 1));
-    jn_mutex_t* lock = jn_weak_lock(referent);
-    jn_mutex_lock(lock);
-    node->next = jn_weak[b];
-    jn_weak[b] = node;
-    jn_mutex_unlock(lock);
+    JnWeakNode* node = NULL;
+    if (info != NULL && info->offset >= 0) {
+        node = (JnWeakNode*)malloc(sizeof(JnWeakNode));
+        if (node == NULL) __jnative_throw_out_of_memory_error_ctx("Reference.referent");
+        node->slot = slot;
+        node->referent = referent;
+    }
+    jn_mutex_lock(&jn_weak_mutex);
+    void* old = __atomic_load_n(slot, __ATOMIC_ACQUIRE);
+    if (old != NULL) {
+        JnWeakNode** link = &jn_weak[jn_weak_bucket(old)];
+        while (*link != NULL) {
+            JnWeakNode* item = *link;
+            if (item->slot == slot) {
+                *link = item->next;
+                free(item);
+                break;
+            }
+            link = &item->next;
+        }
+    }
+    if (node != NULL) {
+        size_t b = jn_weak_bucket(referent);
+        node->next = jn_weak[b];
+        jn_weak[b] = node;
+    }
+    __atomic_store_n(slot, referent, __ATOMIC_RELEASE);
+    jn_mutex_unlock(&jn_weak_mutex);
 }
 
-static void jn_rc_forget_reference(void* ref) {
-    jn_once(&jn_weak_once, jn_weak_init);
-    if (jn_referent_offset <= 0) return;
-    void* referent = __atomic_load_n((void**)((char*)ref + jn_referent_offset), __ATOMIC_ACQUIRE);
-    jn_weak_remove(ref, referent);
+void __jnative_weak_forget(void* ref) {
+    __jnative_weak_store(__jnative_referent_slot(ref), NULL);
+}
+
+void* __jnative_weak_load(void** slot, void** hold) {
+    jn_mutex_lock(&jn_weak_mutex);
+    void* value = __atomic_load_n(slot, __ATOMIC_ACQUIRE);
+    __atomic_store_n(hold, value, __ATOMIC_RELEASE);
+    jn_mutex_unlock(&jn_weak_mutex);
+    return value;
 }
 
 void __jnative_rc_inc(void* p) {
@@ -1495,17 +1475,17 @@ void* __jnative_rc_cae(void** addr, void* expected, void* desired, void** hold) 
 
 static void jn_rc_retire(void* p, uint32_t* word) {
     uint32_t cur = __atomic_load_n(word, __ATOMIC_ACQUIRE);
-    for (;;) {
-        if ((cur & JN_RC_COUNT) != 0 || (cur & JN_RC_RETIRED) != 0) return;
-        if (__atomic_compare_exchange_n(word, &cur, cur | JN_RC_RETIRED, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) break;
-    }
-    jn_weak_clear_all(p);
+    if ((cur & (JN_RC_COUNT | JN_RC_RETIRED)) != 0) return;
     if (jn_rc_retired_n == jn_rc_retired_cap) {
         int cap = jn_rc_retired_cap == 0 ? 1024 : jn_rc_retired_cap * 2;
         void** grown = (void**)realloc(jn_rc_retired, (size_t)cap * sizeof(void*));
-        if (grown == NULL) return;
+        if (grown == NULL) __jnative_throw_out_of_memory_error_ctx("ARC retirement");
         jn_rc_retired = grown;
         jn_rc_retired_cap = cap;
+    }
+    for (;;) {
+        if ((cur & JN_RC_COUNT) != 0 || (cur & JN_RC_RETIRED) != 0) return;
+        if (__atomic_compare_exchange_n(word, &cur, cur | JN_RC_RETIRED, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) break;
     }
     jn_rc_retired[jn_rc_retired_n++] = p;
     if (jn_rc_retired_n >= jn_rc_next_scan) jn_rc_scan();
@@ -1517,78 +1497,78 @@ static size_t jn_rc_hash(void* p, size_t mask) {
 
 static __thread int jn_rc_scanning;
 
+typedef struct {
+    void* object;
+    int held;
+} JnRcCandidate;
+
+static JnRcCandidate* jn_rc_candidate(JnRcCandidate* table, size_t mask, void* object) {
+    size_t i = jn_rc_hash(object, mask);
+    while (table[i].object != NULL && table[i].object != object) i = (i + 1) & mask;
+    return &table[i];
+}
+
 static void jn_rc_scan(void) {
     if (jn_rc_scanning || jn_rc_retired_n == 0) return;
-    jn_rc_scanning = 1;
-    __atomic_thread_fence(__ATOMIC_SEQ_CST);
-    size_t total = 1;
-    for (JnHoldThread* t = __atomic_load_n(&jn_hold_threads, __ATOMIC_ACQUIRE); t != NULL; t = t->next) {
-        total++;
-        for (JnHoldChunk* c = t->first; c != NULL; c = __atomic_load_n(&c->next, __ATOMIC_ACQUIRE)) {
-            total += __atomic_load_n(&c->high, __ATOMIC_ACQUIRE);
-        }
-    }
     size_t cap = 64;
-    while (cap < total * 2) cap <<= 1;
-    void** set = (void**)calloc(cap, sizeof(void*));
-    if (set == NULL) {
-        jn_rc_scanning = 0;
-        return;
-    }
+    while (cap < (size_t)jn_rc_retired_n * 2) cap <<= 1;
+    JnRcCandidate* candidates = (JnRcCandidate*)calloc(cap, sizeof(JnRcCandidate));
+    if (candidates == NULL) return;
+    jn_rc_scanning = 1;
     size_t mask = cap - 1;
+    for (int i = 0; i < jn_rc_retired_n; i++) {
+        void* p = jn_rc_retired[i];
+        jn_rc_candidate(candidates, mask, p)->object = p;
+    }
+
+    jn_mutex_lock(&jn_weak_mutex);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
     for (JnHoldThread* t = __atomic_load_n(&jn_hold_threads, __ATOMIC_ACQUIRE); t != NULL; t = t->next) {
         void* r = __atomic_load_n(&t->ret, __ATOMIC_ACQUIRE);
-        if (r != NULL) {
-            size_t i = jn_rc_hash(r, mask);
-            while (set[i] != NULL && set[i] != r) i = (i + 1) & mask;
-            set[i] = r;
-        }
+        if (r != NULL) jn_rc_candidate(candidates, mask, r)->held = 1;
         for (JnHoldChunk* c = t->first; c != NULL; c = __atomic_load_n(&c->next, __ATOMIC_ACQUIRE)) {
             size_t high = __atomic_load_n(&c->high, __ATOMIC_ACQUIRE);
             for (size_t k = 0; k < high; k++) {
                 void* v = __atomic_load_n(&c->slots[k], __ATOMIC_ACQUIRE);
-                if (v == NULL) continue;
-                size_t i = jn_rc_hash(v, mask);
-                while (set[i] != NULL && set[i] != v) i = (i + 1) & mask;
-                set[i] = v;
+                if (v != NULL) jn_rc_candidate(candidates, mask, v)->held = 1;
             }
         }
     }
-    int n = jn_rc_retired_n;
-    void** batch = (void**)malloc((size_t)n * sizeof(void*));
-    if (batch == NULL) {
-        free(set);
-        jn_rc_scanning = 0;
-        return;
-    }
-    memcpy(batch, jn_rc_retired, (size_t)n * sizeof(void*));
-    jn_rc_retired_n = 0;
-    for (int b = 0; b < n; b++) {
-        void* p = batch[b];
-        size_t i = jn_rc_hash(p, mask);
-        int held = 0;
-        while (set[i] != NULL) {
-            if (set[i] == p) {
-                held = 1;
-                break;
-            }
-            i = (i + 1) & mask;
-        }
-        if (held) {
-            if (jn_rc_retired_n == jn_rc_retired_cap) {
-                int grow = jn_rc_retired_cap == 0 ? 1024 : jn_rc_retired_cap * 2;
-                void** grown = (void**)realloc(jn_rc_retired, (size_t)grow * sizeof(void*));
-                if (grown == NULL) continue;
-                jn_rc_retired = grown;
-                jn_rc_retired_cap = grow;
-            }
-            jn_rc_retired[jn_rc_retired_n++] = p;
+    int keep = 0;
+    for (int i = 0; i < jn_rc_retired_n; i++) {
+        void* p = jn_rc_retired[i];
+        JnRcCandidate* candidate = jn_rc_candidate(candidates, mask, p);
+        if (candidate->held) {
+            jn_rc_retired[keep++] = p;
             continue;
         }
-        jn_rc_reclaim(p);
+        JnRcInfo* info = jn_rc_of(p);
+        uint32_t* word = (uint32_t*)((char*)p + info->offset);
+        uint32_t state = __atomic_load_n(word, __ATOMIC_ACQUIRE);
+        for (;;) {
+            // A strong owner may have handed the object to a new local while we
+            // scanned holds. Keep its retirement pending for a fresh snapshot.
+            int recheck = (state & JN_RC_RECHECK) && !(state & JN_RC_COUNT);
+            uint32_t next = recheck ? JN_RC_RETIRED : state & JN_RC_COUNT;
+            if (!__atomic_compare_exchange_n(word, &state, next, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) continue;
+            if (recheck) jn_rc_retired[keep++] = p;
+            if (recheck || (state & JN_RC_COUNT)) candidate->held = 1;
+            else jn_weak_clear_locked(p);
+            break;
+        }
     }
-    free(batch);
-    free(set);
+    jn_rc_retired_n = keep;
+    jn_mutex_unlock(&jn_weak_mutex);
+
+    /* Destructors can enqueue more candidates or unregister a Reference. */
+    for (size_t i = 0; i < cap; i++) {
+        void* p = candidates[i].object;
+        if (p == NULL || candidates[i].held) continue;
+        jnative_release_storage(p);
+        jnative_rc_release_fields(p);
+        __jnative_free(p);
+    }
+    free(candidates);
     jn_rc_next_scan = jn_rc_retired_n * 2 > 4096 ? jn_rc_retired_n * 2 : 4096;
     jn_rc_scanning = 0;
 }
@@ -1600,9 +1580,11 @@ void __jnative_rc_dec(void* p) {
     uint32_t cur = __atomic_load_n(word, __ATOMIC_ACQUIRE);
     for (;;) {
         if ((cur & JN_RC_COUNT) == 0) return;
-        if (__atomic_compare_exchange_n(word, &cur, cur - 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) break;
+        uint32_t next = cur - 1;
+        if ((cur & JN_RC_RETIRED) && (next & JN_RC_COUNT) == 0) next |= JN_RC_RECHECK;
+        if (__atomic_compare_exchange_n(word, &cur, next, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) break;
     }
-    if (((cur - 1) & JN_RC_COUNT) == 0) jn_rc_retire(p, word);
+    if ((cur & (JN_RC_COUNT | JN_RC_RETIRED)) == 1) jn_rc_retire(p, word);
 }
 
 void __jnative_rc_cas(int32_t ok, void* x, void* expected) {
@@ -1620,7 +1602,7 @@ void __jnative_rc_drop(void* p) {
 static void jnative_rc_release_fields(void* obj) {
     JnRcInfo* info = jn_rc_of(obj);
     if (info == NULL) return;
-    if (info->flags & JN_RC_REFERENCE) jn_rc_forget_reference(obj);
+    if (info->flags & JN_RC_REFERENCE) __jnative_weak_forget(obj);
     if (info->fields == NULL) return;
     int32_t n = info->fields[0];
     for (int32_t i = 1; i <= n; i++) {
@@ -1677,20 +1659,6 @@ void __jnative_rc_array_copy(void* src, int32_t srcPos, void* dest, int32_t dest
     void** d = (void**)((char*)dest + JAVA_ARR_HDR) + destPos;
     for (int32_t i = 0; i < length; i++) __jnative_rc_inc(s[i]);
     for (int32_t i = 0; i < length; i++) __jnative_rc_dec(d[i]);
-}
-
-static void jn_rc_reclaim(void* p) {
-    JnRcInfo* info = jn_rc_of(p);
-    if (info == NULL || info->offset < 0) return;
-    uint32_t* word = (uint32_t*)((char*)p + info->offset);
-    uint32_t cur = __atomic_load_n(word, __ATOMIC_ACQUIRE);
-    for (;;) {
-        if (__atomic_compare_exchange_n(word, &cur, cur & ~JN_RC_RETIRED, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) break;
-    }
-    if ((cur & JN_RC_COUNT) != 0) return;
-    jnative_release_storage(p);
-    jnative_rc_release_fields(p);
-    __jnative_free(p);
 }
 
 void __jnative_container_detach_clone(void* clone) {

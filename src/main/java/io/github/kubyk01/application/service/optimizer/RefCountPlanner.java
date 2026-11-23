@@ -43,8 +43,9 @@ final class RefCountPlanner {
     private final LifetimeAnalysisResult lifetime;
     private final RefCountPlan plan = new RefCountPlan();
     private final BitSet counted = new BitSet();
+    private final BitSet weakTargets = new BitSet();
     private final Set<Function> pinned = Collections.newSetFromMap(new IdentityHashMap<>());
-    private final Set<Instruction> weakStores = Collections.newSetFromMap(new IdentityHashMap<>());
+    private int weakStores;
     private final Set<String> relatedTypes = new HashSet<>();
 
     RefCountPlanner(Module module, DependencyResolver resolver, AliasAnalysisResult alias, LifetimeAnalysisResult lifetime) {
@@ -60,10 +61,6 @@ final class RefCountPlanner {
 
     boolean isPinned(Function f) {
         return pinned.contains(f);
-    }
-
-    boolean isWeakStore(Instruction inst) {
-        return weakStores.contains(inst);
     }
 
     boolean isCountedType(Type t) {
@@ -106,7 +103,7 @@ final class RefCountPlanner {
         int stores = markStores();
         module.setRefCountPlan(plan);
         System.out.println("RefCount: " + leaking.size() + " counted class(es), " + counted.cardinality() + " site(s), "
-            + stores + " counted store(s), " + weakStores.size() + " weak store(s), " + pinned.size() + " function(s) with hold slots, "
+            + stores + " counted store(s), " + weakStores + " weak store(s), " + pinned.size() + " function(s) with hold slots, "
             + plan.getCountedFields().size() + " holder class(es), " + plan.getCountedArrayTypes().size() + " holder array type(s) in "
             + (System.nanoTime() - started) / 1_000_000 + " ms");
     }
@@ -132,7 +129,10 @@ final class RefCountPlanner {
         PointsToGraph graph = alias.getGraph();
         BitSet out = new BitSet();
         for (int src = 0; src < n; src++) {
-            for (FieldCell cell : graph.fieldCells(src)) addAll(out, cell.get());
+            for (FieldCell cell : graph.fieldCells(src)) {
+                addAll(out, cell.get());
+                if (isWeakReferent(cell.field())) addAll(weakTargets, cell.get());
+            }
         }
         for (PointsToSet pts : graph.getStaticFieldPointsToMap().values()) addAll(out, pts);
         out.clear(AllocationSite.UNKNOWN.getId());
@@ -147,7 +147,8 @@ final class RefCountPlanner {
         if (t == null || !t.isReference() || t.isArray() || t.isUnknown() || t.isNull()) return null;
         String cls = t.getClassName();
         if (cls == null || cls.isEmpty() || cls.charAt(0) == '[' || cls.startsWith("__Lambda_")) return null;
-        if (LlvmUtil.isSystemClassName(cls)) return null;
+        // Intern tables own their WeakReference wrappers through ordinary strong array slots.
+        if (LlvmUtil.isSystemClassName(cls) && !"java/lang/ref/WeakReference".equals(cls)) return null;
         ClassNode node = resolver.getClassNode(cls);
         if (node == null || node.isExternal() || node.isInterface() || (node.getAccess() & Opcodes.ACC_ABSTRACT) != 0) return null;
         for (String c = superOf(cls); c != null; c = superOf(c)) {
@@ -285,6 +286,9 @@ final class RefCountPlanner {
             for (BasicBlock block : f.getBlocks()) {
                 for (Instruction inst : block.getInstructions()) {
                     Value res = inst.getResult();
+                    if (inst.getOpcode() == Opcode.GET_FIELD && isWeakReferent(extractFieldName(inst))) {
+                        inst.setRcWeak(true);
+                    }
                     if (inst.getOpcode() == Opcode.STORE) {
                         Value stored = inst.getOperands().isEmpty() ? null : inst.getOperands().getFirst();
                         if (inst.getLocalIndex() >= 0 && isReference(stored) && maybeCounted(stored)) {
@@ -295,8 +299,12 @@ final class RefCountPlanner {
                             }
                             inst.setRcHold(k);
                         }
-                    } else if (isReference(res) && maybeCounted(res)) {
+                    } else if (isReference(res) && (inst.isRcWeak() || maybeCounted(res))) {
                         inst.setRcHold(next++);
+                    }
+                    if (inst.getOpcode() == Opcode.NEW && isCountedType(res == null ? null : res.getType())
+                            && mayBeWeakTarget(res)) {
+                        inst.setRcWeak(true);
                     }
                     if (markStore(inst)) marked++;
                 }
@@ -320,7 +328,8 @@ final class RefCountPlanner {
                 }
                 String raw = extractFieldName(inst);
                 if (isWeakReferent(raw)) {
-                    weakStores.add(inst);
+                    inst.setRcWeak(true);
+                    weakStores++;
                     return false;
                 }
                 PointsToSet old = alias.getFieldPointsToForSites(alias.getPointsTo(ops.getFirst()), raw);
@@ -350,10 +359,18 @@ final class RefCountPlanner {
         }
     }
 
+    private boolean mayBeWeakTarget(Value value) {
+        PointsToSet sites = alias.getPointsTo(value);
+        if (weakTargets.get(AllocationSite.UNKNOWN.getId())) return true;
+        for (long c = sites.cursor(); sites.has(c); c = sites.next(c)) {
+            if (weakTargets.get(sites.id(c))) return true;
+        }
+        return false;
+    }
+
     private boolean isWeakReferent(String raw) {
-        if (raw == null) return false;
+        if (raw == null || !raw.endsWith("." + WEAK_FIELD)) return false;
         int dot = raw.lastIndexOf('.');
-        if (dot <= 0 || !WEAK_FIELD.equals(raw.substring(dot + 1))) return false;
         FieldNode f = resolver.getField(raw.substring(0, dot), raw.substring(dot + 1));
         return f != null && WEAK_OWNER.equals(f.getOwner());
     }

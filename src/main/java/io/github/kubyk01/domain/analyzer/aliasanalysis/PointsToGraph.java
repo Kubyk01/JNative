@@ -3,7 +3,9 @@ package io.github.kubyk01.domain.analyzer.aliasanalysis;
 import io.github.kubyk01.domain.ir.Value;
 import lombok.Getter;
 
+import java.util.Arrays;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -21,7 +23,7 @@ public class PointsToGraph {
     private static final int CHUNK_MASK = CHUNK_SIZE - 1;
     private static final FieldCell[] NO_CELLS = new FieldCell[0];
 
-    private final AtomicReferenceArray<AtomicReferenceArray<FieldCell[]>> siteCells =
+    private final AtomicReferenceArray<AtomicReferenceArray<SiteFields>> siteCells =
         new AtomicReferenceArray<>(1 << (31 - CHUNK_BITS));
     private final ConcurrentHashMap<String, Integer> fieldIds = new ConcurrentHashMap<>();
     private final AtomicInteger nextFieldId = new AtomicInteger();
@@ -72,50 +74,94 @@ public class PointsToGraph {
     }
 
     public FieldCell findFieldCell(int siteId, int fieldId) {
-        AtomicReferenceArray<FieldCell[]> chunk = siteCells.get(siteId >>> CHUNK_BITS);
+        AtomicReferenceArray<SiteFields> chunk = siteCells.get(siteId >>> CHUNK_BITS);
         if (chunk == null) return null;
-        FieldCell[] cells = chunk.get(siteId & CHUNK_MASK);
-        if (cells == null) return null;
-        int i = indexOf(cells, fieldId);
-        return i >= 0 ? cells[i] : null;
+        SiteFields fields = chunk.get(siteId & CHUNK_MASK);
+        return fields == null ? null : fields.find(fieldId);
     }
 
-    /** Binary search: cells are kept sorted by fieldId (wide sites such as statics have thousands). */
-    private static int indexOf(FieldCell[] cells, int fieldId) {
-        int lo = 0, hi = cells.length - 1;
-        while (lo <= hi) {
-            int mid = (lo + hi) >>> 1;
-            int id = cells[mid].fieldId();
-            if (id < fieldId) lo = mid + 1;
-            else if (id > fieldId) hi = mid - 1;
-            else return mid;
+    /** Append-only hash table. Readers can finish a lookup in an older table during growth. */
+    private static final class SiteFields {
+        private volatile AtomicReferenceArray<FieldCell> table = new AtomicReferenceArray<>(2);
+        private volatile FieldCell[] sorted;
+        private int size;
+
+        private static int slot(AtomicReferenceArray<FieldCell> cells, int id) {
+            int mask = cells.length() - 1;
+            int i = (id ^ (id >>> 16)) & mask;
+            while (true) {
+                FieldCell cell = cells.get(i);
+                if (cell == null || cell.fieldId() == id) return i;
+                i = (i + 1) & mask;
+            }
         }
-        return -(lo + 1);
+
+        FieldCell find(int id) {
+            AtomicReferenceArray<FieldCell> cells = table;
+            FieldCell cell = cells.get(slot(cells, id));
+            // A concurrent insertion may have filled a previously empty slot.
+            return cell != null && cell.fieldId() == id ? cell : null;
+        }
+
+        synchronized FieldCell insert(int id, String field) {
+            AtomicReferenceArray<FieldCell> cells = table;
+            int i = slot(cells, id);
+            FieldCell existing = cells.get(i);
+            if (existing != null) return existing;
+            if (size >= cells.length() / 2) {
+                AtomicReferenceArray<FieldCell> grown = new AtomicReferenceArray<>(cells.length() * 2);
+                for (int j = 0; j < cells.length(); j++) {
+                    FieldCell cell = cells.get(j);
+                    if (cell != null) grown.set(slot(grown, cell.fieldId()), cell);
+                }
+                cells = grown;
+                i = slot(cells, id);
+            }
+            FieldCell created = new FieldCell(id, field);
+            sorted = null;
+            cells.set(i, created);
+            size++;
+            table = cells;
+            return created;
+        }
+
+        FieldCell[] snapshot() {
+            FieldCell[] result = sorted;
+            return result != null ? result : sortedSnapshot();
+        }
+
+        private synchronized FieldCell[] sortedSnapshot() {
+            if (sorted == null) {
+                FieldCell[] result = new FieldCell[size];
+                int n = 0;
+                for (int i = 0; i < table.length(); i++) {
+                    FieldCell cell = table.get(i);
+                    if (cell != null) result[n++] = cell;
+                }
+                Arrays.sort(result, Comparator.comparingInt(FieldCell::fieldId));
+                sorted = result;
+            }
+            return sorted;
+        }
     }
 
     public FieldCell fieldCell(int siteId, int fieldId, String field) {
         int chunkIndex = siteId >>> CHUNK_BITS;
-        AtomicReferenceArray<FieldCell[]> chunk = siteCells.get(chunkIndex);
+        AtomicReferenceArray<SiteFields> chunk = siteCells.get(chunkIndex);
         if (chunk == null) {
-            AtomicReferenceArray<FieldCell[]> fresh = new AtomicReferenceArray<>(CHUNK_SIZE);
+            AtomicReferenceArray<SiteFields> fresh = new AtomicReferenceArray<>(CHUNK_SIZE);
             chunk = siteCells.compareAndExchange(chunkIndex, null, fresh);
             if (chunk == null) chunk = fresh;
         }
         int slot = siteId & CHUNK_MASK;
-        FieldCell created = null;
-        while (true) {
-            FieldCell[] cells = chunk.get(slot);
-            if (cells == null) cells = NO_CELLS;
-            int at = indexOf(cells, fieldId);
-            if (at >= 0) return cells[at];
-            at = -at - 1;
-            if (created == null) created = new FieldCell(fieldId, field);
-            FieldCell[] grown = new FieldCell[cells.length + 1];
-            System.arraycopy(cells, 0, grown, 0, at);
-            grown[at] = created;
-            System.arraycopy(cells, at, grown, at + 1, cells.length - at);
-            if (chunk.compareAndSet(slot, cells == NO_CELLS ? null : cells, grown)) return created;
+        SiteFields fields = chunk.get(slot);
+        if (fields == null) {
+            SiteFields fresh = new SiteFields();
+            fields = chunk.compareAndExchange(slot, null, fresh);
+            if (fields == null) fields = fresh;
         }
+        FieldCell cell = fields.find(fieldId);
+        return cell != null ? cell : fields.insert(fieldId, field);
     }
 
     public FieldCell fieldCell(AllocationSite site, String field) {
@@ -138,20 +184,16 @@ public class PointsToGraph {
         return getFieldPointsTo(site, field).containsUnknown();
     }
 
-    /** The site's field cells sorted by fieldId, without copying; callers must not modify the array. */
+    /** The site's field cells in a cached snapshot sorted by fieldId; callers must not modify the array. */
     public FieldCell[] fieldCells(int siteId) {
-        AtomicReferenceArray<FieldCell[]> chunk = siteCells.get(siteId >>> CHUNK_BITS);
+        AtomicReferenceArray<SiteFields> chunk = siteCells.get(siteId >>> CHUNK_BITS);
         if (chunk == null) return NO_CELLS;
-        FieldCell[] cells = chunk.get(siteId & CHUNK_MASK);
-        return cells == null ? NO_CELLS : cells;
+        SiteFields fields = chunk.get(siteId & CHUNK_MASK);
+        return fields == null ? NO_CELLS : fields.snapshot();
     }
 
     public Map<String, PointsToSet> getFieldPointsToMap(AllocationSite site) {
-        int siteId = site.getId();
-        AtomicReferenceArray<FieldCell[]> chunk = siteCells.get(siteId >>> CHUNK_BITS);
-        if (chunk == null) return null;
-        FieldCell[] cells = chunk.get(siteId & CHUNK_MASK);
-        if (cells == null) return null;
+        FieldCell[] cells = fieldCells(site.getId());
         Map<String, PointsToSet> out = null;
         for (FieldCell c : cells) {
             PointsToSet pts = c.get();
@@ -235,12 +277,12 @@ public class PointsToGraph {
 
     public void releaseSolverState() {
         for (int ci = 0, n = siteCells.length(); ci < n; ci++) {
-            AtomicReferenceArray<FieldCell[]> chunk = siteCells.get(ci);
+            AtomicReferenceArray<SiteFields> chunk = siteCells.get(ci);
             if (chunk == null) continue;
             for (int s = 0; s < CHUNK_SIZE; s++) {
-                FieldCell[] cells = chunk.get(s);
-                if (cells == null) continue;
-                for (FieldCell c : cells) c.clearReaders();
+                SiteFields fields = chunk.get(s);
+                if (fields == null) continue;
+                for (FieldCell c : fields.snapshot()) c.clearReaders();
             }
         }
         for (FieldCell c : staticCells.values()) c.clearReaders();

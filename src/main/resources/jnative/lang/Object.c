@@ -333,7 +333,27 @@ void *__jnative_fn_java_lang_Object_clone___Ljava_lang_Object_(void *obj) {
         return NULL;
     }
 
-    memcpy(clone, obj, (size_t)size);
+    // Copy Reference.referent through the registry so both wrappers can be
+    // cleared independently and the referent stays protected during the copy.
+    void** weak_slot = NULL;
+    for (struct ReflectionClass *c = cls; c != NULL; c = c->superclass) {
+        if (c->cname != NULL && strcmp(c->cname, "java/lang/ref/Reference") == 0) {
+            weak_slot = __jnative_referent_slot(obj);
+            break;
+        }
+    }
+    if (weak_slot != NULL) {
+        size_t offset = (char*)weak_slot - (char*)obj;
+        size_t tail = offset + sizeof(void*);
+        void* value = __jnative_weak_load(weak_slot, __jnative_rc_ret_slot());
+        memcpy(clone, obj, offset);
+        memcpy((char*)clone + tail, (char*)obj + tail, (size_t)size - tail);
+        void** dest = (void**)((char*)clone + offset);
+        *dest = NULL;
+        __jnative_weak_store(dest, value);
+    } else {
+        memcpy(clone, obj, (size_t)size);
+    }
     __jnative_container_detach_clone(clone);
     for (struct ReflectionClass *c = cls; c != NULL; c = c->superclass) {
         if (c->fields == NULL) continue;
@@ -343,6 +363,7 @@ void *__jnative_fn_java_lang_Object_clone___Ljava_lang_Object_(void *obj) {
             if ((f->modifiers & 0x0008) != 0 || desc == NULL) continue;
             if (desc[0] != 'L' && desc[0] != '[') continue;
             if (f->offset <= 0 || f->offset + (int)sizeof(void *) > size) continue;
+            if ((void**)((char*)obj + f->offset) == weak_slot) continue;
             __jnative_share(*(void **)((char *)clone + f->offset));
         }
     }
