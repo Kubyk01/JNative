@@ -38,6 +38,7 @@ import java.util.Set;
 import static io.github.kubyk01.util.LlvmUtil.canonicalCalleeKey;
 import static io.github.kubyk01.util.LlvmUtil.extractCalleeName;
 import static io.github.kubyk01.util.LlvmUtil.extractFieldName;
+import static io.github.kubyk01.util.LlvmUtil.lambdaCaptures;
 
 final class ContainerArrayBorrows {
 
@@ -545,7 +546,9 @@ final class ContainerArrayBorrows {
                             if (arg(inst, j) == v && (s == null || CallShape.has(s.retainedArgs(), j))) retained = true;
                         }
                     }
-                    if (storedElsewhere || retained) return "stored array also kept elsewhere in " + f.getName();
+                    if (storedElsewhere || retained || lambdaCaptures(inst).contains(v)) {
+                        return "stored array also kept elsewhere in " + f.getName();
+                    }
                     if (transfer && reaches(idx, sink, inst)) return "array used after it is passed on in " + f.getName();
                 }
             }

@@ -31,6 +31,7 @@ import java.util.Map;
 import java.util.Set;
 
 import static io.github.kubyk01.util.LlvmUtil.extractFieldName;
+import static io.github.kubyk01.util.LlvmUtil.lambdaCaptures;
 
 final class RefCountPlanner {
 
@@ -43,6 +44,7 @@ final class RefCountPlanner {
     private final LifetimeAnalysisResult lifetime;
     private final RefCountPlan plan = new RefCountPlan();
     private final BitSet counted = new BitSet();
+    private final BitSet captured = new BitSet();
     private final BitSet weakTargets = new BitSet();
     private final Set<Function> pinned = Collections.newSetFromMap(new IdentityHashMap<>());
     private int weakStores;
@@ -67,11 +69,20 @@ final class RefCountPlanner {
         return t != null && t.isReference() && !t.isArray() && t.getClassName() != null && plan.isCounted(t.getClassName());
     }
 
+    boolean isCapturedSite(AllocationSite site) {
+        return captured.get(site.getId());
+    }
+
     void compute() {
         long started = System.nanoTime();
         int n = AllocationSite.count();
         BitSet freed = freedSites();
         BitSet stored = heapStoredSites(n);
+        collectCapturedSites();
+        // A closure owns a strong reference even when the lifetime pass found
+        // a destruction point for another reference to the same allocation.
+        stored.or(captured);
+        freed.andNot(captured);
         Set<String> leaking = new HashSet<>();
         for (int id = 0; id < n; id++) {
             if (!stored.get(id) || freed.get(id)) continue;
@@ -137,6 +148,20 @@ final class RefCountPlanner {
         for (PointsToSet pts : graph.getStaticFieldPointsToMap().values()) addAll(out, pts);
         out.clear(AllocationSite.UNKNOWN.getId());
         return out;
+    }
+
+    private void collectCapturedSites() {
+        for (Function function : module.getFunctions()) {
+            for (BasicBlock block : function.getBlocks()) {
+                for (Instruction inst : block.getInstructions()) {
+                    if (inst.getOpcode() != Opcode.INVOKEDYNAMIC) continue;
+                    for (Value value : lambdaCaptures(inst)) {
+                        if (isReference(value)) addAll(captured, alias.getPointsTo(value));
+                    }
+                }
+            }
+        }
+        captured.clear(AllocationSite.UNKNOWN.getId());
     }
 
     private static void addAll(BitSet out, PointsToSet pts) {

@@ -1024,30 +1024,7 @@ public class LlvmGenerator implements LlvmGeneratorPort {
         return out;
     }
 
-    /** Stub from the first call site in {@code body}, else in {@code extra} (the two were once one concatenated string). */
-    private static List<String> lambdaMarkerInterfaces(InvokeDynamicInfo info) {
-        List<String> out = new ArrayList<>();
-        Handle bsm = info.bootstrapMethod();
-        if (bsm == null || !"altMetafactory".equals(bsm.getName())) return out;
-        Object[] args = info.bootstrapArgs();
-        if (args == null || args.length < 4 || !(args[3] instanceof Integer flags)) return out;
-        int i = 4;
-        if ((flags & java.lang.invoke.LambdaMetafactory.FLAG_MARKERS) != 0
-                && i < args.length && args[i] instanceof Integer count) {
-            i++;
-            for (int k = 0; k < count && i < args.length; k++, i++) {
-                if (args[i] instanceof org.objectweb.asm.Type t
-                        && t.getSort() == org.objectweb.asm.Type.OBJECT) {
-                    out.add(t.getInternalName());
-                }
-            }
-        }
-        if ((flags & java.lang.invoke.LambdaMetafactory.FLAG_SERIALIZABLE) != 0) {
-            out.add("java/io/Serializable");
-        }
-        return out;
-    }
-
+    /** Stub from the first call site in {@code body}, else in {@code extra}. */
     private static String weakNativeStub(String name, String body, String extra) {
         String stub = weakNativeStub(name, body);
         return stub != null || extra.isEmpty() ? stub : weakNativeStub(name, extra);
@@ -1659,8 +1636,7 @@ public class LlvmGenerator implements LlvmGeneratorPort {
         globals.append("declare void @__jnative_jni_preload_bundled()\n");
 
         List<? extends ClinitScheduleEntry> jnLoop18 = clinitSchedule;
-        for (int jnIdx18 = 0; jnIdx18 < jnLoop18.size(); jnIdx18++) {
-            ClinitScheduleEntry entry = jnLoop18.get(jnIdx18);
+        for (ClinitScheduleEntry entry : jnLoop18) {
             Function f = entry.function();
             String name = f.getName();
 
@@ -1984,11 +1960,8 @@ public class LlvmGenerator implements LlvmGeneratorPort {
         String samDescriptor = samType.getDescriptor();
         String samSig        = info.name() + samDescriptor;
 
-        String dynDescriptor = info.descriptor();
-        org.objectweb.asm.Type dynReturnType =
-            org.objectweb.asm.Type.getReturnType(dynDescriptor);
-        if (dynReturnType.getSort() != org.objectweb.asm.Type.OBJECT) return;
-        String samInterface = dynReturnType.getInternalName();
+        String samInterface = info.lambdaInterface();
+        if (samInterface == null) return;
 
         Type retType = TypeResolver.descToReturnType(samDescriptor);
         List<Type> paramTypes = TypeResolver.descToParamTypes(samDescriptor);
@@ -2002,7 +1975,7 @@ public class LlvmGenerator implements LlvmGeneratorPort {
 
         globalEmitter.registerLambdaClass(
             lambdaId, samInterface, samSig, adaptorName, call.getCapturedTypes(),
-            lambdaMarkerInterfaces(info));
+            info.lambdaMarkerInterfaces());
 
         builder.createBlock(adaptorName + "_entry");
         BasicBlock entry = builder.currentBlock();

@@ -56,6 +56,7 @@ public final class CallShapeEscapeStrategy implements EscapeAnalysisStrategies {
 
     private static final int[] NONE = new int[0];
     private static final Target UNKNOWN = new Target(NONE, true);
+    private static final Target LAMBDA_DISPATCH = new Target(NONE, true);
     private static final Target PURE_NATIVE = new Target(NONE, false);
     private static final Target FRESH_NATIVE = new Target(NONE, false);
     private static final Set<String> FRESH_NATIVES = Set.of(
@@ -489,6 +490,7 @@ public final class CallShapeEscapeStrategy implements EscapeAnalysisStrategies {
         private final Scheduler scheduler;
         private final List<Function> bodies = new ArrayList<>();
         private final Map<Function, Integer> index = new IdentityHashMap<>();
+        private final Set<String> lambdaInterfaces = new HashSet<>();
         private final Map<String, Target> directTargets = new ConcurrentHashMap<>();
         private final Map<String, Target> dispatchTargets = new ConcurrentHashMap<>();
         private final Map<String, Integer> implCache = new ConcurrentHashMap<>();
@@ -520,6 +522,7 @@ public final class CallShapeEscapeStrategy implements EscapeAnalysisStrategies {
                 if (f.getEntryBlock() == null || index.containsKey(f)) continue;
                 index.put(f, bodies.size());
                 bodies.add(f);
+                collectLambdaInterfaces(f);
             }
             int n = bodies.size();
             sites = new AtomicReferenceArray<>(n);
@@ -706,6 +709,26 @@ public final class CallShapeEscapeStrategy implements EscapeAnalysisStrategies {
             return out.toArray(new Site[0]);
         }
 
+        private void collectLambdaInterfaces(Function f) {
+            for (BasicBlock block : f.getBlocks()) {
+                for (Instruction inst : block.getInstructions()) {
+                    if (inst.getOpcode() != Opcode.INVOKEDYNAMIC
+                            || !(inst.getInvokedynamicData() instanceof InvokeDynamicInfo info)) continue;
+                    String iface = info.lambdaInterface();
+                    if (iface == null) continue;
+                    addLambdaInterface(iface);
+                    for (String marker : info.lambdaMarkerInterfaces()) addLambdaInterface(marker);
+                }
+            }
+        }
+
+        private void addLambdaInterface(String iface) {
+            if (!lambdaInterfaces.add(iface)) return;
+            ClassNode node = resolver.getClassNode(iface);
+            if (node == null) return;
+            for (String parent : node.getInterfaces()) addLambdaInterface(parent);
+        }
+
         private static boolean isArrayClone(Instruction inst) {
             if (!isDispatch(inst.getOpcode()) || inst.getOperands().isEmpty()) return false;
             String callee = extractCalleeName(inst);
@@ -755,6 +778,9 @@ public final class CallShapeEscapeStrategy implements EscapeAnalysisStrategies {
             int dot = paren < 0 ? -1 : callee.lastIndexOf('.', paren);
             if (dot <= 0) return UNKNOWN;
             String owner = callee.substring(0, dot);
+            // LLVM emits lambda adaptors after escape analysis. The class hierarchy
+            // cannot account for these implementations or their return values.
+            if (lambdaInterfaces.contains(owner)) return LAMBDA_DISPATCH;
             String name = callee.substring(dot + 1, paren);
             String descriptor = callee.substring(paren);
             if (owner.startsWith("[")) {
@@ -792,6 +818,9 @@ public final class CallShapeEscapeStrategy implements EscapeAnalysisStrategies {
         }
 
         private Target narrowed(Instruction inst, Target cha) {
+            // Points-to sets do not include lambda allocations. Narrow these calls
+            // only in refineByReturnClasses, which requires known allocation origins.
+            if (cha == LAMBDA_DISPATCH) return cha;
             if (!cha.unknown() && cha.functions().length <= 1) return cha;
             List<Value> ops = inst.getOperands();
             if (ops.isEmpty()) return cha;
@@ -853,7 +882,7 @@ public final class CallShapeEscapeStrategy implements EscapeAnalysisStrategies {
                     if (ops.isEmpty()) continue;
                     if (local == null) {
                         local = new IdentityHashMap<>();
-                        for (int q = 0; q < ss.length; q++) local.put(ss[q].inst(), ss[q].target());
+                        for (Site site : ss) local.put(site.inst(), site.target());
                     }
                     ArrayDeque<Value> work = new ArrayDeque<>();
                     work.push(ops.getFirst());
@@ -931,7 +960,7 @@ public final class CallShapeEscapeStrategy implements EscapeAnalysisStrategies {
                 }
                 Map<Instruction, Target> local = new IdentityHashMap<>();
                 Site[] ss = sites.get(g);
-                for (int q = 0; q < ss.length; q++) local.put(ss[q].inst(), ss[q].target());
+                for (Site s : ss) local.put(s.inst(), s.target());
                 ArrayDeque<Value> work = new ArrayDeque<>();
                 work.push(put.getOperands().get(2));
                 Set<String> c = allocatedClasses(work, local, memo, failed);
@@ -954,7 +983,7 @@ public final class CallShapeEscapeStrategy implements EscapeAnalysisStrategies {
             Function f = bodies.get(g);
             Map<Instruction, Target> local = new IdentityHashMap<>();
             Site[] ss = sites.get(g);
-            for (int q = 0; q < ss.length; q++) local.put(ss[q].inst(), ss[q].target());
+            for (Site s : ss) local.put(s.inst(), s.target());
             ArrayDeque<Value> work = new ArrayDeque<>();
             for (int b = 0; b < f.getBlocks().size(); b++) {
                 Terminator term = f.getBlocks().get(b).getTerminator();
@@ -1996,7 +2025,7 @@ public final class CallShapeEscapeStrategy implements EscapeAnalysisStrategies {
                             return false;
                         }
                         if (loadedSlots.add(slot)) {
-                            for (int k = 0; k < st.size(); k++) work.push(st.get(k).getOperands().getFirst());
+                            for (Instruction instruction : st) work.push(instruction.getOperands().getFirst());
                         }
                     }
                     case CALL, VIRTUAL_CALL, INTERFACE_CALL, STATIC_CALL, SPECIAL_CALL -> {
@@ -2032,7 +2061,7 @@ public final class CallShapeEscapeStrategy implements EscapeAnalysisStrategies {
                             if (res != null) work.push(res);
                             List<Instruction> ld = loads.get(inst.getLocalIndex());
                             if (ld != null && inst.getOperands().getFirst() == v) {
-                                for (int k = 0; k < ld.size(); k++) work.push(ld.get(k).getResult());
+                                for (Instruction instruction : ld) work.push(instruction.getResult());
                             }
                         }
                         case CALL, VIRTUAL_CALL, INTERFACE_CALL, STATIC_CALL, SPECIAL_CALL -> {
@@ -2058,8 +2087,8 @@ public final class CallShapeEscapeStrategy implements EscapeAnalysisStrategies {
                     }
                 }
             }
-            for (int k = 0; k < thrown.size(); k++) {
-                if (alias.contains(thrown.get(k))) return false;
+            for (Value value : thrown) {
+                if (alias.contains(value)) return false;
             }
             return true;
         }

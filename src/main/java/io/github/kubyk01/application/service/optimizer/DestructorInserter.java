@@ -1335,7 +1335,8 @@ public class DestructorInserter {
         int ownerFieldId = graph.findFieldId(fieldKey);
         for (int id : destroyed) {
             AllocationSite site = AllocationSite.byId(id);
-            if (staticFieldSites.contains(site) || liveOutSet.contains(site)) return false;
+            if (staticFieldSites.contains(site) || liveOutSet.contains(site)
+                    || refCounts.isCapturedSite(site)) return false;
             if (id + 1 >= inboundStart.length) return false;
             for (int e = inboundStart[id]; e < inboundStart[id + 1]; e++) {
                 int src = inboundSrc[e];
@@ -2463,6 +2464,8 @@ private void emitDestructionGuard(BasicBlock entry,
         // always a concrete class (an abstract class cannot have a NEW)
         // or an array type, so the call is well-typed.
         boolean countedSite = refCounts.isCountedType(site.getType());
+        // A live closure can still reach this allocation after the local reference dies.
+        if (refCounts.isCapturedSite(site) && (isHeap || !countedSite)) return;
         String target = countedSite ? "__jnative_rc_drop" : dtor.getName();
         Instruction call = new Instruction(Opcode.STATIC_CALL);
         call.addOperand(new Constant(Type.reference(target), target));
