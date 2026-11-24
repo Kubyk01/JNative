@@ -158,9 +158,6 @@ public class DestructorInserter {
                 continue;
             }
 
-            // STACK objects live in the stack frame; their fields are
-            // released through the frame teardown, so a per-use
-            // destructor is not needed for them.
             if (escapeResult.getSiteStatus(site) == EscapeStatus.STACK) continue;
 
             Type type = site.getType();

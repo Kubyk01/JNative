@@ -1564,7 +1564,10 @@ public class Compiler implements CompilerPort {
         for (String g : definedGlobals) {
             if (g.startsWith("gv_")
                 || g.startsWith("vtable_")
-                || g.startsWith("__type_info_")) {
+                || g.startsWith("__type_info_")
+                || g.startsWith("__jnative_rcfields_")
+                || g.startsWith("__jnative_rcoff_")
+                || g.startsWith("__jnative_rcarray_")) {
                 exports.add(g);
             }
         }
@@ -1581,6 +1584,8 @@ public class Compiler implements CompilerPort {
         // ------------------------------------------------------------------
         for (String f : definedFunctions) {
             if (f.startsWith("__destruct_")) {
+                exports.add(f);
+            } else if (f.startsWith("__jnative_storage_")) {
                 exports.add(f);
             } else if (f.startsWith("fn_")
                     && (f.endsWith("__clinit____V") || f.endsWith("__init____V"))) {
