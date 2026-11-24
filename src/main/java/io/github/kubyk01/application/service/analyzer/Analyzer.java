@@ -335,24 +335,52 @@ public class Analyzer {
             });
         }
 
+        final int nodeWords = (nodes.size() + 63) >>> 6;
+        final long[][] writerMask = new long[fieldReaders.length][];
+        final IntArrayList[] readerFields = new IntArrayList[nodes.size()];
         for (int fld = 0; fld < fieldReaders.length; fld++) {
             if (fieldReaders[fld] == null || fieldWriters[fld] == null) continue;
-            fieldWriters[fld].sortUnique();
-            int[] writers = fieldWriters[fld].toArray();
-            fieldReaders[fld].sortUnique();
-            for (int r = 0; r < fieldReaders[fld].size(); r++) {
-                int reader = fieldReaders[fld].get(r);
-                if (Arrays.binarySearch(writers, reader) >= 0) continue;
-                for (int writer : writers) edges[reader].add(writer);
+            long[] mask = new long[nodeWords];
+            IntArrayList writers = fieldWriters[fld];
+            for (int w = 0; w < writers.size(); w++) {
+                int writer = writers.get(w);
+                mask[writer >>> 6] |= 1L << writer;
+            }
+            writerMask[fld] = mask;
+            IntArrayList readers = fieldReaders[fld];
+            for (int r = 0; r < readers.size(); r++) {
+                int reader = readers.get(r);
+                if (readerFields[reader] == null) readerFields[reader] = new IntArrayList();
+                readerFields[reader].add(fld);
             }
         }
+        forEachIndexParallel(nodes.size(), reader -> {
+            IntArrayList fields = readerFields[reader];
+            if (fields == null) return;
+            int rw = reader >>> 6;
+            long rbit = 1L << reader;
+            long[] acc = new long[nodeWords];
+            for (int fi = 0; fi < fields.size(); fi++) {
+                long[] mask = writerMask[fields.get(fi)];
+                if ((mask[rw] & rbit) != 0) continue;
+                for (int w = 0; w < nodeWords; w++) acc[w] |= mask[w];
+            }
+            IntArrayList out = edges[reader];
+            for (int w = 0; w < nodeWords; w++) {
+                long word = acc[w];
+                while (word != 0) {
+                    out.add((w << 6) + Long.numberOfTrailingZeros(word));
+                    word &= word - 1;
+                }
+            }
+        });
 
         int[][] adjacency = new int[nodes.size()][];
-        for (int i = 0; i < adjacency.length; i++) {
+        forEachIndexParallel(adjacency.length, i -> {
             edges[i].sortUnique();
             adjacency[i] = edges[i].toArray();
             edges[i] = null;
-        }
+        });
 
         Set<String> cyclicClasses = new LinkedHashSet<>();
         for (int i : cyclicNodes(adjacency)) cyclicClasses.add(nodes.get(i));
@@ -1193,34 +1221,64 @@ public class Analyzer {
             baseEdges += d.size();
         }
 
-        int dedupAt = 2 * allInit.size() + 16;
+        final int[] initOrdinal = new int[liveFunctions.size()];
+        Arrays.fill(initOrdinal, -1);
+        final IntArrayList ordinalToIdx = new IntArrayList();
+        for (Function f : allInit) {
+            Integer idxObj = funcIndex.get(f.getName());
+            if (idxObj == null || initOrdinal[idxObj] >= 0) continue;
+            initOrdinal[idxObj] = ordinalToIdx.size();
+            ordinalToIdx.add(idxObj);
+        }
+        final int initWords = (ordinalToIdx.size() + 63) >>> 6;
+        final long[][] writerMask = new long[fieldList.size()][];
+        final IntArrayList[] readerFields = new IntArrayList[ordinalToIdx.size()];
         for (int fieldId = 0; fieldId < fieldList.size(); fieldId++) {
             IntArrayList writers = fieldWriters[fieldId];
             IntArrayList readers = fieldReaders[fieldId];
             if (writers == null || writers.isEmpty() || readers == null) continue;
+            long[] mask = new long[initWords];
+            for (int wi = 0; wi < writers.size(); wi++) {
+                int ord = initOrdinal[writers.get(wi)];
+                mask[ord >>> 6] |= 1L << ord;
+            }
+            writerMask[fieldId] = mask;
             for (int ri = 0; ri < readers.size(); ri++) {
-                int reader = readers.get(ri);
-                IntArrayList rd = depsList[reader];
-                if (rd == null) continue;
-                for (int wi = 0; wi < writers.size(); wi++) {
-                    int writer = writers.get(wi);
-                    if (writer != reader) rd.add(writer);
-                }
-                if (rd.size() > dedupAt) rd.sortUnique();
+                int ord = initOrdinal[readers.get(ri)];
+                if (readerFields[ord] == null) readerFields[ord] = new IntArrayList();
+                readerFields[ord].add(fieldId);
             }
         }
+        forEachIndexParallel(ordinalToIdx.size(), ord -> {
+            IntArrayList fields = readerFields[ord];
+            if (fields == null) return;
+            int reader = ordinalToIdx.get(ord);
+            IntArrayList rd = depsList[reader];
+            if (rd == null) return;
+            long[] acc = new long[initWords];
+            for (int fi = 0; fi < fields.size(); fi++) {
+                long[] mask = writerMask[fields.get(fi)];
+                for (int w = 0; w < initWords; w++) acc[w] |= mask[w];
+            }
+            acc[ord >>> 6] &= ~(1L << ord);
+            for (int w = 0; w < initWords; w++) {
+                long word = acc[w];
+                while (word != 0) {
+                    rd.add(ordinalToIdx.get((w << 6) + Long.numberOfTrailingZeros(word)));
+                    word &= word - 1;
+                }
+            }
+        });
 
         int[][] deps = new int[liveFunctions.size()][];
-        int finalEdges = 0;
-        for (Function f : allInit) {
-            Integer idxObj = funcIndex.get(f.getName());
-            if (idxObj == null) continue;
-            int idx = idxObj;
+        forEachIndexParallel(ordinalToIdx.size(), ord -> {
+            int idx = ordinalToIdx.get(ord);
             IntArrayList d = depsList[idx];
             d.sortUnique();
             deps[idx] = d.toArray();
-            finalEdges += deps[idx].length;
-        }
+        });
+        int finalEdges = 0;
+        for (int ord = 0; ord < ordinalToIdx.size(); ord++) finalEdges += deps[ordinalToIdx.get(ord)].length;
         int provenanceEdges = finalEdges - baseEdges;
         if (provenanceEdges > 0) {
             System.out.println("Added " + provenanceEdges
@@ -1524,9 +1582,15 @@ public class Analyzer {
         Set<Function> tainted = new HashSet<>();
         Deque<Function> work = new ArrayDeque<>();
 
-        List<? extends Function> jnLoop53 = module.getFunctions();
-        for (Function f : jnLoop53) {
-            if (f.getEntryBlock() == null) continue;
+        final List<? extends Function> functions = module.getFunctions();
+        final int n = functions.size();
+        final Function[][] targetsOf = new Function[n][];
+        final boolean[] callsJni = new boolean[n];
+        forEachIndexParallel(n, i -> {
+            Function f = functions.get(i);
+            if (f.getEntryBlock() == null) return;
+            List<Function> targets = new ArrayList<>();
+            boolean jni = false;
             for (BasicBlock b : f.getBlocks()) {
                 for (Instruction inst : b.getInstructions()) {
                     Opcode op = inst.getOpcode();
@@ -1536,12 +1600,23 @@ public class Analyzer {
                         Function target = resolveCallTarget(module, extractCalleeConstant(inst, k));
                         if (target == null) continue;
                         if (target.isJniNative() && target.getEntryBlock() == null) {
-                            if (tainted.add(f)) work.add(f);
+                            jni = true;
                         } else {
-                            callers.computeIfAbsent(target, x -> new HashSet<>()).add(f);
+                            targets.add(target);
                         }
                     }
                 }
+            }
+            targetsOf[i] = targets.toArray(new Function[0]);
+            callsJni[i] = jni;
+        });
+        for (int i = 0; i < n; i++) {
+            Function[] targets = targetsOf[i];
+            if (targets == null) continue;
+            Function f = functions.get(i);
+            if (callsJni[i] && tainted.add(f)) work.add(f);
+            for (Function target : targets) {
+                callers.computeIfAbsent(target, x -> new HashSet<>()).add(f);
             }
         }
 

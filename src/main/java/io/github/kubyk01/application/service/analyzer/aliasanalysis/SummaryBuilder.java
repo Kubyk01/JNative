@@ -85,17 +85,17 @@ public class SummaryBuilder {
         // not cascade into its tens of thousands of trigger sites. See
         // LlvmUtil.isLazyClinitWrapper.
         Map<String, Function> byName = new HashMap<>(allLive.size() * 2);
-        {
-            for (int jnIdx2 = 0; jnIdx2 < allLive.size(); jnIdx2++) { Function f = ((List<? extends Function>) allLive).get(jnIdx2);
+
+        for (int jnIdx2 = 0; jnIdx2 < allLive.size(); jnIdx2++) {
+            Function f = ((List<? extends Function>) allLive).get(jnIdx2);
             byName.put(f.getName(), f);
-        } }
+        }
 
         Map<Function, List<Function>> callees = new HashMap<>(allLive.size() * 2);
         Map<String, Set<Function>> callers = new HashMap<>(allLive.size() * 2);
 
-        {
-            for (int jnIdx3 = 0; jnIdx3 < allLive.size(); jnIdx3++) { Function f = ((List<? extends Function>) allLive).get(jnIdx3);
-            List<Function> out = new ArrayList<>();
+        List<List<String>> calleeKeys = LlvmUtil.parallelMapOrdered(allLive, scheduler, f -> {
+            List<String> keys = new ArrayList<>();
             Set<String> seen = new HashSet<>();
             for (BasicBlock block : f.getBlocks()) {
                 for (Instruction inst : block.getInstructions()) {
@@ -115,19 +115,26 @@ public class SummaryBuilder {
                     if (isLazyClinitWrapper(calleeKey)) {
                         continue;
                     }
-
-                    if (!seen.add(calleeKey)) {
-                        continue;
+                    if (seen.add(calleeKey)) {
+                        keys.add(calleeKey);
                     }
-                    Function callee = byName.get(calleeKey);
-                    if (callee != null) {
-                        out.add(callee);
-                    }
-                    callers.computeIfAbsent(calleeKey, k -> new HashSet<>(4)).add(f);
                 }
             }
+            return keys;
+        });
+
+        for (int i = 0; i < allLive.size(); i++) {
+            Function f = allLive.get(i);
+            List<Function> out = new ArrayList<>();
+            for (String calleeKey : calleeKeys.get(i)) {
+                Function callee = byName.get(calleeKey);
+                if (callee != null) {
+                    out.add(callee);
+                }
+                callers.computeIfAbsent(calleeKey, k -> new HashSet<>(4)).add(f);
+            }
             callees.put(f, out);
-        } }
+        }
 
         // ---- SCCs in reverse topological order -------------------------
         //
@@ -139,13 +146,45 @@ public class SummaryBuilder {
         List<List<Function>> sccs = computeSCCs(allLive, callees);
 
         // ---- Process SCCs bottom-up -----------------------------------
-        int totalProcessed = 0;
+        Map<Function, Integer> sccOf = new HashMap<>(allLive.size() * 2);
+        for (int s = 0; s < sccs.size(); s++) {
+            for (Function f : sccs.get(s)) sccOf.put(f, s);
+        }
+        int[] level = new int[sccs.size()];
+        int maxLevel = 0;
         int maxSccSize = 0;
-        {
-            for (int jnIdx4 = 0; jnIdx4 < sccs.size(); jnIdx4++) { List<Function> scc = ((List<? extends List<Function>>) sccs).get(jnIdx4);
+        for (int s = 0; s < sccs.size(); s++) {
+            List<Function> scc = sccs.get(s);
             if (scc.size() > maxSccSize) maxSccSize = scc.size();
-            totalProcessed += processSCC(scc, callers);
-        } }
+            int lv = 0;
+            for (Function f : scc) {
+                for (Function callee : callees.get(f)) {
+                    Integer cs = sccOf.get(callee);
+                    if (cs != null && cs != s) lv = Math.max(lv, level[cs] + 1);
+                }
+            }
+            level[s] = lv;
+            if (lv > maxLevel) maxLevel = lv;
+        }
+        List<List<Integer>> singlesByLevel = new ArrayList<>(maxLevel + 1);
+        List<List<Integer>> groupsByLevel = new ArrayList<>(maxLevel + 1);
+        for (int lv = 0; lv <= maxLevel; lv++) {
+            singlesByLevel.add(new ArrayList<>());
+            groupsByLevel.add(new ArrayList<>());
+        }
+        for (int s = 0; s < sccs.size(); s++) {
+            (sccs.get(s).size() == 1 ? singlesByLevel : groupsByLevel).get(level[s]).add(s);
+        }
+
+        int totalProcessed = 0;
+        for (int lv = 0; lv <= maxLevel; lv++) {
+            List<Integer> counts = LlvmUtil.parallelMapOrdered(
+                singlesByLevel.get(lv), scheduler, s -> processSCC(sccs.get(s), callers));
+            for (int c : counts) totalProcessed += c;
+            for (int s : groupsByLevel.get(lv)) {
+                totalProcessed += processSCC(sccs.get(s), callers);
+            }
+        }
 
         System.out.println("SummaryBuilder: converged after " + sccs.size()
             + " SCC(s) (largest " + maxSccSize + " function(s)), "
