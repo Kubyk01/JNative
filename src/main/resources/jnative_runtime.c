@@ -271,7 +271,7 @@ typedef struct {
 static JNativeFreedSet jnative_freed_set  = { NULL, 0, 0 };
 static jn_mutex_t jnative_freed_lock = JN_MUTEX_INITIALIZER;
 
-static inline uintptr_t jnative_mix(uintptr_t p) {
+static inline __attribute__((always_inline)) uintptr_t jnative_mix(uintptr_t p) {
     p ^= p >> 33;
     p *= 0xff51afd7ed558ccdULL;
     p ^= p >> 33;
@@ -1160,24 +1160,121 @@ static jn_mutex_t jn_weak_mutex = JN_MUTEX_INITIALIZER;
 typedef struct JnRcArray {
     void* array;
     uint32_t state;
-    struct JnRcArray* next;
 } JnRcArray;
 
-/* Keep the Java array header and its inline and static representations intact. */
-static JnRcArray* jn_rc_arrays[JN_RC_SLOTS];
+#define JN_RC_SHARD_BITS 6
+#define JN_RC_TOMB       ((void*)1)
 
-static JnRcArray** jn_rc_array_link(void* p) {
-    JnRcArray** link = &jn_rc_arrays[jnative_mix((uintptr_t)p) & (JN_RC_SLOTS - 1)];
-    while (*link != NULL && (*link)->array != p) link = &(*link)->next;
-    return link;
+typedef struct __attribute__((aligned(64))) {
+    int         lock;
+    size_t      cap;
+    size_t      used;
+    size_t      live;
+    void**      keys;
+    JnRcArray** nodes;
+} JnRcShard;
+
+/* Keep the Java array header and its inline and static representations intact. */
+static JnRcShard jn_rc_shards[1u << JN_RC_SHARD_BITS];
+
+static JnRcShard* jn_rc_shard(uintptr_t h) {
+    return &jn_rc_shards[h >> (sizeof(uintptr_t) * 8 - JN_RC_SHARD_BITS)];
+}
+
+static void jn_rc_shard_lock(JnRcShard* s) {
+    while (__atomic_exchange_n(&s->lock, 1, __ATOMIC_ACQUIRE)) {
+        while (__atomic_load_n(&s->lock, __ATOMIC_RELAXED)) jn_yield();
+    }
+}
+
+static void jn_rc_shard_unlock(JnRcShard* s) {
+    __atomic_store_n(&s->lock, 0, __ATOMIC_RELEASE);
+}
+
+static size_t jn_rc_shard_slot(JnRcShard* s, void* p, uintptr_t h) {
+    if (s->cap == 0) return 0;
+    size_t mask = s->cap - 1;
+    for (size_t i = (size_t)h & mask;; i = (i + 1) & mask) {
+        void* k = s->keys[i];
+        if (k == p) return i;
+        if (k == NULL) return s->cap;
+    }
+}
+
+static int jn_rc_shard_grow(JnRcShard* s) {
+    size_t cap = 256;
+    while (cap < (s->live + 1) * 4) cap <<= 1;
+    void** keys = (void**)calloc(cap, sizeof(void*));
+    JnRcArray** nodes = (JnRcArray**)calloc(cap, sizeof(JnRcArray*));
+    if (keys == NULL || nodes == NULL) {
+        free(keys);
+        free(nodes);
+        return 0;
+    }
+    for (size_t j = 0; j < s->cap; j++) {
+        void* k = s->keys[j];
+        if (k == NULL || k == JN_RC_TOMB) continue;
+        size_t i = (size_t)jnative_mix((uintptr_t)k) & (cap - 1);
+        while (keys[i] != NULL) i = (i + 1) & (cap - 1);
+        keys[i] = k;
+        nodes[i] = s->nodes[j];
+    }
+    free(s->keys);
+    free(s->nodes);
+    s->keys = keys;
+    s->nodes = nodes;
+    s->cap = cap;
+    s->used = s->live;
+    return 1;
+}
+
+static JnRcArray* jn_rc_array_find(void* p) {
+    uintptr_t h = jnative_mix((uintptr_t)p);
+    JnRcShard* s = jn_rc_shard(h);
+    jn_rc_shard_lock(s);
+    size_t i = jn_rc_shard_slot(s, p, h);
+    JnRcArray* array = i < s->cap ? s->nodes[i] : NULL;
+    jn_rc_shard_unlock(s);
+    return array;
+}
+
+static int jn_rc_array_insert(JnRcArray* array) {
+    uintptr_t h = jnative_mix((uintptr_t)array->array);
+    JnRcShard* s = jn_rc_shard(h);
+    jn_rc_shard_lock(s);
+    if ((s->used + 1) * 2 > s->cap && !jn_rc_shard_grow(s)) {
+        jn_rc_shard_unlock(s);
+        return 0;
+    }
+    size_t mask = s->cap - 1;
+    size_t i = (size_t)h & mask;
+    while (s->keys[i] != NULL && s->keys[i] != JN_RC_TOMB) i = (i + 1) & mask;
+    if (s->keys[i] == NULL) s->used++;
+    s->keys[i] = array->array;
+    s->nodes[i] = array;
+    s->live++;
+    jn_rc_shard_unlock(s);
+    return 1;
+}
+
+static JnRcArray* jn_rc_array_remove(void* p) {
+    uintptr_t h = jnative_mix((uintptr_t)p);
+    JnRcShard* s = jn_rc_shard(h);
+    jn_rc_shard_lock(s);
+    size_t i = jn_rc_shard_slot(s, p, h);
+    JnRcArray* array = NULL;
+    if (i < s->cap) {
+        array = s->nodes[i];
+        s->keys[i] = JN_RC_TOMB;
+        s->nodes[i] = NULL;
+        s->live--;
+    }
+    jn_rc_shard_unlock(s);
+    return array;
 }
 
 static int jn_rc_managed_array(void* p) {
-    if (p == NULL) return 0;
-    jn_mutex_lock(&jn_weak_mutex);
-    int managed = *jn_rc_array_link(p) != NULL;
-    jn_mutex_unlock(&jn_weak_mutex);
-    return managed;
+    return p != NULL && jn_rc_array_find(p) != NULL;
 }
 
 void** __jnative_referent_slot(void* ref) {
@@ -1290,7 +1387,7 @@ static uint32_t* jn_rc_word_locked(void* p) {
     JnRcInfo* info = jn_rc_of(p);
     if (info == NULL) return NULL;
     if (info->offset >= 0) return (uint32_t*)((char*)p + info->offset);
-    JnRcArray* array = *jn_rc_array_link(p);
+    JnRcArray* array = jn_rc_array_find(p);
     return array == NULL ? NULL : &array->state;
 }
 
@@ -1401,22 +1498,13 @@ static void jn_rc_inc_locked(void* p) {
 static int jn_rc_queue_locked(void* p);
 
 static int jn_rc_apply(void* p, int (*op)(uint32_t*)) {
-    JnRcInfo* info = jn_rc_of(p);
-    if (info == NULL) return 0;
-    int r;
+    uint32_t* word = jn_rc_word_locked(p);
+    if (word == NULL) return 0;
+    int r = op(word);
     int ok = 1;
-    if (info->offset >= 0) {
-        r = op((uint32_t*)((char*)p + info->offset));
-        if (r == 2) {
-            jn_mutex_lock(&jn_weak_mutex);
-            ok = jn_rc_queue_locked(p);
-            jn_mutex_unlock(&jn_weak_mutex);
-        }
-    } else {
+    if (r == 2) {
         jn_mutex_lock(&jn_weak_mutex);
-        uint32_t* word = jn_rc_word_locked(p);
-        r = word == NULL ? 0 : op(word);
-        if (r == 2) ok = jn_rc_queue_locked(p);
+        ok = jn_rc_queue_locked(p);
         jn_mutex_unlock(&jn_weak_mutex);
     }
     if (!ok) __jnative_throw_out_of_memory_error_ctx("ARC retirement");
@@ -1453,6 +1541,8 @@ typedef struct JnHoldThread {
     JnHoldChunk*         first;
     void*                ret;
     jn_mutex_t           lock;
+    uint32_t             seq;
+    int                  scan_req;
     struct JnHoldThread* next;
 } JnHoldThread;
 
@@ -1467,7 +1557,7 @@ static void** jn_rc_retired;
 static size_t jn_rc_retired_n;
 static size_t jn_rc_retired_cap;
 static int    jn_rc_scan_busy;
-#define JN_RC_SCAN_MIN 1024
+#define JN_RC_SCAN_MIN 8192
 static size_t jn_rc_scan_at = JN_RC_SCAN_MIN;
 
 static void jn_rc_scan(void);
@@ -1476,16 +1566,28 @@ static void jn_rc_maybe_scan(void) {
     if (__atomic_load_n(&jn_rc_retired_n, __ATOMIC_RELAXED) >= __atomic_load_n(&jn_rc_scan_at, __ATOMIC_RELAXED)) jn_rc_scan();
 }
 
+static void jn_hold_write(JnHoldThread* t, void** hold, void* value) {
+    uint32_t s = t->seq;
+    __atomic_store_n(&t->seq, s + 1, __ATOMIC_RELAXED);
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    __atomic_store_n(hold, value, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&t->seq, s + 2, __ATOMIC_RELEASE);
+}
+
 static void jn_hold_set(void** hold, void* value) {
     if (__atomic_load_n(hold, __ATOMIC_RELAXED) == value) return;
     JnHoldThread* t = jn_hold_self;
     if (value == NULL || t == NULL) {
-        __atomic_store_n(hold, value, __ATOMIC_RELEASE);
+        __atomic_store_n(hold, value, __ATOMIC_SEQ_CST);
         return;
     }
-    jn_mutex_lock(&t->lock);
-    __atomic_store_n(hold, value, __ATOMIC_RELEASE);
-    jn_mutex_unlock(&t->lock);
+    if (__atomic_load_n(&t->scan_req, __ATOMIC_ACQUIRE)) {
+        jn_mutex_lock(&t->lock);
+        jn_hold_write(t, hold, value);
+        jn_mutex_unlock(&t->lock);
+        return;
+    }
+    jn_hold_write(t, hold, value);
 }
 
 static JnHoldChunk* jn_hold_new_chunk(size_t cap) {
@@ -1679,12 +1781,12 @@ static void jn_rc_register_array(void* p, void** hold) {
         array->state = JN_RC_RETIRED;
         jn_hold_set(hold, p);
         jn_mutex_lock(&jn_weak_mutex);
-        if (jn_rc_queue_locked(p)) {
-            JnRcArray** link = jn_rc_array_link(p);
-            array->next = *link;
-            *link = array;
-            jn_mutex_unlock(&jn_weak_mutex);
-            return;
+        if (jn_rc_array_insert(array)) {
+            if (jn_rc_queue_locked(p)) {
+                jn_mutex_unlock(&jn_weak_mutex);
+                return;
+            }
+            jn_rc_array_remove(p);
         }
         jn_mutex_unlock(&jn_weak_mutex);
         jn_hold_set(hold, NULL);
@@ -1713,6 +1815,16 @@ static void jn_rc_mark_held(JnRcCandidate* table, size_t mask, void* v) {
     if (v == NULL) return;
     JnRcCandidate* candidate = jn_rc_candidate(table, mask, v);
     if (candidate->object == v) candidate->held = 1;
+}
+
+static void jn_rc_mark_thread(JnRcCandidate* table, size_t mask, JnHoldThread* t) {
+    jn_rc_mark_held(table, mask, __atomic_load_n(&t->ret, __ATOMIC_ACQUIRE));
+    for (JnHoldChunk* c = t->first; c != NULL; c = __atomic_load_n(&c->next, __ATOMIC_ACQUIRE)) {
+        size_t top = __atomic_load_n(&c->top, __ATOMIC_ACQUIRE);
+        for (size_t k = 0; k < top; k++) {
+            jn_rc_mark_held(table, mask, __atomic_load_n(&c->slots[k], __ATOMIC_ACQUIRE));
+        }
+    }
 }
 
 static int jn_rc_reclaim_pending(void) {
@@ -1748,15 +1860,30 @@ static int jn_rc_reclaim_pending(void) {
         __atomic_thread_fence(__ATOMIC_SEQ_CST);
         jn_mutex_lock(&jn_hold_list_lock);
         for (JnHoldThread* t = jn_hold_threads; t != NULL; t = t->next) {
-            jn_mutex_lock(&t->lock);
-            jn_rc_mark_held(candidates, mask, __atomic_load_n(&t->ret, __ATOMIC_ACQUIRE));
-            for (JnHoldChunk* c = t->first; c != NULL; c = __atomic_load_n(&c->next, __ATOMIC_ACQUIRE)) {
-                size_t top = __atomic_load_n(&c->top, __ATOMIC_ACQUIRE);
-                for (size_t k = 0; k < top; k++) {
-                    jn_rc_mark_held(candidates, mask, __atomic_load_n(&c->slots[k], __ATOMIC_ACQUIRE));
-                }
+            if (t == jn_hold_self) {
+                jn_rc_mark_thread(candidates, mask, t);
+                continue;
             }
-            jn_mutex_unlock(&t->lock);
+            int locked = 0;
+            for (int attempt = 0;; attempt++) {
+                if (attempt == 3) {
+                    __atomic_store_n(&t->scan_req, 1, __ATOMIC_SEQ_CST);
+                    jn_mutex_lock(&t->lock);
+                    locked = 1;
+                }
+                uint32_t s1 = __atomic_load_n(&t->seq, __ATOMIC_ACQUIRE);
+                if (s1 & 1u) {
+                    jn_yield();
+                    continue;
+                }
+                jn_rc_mark_thread(candidates, mask, t);
+                __atomic_thread_fence(__ATOMIC_ACQUIRE);
+                if (__atomic_load_n(&t->seq, __ATOMIC_RELAXED) == s1) break;
+            }
+            if (locked) {
+                jn_mutex_unlock(&t->lock);
+                __atomic_store_n(&t->scan_req, 0, __ATOMIC_RELEASE);
+            }
         }
         jn_mutex_unlock(&jn_hold_list_lock);
     }
@@ -1778,12 +1905,7 @@ static int jn_rc_reclaim_pending(void) {
             jn_rc_retired[keep++] = p;
         } else {
             jn_weak_clear_locked(p);
-            JnRcArray** link = jn_rc_array_link(p);
-            if (*link != NULL) {
-                JnRcArray* array = *link;
-                *link = array->next;
-                free(array);
-            }
+            free(jn_rc_array_remove(p));
         }
     }
     for (size_t i = n; i < jn_rc_retired_n; i++) jn_rc_retired[keep++] = jn_rc_retired[i];
@@ -3263,9 +3385,33 @@ static void jnative_init_universal_vtables(void) {
         __jnative_own_class_vtable("java/io/Serializable");
 }
 
+#define JN_IOF_CACHE 1024
+
+typedef struct {
+    void*  vt;
+    void** ti;
+    int    result;
+} JnIofEntry;
+
+static __thread JnIofEntry jn_iof_cache[JN_IOF_CACHE];
+
+static int jn_instanceof_slow(void* first_word, void** type_info);
+
 int __jnative_instanceof(void* obj, void** type_info) {
     if (obj == NULL || type_info == NULL) return 0;
     void* first_word = *(void**)obj;
+    if (*type_info == first_word) return 1;
+    size_t i = (size_t)(jnative_mix((uintptr_t)first_word ^ ((uintptr_t)type_info * 31u)) & (JN_IOF_CACHE - 1));
+    JnIofEntry* e = &jn_iof_cache[i];
+    if (e->vt == first_word && e->ti == type_info) return e->result;
+    int result = jn_instanceof_slow(first_word, type_info);
+    e->vt = first_word;
+    e->ti = type_info;
+    e->result = result;
+    return result;
+}
+
+static int jn_instanceof_slow(void* first_word, void** type_info) {
     void** ti = type_info;
     while (*ti) { if (*ti == first_word) return 1; ti++; }
     if (!__jnative_is_class_mirror(first_word)) return 0;
