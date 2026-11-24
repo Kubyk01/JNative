@@ -179,6 +179,10 @@ public class LlvmFunctionEmitter {
 
         currentEntryBlock = func.getEntryBlock();
         rcHoldCount = func.getRcHolds();
+        if (rcHoldCount == 0 && func.getBlocks().stream().flatMap(block -> block.getInstructions().stream())
+                .anyMatch(inst -> inst.isStackAllocated() || inst.isRcStore() || inst.isRcWeak())) {
+            rcHoldCount = 1;
+        }
         buildTryCatchInfo(func);
         computeTryRegions(func);
         tryCrossingValues.addAll(computeTryCrossingValues(func));
@@ -620,6 +624,9 @@ public class LlvmFunctionEmitter {
                         sb.append("  call void @__jnative_rc_drop(i8* ").append(object).append(")\n");
                     }
                 }
+                case NEW_ARRAY -> {
+                    if (!inst.isRcManagedArray()) emitHold(sb, inst, inst.getResult());
+                }
                 case STORE -> emitHold(sb, inst, inst.getOperands().getFirst());
                 case GET_FIELD, ALOAD, GET_STATIC -> { }
                 default -> {
@@ -687,7 +694,7 @@ public class LlvmFunctionEmitter {
         String ref = castValueToType(sb, getLlvmValue(sb, value), t, Type.reference("java/lang/Object"));
         String hp = holdPointer(sb, inst);
         if (hp == null) return;
-        sb.append("  store atomic i8* ").append(ref).append(", i8** ").append(hp).append(" release, align 8\n");
+        sb.append("  call void @__jnative_rc_hold(i8** ").append(hp).append(", i8* ").append(ref).append(")\n");
     }
 
     private boolean emitHeldLoad(StringBuilder sb, Instruction inst, String resultName, String llvmType, String typedPointer) {
@@ -2286,6 +2293,8 @@ public class LlvmFunctionEmitter {
                     String allocName = newAux("stack_alloc");
                     pendingSlotDeclarations.add(
                             "  " + allocName + " = alloca " + structType + ", align 8\n");
+                    String cleanup = newAux("stack_cleanup");
+                    pendingSlotDeclarations.add("  " + cleanup + " = alloca [2 x i8*], align 8\n");
 
                     String gepReg = newAux("alloc_gep");
                     sb.append("  ").append(gepReg)
@@ -2323,6 +2332,11 @@ public class LlvmFunctionEmitter {
                     valuePointers.put(inst.getResult(),
                             new StackAlloc(allocName, structType));
                     valueMapper.setValue(inst.getResult(), null);
+                    String cleanupPtr = newAux("stack_cleanup_ptr");
+                    sb.append("  ").append(cleanupPtr).append(" = bitcast [2 x i8*]* ")
+                            .append(cleanup).append(" to i8**\n");
+                    sb.append("  call void @__jnative_rc_stack_push(i8* ").append(i8Ptr)
+                            .append(", i8** ").append(cleanupPtr).append(")\n");
                     break;
                 }
 
@@ -2395,6 +2409,17 @@ public class LlvmFunctionEmitter {
                 int elemSize = getElementSizeOfType(elemType);
 
                 String sizeRef = coerceSizeToInt(sb, sizeVal, getLlvmValue(sb, sizeVal));
+                String arrClassName = arrayClassDescriptorFor(elemTypeName);
+                if (arrClassName == null) arrClassName = "[Ljava/lang/Object;";
+                String arrClassRef = globalEmitter.getRefClassGlobalName(arrClassName);
+
+                if (inst.isRcManagedArray()) {
+                    String hold = holdPointer(sb, inst);
+                    sb.append("  ").append(resultName).append(" = call i8* @__jnative_rc_new_array(")
+                            .append("i8* bitcast (%ReflectionClass* ").append(arrClassRef).append(" to i8*), i32 ")
+                            .append(sizeRef).append(", i32 ").append(elemSize).append(", i8** ").append(hold).append(")\n");
+                    break;
+                }
 
                 String totalSize = newAux("total_size");
                 sb.append("  ").append(totalSize).append(" = mul i32 ")
@@ -2433,10 +2458,6 @@ public class LlvmFunctionEmitter {
                             .append(" = call i8* @calloc(i64 1, i64 ")
                             .append(allocSize).append(")\n");
                 }
-
-                String arrClassName = arrayClassDescriptorFor(elemTypeName);
-                if (arrClassName == null) arrClassName = "[Ljava/lang/Object;";
-                String arrClassRef = globalEmitter.getRefClassGlobalName(arrClassName);
 
                 String klassPtr = newAux("klass_ptr");
                 sb.append("  ").append(klassPtr).append(" = bitcast i8* ").append(allocReg)
@@ -3080,6 +3101,9 @@ public class LlvmFunctionEmitter {
             String expected = vhMemoryToCas(sb, vhToMemory(sb, values.get(0), vt), memTy, casTy);
             String desired = vhMemoryToCas(sb, vhToMemory(sb, values.get(1), vt), memTy, casTy);
             String pair = newAux("vh_cas");
+            if ("i8*".equals(casTy)) {
+                sb.append("  call void @__jnative_rc_inc(i8* ").append(desired).append(")\n");
+            }
             sb.append("  ").append(pair).append(" = cmpxchg ");
             if (weak) sb.append("weak ");
             sb.append(casTy).append("* ").append(ptr)
@@ -3112,16 +3136,18 @@ public class LlvmFunctionEmitter {
             String ptr = vhTypedPointer(sb, slot, memTy);
             String v = vhToMemory(sb, values.getFirst(), vt);
             String old = newAux("vh_old");
+            if ("i8*".equals(memTy)) {
+                sb.append("  call void @__jnative_rc_inc(i8* ").append(v).append(")\n");
+            }
             sb.append("  ").append(old).append(" = atomicrmw ").append(rmwOp).append(" ")
                     .append(memTy).append("* ").append(ptr).append(", ").append(memTy).append(" ").append(v)
                     .append(" ").append(rmwOrder).append(", align ").append(align).append("\n");
             if ("i8*".equals(memTy)) {
                 String hp = holdPointer(sb, inst);
                 if (hp != null) {
-                    sb.append("  store atomic i8* ").append(old).append(", i8** ").append(hp).append(" seq_cst, align 8\n");
+                    sb.append("  call void @__jnative_rc_hold(i8** ").append(hp).append(", i8* ").append(old).append(")\n");
                     heldInline.add(inst);
                 }
-                sb.append("  call void @__jnative_rc_inc(i8* ").append(v).append(")\n");
                 sb.append("  call void @__jnative_rc_dec(i8* ").append(old).append(")\n");
             }
             out = vhFromMemory(sb, old, vt);
@@ -3134,6 +3160,7 @@ public class LlvmFunctionEmitter {
     }
 
     private void emitCountedStore(StringBuilder sb, String typedPointer, String value) {
+        sb.append("  call void @__jnative_rc_inc(i8* ").append(value).append(")\n");
         String slot = newAux("rc_slot");
         sb.append("  ").append(slot).append(" = bitcast ").append(typedPointer).append(" to i64*\n");
         String fresh = newAux("rc_new");
@@ -3143,7 +3170,6 @@ public class LlvmFunctionEmitter {
                 .append(" seq_cst\n");
         String oldPtr = newAux("rc_oldp");
         sb.append("  ").append(oldPtr).append(" = inttoptr i64 ").append(old).append(" to i8*\n");
-        sb.append("  call void @__jnative_rc_inc(i8* ").append(value).append(")\n");
         sb.append("  call void @__jnative_rc_dec(i8* ").append(oldPtr).append(")\n");
     }
 

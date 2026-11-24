@@ -144,7 +144,7 @@ void __jnative_fn_java_lang_System_arraycopy__Ljava_lang_Object_ILjava_lang_Obje
     char* dstPtr = (char*)jnative_array_data(dest) + (size_t)destPos * (size_t)dstElemSize;
     size_t bytes = (size_t)length * (size_t)srcElemSize;
 
-    if (srcElemSize == (int32_t)sizeof(void*)) __jnative_rc_array_copy(src, srcPos, dest, destPos, length);
+    if (srcElemSize == (int32_t)sizeof(void*) && __jnative_rc_array_copy(src, srcPos, dest, destPos, length)) return;
     memmove(dstPtr, srcPtr, bytes);
 }
 

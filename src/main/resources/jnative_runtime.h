@@ -908,10 +908,8 @@ extern void __jnative_destruct_dispatch_if_not_same(void* old_val,
  * pass safe against both shapes.
  *
  *   __jnative_begin_shutdown()
- *       Activates the machinery for the remainder of the process. Called
- *       once, from the very beginning of fn___jnative_shutdown, before the
- *       first destructor runs. Before it is called the two guards below
- *       are no-ops; ordinary-execution destructor calls pay nothing.
+ *       Activates the machinery for the remainder of the process.
+ *       Callers must arrange for exclusive access to the objects they drop.
  *
  *   __jnative_dtor_enter(this) -> int
  *       Called at the entry of every generated destructor. Returns 1 if
@@ -937,11 +935,8 @@ extern void __jnative_destruct_dispatch_if_not_same(void* old_val,
  * same address in the same shutdown pass is rejected by
  * __jnative_dtor_enter.
  *
- * Threading model: the shutdown pass is single-threaded by construction
- * (atexit runs on the main thread), so the claim stack is thread-local
- * and both operations are lock-free. The freed set is process-wide and
- * protected by a mutex, because it must remain valid if any thread ever
- * invokes a destructor during shutdown (defensive, not needed today).
+ * The claim stack is thread-local. The freed set is process-wide and
+ * protected by a mutex.
  * ========================================================================== */
 
 extern volatile int gv_jnative_in_shutdown;
@@ -959,6 +954,8 @@ extern void    __jnative_free_container(void* p);
 extern void    __jnative_free_container_storage(void* p);
 extern void    __jnative_rc_inc(void* p);
 extern void    __jnative_rc_dec(void* p);
+extern void    __jnative_rc_hold(void** hold, void* object);
+extern void    __jnative_rc_thread_exit(void);
 extern void    __jnative_rc_drop(void* p);
 extern void    __jnative_rc_cas(int32_t ok, void* x, void* expected);
 extern void**  __jnative_rc_frame_enter(int32_t n);
@@ -972,7 +969,7 @@ extern void    __jnative_weak_forget(void* ref);
 extern void    __jnative_weak_store(void** slot, void* referent);
 extern void*   __jnative_weak_load(void** slot, void** hold);
 extern void    __jnative_rc_cloned(void* copy);
-extern void    __jnative_rc_array_copy(void* src, int32_t srcPos, void* dest, int32_t destPos, int32_t length);
+extern int32_t __jnative_rc_array_copy(void* src, int32_t srcPos, void* dest, int32_t destPos, int32_t length);
 extern void    __jnative_borrow_enter(void* owner);
 extern void    __jnative_borrow_exit(void);
 extern void    __jnative_replace_array(void* owner, void* old, void* replacement, int32_t mode);

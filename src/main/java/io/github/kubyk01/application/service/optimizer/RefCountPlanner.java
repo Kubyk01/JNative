@@ -17,6 +17,7 @@ import io.github.kubyk01.domain.ir.Function;
 import io.github.kubyk01.domain.ir.Instruction;
 import io.github.kubyk01.domain.ir.Module;
 import io.github.kubyk01.domain.ir.Opcode;
+import io.github.kubyk01.domain.ir.Temporary;
 import io.github.kubyk01.domain.ir.Type;
 import io.github.kubyk01.domain.ir.Value;
 import io.github.kubyk01.util.LlvmUtil;
@@ -30,6 +31,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
+import static io.github.kubyk01.application.service.analyzer.ssa.TypeResolver.primitiveDescriptor;
 import static io.github.kubyk01.util.LlvmUtil.extractFieldName;
 import static io.github.kubyk01.util.LlvmUtil.lambdaCaptures;
 
@@ -44,6 +46,8 @@ final class RefCountPlanner {
     private final LifetimeAnalysisResult lifetime;
     private final RefCountPlan plan = new RefCountPlan();
     private final BitSet counted = new BitSet();
+    private final BitSet erasedArrayOwners = new BitSet();
+    private boolean managesArrays;
     private final BitSet captured = new BitSet();
     private final BitSet weakTargets = new BitSet();
     private final Set<Function> pinned = Collections.newSetFromMap(new IdentityHashMap<>());
@@ -82,6 +86,7 @@ final class RefCountPlanner {
         // A closure owns a strong reference even when the lifetime pass found
         // a destruction point for another reference to the same allocation.
         stored.or(captured);
+        erasedArrayOwners.or(captured);
         freed.andNot(captured);
         Set<String> leaking = new HashSet<>();
         for (int id = 0; id < n; id++) {
@@ -99,18 +104,31 @@ final class RefCountPlanner {
             plan.getCountDeclarers().add(declarer);
         }
         for (int id = 0; id < n; id++) {
-            Type t = AllocationSite.byId(id).getType();
+            AllocationSite site = AllocationSite.byId(id);
+            Type t = site.getType();
             if (t != null && t.isReference() && !t.isArray() && t.getClassName() != null && leaking.contains(t.getClassName())) {
                 counted.set(id);
+            }
+            // A primitive array can have several owners once it flows through
+            // erased storage. Give that allocation the same lifetime as an object.
+            if (erasedArrayOwners.get(id) && alias.getAllocationSiteToValue().get(site) instanceof Temporary value
+                    && value.getType() != null && value.getType().isArray()
+                    && value.getType().getElementType().isPrimitive()) {
+                Instruction allocation = value.getDefiningInstruction();
+                if (allocation != null && allocation.getOpcode() == Opcode.NEW_ARRAY
+                        && allocation.getOperands().size() == 2) {
+                    allocation.setRcManagedArray(true);
+                    counted.set(id);
+                    managesArrays = true;
+                }
             }
         }
         if (counted.isEmpty()) {
             module.setRefCountPlan(plan);
-            System.out.println("RefCount: no counted classes");
             return;
         }
-        collectHolders(n);
         collectArrayTypes();
+        collectHolders(n);
         int stores = markStores();
         module.setRefCountPlan(plan);
         System.out.println("RefCount: " + leaking.size() + " counted class(es), " + counted.cardinality() + " site(s), "
@@ -142,10 +160,16 @@ final class RefCountPlanner {
         for (int src = 0; src < n; src++) {
             for (FieldCell cell : graph.fieldCells(src)) {
                 addAll(out, cell.get());
+                if (PointsToGraph.ARRAY_ELEMENT_FIELD.equals(cell.field()) || canHoldErasedArray(fieldType(cell.field()))) {
+                    addAll(erasedArrayOwners, cell.get());
+                }
                 if (isWeakReferent(cell.field())) addAll(weakTargets, cell.get());
             }
         }
-        for (PointsToSet pts : graph.getStaticFieldPointsToMap().values()) addAll(out, pts);
+        graph.getStaticFieldPointsToMap().forEach((field, pts) -> {
+            addAll(out, pts);
+            if (canHoldErasedArray(fieldType(field))) addAll(erasedArrayOwners, pts);
+        });
         out.clear(AllocationSite.UNKNOWN.getId());
         return out;
     }
@@ -192,10 +216,22 @@ final class RefCountPlanner {
 
     private boolean maybeCountedType(Type t) {
         if (t == null || t.isUnknown()) return true;
-        if (t.isNull() || t.isArray() || !t.isReference()) return false;
+        if (t.isArray()) return managesArrays && t.getElementType().isPrimitive();
+        if (t.isNull() || !t.isReference()) return false;
         String cls = t.getClassName();
-        if (cls == null || cls.startsWith("[")) return cls == null;
+        if (cls == null) return true;
+        if (cls.startsWith("[")) return maybeCountedType(Type.array(cls));
+        if (managesArrays && canHoldErasedArray(t)) return true;
         return relatedTypes.contains(cls) || resolver.getClassNode(cls) == null;
+    }
+
+    private static boolean canHoldErasedArray(Type type) {
+        if (type == null || type.isUnknown()) return true;
+        if (!type.isReference()) return false;
+        return switch (type.getClassName()) {
+            case "java/lang/Object", "java/lang/Cloneable", "java/io/Serializable" -> true;
+            case null, default -> false;
+        };
     }
 
     private boolean maybeCounted(Value v) {
@@ -230,6 +266,10 @@ final class RefCountPlanner {
         Set<String> seen = new HashSet<>();
         java.util.ArrayDeque<String> work = new java.util.ArrayDeque<>(plan.getCountedClasses());
         work.add("java/lang/Object");
+        if (managesArrays) {
+            work.add("java/lang/Cloneable");
+            work.add("java/io/Serializable");
+        }
         while (!work.isEmpty()) {
             String c = work.poll();
             if (c == null || !seen.add(c)) continue;
@@ -249,10 +289,13 @@ final class RefCountPlanner {
             if (t == null || t.isUnknown() || t.isNull()) continue;
             boolean arrayClass = t.isReference() && t.getClassName() != null && t.getClassName().startsWith("[");
             for (FieldCell cell : graph.fieldCells(src)) {
-                if (!holdsCounted(cell.get())) continue;
+                if (!holdsCounted(cell.get()) && !(managesArrays && maybeCountedType(fieldType(cell.field())))) continue;
                 if (t.isArray() || arrayClass) {
                     if (PointsToGraph.ARRAY_ELEMENT_FIELD.equals(cell.field())) {
-                        String desc = arrayClass ? t.getClassName() : arrayDescriptor(t);
+                        Value allocation = alias.getAllocationSiteToValue().get(AllocationSite.byId(src));
+                        Type valueType = allocation == null ? null : allocation.getType();
+                        Type arrayType = valueType != null && valueType.isArray() ? valueType : t;
+                        String desc = arrayClass ? t.getClassName() : arrayDescriptor(arrayType);
                         if (desc != null && desc.length() > 1 && (desc.charAt(1) == 'L' || desc.charAt(1) == '[')) {
                             plan.getCountedArrayTypes().add(desc);
                         }
@@ -285,7 +328,7 @@ final class RefCountPlanner {
         FieldNode f = resolver.getField(raw.substring(0, dot), raw.substring(dot + 1));
         if (f == null || f.getOwner() == null || (f.getAccess() & Opcodes.ACC_STATIC) != 0) return null;
         String d = f.getDescriptor();
-        if (d == null || d.charAt(0) != 'L') return null;
+        if (d == null || (d.charAt(0) != 'L' && d.charAt(0) != '[')) return null;
         if (WEAK_OWNER.equals(f.getOwner()) && WEAK_FIELD.equals(f.getName())) return null;
         return f.getOwner() + "." + f.getName();
     }
@@ -299,6 +342,7 @@ final class RefCountPlanner {
             return inner == null ? null : "[" + inner;
         }
         if (e.isReference() && e.getClassName() != null) return "[L" + e.getClassName() + ";";
+        if (e.isPrimitive() && !e.isVoid()) return "[" + primitiveDescriptor(e);
         return null;
     }
 
@@ -324,7 +368,7 @@ final class RefCountPlanner {
                             }
                             inst.setRcHold(k);
                         }
-                    } else if (isReference(res) && (inst.isRcWeak() || maybeCounted(res))) {
+                    } else if (isReference(res) && (inst.isRcManagedArray() || inst.isRcWeak() || maybeCounted(res))) {
                         inst.setRcHold(next++);
                     }
                     if (inst.getOpcode() == Opcode.NEW && isCountedType(res == null ? null : res.getType())
@@ -358,7 +402,9 @@ final class RefCountPlanner {
                     return false;
                 }
                 PointsToSet old = alias.getFieldPointsToForSites(alias.getPointsTo(ops.getFirst()), raw);
-                if (!maybeCounted(ops.get(2)) && !maybeCountedContents(old, fieldType(raw))) return false;
+                Type type = fieldType(raw);
+                if (!maybeCounted(ops.get(2)) && !maybeCountedContents(old, type)
+                        && !(managesArrays && maybeCountedType(type))) return false;
                 inst.setRcStore(true);
                 return true;
             }
@@ -367,14 +413,17 @@ final class RefCountPlanner {
                 PointsToSet old = alias.getFieldPointsToForSites(alias.getPointsTo(ops.getFirst()), PointsToGraph.ARRAY_ELEMENT_FIELD);
                 Type arr = ops.getFirst().getType();
                 Type element = arr != null && arr.isArray() ? arr.getElementType() : null;
-                if (!maybeCounted(ops.get(2)) && !maybeCountedContents(old, element)) return false;
+                if (!maybeCounted(ops.get(2)) && !maybeCountedContents(old, element)
+                        && !(managesArrays && maybeCountedType(element))) return false;
                 inst.setRcStore(true);
                 return true;
             }
             case PUT_STATIC -> {
                 if (ops.size() < 2 || !isReference(ops.get(1))) return false;
                 PointsToSet old = alias.getStaticFieldPointsTo(extractFieldName(inst));
-                if (!maybeCounted(ops.get(1)) && !maybeCountedContents(old, fieldType(extractFieldName(inst)))) return false;
+                Type type = fieldType(extractFieldName(inst));
+                if (!maybeCounted(ops.get(1)) && !maybeCountedContents(old, type)
+                        && !(managesArrays && maybeCountedType(type))) return false;
                 inst.setRcStore(true);
                 return true;
             }

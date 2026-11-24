@@ -156,8 +156,7 @@ The following features are implemented, subject to application-specific constrai
 - **Networking:** `Inet4Address`, `Inet6Address`, `InetAddress`, and `NetworkInterface`, including interface enumeration and reverse lookups.
 - **Reflection mirrors:** `Class.getDeclaredMethods0`, `getDeclaredFields0`, and `getDeclaredConstructors0` construct real `Field`, `Method`, and `Constructor` mirrors with populated `parameterTypes`, `exceptionTypes`, and root fields, supporting `Executable.sharedToString` and `ReflectionData` without null-pointer failures.
 - **Resources and time zones:** embeds every non-`.class` resource in the target JDK's `java.base` module and its `lib/tzdb.dat`, served through `Class.getResourceAsStream` and `FileInputStream` for `/lib/tzdb.dat`.
-- **Shutdown cleanup:** cycle-safe destruction uses a freed-address set and per-thread claim stack to detect doubly reachable objects and destructor cycles during `atexit` cleanup.
-- **Destructor fast/slow paths:** outside shutdown, destructors use a direct load-check-free call; during shutdown, they use a cycle-safe slow path.
+- **Ownership cleanup:** stack objects release owned fields on frame exit and exception unwinding. Reference-counted storage is released after the last strong owner and outstanding local borrows disappear.
 - **Core system APIs:** `System.out`, `System.err`, `System.in`, `System.getProperties`, `System.setProperty`, `System.currentTimeMillis`, `System.nanoTime`, `System.identityHashCode`, and `System.exit`.
 
 Distribute the executable alone. Application resources, classpath archives, discovered JNI libraries, and the target JDK's `release`, `conf/`, `lib/`, and available `legal/` trees are embedded as binary data. No `<executable>.classpath`, `<executable>.runtime`, or companion JNI libraries are generated or required. Spring Boot classes and dependency JARs retain their classpath order, including duplicate resource names in separate archives. The executable does not require an installed JDK, JVM, or `libz`.
@@ -170,10 +169,10 @@ JNative uses static escape and lifetime analysis to classify each allocation sit
 
 | Classification | Meaning and cleanup behavior |
 | --- | --- |
-| `STACK` | The object does not escape its defining function. It can use stack allocation when no opaque use prevents it; scalar replacement can eliminate it entirely when its fields are the only observable state. |
+| `STACK` | The object does not escape its defining function. Materialized stack objects release their owned fields at frame exit. Scalar replacement can eliminate the object when only its fields are observable. |
 | `HEAP` | The object is stored in another object's field. A destructor is inserted at its last use, with the containing field nulled. Field-overwrite instrumentation also releases the previous value at `PUT_FIELD` when liveness analysis proves no other reference observes it. |
 | `RETURN` | The object is returned to the caller; the caller owns it. |
-| `GLOBAL` | The object is reachable from a static field and is released during the shutdown pass only. |
+| `GLOBAL` | Static fields hold strong references. The operating system reclaims storage still rooted at process exit. |
 | `THREAD` | The object is handed to another thread and is not released per-use. |
 | `UNKNOWN` | The analysis cannot classify the site, so cleanup is handled conservatively. |
 

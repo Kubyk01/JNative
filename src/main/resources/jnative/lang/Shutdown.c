@@ -27,11 +27,8 @@
  * runtime itself uses its own signal handlers for crash reporting.
  * Consequently:
  *
- *   - halt0 simply forwards to the C library's exit(3). exit() runs
- *     atexit handlers, which is exactly what is needed to invoke the
- *     __jnative_shutdown function that LlvmGenerator registers at
- *     program start-up (see generateMain()). It then flushes stdio
- *     and terminates the process with the requested status.
+ *   - halt0 forwards to the C library's exit(3), which runs C exit
+ *     handlers, flushes stdio and terminates with the requested status.
  *
  *   - beforeHalt is a no-op. The reference implementation's work
  *     (releasing JVMTI resources, unparking threads, etc.) is
@@ -39,21 +36,13 @@
  *     native image where every allocation is a libc malloc and every
  *     thread is a plain pthread.
  *
- * Note on exit vs. _exit: this runtime deliberately uses exit() rather
- * than _exit() so that the atexit-registered __jnative_shutdown runs
- * and releases objects held in static fields. _exit() would skip that
- * step and leak every still-reachable object, which is harmless for
- * the process image but makes leak-checking harder during
- * development.
+ * The operating system releases memory still rooted when the process exits.
  */
 
 /*
  * static native void halt0(int status);
  *
- * Terminates the running JVM image with the supplied exit status. Runs
- * atexit handlers first (notably __jnative_shutdown) so that any
- * objects still rooted in static fields are released through the
- * generated destructor chains.
+ * Terminates the running JVM image with the supplied exit status.
  *
  * The explicit abort() after exit() is defensive: exit(3) is declared
  * noreturn, and every compiler this runtime targets honours that

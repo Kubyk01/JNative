@@ -165,6 +165,8 @@ public class DestructorInserter {
 
             Type type = site.getType();
             if (type.isUnknown() || type.isNull()) continue;
+            if (siteToValue.get(site) instanceof Temporary value && value.getDefiningInstruction() != null
+                    && value.getDefiningInstruction().isRcManagedArray()) continue;
 
             // ------------------------------------------------------------------
             // System-class reference sites are deliberately skipped here.
@@ -308,7 +310,7 @@ public class DestructorInserter {
         Deque<BasicBlock> pending = new ArrayDeque<>();
         List<? extends Function> jnLoop6 = new ArrayList<>(module.getFunctions());
         for (Function func : jnLoop6) {
-            if (func.getEntryBlock() == null) continue;
+            if (func.getEntryBlock() == null || func.getName().startsWith(ContainerArrayBorrows.STORAGE_PREFIX)) continue;
             pending.addAll(new ArrayList<>(func.getBlocks()));
         }
 
@@ -430,8 +432,12 @@ public class DestructorInserter {
                 value.setDefiningInstruction(get);
                 get.setParent(body);
                 body.addInstruction(get);
-                body.addInstruction(runtimeCall(body, "__jnative_replace_array", self, value,
-                    new Constant(Type.NULL, null), new Constant(Type.INT, 1)));
+                Instruction clear = new Instruction(Opcode.PUT_FIELD);
+                clear.addOperand(self);
+                clear.addOperand(new Constant(Type.reference(key), key));
+                clear.addOperand(new Constant(Type.NULL, null));
+                body.addInstruction(clear);
+                body.addInstruction(runtimeCall(body, "__jnative_release_array_field", self, value));
             }
             body.setTerminator(new ReturnTerminator(null));
             module.addFunction(func);
@@ -467,6 +473,12 @@ public class DestructorInserter {
                     getField.setResult(oldValue);
                     oldValue.setDefiningInstruction(getField);
                     getField.setParent(block);
+                    if (inst.isRcStore()) {
+                        // The legacy replacement hook also inspects the previous value.
+                        // Keep that borrow across the strong decrement emitted by PUT_FIELD.
+                        getField.setRcHold(f.getRcHolds());
+                        f.setRcHolds(f.getRcHolds() + 1);
+                    }
                     insts.add(i, getField);
                     i++;
                     Constant mode = new Constant(Type.INT, containerBorrows.immediate(key) ? 1 : 0);
@@ -1567,7 +1579,7 @@ public class DestructorInserter {
      * every call site, so the fast path becomes a single load, a compare and
      * a branch — three instructions, no frame, no call.</p>
      *
-     * <p>Slow path (only during {@code __jnative_shutdown}):</p>
+     * <p>Slow path (when {@code __jnative_begin_shutdown} has been called):</p>
      * <pre>
      * slow:
      *   %r = call i32 @__jnative_dtor_enter(i8* %this)

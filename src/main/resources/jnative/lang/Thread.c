@@ -504,6 +504,7 @@ static void* thread_entry(void* arg) {
     set_eetop(s->java_thread, 0);
     __jnative_fn_java_lang_Object_notifyAll___V(s->java_thread);
     __jnative_monitor_exit(s->java_thread);
+    __jnative_rc_thread_exit();
 
     jn_mutex_lock(&s->mutex);
     s->running = 0;
