@@ -811,6 +811,8 @@ extern void** __jnative_lookup_itable(JNativeIfaceMap* ifacemap, int32_t iface_i
 
 extern void __jnative_monitor_enter(void* obj);
 extern void __jnative_monitor_exit(void* obj);
+extern void __jnative_monitor_wait(void* obj, int64_t timeout_ms);
+extern void __jnative_monitor_notify(void* obj, int all);
 
 /* ============================================================================
  *  Safe deallocation of Java reference fields.

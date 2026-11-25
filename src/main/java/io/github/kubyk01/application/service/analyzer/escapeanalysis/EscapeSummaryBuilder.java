@@ -125,37 +125,74 @@ public class EscapeSummaryBuilder {
         Map<Function, List<Function>> callees = new HashMap<>(live.size() * 2);
         Map<String, Set<Function>> callersOf = new HashMap<>(live.size() * 2);
 
-        List<? extends Function> jnLoop3 = live;
-        for (Function f : jnLoop3) {
-            List<Function> out = new ArrayList<>();
-            Set<String> seen = new HashSet<>();
+        List<List<String>> calleeKeys = LlvmUtil.parallelMapOrdered(live, scheduler, f -> {
+            Set<String> seen = new LinkedHashSet<>();
             for (BasicBlock b : f.getBlocks()) {
                 for (Instruction inst : b.getInstructions()) {
                     String callee = extractCalleeName(inst);
                     if (callee == null) continue;
                     String calleeKey = canonicalCalleeKey(callee);
-
-                    if (isLazyClinitWrapper(calleeKey)) continue;
-
-                    if (!seen.add(calleeKey)) continue;
-                    Function calleeFunc = byName.get(calleeKey);
-                    if (calleeFunc != null) {
-                        out.add(calleeFunc);
-                    }
-                    callersOf.computeIfAbsent(calleeKey, k -> new HashSet<>(4)).add(f);
+                    if (!isLazyClinitWrapper(calleeKey)) seen.add(calleeKey);
                 }
+            }
+            return new ArrayList<>(seen);
+        });
+        for (int i = 0; i < live.size(); i++) {
+            Function f = live.get(i);
+            List<Function> out = new ArrayList<>();
+            for (String calleeKey : calleeKeys.get(i)) {
+                Function calleeFunc = byName.get(calleeKey);
+                if (calleeFunc != null) out.add(calleeFunc);
+                callersOf.computeIfAbsent(calleeKey, k -> new HashSet<>(4)).add(f);
             }
             callees.put(f, out);
         }
 
         List<List<Function>> sccs = computeSCCs(live, callees);
 
-        int totalProcessed = 0;
+        Map<Function, Integer> sccOf = new HashMap<>(live.size() * 2);
+        for (int s = 0; s < sccs.size(); s++) {
+            for (Function f : sccs.get(s)) sccOf.put(f, s);
+        }
+        int[] level = new int[sccs.size()];
+        int maxLevel = 0;
         int maxSccSize = 0;
-        List<? extends List<Function>> jnLoop4 = sccs;
-        for (List<Function> scc : jnLoop4) {
+        for (int s = 0; s < sccs.size(); s++) {
+            List<Function> scc = sccs.get(s);
             if (scc.size() > maxSccSize) maxSccSize = scc.size();
-            totalProcessed += processSCC(scc, callersOf);
+            int lv = 0;
+            for (Function f : scc) {
+                for (Function callee : callees.get(f)) {
+                    Integer cs = sccOf.get(callee);
+                    if (cs != null && cs != s) lv = Math.max(lv, level[cs] + 1);
+                }
+            }
+            level[s] = lv;
+            if (lv > maxLevel) maxLevel = lv;
+        }
+        List<List<Integer>> singlesByLevel = new ArrayList<>(maxLevel + 1);
+        List<List<Integer>> groupsByLevel = new ArrayList<>(maxLevel + 1);
+        for (int lv = 0; lv <= maxLevel; lv++) {
+            singlesByLevel.add(new ArrayList<>());
+            groupsByLevel.add(new ArrayList<>());
+        }
+        for (int s = 0; s < sccs.size(); s++) {
+            (sccs.get(s).size() == 1 ? singlesByLevel : groupsByLevel).get(level[s]).add(s);
+        }
+
+        int totalProcessed = 0;
+        for (int lv = 0; lv <= maxLevel; lv++) {
+            List<Integer> counts = LlvmUtil.parallelMapOrdered(
+                    singlesByLevel.get(lv), scheduler, s -> processSCC(sccs.get(s), callersOf, true));
+            for (int c : counts) totalProcessed += c;
+            List<Integer> groups = groupsByLevel.get(lv);
+            if (groups.size() == 1) {
+                totalProcessed += processSCC(sccs.get(groups.getFirst()), callersOf, false);
+            } else {
+                List<Integer> groupCounts = LlvmUtil.parallelMapOrdered(
+                        groups, scheduler, s -> processSCC(sccs.get(s), callersOf, true));
+                for (int c : groupCounts) totalProcessed += c;
+            }
         }
 
         System.out.println("EscapeSummaryBuilder: converged after " + sccs.size()
@@ -169,7 +206,7 @@ public class EscapeSummaryBuilder {
     //  Per-SCC fixed point
     // =====================================================================
 
-    private int processSCC(List<Function> scc, Map<String, Set<Function>> callersOf) {
+    private int processSCC(List<Function> scc, Map<String, Set<Function>> callersOf, boolean inline) {
         if (scc.isEmpty()) {
             return 0;
         }
@@ -215,9 +252,13 @@ public class EscapeSummaryBuilder {
             }
             totalProcessed += batch.size();
 
-            List<EscapeSummary> fresh = LlvmUtil.parallelMapOrdered(
-                    batch, scheduler,
-                    func -> analyzeFunction(func, summaries));
+            List<EscapeSummary> fresh;
+            if (inline) {
+                fresh = new ArrayList<>(batch.size());
+                for (Function func : batch) fresh.add(analyzeFunction(func, summaries));
+            } else {
+                fresh = LlvmUtil.parallelMapOrdered(batch, scheduler, func -> analyzeFunction(func, summaries));
+            }
 
             int committed = 0;
             for (int i = 0; i < batch.size(); i++) {

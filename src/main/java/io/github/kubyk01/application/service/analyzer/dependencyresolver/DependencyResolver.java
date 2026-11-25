@@ -166,6 +166,7 @@ public class DependencyResolver {
 
     private byte[] transformClass(byte[] bytes) {
         if (BootstrapRewriter.needsRewrite(bytes)) bytes = BootstrapRewriter.rewrite(bytes);
+        if (SynchronizedMethodRewriter.needsRewrite(bytes)) bytes = SynchronizedMethodRewriter.rewrite(bytes);
         String className = new ClassReader(bytes).getClassName();
         if (ProxyRewriter.PROXY.equals(className)) return ProxyRewriter.rewrite(bytes);
         if (!ServiceLoaderRewriter.ITERATOR.equals(className)) return bytes;

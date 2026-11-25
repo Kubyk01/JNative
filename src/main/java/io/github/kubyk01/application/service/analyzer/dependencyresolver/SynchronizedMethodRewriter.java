@@ -26,6 +26,19 @@ final class SynchronizedMethodRewriter {
             && !name.equals("<init>") && !name.equals("<clinit>");
     }
 
+    static boolean needsRewrite(byte[] bytes) {
+        boolean[] found = {false};
+        new ClassReader(bytes).accept(new ClassVisitor(Opcodes.ASM9) {
+            @Override
+            public MethodVisitor visitMethod(int access, String name, String descriptor,
+                                             String signature, String[] exceptions) {
+                if (needsRewrite(access, name)) found[0] = true;
+                return null;
+            }
+        }, ClassReader.SKIP_CODE | ClassReader.SKIP_DEBUG | ClassReader.SKIP_FRAMES);
+        return found[0];
+    }
+
     static byte[] rewrite(byte[] bytes) {
         ClassReader reader = new ClassReader(bytes);
         ClassWriter writer = new ClassWriter(reader, ClassWriter.COMPUTE_MAXS);

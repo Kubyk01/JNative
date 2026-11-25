@@ -371,134 +371,16 @@ void *__jnative_fn_java_lang_Object_clone___Ljava_lang_Object_(void *obj) {
     return clone;
 }
 
-/* ---- Monitor wait/notify support using jn_cond_t ---- */
-
-typedef struct MonitorEx {
-    void *obj;
-    jn_mutex_t mutex;
-    jn_cond_t cond;
-    int wait_count;
-    struct MonitorEx *next;
-} MonitorEx;
-
-#define MONITOR_HASH_SIZE 1024
-static MonitorEx *monitor_ex_table[MONITOR_HASH_SIZE] = {0};
-static jn_mutex_t monitor_table_lock = JN_MUTEX_INITIALIZER;
-
-static uint32_t hash_ptr(void *p) {
-    return (uint32_t)((uintptr_t)p) % MONITOR_HASH_SIZE;
-}
-
-static MonitorEx *get_monitor_ex(void *obj) {
-    if (!obj) return NULL;
-    uint32_t idx = hash_ptr(obj);
-    jn_mutex_lock(&monitor_table_lock);
-    MonitorEx *m = monitor_ex_table[idx];
-    while (m) {
-        if (m->obj == obj) {
-            jn_mutex_unlock(&monitor_table_lock);
-            return m;
-        }
-        m = m->next;
-    }
-    MonitorEx *newm = calloc(1, sizeof(MonitorEx));
-    if (!newm) {
-        jn_mutex_unlock(&monitor_table_lock);
-        return NULL;
-    }
-    newm->obj = obj;
-    pthread_mutex_init(&newm->mutex, NULL);
-    pthread_cond_init(&newm->cond, NULL);
-    newm->wait_count = 0;
-    newm->next = monitor_ex_table[idx];
-    monitor_ex_table[idx] = newm;
-    jn_mutex_unlock(&monitor_table_lock);
-    return newm;
-}
-
-static MonitorEx *find_monitor_ex(void *obj) {
-    if (!obj) return NULL;
-    uint32_t idx = hash_ptr(obj);
-    jn_mutex_lock(&monitor_table_lock);
-    MonitorEx *m = monitor_ex_table[idx];
-    while (m) {
-        if (m->obj == obj) {
-            jn_mutex_unlock(&monitor_table_lock);
-            return m;
-        }
-        m = m->next;
-    }
-    jn_mutex_unlock(&monitor_table_lock);
-    return NULL;
-}
-
 void __jnative_fn_java_lang_Object_notify___V(void *obj) {
-    if (!obj) {
-        __jnative_throw_null_pointer_exception();
-        return;
-    }
-    MonitorEx *m = find_monitor_ex(obj);
-    if (!m) return;
-    jn_mutex_lock(&m->mutex);
-    if (m->wait_count > 0) {
-        jn_cond_signal(&m->cond);
-    }
-    jn_mutex_unlock(&m->mutex);
+    __jnative_monitor_notify(obj, 0);
 }
 
 void __jnative_fn_java_lang_Object_notifyAll___V(void *obj) {
-    if (!obj) {
-        __jnative_throw_null_pointer_exception();
-        return;
-    }
-    MonitorEx *m = find_monitor_ex(obj);
-    if (!m) return;
-    jn_mutex_lock(&m->mutex);
-    if (m->wait_count > 0) {
-        jn_cond_broadcast(&m->cond);
-    }
-    jn_mutex_unlock(&m->mutex);
+    __jnative_monitor_notify(obj, 1);
 }
 
 void __jnative_fn_java_lang_Object_wait0__J_V(void *obj, int64_t timeoutMillis) {
-    if (!obj) {
-        __jnative_throw_null_pointer_exception();
-        return;
-    }
-    MonitorEx *m = get_monitor_ex(obj);
-    if (!m) {
-        __jnative_throw_exception(NULL);
-        return;
-    }
-
-    jn_mutex_lock(&m->mutex);
-    m->wait_count++;
-    /* Java wait() releases the object's monitor; the notifier must be able
-     * to take it. Done after wait_count++ under m->mutex so a notifier that
-     * then acquires the monitor cannot broadcast before we are waiting.
-     * shortcut: releases one recursion level only, upgrade if a wait() inside
-     * nested synchronized(obj) blocks shows up. */
-    __jnative_monitor_exit(obj);
-
-    struct timespec ts;
-    if (timeoutMillis == 0) {
-        jn_cond_wait(&m->cond, &m->mutex);
-    } else {
-        jn_now_realtime(&ts);
-        ts.tv_sec += timeoutMillis / 1000;
-        ts.tv_nsec += (timeoutMillis % 1000) * 1000000L;
-        if (ts.tv_nsec >= 1000000000) {
-            ts.tv_sec++;
-            ts.tv_nsec -= 1000000000;
-        }
-        jn_cond_timedwait(&m->cond, &m->mutex, &ts);
-    }
-
-    m->wait_count--;
-    jn_mutex_unlock(&m->mutex);
-    /* Retake the monitor only after dropping m->mutex: the notifier holds
-     * the monitor while it locks m->mutex, so the reverse order would deadlock. */
-    __jnative_monitor_enter(obj);
+    __jnative_monitor_wait(obj, timeoutMillis);
 }
 
 /* ---- System.nanoTime() ---- */

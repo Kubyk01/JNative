@@ -195,8 +195,24 @@ public final class CallShapeEscapeStrategy implements EscapeAnalysisStrategies {
         }
 
         void orFacts(long[] other) {
-            if (other == null) return;
-            for (long x : other) addFact(x);
+            if (other == null || other.length == 0) return;
+            if (facts == null) {
+                facts = other;
+                return;
+            }
+            long[] a = facts;
+            long[] n = new long[a.length + other.length];
+            int i = 0, j = 0, k = 0;
+            while (i < a.length && j < other.length) {
+                long x = a[i], y = other[j];
+                if (x < y) n[k++] = a[i++];
+                else if (y < x) n[k++] = other[j++];
+                else { n[k++] = x; i++; j++; }
+            }
+            while (i < a.length) n[k++] = a[i++];
+            while (j < other.length) n[k++] = other[j++];
+            if (k == a.length) return;
+            facts = k == other.length ? other : k == n.length ? n : Arrays.copyOf(n, k);
         }
 
         boolean hasFact(long x) {
@@ -255,10 +271,21 @@ public final class CallShapeEscapeStrategy implements EscapeAnalysisStrategies {
             if (into != null) {
                 for (int k = 0; k < into.length; k++) s.addInto(k >> 1, k & 1, into[k] & o.into(k >> 1, k & 1));
             }
-            if (facts != null) for (long x : facts) if (o.covers(x)) s.addFact(x);
-            if (o.facts != null) for (long x : o.facts) if (covers(x)) s.addFact(x);
+            long[] buf = new long[(facts == null ? 0 : facts.length) + (o.facts == null ? 0 : o.facts.length)];
+            int n = 0;
+            if (facts != null) for (long x : facts) if (o.covers(x)) buf[n++] = x;
+            if (o.facts != null) for (long x : o.facts) if (covers(x)) buf[n++] = x;
+            s.facts = sortedUnique(buf, n);
             return s;
         }
+    }
+
+    private static long[] sortedUnique(long[] buf, int n) {
+        if (n == 0) return null;
+        Arrays.sort(buf, 0, n);
+        int w = 1;
+        for (int r = 1; r < n; r++) if (buf[r] != buf[w - 1]) buf[w++] = buf[r];
+        return w == buf.length ? buf : Arrays.copyOf(buf, w);
     }
 
     private static long storedOf(long[] into) {
@@ -1133,15 +1160,11 @@ public final class CallShapeEscapeStrategy implements EscapeAnalysisStrategies {
                 }
             }
             if (r.facts != null) {
+                long[] old = fieldFacts.get(i);
                 Sum cur = new Sum();
-                cur.orFacts(fieldFacts.get(i));
-                boolean added = false;
-                for (long x : r.facts) {
-                    if (cur.hasFact(x)) continue;
-                    cur.addFact(x);
-                    added = true;
-                }
-                if (added) {
+                cur.facts = old;
+                cur.orFacts(r.facts);
+                if (cur.facts != old) {
                     fieldFacts.set(i, cur.facts);
                     grew = true;
                 }
@@ -1160,7 +1183,11 @@ public final class CallShapeEscapeStrategy implements EscapeAnalysisStrategies {
             if (t.unknown()) return UNKNOWN_SUM;
             if (t.functions().length == 0) return NATIVE_SUM;
             Sum s = new Sum();
-            for (int g : t.functions()) {
+            int[] fs = t.functions();
+            long[][] parts = new long[fs.length][];
+            int count = 0;
+            int total = 0;
+            for (int g : fs) {
                 s.retained |= retained.get(g);
                 s.returned |= returned.get(g);
                 s.e1 |= e1.get(g);
@@ -1168,7 +1195,22 @@ public final class CallShapeEscapeStrategy implements EscapeAnalysisStrategies {
                 s.rd1 |= rd1.get(g);
                 s.rd2 |= rd2.get(g);
                 s.orInto(into.get(g));
-                s.orFacts(fieldFacts.get(g));
+                long[] f = fieldFacts.get(g);
+                if (f != null && f.length > 0) {
+                    parts[count++] = f;
+                    total += f.length;
+                }
+            }
+            if (count == 1) {
+                s.facts = parts[0];
+            } else if (count > 1) {
+                long[] buf = new long[total];
+                int k = 0;
+                for (int p = 0; p < count; p++) {
+                    System.arraycopy(parts[p], 0, buf, k, parts[p].length);
+                    k += parts[p].length;
+                }
+                s.facts = sortedUnique(buf, total);
             }
             return s;
         }
@@ -1845,6 +1887,11 @@ public final class CallShapeEscapeStrategy implements EscapeAnalysisStrategies {
             return sb.toString();
         }
 
+        private Sum publish(String key, Sum value) {
+            Sum prev = contexts.putIfAbsent(key, value);
+            return prev == null ? value : prev;
+        }
+
         private Sum specialize(int g, Object[] c, String[] reason) {
             String key = contextKey(g, c);
             Sum known = contexts.get(key);
@@ -1909,17 +1956,20 @@ public final class CallShapeEscapeStrategy implements EscapeAnalysisStrategies {
                         sums[k] = base;
                     }
                     if (!gain) {
-                        contexts.put(key, NO_GAIN);
+                        Sum won = publish(key, NO_GAIN);
                         if (reason != null) reason[0] = "no-gain (no folded branch, no specialised callee)";
                         if (log != null) System.out.print("DBG ctx " + fg.getName() + " [" + key + "] no-gain\n" + log);
-                        return null;
+                        return won == NO_GAIN ? null : won;
                     }
                     Why why = dbg ? new Why() : null;
                     Sum r = analyze(fg, gs, sums, cc, why);
                     Sum done = !frame.used ? r : r.within(frame.approx) ? frame.approx : null;
                     if (done != null) {
                         boolean fin = frame.low >= frame.depth;
-                        if (fin) contexts.put(key, done);
+                        if (fin) {
+                            Sum won = publish(key, done);
+                            if (won != done) return won == NO_GAIN ? null : won;
+                        }
                         if (reason != null) {
                             reason[0] = (fin ? "created" : "provisional, depends on in-progress context depth " + frame.low)
                                 + " (folded=" + cc.folded() + ", rounds=" + (round + 1) + ")";
@@ -1933,9 +1983,9 @@ public final class CallShapeEscapeStrategy implements EscapeAnalysisStrategies {
                     }
                     frame.approx = frame.approx.union(r);
                 }
-                contexts.put(key, NO_GAIN);
+                Sum won = publish(key, NO_GAIN);
                 if (reason != null) reason[0] = "recursion did not stabilise, generic for this context group";
-                return null;
+                return won == NO_GAIN ? null : won;
             } finally {
                 stack.pop();
             }

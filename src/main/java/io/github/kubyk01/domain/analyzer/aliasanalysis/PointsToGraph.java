@@ -3,6 +3,8 @@ package io.github.kubyk01.domain.analyzer.aliasanalysis;
 import io.github.kubyk01.domain.ir.Value;
 import lombok.Getter;
 
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
@@ -80,11 +82,22 @@ public class PointsToGraph {
         return fields == null ? null : fields.find(fieldId);
     }
 
-    /** Append-only hash table. Readers can finish a lookup in an older table during growth. */
+    /** Copy-on-write hash table: published tables are immutable and at most half full. */
     private static final class SiteFields {
+        private static final VarHandle TABLE;
+
+        static {
+            try {
+                TABLE = MethodHandles.lookup().findVarHandle(SiteFields.class, "table", FieldCell[].class);
+            } catch (ReflectiveOperationException e) {
+                throw new ExceptionInInitializerError(e);
+            }
+        }
+
+        private record Sorted(FieldCell[] table, FieldCell[] cells) {}
+
         private volatile FieldCell[] table = new FieldCell[2];
-        private volatile FieldCell[] sorted;
-        private int size;
+        private volatile Sorted sorted;
 
         private static int slot(FieldCell[] cells, int id) {
             int mask = cells.length - 1;
@@ -103,43 +116,42 @@ public class PointsToGraph {
             return cell != null && cell.fieldId() == id ? cell : null;
         }
 
-        synchronized FieldCell insert(int id, String field) {
-            FieldCell[] cells = table;
-            int i = slot(cells, id);
-            FieldCell existing = cells[i];
-            if (existing != null) return existing;
-            if (size >= cells.length / 2) {
-                FieldCell[] grown = new FieldCell[cells.length * 2];
+        FieldCell insert(int id, String field) {
+            FieldCell created = null;
+            while (true) {
+                FieldCell[] cells = table;
+                FieldCell existing = cells[slot(cells, id)];
+                if (existing != null) return existing;
+                int size = 0;
                 for (FieldCell cell : cells) {
-                    if (cell != null) grown[slot(grown, cell.fieldId())] = cell;
+                    if (cell != null) size++;
                 }
-                cells = grown;
-                i = slot(cells, id);
+                FieldCell[] next = new FieldCell[(size + 1) * 2 > cells.length ? cells.length * 2 : cells.length];
+                for (FieldCell cell : cells) {
+                    if (cell != null) next[slot(next, cell.fieldId())] = cell;
+                }
+                if (created == null) created = new FieldCell(id, field);
+                next[slot(next, id)] = created;
+                if (TABLE.compareAndSet(this, cells, next)) return created;
             }
-            FieldCell created = new FieldCell(id, field);
-            sorted = null;
-            cells[i] = created;
-            size++;
-            table = cells;
-            return created;
         }
 
         FieldCell[] snapshot() {
-            FieldCell[] result = sorted;
-            return result != null ? result : sortedSnapshot();
-        }
-
-        private synchronized FieldCell[] sortedSnapshot() {
-            if (sorted == null) {
-                FieldCell[] result = new FieldCell[size];
-                int n = 0;
-                for (FieldCell cell : table) {
-                    if (cell != null) result[n++] = cell;
-                }
-                Arrays.sort(result, Comparator.comparingInt(FieldCell::fieldId));
-                sorted = result;
+            FieldCell[] cells = table;
+            Sorted cached = sorted;
+            if (cached != null && cached.table() == cells) return cached.cells();
+            int size = 0;
+            for (FieldCell cell : cells) {
+                if (cell != null) size++;
             }
-            return sorted;
+            FieldCell[] result = new FieldCell[size];
+            int n = 0;
+            for (FieldCell cell : cells) {
+                if (cell != null) result[n++] = cell;
+            }
+            Arrays.sort(result, Comparator.comparingInt(FieldCell::fieldId));
+            sorted = new Sorted(cells, result);
+            return result;
         }
     }
 

@@ -1676,11 +1676,29 @@ static size_t jn_rc_retired_cap;
 static int    jn_rc_scan_busy;
 #define JN_RC_SCAN_MIN 8192
 static size_t jn_rc_scan_at = JN_RC_SCAN_MIN;
+#define JN_RC_SCAN_MIN_BYTES ((size_t)64 << 20)
+#define JN_RC_BACKLOG_FACTOR 4
+#define JN_RC_BACKLOG_SPINS 100000
+static size_t jn_rc_retired_bytes;
+static size_t jn_rc_scan_bytes_at = JN_RC_SCAN_MIN_BYTES;
 
 static void jn_rc_scan(void);
 
+static int jn_rc_over(size_t factor) {
+    return __atomic_load_n(&jn_rc_retired_n, __ATOMIC_RELAXED) >= factor * __atomic_load_n(&jn_rc_scan_at, __ATOMIC_RELAXED)
+        || __atomic_load_n(&jn_rc_retired_bytes, __ATOMIC_RELAXED) >= factor * __atomic_load_n(&jn_rc_scan_bytes_at, __ATOMIC_RELAXED);
+}
+
 static void jn_rc_maybe_scan(void) {
-    if (__atomic_load_n(&jn_rc_retired_n, __ATOMIC_RELAXED) >= __atomic_load_n(&jn_rc_scan_at, __ATOMIC_RELAXED)) jn_rc_scan();
+    if (!jn_rc_over(1)) return;
+    jn_rc_scan();
+    for (int spins = 0; spins < JN_RC_BACKLOG_SPINS && jn_rc_over(JN_RC_BACKLOG_FACTOR); spins++) {
+        if (!__atomic_load_n(&jn_rc_scan_busy, __ATOMIC_ACQUIRE)) {
+            jn_rc_scan();
+            continue;
+        }
+        jn_yield();
+    }
 }
 
 static void jn_hold_write(JnHoldThread* t, void** hold, void* value) {
@@ -1807,7 +1825,7 @@ void __jnative_rc_frame_exit(void** holds, int32_t n, void* ret) {
     (void)n;
     JnHoldThread* t = jn_hold_self;
     if (t == NULL) return;
-    jn_hold_set(&t->ret, ret);
+    if (ret != NULL) jn_hold_set(&t->ret, ret);
     int keep = jn_hold_frame_n;
     while (keep > 0 && jn_hold_frames[keep - 1].holds != holds) keep--;
     if (keep > 0) jn_hold_pop_to(keep - 1);
@@ -1880,6 +1898,14 @@ void* __jnative_rc_cae(void** addr, void* expected, void* desired, void** hold) 
     return witness;
 }
 
+static size_t jn_rc_bytes_locked(void* p) {
+    JnRcInfo* info = jn_rc_of(p);
+    if (info == NULL || info->offset >= 0) return 0;
+    int32_t len = *(int32_t*)((char*)p + JAVA_ARR_LENGTH_OFFSET);
+    int32_t elem = *(int32_t*)((char*)p + JAVA_ARR_ELEM_SIZE_OFFSET);
+    return JAVA_ARR_HDR + (len > 0 && elem > 0 ? (size_t)len * (size_t)elem : 0);
+}
+
 static int jn_rc_queue_locked(void* p) {
     if (jn_rc_retired_n == jn_rc_retired_cap) {
         size_t cap = jn_rc_retired_cap == 0 ? 64 : jn_rc_retired_cap * 2;
@@ -1890,6 +1916,7 @@ static int jn_rc_queue_locked(void* p) {
     }
     jn_rc_retired[jn_rc_retired_n] = p;
     __atomic_store_n(&jn_rc_retired_n, jn_rc_retired_n + 1, __ATOMIC_RELAXED);
+    __atomic_store_n(&jn_rc_retired_bytes, jn_rc_retired_bytes + jn_rc_bytes_locked(p), __ATOMIC_RELAXED);
     return 1;
 }
 
@@ -2027,9 +2054,18 @@ static int jn_rc_reclaim_pending(void) {
             free(jn_rc_array_remove(p));
         }
     }
-    for (size_t i = n; i < jn_rc_retired_n; i++) jn_rc_retired[keep++] = jn_rc_retired[i];
+    size_t kept_bytes = 0;
+    for (size_t i = 0; i < keep; i++) kept_bytes += jn_rc_bytes_locked(jn_rc_retired[i]);
+    size_t fresh_bytes = 0;
+    for (size_t i = n; i < jn_rc_retired_n; i++) {
+        fresh_bytes += jn_rc_bytes_locked(jn_rc_retired[i]);
+        jn_rc_retired[keep++] = jn_rc_retired[i];
+    }
+    size_t kept_n = keep - (jn_rc_retired_n - n);
     __atomic_store_n(&jn_rc_retired_n, keep, __ATOMIC_RELAXED);
-    __atomic_store_n(&jn_rc_scan_at, keep * 2 > JN_RC_SCAN_MIN ? keep * 2 : JN_RC_SCAN_MIN, __ATOMIC_RELAXED);
+    __atomic_store_n(&jn_rc_retired_bytes, kept_bytes + fresh_bytes, __ATOMIC_RELAXED);
+    __atomic_store_n(&jn_rc_scan_at, kept_n * 2 > JN_RC_SCAN_MIN ? kept_n * 2 : JN_RC_SCAN_MIN, __ATOMIC_RELAXED);
+    __atomic_store_n(&jn_rc_scan_bytes_at, kept_bytes * 2 > JN_RC_SCAN_MIN_BYTES ? kept_bytes * 2 : JN_RC_SCAN_MIN_BYTES, __ATOMIC_RELAXED);
     jn_mutex_unlock(&jn_weak_mutex);
 
     if (candidates == NULL) return 0;
@@ -2274,6 +2310,12 @@ void __jnative_free_container_storage(void* p) {
 typedef struct MonitorEntry {
     void* obj;
     jn_mutex_t mutex;
+    jn_cond_t entry_cond;
+    jn_cond_t wait_cond;
+    jn_thread_t owner;
+    int count;
+    int contenders;
+    int waiters;
     int refs;
     struct MonitorEntry* next;
 } MonitorEntry;
@@ -2301,43 +2343,68 @@ static MonitorEntry** find_entry(void* obj) {
     return pp;
 }
 
-static void free_entry(MonitorEntry** pp) {
-    MonitorEntry* entry = *pp;
-    *pp = entry->next;
-    jn_mutex_destroy(&entry->mutex);
-    free(entry);
-}
+static MonitorEntry* monitor_free_list[MONITOR_STRIPES];
 
-static jn_mutex_t* get_or_create_mutex(void* obj) {
-    if (obj == NULL) return NULL;
-    int* lock = monitor_lock_for(obj);
+static MonitorEntry* monitor_pin(void* obj) {
+    uint32_t h = hash_ptr(obj);
+    int* lock = monitor_stripe_lock[h & (MONITOR_STRIPES - 1)];
     jn_spin_lock(lock);
-    MonitorEntry** pp = find_entry(obj);
-    MonitorEntry* entry = *pp;
+    MonitorEntry* entry = *find_entry(obj);
     if (entry == NULL) {
-        entry = malloc(sizeof(MonitorEntry));
-        if (entry == NULL) {
-            jn_spin_unlock(lock);
-            return NULL;
+        MonitorEntry** pool = &monitor_free_list[h & (MONITOR_STRIPES - 1)];
+        entry = *pool;
+        if (entry != NULL) {
+            *pool = entry->next;
+        } else {
+            entry = calloc(1, sizeof(MonitorEntry));
+            if (entry == NULL) {
+                jn_spin_unlock(lock);
+                __jnative_throw_out_of_memory_error_ctx("monitor");
+                return NULL;
+            }
+            jn_mutex_init(&entry->mutex, NULL);
+            jn_cond_init(&entry->entry_cond, NULL);
+            jn_cond_init(&entry->wait_cond, NULL);
         }
         entry->obj = obj;
-        entry->refs = 0;
-        jn_recmutex_init(&entry->mutex);
-        entry->next = NULL;
-        *pp = entry;
+        entry->next = monitor_table[h];
+        monitor_table[h] = entry;
     }
     entry->refs++;
     jn_spin_unlock(lock);
-    return &entry->mutex;
+    return entry;
 }
 
-void __jnative_monitor_destroy(void* obj) {
-    if (obj == NULL) return;
-    int* lock = monitor_lock_for(obj);
+static void monitor_release_locked(MonitorEntry* entry) {
+    if (--entry->refs > 0) return;
+    uint32_t h = hash_ptr(entry->obj);
+    MonitorEntry** pp = &monitor_table[h];
+    while (*pp != entry) pp = &(*pp)->next;
+    *pp = entry->next;
+    entry->obj = NULL;
+    entry->next = monitor_free_list[h & (MONITOR_STRIPES - 1)];
+    monitor_free_list[h & (MONITOR_STRIPES - 1)] = entry;
+}
+
+static void monitor_unpin(MonitorEntry* entry) {
+    int* lock = monitor_lock_for(entry->obj);
     jn_spin_lock(lock);
-    MonitorEntry** pp = find_entry(obj);
-    if (*pp && (*pp)->refs == 0) free_entry(pp);
+    monitor_release_locked(entry);
     jn_spin_unlock(lock);
+}
+
+static int monitor_owned_by(MonitorEntry* entry, jn_thread_t self) {
+    return entry->count > 0 && jn_thread_equal(entry->owner, self);
+}
+
+static void monitor_take_locked(MonitorEntry* entry, jn_thread_t self, int count) {
+    while (entry->count > 0) {
+        entry->contenders++;
+        jn_cond_wait(&entry->entry_cond, &entry->mutex);
+        entry->contenders--;
+    }
+    entry->owner = self;
+    entry->count = count;
 }
 
 void __jnative_monitor_enter(void* obj) {
@@ -2345,8 +2412,13 @@ void __jnative_monitor_enter(void* obj) {
         __jnative_throw_null_pointer_exception();
         return;
     }
-    jn_mutex_t* mtx = get_or_create_mutex(obj);
-    if (mtx) jn_mutex_lock(mtx);
+    MonitorEntry* entry = monitor_pin(obj);
+    if (entry == NULL) return;
+    jn_thread_t self = jn_thread_self();
+    jn_mutex_lock(&entry->mutex);
+    if (monitor_owned_by(entry, self)) entry->count++;
+    else monitor_take_locked(entry, self, 1);
+    jn_mutex_unlock(&entry->mutex);
 }
 
 void __jnative_monitor_exit(void* obj) {
@@ -2354,13 +2426,70 @@ void __jnative_monitor_exit(void* obj) {
         __jnative_throw_null_pointer_exception();
         return;
     }
+    jn_thread_t self = jn_thread_self();
     int* lock = monitor_lock_for(obj);
     jn_spin_lock(lock);
-    MonitorEntry** pp = find_entry(obj);
-    MonitorEntry* entry = *pp;
-    if (entry) {
+    MonitorEntry* entry = *find_entry(obj);
+    if (entry != NULL) {
+        jn_mutex_lock(&entry->mutex);
+        int owned = monitor_owned_by(entry, self);
+        if (owned && --entry->count == 0 && entry->contenders > 0) jn_cond_signal(&entry->entry_cond);
         jn_mutex_unlock(&entry->mutex);
-        if (--entry->refs == 0) free_entry(pp);
+        if (owned) monitor_release_locked(entry);
+    }
+    jn_spin_unlock(lock);
+}
+
+void __jnative_monitor_wait(void* obj, int64_t timeout_ms) {
+    if (obj == NULL) {
+        __jnative_throw_null_pointer_exception();
+        return;
+    }
+    MonitorEntry* entry = monitor_pin(obj);
+    if (entry == NULL) return;
+    jn_thread_t self = jn_thread_self();
+    jn_mutex_lock(&entry->mutex);
+    int saved = 0;
+    if (monitor_owned_by(entry, self)) {
+        saved = entry->count;
+        entry->count = 0;
+        if (entry->contenders > 0) jn_cond_signal(&entry->entry_cond);
+    }
+    entry->waiters++;
+    if (timeout_ms <= 0) {
+        jn_cond_wait(&entry->wait_cond, &entry->mutex);
+    } else {
+        struct timespec ts;
+        jn_now_realtime(&ts);
+        ts.tv_sec += (time_t)(timeout_ms / 1000);
+        ts.tv_nsec += (long)((timeout_ms % 1000) * 1000000L);
+        if (ts.tv_nsec >= 1000000000L) {
+            ts.tv_sec++;
+            ts.tv_nsec -= 1000000000L;
+        }
+        jn_cond_timedwait(&entry->wait_cond, &entry->mutex, &ts);
+    }
+    entry->waiters--;
+    if (saved > 0) monitor_take_locked(entry, self, saved);
+    jn_mutex_unlock(&entry->mutex);
+    monitor_unpin(entry);
+}
+
+void __jnative_monitor_notify(void* obj, int all) {
+    if (obj == NULL) {
+        __jnative_throw_null_pointer_exception();
+        return;
+    }
+    int* lock = monitor_lock_for(obj);
+    jn_spin_lock(lock);
+    MonitorEntry* entry = *find_entry(obj);
+    if (entry != NULL) {
+        jn_mutex_lock(&entry->mutex);
+        if (entry->waiters > 0) {
+            if (all) jn_cond_broadcast(&entry->wait_cond);
+            else jn_cond_signal(&entry->wait_cond);
+        }
+        jn_mutex_unlock(&entry->mutex);
     }
     jn_spin_unlock(lock);
 }
