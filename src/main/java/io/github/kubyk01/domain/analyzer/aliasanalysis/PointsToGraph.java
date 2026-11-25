@@ -82,44 +82,43 @@ public class PointsToGraph {
 
     /** Append-only hash table. Readers can finish a lookup in an older table during growth. */
     private static final class SiteFields {
-        private volatile AtomicReferenceArray<FieldCell> table = new AtomicReferenceArray<>(2);
+        private volatile FieldCell[] table = new FieldCell[2];
         private volatile FieldCell[] sorted;
         private int size;
 
-        private static int slot(AtomicReferenceArray<FieldCell> cells, int id) {
-            int mask = cells.length() - 1;
+        private static int slot(FieldCell[] cells, int id) {
+            int mask = cells.length - 1;
             int i = (id ^ (id >>> 16)) & mask;
             while (true) {
-                FieldCell cell = cells.get(i);
+                FieldCell cell = cells[i];
                 if (cell == null || cell.fieldId() == id) return i;
                 i = (i + 1) & mask;
             }
         }
 
         FieldCell find(int id) {
-            AtomicReferenceArray<FieldCell> cells = table;
-            FieldCell cell = cells.get(slot(cells, id));
+            FieldCell[] cells = table;
+            FieldCell cell = cells[slot(cells, id)];
             // A concurrent insertion may have filled a previously empty slot.
             return cell != null && cell.fieldId() == id ? cell : null;
         }
 
         synchronized FieldCell insert(int id, String field) {
-            AtomicReferenceArray<FieldCell> cells = table;
+            FieldCell[] cells = table;
             int i = slot(cells, id);
-            FieldCell existing = cells.get(i);
+            FieldCell existing = cells[i];
             if (existing != null) return existing;
-            if (size >= cells.length() / 2) {
-                AtomicReferenceArray<FieldCell> grown = new AtomicReferenceArray<>(cells.length() * 2);
-                for (int j = 0; j < cells.length(); j++) {
-                    FieldCell cell = cells.get(j);
-                    if (cell != null) grown.set(slot(grown, cell.fieldId()), cell);
+            if (size >= cells.length / 2) {
+                FieldCell[] grown = new FieldCell[cells.length * 2];
+                for (FieldCell cell : cells) {
+                    if (cell != null) grown[slot(grown, cell.fieldId())] = cell;
                 }
                 cells = grown;
                 i = slot(cells, id);
             }
             FieldCell created = new FieldCell(id, field);
             sorted = null;
-            cells.set(i, created);
+            cells[i] = created;
             size++;
             table = cells;
             return created;
@@ -134,8 +133,7 @@ public class PointsToGraph {
             if (sorted == null) {
                 FieldCell[] result = new FieldCell[size];
                 int n = 0;
-                for (int i = 0; i < table.length(); i++) {
-                    FieldCell cell = table.get(i);
+                for (FieldCell cell : table) {
                     if (cell != null) result[n++] = cell;
                 }
                 Arrays.sort(result, Comparator.comparingInt(FieldCell::fieldId));

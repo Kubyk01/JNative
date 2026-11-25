@@ -866,7 +866,7 @@ static void jnative_defer_until_death(void* owner, void* array) {
 
 __attribute__((noinline)) void __jnative_borrow_enter(void* owner) {
     if (owner == NULL) return;
-    uintptr_t frame = (uintptr_t)__builtin_frame_address(0);
+    uintptr_t frame = JN_CALLER_FRAME();
     jnative_drop_borrows_below(frame, 0);
     if (jn_bm_get(&jnative_borrow_pairs, (uintptr_t)owner, frame) > 0) return;
     if (jnative_borrow_n == jnative_borrow_cap) {
@@ -888,7 +888,7 @@ __attribute__((noinline)) void __jnative_borrow_enter(void* owner) {
 
 __attribute__((noinline)) void __jnative_borrow_exit(void) {
     if (jnative_borrow_n == 0 && jnative_retired_n == 0) return;
-    uintptr_t frame = (uintptr_t)__builtin_frame_address(0);
+    uintptr_t frame = JN_CALLER_FRAME();
     jnative_drop_borrows_below(frame, 1);
 }
 
@@ -919,7 +919,7 @@ __attribute__((noinline)) void __jnative_replace_array(void* owner, void* old, v
     }
     if (*(int32_t*)((char*)old + JAVA_ARR_LENGTH_OFFSET) <= 0) return;
     if (!__jnative_release_owner(old)) return;
-    uintptr_t frame = (uintptr_t)__builtin_frame_address(0);
+    uintptr_t frame = JN_CALLER_FRAME();
     jnative_drop_borrows_below(frame, 0);
     if (mode == 0) {
         jnative_defer_until_death(owner, old);
@@ -1051,7 +1051,7 @@ static void jn_ebr_collect(void) {
 }
 
 __attribute__((noinline)) void __jnative_ebr_pin(void) {
-    uintptr_t frame = (uintptr_t)__builtin_frame_address(0);
+    uintptr_t frame = JN_CALLER_FRAME();
     JnEbrThread* t = jn_ebr_thread();
     jn_ebr_drop_frames(frame, 0);
     for (int i = jn_ebr_frame_n - 1; i >= 0; i--) {
@@ -1076,7 +1076,7 @@ __attribute__((noinline)) void __jnative_ebr_pin(void) {
 __attribute__((noinline)) void __jnative_ebr_unpin(void) {
     JnEbrThread* t = jn_ebr_self;
     if (t == NULL) return;
-    uintptr_t frame = (uintptr_t)__builtin_frame_address(0);
+    uintptr_t frame = JN_CALLER_FRAME();
     jn_ebr_drop_frames(frame, 1);
     if (jn_ebr_frame_n == 0 && __atomic_load_n(&t->active, __ATOMIC_RELAXED)) {
         __atomic_store_n(&t->active, 0, __ATOMIC_SEQ_CST);

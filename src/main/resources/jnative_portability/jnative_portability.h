@@ -389,6 +389,13 @@ JNATIVE_NORETURN void jn_exit_process(int code);
 int jn_get_static_range(uintptr_t* low, uintptr_t* high);
 int jn_get_text_range  (uintptr_t* low, uintptr_t* high);
 
+#if defined(_MSC_VER) && !defined(__MINGW32__)
+#  include <intrin.h>
+#  define JN_CALLER_FRAME() ((uintptr_t)_AddressOfReturnAddress())
+#else
+#  define JN_CALLER_FRAME() ((uintptr_t)__builtin_frame_address(0))
+#endif
+
 /* ==================================================================
  *  7. CONSTRUCTOR
  * ================================================================== */
