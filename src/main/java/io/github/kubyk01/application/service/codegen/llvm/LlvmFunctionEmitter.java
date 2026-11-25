@@ -1173,9 +1173,12 @@ public class LlvmFunctionEmitter {
                 String ptrCast = newAux("ptrcast");
                 sb.append("  ").append(ptrCast).append(" = bitcast i8* ").append(gep)
                         .append(" to ").append(fieldLlvm).append("*\n");
-                if (emitHeldLoad(sb, inst, resultName, fieldLlvm, ptrCast)) break;
-                sb.append("  ").append(resultName).append(" = load ").append(fieldLlvm)
-                        .append(", ").append(fieldLlvm).append("* ").append(ptrCast).append("\n");
+                boolean volatileField = globalEmitter.isVolatileField(owner, fieldName);
+                if (!emitHeldLoad(sb, inst, resultName, fieldLlvm, ptrCast)) {
+                    sb.append("  ").append(resultName).append(volatileField ? " = load volatile " : " = load ")
+                            .append(fieldLlvm).append(", ").append(fieldLlvm).append("* ").append(ptrCast).append("\n");
+                }
+                if (volatileField) sb.append("  fence acquire\n");
                 break;
             }
 
@@ -1207,7 +1210,7 @@ public class LlvmFunctionEmitter {
                     sb.append("  ").append(ptrCast).append(" = bitcast i8* ").append(gep)
                             .append(" to ").append(fieldLlvm).append("*\n");
                     if (inst.isRcStore() && "i8*".equals(fieldLlvm)) {
-                        emitCountedStore(sb, "i8** " + ptrCast, rhsConverted);
+                        emitCountedStore(sb, "i8** " + ptrCast, rhsConverted, baseI8);
                         break;
                     }
                     sb.append("  store ").append(fieldLlvm).append(" ").append(rhsConverted)
@@ -1248,17 +1251,19 @@ public class LlvmFunctionEmitter {
                 String ptrCast = newAux("ptrcast");
                 sb.append("  ").append(ptrCast).append(" = bitcast i8* ").append(gep)
                         .append(" to ").append(fieldLlvm).append("*\n");
+                boolean volatileField = globalEmitter.isVolatileField(owner, fieldName);
+                if (volatileField) sb.append("  fence release\n");
                 if (inst.isRcWeak()) {
                     sb.append("  call void @__jnative_weak_store(i8** ").append(ptrCast)
                             .append(", i8* ").append(rhsConverted).append(")\n");
+                } else if (inst.isRcStore() && "i8*".equals(fieldLlvm)) {
+                    emitCountedStore(sb, "i8** " + ptrCast, rhsConverted, baseI8);
                     break;
+                } else {
+                    sb.append(volatileField ? "  store volatile " : "  store ").append(fieldLlvm).append(" ").append(rhsConverted)
+                            .append(", ").append(fieldLlvm).append("* ").append(ptrCast).append("\n");
                 }
-                if (inst.isRcStore() && "i8*".equals(fieldLlvm)) {
-                    emitCountedStore(sb, "i8** " + ptrCast, rhsConverted);
-                    break;
-                }
-                sb.append("  store ").append(fieldLlvm).append(" ").append(rhsConverted)
-                        .append(", ").append(fieldLlvm).append("* ").append(ptrCast).append("\n");
+                if (volatileField) sb.append("  fence seq_cst\n");
                 break;
             }
 
@@ -1296,10 +1301,13 @@ public class LlvmFunctionEmitter {
                     fieldType = inst.getResult().getType();
                 }
                 String llvmType = LlvmTypeMapper.toLlvmType(fieldType);
-                if (emitHeldLoad(sb, inst, resultName, llvmType, "@" + globalName)) break;
-                sb.append("  ").append(resultName).append(" = load ")
-                        .append(llvmType).append(", ")
-                        .append(llvmType).append("* @").append(globalName).append("\n");
+                boolean volatileField = globalEmitter.isVolatileField(owner, bareField);
+                if (!emitHeldLoad(sb, inst, resultName, llvmType, "@" + globalName)) {
+                    sb.append("  ").append(resultName).append(volatileField ? " = load volatile " : " = load ")
+                            .append(llvmType).append(", ")
+                            .append(llvmType).append("* @").append(globalName).append("\n");
+                }
+                if (volatileField) sb.append("  fence acquire\n");
                 break;
             }
 
@@ -1338,12 +1346,15 @@ public class LlvmFunctionEmitter {
                     String rhsConverted = castValueToType(sb, rhsRef, rhs.getType(), fieldType);
                     String llvmType = LlvmTypeMapper.toLlvmType(fieldType);
 
+                    boolean volatileField = globalEmitter.isVolatileField(owner, bareField);
+                    if (volatileField) sb.append("  fence release\n");
                     if (inst.isRcStore() && "i8*".equals(llvmType)) {
                         emitCountedStore(sb, "i8** @" + globalName, rhsConverted);
                         break;
                     }
-                    sb.append("  store ").append(llvmType).append(" ").append(rhsConverted)
+                    sb.append(volatileField ? "  store volatile " : "  store ").append(llvmType).append(" ").append(rhsConverted)
                             .append(", ").append(llvmType).append("* @").append(globalName).append("\n");
+                    if (volatileField) sb.append("  fence seq_cst\n");
                 }
                 break;
             }
@@ -3012,11 +3023,13 @@ public class LlvmFunctionEmitter {
         if (args.size() != coordinateCount + valueCount) return false;
 
         String slot = newAux("vh_slot");
+        String selfBase = null;
         switch (target.kind()) {
             case INSTANCE_FIELD -> {
                 Value obj = args.getFirst();
                 emitNullCheck(sb, obj, ranges, "field '" + target.owner() + "." + target.fieldName() + "'");
                 String base = emitBaseToI8Pointer(sb, obj);
+                selfBase = base;
                 int offset = globalEmitter.getFieldOffset(target.owner(), target.fieldName());
                 sb.append("  ").append(slot).append(" = getelementptr i8, i8* ").append(base)
                         .append(", i32 ").append(offset).append("\n");
@@ -3074,9 +3087,10 @@ public class LlvmFunctionEmitter {
             String desired = vhMemoryToCas(sb, vhToMemory(sb, values.get(1), vt), memTy, casTy);
             String hp = holdPointer(sb, inst);
             String witness = newAux("vh_witness");
-            sb.append("  ").append(witness).append(" = call i8* @__jnative_rc_cae(i8** ").append(ptr)
+            sb.append("  ").append(witness).append(" = call i8* @__jnative_rc_cae_in(i8** ").append(ptr)
                     .append(", i8* ").append(expected).append(", i8* ").append(desired)
-                    .append(", i8** ").append(hp == null ? "null" : hp).append(")\n");
+                    .append(", i8** ").append(hp == null ? "null" : hp)
+                    .append(", i8* ").append(selfBase == null ? "null" : selfBase).append(")\n");
             if (hp != null) heldInline.add(inst);
             out = witness;
         } else if (loadOrder != null) {
@@ -3089,7 +3103,7 @@ public class LlvmFunctionEmitter {
         } else if (storeOrder != null && "i8*".equals(memTy)) {
             String ptr = vhTypedPointer(sb, slot, memTy);
             String v = vhToMemory(sb, values.getFirst(), vt);
-            emitCountedStore(sb, "i8** " + ptr, v);
+            emitCountedStore(sb, "i8** " + ptr, v, selfBase);
         } else if (storeOrder != null) {
             String ptr = vhTypedPointer(sb, slot, memTy);
             String v = vhToMemory(sb, values.getFirst(), vt);
@@ -3101,8 +3115,12 @@ public class LlvmFunctionEmitter {
             String expected = vhMemoryToCas(sb, vhToMemory(sb, values.get(0), vt), memTy, casTy);
             String desired = vhMemoryToCas(sb, vhToMemory(sb, values.get(1), vt), memTy, casTy);
             String pair = newAux("vh_cas");
+            String countedDesired = desired;
+            String countedExpected = expected;
             if ("i8*".equals(casTy)) {
-                sb.append("  call void @__jnative_rc_inc(i8* ").append(desired).append(")\n");
+                countedDesired = unlessSelf(sb, desired, selfBase);
+                countedExpected = unlessSelf(sb, expected, selfBase);
+                sb.append("  call void @__jnative_rc_inc(i8* ").append(countedDesired).append(")\n");
             }
             sb.append("  ").append(pair).append(" = cmpxchg ");
             if (weak) sb.append("weak ");
@@ -3117,8 +3135,8 @@ public class LlvmFunctionEmitter {
                         .append(", i1 } ").append(pair).append(", 1\n");
                 String swappedI32 = newAux("vh_swapped32");
                 sb.append("  ").append(swappedI32).append(" = zext i1 ").append(swapped).append(" to i32\n");
-                sb.append("  call void @__jnative_rc_cas(i32 ").append(swappedI32).append(", i8* ").append(desired)
-                        .append(", i8* ").append(expected).append(")\n");
+                sb.append("  call void @__jnative_rc_cas(i32 ").append(swappedI32).append(", i8* ").append(countedDesired)
+                        .append(", i8* ").append(countedExpected).append(")\n");
             }
             if (exchange) {
                 String witness = newAux("vh_witness");
@@ -3137,7 +3155,8 @@ public class LlvmFunctionEmitter {
             String v = vhToMemory(sb, values.getFirst(), vt);
             String old = newAux("vh_old");
             if ("i8*".equals(memTy)) {
-                sb.append("  call void @__jnative_rc_inc(i8* ").append(v).append(")\n");
+                String countedValue = unlessSelf(sb, v, selfBase);
+                sb.append("  call void @__jnative_rc_inc(i8* ").append(countedValue).append(")\n");
             }
             sb.append("  ").append(old).append(" = atomicrmw ").append(rmwOp).append(" ")
                     .append(memTy).append("* ").append(ptr).append(", ").append(memTy).append(" ").append(v)
@@ -3148,7 +3167,8 @@ public class LlvmFunctionEmitter {
                     sb.append("  call void @__jnative_rc_hold(i8** ").append(hp).append(", i8* ").append(old).append(")\n");
                     heldInline.add(inst);
                 }
-                sb.append("  call void @__jnative_rc_dec(i8* ").append(old).append(")\n");
+                String countedOld = unlessSelf(sb, old, selfBase);
+                sb.append("  call void @__jnative_rc_dec(i8* ").append(countedOld).append(")\n");
             }
             out = vhFromMemory(sb, old, vt);
         }
@@ -3159,8 +3179,23 @@ public class LlvmFunctionEmitter {
         return true;
     }
 
+    private String unlessSelf(StringBuilder sb, String value, String self) {
+        if (self == null) return value;
+        String same = newAux("rc_self");
+        sb.append("  ").append(same).append(" = icmp eq i8* ").append(value).append(", ").append(self).append("\n");
+        String counted = newAux("rc_counted");
+        sb.append("  ").append(counted).append(" = select i1 ").append(same).append(", i8* null, i8* ")
+                .append(value).append("\n");
+        return counted;
+    }
+
     private void emitCountedStore(StringBuilder sb, String typedPointer, String value) {
-        sb.append("  call void @__jnative_rc_inc(i8* ").append(value).append(")\n");
+        emitCountedStore(sb, typedPointer, value, null);
+    }
+
+    private void emitCountedStore(StringBuilder sb, String typedPointer, String value, String self) {
+        String countedValue = unlessSelf(sb, value, self);
+        sb.append("  call void @__jnative_rc_inc(i8* ").append(countedValue).append(")\n");
         String slot = newAux("rc_slot");
         sb.append("  ").append(slot).append(" = bitcast ").append(typedPointer).append(" to i64*\n");
         String fresh = newAux("rc_new");
@@ -3170,7 +3205,8 @@ public class LlvmFunctionEmitter {
                 .append(" seq_cst\n");
         String oldPtr = newAux("rc_oldp");
         sb.append("  ").append(oldPtr).append(" = inttoptr i64 ").append(old).append(" to i8*\n");
-        sb.append("  call void @__jnative_rc_dec(i8* ").append(oldPtr).append(")\n");
+        String countedOld = unlessSelf(sb, oldPtr, self);
+        sb.append("  call void @__jnative_rc_dec(i8* ").append(countedOld).append(")\n");
     }
 
     private String vhTypedPointer(StringBuilder sb, String slot, String ty) {

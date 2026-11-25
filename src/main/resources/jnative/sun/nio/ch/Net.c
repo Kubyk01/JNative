@@ -499,7 +499,11 @@ int32_t __jnative_fn_sun_nio_ch_Net_accept__Ljava_io_FileDescriptor_Ljava_io_Fil
 
     if (isaa_array != NULL) {
         void** slots = (void**)((char*)isaa_array + JAVA_ARR_HDR);
-        slots[0] = net_make_socket_address(&ss);
+        void* old_isa = slots[0];
+        void* new_isa = net_make_socket_address(&ss);
+        __jnative_rc_inc(new_isa);
+        slots[0] = new_isa;
+        __jnative_rc_dec(old_isa);
     }
     return 1;
 }
@@ -664,7 +668,11 @@ int32_t __jnative_fn_sun_nio_ch_Net_recvFrom__Ljava_io_FileDescriptor_JILjava_ne
 
     if (isaa_array != NULL) {
         void** slots = (void**)((char*)isaa_array + JAVA_ARR_HDR);
-        slots[0] = net_make_socket_address(&ss);
+        void* old_isa = slots[0];
+        void* new_isa = net_make_socket_address(&ss);
+        __jnative_rc_inc(new_isa);
+        slots[0] = new_isa;
+        __jnative_rc_dec(old_isa);
     }
     return (int32_t)n;
 }

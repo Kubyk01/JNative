@@ -23,7 +23,9 @@ import io.github.kubyk01.domain.ir.Terminator;
 import io.github.kubyk01.domain.ir.ThrowTerminator;
 import io.github.kubyk01.domain.ir.Type;
 import io.github.kubyk01.domain.ir.Value;
+import io.github.kubyk01.util.LlvmUtil;
 import org.objectweb.asm.Opcodes;
+import reactor.core.scheduler.Scheduler;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -34,6 +36,7 @@ import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 import static io.github.kubyk01.util.LlvmUtil.canonicalCalleeKey;
 import static io.github.kubyk01.util.LlvmUtil.extractCalleeName;
@@ -56,6 +59,7 @@ final class AtomicSlotArrays {
     private final AliasAnalysisResult alias;
     private final EscapeAnalysisResult escape;
     private final VarHandleTargetResolver handles;
+    private final Scheduler scheduler;
 
     private final List<Op> ops = new ArrayList<>();
     private final Set<String> fieldFamilies = new HashSet<>();
@@ -83,8 +87,9 @@ final class AtomicSlotArrays {
     private final ReflectInfo reflectInfo;
 
     AtomicSlotArrays(Module module, DependencyResolver resolver, AliasAnalysisResult alias, EscapeAnalysisResult escape,
-                     ReflectInfo reflectInfo) {
+                     ReflectInfo reflectInfo, Scheduler scheduler) {
         this.reflectInfo = reflectInfo;
+        this.scheduler = scheduler;
         this.module = module;
         this.resolver = resolver;
         this.alias = alias;
@@ -175,29 +180,47 @@ final class AtomicSlotArrays {
             if (invalid.containsKey(fam)) System.out.println("AtomicSlotArrays: " + fam + " kept: " + invalid.get(fam));
         }
         indexes.clear();
+        indexOps();
+    }
+
+    private record ScannedFunction(List<Instruction> plain, List<Instruction> calls, List<List<Function>> targets) {}
+
+    private ScannedFunction scanFunction(Function f) {
+        ScannedFunction out = new ScannedFunction(new ArrayList<>(), new ArrayList<>(), new ArrayList<>());
+        for (BasicBlock block : f.getBlocks()) {
+            for (Instruction inst : block.getInstructions()) {
+                Opcode op = inst.getOpcode();
+                if (op == Opcode.GET_FIELD || op == Opcode.PUT_FIELD) {
+                    out.plain().add(inst);
+                    continue;
+                }
+                if (!isCall(op)) continue;
+                out.calls().add(inst);
+                out.targets().add(resolveTargets(inst));
+            }
+        }
+        return out;
     }
 
     private void scan() {
-        List<? extends Function> fns = module.getFunctions();
+        List<Function> fns = new ArrayList<>();
+        for (Function f : module.getFunctions()) {
+            if (f.getEntryBlock() != null && !ContainerArrayBorrows.isDestructor(f)) fns.add(f);
+        }
+        List<ScannedFunction> scanned = LlvmUtil.parallelMapOrdered(fns, scheduler, this::scanFunction);
         List<Instruction> plain = new ArrayList<>();
         List<Instruction> calls = new ArrayList<>();
-        for (Function f : fns) {
-            if (f.getEntryBlock() == null || ContainerArrayBorrows.isDestructor(f)) continue;
-            boolean intrinsicOwner = isAtomicHolder(f);
-            for (BasicBlock block : f.getBlocks()) {
-                for (Instruction inst : block.getInstructions()) {
-                    Opcode op = inst.getOpcode();
-                    if (op == Opcode.GET_FIELD || op == Opcode.PUT_FIELD) {
-                        plain.add(inst);
-                        continue;
-                    }
-                    if (!isCall(op)) continue;
-                    List<Function> ts = resolveTargets(inst);
-                    targets.put(inst, ts);
-                    for (Function function : ts)
-                        callSitesOf.computeIfAbsent(function, k -> new ArrayList<>()).add(inst);
-                    if (!intrinsicOwner) calls.add(inst);
-                }
+        for (int fi = 0; fi < fns.size(); fi++) {
+            ScannedFunction sf = scanned.get(fi);
+            boolean intrinsicOwner = isAtomicHolder(fns.get(fi));
+            plain.addAll(sf.plain());
+            for (int ci = 0; ci < sf.calls().size(); ci++) {
+                Instruction inst = sf.calls().get(ci);
+                List<Function> ts = sf.targets().get(ci);
+                targets.put(inst, ts);
+                for (Function function : ts)
+                    callSitesOf.computeIfAbsent(function, k -> new ArrayList<>()).add(inst);
+                if (!intrinsicOwner) calls.add(inst);
             }
         }
         for (Instruction inst : calls) noteUpdaterCreation(inst);
@@ -1093,8 +1116,12 @@ final class AtomicSlotArrays {
     private final Map<Instruction, Op> opIndex = new IdentityHashMap<>();
 
     private Op opOf(Instruction inst) {
-        if (opIndex.isEmpty()) for (Op op : ops) opIndex.put(op.inst(), op);
+        indexOps();
         return opIndex.get(inst);
+    }
+
+    private void indexOps() {
+        if (opIndex.isEmpty()) for (Op op : ops) opIndex.put(op.inst(), op);
     }
 
     private boolean isAtomicOp(Instruction inst) {
@@ -1464,7 +1491,7 @@ final class AtomicSlotArrays {
         return out;
     }
 
-    private final Map<String, List<Function>> dispatchCache = new HashMap<>();
+    private final Map<String, List<Function>> dispatchCache = new ConcurrentHashMap<>();
 
     private List<Function> resolveTargets(Instruction inst) {
         String callee = extractCalleeName(inst);
@@ -1485,8 +1512,8 @@ final class AtomicSlotArrays {
         List<Function> cached = dispatchCache.get(callee);
         if (cached != null) return cached;
         List<Function> computed = dispatchTargets(callee);
-        dispatchCache.put(callee, computed);
-        return computed;
+        List<Function> raced = dispatchCache.putIfAbsent(callee, computed);
+        return raced != null ? raced : computed;
     }
 
     private List<Function> dispatchTargets(String callee) {

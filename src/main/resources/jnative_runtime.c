@@ -631,7 +631,7 @@ typedef struct {
     void* array;
 } JNativeRetired;
 
-#define JN_DEATH_BUCKETS 65536
+#define JN_DEATH_BUCKETS (1 << 20)
 
 typedef struct JNativeDeathNode {
     void* owner;
@@ -1338,6 +1338,38 @@ static int jn_rc_shard_grow(JnRcShard* s) {
     return 1;
 }
 
+#define JN_RC_KLASS_MAX 256
+static void* jn_rc_klasses[JN_RC_KLASS_MAX];
+static int   jn_rc_klass_n;
+static int   jn_rc_klass_overflow;
+static int   jn_rc_klass_lock;
+
+static int jn_rc_klass_managed(void* klass) {
+    if (__atomic_load_n(&jn_rc_klass_overflow, __ATOMIC_ACQUIRE)) return 1;
+    int n = __atomic_load_n(&jn_rc_klass_n, __ATOMIC_ACQUIRE);
+    for (int i = 0; i < n; i++) {
+        if (__atomic_load_n(&jn_rc_klasses[i], __ATOMIC_RELAXED) == klass) return 1;
+    }
+    return 0;
+}
+
+static void jn_rc_klass_add(void* klass) {
+    if (jn_rc_klass_managed(klass)) return;
+    jn_spin_lock(&jn_rc_klass_lock);
+    int n = jn_rc_klass_n;
+    int found = 0;
+    for (int i = 0; i < n && !found; i++) found = jn_rc_klasses[i] == klass;
+    if (!found) {
+        if (n < JN_RC_KLASS_MAX) {
+            __atomic_store_n(&jn_rc_klasses[n], klass, __ATOMIC_RELAXED);
+            __atomic_store_n(&jn_rc_klass_n, n + 1, __ATOMIC_RELEASE);
+        } else {
+            __atomic_store_n(&jn_rc_klass_overflow, 1, __ATOMIC_RELEASE);
+        }
+    }
+    jn_spin_unlock(&jn_rc_klass_lock);
+}
+
 static JnRcArray* jn_rc_array_find(void* p) {
     uintptr_t h = jnative_mix((uintptr_t)p);
     JnRcShard* s = jn_rc_shard(h);
@@ -1391,7 +1423,9 @@ static JnRcArray* jn_rc_array_remove(void* p) {
 }
 
 static int jn_rc_managed_array(void* p) {
-    return p != NULL && jn_rc_array_find(p) != NULL;
+    if (p == NULL) return 0;
+    void* klass = *(void**)p;
+    return klass != NULL && jn_rc_klass_managed(klass) && jn_rc_array_find(p) != NULL;
 }
 
 void** __jnative_referent_slot(void* ref) {
@@ -1504,6 +1538,7 @@ static uint32_t* jn_rc_word_locked(void* p) {
     JnRcInfo* info = jn_rc_of(p);
     if (info == NULL) return NULL;
     if (info->offset >= 0) return (uint32_t*)((char*)p + info->offset);
+    if (!jn_rc_klass_managed(*(void**)p)) return NULL;
     JnRcArray* array = jn_rc_array_find(p);
     return array == NULL ? NULL : &array->state;
 }
@@ -1898,6 +1933,23 @@ void* __jnative_rc_cae(void** addr, void* expected, void* desired, void** hold) 
     return witness;
 }
 
+void* __jnative_rc_cae_in(void** addr, void* expected, void* desired, void** hold, void* self) {
+    void* counted_desired = desired == self ? NULL : desired;
+    void* counted_expected = expected == self ? NULL : expected;
+    __jnative_rc_inc(counted_desired);
+    void* witness;
+    int swapped;
+    for (;;) {
+        witness = expected;
+        swapped = __atomic_compare_exchange_n(addr, &witness, desired, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+        if (hold == NULL) break;
+        jn_hold_set(hold, witness);
+        if (swapped || witness == NULL || __atomic_load_n(addr, __ATOMIC_SEQ_CST) == witness) break;
+    }
+    __jnative_rc_dec(swapped ? counted_expected : counted_desired);
+    return witness;
+}
+
 static size_t jn_rc_bytes_locked(void* p) {
     JnRcInfo* info = jn_rc_of(p);
     if (info == NULL || info->offset >= 0) return 0;
@@ -1925,6 +1977,7 @@ static void jn_rc_register_array(void* p, void** hold) {
     if (array != NULL) {
         array->array = p;
         array->state = JN_RC_RETIRED;
+        jn_rc_klass_add(*(void**)p);
         jn_hold_set(hold, p);
         jn_mutex_lock(&jn_weak_mutex);
         if (jn_rc_array_insert(array)) {
@@ -3444,8 +3497,22 @@ static void __jnative_install_fatal_handlers(void) {
     sigaction(SIGILL,  &sa, NULL);
 }
 
+#if defined(__GLIBC__)
+#include <malloc.h>
+static void jnative_tune_malloc(void) {
+    if (getenv("MALLOC_MMAP_THRESHOLD_") == NULL) mallopt(M_MMAP_THRESHOLD, 1024 * 1024);
+    if (getenv("MALLOC_ARENA_MAX") == NULL) {
+        long cpus = sysconf(_SC_NPROCESSORS_ONLN);
+        mallopt(M_ARENA_MAX, cpus < 2 ? 2 : (int)cpus);
+    }
+}
+#endif
+
 __attribute__((constructor))
 static void __jnative_auto_init(void) {
+#if defined(__GLIBC__)
+    jnative_tune_malloc();
+#endif
     jn_dlsym_default = dlopen(NULL, RTLD_LAZY);
     jnative_build_static_range();
     __jnative_install_fatal_handlers();
@@ -3474,11 +3541,15 @@ static void* __jnative_make_exception_object(const char* vtable_symbol,
                                              const char* message) {
     JNativeVTable* vt = __jnative_lookup_vtable_weak(vtable_symbol);
     if (vt == NULL) return NULL;
-    void* exc = calloc(1, JNATIVE_EXCEPTION_OBJECT_SIZE);
+    ReflectionClass* cls = vt->name != NULL ? jnative_class_by_name(vt->name) : NULL;
+    size_t size = cls != NULL && (size_t)cls->object_size > JNATIVE_EXCEPTION_OBJECT_SIZE
+        ? (size_t)cls->object_size : JNATIVE_EXCEPTION_OBJECT_SIZE;
+    void* exc = calloc(1, size);
     if (exc == NULL) return NULL;
     *(void**)((char*)exc + 0) = (void*)vt;
     if (message != NULL) {
         void* msg = __jnative_make_string_obj(message, (int32_t)strlen(message));
+        __jnative_rc_inc(msg);
         *(void**)((char*)exc + JNATIVE_THROWABLE_MESSAGE_OFFSET) = msg;
     }
     return exc;
@@ -4057,6 +4128,7 @@ void* __jnative_create_string_array(int argc, char** argv) {
     for (int i = 0; i < argc; i++) {
         int len = (int)strlen(argv[i]);
         slots[i] = __jnative_make_string_obj(argv[i], len);
+        __jnative_rc_inc(slots[i]);
     }
     return array;
 }
@@ -4078,6 +4150,7 @@ static void* create_multi_array_rec(const char* desc, int last_dim,
         for (int i = 0; i < length; i++) {
             slots[i] = create_multi_array_rec(desc, last_dim, sizes,
                                               current_dim + 1, elem_size);
+            __jnative_rc_inc(slots[i]);
         }
     }
     return array;
@@ -4218,6 +4291,7 @@ static void* jn_make_string(const char* bytes, int32_t len, uint16_t* units, int
     if (s == NULL)
         __jnative_throw_out_of_memory_error_ctx("__jnative_make_string_obj");
     *(void**)((char*)s + 0)    = (void*)&vtable_java_lang_String;
+    __jnative_rc_inc(value);
     *(void**)((char*)s + 8)    = value;
     *(uint8_t*)((char*)s + 16) = coder;
     *(int32_t*)((char*)s + 20) = 0;
@@ -4519,6 +4593,7 @@ void* __jnative_string_intern(void* this_str) {
     }
     JNativeInternEntry* ne = malloc(sizeof(JNativeInternEntry));
     if (ne != NULL) {
+        __jnative_rc_inc(this_str);
         ne->str = this_str;
         ne->next = __jnative_intern_table[bucket];
         __jnative_intern_table[bucket] = ne;
@@ -4696,6 +4771,7 @@ void* __jnative_make_byte_array_input_stream(void* bytes) {
     if (bais == NULL)
         __jnative_throw_out_of_memory_error_ctx("Class.getResourceAsStream");
     int32_t len = jnative_array_length(bytes);
+    __jnative_rc_inc(bytes);
     *(void**)((char*)bais + BAIS_BUF_OFFSET)    = bytes;
     *(int32_t*)((char*)bais + BAIS_POS_OFFSET)   = 0;
     *(int32_t*)((char*)bais + BAIS_MARK_OFFSET)  = 0;
@@ -4942,4 +5018,5 @@ void __jnative_destruct_dispatch(void* obj) {
     if (first_word == NULL) return;
     jnative_destructor_fn fn = jnative_destructor_for(first_word);
     if (fn != NULL) fn(obj);
+    else __jnative_rc_dec(obj);
 }

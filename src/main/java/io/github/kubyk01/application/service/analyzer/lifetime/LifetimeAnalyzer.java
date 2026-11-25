@@ -55,6 +55,7 @@ public class LifetimeAnalyzer {
         // -------- 2. Cyclic reference detection --------
         CyclicReferenceDetector cyclicDetector =
                 new CyclicReferenceDetector(aliasResult.getGraph(), allSites);
+        cyclicDetector.setScheduler(scheduler);
         Set<AllocationSite> cyclicSites = cyclicDetector.detect();
         result.getUnresolved().addAll(cyclicSites);
         System.out.println("Lifetime: " + cyclicSites.size() + " cyclic site(s)");

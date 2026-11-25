@@ -535,7 +535,10 @@ void __jnative_fn_java_lang_reflect_Array_set__Ljava_lang_Object_ILjava_lang_Obj
             array_throw_iae("array element type mismatch");
         }
         void** slot = (void**)array_element_address(array, index, (int32_t)sizeof(void*));
+        __jnative_rc_inc(value);
+        void* old = *slot;
         *slot = value;
+        __jnative_rc_dec(old);
         return;
     }
 

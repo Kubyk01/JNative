@@ -86,13 +86,16 @@ void* __jnative_fn_java_lang_reflect_Executable_getParameters0____Ljava_lang_ref
             __jnative_throw_out_of_memory_error_ctx("Executable.getParameters0");
         }
 
-        *(void**)((char*)parameter + JNATIVE_PARAMETER_NAME_OFFSET) =
-            jnative_string(metadata[i].name);
+        void* parameter_name = jnative_string(metadata[i].name);
+        __jnative_rc_inc(parameter_name);
+        *(void**)((char*)parameter + JNATIVE_PARAMETER_NAME_OFFSET) = parameter_name;
         *(int32_t*)((char*)parameter + JNATIVE_PARAMETER_MODIFIERS_OFFSET) =
             metadata[i].modifiers;
+        __jnative_rc_inc(this_executable);
         *(void**)((char*)parameter + JNATIVE_PARAMETER_EXECUTABLE_OFFSET) =
             this_executable;
         *(int32_t*)((char*)parameter + JNATIVE_PARAMETER_INDEX_OFFSET) = i;
+        __jnative_rc_inc(parameter);
         parameter_slots[i] = parameter;
     }
 

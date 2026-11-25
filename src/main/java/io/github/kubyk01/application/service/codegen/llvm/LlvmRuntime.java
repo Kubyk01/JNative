@@ -141,6 +141,7 @@ public class LlvmRuntime {
             declare void @__jnative_rc_frame_exit(i8**, i32, i8*)
             declare i8* @__jnative_rc_load(i8**, i8**)
             declare i8* @__jnative_rc_cae(i8**, i8*, i8*, i8**)
+            declare i8* @__jnative_rc_cae_in(i8**, i8*, i8*, i8**, i8*)
             declare void @__jnative_ebr_pin()
             declare void @__jnative_ebr_unpin()
             declare void @__jnative_ebr_retire(i8*)

@@ -583,7 +583,7 @@ public class Analyzer {
      * O(roots x reachable). Summaries are copy-on-write shared and freed once
      * their last caller component has consumed them.
      */
-    private static InitFacts[] closeOverInitializers(InitGraph g, boolean[] cut, List<Integer> roots) {
+    private InitFacts[] closeOverInitializers(InitGraph g, boolean[] cut, List<Integer> roots) {
         int n = g.live().size();
         int[][] callees = g.callees();
         int[] cutId = new int[n];
@@ -655,29 +655,50 @@ public class Analyzer {
             }
         }
 
-        long[][][] summary = new long[comps][][];
+        int[] level = new int[comps];
+        int maxLevel = -1;
         for (int c = 0; c < comps; c++) {
-            SharedBits trig = new SharedBits(classWords);
-            SharedBits rd   = new SharedBits(fieldWords);
-            SharedBits wr   = new SharedBits(fieldWords);
-            SharedBits nest = new SharedBits(cutWords);
-            int from = compStart.get(c), to = compStart.get(c + 1);
-            for (int k = from; k < to; k++) {
-                int u = members.get(k);
-                for (int id : g.trig()[u])   trig.set(id);
-                for (int id : g.reads()[u])  rd.set(id);
-                for (int id : g.writes()[u]) wr.set(id);
-                for (int v : callees[u]) {
-                    if (cut[v]) { nest.set(cutId[v]); continue; }
-                    if (comp[v] == c) continue;
-                    long[][] s = summary[comp[v]];
-                    trig.or(s[0]); rd.or(s[1]); wr.or(s[2]); nest.or(s[3]);
+            int lv = 0;
+            for (int k = compStart.get(c); k < compStart.get(c + 1); k++) {
+                for (int v : callees[members.get(k)]) {
+                    if (!cut[v] && comp[v] != c) lv = Math.max(lv, level[comp[v]] + 1);
                 }
             }
-            summary[c] = new long[][] { trig.bits, rd.bits, wr.bits, nest.bits };
-            for (int k = from; k < to; k++) {
-                for (int v : callees[members.get(k)]) {
-                    if (!cut[v] && comp[v] != c && --refs[comp[v]] == 0) summary[comp[v]] = null;
+            level[c] = lv;
+            maxLevel = Math.max(maxLevel, lv);
+        }
+        List<List<Integer>> byLevel = new ArrayList<>(maxLevel + 1);
+        for (int lv = 0; lv <= maxLevel; lv++) byLevel.add(new ArrayList<>());
+        for (int c = 0; c < comps; c++) byLevel.get(level[c]).add(c);
+
+        long[][][] summary = new long[comps][][];
+        for (List<Integer> levelComps : byLevel) {
+            LlvmUtil.parallelMapOrdered(levelComps, scheduler, c -> {
+                SharedBits trig = new SharedBits(classWords);
+                SharedBits rd   = new SharedBits(fieldWords);
+                SharedBits wr   = new SharedBits(fieldWords);
+                SharedBits nest = new SharedBits(cutWords);
+                int from = compStart.get(c), to = compStart.get(c + 1);
+                for (int k = from; k < to; k++) {
+                    int u = members.get(k);
+                    for (int id : g.trig()[u])   trig.set(id);
+                    for (int id : g.reads()[u])  rd.set(id);
+                    for (int id : g.writes()[u]) wr.set(id);
+                    for (int v : callees[u]) {
+                        if (cut[v]) { nest.set(cutId[v]); continue; }
+                        if (comp[v] == c) continue;
+                        long[][] s = summary[comp[v]];
+                        trig.or(s[0]); rd.or(s[1]); wr.or(s[2]); nest.or(s[3]);
+                    }
+                }
+                summary[c] = new long[][] { trig.bits, rd.bits, wr.bits, nest.bits };
+                return Boolean.TRUE;
+            });
+            for (int c : levelComps) {
+                for (int k = compStart.get(c); k < compStart.get(c + 1); k++) {
+                    for (int v : callees[members.get(k)]) {
+                        if (!cut[v] && comp[v] != c && --refs[comp[v]] == 0) summary[comp[v]] = null;
+                    }
                 }
             }
         }
@@ -852,11 +873,12 @@ public class Analyzer {
     }
 
     private Set<String> collectTriggeredOwners(Module module, DependencyResolver resolver) {
-        Set<String> owners = new HashSet<>();
-
-        List<? extends Function> jnLoop24 = module.getFunctions();
-        for (Function f : jnLoop24) {
-            if (f.getEntryBlock() == null) continue;
+        List<Function> live = new ArrayList<>();
+        for (Function f : module.getFunctions()) {
+            if (f.getEntryBlock() != null) live.add(f);
+        }
+        List<Set<String>> perFunction = LlvmUtil.parallelMapOrdered(live, scheduler, f -> {
+            Set<String> owners = new LinkedHashSet<>();
             for (BasicBlock b : f.getBlocks()) {
                 for (Instruction inst : b.getInstructions()) {
                     Opcode op = inst.getOpcode();
@@ -888,7 +910,10 @@ public class Analyzer {
                     }
                 }
             }
-        }
+            return owners;
+        });
+        Set<String> owners = new HashSet<>();
+        for (Set<String> part : perFunction) owners.addAll(part);
 
         Deque<String> worklist = new ArrayDeque<>(owners);
         while (!worklist.isEmpty()) {
@@ -948,37 +973,48 @@ public class Analyzer {
         while (changed && guard++ < maxPasses) {
             changed = false;
 
-            Set<String> callees = new HashSet<>();
-            List<? extends Function> jnLoop25 = new ArrayList<>(module.getFunctions());
-            for (Function f : jnLoop25) {
-                if (f.getEntryBlock() == null) continue;
+            List<Function> live = new ArrayList<>();
+            for (Function f : module.getFunctions()) {
+                if (f.getEntryBlock() != null) live.add(f);
+            }
+            List<Set<String>> perFunction = LlvmUtil.parallelMapOrdered(live, scheduler, f -> {
+                Set<String> found = new LinkedHashSet<>();
                 for (BasicBlock b : f.getBlocks()) {
                     for (Instruction inst : b.getInstructions()) {
                         Opcode op = inst.getOpcode();
                         if (op != Opcode.STATIC_CALL && op != Opcode.CALL) continue;
                         String callee = extractCalleeConstant(inst, 0);
-                        if (callee != null) callees.add(callee);
+                        if (callee != null) found.add(callee);
                     }
                 }
-            }
+                return found;
+            });
+            Set<String> callees = new HashSet<>();
+            for (Set<String> part : perFunction) callees.addAll(part);
 
-            for (String calleeName : callees) {
+            List<String> calleeList = new ArrayList<>(callees);
+            List<String> nativeOwners = LlvmUtil.parallelMapOrdered(calleeList, scheduler, calleeName -> {
                 int dotIdx = calleeName.lastIndexOf('.');
                 int parenIdx = calleeName.indexOf('(');
-                if (dotIdx <= 0 || parenIdx <= dotIdx) continue;
-
+                if (dotIdx <= 0 || parenIdx <= dotIdx) return null;
                 String owner = calleeName.substring(0, dotIdx);
-                String methodPart = calleeName.substring(dotIdx + 1);
-                int localParenIdx = parenIdx - dotIdx - 1;
-                String methodName = methodPart.substring(0, localParenIdx);
-                String descriptor = methodPart.substring(localParenIdx);
-
+                String methodName = calleeName.substring(dotIdx + 1, parenIdx);
+                String descriptor = calleeName.substring(parenIdx);
                 String[] foundOwner = new String[1];
                 MethodNode mn = resolver.findMethodInHierarchy(
                     owner, methodName, descriptor, foundOwner);
-                if (mn == null || !mn.isNative()) continue;
+                if (mn == null || !mn.isNative()) return null;
+                return foundOwner[0] != null ? foundOwner[0] : owner;
+            });
 
-                String actualOwner = foundOwner[0] != null ? foundOwner[0] : owner;
+            for (int ci = 0; ci < calleeList.size(); ci++) {
+                String actualOwner = nativeOwners.get(ci);
+                if (actualOwner == null) continue;
+                String calleeName = calleeList.get(ci);
+                int dotIdx = calleeName.lastIndexOf('.');
+                int parenIdx = calleeName.indexOf('(');
+                String methodName = calleeName.substring(dotIdx + 1, parenIdx);
+                String descriptor = calleeName.substring(parenIdx);
                 String nativeName = "__jnative_"
                     + LlvmRuntime.mangleMethod(actualOwner, methodName, descriptor);
                 if (module.getFunction(nativeName) != null) continue;
@@ -1644,12 +1680,10 @@ public class Analyzer {
      * runs. The JVM only runs it on first use of its class (guarded by KotlinDetector etc.),
      * so it must stay lazy instead of running eagerly at startup.
      */
-    private static Set<String> computeMissingClassClinits(List<Function> clinitOrder,
-                                                          DependencyResolver resolver) {
-        Set<String> result = new LinkedHashSet<>();
-        for (Function c : clinitOrder) {
-            if (c.getEntryBlock() == null) continue;
-            scan:
+    private Set<String> computeMissingClassClinits(List<Function> clinitOrder,
+                                                   DependencyResolver resolver) {
+        List<Boolean> missing = LlvmUtil.parallelMapOrdered(clinitOrder, scheduler, c -> {
+            if (c.getEntryBlock() == null) return Boolean.FALSE;
             for (BasicBlock b : c.getBlocks()) {
                 for (Instruction inst : b.getInstructions()) {
                     Opcode op = inst.getOpcode();
@@ -1666,13 +1700,15 @@ public class Analyzer {
                     }
                     for (String owner : owners) {
                         if (owner == null || owner.isEmpty() || owner.charAt(0) == '[') continue;
-                        if (resolver.isMissingClass(owner)) {
-                            result.add(c.getName());
-                            break scan;
-                        }
+                        if (resolver.isMissingClass(owner)) return Boolean.TRUE;
                     }
                 }
             }
+            return Boolean.FALSE;
+        });
+        Set<String> result = new LinkedHashSet<>();
+        for (int i = 0; i < clinitOrder.size(); i++) {
+            if (missing.get(i)) result.add(clinitOrder.get(i).getName());
         }
         if (!result.isEmpty()) {
             System.out.println("Deferring " + result.size()

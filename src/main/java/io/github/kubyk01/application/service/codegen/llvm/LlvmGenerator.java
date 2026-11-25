@@ -81,6 +81,7 @@ public class LlvmGenerator implements LlvmGeneratorPort {
     @Override
     public void setScheduler(Scheduler scheduler) {
         if (scheduler != null) this.scheduler = scheduler;
+        globalEmitter.setScheduler(this.scheduler);
     }
 
     /**

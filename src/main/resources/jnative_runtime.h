@@ -966,6 +966,7 @@ extern void*   __jnative_rc_load(void** addr, void** hold);
 extern void*   __jnative_rc_load_ret(void** addr);
 extern void**  __jnative_rc_ret_slot(void);
 extern void*   __jnative_rc_cae(void** addr, void* expected, void* desired, void** hold);
+extern void*   __jnative_rc_cae_in(void** addr, void* expected, void* desired, void** hold, void* self);
 extern void**  __jnative_referent_slot(void* ref);
 extern void    __jnative_weak_forget(void* ref);
 extern void    __jnative_weak_store(void** slot, void* referent);
@@ -1507,7 +1508,9 @@ static inline void* jnative_make_inet_address(const uint8_t* bytes, int len, con
     void* holder = jnative_alloc_object(h_cls);
     if (holder == NULL) return NULL;
     void* host = jnative_string(hostname);
+    __jnative_rc_inc(host);
     *(void**)((char*)holder + o_orig) = host;
+    __jnative_rc_inc(host);
     *(void**)((char*)holder + o_host) = host;
 
     void* ia;
@@ -1526,10 +1529,14 @@ static inline void* jnative_make_inet_address(const uint8_t* bytes, int len, con
         if (holder6 == NULL) { free(holder); return NULL; }
         ia = jnative_alloc_object(cls);
         if (ia == NULL) { free(holder); free(holder6); return NULL; }
-        *(void**)((char*)holder6 + o_ip) = jnative_byte_array(bytes, 16);
+        void* ip = jnative_byte_array(bytes, 16);
+        __jnative_rc_inc(ip);
+        *(void**)((char*)holder6 + o_ip) = ip;
         *(int32_t*)((char*)holder + o_family) = 2;
+        __jnative_rc_inc(holder6);
         *(void**)((char*)ia + o_holder6) = holder6;
     }
+    __jnative_rc_inc(holder);
     *(void**)((char*)ia + o_holder) = holder;
     return ia;
 }
@@ -1543,7 +1550,9 @@ static inline void* jnative_ref_array_of_class(void** items, int32_t count,
     if (count > 0) {
         void** slots = (void**)((char*)arr + JAVA_ARR_HDR);
         for (int32_t i = 0; i < count; i++) {
-            slots[i] = (items != NULL) ? items[i] : NULL;
+            void* item = (items != NULL) ? items[i] : NULL;
+            __jnative_rc_inc(item);
+            slots[i] = item;
         }
     }
     return arr;

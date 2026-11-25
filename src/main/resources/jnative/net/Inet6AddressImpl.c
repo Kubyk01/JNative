@@ -121,7 +121,8 @@ void* __jnative_fn_java_net_Inet6AddressImpl_lookupAllHostAddr__Ljava_lang_Strin
         } else {
             continue;
         }
-        slots[i++] = make_inet_address(bytes, java_family, host);
+        slots[i] = make_inet_address(bytes, java_family, host);
+        __jnative_rc_inc(slots[i++]);
     }
 
     freeaddrinfo(res);

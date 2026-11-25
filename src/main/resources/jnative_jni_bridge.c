@@ -250,6 +250,7 @@ static jstring string_from_utf16(const jchar* chars, jsize len) {
         void* s = calloc(1, 32);
         if (s == NULL) { __jnative_throw_out_of_memory_error_ctx("NewString"); }
         *(void**)s = (void*)&vtable_java_lang_String;
+        __jnative_rc_inc(value);
         *(void**)((char*)s + 8)  = value;
         *(uint8_t*)((char*)s + 16) = 0;
         return s;
@@ -266,6 +267,7 @@ static jstring string_from_utf16(const jchar* chars, jsize len) {
         void* s = calloc(1, 32);
         if (s == NULL) { __jnative_throw_out_of_memory_error_ctx("NewString"); }
         *(void**)s = (void*)&vtable_java_lang_String;
+        __jnative_rc_inc(value);
         *(void**)((char*)s + 8)  = value;
         *(uint8_t*)((char*)s + 16) = 1;
         return s;
@@ -675,6 +677,7 @@ static jobject jn_NewGlobalRef(void* env, jobject obj) {
     if (obj == NULL) return NULL;
     GlobalRefEntry* e = (GlobalRefEntry*)malloc(sizeof(GlobalRefEntry));
     if (e == NULL) return NULL;
+    __jnative_rc_inc(obj);
     e->obj = obj;
     uint32_t b = ref_hash(obj);
     jn_mutex_lock(&global_ref_lock);
@@ -690,16 +693,19 @@ static void jn_DeleteGlobalRef(void* env, jobject obj) {
     uint32_t b = ref_hash(obj);
     jn_mutex_lock(&global_ref_lock);
     GlobalRefEntry** pp = &global_ref_table[b];
+    int found = 0;
     while (*pp) {
         if ((*pp)->obj == obj) {
             GlobalRefEntry* v = *pp;
             *pp = v->next;
             free(v);
+            found = 1;
             break;
         }
         pp = &(*pp)->next;
     }
     jn_mutex_unlock(&global_ref_lock);
+    if (found) __jnative_rc_dec(obj);
 }
 
 static void jn_DeleteLocalRef(void* env, jobject obj) {
@@ -1190,7 +1196,10 @@ static jarray jn_NewObjectArray(void* env, jsize len, jclass cls, jobject init) 
     void* arr = jnative_array_alloc(buf, len, JNATIVE_ELEM_SIZE_REFERENCE);
     if (arr != NULL && init != NULL) {
         void** slots = (void**)jnative_array_data(arr);
-        for (jsize i = 0; i < len; i++) slots[i] = init;
+        for (jsize i = 0; i < len; i++) {
+            __jnative_rc_inc(init);
+            slots[i] = init;
+        }
     }
     return (jarray)arr;
 }

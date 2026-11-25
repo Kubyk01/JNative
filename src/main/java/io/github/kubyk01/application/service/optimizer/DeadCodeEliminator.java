@@ -110,14 +110,13 @@ public class DeadCodeEliminator {
 
         if (emptyClinits.isEmpty()) return;
 
-        List<? extends Function> jnLoop2 = module.getFunctions();
-        for (Function func : jnLoop2) {
-            if (emptyClinits.contains(func.getName())) continue;
+        forEachParallel(new ArrayList<>(module.getFunctions()), func -> {
+            if (emptyClinits.contains(func.getName())) return;
             for (int blockIdx1 = 0; blockIdx1 < func.getBlocks().size(); blockIdx1++) {
                 BasicBlock block = func.getBlocks().get(blockIdx1);
                 block.getInstructions().removeIf(inst -> isCallTo(inst, emptyClinits));
             }
-        }
+        });
 
         Set<Function> doomed = new HashSet<>();
         List<? extends Function> jnLoop3 = module.getFunctions();
@@ -156,10 +155,9 @@ public class DeadCodeEliminator {
      * to such a slot is observable and must not be eliminated.
      */
     private Set<Integer> collectLoadedLocals() {
-        Set<Integer> loaded = new HashSet<>();
-        List<Function> functions = module.getFunctions();
-        for (Function func : functions) {
-            if (func.getEntryBlock() == null) continue;
+        Set<Integer> loaded = ConcurrentHashMap.newKeySet();
+        forEachParallel(new ArrayList<>(module.getFunctions()), func -> {
+            if (func.getEntryBlock() == null) return;
             List<BasicBlock> blocks = func.getBlocks();
             for (BasicBlock block : blocks) {
                 List<Instruction> insts = block.getInstructions();
@@ -169,7 +167,7 @@ public class DeadCodeEliminator {
                     }
                 }
             }
-        }
+        });
         return loaded;
     }
 

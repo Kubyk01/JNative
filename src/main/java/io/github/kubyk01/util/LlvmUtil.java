@@ -191,7 +191,8 @@ public class LlvmUtil {
                 : Schedulers.single();
 
         final int parallelism = Math.clamp(Runtime.getRuntime().availableProcessors(), 1, n);
-        final int chunkSize = (n + parallelism - 1) / parallelism;
+        final int chunks = Math.min(n, parallelism * 8);
+        final int chunkSize = (n + chunks - 1) / chunks;
         final int chunkCount = (n + chunkSize - 1) / chunkSize;
 
         @SuppressWarnings("unchecked")

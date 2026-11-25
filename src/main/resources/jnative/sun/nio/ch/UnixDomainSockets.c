@@ -190,7 +190,12 @@ int32_t __jnative_fn_sun_nio_ch_UnixDomainSockets_accept0__Ljava_io_FileDescript
 #endif
     *(int32_t*)((char*)newfdo + FD_OFFSET) = (int32_t)(intptr_t)s;
     if (array != NULL && jnative_array_length(array) > 0) {
-        ((void**)jnative_array_data(array))[0] = uds_address_bytes(&sa, sa_len);
+        void** slots = (void**)jnative_array_data(array);
+        void* old_addr = slots[0];
+        void* new_addr = uds_address_bytes(&sa, sa_len);
+        __jnative_rc_inc(new_addr);
+        slots[0] = new_addr;
+        __jnative_rc_dec(old_addr);
     }
     return 1;
 }

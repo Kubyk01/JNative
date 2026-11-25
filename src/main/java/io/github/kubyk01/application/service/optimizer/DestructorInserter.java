@@ -75,7 +75,7 @@ public class DestructorInserter {
     private io.github.kubyk01.domain.analyzer.reflection.ReflectInfo reflectInfo;
 
     public void insert() {
-        refCounts = new RefCountPlanner(module, resolver, aliasResult, lifetimeResult);
+        refCounts = new RefCountPlanner(module, resolver, aliasResult, lifetimeResult, scheduler);
         refCounts.compute();
         this.allocatedTypes = collectAllocatedTypes();
         log.debug("DestructorInserter: {} distinct allocated type(s)",
@@ -181,6 +181,12 @@ public class DestructorInserter {
                 String cls = type.getClassName();
                 if (cls != null && !cls.isEmpty() && cls.charAt(0) != '['
                     && LlvmUtil.isSystemClassName(cls)) {
+                    if (refCounts.isCountedType(type) && !refCounts.isCapturedSite(site)) {
+                        for (DestructionPoint dp : entry.getValue()) {
+                            byFunction.computeIfAbsent(dp.getBlock().getFunction(), k -> new ArrayList<>())
+                                .add(new PendingDestructor(site, dp, null));
+                        }
+                    }
                     continue;
                 }
             }
@@ -211,11 +217,11 @@ public class DestructorInserter {
             }
             return null;
         });
-        containerBorrows = new ContainerArrayBorrows(module, resolver, aliasResult, escapeResult);
+        containerBorrows = new ContainerArrayBorrows(module, resolver, aliasResult, escapeResult, scheduler);
         containerBorrows.compute();
         createStorageReleases();
         instrumentContainerArrays();
-        atomicSlots = new AtomicSlotArrays(module, resolver, aliasResult, escapeResult, reflectInfo);
+        atomicSlots = new AtomicSlotArrays(module, resolver, aliasResult, escapeResult, reflectInfo, scheduler);
         atomicSlots.compute();
         instrumentAtomicSlots();
         int instrumented = instrumentFieldOverwrites(lifetimeResult.getLiveOut());
@@ -243,12 +249,6 @@ public class DestructorInserter {
     // =====================================================================
     //  Field-overwrite instrumentation
     // =====================================================================
-
-    /**
-     * Counter that makes the labels of the blocks created by a block split
-     * unique within the module.
-     */
-    private int splitId = 0;
 
     private static String baseLabel(String label) {
         int i = label.indexOf("_rel_");
@@ -304,17 +304,27 @@ public class DestructorInserter {
             }
         }
 
-        Deque<BasicBlock> pending = new ArrayDeque<>();
-        List<? extends Function> jnLoop6 = new ArrayList<>(module.getFunctions());
-        for (Function func : jnLoop6) {
+        buildInboundEdges();
+        List<Function> functions = new ArrayList<>();
+        for (Function func : new ArrayList<>(module.getFunctions())) {
             if (func.getEntryBlock() == null || func.getName().startsWith(ContainerArrayBorrows.STORAGE_PREFIX)) continue;
-            pending.addAll(new ArrayList<>(func.getBlocks()));
+            functions.add(func);
         }
 
         int processed = 0;
+        for (Integer count : LlvmUtil.parallelMapOrdered(functions, scheduler,
+                func -> instrumentFieldOverwrites(func, liveOut))) {
+            processed += count;
+        }
+        return processed;
+    }
+
+    private int instrumentFieldOverwrites(Function func, Map<BasicBlock, Set<AllocationSite>> liveOut) {
+        int[] splitId = new int[1];
+        Deque<BasicBlock> pending = new ArrayDeque<>(func.getBlocks());
+        int processed = 0;
         while (!pending.isEmpty()) {
-            BasicBlock block = pending.poll();
-            BasicBlock tail = instrumentOneBlock(block, liveOut);
+            BasicBlock tail = instrumentOneBlock(pending.poll(), liveOut, splitId);
             if (tail != null) {
                 pending.add(tail);
             }
@@ -332,7 +342,8 @@ public class DestructorInserter {
      */
     private BasicBlock instrumentOneBlock(
         BasicBlock block,
-        Map<BasicBlock, Set<AllocationSite>> liveOut) {
+        Map<BasicBlock, Set<AllocationSite>> liveOut,
+        int[] splitId) {
         List<Instruction> insts = block.getInstructions();
         int i = 0;
         while (i < insts.size()) {
@@ -373,7 +384,7 @@ public class DestructorInserter {
                 // system-class site was filtered — the chain then consists
                 // of exactly one vtable check, and values of any other type
                 // fall through to the tail without a release.
-                return emitPolymorphicRelease(inst, block, i, dc.types());
+                return emitPolymorphicRelease(inst, block, i, dc.types(), splitId);
             }
         }
         return null;
@@ -443,10 +454,16 @@ public class DestructorInserter {
         System.out.println("DestructorInserter: " + made + " owned-array release function(s) generated");
     }
 
+    private List<Function> instrumentableFunctions() {
+        List<Function> out = new ArrayList<>();
+        for (Function f : module.getFunctions()) {
+            if (f.getEntryBlock() != null && !ContainerArrayBorrows.isDestructor(f)) out.add(f);
+        }
+        return out;
+    }
+
     private void instrumentContainerArrays() {
-        List<? extends Function> fns = module.getFunctions();
-        for (Function f : fns) {
-            if (f.getEntryBlock() == null || ContainerArrayBorrows.isDestructor(f)) continue;
+        LlvmUtil.parallelMapOrdered(instrumentableFunctions(), scheduler, f -> {
             boolean exits = containerBorrows.needsExit(f);
             for (BasicBlock block : f.getBlocks()) {
                 List<Instruction> insts = block.getInstructions();
@@ -487,13 +504,12 @@ public class DestructorInserter {
                     insts.add(runtimeCall(block, "__jnative_borrow_exit"));
                 }
             }
-        }
+            return null;
+        });
     }
 
     private void instrumentAtomicSlots() {
-        List<? extends Function> fns = module.getFunctions();
-        for (Function f : fns) {
-            if (f.getEntryBlock() == null || ContainerArrayBorrows.isDestructor(f)) continue;
+        LlvmUtil.parallelMapOrdered(instrumentableFunctions(), scheduler, f -> {
             boolean exits = atomicSlots.unpinsAtExit(f);
             for (BasicBlock block : f.getBlocks()) {
                 List<Instruction> insts = block.getInstructions();
@@ -534,7 +550,8 @@ public class DestructorInserter {
                     insts.add(runtimeCall(block, "__jnative_ebr_unpin"));
                 }
             }
-        }
+            return null;
+        });
     }
 
     private static Instruction intOf(BasicBlock block, Value v) {
@@ -545,6 +562,11 @@ public class DestructorInserter {
         out.setDefiningInstruction(cast);
         cast.setParent(block);
         return cast;
+    }
+
+    private boolean holdsCountedField(String className, String fieldKey) {
+        Set<String> fields = refCounts.plan().getCountedFields().get(className);
+        return fields != null && fields.contains(fieldKey);
     }
 
     private static Instruction runtimeCall(BasicBlock block, String name, Value... args) {
@@ -855,7 +877,8 @@ public class DestructorInserter {
         Instruction putField,
         BasicBlock block,
         int instIdx,
-        List<Type> destructorTypes) {
+        List<Type> destructorTypes,
+        int[] splitId) {
 
         Function func = block.getFunction();
         List<Instruction> insts = block.getInstructions();
@@ -863,7 +886,7 @@ public class DestructorInserter {
 
         // ---- 1. Split: move [instIdx, end) to a new tail block ----
         BasicBlock tail = new BasicBlock(
-            baseLabel(block.getLabel()) + "_rel_tail_" + (++splitId));
+            baseLabel(block.getLabel()) + "_rel_tail_" + (++splitId[0]));
         func.addBlock(tail);
 
         List<Instruction> moved = new ArrayList<>(insts.subList(instIdx, insts.size()));
@@ -1005,7 +1028,7 @@ public class DestructorInserter {
 
         // ---- 6. Dispatch block ----
         BasicBlock dispatch = new BasicBlock(
-            baseLabel(block.getLabel()) + "_rel_dispatch_" + (++splitId));
+            baseLabel(block.getLabel()) + "_rel_dispatch_" + (++splitId[0]));
         func.addBlock(dispatch);
         block.setTerminator(new CondBranchTerminator(skipResult, tail, dispatch));
 
@@ -1045,7 +1068,7 @@ public class DestructorInserter {
             current.addInstruction(isT);
 
             BasicBlock freeBlock = new BasicBlock(
-                baseLabel(current.getLabel()) + "_rel_free_" + (++splitId));
+                baseLabel(current.getLabel()) + "_rel_free_" + (++splitId[0]));
             func.addBlock(freeBlock);
 
             BasicBlock next;
@@ -1053,7 +1076,7 @@ public class DestructorInserter {
                 next = tail;
             } else {
                 next = new BasicBlock(
-                    baseLabel(current.getLabel()) + "_rel_next_" + (++splitId));
+                    baseLabel(current.getLabel()) + "_rel_next_" + (++splitId[0]));
                 func.addBlock(next);
             }
 
@@ -1088,6 +1111,8 @@ public class DestructorInserter {
         Type type = rhs.getType();
         if (type == null) return false;
         if (isOuterInstanceField(fieldNameOf(putField))) return false;
+        if (putField.getOperands().get(1) instanceof Constant c
+                && refCounts.isNonOwningField(c.getValue().toString())) return false;
         return !type.isPrimitive() && !type.isVoid();
     }
 
@@ -1795,6 +1820,11 @@ private void emitDestructionGuard(BasicBlock entry,
             if (className != null && !className.isEmpty()
                 && className.charAt(0) != '[') {
                 ClassNode cn = resolver.getClassNode(className);
+                if (cn != null && LlvmUtil.isSystemClassName(className)
+                    && (cn.getAccess() & Opcodes.ACC_FINAL) != 0) {
+                    block.addInstruction(runtimeCall(block, "__jnative_rc_dec", fieldValue));
+                    return;
+                }
                 if (cn != null && !cn.isExternal() && !cn.isInterface()
                     && (cn.getAccess() & Opcodes.ACC_ABSTRACT) == 0) {
                     boolean isFinal = (cn.getAccess() & Opcodes.ACC_FINAL) != 0;
@@ -1910,11 +1940,12 @@ private void emitDestructionGuard(BasicBlock entry,
             FieldNode field = ((List<? extends FieldNode>) ownedFields).get(jnIdx26);
             if ((field.getAccess() & Opcodes.ACC_STATIC) != 0) continue;
             Type fieldType = field.getType();
-            if (!isManagedType(fieldType)) continue;
 
             String fieldOwner = field.getOwner();
             if (fieldOwner == null || fieldOwner.isEmpty()) fieldOwner = className;
             String fullFieldName = fieldOwner + "." + field.getName();
+            boolean managed = isManagedType(fieldType);
+            if (!managed && !holdsCountedField(className, fullFieldName)) continue;
             if (coAllocatedFields.contains(fullFieldName)) continue;
 
             Instruction getField = new Instruction(Opcode.GET_FIELD);
@@ -1926,7 +1957,8 @@ private void emitDestructionGuard(BasicBlock entry,
             fieldValue.setDefiningInstruction(getField);
             bodyFast.addInstruction(getField);
 
-            emitFieldDestruction(bodyFast, fieldValue, fieldType);
+            if (managed) emitFieldDestruction(bodyFast, fieldValue, fieldType);
+            else bodyFast.addInstruction(runtimeCall(bodyFast, "__jnative_rc_dec", fieldValue));
         }
 
         Instruction freeFast = new Instruction(Opcode.STATIC_CALL);
@@ -1941,11 +1973,12 @@ private void emitDestructionGuard(BasicBlock entry,
             FieldNode field = ((List<? extends FieldNode>) ownedFields).get(jnIdx27);
             if ((field.getAccess() & Opcodes.ACC_STATIC) != 0) continue;
             Type fieldType = field.getType();
-            if (!isManagedType(fieldType)) continue;
 
             String fieldOwner = field.getOwner();
             if (fieldOwner == null || fieldOwner.isEmpty()) fieldOwner = className;
             String fullFieldName = fieldOwner + "." + field.getName();
+            boolean managed = isManagedType(fieldType);
+            if (!managed && !holdsCountedField(className, fullFieldName)) continue;
             if (coAllocatedFields.contains(fullFieldName)) continue;
 
             Instruction getField = new Instruction(Opcode.GET_FIELD);
@@ -1957,7 +1990,8 @@ private void emitDestructionGuard(BasicBlock entry,
             fieldValue.setDefiningInstruction(getField);
             bodySlow.addInstruction(getField);
 
-            emitFieldDestruction(bodySlow, fieldValue, fieldType);
+            if (managed) emitFieldDestruction(bodySlow, fieldValue, fieldType);
+            else bodySlow.addInstruction(runtimeCall(bodySlow, "__jnative_rc_dec", fieldValue));
         }
 
         emitUnclaim(bodySlow, thisParam);
@@ -1984,6 +2018,8 @@ private void emitDestructionGuard(BasicBlock entry,
         for (FieldNode field : jnLoop28) {
             if ((field.getAccess() & Opcodes.ACC_STATIC) != 0) continue;
             if (isOuterInstanceField(field.getName())) continue;
+            String owner = field.getOwner() == null || field.getOwner().isEmpty() ? classNode.getName() : field.getOwner();
+            if (RefCountPlanner.NON_OWNING_FIELDS.contains(owner + "." + field.getName())) continue;
             Type ft = field.getType();
             if (ft.isReference() || ft.isArray()) result.add(field);
         }
@@ -2067,7 +2103,7 @@ private void emitDestructionGuard(BasicBlock entry,
                 ClassNode elemNode = resolver.getClassNode(elemClass);
                 boolean elemIsFinal = elemNode != null
                     && (elemNode.getAccess() & Opcodes.ACC_FINAL) != 0;
-                if (elemIsFinal) {
+                if (elemIsFinal && !refCounts.isCountedType(elementType)) {
                     return createTrivialArrayDestructor(arrayType);
                 }
             }

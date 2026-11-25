@@ -96,6 +96,7 @@ static void* wchars_to_jstr(const wchar_t* wstr, int32_t char_count) {
     void* s = calloc(1, 32);
     if (s == NULL) return NULL;
     *(void**)((char*)s + 0) = (void*)&vtable_java_lang_String;
+    __jnative_rc_inc(value);
     *(void**)((char*)s + 8) = value;
     *(uint8_t*)((char*)s + 16) = coder;
     return s;

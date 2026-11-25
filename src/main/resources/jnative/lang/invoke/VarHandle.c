@@ -156,10 +156,20 @@ static inline void barray_check(void* arr, int32_t index, int32_t elem_size) {
     }
 }
 
-static inline int32_t cas_ref(void** slot, void* expected, void* newValue) {
+static inline int32_t cas_ref(void* obj, void** slot, void* expected, void* newValue) {
     void* exp = expected;
-    return __atomic_compare_exchange_n(slot, &exp, newValue, 0,
+    if (newValue != obj) __jnative_rc_inc(newValue);
+    int32_t swapped = __atomic_compare_exchange_n(slot, &exp, newValue, 0,
                                        __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;
+    void* gone = swapped ? expected : newValue;
+    if (gone != obj) __jnative_rc_dec(gone);
+    return swapped;
+}
+
+static inline void store_ref(void* obj, void** slot, void* newValue) {
+    if (newValue != obj) __jnative_rc_inc(newValue);
+    void* old = __atomic_exchange_n(slot, newValue, __ATOMIC_ACQ_REL);
+    if (old != obj) __jnative_rc_dec(old);
 }
 
 static inline int32_t cas_int(int32_t* slot, int32_t expected, int32_t newValue) {
@@ -175,10 +185,20 @@ static inline int32_t cas_bool(uint8_t* slot, int32_t expected, int32_t newValue
                                        __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;
 }
 
-static inline void* cax_ref(void** slot, void* expected, void* newValue) {
-    void* witness = expected;
-    __atomic_compare_exchange_n(slot, &witness, newValue, 0,
-                                __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+static inline void* cax_ref(void* obj, void** slot, void* expected, void* newValue) {
+    void** hold = __jnative_rc_ret_slot();
+    if (newValue != obj) __jnative_rc_inc(newValue);
+    void* witness;
+    int swapped;
+    for (;;) {
+        witness = expected;
+        swapped = __atomic_compare_exchange_n(slot, &witness, newValue, 0,
+                                              __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+        __jnative_rc_hold(hold, witness);
+        if (swapped || witness == NULL || __atomic_load_n(slot, __ATOMIC_SEQ_CST) == witness) break;
+    }
+    void* gone = swapped ? expected : newValue;
+    if (gone != obj) __jnative_rc_dec(gone);
     return witness;
 }
 
@@ -949,7 +969,7 @@ int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concur
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
-    return cas_ref((void**)((char*)obj + 8), expected, newValue);
+    return cas_ref(obj, (void**)((char*)obj + 8), expected, newValue);
 }
 
 /* ===========================================================================
@@ -1014,7 +1034,7 @@ int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concur
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
-    return cas_ref((void**)((char*)obj + 8), expected, newValue);
+    return cas_ref(obj, (void**)((char*)obj + 8), expected, newValue);
 }
 
 /* ===========================================================================
@@ -1076,7 +1096,7 @@ int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concur
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
-    return cas_ref((void**)((char*)obj + 32), expected, newValue);
+    return cas_ref(obj, (void**)((char*)obj + 32), expected, newValue);
 }
 
 /* WAITERS.compareAndSet(this, q, s) — waiters @ +40 */
@@ -1085,7 +1105,7 @@ int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concur
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
-    return cas_ref((void**)((char*)obj + 40), expected, newValue);
+    return cas_ref(obj, (void**)((char*)obj + 40), expected, newValue);
 }
 
 /* WAITERS.weakCompareAndSet(this, q, q') — waiters @ +40 */
@@ -1098,7 +1118,7 @@ int32_t __jnative_fn_java_lang_invoke_VarHandle_weakCompareAndSet__Ljava_util_co
      * caller wraps it in a retry loop. The primitive used here does
      * not fail spuriously, so this implementation is strictly stronger
      * than the contract requires. */
-    return cas_ref((void**)((char*)obj + 40), expected, newValue);
+    return cas_ref(obj, (void**)((char*)obj + 40), expected, newValue);
 }
 
 /* WAITERS.weakCompareAndSet(this, q, null) — waiters @ +40, newValue == null */
@@ -1107,7 +1127,7 @@ int32_t __jnative_fn_java_lang_invoke_VarHandle_weakCompareAndSet__Ljava_util_co
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
-    return cas_ref((void**)((char*)obj + 40), expected, newValue);
+    return cas_ref(obj, (void**)((char*)obj + 40), expected, newValue);
 }
 
 /* ===========================================================================
@@ -1123,7 +1143,7 @@ int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concur
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
-    return cas_ref((void**)((char*)obj + 16), expected, newValue);
+    return cas_ref(obj, (void**)((char*)obj + 16), expected, newValue);
 }
 
 int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concurrent_ConcurrentSkipListMap_Node_Ljava_lang_Object_Ljava_lang_Void__Z(
@@ -1131,7 +1151,7 @@ int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concur
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
-    return cas_ref((void**)((char*)obj + 16), expected, newValue);
+    return cas_ref(obj, (void**)((char*)obj + 16), expected, newValue);
 }
 
 int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concurrent_ConcurrentSkipListMap_Node_Ljava_util_concurrent_ConcurrentSkipListMap_Node_Ljava_util_concurrent_ConcurrentSkipListMap_Node__Z(
@@ -1139,7 +1159,7 @@ int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concur
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
-    return cas_ref((void**)((char*)obj + 24), expected, newValue);
+    return cas_ref(obj, (void**)((char*)obj + 24), expected, newValue);
 }
 
 int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concurrent_ConcurrentSkipListMap_Index_Ljava_util_concurrent_ConcurrentSkipListMap_Index_Ljava_util_concurrent_ConcurrentSkipListMap_Index__Z(
@@ -1147,7 +1167,7 @@ int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concur
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
-    return cas_ref((void**)((char*)obj + 24), expected, newValue);
+    return cas_ref(obj, (void**)((char*)obj + 24), expected, newValue);
 }
 
 int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concurrent_ConcurrentSkipListMap_Index_Ljava_util_concurrent_ConcurrentSkipListMap_Index_Ljava_lang_Void__Z(
@@ -1155,7 +1175,7 @@ int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concur
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
-    return cas_ref((void**)((char*)obj + 24), expected, newValue);
+    return cas_ref(obj, (void**)((char*)obj + 24), expected, newValue);
 }
 
 int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concurrent_ConcurrentSkipListMap_Ljava_util_concurrent_ConcurrentSkipListMap_Index_Ljava_util_concurrent_ConcurrentSkipListMap_Index__Z(
@@ -1163,7 +1183,7 @@ int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concur
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
-    return cas_ref((void**)((char*)obj + 24), expected, newValue);
+    return cas_ref(obj, (void**)((char*)obj + 24), expected, newValue);
 }
 
 int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concurrent_ConcurrentSkipListMap_Ljava_lang_Void_Ljava_util_concurrent_ConcurrentSkipListMap_Index__Z(
@@ -1171,7 +1191,7 @@ int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concur
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
-    return cas_ref((void**)((char*)obj + 24), expected, newValue);
+    return cas_ref(obj, (void**)((char*)obj + 24), expected, newValue);
 }
 
 int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concurrent_ConcurrentSkipListMap_Ljava_lang_Void_Ljava_util_concurrent_atomic_LongAdder__Z(
@@ -1179,7 +1199,7 @@ int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concur
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
-    return cas_ref((void**)((char*)obj + 40), expected, newValue);
+    return cas_ref(obj, (void**)((char*)obj + 40), expected, newValue);
 }
 
 /* ===========================================================================
@@ -1202,7 +1222,7 @@ int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljdk_internal_vm_
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
-    return cas_ref((void**)((char*)obj + 16), expected, newValue);
+    return cas_ref(obj, (void**)((char*)obj + 16), expected, newValue);
 }
 
 /* ===========================================================================
@@ -1223,7 +1243,7 @@ void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_util_concurrent_Concurre
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
-    __atomic_store_n((void**)((char*)obj + 8), newValue, __ATOMIC_RELEASE);
+    store_ref(obj, (void**)((char*)obj + 8), newValue);
 }
 
 int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concurrent_ConcurrentLinkedQueue_Node_Ljava_lang_Object_Ljava_lang_Object__Z(
@@ -1231,7 +1251,7 @@ int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concur
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
-    return cas_ref((void**)((char*)obj + 8), expected, newValue);
+    return cas_ref(obj, (void**)((char*)obj + 8), expected, newValue);
 }
 
 int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concurrent_ConcurrentLinkedQueue_Node_Ljava_lang_Void_Ljava_util_concurrent_ConcurrentLinkedQueue_Node__Z(
@@ -1239,7 +1259,7 @@ int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concur
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
-    return cas_ref((void**)((char*)obj + 8), expected, newValue);
+    return cas_ref(obj, (void**)((char*)obj + 8), expected, newValue);
 }
 
 void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_util_concurrent_ConcurrentLinkedQueue_Node_Ljava_util_concurrent_ConcurrentLinkedQueue_Node__V(
@@ -1247,7 +1267,7 @@ void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_util_concurrent_Concurre
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
-    __atomic_store_n((void**)((char*)obj + 16), newValue, __ATOMIC_RELEASE);
+    store_ref(obj, (void**)((char*)obj + 16), newValue);
 }
 
 void __jnative_fn_java_lang_invoke_VarHandle_setRelease__Ljava_util_concurrent_ConcurrentLinkedQueue_Node_Ljava_util_concurrent_ConcurrentLinkedQueue_Node__V(
@@ -1255,7 +1275,7 @@ void __jnative_fn_java_lang_invoke_VarHandle_setRelease__Ljava_util_concurrent_C
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
-    __atomic_store_n((void**)((char*)obj + 16), newValue, __ATOMIC_RELEASE);
+    store_ref(obj, (void**)((char*)obj + 16), newValue);
 }
 
 int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concurrent_ConcurrentLinkedQueue_Node_Ljava_util_concurrent_ConcurrentLinkedQueue_Node_Ljava_util_concurrent_ConcurrentLinkedQueue_Node__Z(
@@ -1263,7 +1283,7 @@ int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concur
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
-    return cas_ref((void**)((char*)obj + 16), expected, newValue);
+    return cas_ref(obj, (void**)((char*)obj + 16), expected, newValue);
 }
 
 int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concurrent_ConcurrentLinkedQueue_Ljava_util_concurrent_ConcurrentLinkedQueue_Node_Ljava_util_concurrent_ConcurrentLinkedQueue_Node__Z(
@@ -1271,7 +1291,7 @@ int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concur
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
-    return cas_ref((void**)((char*)obj + 8), expected, newValue);
+    return cas_ref(obj, (void**)((char*)obj + 8), expected, newValue);
 }
 
 int32_t __jnative_fn_java_lang_invoke_VarHandle_weakCompareAndSet__Ljava_util_concurrent_ConcurrentLinkedQueue_Ljava_util_concurrent_ConcurrentLinkedQueue_Node_Ljava_util_concurrent_ConcurrentLinkedQueue_Node__Z(
@@ -1279,7 +1299,7 @@ int32_t __jnative_fn_java_lang_invoke_VarHandle_weakCompareAndSet__Ljava_util_co
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
-    return cas_ref((void**)((char*)obj + 8), expected, newValue);
+    return cas_ref(obj, (void**)((char*)obj + 8), expected, newValue);
 }
 
 int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concurrent_ConcurrentLinkedQueue_Ljava_util_concurrent_ConcurrentLinkedQueue_Node_Ljava_util_concurrent_ConcurrentLinkedQueue_Node_T_Z(
@@ -1287,7 +1307,7 @@ int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concur
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
-    return cas_ref((void**)((char*)obj + 16), expected, newValue);
+    return cas_ref(obj, (void**)((char*)obj + 16), expected, newValue);
 }
 
 int32_t __jnative_fn_java_lang_invoke_VarHandle_weakCompareAndSet__Ljava_util_concurrent_ConcurrentLinkedQueue_Ljava_util_concurrent_ConcurrentLinkedQueue_Node_Ljava_util_concurrent_ConcurrentLinkedQueue_Node_T_Z(
@@ -1295,7 +1315,7 @@ int32_t __jnative_fn_java_lang_invoke_VarHandle_weakCompareAndSet__Ljava_util_co
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
-    return cas_ref((void**)((char*)obj + 16), expected, newValue);
+    return cas_ref(obj, (void**)((char*)obj + 16), expected, newValue);
 }
 
 /* ===========================================================================
@@ -1312,7 +1332,7 @@ int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concur
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
-    return cas_ref((void**)((char*)obj + 8), expected, newValue);
+    return cas_ref(obj, (void**)((char*)obj + 8), expected, newValue);
 }
 
 int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concurrent_LinkedTransferQueue_Node_Ljava_lang_Object_Ljava_lang_Object__Z(
@@ -1320,7 +1340,7 @@ int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concur
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
-    return cas_ref((void**)((char*)obj + 16), expected, newValue);
+    return cas_ref(obj, (void**)((char*)obj + 16), expected, newValue);
 }
 
 int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concurrent_LinkedTransferQueue_Node_Ljava_lang_Object_Ljava_lang_Void__Z(
@@ -1328,7 +1348,7 @@ int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concur
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
-    return cas_ref((void**)((char*)obj + 16), expected, newValue);
+    return cas_ref(obj, (void**)((char*)obj + 16), expected, newValue);
 }
 
 int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concurrent_LinkedTransferQueue_Node_Ljava_util_concurrent_LinkedTransferQueue_Node_Ljava_util_concurrent_LinkedTransferQueue_Node__Z(
@@ -1336,7 +1356,7 @@ int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concur
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
-    return cas_ref((void**)((char*)obj + 24), expected, newValue);
+    return cas_ref(obj, (void**)((char*)obj + 24), expected, newValue);
 }
 
 void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_util_concurrent_LinkedTransferQueue_Node_Ljava_lang_Object__V(
@@ -1344,7 +1364,7 @@ void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_util_concurrent_LinkedTr
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
-    __atomic_store_n((void**)((char*)obj + 16), newValue, __ATOMIC_RELEASE);
+    store_ref(obj, (void**)((char*)obj + 16), newValue);
 }
 
 void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_util_concurrent_LinkedTransferQueue_Node_Ljava_lang_Void__V(
@@ -1352,7 +1372,7 @@ void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_util_concurrent_LinkedTr
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
-    __atomic_store_n((void**)((char*)obj + 16), newValue, __ATOMIC_RELEASE);
+    store_ref(obj, (void**)((char*)obj + 16), newValue);
 }
 
 void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_util_concurrent_LinkedTransferQueue_Node_Ljava_util_concurrent_LinkedTransferQueue_Node__V(
@@ -1360,7 +1380,7 @@ void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_util_concurrent_LinkedTr
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
-    __atomic_store_n((void**)((char*)obj + 24), newValue, __ATOMIC_RELEASE);
+    store_ref(obj, (void**)((char*)obj + 24), newValue);
 }
 
 void __jnative_fn_java_lang_invoke_VarHandle_setRelease__Ljava_util_concurrent_LinkedTransferQueue_Node_Ljava_util_concurrent_LinkedTransferQueue_Node__V(
@@ -1368,7 +1388,7 @@ void __jnative_fn_java_lang_invoke_VarHandle_setRelease__Ljava_util_concurrent_L
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
-    __atomic_store_n((void**)((char*)obj + 24), newValue, __ATOMIC_RELEASE);
+    store_ref(obj, (void**)((char*)obj + 24), newValue);
 }
 
 void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_util_concurrent_LinkedTransferQueue_DualNode_Ljava_util_concurrent_LinkedTransferQueue_DualNode__V(
@@ -1376,7 +1396,7 @@ void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_util_concurrent_LinkedTr
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
-    __atomic_store_n((void**)((char*)obj + 24), newValue, __ATOMIC_RELEASE);
+    store_ref(obj, (void**)((char*)obj + 24), newValue);
 }
 
 void* __jnative_fn_java_lang_invoke_VarHandle_compareAndExchange__Ljava_util_concurrent_LinkedTransferQueue_DualNode_Ljava_util_concurrent_LinkedTransferQueue_DualNode_Ljava_util_concurrent_LinkedTransferQueue_DualNode__Ljava_util_concurrent_LinkedTransferQueue_DualNode_(
@@ -1384,7 +1404,7 @@ void* __jnative_fn_java_lang_invoke_VarHandle_compareAndExchange__Ljava_util_con
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
-    return cax_ref((void**)((char*)obj + 24), expected, newValue);
+    return cax_ref(obj, (void**)((char*)obj + 24), expected, newValue);
 }
 
 void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_util_concurrent_LinkedTransferQueue_DualNode_Ljava_lang_Object__V(
@@ -1392,7 +1412,7 @@ void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_util_concurrent_LinkedTr
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
-    __atomic_store_n((void**)((char*)obj + 16), newValue, __ATOMIC_RELEASE);
+    store_ref(obj, (void**)((char*)obj + 16), newValue);
 }
 
 void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_util_concurrent_LinkedTransferQueue_DualNode_Ljava_lang_Void__V(
@@ -1400,7 +1420,7 @@ void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_util_concurrent_LinkedTr
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
-    __atomic_store_n((void**)((char*)obj + 16), newValue, __ATOMIC_RELEASE);
+    store_ref(obj, (void**)((char*)obj + 16), newValue);
 }
 
 void* __jnative_fn_java_lang_invoke_VarHandle_compareAndExchange__Ljava_util_concurrent_LinkedTransferQueue_DualNode_Ljava_lang_Object_Ljava_lang_Object__Ljava_lang_Object_(
@@ -1408,7 +1428,7 @@ void* __jnative_fn_java_lang_invoke_VarHandle_compareAndExchange__Ljava_util_con
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
-    return cax_ref((void**)((char*)obj + 16), expected, newValue);
+    return cax_ref(obj, (void**)((char*)obj + 16), expected, newValue);
 }
 
 void* __jnative_fn_java_lang_invoke_VarHandle_compareAndExchange__Ljava_util_concurrent_LinkedTransferQueue_DualNode_Ljava_lang_Object_Ljava_lang_Void__Ljava_lang_Object_(
@@ -1416,7 +1436,7 @@ void* __jnative_fn_java_lang_invoke_VarHandle_compareAndExchange__Ljava_util_con
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
-    return cax_ref((void**)((char*)obj + 16), expected, newValue);
+    return cax_ref(obj, (void**)((char*)obj + 16), expected, newValue);
 }
 
 void* __jnative_fn_java_lang_invoke_VarHandle_compareAndExchange__Ljava_util_concurrent_LinkedTransferQueue_Ljava_util_concurrent_LinkedTransferQueue_DualNode_Ljava_util_concurrent_LinkedTransferQueue_DualNode__Ljava_util_concurrent_LinkedTransferQueue_DualNode_(
@@ -1425,7 +1445,7 @@ void* __jnative_fn_java_lang_invoke_VarHandle_compareAndExchange__Ljava_util_con
         __jnative_throw_null_pointer_exception();
     }
     /* Primary symbol targets `head` (+8). */
-    return cax_ref((void**)((char*)obj + 8), expected, newValue);
+    return cax_ref(obj, (void**)((char*)obj + 8), expected, newValue);
 }
 
 void* __jnative_fn_java_lang_invoke_VarHandle_compareAndExchange__Ljava_util_concurrent_LinkedTransferQueue_Ljava_util_concurrent_LinkedTransferQueue_DualNode_Ljava_util_concurrent_LinkedTransferQueue_DualNode_T_Ljava_util_concurrent_LinkedTransferQueue_DualNode_(
@@ -1434,7 +1454,7 @@ void* __jnative_fn_java_lang_invoke_VarHandle_compareAndExchange__Ljava_util_con
         __jnative_throw_null_pointer_exception();
     }
     /* Tail-suffixed symbol targets `tail` (+16). */
-    return cax_ref((void**)((char*)obj + 16), expected, newValue);
+    return cax_ref(obj, (void**)((char*)obj + 16), expected, newValue);
 }
 
 int32_t __jnative_fn_java_lang_invoke_VarHandle_getAndAdd__Ljava_util_concurrent_LinkedTransferQueue_I_I(
@@ -1456,7 +1476,7 @@ int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_stream
     if (obj == NULL) {
         __jnative_throw_null_pointer_exception();
     }
-    return cas_ref((void**)((char*)obj + 80), expected, newValue);
+    return cas_ref(obj, (void**)((char*)obj + 80), expected, newValue);
 }
 
 void* __jnative_fn_java_lang_invoke_VarHandle_getAndSet__Ljava_util_stream_ForEachOps_ForEachOrderedTask_Ljava_lang_Void__Ljava_util_stream_ForEachOps_ForEachOrderedTask_(
@@ -1465,7 +1485,10 @@ void* __jnative_fn_java_lang_invoke_VarHandle_getAndSet__Ljava_util_stream_ForEa
         __jnative_throw_null_pointer_exception();
     }
     void* old;
+    if (newValue != obj) __jnative_rc_inc(newValue);
     __atomic_exchange((void**)((char*)obj + 80), &newValue, &old, __ATOMIC_SEQ_CST);
+    __jnative_rc_hold(__jnative_rc_ret_slot(), old);
+    if (old != obj) __jnative_rc_dec(old);
     return old;
 }
 
@@ -1484,7 +1507,7 @@ extern void* gv_jdk_internal_event_EventHelper_loggingLogger __attribute__((weak
 int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_lang_Void_Ljava_lang_System_Logger__Z(
         void* expected, void* newValue) {
     if (&gv_jdk_internal_event_EventHelper_loggingLogger != NULL) {
-        return cas_ref(&gv_jdk_internal_event_EventHelper_loggingLogger,
+        return cas_ref(NULL, &gv_jdk_internal_event_EventHelper_loggingLogger,
                        expected, newValue);
     }
     return 1;
@@ -1668,7 +1691,7 @@ int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concur
     if (cf == NULL) {
         __jnative_throw_null_pointer_exception();
     }
-    return cas_ref((void**)((char*)cf + 8), expected, new_value);
+    return cas_ref(cf, (void**)((char*)cf + 8), expected, new_value);
 }
 
 int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concurrent_CompletableFuture_Ljava_lang_Void_Ljava_lang_Object__Z(
@@ -1676,7 +1699,7 @@ int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concur
     if (cf == NULL) {
         __jnative_throw_null_pointer_exception();
     }
-    return cas_ref((void**)((char*)cf + 8), expected, new_value);
+    return cas_ref(cf, (void**)((char*)cf + 8), expected, new_value);
 }
 
 int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concurrent_CompletableFuture_Ljava_util_concurrent_CompletableFuture_Completion_Ljava_util_concurrent_CompletableFuture_Completion__Z(
@@ -1684,7 +1707,7 @@ int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concur
     if (cf == NULL) {
         __jnative_throw_null_pointer_exception();
     }
-    return cas_ref((void**)((char*)cf + 16), expected, new_value);
+    return cas_ref(cf, (void**)((char*)cf + 16), expected, new_value);
 }
 
 void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_util_concurrent_CompletableFuture_Completion_Ljava_util_concurrent_CompletableFuture_Completion__V(
@@ -1692,7 +1715,7 @@ void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_util_concurrent_Completa
     if (completion == NULL) {
         __jnative_throw_null_pointer_exception();
     }
-    __atomic_store_n((void**)((char*)completion + 16), new_value, __ATOMIC_RELEASE);
+    store_ref(completion, (void**)((char*)completion + 16), new_value);
 }
 
 void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_util_concurrent_CompletableFuture_Completion_Ljava_util_concurrent_CompletableFuture_Completion_T_V(
@@ -1706,7 +1729,7 @@ int32_t __jnative_fn_java_lang_invoke_VarHandle_compareAndSet__Ljava_util_concur
     if (completion == NULL) {
         __jnative_throw_null_pointer_exception();
     }
-    return cas_ref((void**)((char*)completion + 16), expected, new_value);
+    return cas_ref(completion, (void**)((char*)completion + 16), expected, new_value);
 }
 
 int32_t __jnative_fn_java_lang_invoke_VarHandle_weakCompareAndSet__Ljava_util_concurrent_CompletableFuture_Ljava_util_concurrent_CompletableFuture_Completion_Ljava_util_concurrent_CompletableFuture_Completion__Z(
@@ -1714,7 +1737,7 @@ int32_t __jnative_fn_java_lang_invoke_VarHandle_weakCompareAndSet__Ljava_util_co
     if (cf == NULL) {
         __jnative_throw_null_pointer_exception();
     }
-    return cas_ref((void**)((char*)cf + 16), expected, new_value);
+    return cas_ref(cf, (void**)((char*)cf + 16), expected, new_value);
 }
 
 int32_t __jnative_fn_java_lang_invoke_VarHandle_weakCompareAndSet__Ljava_util_concurrent_CompletableFuture_Completion_Ljava_util_concurrent_CompletableFuture_Completion_Ljava_util_concurrent_CompletableFuture_Completion__Z(
@@ -1722,7 +1745,7 @@ int32_t __jnative_fn_java_lang_invoke_VarHandle_weakCompareAndSet__Ljava_util_co
     if (completion == NULL) {
         __jnative_throw_null_pointer_exception();
     }
-    return cas_ref((void**)((char*)completion + 16), expected, new_value);
+    return cas_ref(completion, (void**)((char*)completion + 16), expected, new_value);
 }
 
 void __jnative_fn_java_lang_invoke_VarHandle_setRelease__Ljava_util_concurrent_CompletableFuture_Ljava_lang_Object__V(
@@ -1730,7 +1753,7 @@ void __jnative_fn_java_lang_invoke_VarHandle_setRelease__Ljava_util_concurrent_C
     if (cf == NULL) {
         __jnative_throw_null_pointer_exception();
     }
-    __atomic_store_n((void**)((char*)cf + 8), new_value, __ATOMIC_RELEASE);
+    store_ref(cf, (void**)((char*)cf + 8), new_value);
 }
 
 void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_util_concurrent_CompletableFuture_Completion_Ljava_lang_Void__V(
@@ -1738,7 +1761,7 @@ void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_util_concurrent_Completa
     if (completion == NULL) {
         __jnative_throw_null_pointer_exception();
     }
-    __atomic_store_n((void**)((char*)completion + 16), value, __ATOMIC_RELEASE);
+    store_ref(completion, (void**)((char*)completion + 16), value);
 }
 
 void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_util_concurrent_CompletableFuture_BiCompletion_Ljava_lang_Void__V(
@@ -1746,7 +1769,7 @@ void __jnative_fn_java_lang_invoke_VarHandle_set__Ljava_util_concurrent_Completa
     if (bicomp == NULL) {
         __jnative_throw_null_pointer_exception();
     }
-    __atomic_store_n((void**)((char*)bicomp + 16), value, __ATOMIC_RELEASE);
+    store_ref(bicomp, (void**)((char*)bicomp + 16), value);
 }
 
 /* ===========================================================================

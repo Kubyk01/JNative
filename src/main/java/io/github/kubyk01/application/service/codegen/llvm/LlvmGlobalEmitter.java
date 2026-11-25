@@ -216,6 +216,9 @@ public class LlvmGlobalEmitter {
     @lombok.Setter
     private java.util.function.BiConsumer<String, String> adaptorSink;
 
+    @lombok.Setter
+    private reactor.core.scheduler.Scheduler scheduler;
+
     // -------------------------------------------------------------------------
     //  Caches. Every map/set that is written by one thread and read by
     //  another uses a ConcurrentHashMap or ConcurrentHashMap.newKeySet().
@@ -366,9 +369,7 @@ public class LlvmGlobalEmitter {
      */
     private String findOverride(String className, String name, String descriptor,
                                 String[] ownerOut) {
-        String owner = className;
-        Set<String> seen = new HashSet<>();
-        while (owner != null && !owner.isEmpty() && seen.add(owner)) {
+        for (String owner : overrideOwners(className)) {
 
             // 1. Explicit override registry (overrideMethod).
             String nativeName = methodOverrides.get(overrideKey(owner, name, descriptor));
@@ -384,12 +385,56 @@ public class LlvmGlobalEmitter {
                 ownerOut[0] = owner;
                 return rawSymbol;
             }
-
-            ClassNode cn = resolver.getClassNode(owner);
-            if (cn == null) return null;
-            owner = cn.getSuperName();
         }
         return null;
+    }
+
+    private volatile NavigableSet<String> overrideRegistryKeys;
+    private volatile NavigableSet<String> overrideFunctionNames;
+    private final Map<String, String[]> overrideOwnerChains = new ConcurrentHashMap<>();
+
+    private void buildOverrideIndex() {
+        NavigableSet<String> fnNames = new TreeSet<>();
+        for (Function f : module.getFunctions()) {
+            String n = f.getName();
+            if (n != null && n.startsWith("__jnative_override_")) fnNames.add(n);
+        }
+        overrideOwnerChains.clear();
+        overrideRegistryKeys = new TreeSet<>(methodOverrides.keySet());
+        overrideFunctionNames = fnNames;
+    }
+
+    private static boolean hasKeyWithPrefix(NavigableSet<String> keys, String prefix) {
+        String next = keys.ceiling(prefix);
+        return next != null && next.startsWith(prefix);
+    }
+
+    private boolean mayHaveOverride(String owner) {
+        NavigableSet<String> regKeys = overrideRegistryKeys;
+        NavigableSet<String> fnNames = overrideFunctionNames;
+        if (regKeys == null || fnNames == null) return true;
+        return hasKeyWithPrefix(regKeys, owner + ".")
+            || hasKeyWithPrefix(fnNames, "__jnative_override_" + owner.replace('/', '_') + "_");
+    }
+
+    private String[] overrideOwners(String className) {
+        if (className == null) return new String[0];
+        String[] cached = overrideOwnerChains.get(className);
+        if (cached != null) return cached;
+        List<String> out = new ArrayList<>();
+        String owner = className;
+        Set<String> seen = new HashSet<>();
+        while (owner != null && !owner.isEmpty() && seen.add(owner)) {
+            if (mayHaveOverride(owner)) out.add(owner);
+            ClassNode cn = resolver.getClassNode(owner);
+            if (cn == null) break;
+            owner = cn.getSuperName();
+        }
+        String[] chain = out.toArray(new String[0]);
+        if (overrideRegistryKeys != null && overrideFunctionNames != null) {
+            overrideOwnerChains.putIfAbsent(className, chain);
+        }
+        return chain;
     }
 
     /**
@@ -1186,6 +1231,10 @@ public class LlvmGlobalEmitter {
     }
 
     private ResolvedFn resolveVtableEntry(String className, String sig) {
+        return resolveVtableEntry(className, sig, null);
+    }
+
+    private ResolvedFn resolveVtableEntry(String className, String sig, List<Function> pendingNatives) {
         int parenIdx = sig.indexOf('(');
         if (parenIdx <= 0) return null;
         String name = sig.substring(0, parenIdx);
@@ -1350,7 +1399,8 @@ public class LlvmGlobalEmitter {
                 for (int i = 0; i < allParams.size(); i++) {
                     nf.addParameter(new Parameter(allParams.get(i), i));
                 }
-                module.addFunction(nf);
+                if (pendingNatives != null) pendingNatives.add(nf);
+                else module.addFunction(nf);
                 funcName = nativeName;
             } else {
                 return null;
@@ -1430,12 +1480,28 @@ public class LlvmGlobalEmitter {
                 .append(ifaceNameRef).append(" }\n");
         }
 
+        List<ClassNode> concreteClasses = new ArrayList<>();
         for (ClassNode cls : allClasses) {
-            if (cls.isExternal()) continue;
-            if (cls.isInterface()) continue;
+            if (cls.isExternal() || cls.isInterface()) continue;
+            concreteClasses.add(cls);
+            getOrBuildClassLayout(cls.getName());
+        }
+        buildOverrideIndex();
+        List<ClassVtableResolution> resolutions =
+            LlvmUtil.parallelMapOrdered(concreteClasses, scheduler, this::resolveClassVtables);
+        for (ClassVtableResolution r : resolutions) {
+            for (Function nf : r.vtableNatives()) module.addFunction(nf);
+        }
+        for (ClassVtableResolution r : resolutions) {
+            for (Function nf : r.itableNatives()) module.addFunction(nf);
+        }
+
+        for (int ci = 0; ci < concreteClasses.size(); ci++) {
+            ClassNode cls = concreteClasses.get(ci);
+            ClassVtableResolution resolution = resolutions.get(ci);
 
             String className = cls.getName();
-            VtableLayout layout = getOrBuildClassLayout(className);
+            VtableLayout layout = resolution.layout();
             int length = Math.max(layout.slots.size(), 1);
 
             List<String> entries = new ArrayList<>(length);
@@ -1443,7 +1509,7 @@ public class LlvmGlobalEmitter {
 
             for (int i = 0; i < layout.slots.size(); i++) {
                 String sig = layout.slots.get(i);
-                ResolvedFn fn = resolveVtableEntry(className, sig);
+                ResolvedFn fn = resolution.vtable()[i];
                 entries.set(i, vtableSlotEntry(className, null, sig, fn, sb, emittedThunks));
             }
 
@@ -1459,20 +1525,19 @@ public class LlvmGlobalEmitter {
             vtableLengths.put(className, length);
         }
 
-        for (ClassNode cls : allClasses) {
-            if (cls.isExternal() || cls.isInterface()) continue;
+        for (int ci = 0; ci < concreteClasses.size(); ci++) {
+            ClassNode cls = concreteClasses.get(ci);
             String className = cls.getName();
 
-            Set<String> ifaces = collectAllInterfaces(cls);
             Map<String, String> itableNames = new LinkedHashMap<>();
             Map<String, Integer> itableLens = new LinkedHashMap<>();
             Map<String, Integer> itableIds = new LinkedHashMap<>();
 
-            for (String iface : ifaces) {
-                Integer ifaceId = interfaceIds.get(iface);
-                if (ifaceId == null) continue;
+            for (ItableResolution itable : resolutions.get(ci).itables()) {
+                String iface = itable.iface();
+                Integer ifaceId = itable.ifaceId();
 
-                VtableLayout ifaceLayout = getOrBuildInterfaceLayout(iface);
+                VtableLayout ifaceLayout = itable.layout();
                 int len = Math.max(ifaceLayout.slots.size(), 1);
 
                 List<String> entries = new ArrayList<>(len);
@@ -1480,7 +1545,7 @@ public class LlvmGlobalEmitter {
 
                 for (int i = 0; i < ifaceLayout.slots.size(); i++) {
                     String sig = ifaceLayout.slots.get(i);
-                    ResolvedFn fn = resolveVtableEntry(className, sig);
+                    ResolvedFn fn = itable.fns()[i];
                     entries.set(i, vtableSlotEntry(className, iface, sig, fn, sb, emittedThunks));
                 }
 
@@ -1546,6 +1611,39 @@ public class LlvmGlobalEmitter {
         // Lambda vtables can refer to the same unresolved Object slots as class vtables.
         emitLambdaVtables(sb, emittedThunks);
         return sb.toString();
+    }
+
+    private record ItableResolution(String iface, Integer ifaceId, VtableLayout layout, ResolvedFn[] fns) {
+    }
+
+    private record ClassVtableResolution(VtableLayout layout, ResolvedFn[] vtable,
+                                         List<ItableResolution> itables,
+                                         List<Function> vtableNatives,
+                                         List<Function> itableNatives) {
+    }
+
+    private ClassVtableResolution resolveClassVtables(ClassNode cls) {
+        String className = cls.getName();
+        VtableLayout layout = getOrBuildClassLayout(className);
+        List<Function> vtableNatives = new ArrayList<>();
+        ResolvedFn[] vtable = new ResolvedFn[layout.slots.size()];
+        for (int i = 0; i < vtable.length; i++) {
+            vtable[i] = resolveVtableEntry(className, layout.slots.get(i), vtableNatives);
+        }
+
+        List<Function> itableNatives = new ArrayList<>();
+        List<ItableResolution> itables = new ArrayList<>();
+        for (String iface : collectAllInterfaces(cls)) {
+            Integer ifaceId = interfaceIds.get(iface);
+            if (ifaceId == null) continue;
+            VtableLayout ifaceLayout = getOrBuildInterfaceLayout(iface);
+            ResolvedFn[] fns = new ResolvedFn[ifaceLayout.slots.size()];
+            for (int i = 0; i < fns.length; i++) {
+                fns[i] = resolveVtableEntry(className, ifaceLayout.slots.get(i), itableNatives);
+            }
+            itables.add(new ItableResolution(iface, ifaceId, ifaceLayout, fns));
+        }
+        return new ClassVtableResolution(layout, vtable, itables, vtableNatives, itableNatives);
     }
 
     private Set<String> collectAllInterfaces(ClassNode cls) {
@@ -2007,11 +2105,18 @@ public class LlvmGlobalEmitter {
     }
 
     private List<FieldNode> collectInstanceFields(ClassNode cls) {
+        List<FieldNode> result = collectDeclaredInstanceFields(cls);
+        RefCountPlan plan = module.getRefCountPlan();
+        if (plan != null && plan.declaresCount(cls.getName())) result.add(countField(cls.getName()));
+        return result;
+    }
+
+    private List<FieldNode> collectDeclaredInstanceFields(ClassNode cls) {
         List<FieldNode> result = new ArrayList<>();
         if (cls.getSuperName() != null && !cls.getSuperName().equals("java/lang/Object")) {
             ClassNode superNode = resolver.getClassNode(cls.getSuperName());
             if (superNode != null && !superNode.isExternal()) {
-                result.addAll(collectInstanceFields(superNode));
+                result.addAll(collectDeclaredInstanceFields(superNode));
             } else {
                 result.addAll(phantomFields().getOrDefault(cls.getSuperName(), List.of()));
             }
@@ -2022,8 +2127,6 @@ public class LlvmGlobalEmitter {
                 result.add(f);
             }
         }
-        RefCountPlan plan = module.getRefCountPlan();
-        if (plan != null && plan.declaresCount(cls.getName())) result.add(countField(cls.getName()));
         return result;
     }
 
@@ -2615,166 +2718,11 @@ public class LlvmGlobalEmitter {
         List<String> literals = new ArrayList<>(collectJavaStringLiterals());
         Collections.sort(literals);
 
-        for (String s : literals) {
-            /*
-             * Decide which of the two compact-string encodings the literal
-             * must use.
-             *
-             * The decision is made per character code unit, not per code
-             * point. A supplementary character (U+10000..U+10FFFF) is
-             * represented in the Java String as two surrogate code units
-             * in the range U+DC80..U+DFFF, both of which are greater than
-             * 0xFF; a string containing one therefore lands in the UTF-16
-             * branch automatically, with no separate surrogate-pair test
-             * required.
-             *
-             * A string consisting entirely of characters in U+0000..U+00FF
-             * is encoded in the compact LATIN1 form: one byte per character
-             * code unit, equal to the character's low 8 bits. This is the
-             * same representation java.lang.String uses internally when
-             * String.COMPACT_STRINGS is true.
-             *
-             * Every other string is encoded as UTF-16LE: two bytes per
-             * character code unit, low byte first, matching
-             * StringUTF16.isBigEndian() on every supported target. This is the same
-             * representation java.lang.String uses internally when the
-             * compact-string optimisation is not in effect.
-             */
-            boolean latin1 = true;
-            int charCount = s.length();
-            for (int i = 0; i < charCount; i++) {
-                if (s.charAt(i) > 0xFF) {
-                    latin1 = false;
-                    break;
-                }
-            }
-
-            byte[] bytes;
-            int coder;
-            int lengthField;
-
-            if (latin1) {
-                /*
-                 * Compact LATIN1 form. One byte per character code unit;
-                 * the byte value is the low 8 bits of the char, which for
-                 * a char <= 0xFF is the char itself.
-                 */
-                bytes = new byte[charCount];
-                for (int i = 0; i < charCount; i++) {
-                    bytes[i] = (byte) s.charAt(i);
-                }
-                coder = 0;
-                lengthField = charCount;
-            } else {
-                /*
-                 * UTF-16LE form. Two bytes per character code unit, low
-                 * byte first. Surrogate pairs are emitted as two
-                 * consecutive code units, exactly as they appear in the
-                 * Java String.
-                 *
-                 * The charCount used here is String.length(), i.e. the
-                 * number of char code units, not the number of Unicode
-                 * code points. That is the number of elements that
-                 * String.length() must report, and it is the number the
-                 * length word below is derived from.
-                 */
-                bytes = new byte[charCount * 2];
-                for (int i = 0; i < charCount; i++) {
-                    char ch = s.charAt(i);
-                    bytes[i * 2]     = (byte) (ch & 0xFF);
-                    bytes[i * 2 + 1] = (byte) (ch >>> 8);
-                }
-                coder = 1;
-                lengthField = charCount * 2;
-            }
-
-            int len = bytes.length;
-
-            /*
-             * Escape the payload for LLVM's c"..." string-literal syntax.
-             * Every byte outside printable ASCII, plus backslash, double
-             * quote and the common whitespace escapes, is rendered in
-             * uppercase two-digit hex. A trailing NUL byte is appended so
-             * that C-side consumers can treat the payload as a C string;
-             * it is C-side slack, not a Java element — the `length` field
-             * below is the true Java-visible byte count, and the NUL is
-             * never observed by String.length(), String.charAt() or any
-             * other method of String.
-             */
-            StringBuilder escaped = getStringBuilder(bytes);
-
-            String safe = LlvmRuntime.stringIdSuffix(s);
-            String bytesGlobal = "strbytes_" + safe;
-            String objGlobal = "jstr_" + safe;
-
-            /*
-             * The backing byte[]. Emitted as an anonymous struct so that
-             * the klass word at offset 0 can be a real pointer relocation
-             * rather than compile-time bytes. LLVM lays the fields out
-             * naturally (i8* @0, i32 @8, i32 @12, [N x i8] @16), which is
-             * exactly the canonical Java array header:
-             *
-             *     JAVA_ARR_KLASS_OFFSET      = 0
-             *     JAVA_ARR_LENGTH_OFFSET     = 8
-             *     JAVA_ARR_ELEM_SIZE_OFFSET  = 12
-             *     JAVA_ARR_HDR               = 16
-             *
-             * `align 8` matches the natural alignment of the i8* header
-             * word; the alignment does not change the field offsets but
-             * does keep the pointer slot addressable as a pointer.
-             *
-             * The value written into the length word is `lengthField`,
-             * which is the character count in the LATIN1 branch and twice
-             * the character count in the UTF-16 branch. That is the value
-             * String.length() derives the Java-level length from, via
-             * `value.length >> coder`.
-             */
-            int payloadLen = len + 1;   // NUL terminator is part of the array
-
-            sb.append("@").append(bytesGlobal)
-                    .append(" = unnamed_addr constant { i8*, i32, i32, [")
-                    .append(payloadLen).append(" x i8] } {\n")
-                    .append("  i8* bitcast (%ReflectionClass* ").append(byteArrayKlassRef)
-                    .append(" to i8*),\n")
-                    .append("  i32 ").append(lengthField).append(",\n")
-                    .append("  i32 1,\n")
-                    .append("  [").append(payloadLen).append(" x i8] c\"")
-                    .append(escaped).append("\"\n")
-                    .append("}, align 8\n");
-
-            /*
-             * The String object. Its `value` field is a bitcast of the
-             * anonymous struct pointer to i8*, matching the i8* declared
-             * for that field in %struct.java_lang_String. The bitcast is
-             * necessary because the struct type is anonymous and therefore
-             * not nameable in the field declaration.
-             *
-             * The `coder` field carries the same value the payload was
-             * encoded with:
-             *
-             *     coder == 0  ->  LATIN1  (one byte per character)
-             *     coder == 1  ->  UTF-16  (two bytes per character)
-             *
-             * String.coder() reads it (after checking
-             * @gv_java_lang_String_COMPACT_STRINGS, which String.<clinit>
-             * sets to true) and String.length() applies it as the
-             * right-shift amount.
-             *
-             * The `hash` field is left at zero so the first hashCode()
-             * call computes and caches the real value lazily. The trailing
-             * i1 is left false for the same reason.
-             */
-            sb.append("@").append(objGlobal)
-                    .append(" = global %struct.java_lang_String {\n")
-                    .append("  i8* bitcast (%JNativeVTable* ").append(vtableName).append(" to i8*),\n")
-                    .append("  i8* bitcast ({ i8*, i32, i32, [").append(payloadLen)
-                    .append(" x i8] }* @").append(bytesGlobal).append(" to i8*),\n")
-                    .append("  i8 ").append(coder).append(",\n")
-                    .append("  i32 0,\n")
-                    .append("  i1 false\n")
-                    .append("}, align 8\n");
-
-            stringLiteralPool.add(objGlobal);
+        List<String> literalTexts = LlvmUtil.parallelMapOrdered(literals, scheduler,
+            s -> stringLiteralDefinition(s, byteArrayKlassRef, vtableName));
+        for (int li = 0; li < literals.size(); li++) {
+            sb.append(literalTexts.get(li));
+            stringLiteralPool.add("jstr_" + LlvmRuntime.stringIdSuffix(literals.get(li)));
         }
 
         int n = stringLiteralPool.size();
@@ -2785,6 +2733,170 @@ public class LlvmGlobalEmitter {
         }
         sb.append("], align 8\n");
         sb.append("@__jnative_literal_pool_size = constant i32 ").append(n).append("\n");
+        return sb.toString();
+    }
+
+    private String stringLiteralDefinition(String s, String byteArrayKlassRef, String vtableName) {
+        StringBuilder sb = new StringBuilder();
+        /*
+         * Decide which of the two compact-string encodings the literal
+         * must use.
+         *
+         * The decision is made per character code unit, not per code
+         * point. A supplementary character (U+10000..U+10FFFF) is
+         * represented in the Java String as two surrogate code units
+         * in the range U+DC80..U+DFFF, both of which are greater than
+         * 0xFF; a string containing one therefore lands in the UTF-16
+         * branch automatically, with no separate surrogate-pair test
+         * required.
+         *
+         * A string consisting entirely of characters in U+0000..U+00FF
+         * is encoded in the compact LATIN1 form: one byte per character
+         * code unit, equal to the character's low 8 bits. This is the
+         * same representation java.lang.String uses internally when
+         * String.COMPACT_STRINGS is true.
+         *
+         * Every other string is encoded as UTF-16LE: two bytes per
+         * character code unit, low byte first, matching
+         * StringUTF16.isBigEndian() on every supported target. This is the same
+         * representation java.lang.String uses internally when the
+         * compact-string optimisation is not in effect.
+         */
+        boolean latin1 = true;
+        int charCount = s.length();
+        for (int i = 0; i < charCount; i++) {
+            if (s.charAt(i) > 0xFF) {
+                latin1 = false;
+                break;
+            }
+        }
+
+        byte[] bytes;
+        int coder;
+        int lengthField;
+
+        if (latin1) {
+            /*
+             * Compact LATIN1 form. One byte per character code unit;
+             * the byte value is the low 8 bits of the char, which for
+             * a char <= 0xFF is the char itself.
+             */
+            bytes = new byte[charCount];
+            for (int i = 0; i < charCount; i++) {
+                bytes[i] = (byte) s.charAt(i);
+            }
+            coder = 0;
+            lengthField = charCount;
+        } else {
+            /*
+             * UTF-16LE form. Two bytes per character code unit, low
+             * byte first. Surrogate pairs are emitted as two
+             * consecutive code units, exactly as they appear in the
+             * Java String.
+             *
+             * The charCount used here is String.length(), i.e. the
+             * number of char code units, not the number of Unicode
+             * code points. That is the number of elements that
+             * String.length() must report, and it is the number the
+             * length word below is derived from.
+             */
+            bytes = new byte[charCount * 2];
+            for (int i = 0; i < charCount; i++) {
+                char ch = s.charAt(i);
+                bytes[i * 2]     = (byte) (ch & 0xFF);
+                bytes[i * 2 + 1] = (byte) (ch >>> 8);
+            }
+            coder = 1;
+            lengthField = charCount * 2;
+        }
+
+        int len = bytes.length;
+
+        /*
+         * Escape the payload for LLVM's c"..." string-literal syntax.
+         * Every byte outside printable ASCII, plus backslash, double
+         * quote and the common whitespace escapes, is rendered in
+         * uppercase two-digit hex. A trailing NUL byte is appended so
+         * that C-side consumers can treat the payload as a C string;
+         * it is C-side slack, not a Java element — the `length` field
+         * below is the true Java-visible byte count, and the NUL is
+         * never observed by String.length(), String.charAt() or any
+         * other method of String.
+         */
+        StringBuilder escaped = getStringBuilder(bytes);
+
+        String safe = LlvmRuntime.stringIdSuffix(s);
+        String bytesGlobal = "strbytes_" + safe;
+        String objGlobal = "jstr_" + safe;
+
+        /*
+         * The backing byte[]. Emitted as an anonymous struct so that
+         * the klass word at offset 0 can be a real pointer relocation
+         * rather than compile-time bytes. LLVM lays the fields out
+         * naturally (i8* @0, i32 @8, i32 @12, [N x i8] @16), which is
+         * exactly the canonical Java array header:
+         *
+         *     JAVA_ARR_KLASS_OFFSET      = 0
+         *     JAVA_ARR_LENGTH_OFFSET     = 8
+         *     JAVA_ARR_ELEM_SIZE_OFFSET  = 12
+         *     JAVA_ARR_HDR               = 16
+         *
+         * `align 8` matches the natural alignment of the i8* header
+         * word; the alignment does not change the field offsets but
+         * does keep the pointer slot addressable as a pointer.
+         *
+         * The value written into the length word is `lengthField`,
+         * which is the character count in the LATIN1 branch and twice
+         * the character count in the UTF-16 branch. That is the value
+         * String.length() derives the Java-level length from, via
+         * `value.length >> coder`.
+         */
+        int payloadLen = len + 1;   // NUL terminator is part of the array
+
+        sb.append("@").append(bytesGlobal)
+                .append(" = unnamed_addr constant { i8*, i32, i32, [")
+                .append(payloadLen).append(" x i8] } {\n")
+                .append("  i8* bitcast (%ReflectionClass* ").append(byteArrayKlassRef)
+                .append(" to i8*),\n")
+                .append("  i32 ").append(lengthField).append(",\n")
+                .append("  i32 1,\n")
+                .append("  [").append(payloadLen).append(" x i8] c\"")
+                .append(escaped).append("\"\n")
+                .append("}, align 8\n");
+
+        /*
+         * The String object. Its `value` field is a bitcast of the
+         * anonymous struct pointer to i8*, matching the i8* declared
+         * for that field in %struct.java_lang_String. The bitcast is
+         * necessary because the struct type is anonymous and therefore
+         * not nameable in the field declaration.
+         *
+         * The `coder` field carries the same value the payload was
+         * encoded with:
+         *
+         *     coder == 0  ->  LATIN1  (one byte per character)
+         *     coder == 1  ->  UTF-16  (two bytes per character)
+         *
+         * String.coder() reads it (after checking
+         * @gv_java_lang_String_COMPACT_STRINGS, which String.<clinit>
+         * sets to true) and String.length() applies it as the
+         * right-shift amount.
+         *
+         * The `hash` field is left at zero so the first hashCode()
+         * call computes and caches the real value lazily. The trailing
+         * i1 is left false for the same reason.
+         */
+        sb.append("@").append(objGlobal)
+                .append(" = global %struct.java_lang_String {\n")
+                .append("  i8* bitcast (%JNativeVTable* ").append(vtableName).append(" to i8*),\n")
+                .append("  i8* bitcast ({ i8*, i32, i32, [").append(payloadLen)
+                .append(" x i8] }* @").append(bytesGlobal).append(" to i8*),\n")
+                .append("  i8 ").append(coder).append(",\n")
+                .append("  i32 0,\n")
+                .append("  i1 false");
+        RefCountPlan plan = module.getRefCountPlan();
+        if (plan != null && plan.declaresCount("java/lang/String")) sb.append(",\n  i32 0");
+        sb.append("\n}, align 8\n");
         return sb.toString();
     }
 
@@ -2825,18 +2937,22 @@ public class LlvmGlobalEmitter {
         // own vtable to instancesOf[S] for every S in C's supertype closure. This
         // includes C itself — see collectSuperclasses(), which always adds cls.getName()
         // to the accumulator.
+        List<ClassNode> typedClasses = new ArrayList<>();
         for (ClassNode cls : allClasses) {
             if (cls.isExternal()) continue;
-
-            String className = cls.getName();
-            String classVtable = vtableNames.get(className);
-            if (classVtable == null) continue;
-
+            if (vtableNames.get(cls.getName()) == null) continue;
+            typedClasses.add(cls);
+        }
+        List<Set<String>> supertypeSets = LlvmUtil.parallelMapOrdered(typedClasses, scheduler, cls -> {
             Set<String> supertypes = new LinkedHashSet<>();
             collectSuperclasses(cls, supertypes);
             collectInterfaces(cls, supertypes);
+            return supertypes;
+        });
+        for (int ti = 0; ti < typedClasses.size(); ti++) {
+            String classVtable = vtableNames.get(typedClasses.get(ti).getName());
 
-            for (String supertype : supertypes) {
+            for (String supertype : supertypeSets.get(ti)) {
                 instancesOf.computeIfAbsent(supertype, k -> new LinkedHashSet<>())
                     .add(classVtable);
             }
@@ -3136,6 +3252,12 @@ public class LlvmGlobalEmitter {
         }
         FieldNode fn = resolver.getField(className, fieldName);
         return fn != null ? fn.getType() : null;
+    }
+
+    public boolean isVolatileField(String className, String fieldName) {
+        if (className == null || className.isEmpty() || fieldName == null || fieldName.isEmpty()) return false;
+        FieldNode fn = resolver.getField(className, fieldName);
+        return fn != null && (fn.getAccess() & Opcodes.ACC_VOLATILE) != 0;
     }
 
     /**

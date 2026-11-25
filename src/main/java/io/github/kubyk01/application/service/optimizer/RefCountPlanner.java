@@ -22,7 +22,9 @@ import io.github.kubyk01.domain.ir.Type;
 import io.github.kubyk01.domain.ir.Value;
 import io.github.kubyk01.util.LlvmUtil;
 import org.objectweb.asm.Opcodes;
+import reactor.core.scheduler.Scheduler;
 
+import java.util.ArrayList;
 import java.util.BitSet;
 import java.util.Collections;
 import java.util.HashSet;
@@ -44,6 +46,7 @@ final class RefCountPlanner {
     private final DependencyResolver resolver;
     private final AliasAnalysisResult alias;
     private final LifetimeAnalysisResult lifetime;
+    private final Scheduler scheduler;
     private final RefCountPlan plan = new RefCountPlan();
     private final BitSet counted = new BitSet();
     private final BitSet erasedArrayOwners = new BitSet();
@@ -54,8 +57,10 @@ final class RefCountPlanner {
     private int weakStores;
     private final Set<String> relatedTypes = new HashSet<>();
 
-    RefCountPlanner(Module module, DependencyResolver resolver, AliasAnalysisResult alias, LifetimeAnalysisResult lifetime) {
+    RefCountPlanner(Module module, DependencyResolver resolver, AliasAnalysisResult alias, LifetimeAnalysisResult lifetime,
+                    Scheduler scheduler) {
         this.module = module;
+        this.scheduler = scheduler;
         this.resolver = resolver;
         this.alias = alias;
         this.lifetime = lifetime;
@@ -90,19 +95,12 @@ final class RefCountPlanner {
         freed.andNot(captured);
         Set<String> leaking = new HashSet<>();
         for (int id = 0; id < n; id++) {
-            if (!stored.get(id) || freed.get(id)) continue;
             String cls = countableClass(AllocationSite.byId(id).getType());
-            if (cls != null) leaking.add(cls);
+            if (cls == null) continue;
+            if ((stored.get(id) && !freed.get(id)) || LlvmUtil.isSystemClassName(cls)) leaking.add(cls);
         }
         plan.getCountedClasses().addAll(leaking);
-        for (String cls : leaking) {
-            String declarer = cls;
-            Set<String> seen = new HashSet<>();
-            for (String c = superOf(cls); c != null && seen.add(c); c = superOf(c)) {
-                if (leaking.contains(c)) declarer = c;
-            }
-            plan.getCountDeclarers().add(declarer);
-        }
+        plan.getCountDeclarers().addAll(leaking);
         for (int id = 0; id < n; id++) {
             AllocationSite site = AllocationSite.byId(id);
             Type t = site.getType();
@@ -157,14 +155,25 @@ final class RefCountPlanner {
     private BitSet heapStoredSites(int n) {
         PointsToGraph graph = alias.getGraph();
         BitSet out = new BitSet();
-        for (int src = 0; src < n; src++) {
-            for (FieldCell cell : graph.fieldCells(src)) {
-                addAll(out, cell.get());
-                if (PointsToGraph.ARRAY_ELEMENT_FIELD.equals(cell.field()) || canHoldErasedArray(fieldType(cell.field()))) {
-                    addAll(erasedArrayOwners, cell.get());
+        List<BitSet[]> parts = LlvmUtil.parallelMapOrdered(siteRanges(n), scheduler, r -> {
+            BitSet stored = new BitSet();
+            BitSet erased = new BitSet();
+            BitSet weak = new BitSet();
+            for (int src = r[0]; src < r[1]; src++) {
+                for (FieldCell cell : graph.fieldCells(src)) {
+                    addAll(stored, cell.get());
+                    if (PointsToGraph.ARRAY_ELEMENT_FIELD.equals(cell.field()) || canHoldErasedArray(fieldType(cell.field()))) {
+                        addAll(erased, cell.get());
+                    }
+                    if (isWeakReferent(cell.field()) || isViewCacheField(cell.field())) addAll(weak, cell.get());
                 }
-                if (isWeakReferent(cell.field())) addAll(weakTargets, cell.get());
             }
+            return new BitSet[]{stored, erased, weak};
+        });
+        for (BitSet[] part : parts) {
+            out.or(part[0]);
+            erasedArrayOwners.or(part[1]);
+            weakTargets.or(part[2]);
         }
         graph.getStaticFieldPointsToMap().forEach((field, pts) -> {
             addAll(out, pts);
@@ -175,17 +184,27 @@ final class RefCountPlanner {
     }
 
     private void collectCapturedSites() {
-        for (Function function : module.getFunctions()) {
+        List<BitSet> parts = LlvmUtil.parallelMapOrdered(new ArrayList<>(module.getFunctions()), scheduler, function -> {
+            BitSet part = new BitSet();
             for (BasicBlock block : function.getBlocks()) {
                 for (Instruction inst : block.getInstructions()) {
                     if (inst.getOpcode() != Opcode.INVOKEDYNAMIC) continue;
                     for (Value value : lambdaCaptures(inst)) {
-                        if (isReference(value)) addAll(captured, alias.getPointsTo(value));
+                        if (isReference(value)) addAll(part, alias.getPointsTo(value));
                     }
                 }
             }
-        }
+            return part;
+        });
+        for (BitSet part : parts) captured.or(part);
         captured.clear(AllocationSite.UNKNOWN.getId());
+    }
+
+    private static List<int[]> siteRanges(int n) {
+        int chunk = Math.max(1, (n + 255) / 256);
+        List<int[]> out = new ArrayList<>();
+        for (int lo = 0; lo < n; lo += chunk) out.add(new int[]{lo, Math.min(n, lo + chunk)});
+        return out;
     }
 
     private static void addAll(BitSet out, PointsToSet pts) {
@@ -196,8 +215,7 @@ final class RefCountPlanner {
         if (t == null || !t.isReference() || t.isArray() || t.isUnknown() || t.isNull()) return null;
         String cls = t.getClassName();
         if (cls == null || cls.isEmpty() || cls.charAt(0) == '[' || cls.startsWith("__Lambda_")) return null;
-        // Intern tables own their WeakReference wrappers through ordinary strong array slots.
-        if (LlvmUtil.isSystemClassName(cls) && !"java/lang/ref/WeakReference".equals(cls)) return null;
+        if ("java/lang/Class".equals(cls)) return null;
         ClassNode node = resolver.getClassNode(cls);
         if (node == null || node.isExternal() || node.isInterface() || (node.getAccess() & Opcodes.ACC_ABSTRACT) != 0) return null;
         for (String c = superOf(cls); c != null; c = superOf(c)) {
@@ -282,31 +300,45 @@ final class RefCountPlanner {
         }
     }
 
+    private record Holders(List<String> arrayTypes, List<String[]> fields) {}
+
     private void collectHolders(int n) {
         PointsToGraph graph = alias.getGraph();
-        for (int src = 0; src < n; src++) {
-            Type t = AllocationSite.byId(src).getType();
-            if (t == null || t.isUnknown() || t.isNull()) continue;
-            boolean arrayClass = t.isReference() && t.getClassName() != null && t.getClassName().startsWith("[");
-            for (FieldCell cell : graph.fieldCells(src)) {
-                if (!holdsCounted(cell.get()) && !(managesArrays && maybeCountedType(fieldType(cell.field())))) continue;
-                if (t.isArray() || arrayClass) {
-                    if (PointsToGraph.ARRAY_ELEMENT_FIELD.equals(cell.field())) {
-                        Value allocation = alias.getAllocationSiteToValue().get(AllocationSite.byId(src));
-                        Type valueType = allocation == null ? null : allocation.getType();
-                        Type arrayType = valueType != null && valueType.isArray() ? valueType : t;
-                        String desc = arrayClass ? t.getClassName() : arrayDescriptor(arrayType);
-                        if (desc != null && desc.length() > 1 && (desc.charAt(1) == 'L' || desc.charAt(1) == '[')) {
-                            plan.getCountedArrayTypes().add(desc);
-                        }
+        List<Holders> parts = LlvmUtil.parallelMapOrdered(siteRanges(n), scheduler, r -> {
+            Holders part = new Holders(new ArrayList<>(), new ArrayList<>());
+            for (int src = r[0]; src < r[1]; src++) collectHolders(graph, src, part);
+            return part;
+        });
+        for (Holders part : parts) {
+            plan.getCountedArrayTypes().addAll(part.arrayTypes());
+            for (String[] field : part.fields()) {
+                plan.getCountedFields().computeIfAbsent(field[0], k -> new HashSet<>()).add(field[1]);
+            }
+        }
+    }
+
+    private void collectHolders(PointsToGraph graph, int src, Holders part) {
+        Type t = AllocationSite.byId(src).getType();
+        if (t == null || t.isUnknown() || t.isNull()) return;
+        boolean arrayClass = t.isReference() && t.getClassName() != null && t.getClassName().startsWith("[");
+        for (FieldCell cell : graph.fieldCells(src)) {
+            if (!holdsCounted(cell.get()) && !(managesArrays && maybeCountedType(fieldType(cell.field())))) continue;
+            if (t.isArray() || arrayClass) {
+                if (PointsToGraph.ARRAY_ELEMENT_FIELD.equals(cell.field())) {
+                    Value allocation = alias.getAllocationSiteToValue().get(AllocationSite.byId(src));
+                    Type valueType = allocation == null ? null : allocation.getType();
+                    Type arrayType = valueType != null && valueType.isArray() ? valueType : t;
+                    String desc = arrayClass ? t.getClassName() : arrayDescriptor(arrayType);
+                    if (desc != null && desc.length() > 1 && (desc.charAt(1) == 'L' || desc.charAt(1) == '[')) {
+                        part.arrayTypes().add(desc);
                     }
-                    continue;
                 }
-                if (!t.isReference() || t.getClassName() == null || t.getClassName().startsWith("__Lambda_")) continue;
-                String key = instanceReferenceField(cell.field());
-                if (key != null && declaredIn(t.getClassName(), key.substring(0, key.lastIndexOf('.')))) {
-                    plan.getCountedFields().computeIfAbsent(t.getClassName(), k -> new HashSet<>()).add(key);
-                }
+                continue;
+            }
+            if (!t.isReference() || t.getClassName() == null || t.getClassName().startsWith("__Lambda_")) continue;
+            String key = instanceReferenceField(cell.field());
+            if (key != null && declaredIn(t.getClassName(), key.substring(0, key.lastIndexOf('.')))) {
+                part.fields().add(new String[]{t.getClassName(), key});
             }
         }
     }
@@ -330,7 +362,75 @@ final class RefCountPlanner {
         String d = f.getDescriptor();
         if (d == null || (d.charAt(0) != 'L' && d.charAt(0) != '[')) return null;
         if (WEAK_OWNER.equals(f.getOwner()) && WEAK_FIELD.equals(f.getName())) return null;
-        return f.getOwner() + "." + f.getName();
+        String key = f.getOwner() + "." + f.getName();
+        if (NON_OWNING_FIELDS.contains(key) || VIEW_CACHE_FIELDS.contains(key)) return null;
+        return key;
+    }
+
+    static final Set<String> NON_OWNING_FIELDS = Set.of(
+        "java/util/LinkedHashMap$Entry.before",
+        "java/util/HashMap$TreeNode.parent",
+        "java/util/HashMap$TreeNode.prev",
+        "java/util/TreeMap$Entry.parent",
+        "java/util/LinkedList$Node.prev",
+        "java/util/concurrent/ConcurrentHashMap$TreeNode.parent",
+        "java/util/concurrent/ConcurrentHashMap$TreeNode.prev",
+        "java/util/concurrent/LinkedBlockingDeque$Node.prev");
+
+    static final Set<String> VIEW_CACHE_FIELDS = Set.of(
+        "java/util/AbstractMap.keySet",
+        "java/util/AbstractMap.values",
+        "java/util/HashMap.entrySet",
+        "java/util/TreeMap.entrySet",
+        "java/util/TreeMap.navigableKeySet",
+        "java/util/TreeMap.descendingMap",
+        "java/util/TreeMap$NavigableSubMap.entrySetView",
+        "java/util/TreeMap$NavigableSubMap.navigableKeySetView",
+        "java/util/TreeMap$NavigableSubMap.descendingMapView",
+        "java/util/IdentityHashMap.entrySet",
+        "java/util/WeakHashMap.entrySet",
+        "java/util/EnumMap.entrySet",
+        "java/util/Hashtable.keySet",
+        "java/util/Hashtable.entrySet",
+        "java/util/Hashtable.values",
+        "java/util/Collections$SynchronizedMap.keySet",
+        "java/util/Collections$SynchronizedMap.entrySet",
+        "java/util/Collections$SynchronizedMap.values",
+        "java/util/Collections$UnmodifiableMap.keySet",
+        "java/util/Collections$UnmodifiableMap.entrySet",
+        "java/util/Collections$UnmodifiableMap.values",
+        "java/util/Collections$CheckedMap.entrySet",
+        "java/util/concurrent/ConcurrentHashMap.keySet",
+        "java/util/concurrent/ConcurrentHashMap.values",
+        "java/util/concurrent/ConcurrentHashMap.entrySet",
+        "java/util/concurrent/ConcurrentSkipListMap.keySet",
+        "java/util/concurrent/ConcurrentSkipListMap.values",
+        "java/util/concurrent/ConcurrentSkipListMap.entrySet",
+        "java/util/concurrent/ConcurrentSkipListMap.descendingMap");
+
+    private final Map<String, String> declaredKeys = new java.util.concurrent.ConcurrentHashMap<>();
+
+    private String declaredKey(String raw) {
+        if (raw == null) return null;
+        String key = declaredKeys.get(raw);
+        if (key == null) {
+            int dot = raw.lastIndexOf('.');
+            FieldNode f = dot <= 0 ? null : resolver.getField(raw.substring(0, dot), raw.substring(dot + 1));
+            key = f == null || f.getOwner() == null || (f.getAccess() & Opcodes.ACC_STATIC) != 0
+                ? "" : f.getOwner() + "." + f.getName();
+            declaredKeys.put(raw, key);
+        }
+        return key.isEmpty() ? null : key;
+    }
+
+    boolean isNonOwningField(String raw) {
+        String key = declaredKey(raw);
+        return key != null && NON_OWNING_FIELDS.contains(key);
+    }
+
+    boolean isViewCacheField(String raw) {
+        String key = declaredKey(raw);
+        return key != null && VIEW_CACHE_FIELDS.contains(key);
     }
 
     static String arrayDescriptor(Type t) {
@@ -347,44 +447,66 @@ final class RefCountPlanner {
     }
 
     private int markStores() {
-        int marked = 0;
+        List<Function> functions = new ArrayList<>();
         for (Function f : module.getFunctions()) {
-            if (f.getEntryBlock() == null) continue;
-            int next = 0;
-            Map<Integer, Integer> localHolds = new java.util.HashMap<>();
-            for (BasicBlock block : f.getBlocks()) {
-                for (Instruction inst : block.getInstructions()) {
-                    Value res = inst.getResult();
-                    if (inst.getOpcode() == Opcode.GET_FIELD && isWeakReferent(extractFieldName(inst))) {
-                        inst.setRcWeak(true);
-                    }
-                    if (inst.getOpcode() == Opcode.STORE) {
-                        Value stored = inst.getOperands().isEmpty() ? null : inst.getOperands().getFirst();
-                        if (inst.getLocalIndex() >= 0 && isReference(stored) && maybeCounted(stored)) {
-                            Integer k = localHolds.get(inst.getLocalIndex());
-                            if (k == null) {
-                                k = next++;
-                                localHolds.put(inst.getLocalIndex(), k);
-                            }
-                            inst.setRcHold(k);
-                        }
-                    } else if (isReference(res) && (inst.isRcManagedArray() || inst.isRcWeak() || maybeCounted(res))) {
-                        inst.setRcHold(next++);
-                    }
-                    if (inst.getOpcode() == Opcode.NEW && isCountedType(res == null ? null : res.getType())
-                            && mayBeWeakTarget(res)) {
-                        inst.setRcWeak(true);
-                    }
-                    if (markStore(inst)) marked++;
-                }
-            }
-            f.setRcHolds(next);
-            if (next > 0) pinned.add(f);
+            if (f.getEntryBlock() != null) functions.add(f);
+        }
+        List<int[]> counts = LlvmUtil.parallelMapOrdered(functions, scheduler, this::markFunctionStores);
+        int marked = 0;
+        for (int i = 0; i < functions.size(); i++) {
+            int[] c = counts.get(i);
+            marked += c[0];
+            weakStores += c[1];
+            if (c[2] > 0) pinned.add(functions.get(i));
         }
         return marked;
     }
 
-    private boolean markStore(Instruction inst) {
+    private int[] markFunctionStores(Function f) {
+        int marked = 0;
+        int[] weak = new int[1];
+        int next = 0;
+        Map<Integer, Integer> localHolds = new java.util.HashMap<>();
+        for (BasicBlock block : f.getBlocks()) {
+            Set<Instruction> elided = null;
+            for (Instruction inst : block.getInstructions()) {
+                Value res = inst.getResult();
+                if (inst.getOpcode() == Opcode.PUT_FIELD && inst.getOperands().size() >= 3
+                        && !(inst.getOperands().get(1) instanceof Constant c && c.getType() == Type.INT)
+                        && isViewCacheField(extractFieldName(inst))) {
+                    if (elided == null) elided = Collections.newSetFromMap(new IdentityHashMap<>());
+                    elided.add(inst);
+                    continue;
+                }
+                if (inst.getOpcode() == Opcode.GET_FIELD && isWeakReferent(extractFieldName(inst))) {
+                    inst.setRcWeak(true);
+                }
+                if (inst.getOpcode() == Opcode.STORE) {
+                    Value stored = inst.getOperands().isEmpty() ? null : inst.getOperands().getFirst();
+                    if (inst.getLocalIndex() >= 0 && isReference(stored) && maybeCounted(stored)) {
+                        Integer k = localHolds.get(inst.getLocalIndex());
+                        if (k == null) {
+                            k = next++;
+                            localHolds.put(inst.getLocalIndex(), k);
+                        }
+                        inst.setRcHold(k);
+                    }
+                } else if (isReference(res) && (inst.isRcManagedArray() || inst.isRcWeak() || maybeCounted(res))) {
+                    inst.setRcHold(next++);
+                }
+                if (inst.getOpcode() == Opcode.NEW && isCountedType(res == null ? null : res.getType())
+                        && mayBeWeakTarget(res)) {
+                    inst.setRcWeak(true);
+                }
+                if (markStore(inst, weak)) marked++;
+            }
+            if (elided != null) block.getInstructions().removeIf(elided::contains);
+        }
+        f.setRcHolds(next);
+        return new int[]{marked, weak[0], next};
+    }
+
+    private boolean markStore(Instruction inst, int[] weak) {
         List<Value> ops = inst.getOperands();
         switch (inst.getOpcode()) {
             case PUT_FIELD -> {
@@ -398,9 +520,10 @@ final class RefCountPlanner {
                 String raw = extractFieldName(inst);
                 if (isWeakReferent(raw)) {
                     inst.setRcWeak(true);
-                    weakStores++;
+                    weak[0]++;
                     return false;
                 }
+                if (isNonOwningField(raw)) return false;
                 PointsToSet old = alias.getFieldPointsToForSites(alias.getPointsTo(ops.getFirst()), raw);
                 Type type = fieldType(raw);
                 if (!maybeCounted(ops.get(2)) && !maybeCountedContents(old, type)

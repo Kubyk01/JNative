@@ -89,7 +89,12 @@ static void wnd_set_long(void* obj, WndField* f, int64_t v) {
 
 static void wnd_set_obj(void* obj, WndField* f, void* v) {
     int off = wnd_field_offset(f);
-    if (obj != NULL && off >= 0) *(void**)((char*)obj + off) = v;
+    if (obj != NULL && off >= 0) {
+        void* old = *(void**)((char*)obj + off);
+        __jnative_rc_inc(v);
+        *(void**)((char*)obj + off) = v;
+        __jnative_rc_dec(old);
+    }
 }
 
 JNATIVE_NORETURN static void wnd_throw(DWORD last_error) {
@@ -164,6 +169,7 @@ static void* wnd_string(const WCHAR* wstr, size_t len) {
     void* s = calloc(1, 32);
     if (s == NULL) __jnative_throw_out_of_memory_error_ctx("WindowsNativeDispatcher");
     *(void**)s = (void*)&vtable_java_lang_String;
+    __jnative_rc_inc(value);
     *(void**)((char*)s + 8) = value;
     *(uint8_t*)((char*)s + 16) = coder;
     return s;

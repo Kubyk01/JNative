@@ -127,6 +127,13 @@
 
 #include "jnative_runtime.h"
 
+static void mhn_put_ref(void** slot, void* value) {
+    __jnative_rc_inc(value);
+    void* old = *slot;
+    *slot = value;
+    __jnative_rc_dec(old);
+}
+
 /*
  * --------------------------------------------------------------------------
  * MemberName layout
@@ -584,9 +591,9 @@ void __jnative_fn_java_lang_invoke_MethodHandleNatives_init__Ljava_lang_invoke_M
         int32_t modifiers = *(int32_t*)((char*)target + JNATIVE_METHOD_MODIFIERS_OFFSET);
         void* method_type = method_get_type(target);
 
-        *(void**)((char*)self + MEMBERNAME_FIELD_CLAZZ)  = clazz;
-        *(void**)((char*)self + MEMBERNAME_FIELD_NAME)   = name;
-        *(void**)((char*)self + MEMBERNAME_FIELD_TYPE)   = method_type;
+        mhn_put_ref((void**)((char*)self + MEMBERNAME_FIELD_CLAZZ), clazz);
+        mhn_put_ref((void**)((char*)self + MEMBERNAME_FIELD_NAME), name);
+        mhn_put_ref((void**)((char*)self + MEMBERNAME_FIELD_TYPE), method_type);
         /* Like HotSpot's init_method_MemberName: the refKind must be set, or a later
          * resolve() derives ACC_STATIC from REF_NONE and clears it. */
         int32_t ref_kind;
@@ -604,9 +611,9 @@ void __jnative_fn_java_lang_invoke_MethodHandleNatives_init__Ljava_lang_invoke_M
         void* clazz     = *(void**)((char*)target + JNATIVE_CTOR_CLAZZ_OFFSET);
         int32_t modifiers = *(int32_t*)((char*)target + JNATIVE_CTOR_MODIFIERS_OFFSET);
 
-        *(void**)((char*)self + MEMBERNAME_FIELD_CLAZZ)  = clazz;
-        *(void**)((char*)self + MEMBERNAME_FIELD_NAME)   = NULL;
-        *(void**)((char*)self + MEMBERNAME_FIELD_TYPE)   = NULL;
+        mhn_put_ref((void**)((char*)self + MEMBERNAME_FIELD_CLAZZ), clazz);
+        mhn_put_ref((void**)((char*)self + MEMBERNAME_FIELD_NAME), NULL);
+        mhn_put_ref((void**)((char*)self + MEMBERNAME_FIELD_TYPE), NULL);
         *(int32_t*)((char*)self + MEMBERNAME_FIELD_FLAGS) =
             modifiers | MN_IS_CONSTRUCTOR | (JN_REF_newInvokeSpecial << MN_REFERENCE_KIND_SHIFT);
         return;
@@ -617,9 +624,9 @@ void __jnative_fn_java_lang_invoke_MethodHandleNatives_init__Ljava_lang_invoke_M
         void* name      = *(void**)((char*)target + JNATIVE_FIELD_NAME_OFFSET);
         int32_t modifiers = *(int32_t*)((char*)target + JNATIVE_FIELD_MODIFIERS_OFFSET);
 
-        *(void**)((char*)self + MEMBERNAME_FIELD_CLAZZ)  = clazz;
-        *(void**)((char*)self + MEMBERNAME_FIELD_NAME)   = name;
-        *(void**)((char*)self + MEMBERNAME_FIELD_TYPE)   = NULL;
+        mhn_put_ref((void**)((char*)self + MEMBERNAME_FIELD_CLAZZ), clazz);
+        mhn_put_ref((void**)((char*)self + MEMBERNAME_FIELD_NAME), name);
+        mhn_put_ref((void**)((char*)self + MEMBERNAME_FIELD_TYPE), NULL);
         /* HotSpot's init_field_MemberName: getStatic/getField; MemberName(Field, true)
          * then turns it into the put variant itself. */
         int32_t ref_kind = (modifiers & JNATIVE_ACC_STATIC) ? JN_REF_getStatic : JN_REF_getField;
@@ -642,11 +649,11 @@ void __jnative_fn_java_lang_invoke_MethodHandleNatives_init__Ljava_lang_invoke_M
         return;
     }
 
-    *(void**)((char*)self + MEMBERNAME_FIELD_TYPE)   = target;
+    mhn_put_ref((void**)((char*)self + MEMBERNAME_FIELD_TYPE), target);
     *(int32_t*)((char*)self + MEMBERNAME_FIELD_FLAGS) = MN_IS_METHOD;
-    *(void**)((char*)self + MEMBERNAME_FIELD_CLAZZ)   = NULL;
-    *(void**)((char*)self + MEMBERNAME_FIELD_NAME)    = NULL;
-    *(void**)((char*)self + MEMBERNAME_FIELD_RESOLUTION) = NULL;
+    mhn_put_ref((void**)((char*)self + MEMBERNAME_FIELD_CLAZZ), NULL);
+    mhn_put_ref((void**)((char*)self + MEMBERNAME_FIELD_NAME), NULL);
+    mhn_put_ref((void**)((char*)self + MEMBERNAME_FIELD_RESOLUTION), NULL);
 }
 
 /*
@@ -833,7 +840,7 @@ void* __jnative_fn_java_lang_invoke_MethodHandleNatives_resolve__BLjava_lang_inv
      * makes those checks agree with the JVM's own resolution.
      */
     if (declaring_class != cls) {
-        *(void**)((char*)member + MEMBERNAME_FIELD_CLAZZ) = declaring_class;
+        mhn_put_ref((void**)((char*)member + MEMBERNAME_FIELD_CLAZZ), declaring_class);
     }
 
     return member;
@@ -1229,7 +1236,7 @@ void __jnative_fn_java_lang_invoke_MethodHandleNatives_setCallSiteTargetNormal__
         return;
     }
 
-    *(void**)((char*)site + OBJECT_HEADER_SIZE) = target;
+    mhn_put_ref((void**)((char*)site + OBJECT_HEADER_SIZE), target);
 }
 
 /*
@@ -1245,11 +1252,13 @@ void __jnative_fn_java_lang_invoke_MethodHandleNatives_setCallSiteTargetVolatile
         return;
     }
 
-    __atomic_store_n(
+    __jnative_rc_inc(target);
+    void* old = __atomic_exchange_n(
         (void**)((char*)site + OBJECT_HEADER_SIZE),
         target,
         __ATOMIC_SEQ_CST
     );
+    __jnative_rc_dec(old);
 }
 
 /*

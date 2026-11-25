@@ -22,7 +22,9 @@ import io.github.kubyk01.domain.ir.Terminator;
 import io.github.kubyk01.domain.ir.ThrowTerminator;
 import io.github.kubyk01.domain.ir.Type;
 import io.github.kubyk01.domain.ir.Value;
+import io.github.kubyk01.util.LlvmUtil;
 import org.objectweb.asm.Opcodes;
+import reactor.core.scheduler.Scheduler;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -34,6 +36,7 @@ import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 import static io.github.kubyk01.util.LlvmUtil.canonicalCalleeKey;
 import static io.github.kubyk01.util.LlvmUtil.extractCalleeName;
@@ -55,13 +58,14 @@ final class ContainerArrayBorrows {
     private final DependencyResolver resolver;
     private final AliasAnalysisResult alias;
     private final EscapeAnalysisResult escape;
+    private final Scheduler scheduler;
     private final Map<String, String> excluded = new HashMap<>();
     private final Set<String> sharedClasses = new HashSet<>();
     private boolean cloneAll;
     private final List<String> unknownClones = new ArrayList<>();
-    private final Map<Function, Map<String, List<Instruction>>> writersCache = new IdentityHashMap<>();
+    private final Map<Function, Map<String, List<Instruction>>> writersCache = new ConcurrentHashMap<>();
 
-    private final Map<String, String> canonical = new HashMap<>();
+    private final Map<String, String> canonical = new ConcurrentHashMap<>();
     private final Map<String, List<Instruction>> puts = new HashMap<>();
     private final Map<String, List<Instruction>> gets = new HashMap<>();
     private final Map<Instruction, List<Function>> targets = new IdentityHashMap<>();
@@ -69,7 +73,7 @@ final class ContainerArrayBorrows {
     private final Map<Function, List<Instruction>> callSitesOf = new IdentityHashMap<>();
     private final Set<String> returnPropagated = new HashSet<>();
     private final List<Borrow> roots = new ArrayList<>();
-    private final Map<Function, FnIndex> indexes = new IdentityHashMap<>();
+    private final Map<Function, FnIndex> indexes = new ConcurrentHashMap<>();
     private final Map<Function, BitSet> writes = new IdentityHashMap<>();
     private final Map<String, Integer> keyIds = new HashMap<>();
     private final Map<String, String> retireOnly = new HashMap<>();
@@ -103,8 +107,9 @@ final class ContainerArrayBorrows {
     }
 
     ContainerArrayBorrows(Module module, DependencyResolver resolver, AliasAnalysisResult alias,
-                          EscapeAnalysisResult escape) {
+                          EscapeAnalysisResult escape, Scheduler scheduler) {
         this.module = module;
+        this.scheduler = scheduler;
         this.resolver = resolver;
         this.alias = alias;
         this.escape = escape;
@@ -208,8 +213,10 @@ final class ContainerArrayBorrows {
             }
         }
         long rootsStart = System.nanoTime();
-        for (Borrow b : roots) {
-            if (held(b)) {
+        boolean[] rootHeld = heldRoots();
+        for (int r = 0; r < roots.size(); r++) {
+            Borrow b = roots.get(r);
+            if (rootHeld[r]) {
                 if (b.owner() == null) {
                     retireOnly.putIfAbsent(b.key(), "borrowed array returned by a static call in " + b.fn().getName());
                     continue;
@@ -272,36 +279,71 @@ final class ContainerArrayBorrows {
         return key + "|" + f.getName() + "|" + ordinal;
     }
 
+    private boolean[] heldRoots() {
+        boolean[] out = new boolean[roots.size()];
+        Map<Function, List<Integer>> byFunction = new IdentityHashMap<>();
+        List<List<Integer>> groups = new ArrayList<>();
+        for (int r = 0; r < roots.size(); r++) {
+            List<Integer> group = byFunction.get(roots.get(r).fn());
+            if (group == null) {
+                group = new ArrayList<>();
+                byFunction.put(roots.get(r).fn(), group);
+                groups.add(group);
+            }
+            group.add(r);
+        }
+        LlvmUtil.parallelMapOrdered(groups, scheduler, group -> {
+            for (int r : group) out[r] = held(roots.get(r));
+            return null;
+        });
+        return out;
+    }
+
+    private record ScanEntry(Instruction inst, String key, List<Function> targets) {}
+
     private void scan() {
-        List<? extends Function> fns = module.getFunctions();
-        for (Function f : fns) {
-            if (f.getEntryBlock() == null || isDestructor(f)) continue;
-            for (BasicBlock block : f.getBlocks()) {
-                for (Instruction inst : block.getInstructions()) {
-                    switch (inst.getOpcode()) {
-                        case PUT_FIELD -> {
-                            String key = keyOf(inst);
-                            if (key != null) puts.computeIfAbsent(key, k -> new ArrayList<>()).add(inst);
+        List<Function> fns = new ArrayList<>();
+        for (Function f : module.getFunctions()) {
+            if (f.getEntryBlock() != null && !isDestructor(f)) fns.add(f);
+        }
+        List<List<ScanEntry>> scanned = LlvmUtil.parallelMapOrdered(fns, scheduler, this::scanFunction);
+        for (int fi = 0; fi < fns.size(); fi++) {
+            Function f = fns.get(fi);
+            for (ScanEntry e : scanned.get(fi)) {
+                Instruction inst = e.inst();
+                switch (inst.getOpcode()) {
+                    case PUT_FIELD -> puts.computeIfAbsent(e.key(), k -> new ArrayList<>()).add(inst);
+                    case GET_FIELD -> gets.computeIfAbsent(e.key(), k -> new ArrayList<>()).add(inst);
+                    default -> {
+                        targets.put(inst, e.targets());
+                        for (Function function : e.targets()) {
+                            callers.computeIfAbsent(function, k -> new ArrayList<>()).add(f);
+                            callSitesOf.computeIfAbsent(function, k -> new ArrayList<>()).add(inst);
                         }
-                        case GET_FIELD -> {
-                            String key = keyOf(inst);
-                            if (key != null) gets.computeIfAbsent(key, k -> new ArrayList<>()).add(inst);
-                        }
-                        case CALL, VIRTUAL_CALL, INTERFACE_CALL, STATIC_CALL, SPECIAL_CALL -> {
-                            List<Function> ts = resolveTargets(inst);
-                            targets.put(inst, ts);
-                            for (Function function : ts) {
-                                callers.computeIfAbsent(function, k -> new ArrayList<>()).add(f);
-                                callSitesOf.computeIfAbsent(function, k -> new ArrayList<>()).add(inst);
-                            }
-                            noteClone(inst);
-                            noteDeath(inst);
-                        }
-                        default -> { }
+                        noteClone(inst);
+                        noteDeath(inst);
                     }
                 }
             }
         }
+    }
+
+    private List<ScanEntry> scanFunction(Function f) {
+        List<ScanEntry> out = new ArrayList<>();
+        for (BasicBlock block : f.getBlocks()) {
+            for (Instruction inst : block.getInstructions()) {
+                switch (inst.getOpcode()) {
+                    case PUT_FIELD, GET_FIELD -> {
+                        String key = keyOf(inst);
+                        if (key != null) out.add(new ScanEntry(inst, key, null));
+                    }
+                    case CALL, VIRTUAL_CALL, INTERFACE_CALL, STATIC_CALL, SPECIAL_CALL ->
+                        out.add(new ScanEntry(inst, null, resolveTargets(inst)));
+                    default -> { }
+                }
+            }
+        }
+        return out;
     }
 
     private void noteClone(Instruction inst) {
@@ -614,7 +656,7 @@ final class ContainerArrayBorrows {
         return true;
     }
 
-    private final Map<String, List<Function>> dispatchCache = new HashMap<>();
+    private final Map<String, List<Function>> dispatchCache = new ConcurrentHashMap<>();
 
     private List<Function> resolveTargets(Instruction inst) {
         String callee = extractCalleeName(inst);
@@ -635,8 +677,8 @@ final class ContainerArrayBorrows {
         List<Function> cached = dispatchCache.get(callee);
         if (cached != null) return cached;
         List<Function> computed = dispatchTargets(callee);
-        dispatchCache.put(callee, computed);
-        return computed;
+        List<Function> raced = dispatchCache.putIfAbsent(callee, computed);
+        return raced != null ? raced : computed;
     }
 
     private List<Function> dispatchTargets(String callee) {

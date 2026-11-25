@@ -199,7 +199,10 @@ static void init_crypto_permissions_map(ReflectionClass* cp_cls, void* cp) {
             "CryptoPermissions.perms cannot be constructed"));
     }
     map_ctor(map);
+    void* old_map = *(void**)((char*)cp + perms->offset);
+    __jnative_rc_inc(map);
     *(void**)((char*)cp + perms->offset) = map;
+    __jnative_rc_dec(old_map);
 }
 
 static void* make_empty_crypto_permissions(void) {
@@ -243,9 +246,15 @@ void __jnative_override_javax_crypto_JceSecurity_setupJurisdictionPolicies() {
     void* exempt_policy  = make_empty_crypto_permissions();
 
     if (&gv_javax_crypto_JceSecurity_defaultPolicy != NULL) {
+        void* old_default = gv_javax_crypto_JceSecurity_defaultPolicy;
+        __jnative_rc_inc(default_policy);
         gv_javax_crypto_JceSecurity_defaultPolicy = default_policy;
+        __jnative_rc_dec(old_default);
     }
     if (&gv_javax_crypto_JceSecurity_exemptPolicy != NULL) {
+        void* old_exempt = gv_javax_crypto_JceSecurity_exemptPolicy;
+        __jnative_rc_inc(exempt_policy);
         gv_javax_crypto_JceSecurity_exemptPolicy  = exempt_policy;
+        __jnative_rc_dec(old_exempt);
     }
 }

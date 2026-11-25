@@ -35,6 +35,7 @@ static void* pe_make_string(const WCHAR* w, int32_t n)
     d[bytes] = 0;
     d[bytes + 1] = 0;
     *(void**)s = (void*)&vtable_java_lang_String;
+    __jnative_rc_inc(value);
     *(void**)((char*)s + 8) = value;
     *(uint8_t*)((char*)s + 16) = latin1 ? 0 : 1;
     return s;
@@ -95,6 +96,8 @@ void* __jnative_fn_java_lang_ProcessEnvironment_environ_____B(void)
         if (name == NULL || value == NULL) {
             __jnative_throw_out_of_memory_error_ctx("ProcessEnvironment.environ");
         }
+        __jnative_rc_inc(name);
+        __jnative_rc_inc(value);
         slots[2 * j] = name;
         slots[2 * j + 1] = value;
         j++;

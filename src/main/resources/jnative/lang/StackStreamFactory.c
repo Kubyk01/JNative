@@ -247,10 +247,16 @@ static void ssf_fill_member_name_jdk21(void* sfi, const SsfFrame* frame) {
         *(void**)((char*)mn + JNATIVE_MEMBERNAME_CLAZZ_OFFSET) = frame->cls;
     }
     if (ssf_offset_ok(&JNATIVE_MEMBERNAME_NAME_OFFSET)) {
-        *(void**)((char*)mn + JNATIVE_MEMBERNAME_NAME_OFFSET) = ssf_string(frame->name);
+        void* v = ssf_string(frame->name);
+        __jnative_rc_inc(v);
+        void* old = __atomic_exchange_n((void**)((char*)mn + JNATIVE_MEMBERNAME_NAME_OFFSET), v, __ATOMIC_ACQ_REL);
+        __jnative_rc_dec(old);
     }
     if (ssf_offset_ok(&JNATIVE_MEMBERNAME_TYPE_OFFSET)) {
-        *(void**)((char*)mn + JNATIVE_MEMBERNAME_TYPE_OFFSET) = ssf_string(frame->descriptor);
+        void* v = ssf_string(frame->descriptor);
+        __jnative_rc_inc(v);
+        void* old = __atomic_exchange_n((void**)((char*)mn + JNATIVE_MEMBERNAME_TYPE_OFFSET), v, __ATOMIC_ACQ_REL);
+        __jnative_rc_dec(old);
     }
     if (ssf_offset_ok(&JNATIVE_MEMBERNAME_FLAGS_OFFSET)) {
         *(int32_t*)((char*)mn + JNATIVE_MEMBERNAME_FLAGS_OFFSET) = flags;
@@ -262,7 +268,8 @@ static void ssf_fill_member_name_jdk21(void* sfi, const SsfFrame* frame) {
 
 static void ssf_fill_frame_info(void* cfi, const SsfFrame* frame, int class_only) {
     void* holder = class_only ? (void*)frame->cls : ssf_new_resolved_method_name(frame);
-    *(void**)((char*)cfi + JNATIVE_CFI_CLASS_OR_MEMBER_NAME_OFFSET) = holder;
+    __jnative_rc_inc(holder);
+    __jnative_rc_dec(__atomic_exchange_n((void**)((char*)cfi + JNATIVE_CFI_CLASS_OR_MEMBER_NAME_OFFSET), holder, __ATOMIC_ACQ_REL));
     if (ssf_offset_ok(&JNATIVE_CFI_FLAGS_OFFSET)) {
         int32_t* flags = (int32_t*)((char*)cfi + JNATIVE_CFI_FLAGS_OFFSET);
 
@@ -271,10 +278,10 @@ static void ssf_fill_frame_info(void* cfi, const SsfFrame* frame, int class_only
     if (!class_only) {
 
         if (ssf_offset_ok(&JNATIVE_SFI_NAME_OFFSET)) {
-            *(void**)((char*)cfi + JNATIVE_SFI_NAME_OFFSET) = NULL;
+            __jnative_rc_dec(__atomic_exchange_n((void**)((char*)cfi + JNATIVE_SFI_NAME_OFFSET), NULL, __ATOMIC_ACQ_REL));
         }
         if (ssf_offset_ok(&JNATIVE_SFI_TYPE_OFFSET)) {
-            *(void**)((char*)cfi + JNATIVE_SFI_TYPE_OFFSET) = NULL;
+            __jnative_rc_dec(__atomic_exchange_n((void**)((char*)cfi + JNATIVE_SFI_TYPE_OFFSET), NULL, __ATOMIC_ACQ_REL));
         }
         if (ssf_offset_ok(&JNATIVE_SFI_BCI_OFFSET)) {
             *(int32_t*)((char*)cfi + JNATIVE_SFI_BCI_OFFSET) = 0;
@@ -416,8 +423,14 @@ int jnative_stack_frame_expand(void* sfi) {
     if (m == NULL) return 0;
     void** name = (void**)((char*)sfi + JNATIVE_SFI_NAME_OFFSET);
     void** type = (void**)((char*)sfi + JNATIVE_SFI_TYPE_OFFSET);
-    if (*name == NULL) *name = ssf_string(m->name);
-    if (*type == NULL) *type = ssf_string(m->descriptor);
+    if (*name == NULL) {
+        *name = ssf_string(m->name);
+        __jnative_rc_inc(*name);
+    }
+    if (*type == NULL) {
+        *type = ssf_string(m->descriptor);
+        __jnative_rc_inc(*type);
+    }
     return 1;
 }
 

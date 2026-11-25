@@ -275,19 +275,22 @@ extern void* gv_java_lang_System_err __attribute__((weak));
 
 void __jnative_fn_java_lang_System_setIn0__Ljava_io_InputStream__V(void* in) {
     if (&gv_java_lang_System_in != NULL) {
-        gv_java_lang_System_in = in;
+        __jnative_rc_inc(in);
+        __jnative_rc_dec(__atomic_exchange_n(&gv_java_lang_System_in, in, __ATOMIC_ACQ_REL));
     }
 }
 
 void __jnative_fn_java_lang_System_setOut0__Ljava_io_PrintStream__V(void* out) {
     if (&gv_java_lang_System_out != NULL) {
-        gv_java_lang_System_out = out;
+        __jnative_rc_inc(out);
+        __jnative_rc_dec(__atomic_exchange_n(&gv_java_lang_System_out, out, __ATOMIC_ACQ_REL));
     }
 }
 
 void __jnative_fn_java_lang_System_setErr0__Ljava_io_PrintStream__V(void* err) {
     if (&gv_java_lang_System_err != NULL) {
-        gv_java_lang_System_err = err;
+        __jnative_rc_inc(err);
+        __jnative_rc_dec(__atomic_exchange_n(&gv_java_lang_System_err, err, __ATOMIC_ACQ_REL));
     }
 }
 

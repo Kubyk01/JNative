@@ -232,7 +232,10 @@ void __jnative_override_java_time_zone_TzdbZoneRulesProvider_load(
     if (list_cls != NULL) {
         void* list = jnative_alloc_object(list_cls);
         if (list != NULL) {
+            void* old_list = *(void**)((char*)self + 8);
+            __jnative_rc_inc(list);
             *(void**)((char*)self + 8) = list;
+            __jnative_rc_dec(old_list);
         }
     }
 
@@ -246,7 +249,11 @@ void __jnative_override_java_time_zone_TzdbZoneRulesProvider_load(
      * matters because the JDK's exception-message helpers call
      * String concatenation on it without a null guard.
      */
-    *(void**)((char*)self + 16) = jnative_string("unknown");
+    void* old_version = *(void**)((char*)self + 16);
+    void* version = jnative_string("unknown");
+    __jnative_rc_inc(version);
+    *(void**)((char*)self + 16) = version;
+    __jnative_rc_dec(old_version);
 
     /*
      * regionToRules: NOT touched.

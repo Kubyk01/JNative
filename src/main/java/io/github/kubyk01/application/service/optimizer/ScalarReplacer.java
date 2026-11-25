@@ -19,8 +19,11 @@ import io.github.kubyk01.domain.ir.Terminator;
 import io.github.kubyk01.domain.ir.ThrowTerminator;
 import io.github.kubyk01.domain.ir.Value;
 import lombok.Getter;
+import io.github.kubyk01.util.LlvmUtil;
 import lombok.RequiredArgsConstructor;
+import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
+import reactor.core.scheduler.Scheduler;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -74,13 +77,23 @@ public class ScalarReplacer {
     @Getter
     private final Map<AllocationSite, Value> siteToValue;
 
-    // Mapping AllocationSite -> set of fields (fieldName -> current value)
-    private final Map<AllocationSite, Map<String, Value>> fieldValues = new HashMap<>();
+    @Setter
+    private Scheduler scheduler;
 
     public void replace() {
-        List<? extends Function> jnLoop1 = module.getFunctions();
-        for (Function func : jnLoop1) {
-            if (func.getEntryBlock() == null) continue;
+        List<Function> live = new ArrayList<>();
+        for (Function func : module.getFunctions()) {
+            if (func.getEntryBlock() != null) live.add(func);
+        }
+        LlvmUtil.parallelMapOrdered(live, scheduler, func -> {
+            replaceIn(func);
+            return Boolean.TRUE;
+        });
+    }
+
+    private void replaceIn(Function func) {
+        {
+            Map<AllocationSite, Map<String, Value>> fieldValues = new HashMap<>();
 
             // Loop blocks are computed once per function, not per NEW.
             // See the class javadoc for why this set is load-bearing.
@@ -134,14 +147,14 @@ public class ScalarReplacer {
             // removed and the fields turned into individual SSA values.
             // ------------------------------------------------------------------
             Set<AllocationSite> candidates = collectCandidates(func);
-            if (candidates.isEmpty()) continue;
+            if (candidates.isEmpty()) return;
 
             for (int blockIdx3 = 0; blockIdx3 < func.getBlocks().size(); blockIdx3++) { BasicBlock block = func.getBlocks().get(blockIdx3);
                 List<Instruction> instructions = block.getInstructions();
                 List<Instruction> newInstructions = new ArrayList<>();
                 List<? extends Instruction> jnLoop3 = instructions;
                 for (Instruction inst : jnLoop3) {
-                    if (processInstruction(inst, candidates)) {
+                    if (processInstruction(inst, candidates, fieldValues, func)) {
                         // Instruction was replaced or removed.
                     } else {
                         newInstructions.add(inst);
@@ -292,7 +305,9 @@ public class ScalarReplacer {
     }
 
     private boolean processInstruction(Instruction inst,
-                                       Set<AllocationSite> candidates) {
+                                       Set<AllocationSite> candidates,
+                                       Map<AllocationSite, Map<String, Value>> fieldValues,
+                                       Function owner) {
         Opcode op = inst.getOpcode();
 
         if (op == Opcode.NEW) {
@@ -329,7 +344,7 @@ public class ScalarReplacer {
                             // Replace the result of GET_FIELD with the value stored for the field
                             Value replacement = fieldMap.get(fieldName);
                             // Replace all uses of the result
-                            replaceUses(inst.getResult(), replacement);
+                            replaceUses(owner, inst.getResult(), replacement);
                             inst.setOpcode(Opcode.NOP);
                             inst.getOperands().clear();
                             inst.setResult(null);
@@ -362,11 +377,9 @@ public class ScalarReplacer {
         return false;
     }
 
-    private void replaceUses(Value oldVal, Value newVal) {
+    private void replaceUses(Function func, Value oldVal, Value newVal) {
         // Find all instructions using oldVal and replace their operands with newVal
-        List<? extends Function> jnLoop8 = module.getFunctions();
-        for (Function func : jnLoop8) {
-            if (func.getEntryBlock() == null) continue;
+        {
             for (int blockIdx12 = 0; blockIdx12 < func.getBlocks().size(); blockIdx12++) { BasicBlock block = func.getBlocks().get(blockIdx12);
                 for (int instIdx13 = 0; instIdx13 < block.getInstructions().size(); instIdx13++) { Instruction inst = block.getInstructions().get(instIdx13);
                     for (int i = 0; i < inst.getOperands().size(); i++) {

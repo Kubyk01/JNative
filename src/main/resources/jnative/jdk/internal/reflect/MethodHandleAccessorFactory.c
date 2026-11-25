@@ -255,5 +255,7 @@ void __jnative_override_jdk_internal_reflect_MethodHandleObjectFieldAccessorImpl
             type, __jnative_fn_java_lang_Object_getClass___Ljava_lang_Class_(value))) {
         fn_jdk_internal_reflect_FieldAccessorImpl_throwSetIllegalArgumentException__Ljava_lang_Object__V(self, value);
     }
-    __atomic_store((void**)mhfa_address(self, obj, 1), &value, __ATOMIC_SEQ_CST);
+    __jnative_rc_inc(value);
+    void* old = __atomic_exchange_n((void**)mhfa_address(self, obj, 1), value, __ATOMIC_SEQ_CST);
+    __jnative_rc_dec(old);
 }

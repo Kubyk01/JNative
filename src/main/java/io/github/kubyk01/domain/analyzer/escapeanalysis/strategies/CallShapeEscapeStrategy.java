@@ -687,7 +687,7 @@ public final class CallShapeEscapeStrategy implements EscapeAnalysisStrategies {
         private int[] parallel(int[] work, Step step) {
             List<Integer> changed = LlvmUtil.awaitFlux(Flux.range(0, work.length)
                 .parallel()
-                .runOn(scheduler)
+                .runOn(scheduler, 1)
                 .filter(k -> step.run(work[k]))
                 .map(k -> work[k])
                 .sequential());

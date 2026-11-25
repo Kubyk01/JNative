@@ -118,7 +118,8 @@ void* __jnative_fn_java_net_Inet4AddressImpl_lookupAllHostAddr__Ljava_lang_Strin
     for (struct addrinfo* p = res; p && i < count; p = p->ai_next) {
         if (p->ai_family != AF_INET) continue;
         struct sockaddr_in* sin = (struct sockaddr_in*)p->ai_addr;
-        slots[i++] = make_inet4_address((const uint8_t*)&sin->sin_addr, host);
+        slots[i] = make_inet4_address((const uint8_t*)&sin->sin_addr, host);
+        __jnative_rc_inc(slots[i++]);
     }
 
     freeaddrinfo(res);
