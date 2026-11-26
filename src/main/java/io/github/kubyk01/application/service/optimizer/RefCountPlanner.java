@@ -97,7 +97,7 @@ final class RefCountPlanner {
         for (int id = 0; id < n; id++) {
             String cls = countableClass(AllocationSite.byId(id).getType());
             if (cls == null) continue;
-            if ((stored.get(id) && !freed.get(id)) || LlvmUtil.isSystemClassName(cls)) leaking.add(cls);
+            if (stored.get(id) && !freed.get(id)) leaking.add(cls);
         }
         plan.getCountedClasses().addAll(leaking);
         plan.getCountDeclarers().addAll(leaking);
@@ -125,13 +125,22 @@ final class RefCountPlanner {
             module.setRefCountPlan(plan);
             return;
         }
+        for (AllocationSite site : lifetime.getCyclicSites()) {
+            int id = site.getId();
+            Type t = site.getType();
+            if (id >= 0 && id < n && counted.get(id) && t != null && t.isReference() && !t.isArray()
+                    && t.getClassName() != null && plan.isCounted(t.getClassName())) {
+                plan.getCyclicClasses().add(t.getClassName());
+            }
+        }
         collectArrayTypes();
         collectHolders(n);
         int stores = markStores();
         module.setRefCountPlan(plan);
         System.out.println("RefCount: " + leaking.size() + " counted class(es), " + counted.cardinality() + " site(s), "
             + stores + " counted store(s), " + weakStores + " weak store(s), " + pinned.size() + " function(s) with hold slots, "
-            + plan.getCountedFields().size() + " holder class(es), " + plan.getCountedArrayTypes().size() + " holder array type(s) in "
+            + plan.getCountedFields().size() + " holder class(es), " + plan.getCountedArrayTypes().size() + " holder array type(s), "
+            + plan.getCyclicClasses().size() + " cyclic class(es) in "
             + (System.nanoTime() - started) / 1_000_000 + " ms");
     }
 
@@ -165,7 +174,7 @@ final class RefCountPlanner {
                     if (PointsToGraph.ARRAY_ELEMENT_FIELD.equals(cell.field()) || canHoldErasedArray(fieldType(cell.field()))) {
                         addAll(erased, cell.get());
                     }
-                    if (isWeakReferent(cell.field()) || isViewCacheField(cell.field())) addAll(weak, cell.get());
+                    if (isWeakReferent(cell.field())) addAll(weak, cell.get());
                 }
             }
             return new BitSet[]{stored, erased, weak};
@@ -215,7 +224,6 @@ final class RefCountPlanner {
         if (t == null || !t.isReference() || t.isArray() || t.isUnknown() || t.isNull()) return null;
         String cls = t.getClassName();
         if (cls == null || cls.isEmpty() || cls.charAt(0) == '[' || cls.startsWith("__Lambda_")) return null;
-        if ("java/lang/Class".equals(cls)) return null;
         ClassNode node = resolver.getClassNode(cls);
         if (node == null || node.isExternal() || node.isInterface() || (node.getAccess() & Opcodes.ACC_ABSTRACT) != 0) return null;
         for (String c = superOf(cls); c != null; c = superOf(c)) {
@@ -362,49 +370,7 @@ final class RefCountPlanner {
         String d = f.getDescriptor();
         if (d == null || (d.charAt(0) != 'L' && d.charAt(0) != '[')) return null;
         if (WEAK_OWNER.equals(f.getOwner()) && WEAK_FIELD.equals(f.getName())) return null;
-        String key = f.getOwner() + "." + f.getName();
-        if (NON_OWNING_FIELDS.contains(key) || VIEW_CACHE_FIELDS.contains(key)) return null;
-        return key;
-    }
-
-    static final Set<String> NON_OWNING_FIELDS = Set.of(
-        "java/util/LinkedHashMap$Entry.before",
-        "java/util/HashMap$TreeNode.parent",
-        "java/util/HashMap$TreeNode.prev",
-        "java/util/TreeMap$Entry.parent",
-        "java/util/LinkedList$Node.prev",
-        "java/util/concurrent/ConcurrentHashMap$TreeNode.parent",
-        "java/util/concurrent/ConcurrentHashMap$TreeNode.prev",
-        "java/util/concurrent/LinkedBlockingDeque$Node.prev");
-
-    static final Set<String> VIEW_CACHE_FIELDS = RefCountPlan.WEAK_CACHE_FIELDS;
-    private final Map<String, String> declaredKeys = new java.util.concurrent.ConcurrentHashMap<>();
-
-    private String declaredKey(String raw) {
-        if (raw == null) return null;
-        String key = declaredKeys.get(raw);
-        if (key == null) {
-            int dot = raw.lastIndexOf('.');
-            FieldNode f = dot <= 0 ? null : resolver.getField(raw.substring(0, dot), raw.substring(dot + 1));
-            key = f == null || f.getOwner() == null || (f.getAccess() & Opcodes.ACC_STATIC) != 0
-                ? "" : f.getOwner() + "." + f.getName();
-            declaredKeys.put(raw, key);
-        }
-        return key.isEmpty() ? null : key;
-    }
-
-    boolean isNonOwningField(String raw) {
-        String key = declaredKey(raw);
-        return key != null && NON_OWNING_FIELDS.contains(key);
-    }
-
-    boolean isViewCacheField(String raw) {
-        String key = declaredKey(raw);
-        return key != null && VIEW_CACHE_FIELDS.contains(key);
-    }
-
-    private boolean isWeakField(String raw) {
-        return isWeakReferent(raw) || isViewCacheField(raw);
+        return f.getOwner() + "." + f.getName();
     }
 
     static String arrayDescriptor(Type t) {
@@ -444,7 +410,7 @@ final class RefCountPlanner {
         for (BasicBlock block : f.getBlocks()) {
             for (Instruction inst : block.getInstructions()) {
                 Value res = inst.getResult();
-                if (inst.getOpcode() == Opcode.GET_FIELD && isWeakField(extractFieldName(inst))) {
+                if (inst.getOpcode() == Opcode.GET_FIELD && isWeakReferent(extractFieldName(inst))) {
                     inst.setRcWeak(true);
                 }
                 if (inst.getOpcode() == Opcode.STORE) {
@@ -483,12 +449,11 @@ final class RefCountPlanner {
                     return true;
                 }
                 String raw = extractFieldName(inst);
-                if (isWeakField(raw)) {
+                if (isWeakReferent(raw)) {
                     inst.setRcWeak(true);
                     weak[0]++;
                     return false;
                 }
-                if (isNonOwningField(raw)) return false;
                 PointsToSet old = alias.getFieldPointsToForSites(alias.getPointsTo(ops.getFirst()), raw);
                 Type type = fieldType(raw);
                 if (!maybeCounted(ops.get(2)) && !maybeCountedContents(old, type)

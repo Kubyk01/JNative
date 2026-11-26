@@ -409,7 +409,9 @@ void __jnative_dtor_unclaim(void* this_obj) {
 
 /* --- Public deallocation entry point ------------------------------------ */
 
-void __jnative_free(void* p) {
+static uint32_t* jn_rc_word_locked(void* p);
+
+static void jn_free_raw(void* p) {
     if (p == NULL) return;
     uintptr_t addr = (uintptr_t)p;
     if (jnative_static_low != 0
@@ -424,8 +426,21 @@ void __jnative_free(void* p) {
     free(p);
 }
 
+void __jnative_free(void* p) {
+    if (p == NULL) return;
+    if (jn_rc_word_locked(p) != NULL) {
+        __jnative_rc_dec(p);
+        return;
+    }
+    jn_free_raw(p);
+}
+
 void __jnative_free_fast(void* p) {
     if (p == NULL) return;
+    if (jn_rc_word_locked(p) != NULL) {
+        __jnative_rc_dec(p);
+        return;
+    }
     uintptr_t addr = (uintptr_t)p;
     uintptr_t lo = jnative_static_low;
     uintptr_t hi = jnative_static_high;
@@ -621,11 +636,11 @@ static void jnative_free_hash_table(void* table) {
         while (node != NULL) {
             void* next = *(void**)((char*)node + jnative_node_next_offset);
             jnative_rc_release_fields(node);
-            __jnative_free(node);
+            jn_free_raw(node);
             node = next;
         }
     }
-    __jnative_free(table);
+    jn_free_raw(table);
 }
 
 typedef struct {
@@ -1139,9 +1154,11 @@ __attribute__((noinline)) void __jnative_ebr_discard_if(int32_t published, void*
 #define JN_RC_RETIRED   0x80000000u
 #define JN_RC_STACK     0x40000000u
 #define JN_RC_REVIVED   0x20000000u
-#define JN_RC_COUNT     0x1fffffffu
+#define JN_RC_BUFFERED  0x10000000u
+#define JN_RC_COUNT     0x0fffffffu
 #define JN_RC_REF_ARRAY 1
 #define JN_RC_REFERENCE 2
+#define JN_RC_CYCLIC    4
 #define JN_RC_SLOTS     16384
 #define JN_WEAK_BUCKETS 4096
 
@@ -1149,7 +1166,7 @@ typedef struct {
     int32_t          offset;
     int32_t          flags;
     const int32_t*   fields;
-    const int32_t*   weak;
+    const int32_t*   owned;
 } JnRcInfo;
 
 typedef struct JnWeakNode {
@@ -1493,8 +1510,12 @@ static JnRcInfo* jn_rc_resolve(void* key) {
     if (jn_rc_symbol(symbol, sizeof(symbol), "__jnative_rcfields_", vt->name)) {
         info->fields = (const int32_t*)jn_dlsym_default(symbol);
     }
-    if (jn_rc_symbol(symbol, sizeof(symbol), "__jnative_rcweak_", vt->name)) {
-        info->weak = (const int32_t*)jn_dlsym_default(symbol);
+    if (jn_rc_symbol(symbol, sizeof(symbol), "__jnative_rccyclic_", vt->name)
+            && jn_dlsym_default(symbol) != NULL) {
+        info->flags |= JN_RC_CYCLIC;
+        if (jn_rc_symbol(symbol, sizeof(symbol), "__jnative_rcowned_", vt->name)) {
+            info->owned = (const int32_t*)jn_dlsym_default(symbol);
+        }
     }
     for (ReflectionClass* c = jnative_class_by_name(vt->name); c != NULL; c = c->superclass) {
         if (c->cname != NULL && strcmp(c->cname, "java/lang/ref/Reference") == 0) {
@@ -1502,7 +1523,7 @@ static JnRcInfo* jn_rc_resolve(void* key) {
             break;
         }
     }
-    if (info->offset < 0 && info->fields == NULL && info->weak == NULL && info->flags == 0) {
+    if (info->offset < 0 && info->fields == NULL && info->flags == 0) {
         free(info);
         return &jn_rc_plain;
     }
@@ -1643,7 +1664,7 @@ static int jn_rc_word_dec(uint32_t* word) {
         int queue = !(next & JN_RC_COUNT) && !(w & JN_RC_RETIRED);
         if (queue) next |= JN_RC_RETIRED;
         if (__atomic_compare_exchange_n(word, &w, next, 1, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED)) {
-            return queue ? 2 : !(next & JN_RC_COUNT);
+            return queue ? 2 : (next & JN_RC_COUNT) ? 3 : 1;
         }
     }
 }
@@ -1659,19 +1680,16 @@ static void jn_rc_inc_locked(void* p) {
 }
 
 static int jn_rc_queue_locked(void* p);
+static int jn_rc_retire_local(void* p);
+static void jn_rc_buffer_cycle_candidate(void* p, uint32_t* word);
 
 static int jn_rc_apply(void* p, int (*op)(uint32_t*)) {
     uint32_t* word = jn_rc_word_locked(p);
     if (word == NULL) return 0;
     int r = op(word);
-    int ok = 1;
-    if (r == 2) {
-        jn_mutex_lock(&jn_weak_mutex);
-        ok = jn_rc_queue_locked(p);
-        jn_mutex_unlock(&jn_weak_mutex);
-    }
-    if (!ok) __jnative_throw_out_of_memory_error_ctx("ARC retirement");
-    return r != 0;
+    if (r == 2 && !jn_rc_retire_local(p)) __jnative_throw_out_of_memory_error_ctx("ARC retirement");
+    if (r == 3) jn_rc_buffer_cycle_candidate(p, word);
+    return r == 1 || r == 2;
 }
 
 void __jnative_rc_inc(void* p) {
@@ -1720,15 +1738,105 @@ static void** jn_rc_retired;
 static size_t jn_rc_retired_n;
 static size_t jn_rc_retired_cap;
 static int    jn_rc_scan_busy;
-#define JN_RC_SCAN_MIN 8192
+#define JN_RC_SCAN_MIN 65536
 static size_t jn_rc_scan_at = JN_RC_SCAN_MIN;
 #define JN_RC_SCAN_MIN_BYTES ((size_t)64 << 20)
 #define JN_RC_BACKLOG_FACTOR 4
-#define JN_RC_BACKLOG_SPINS 100000
 static size_t jn_rc_retired_bytes;
 static size_t jn_rc_scan_bytes_at = JN_RC_SCAN_MIN_BYTES;
+static jn_mutex_t jn_rc_wait_lock = JN_MUTEX_INITIALIZER;
+static jn_cond_t  jn_rc_wait_cond = JN_COND_INITIALIZER;
+static __thread int jn_rc_in_scan;
+
+#define JN_RC_LOCAL_CAP   1024
+#define JN_RC_LOCAL_FLUSH 256
+static __thread void** jn_rc_local;
+static __thread size_t jn_rc_local_n;
 
 static void jn_rc_scan(void);
+
+static int jn_rc_flush_local(void) {
+    size_t k = jn_rc_local_n;
+    if (k == 0) return 1;
+    int ok = 1;
+    jn_mutex_lock(&jn_weak_mutex);
+    for (size_t i = 0; i < k && ok; i++) ok = jn_rc_queue_locked(jn_rc_local[i]);
+    jn_mutex_unlock(&jn_weak_mutex);
+    jn_rc_local_n = 0;
+    return ok;
+}
+
+static int jn_rc_retire_local(void* p) {
+    if (jn_rc_local == NULL) {
+        jn_rc_local = (void**)malloc(JN_RC_LOCAL_CAP * sizeof(void*));
+        if (jn_rc_local == NULL) {
+            jn_mutex_lock(&jn_weak_mutex);
+            int ok = jn_rc_queue_locked(p);
+            jn_mutex_unlock(&jn_weak_mutex);
+            return ok;
+        }
+    }
+    jn_rc_local[jn_rc_local_n++] = p;
+    return jn_rc_local_n < JN_RC_LOCAL_CAP || jn_rc_flush_local();
+}
+
+#define JN_CYC_LOCAL_CAP   512
+#define JN_CYC_LOCAL_FLUSH 128
+#define JN_CYC_SCAN_AT     ((size_t)65536)
+#define JN_CYC_MAX_NODES   ((size_t)4 << 20)
+static __thread void** jn_cyc_local;
+static __thread size_t jn_cyc_local_n;
+static void**          jn_cyc_roots;
+static size_t          jn_cyc_roots_n;
+static size_t          jn_cyc_roots_cap;
+
+static int jn_cyc_push_locked(void* p) {
+    if (jn_cyc_roots_n == jn_cyc_roots_cap) {
+        size_t cap = jn_cyc_roots_cap == 0 ? 1024 : jn_cyc_roots_cap * 2;
+        void** grown = (void**)realloc(jn_cyc_roots, cap * sizeof(void*));
+        if (grown == NULL) return 0;
+        jn_cyc_roots = grown;
+        jn_cyc_roots_cap = cap;
+    }
+    jn_cyc_roots[jn_cyc_roots_n] = p;
+    __atomic_store_n(&jn_cyc_roots_n, jn_cyc_roots_n + 1, __ATOMIC_RELAXED);
+    return 1;
+}
+
+static void jn_cyc_unbuffer(void* p) {
+    uint32_t* word = jn_rc_word_locked(p);
+    if (word != NULL) __atomic_fetch_and(word, ~JN_RC_BUFFERED, __ATOMIC_SEQ_CST);
+}
+
+static void jn_cyc_flush_local(void) {
+    size_t k = jn_cyc_local_n;
+    if (k == 0) return;
+    jn_mutex_lock(&jn_weak_mutex);
+    for (size_t i = 0; i < k; i++) {
+        if (!jn_cyc_push_locked(jn_cyc_local[i])) jn_cyc_unbuffer(jn_cyc_local[i]);
+    }
+    jn_mutex_unlock(&jn_weak_mutex);
+    jn_cyc_local_n = 0;
+}
+
+static void jn_rc_buffer_cycle_candidate(void* p, uint32_t* word) {
+    JnRcInfo* info = jn_rc_of(p);
+    if (info == NULL || !(info->flags & JN_RC_CYCLIC)) return;
+    uint32_t w = __atomic_load_n(word, __ATOMIC_RELAXED);
+    for (;;) {
+        if ((w & (JN_RC_BUFFERED | JN_RC_STACK)) || !(w & JN_RC_COUNT)) return;
+        if (__atomic_compare_exchange_n(word, &w, w | JN_RC_BUFFERED, 1, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED)) break;
+    }
+    if (jn_cyc_local == NULL) {
+        jn_cyc_local = (void**)malloc(JN_CYC_LOCAL_CAP * sizeof(void*));
+        if (jn_cyc_local == NULL) {
+            __atomic_fetch_and(word, ~JN_RC_BUFFERED, __ATOMIC_SEQ_CST);
+            return;
+        }
+    }
+    jn_cyc_local[jn_cyc_local_n++] = p;
+    if (jn_cyc_local_n == JN_CYC_LOCAL_CAP) jn_cyc_flush_local();
+}
 
 static int jn_rc_over(size_t factor) {
     return __atomic_load_n(&jn_rc_retired_n, __ATOMIC_RELAXED) >= factor * __atomic_load_n(&jn_rc_scan_at, __ATOMIC_RELAXED)
@@ -1736,15 +1844,19 @@ static int jn_rc_over(size_t factor) {
 }
 
 static void jn_rc_maybe_scan(void) {
-    if (!jn_rc_over(1)) return;
-    jn_rc_scan();
-    for (int spins = 0; spins < JN_RC_BACKLOG_SPINS && jn_rc_over(JN_RC_BACKLOG_FACTOR); spins++) {
-        if (!__atomic_load_n(&jn_rc_scan_busy, __ATOMIC_ACQUIRE)) {
-            jn_rc_scan();
-            continue;
-        }
-        jn_yield();
+    if (jn_rc_in_scan) return;
+    if (jn_rc_local_n >= JN_RC_LOCAL_FLUSH && !jn_rc_flush_local()) {
+        __jnative_throw_out_of_memory_error_ctx("ARC retirement");
     }
+    if (jn_cyc_local_n >= JN_CYC_LOCAL_FLUSH) jn_cyc_flush_local();
+    if (!jn_rc_over(1) && __atomic_load_n(&jn_cyc_roots_n, __ATOMIC_RELAXED) < JN_CYC_SCAN_AT) return;
+    jn_rc_scan();
+    if (!jn_rc_over(JN_RC_BACKLOG_FACTOR)) return;
+    jn_mutex_lock(&jn_rc_wait_lock);
+    while (__atomic_load_n(&jn_rc_scan_busy, __ATOMIC_ACQUIRE) && jn_rc_over(JN_RC_BACKLOG_FACTOR)) {
+        jn_cond_wait(&jn_rc_wait_cond, &jn_rc_wait_lock);
+    }
+    jn_mutex_unlock(&jn_rc_wait_lock);
 }
 
 static void jn_hold_write(JnHoldThread* t, void** hold, void* value) {
@@ -1878,10 +1990,22 @@ void __jnative_rc_frame_exit(void** holds, int32_t n, void* ret) {
     jn_rc_maybe_scan();
 }
 
+static void jn_rc_release_local(void) {
+    jn_rc_flush_local();
+    free(jn_rc_local);
+    jn_rc_local = NULL;
+    jn_rc_local_n = 0;
+    jn_cyc_flush_local();
+    free(jn_cyc_local);
+    jn_cyc_local = NULL;
+    jn_cyc_local_n = 0;
+}
+
 void __jnative_rc_thread_exit(void) {
     JnHoldThread* t = jn_hold_self;
     if (t == NULL) {
         jn_rc_scan();
+        jn_rc_release_local();
         jn_reg_thread_exit();
         return;
     }
@@ -1906,6 +2030,7 @@ void __jnative_rc_thread_exit(void) {
     jn_hold_frame_n = 0;
     jn_hold_frame_cap = 0;
     jn_rc_scan();
+    jn_rc_release_local();
     jn_reg_thread_exit();
 }
 
@@ -2002,7 +2127,7 @@ static void jn_rc_register_array(void* p, void** hold) {
         jn_hold_set(hold, NULL);
         free(array);
     }
-    __jnative_free(p);
+    jn_free_raw(p);
     __jnative_throw_out_of_memory_error_ctx("ARC array");
 }
 
@@ -2037,7 +2162,11 @@ static void jn_rc_mark_thread(JnRcCandidate* table, size_t mask, JnHoldThread* t
     }
 }
 
+static JnRcCandidate* jn_rc_cand;
+static size_t         jn_rc_cand_cap;
+
 static int jn_rc_reclaim_pending(void) {
+    if (!jn_rc_flush_local()) __jnative_throw_out_of_memory_error_ctx("ARC retirement");
     jn_mutex_lock(&jn_weak_mutex);
     size_t n = jn_rc_retired_n;
     if (n == 0) {
@@ -2047,7 +2176,13 @@ static int jn_rc_reclaim_pending(void) {
     size_t cap = 2;
     while (cap < n * 2) cap <<= 1;
     size_t mask = cap - 1;
-    JnRcCandidate* candidates = (JnRcCandidate*)calloc(cap, sizeof(JnRcCandidate));
+    if (cap > jn_rc_cand_cap) {
+        free(jn_rc_cand);
+        jn_rc_cand = (JnRcCandidate*)malloc(cap * sizeof(JnRcCandidate));
+        jn_rc_cand_cap = jn_rc_cand != NULL ? cap : 0;
+    }
+    JnRcCandidate* candidates = jn_rc_cand;
+    if (candidates != NULL) memset(candidates, 0, cap * sizeof(JnRcCandidate));
     for (size_t i = 0; i < n; i++) {
         void* p = jn_rc_retired[i];
         uint32_t* word = jn_rc_word_locked(p);
@@ -2110,7 +2245,7 @@ static int jn_rc_reclaim_pending(void) {
                && !__atomic_compare_exchange_n(word, &w, w & ~(JN_RC_RETIRED | JN_RC_REVIVED), 1, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {}
         if (w & JN_RC_COUNT) {
             if (candidate != NULL) candidate->held = 1;
-        } else if (candidate == NULL || candidate->held || (w & JN_RC_REVIVED)) {
+        } else if (candidate == NULL || candidate->held || (w & (JN_RC_REVIVED | JN_RC_BUFFERED))) {
             if (candidate != NULL) candidate->held = 1;
             jn_rc_retired[keep++] = p;
         } else {
@@ -2140,18 +2275,313 @@ static int jn_rc_reclaim_pending(void) {
         if (p == NULL || candidates[i].held) continue;
         jnative_release_storage(p);
         jnative_rc_release_fields(p);
-        __jnative_free(p);
+        jn_free_raw(p);
         reclaimed = 1;
     }
-    free(candidates);
     return reclaimed;
 }
 
+typedef struct {
+    void*    obj;
+    uint32_t word;
+    int32_t  trial;
+    int      black;
+} JnCycNode;
+
+typedef struct {
+    JnCycNode* nodes;
+    size_t     n;
+    size_t     cap;
+    size_t*    index;
+    size_t     mask;
+    int        failed;
+} JnCycGraph;
+
+static uint32_t* jn_cyc_word(void* v) {
+    if (v == NULL || jn_rc_in_static(v)) return NULL;
+    void* vt = *(void**)v;
+    if (vt == NULL || __jnative_is_class_mirror(vt)) return NULL;
+    JnRcInfo* info = jn_rc_info(vt);
+    if (!(info->flags & JN_RC_CYCLIC) || info->offset < 0) return NULL;
+    return (uint32_t*)((char*)v + info->offset);
+}
+
+static long jn_cyc_find(JnCycGraph* g, void* obj) {
+    if (g->index == NULL) return -1;
+    size_t i = jn_rc_hash(obj, g->mask);
+    while (g->index[i] != 0) {
+        size_t k = g->index[i] - 1;
+        if (g->nodes[k].obj == obj) return (long)k;
+        i = (i + 1) & g->mask;
+    }
+    return -1;
+}
+
+static int jn_cyc_rehash(JnCycGraph* g, size_t slots) {
+    size_t* index = (size_t*)calloc(slots, sizeof(size_t));
+    if (index == NULL) return 0;
+    free(g->index);
+    g->index = index;
+    g->mask = slots - 1;
+    for (size_t k = 0; k < g->n; k++) {
+        size_t i = jn_rc_hash(g->nodes[k].obj, g->mask);
+        while (g->index[i] != 0) i = (i + 1) & g->mask;
+        g->index[i] = k + 1;
+    }
+    return 1;
+}
+
+static long jn_cyc_add(JnCycGraph* g, void* obj, uint32_t word) {
+    if (g->n >= JN_CYC_MAX_NODES) {
+        g->failed = 1;
+        return -1;
+    }
+    if (g->n == g->cap) {
+        size_t cap = g->cap == 0 ? 1024 : g->cap * 2;
+        JnCycNode* grown = (JnCycNode*)realloc(g->nodes, cap * sizeof(JnCycNode));
+        if (grown == NULL) {
+            g->failed = 1;
+            return -1;
+        }
+        g->nodes = grown;
+        g->cap = cap;
+    }
+    if (g->index == NULL || (g->n + 1) * 2 > g->mask + 1) {
+        size_t slots = g->index == NULL ? 2048 : (g->mask + 1) * 2;
+        if (!jn_cyc_rehash(g, slots)) {
+            g->failed = 1;
+            return -1;
+        }
+    }
+    JnCycNode* node = &g->nodes[g->n];
+    node->obj = obj;
+    node->word = word;
+    node->trial = (int32_t)(word & JN_RC_COUNT);
+    node->black = (word & (JN_RC_RETIRED | JN_RC_STACK | JN_RC_BUFFERED | JN_RC_REVIVED)) != 0;
+    size_t i = jn_rc_hash(obj, g->mask);
+    while (g->index[i] != 0) i = (i + 1) & g->mask;
+    g->index[i] = g->n + 1;
+    return (long)g->n++;
+}
+
+typedef void (*jn_cyc_edge_fn)(void* source, void* target, void* ctx);
+
+static void jn_cyc_array_edges(void* source, void* arr, jn_cyc_edge_fn fn, void* ctx) {
+    if (arr == NULL || jn_rc_in_static(arr)) return;
+    void* mirror = *(void**)arr;
+    if (mirror == NULL || !__jnative_is_class_mirror(mirror)) return;
+    if (!(jn_rc_info(mirror)->flags & JN_RC_REF_ARRAY)) return;
+    int32_t len = *(int32_t*)((char*)arr + JAVA_ARR_LENGTH_OFFSET);
+    void** slots = (void**)((char*)arr + JAVA_ARR_HDR);
+    for (int32_t i = 0; i < len; i++) fn(source, __atomic_load_n(&slots[i], __ATOMIC_ACQUIRE), ctx);
+}
+
+static void jn_cyc_edges(void* obj, jn_cyc_edge_fn fn, void* ctx) {
+    JnRcInfo* info = jn_rc_of(obj);
+    if (info == NULL) return;
+    if (info->fields != NULL) {
+        for (int32_t i = 1; i <= info->fields[0]; i++) {
+            fn(obj, __atomic_load_n((void**)((char*)obj + info->fields[i]), __ATOMIC_ACQUIRE), ctx);
+        }
+    }
+    if (info->owned != NULL) {
+        for (int32_t i = 1; i <= info->owned[0]; i++) {
+            jn_cyc_array_edges(obj, __atomic_load_n((void**)((char*)obj + info->owned[i]), __ATOMIC_ACQUIRE), fn, ctx);
+        }
+    }
+    jn_once(&jnative_containers_once, jnative_containers_init);
+    void* vt = *(void**)obj;
+    for (int i = 0; i < JN_CONTAINER_COUNT; i++) {
+        JNativeContainerKind* k = &jnative_containers[i];
+        if (k->vtable != vt) continue;
+        jn_cyc_array_edges(obj, __atomic_load_n((void**)((char*)obj + k->offset), __ATOMIC_ACQUIRE), fn, ctx);
+        break;
+    }
+}
+
+typedef struct {
+    JnCycGraph* g;
+    size_t*     stack;
+    size_t      stack_n;
+    size_t      stack_cap;
+} JnCycWalk;
+
+static void jn_cyc_push(JnCycWalk* w, size_t k) {
+    if (w->stack_n == w->stack_cap) {
+        size_t cap = w->stack_cap == 0 ? 1024 : w->stack_cap * 2;
+        size_t* grown = (size_t*)realloc(w->stack, cap * sizeof(size_t));
+        if (grown == NULL) {
+            w->g->failed = 1;
+            return;
+        }
+        w->stack = grown;
+        w->stack_cap = cap;
+    }
+    w->stack[w->stack_n++] = k;
+}
+
+static void jn_cyc_gray_edge(void* source, void* target, void* ctx) {
+    JnCycWalk* w = (JnCycWalk*)ctx;
+    if (target == source || w->g->failed) return;
+    uint32_t* word = jn_cyc_word(target);
+    if (word == NULL) return;
+    long k = jn_cyc_find(w->g, target);
+    if (k < 0) {
+        k = jn_cyc_add(w->g, target, __atomic_load_n(word, __ATOMIC_SEQ_CST));
+        if (k < 0) return;
+        jn_cyc_push(w, (size_t)k);
+    }
+    w->g->nodes[k].trial--;
+}
+
+static void jn_cyc_black_edge(void* source, void* target, void* ctx) {
+    JnCycWalk* w = (JnCycWalk*)ctx;
+    if (target == source || w->g->failed) return;
+    long k = jn_cyc_find(w->g, target);
+    if (k < 0 || w->g->nodes[k].black) return;
+    w->g->nodes[k].black = 1;
+    jn_cyc_push(w, (size_t)k);
+}
+
+static void jn_cyc_mark_held(JnCycGraph* g, void* v) {
+    if (v == NULL) return;
+    long k = jn_cyc_find(g, v);
+    if (k >= 0) g->nodes[k].black = 1;
+}
+
+static void jn_cyc_mark_holds(JnCycGraph* g) {
+    jn_mutex_lock(&jn_hold_list_lock);
+    for (JnHoldThread* t = jn_hold_threads; t != NULL; t = t->next) {
+        int locked = 0;
+        for (int attempt = 0;; attempt++) {
+            if (t != jn_hold_self && attempt == 3) {
+                __atomic_store_n(&t->scan_req, 1, __ATOMIC_SEQ_CST);
+                jn_mutex_lock(&t->lock);
+                locked = 1;
+            }
+            uint32_t s1 = __atomic_load_n(&t->seq, __ATOMIC_ACQUIRE);
+            if ((s1 & 1u) && t != jn_hold_self) {
+                jn_yield();
+                continue;
+            }
+            jn_cyc_mark_held(g, __atomic_load_n(&t->ret, __ATOMIC_ACQUIRE));
+            for (JnHoldChunk* c = t->first; c != NULL; c = __atomic_load_n(&c->next, __ATOMIC_ACQUIRE)) {
+                size_t top = __atomic_load_n(&c->top, __ATOMIC_ACQUIRE);
+                for (size_t i = 0; i < top; i++) jn_cyc_mark_held(g, __atomic_load_n(&c->slots[i], __ATOMIC_ACQUIRE));
+            }
+            __atomic_thread_fence(__ATOMIC_ACQUIRE);
+            if (t == jn_hold_self || __atomic_load_n(&t->seq, __ATOMIC_RELAXED) == s1) break;
+        }
+        if (locked) {
+            jn_mutex_unlock(&t->lock);
+            __atomic_store_n(&t->scan_req, 0, __ATOMIC_RELEASE);
+        }
+    }
+    jn_mutex_unlock(&jn_hold_list_lock);
+}
+
+static void jn_cyc_requeue_locked(void** roots, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        uint32_t* word = jn_cyc_word(roots[i]);
+        if (word == NULL) continue;
+        uint32_t w = __atomic_load_n(word, __ATOMIC_SEQ_CST);
+        for (;;) {
+            if ((w & (JN_RC_BUFFERED | JN_RC_STACK | JN_RC_RETIRED)) || !(w & JN_RC_COUNT)) break;
+            if (__atomic_compare_exchange_n(word, &w, w | JN_RC_BUFFERED, 1, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+                if (!jn_cyc_push_locked(roots[i])) __atomic_fetch_and(word, ~JN_RC_BUFFERED, __ATOMIC_SEQ_CST);
+                break;
+            }
+        }
+    }
+}
+
+static void jn_rc_collect_cycles(void) {
+    jn_cyc_flush_local();
+    jn_mutex_lock(&jn_weak_mutex);
+    void** roots = jn_cyc_roots;
+    size_t root_n = jn_cyc_roots_n;
+    jn_cyc_roots = NULL;
+    jn_cyc_roots_cap = 0;
+    __atomic_store_n(&jn_cyc_roots_n, 0, __ATOMIC_RELAXED);
+    for (size_t i = 0; i < root_n; i++) jn_cyc_unbuffer(roots[i]);
+    jn_mutex_unlock(&jn_weak_mutex);
+    if (root_n == 0) {
+        free(roots);
+        return;
+    }
+
+    JnCycGraph g = {0};
+    JnCycWalk walk = {0};
+    walk.g = &g;
+    for (size_t i = 0; i < root_n && !g.failed; i++) {
+        uint32_t* word = jn_cyc_word(roots[i]);
+        if (word == NULL || jn_cyc_find(&g, roots[i]) >= 0) continue;
+        uint32_t w = __atomic_load_n(word, __ATOMIC_SEQ_CST);
+        if (!(w & JN_RC_COUNT) || (w & (JN_RC_RETIRED | JN_RC_STACK | JN_RC_BUFFERED))) continue;
+        long k = jn_cyc_add(&g, roots[i], w);
+        if (k >= 0) jn_cyc_push(&walk, (size_t)k);
+    }
+    while (walk.stack_n > 0 && !g.failed) {
+        size_t k = walk.stack[--walk.stack_n];
+        jn_cyc_edges(g.nodes[k].obj, jn_cyc_gray_edge, &walk);
+    }
+
+    size_t white_n = 0;
+    if (!g.failed && g.n > 0) {
+        jn_mutex_lock(&jn_weak_mutex);
+        jn_cyc_mark_holds(&g);
+        walk.stack_n = 0;
+        for (size_t k = 0; k < g.n; k++) {
+            if (g.nodes[k].trial > 0) g.nodes[k].black = 1;
+            if (g.nodes[k].black) jn_cyc_push(&walk, k);
+        }
+        while (walk.stack_n > 0 && !g.failed) {
+            size_t k = walk.stack[--walk.stack_n];
+            jn_cyc_edges(g.nodes[k].obj, jn_cyc_black_edge, &walk);
+        }
+        int valid = !g.failed;
+        for (size_t k = 0; k < g.n && valid; k++) {
+            if (g.nodes[k].black) continue;
+            uint32_t* word = jn_cyc_word(g.nodes[k].obj);
+            if (word == NULL || __atomic_load_n(word, __ATOMIC_SEQ_CST) != g.nodes[k].word) valid = 0;
+        }
+        if (valid) {
+            for (size_t k = 0; k < g.n; k++) {
+                if (g.nodes[k].black) continue;
+                __atomic_store_n(jn_cyc_word(g.nodes[k].obj), JN_RC_STACK, __ATOMIC_SEQ_CST);
+                jn_weak_clear_locked(g.nodes[k].obj);
+                g.nodes[white_n++] = g.nodes[k];
+            }
+        } else {
+            jn_cyc_requeue_locked(roots, root_n);
+        }
+        jn_mutex_unlock(&jn_weak_mutex);
+    }
+    for (size_t k = 0; k < white_n; k++) {
+        jnative_release_storage(g.nodes[k].obj);
+        jnative_rc_release_fields(g.nodes[k].obj);
+    }
+    for (size_t k = 0; k < white_n; k++) jn_free_raw(g.nodes[k].obj);
+    free(walk.stack);
+    free(g.index);
+    free(g.nodes);
+    free(roots);
+}
+
 static void jn_rc_scan(void) {
+    if (jn_rc_in_scan) return;
+    if (!jn_rc_flush_local()) __jnative_throw_out_of_memory_error_ctx("ARC retirement");
     if (__atomic_exchange_n(&jn_rc_scan_busy, 1, __ATOMIC_ACQUIRE)) return;
+    jn_rc_in_scan = 1;
+    while (jn_rc_reclaim_pending()) {}
+    jn_rc_collect_cycles();
     while (jn_rc_reclaim_pending()) {}
     jn_rc_tables_reclaim();
+    jn_rc_in_scan = 0;
     __atomic_store_n(&jn_rc_scan_busy, 0, __ATOMIC_RELEASE);
+    jn_mutex_lock(&jn_rc_wait_lock);
+    jn_cond_broadcast(&jn_rc_wait_cond);
+    jn_mutex_unlock(&jn_rc_wait_lock);
 }
 
 void __jnative_rc_dec(void* p) {
@@ -2167,22 +2597,10 @@ void __jnative_rc_drop(void* p) {
     if (p != NULL) jn_rc_apply(p, jn_rc_word_drop);
 }
 
-static void jn_rc_forget_weak_fields(JnRcInfo* info, void* obj) {
-    if (info == NULL || info->weak == NULL) return;
-    for (int32_t i = 1; i <= info->weak[0]; i++) {
-        __jnative_weak_store((void**)((char*)obj + info->weak[i]), NULL);
-    }
-}
-
-void __jnative_weak_forget_fields(void* obj) {
-    if (obj != NULL) jn_rc_forget_weak_fields(jn_rc_of(obj), obj);
-}
-
 static void jnative_rc_release_fields(void* obj) {
     JnRcInfo* info = jn_rc_of(obj);
     if (info == NULL) return;
     if (info->flags & JN_RC_REFERENCE) __jnative_weak_forget(obj);
-    jn_rc_forget_weak_fields(info, obj);
     if (info->fields == NULL) return;
     int32_t n = info->fields[0];
     for (int32_t i = 1; i <= n; i++) {
@@ -2214,7 +2632,7 @@ static void jnative_free_array_rc(void* arr) {
         return;
     }
     jnative_rc_release_elements(arr);
-    __jnative_free(arr);
+    jn_free_raw(arr);
 }
 
 void __jnative_rc_cloned(void* copy) {
@@ -2368,7 +2786,7 @@ void __jnative_free_container(void* p) {
     }
     jnative_release_storage(p);
     jnative_rc_release_fields(p);
-    __jnative_free(p);
+    jn_free_raw(p);
 }
 
 void __jnative_free_container_storage(void* p) {
@@ -3528,6 +3946,8 @@ static void jnative_tune_malloc(void) {
         long cpus = sysconf(_SC_NPROCESSORS_ONLN);
         mallopt(M_ARENA_MAX, cpus < 2 ? 2 : (int)cpus);
     }
+    if (getenv("MALLOC_TOP_PAD_") == NULL) mallopt(M_TOP_PAD, 64 * 1024 * 1024);
+    if (getenv("MALLOC_TRIM_THRESHOLD_") == NULL) mallopt(M_TRIM_THRESHOLD, 256 * 1024 * 1024);
 }
 #endif
 
@@ -5041,5 +5461,4 @@ void __jnative_destruct_dispatch(void* obj) {
     if (first_word == NULL) return;
     jnative_destructor_fn fn = jnative_destructor_for(first_word);
     if (fn != NULL) fn(obj);
-    else __jnative_rc_dec(obj);
 }

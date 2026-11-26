@@ -165,32 +165,6 @@ public class DestructorInserter {
             if (siteToValue.get(site) instanceof Temporary value && value.getDefiningInstruction() != null
                     && value.getDefiningInstruction().isRcManagedArray()) continue;
 
-            // ------------------------------------------------------------------
-            // System-class reference sites are deliberately skipped here.
-            //
-            // findDestructor(SystemClass) would return null (isManagedType
-            // filters them), and the fallback warning below would flood
-            // the log with one warning per allocation site for every
-            // String, Integer, etc. allocated by the JDK's own bootstrap.
-            // The absence of a destructor is not a defect — it is the
-            // policy — so the site is silently left for the process-wide
-            // lifetime. Arrays are handled by findDestructor via
-            // createArrayDestructor and are not covered by this check.
-            // ------------------------------------------------------------------
-            if (type.isReference()) {
-                String cls = type.getClassName();
-                if (cls != null && !cls.isEmpty() && cls.charAt(0) != '['
-                    && LlvmUtil.isSystemClassName(cls)) {
-                    if (refCounts.isCountedType(type) && !refCounts.isCapturedSite(site)) {
-                        for (DestructionPoint dp : entry.getValue()) {
-                            byFunction.computeIfAbsent(dp.getBlock().getFunction(), k -> new ArrayList<>())
-                                .add(new PendingDestructor(site, dp, null));
-                        }
-                    }
-                    continue;
-                }
-            }
-
             Function dtor = findDestructor(type);
             if (dtor == null) {
                 log.warn("DestructorInserter: no destructor for allocation "
@@ -421,6 +395,9 @@ public class DestructorInserter {
                 c = n == null || n.getSuperName() == null || n.getSuperName().equals(c) ? null : n.getSuperName();
             }
             if (fields.isEmpty()) continue;
+            Set<String> ownedKeys = new LinkedHashSet<>();
+            for (FieldNode f : fields) ownedKeys.add(f.getOwner() + "." + f.getName());
+            refCounts.plan().getOwnedArrayFields().put(cls, ownedKeys);
             String name = ContainerArrayBorrows.STORAGE_PREFIX + cls.replace('/', '_').replace('.', '_');
             if (module.getFunction(name) != null) continue;
             Function func = new Function(name, Type.VOID);
@@ -564,22 +541,6 @@ public class DestructorInserter {
         return cast;
     }
 
-    private boolean hasWeakCacheField(ClassNode classNode) {
-        Set<String> seen = new HashSet<>();
-        for (ClassNode c = classNode; c != null && !c.isExternal() && seen.add(c.getName()); ) {
-            for (FieldNode f : c.getFields()) {
-                if (RefCountPlanner.VIEW_CACHE_FIELDS.contains(c.getName() + "." + f.getName())) return true;
-            }
-            c = c.getSuperName() == null ? null : resolver.getClassNode(c.getSuperName());
-        }
-        return false;
-    }
-
-    private boolean holdsCountedField(String className, String fieldKey) {
-        Set<String> fields = refCounts.plan().getCountedFields().get(className);
-        return fields != null && fields.contains(fieldKey);
-    }
-
     private static Instruction runtimeCall(BasicBlock block, String name, Value... args) {
         Instruction call = new Instruction(Opcode.STATIC_CALL);
         call.addOperand(new Constant(Type.reference(name), name));
@@ -652,19 +613,6 @@ public class DestructorInserter {
                 || siteType.isBlock()
                 || siteType.isPrimitive()) {
                 continue;
-            }
-
-            // Record — but do not include — system-class reference sites.
-            // Their presence forces the polymorphic dispatch path; the
-            // runtime vtable check then prevents the user destructor from
-            // firing on a system-class instance.
-            if (siteType.isReference()) {
-                String cls = siteType.getClassName();
-                if (cls != null && !cls.isEmpty() && cls.charAt(0) != '['
-                    && LlvmUtil.isSystemClassName(cls)) {
-                    hasFilteredSystemTypes = true;
-                    continue;
-                }
             }
 
             Function dtor = findDestructor(siteType);
@@ -1122,8 +1070,6 @@ public class DestructorInserter {
         Type type = rhs.getType();
         if (type == null) return false;
         if (isOuterInstanceField(fieldNameOf(putField))) return false;
-        if (putField.getOperands().get(1) instanceof Constant c
-                && refCounts.isNonOwningField(c.getValue().toString())) return false;
         return !type.isPrimitive() && !type.isVoid();
     }
 
@@ -1490,20 +1436,6 @@ public class DestructorInserter {
                     Type t = inst.getResult().getType();
                     if (t == null || t.isUnknown() || t.isNull() || t.isBlock()) continue;
 
-                    // System-class reference allocations do not get their
-                    // own destructor: their lifetime is owned by the JDK's
-                    // own caches (String interning, Integer.valueOf,
-                    // static singletons, etc.) which this runtime cannot
-                    // reason about. Including them here would only cause
-                    // findDestructor to reject them one by one.
-                    if (t.isReference()) {
-                        String cls = t.getClassName();
-                        if (cls != null && !cls.isEmpty() && cls.charAt(0) != '['
-                            && LlvmUtil.isSystemClassName(cls)) {
-                            continue;
-                        }
-                    }
-
                     types.add(t);
                 }
             }
@@ -1565,10 +1497,6 @@ public class DestructorInserter {
         if (type.isReference()) {
             String className = type.getClassName();
             if (className == null || className.isEmpty()) return false;
-
-            // System-class reference — not managed by this pass.
-            if (LlvmUtil.isSystemClassName(className)) return false;
-
             ClassNode cn = resolver.getClassNode(className);
             return !(cn != null && cn.isExternal());
         }
@@ -1831,11 +1759,6 @@ private void emitDestructionGuard(BasicBlock entry,
             if (className != null && !className.isEmpty()
                 && className.charAt(0) != '[') {
                 ClassNode cn = resolver.getClassNode(className);
-                if (cn != null && LlvmUtil.isSystemClassName(className)
-                    && (cn.getAccess() & Opcodes.ACC_FINAL) != 0) {
-                    block.addInstruction(runtimeCall(block, "__jnative_rc_dec", fieldValue));
-                    return;
-                }
                 if (cn != null && !cn.isExternal() && !cn.isInterface()
                     && (cn.getAccess() & Opcodes.ACC_ABSTRACT) == 0) {
                     boolean isFinal = (cn.getAccess() & Opcodes.ACC_FINAL) != 0;
@@ -1937,10 +1860,6 @@ private void emitDestructionGuard(BasicBlock entry,
 
         emitDestructionGuard(entry, thisParam, returnBlock, bodyFast, bodySlow);
 
-        if (hasWeakCacheField(classNode)) {
-            bodyFast.addInstruction(runtimeCall(bodyFast, "__jnative_weak_forget_fields", thisParam));
-            bodySlow.addInstruction(runtimeCall(bodySlow, "__jnative_weak_forget_fields", thisParam));
-        }
         List<FieldNode> ownedFields = collectAllReferenceFields(classNode);
         for (FieldNode field : ownedFields) {
             if (RefCountPlanner.WEAK_OWNER.equals(field.getOwner()) && RefCountPlanner.WEAK_FIELD.equals(field.getName())) {
@@ -1955,12 +1874,11 @@ private void emitDestructionGuard(BasicBlock entry,
             FieldNode field = ((List<? extends FieldNode>) ownedFields).get(jnIdx26);
             if ((field.getAccess() & Opcodes.ACC_STATIC) != 0) continue;
             Type fieldType = field.getType();
+            if (!isManagedType(fieldType)) continue;
 
             String fieldOwner = field.getOwner();
             if (fieldOwner == null || fieldOwner.isEmpty()) fieldOwner = className;
             String fullFieldName = fieldOwner + "." + field.getName();
-            boolean managed = isManagedType(fieldType);
-            if (!managed && !holdsCountedField(className, fullFieldName)) continue;
             if (coAllocatedFields.contains(fullFieldName)) continue;
 
             Instruction getField = new Instruction(Opcode.GET_FIELD);
@@ -1972,8 +1890,7 @@ private void emitDestructionGuard(BasicBlock entry,
             fieldValue.setDefiningInstruction(getField);
             bodyFast.addInstruction(getField);
 
-            if (managed) emitFieldDestruction(bodyFast, fieldValue, fieldType);
-            else bodyFast.addInstruction(runtimeCall(bodyFast, "__jnative_rc_dec", fieldValue));
+            emitFieldDestruction(bodyFast, fieldValue, fieldType);
         }
 
         Instruction freeFast = new Instruction(Opcode.STATIC_CALL);
@@ -1988,12 +1905,11 @@ private void emitDestructionGuard(BasicBlock entry,
             FieldNode field = ((List<? extends FieldNode>) ownedFields).get(jnIdx27);
             if ((field.getAccess() & Opcodes.ACC_STATIC) != 0) continue;
             Type fieldType = field.getType();
+            if (!isManagedType(fieldType)) continue;
 
             String fieldOwner = field.getOwner();
             if (fieldOwner == null || fieldOwner.isEmpty()) fieldOwner = className;
             String fullFieldName = fieldOwner + "." + field.getName();
-            boolean managed = isManagedType(fieldType);
-            if (!managed && !holdsCountedField(className, fullFieldName)) continue;
             if (coAllocatedFields.contains(fullFieldName)) continue;
 
             Instruction getField = new Instruction(Opcode.GET_FIELD);
@@ -2005,8 +1921,7 @@ private void emitDestructionGuard(BasicBlock entry,
             fieldValue.setDefiningInstruction(getField);
             bodySlow.addInstruction(getField);
 
-            if (managed) emitFieldDestruction(bodySlow, fieldValue, fieldType);
-            else bodySlow.addInstruction(runtimeCall(bodySlow, "__jnative_rc_dec", fieldValue));
+            emitFieldDestruction(bodySlow, fieldValue, fieldType);
         }
 
         emitUnclaim(bodySlow, thisParam);
@@ -2033,9 +1948,6 @@ private void emitDestructionGuard(BasicBlock entry,
         for (FieldNode field : jnLoop28) {
             if ((field.getAccess() & Opcodes.ACC_STATIC) != 0) continue;
             if (isOuterInstanceField(field.getName())) continue;
-            String owner = field.getOwner() == null || field.getOwner().isEmpty() ? classNode.getName() : field.getOwner();
-            String key = owner + "." + field.getName();
-            if (RefCountPlanner.NON_OWNING_FIELDS.contains(key) || RefCountPlanner.VIEW_CACHE_FIELDS.contains(key)) continue;
             Type ft = field.getType();
             if (ft.isReference() || ft.isArray()) result.add(field);
         }
@@ -2092,37 +2004,6 @@ private void emitDestructionGuard(BasicBlock entry,
 
         if (!elementsAreRefs) {
             return createTrivialArrayDestructor(arrayType);
-        }
-
-        // ------------------------------------------------------------------
-        // System-class element handling.
-        //
-        // A FINAL system class cannot be subclassed, so every element of
-        // the array is provably of that exact class. For system-owned
-        // values (String, Integer's small-value cache, …) freeing them
-        // from the array destructor would orphan shared state; the array
-        // therefore only frees its own storage and leaves the elements
-        // untouched.
-        //
-        // A NON-FINAL system class (Object, Number, Throwable, …) may
-        // have user-defined subclasses, and those subclasses' instances
-        // genuinely belong to the array. The normal loop is kept for them;
-        // per-element runtime dispatch (via emitFieldDestruction) then
-        // frees the user subclass values and no-ops on system-class
-        // values (there is no __destruct_* symbol for them).
-        // ------------------------------------------------------------------
-        if (elementType.isReference()) {
-            String elemClass = elementType.getClassName();
-            if (elemClass != null && !elemClass.isEmpty()
-                && elemClass.charAt(0) != '['
-                && LlvmUtil.isSystemClassName(elemClass)) {
-                ClassNode elemNode = resolver.getClassNode(elemClass);
-                boolean elemIsFinal = elemNode != null
-                    && (elemNode.getAccess() & Opcodes.ACC_FINAL) != 0;
-                if (elemIsFinal && !refCounts.isCountedType(elementType)) {
-                    return createTrivialArrayDestructor(arrayType);
-                }
-            }
         }
 
         Function func = new Function(funcName, Type.VOID);

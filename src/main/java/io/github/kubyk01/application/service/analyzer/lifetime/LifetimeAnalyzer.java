@@ -58,6 +58,7 @@ public class LifetimeAnalyzer {
         cyclicDetector.setScheduler(scheduler);
         Set<AllocationSite> cyclicSites = cyclicDetector.detect();
         result.getUnresolved().addAll(cyclicSites);
+        result.getCyclicSites().addAll(cyclicSites);
         System.out.println("Lifetime: " + cyclicSites.size() + " cyclic site(s)");
 
         // -------- 3. Liveness (now internally parallel) --------

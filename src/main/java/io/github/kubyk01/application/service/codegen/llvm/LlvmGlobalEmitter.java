@@ -2175,29 +2175,30 @@ public class LlvmGlobalEmitter {
             lines.computeIfAbsent(sym, k -> new ArrayList<>())
                 .add("@" + sym + " = constant [" + (offsets.size() + 1) + " x i32] [" + arr + "]");
         }
-        for (ClassNode node : resolver.getClassMap().values()) {
-            if (node == null || node.isExternal() || node.isInterface()) continue;
+        for (String desc : plan.getCountedArrayTypes()) {
+            String sym = "__jnative_rcarray_" + RefCountPlan.symbolName(desc);
+            lines.computeIfAbsent(sym, k -> new ArrayList<>()).add("@" + sym + " = constant i32 1");
+        }
+        for (String cls : plan.getCyclicClasses()) {
+            ClassNode node = resolver.getClassNode(cls);
+            if (node == null || node.isExternal()) continue;
+            String sym = "__jnative_rccyclic_" + RefCountPlan.symbolName(cls);
+            lines.computeIfAbsent(sym, k -> new ArrayList<>()).add("@" + sym + " = constant i32 1");
+            Set<String> owned = plan.getOwnedArrayFields().get(cls);
+            if (owned == null || owned.isEmpty()) continue;
             Set<Integer> offsets = new TreeSet<>();
-            Set<String> seen = new HashSet<>();
-            for (ClassNode c = node; c != null && !c.isExternal() && seen.add(c.getName()); ) {
-                for (FieldNode f : c.getFields()) {
-                    if ((f.getAccess() & Opcodes.ACC_STATIC) != 0) continue;
-                    if (RefCountPlan.WEAK_CACHE_FIELDS.contains(c.getName() + "." + f.getName())) {
-                        offsets.add(getFieldOffset(node.getName(), f.getName()));
-                    }
-                }
-                c = c.getSuperName() == null ? null : resolver.getClassNode(c.getSuperName());
+            for (String key : owned) {
+                int dot = key.lastIndexOf('.');
+                ClassNode ownerNode = resolver.getClassNode(key.substring(0, dot));
+                if (ownerNode == null || ownerNode.isExternal()) continue;
+                offsets.add(getFieldOffset(key.substring(0, dot), key.substring(dot + 1)));
             }
             if (offsets.isEmpty()) continue;
             StringBuilder arr = new StringBuilder("i32 ").append(offsets.size());
             for (int off : offsets) arr.append(", i32 ").append(off);
-            String sym = "__jnative_rcweak_" + RefCountPlan.symbolName(node.getName());
-            lines.computeIfAbsent(sym, k -> new ArrayList<>())
-                .add("@" + sym + " = constant [" + (offsets.size() + 1) + " x i32] [" + arr + "]");
-        }
-        for (String desc : plan.getCountedArrayTypes()) {
-            String sym = "__jnative_rcarray_" + RefCountPlan.symbolName(desc);
-            lines.computeIfAbsent(sym, k -> new ArrayList<>()).add("@" + sym + " = constant i32 1");
+            String ownedSym = "__jnative_rcowned_" + RefCountPlan.symbolName(cls);
+            lines.computeIfAbsent(ownedSym, k -> new ArrayList<>())
+                .add("@" + ownedSym + " = constant [" + (offsets.size() + 1) + " x i32] [" + arr + "]");
         }
         StringBuilder sb = new StringBuilder("\n; ----- Reference counting tables -----\n");
         for (List<String> defs : lines.values()) {
