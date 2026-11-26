@@ -604,6 +604,8 @@ static void jnative_free_array_storage(void* arr) {
     jnative_free_array_rc(arr);
 }
 
+static uint32_t* jn_rc_word_locked(void* p);
+
 static void jnative_free_hash_table(void* table) {
     if (table == NULL) return;
     int32_t len = *(int32_t*)((char*)table + JAVA_ARR_LENGTH_OFFSET);
@@ -611,6 +613,11 @@ static void jnative_free_hash_table(void* table) {
     void** slots = (void**)((char*)table + JAVA_ARR_HDR);
     for (int32_t i = 0; i < len; i++) {
         void* node = slots[i];
+        if (node != NULL && jn_rc_word_locked(node) != NULL) {
+            slots[i] = NULL;
+            __jnative_rc_dec(node);
+            continue;
+        }
         while (node != NULL) {
             void* next = *(void**)((char*)node + jnative_node_next_offset);
             jnative_rc_release_fields(node);
@@ -1142,6 +1149,7 @@ typedef struct {
     int32_t          offset;
     int32_t          flags;
     const int32_t*   fields;
+    const int32_t*   weak;
 } JnRcInfo;
 
 typedef struct JnWeakNode {
@@ -1485,13 +1493,16 @@ static JnRcInfo* jn_rc_resolve(void* key) {
     if (jn_rc_symbol(symbol, sizeof(symbol), "__jnative_rcfields_", vt->name)) {
         info->fields = (const int32_t*)jn_dlsym_default(symbol);
     }
+    if (jn_rc_symbol(symbol, sizeof(symbol), "__jnative_rcweak_", vt->name)) {
+        info->weak = (const int32_t*)jn_dlsym_default(symbol);
+    }
     for (ReflectionClass* c = jnative_class_by_name(vt->name); c != NULL; c = c->superclass) {
         if (c->cname != NULL && strcmp(c->cname, "java/lang/ref/Reference") == 0) {
             info->flags |= JN_RC_REFERENCE;
             break;
         }
     }
-    if (info->offset < 0 && info->fields == NULL && info->flags == 0) {
+    if (info->offset < 0 && info->fields == NULL && info->weak == NULL && info->flags == 0) {
         free(info);
         return &jn_rc_plain;
     }
@@ -2156,10 +2167,22 @@ void __jnative_rc_drop(void* p) {
     if (p != NULL) jn_rc_apply(p, jn_rc_word_drop);
 }
 
+static void jn_rc_forget_weak_fields(JnRcInfo* info, void* obj) {
+    if (info == NULL || info->weak == NULL) return;
+    for (int32_t i = 1; i <= info->weak[0]; i++) {
+        __jnative_weak_store((void**)((char*)obj + info->weak[i]), NULL);
+    }
+}
+
+void __jnative_weak_forget_fields(void* obj) {
+    if (obj != NULL) jn_rc_forget_weak_fields(jn_rc_of(obj), obj);
+}
+
 static void jnative_rc_release_fields(void* obj) {
     JnRcInfo* info = jn_rc_of(obj);
     if (info == NULL) return;
     if (info->flags & JN_RC_REFERENCE) __jnative_weak_forget(obj);
+    jn_rc_forget_weak_fields(info, obj);
     if (info->fields == NULL) return;
     int32_t n = info->fields[0];
     for (int32_t i = 1; i <= n; i++) {

@@ -377,37 +377,7 @@ final class RefCountPlanner {
         "java/util/concurrent/ConcurrentHashMap$TreeNode.prev",
         "java/util/concurrent/LinkedBlockingDeque$Node.prev");
 
-    static final Set<String> VIEW_CACHE_FIELDS = Set.of(
-        "java/util/AbstractMap.keySet",
-        "java/util/AbstractMap.values",
-        "java/util/HashMap.entrySet",
-        "java/util/TreeMap.entrySet",
-        "java/util/TreeMap.navigableKeySet",
-        "java/util/TreeMap.descendingMap",
-        "java/util/TreeMap$NavigableSubMap.entrySetView",
-        "java/util/TreeMap$NavigableSubMap.navigableKeySetView",
-        "java/util/TreeMap$NavigableSubMap.descendingMapView",
-        "java/util/IdentityHashMap.entrySet",
-        "java/util/WeakHashMap.entrySet",
-        "java/util/EnumMap.entrySet",
-        "java/util/Hashtable.keySet",
-        "java/util/Hashtable.entrySet",
-        "java/util/Hashtable.values",
-        "java/util/Collections$SynchronizedMap.keySet",
-        "java/util/Collections$SynchronizedMap.entrySet",
-        "java/util/Collections$SynchronizedMap.values",
-        "java/util/Collections$UnmodifiableMap.keySet",
-        "java/util/Collections$UnmodifiableMap.entrySet",
-        "java/util/Collections$UnmodifiableMap.values",
-        "java/util/Collections$CheckedMap.entrySet",
-        "java/util/concurrent/ConcurrentHashMap.keySet",
-        "java/util/concurrent/ConcurrentHashMap.values",
-        "java/util/concurrent/ConcurrentHashMap.entrySet",
-        "java/util/concurrent/ConcurrentSkipListMap.keySet",
-        "java/util/concurrent/ConcurrentSkipListMap.values",
-        "java/util/concurrent/ConcurrentSkipListMap.entrySet",
-        "java/util/concurrent/ConcurrentSkipListMap.descendingMap");
-
+    static final Set<String> VIEW_CACHE_FIELDS = RefCountPlan.WEAK_CACHE_FIELDS;
     private final Map<String, String> declaredKeys = new java.util.concurrent.ConcurrentHashMap<>();
 
     private String declaredKey(String raw) {
@@ -431,6 +401,10 @@ final class RefCountPlanner {
     boolean isViewCacheField(String raw) {
         String key = declaredKey(raw);
         return key != null && VIEW_CACHE_FIELDS.contains(key);
+    }
+
+    private boolean isWeakField(String raw) {
+        return isWeakReferent(raw) || isViewCacheField(raw);
     }
 
     static String arrayDescriptor(Type t) {
@@ -468,17 +442,9 @@ final class RefCountPlanner {
         int next = 0;
         Map<Integer, Integer> localHolds = new java.util.HashMap<>();
         for (BasicBlock block : f.getBlocks()) {
-            Set<Instruction> elided = null;
             for (Instruction inst : block.getInstructions()) {
                 Value res = inst.getResult();
-                if (inst.getOpcode() == Opcode.PUT_FIELD && inst.getOperands().size() >= 3
-                        && !(inst.getOperands().get(1) instanceof Constant c && c.getType() == Type.INT)
-                        && isViewCacheField(extractFieldName(inst))) {
-                    if (elided == null) elided = Collections.newSetFromMap(new IdentityHashMap<>());
-                    elided.add(inst);
-                    continue;
-                }
-                if (inst.getOpcode() == Opcode.GET_FIELD && isWeakReferent(extractFieldName(inst))) {
+                if (inst.getOpcode() == Opcode.GET_FIELD && isWeakField(extractFieldName(inst))) {
                     inst.setRcWeak(true);
                 }
                 if (inst.getOpcode() == Opcode.STORE) {
@@ -500,7 +466,6 @@ final class RefCountPlanner {
                 }
                 if (markStore(inst, weak)) marked++;
             }
-            if (elided != null) block.getInstructions().removeIf(elided::contains);
         }
         f.setRcHolds(next);
         return new int[]{marked, weak[0], next};
@@ -518,7 +483,7 @@ final class RefCountPlanner {
                     return true;
                 }
                 String raw = extractFieldName(inst);
-                if (isWeakReferent(raw)) {
+                if (isWeakField(raw)) {
                     inst.setRcWeak(true);
                     weak[0]++;
                     return false;

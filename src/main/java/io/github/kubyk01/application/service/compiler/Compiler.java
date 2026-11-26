@@ -1566,6 +1566,7 @@ public class Compiler implements CompilerPort {
                 || g.startsWith("vtable_")
                 || g.startsWith("__type_info_")
                 || g.startsWith("__jnative_rcfields_")
+                || g.startsWith("__jnative_rcweak_")
                 || g.startsWith("__jnative_rcoff_")
                 || g.startsWith("__jnative_rcarray_")) {
                 exports.add(g);

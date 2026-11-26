@@ -360,7 +360,7 @@ public class LlvmGenerator implements LlvmGeneratorPort {
         String runInit = generateRunAllInitializers();
         String main = generateMain();
         String moduleBodies = Files.exists(moduleSpool)
-            ? Files.readString(moduleSpool, StandardCharsets.UTF_8)
+            ? readSpool(moduleSpool)
             : "";
         Files.deleteIfExists(moduleSpool);
 
@@ -380,7 +380,7 @@ public class LlvmGenerator implements LlvmGeneratorPort {
         moduleTail = null;
 
         for (int gi = 0; gi < globalSpools.size(); gi++) {
-            String body = Files.readString(globalSpools.get(gi), StandardCharsets.UTF_8);
+            String body = readSpool(globalSpools.get(gi));
             Files.deleteIfExists(globalSpools.get(gi));
             String externs = buildExterns(body, knownGlobals, module);
             writeLl(outputDir.resolve("_globals" + gi + ".ll"),
@@ -454,14 +454,28 @@ public class LlvmGenerator implements LlvmGeneratorPort {
 
     private static String readClassBodies(List<Path> sources) throws IOException {
         if (sources.size() == 1) {
-            return Files.readString(sources.getFirst(), StandardCharsets.UTF_8);
+            return readSpool(sources.getFirst());
         }
         StringBuilder body = new StringBuilder();
         {
             for (int jnIdx7 = 0; jnIdx7 < sources.size(); jnIdx7++) { Path source = ((List<? extends Path>) sources).get(jnIdx7);
-            body.append(Files.readString(source, StandardCharsets.UTF_8)).append('\n');
+            appendSpool(body, source);
+            body.append('\n');
         } }
         return body.toString();
+    }
+
+    private static String readSpool(Path spool) throws IOException {
+        StringBuilder sb = new StringBuilder((int) Math.min(Files.size(spool), Integer.MAX_VALUE - 16));
+        appendSpool(sb, spool);
+        return sb.toString();
+    }
+
+    private static void appendSpool(StringBuilder sb, Path spool) throws IOException {
+        char[] chunk = new char[1 << 20];
+        try (java.io.Reader r = Files.newBufferedReader(spool, StandardCharsets.UTF_8)) {
+            for (int n; (n = r.read(chunk)) > 0; ) sb.append(chunk, 0, n);
+        }
     }
 
     private static Path spoolPath(Path spoolDir, String className) {
@@ -1542,7 +1556,7 @@ public class LlvmGenerator implements LlvmGeneratorPort {
         // ------------------------------------------------------------------
         sb.append("  %bootstrap_props = call i8* @__jnative_make_bootstrap_props(")
             .append(offsetArgs).append(")\n");
-        sb.append("  store i8* %bootstrap_props, i8** @gv_java_lang_System_props\n");
+        appendCountedStaticStore(sb, "%bootstrap_props", "@gv_java_lang_System_props", "%bootstrap_props_old");
 
         // ------------------------------------------------------------------
         // Stage 3: prime jdk.internal.misc.VM.savedProps.
@@ -1801,7 +1815,7 @@ public class LlvmGenerator implements LlvmGeneratorPort {
         if (!systemPropsInitialized) {
             sb.append("  %final_props = call i8* @__jnative_make_bootstrap_props(")
                 .append(offsetArgs).append(")\n");
-            sb.append("  store i8* %final_props, i8** @gv_java_lang_System_props\n");
+            appendCountedStaticStore(sb, "%final_props", "@gv_java_lang_System_props", "%final_props_old");
         }
 
         // ------------------------------------------------------------------
@@ -1811,6 +1825,13 @@ public class LlvmGenerator implements LlvmGeneratorPort {
         sb.append("}\n\n");
 
         return globals.toString() + sb;
+    }
+
+    private static void appendCountedStaticStore(StringBuilder sb, String value, String global, String old) {
+        sb.append("  call void @__jnative_rc_inc(i8* ").append(value).append(")\n");
+        sb.append("  ").append(old).append(" = load i8*, i8** ").append(global).append("\n");
+        sb.append("  store i8* ").append(value).append(", i8** ").append(global).append("\n");
+        sb.append("  call void @__jnative_rc_dec(i8* ").append(old).append(")\n");
     }
 
     /**

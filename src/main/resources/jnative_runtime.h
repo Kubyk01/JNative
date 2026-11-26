@@ -967,6 +967,7 @@ extern void*   __jnative_rc_load_ret(void** addr);
 extern void**  __jnative_rc_ret_slot(void);
 extern void*   __jnative_rc_cae(void** addr, void* expected, void* desired, void** hold);
 extern void*   __jnative_rc_cae_in(void** addr, void* expected, void* desired, void** hold, void* self);
+extern void    __jnative_weak_forget_fields(void* obj);
 extern void**  __jnative_referent_slot(void* ref);
 extern void    __jnative_weak_forget(void* ref);
 extern void    __jnative_weak_store(void** slot, void* referent);

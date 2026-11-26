@@ -564,6 +564,17 @@ public class DestructorInserter {
         return cast;
     }
 
+    private boolean hasWeakCacheField(ClassNode classNode) {
+        Set<String> seen = new HashSet<>();
+        for (ClassNode c = classNode; c != null && !c.isExternal() && seen.add(c.getName()); ) {
+            for (FieldNode f : c.getFields()) {
+                if (RefCountPlanner.VIEW_CACHE_FIELDS.contains(c.getName() + "." + f.getName())) return true;
+            }
+            c = c.getSuperName() == null ? null : resolver.getClassNode(c.getSuperName());
+        }
+        return false;
+    }
+
     private boolean holdsCountedField(String className, String fieldKey) {
         Set<String> fields = refCounts.plan().getCountedFields().get(className);
         return fields != null && fields.contains(fieldKey);
@@ -1926,6 +1937,10 @@ private void emitDestructionGuard(BasicBlock entry,
 
         emitDestructionGuard(entry, thisParam, returnBlock, bodyFast, bodySlow);
 
+        if (hasWeakCacheField(classNode)) {
+            bodyFast.addInstruction(runtimeCall(bodyFast, "__jnative_weak_forget_fields", thisParam));
+            bodySlow.addInstruction(runtimeCall(bodySlow, "__jnative_weak_forget_fields", thisParam));
+        }
         List<FieldNode> ownedFields = collectAllReferenceFields(classNode);
         for (FieldNode field : ownedFields) {
             if (RefCountPlanner.WEAK_OWNER.equals(field.getOwner()) && RefCountPlanner.WEAK_FIELD.equals(field.getName())) {
@@ -2019,7 +2034,8 @@ private void emitDestructionGuard(BasicBlock entry,
             if ((field.getAccess() & Opcodes.ACC_STATIC) != 0) continue;
             if (isOuterInstanceField(field.getName())) continue;
             String owner = field.getOwner() == null || field.getOwner().isEmpty() ? classNode.getName() : field.getOwner();
-            if (RefCountPlanner.NON_OWNING_FIELDS.contains(owner + "." + field.getName())) continue;
+            String key = owner + "." + field.getName();
+            if (RefCountPlanner.NON_OWNING_FIELDS.contains(key) || RefCountPlanner.VIEW_CACHE_FIELDS.contains(key)) continue;
             Type ft = field.getType();
             if (ft.isReference() || ft.isArray()) result.add(field);
         }

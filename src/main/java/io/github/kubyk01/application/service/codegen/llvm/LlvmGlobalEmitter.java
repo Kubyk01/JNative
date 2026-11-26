@@ -2175,6 +2175,26 @@ public class LlvmGlobalEmitter {
             lines.computeIfAbsent(sym, k -> new ArrayList<>())
                 .add("@" + sym + " = constant [" + (offsets.size() + 1) + " x i32] [" + arr + "]");
         }
+        for (ClassNode node : resolver.getClassMap().values()) {
+            if (node == null || node.isExternal() || node.isInterface()) continue;
+            Set<Integer> offsets = new TreeSet<>();
+            Set<String> seen = new HashSet<>();
+            for (ClassNode c = node; c != null && !c.isExternal() && seen.add(c.getName()); ) {
+                for (FieldNode f : c.getFields()) {
+                    if ((f.getAccess() & Opcodes.ACC_STATIC) != 0) continue;
+                    if (RefCountPlan.WEAK_CACHE_FIELDS.contains(c.getName() + "." + f.getName())) {
+                        offsets.add(getFieldOffset(node.getName(), f.getName()));
+                    }
+                }
+                c = c.getSuperName() == null ? null : resolver.getClassNode(c.getSuperName());
+            }
+            if (offsets.isEmpty()) continue;
+            StringBuilder arr = new StringBuilder("i32 ").append(offsets.size());
+            for (int off : offsets) arr.append(", i32 ").append(off);
+            String sym = "__jnative_rcweak_" + RefCountPlan.symbolName(node.getName());
+            lines.computeIfAbsent(sym, k -> new ArrayList<>())
+                .add("@" + sym + " = constant [" + (offsets.size() + 1) + " x i32] [" + arr + "]");
+        }
         for (String desc : plan.getCountedArrayTypes()) {
             String sym = "__jnative_rcarray_" + RefCountPlan.symbolName(desc);
             lines.computeIfAbsent(sym, k -> new ArrayList<>()).add("@" + sym + " = constant i32 1");
