@@ -682,23 +682,9 @@ final class ContainerArrayBorrows {
     }
 
     private List<Function> dispatchTargets(String callee) {
-        int paren = callee.indexOf('(');
-        int dot = paren < 0 ? -1 : callee.lastIndexOf('.', paren);
-        if (dot <= 0) return List.of();
-        String owner = callee.substring(0, dot);
-        if (owner.startsWith("[")) return List.of();
-        String name = callee.substring(dot + 1, paren);
-        String descriptor = callee.substring(paren);
-        Set<String> types = new HashSet<>(resolver.getSubclasses(owner));
-        types.add(owner);
         Set<Function> out = Collections.newSetFromMap(new IdentityHashMap<>());
-        for (String type : types) {
-            ClassNode node = resolver.getClassNode(type);
-            if (node == null || node.isInterface() || (node.getAccess() & Opcodes.ACC_ABSTRACT) != 0) continue;
-            String[] holder = new String[1];
-            MethodNode impl = resolver.findMethodInHierarchy(type, name, descriptor, holder);
-            if (impl == null || holder[0] == null || impl.isAbstract()) continue;
-            Function g = module.getFunction(canonicalCalleeKey(holder[0] + "." + name + descriptor));
+        for (String method : resolver.dispatchTargets(callee)) {
+            Function g = module.getFunction(canonicalCalleeKey(method));
             if (g != null && g.getEntryBlock() != null) out.add(g);
         }
         return new ArrayList<>(out);

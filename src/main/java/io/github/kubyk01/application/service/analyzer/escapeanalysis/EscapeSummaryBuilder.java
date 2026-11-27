@@ -117,8 +117,7 @@ public class EscapeSummaryBuilder {
 
         // ---- Call graph ------------------------------------------------
         Map<String, Function> byName = new HashMap<>(live.size() * 2);
-        List<? extends Function> jnLoop2 = live;
-        for (Function f : jnLoop2) {
+        for (Function f : live) {
             byName.put(f.getName(), f);
         }
 
@@ -132,7 +131,12 @@ public class EscapeSummaryBuilder {
                     String callee = extractCalleeName(inst);
                     if (callee == null) continue;
                     String calleeKey = canonicalCalleeKey(callee);
-                    if (!isLazyClinitWrapper(calleeKey)) seen.add(calleeKey);
+                    if (isLazyClinitWrapper(calleeKey)) continue;
+                    seen.add(calleeKey);
+                    Opcode op = inst.getOpcode();
+                    if (op == Opcode.VIRTUAL_CALL || op == Opcode.INTERFACE_CALL) {
+                        for (String method : resolver.dispatchTargets(callee)) seen.add(canonicalCalleeKey(method));
+                    }
                 }
             }
             return new ArrayList<>(seen);
@@ -227,8 +231,7 @@ public class EscapeSummaryBuilder {
         int totalProcessed = 0;
         int iteration = 0;
 
-        List<? extends Function> jnLoop5 = scc;
-        for (Function f : jnLoop5) {
+        for (Function f : scc) {
             summaries.putIfAbsent(f.getName(), EscapeSummary.builder().build());
         }
 
@@ -315,8 +318,7 @@ public class EscapeSummaryBuilder {
         List<List<Function>> sccs = new ArrayList<>();
         int[] counter = {0};
 
-        List<? extends Function> jnLoop7 = functions;
-        for (Function start : jnLoop7) {
+        for (Function start : functions) {
             if (index.containsKey(start)) {
                 continue;
             }
@@ -1217,19 +1219,58 @@ public class EscapeSummaryBuilder {
             } else {
                 // Unknown callee: conservatively assume every reference
                 // argument may be stored anywhere the callee has access to.
-                List<? extends Value> jnLoop21 = getCallArguments(inst);
-                for (Value arg : jnLoop21) {
-                    if (arg instanceof Parameter p) {
-                        paramsEscaped.add(p.getOrdinal());
-                        addAliases(p.getOrdinal(), paramAliases, paramsEscaped);
-                    }
-                }
-                Value ret = inst.getResult();
-                if (ret != null && ret.getType() != Type.VOID) flags[0] = true;
+                markUnknownCall(inst, paramAliases, paramsEscaped, flags);
                 return;
             }
         }
 
+        List<EscapeSummary> applied = new ArrayList<>();
+        applied.add(calleeSum);
+        Opcode op = inst.getOpcode();
+        if (op == Opcode.VIRTUAL_CALL || op == Opcode.INTERFACE_CALL) {
+            for (String method : resolver.dispatchTargets(calleeName)) {
+                String key = canonicalCalleeKey(method);
+                if (key.equals(calleeKey)) continue;
+                EscapeSummary override = snapshot.get(key);
+                if (override == null) {
+                    if (module.getFunction(key) == null) continue;
+                    EscapeSummary computed = nativeAnalyzer.summaryFor(method);
+                    if (computed == null || computed.isEscapesGlobally()) {
+                        markUnknownCall(inst, paramAliases, paramsEscaped, flags);
+                        return;
+                    }
+                    override = computed;
+                }
+                applied.add(override);
+            }
+        }
+        for (EscapeSummary summary : applied) {
+            applyCallSummary(inst, summary, paramAliases, paramsEscaped, paramsReturned, paramsEscapedToStatic,
+                    flags, paramEscapeEdges, localPointsTo, localSiteContents);
+        }
+    }
+
+    private void markUnknownCall(Instruction inst, Map<Integer, Set<Integer>> paramAliases,
+                                 Set<Integer> paramsEscaped, boolean[] flags) {
+        for (Value arg : getCallArguments(inst)) {
+            if (arg instanceof Parameter p) {
+                paramsEscaped.add(p.getOrdinal());
+                addAliases(p.getOrdinal(), paramAliases, paramsEscaped);
+            }
+        }
+        Value ret = inst.getResult();
+        if (ret != null && ret.getType() != Type.VOID) flags[0] = true;
+    }
+
+    private void applyCallSummary(Instruction inst, EscapeSummary calleeSum,
+                             Map<Integer, Set<Integer>> paramAliases,
+                             Set<Integer> paramsEscaped,
+                             Set<Integer> paramsReturned,
+                             Set<Integer> paramsEscapedToStatic,
+                             boolean[]    flags,
+                             Map<Integer, Set<Integer>> paramEscapeEdges,
+                             Map<Value, Set<AllocationSite>> localPointsTo,
+                             Map<AllocationSite, Set<AllocationSite>> localSiteContents) {
         List<Value> args = getCallArguments(inst);
 
         // ------------------------------------------------------------------

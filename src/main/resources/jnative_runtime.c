@@ -1708,6 +1708,57 @@ void __jnative_rc_pin(void* p) {
     }
 }
 
+static __thread uintptr_t jn_stack_lo;
+static __thread uintptr_t jn_stack_hi;
+
+static int jn_on_own_stack(const void* p) {
+    if (jn_stack_hi == 0) {
+        uintptr_t lo = UINTPTR_MAX;
+        uintptr_t hi = UINTPTR_MAX;
+#if defined(_WIN32)
+        ULONG_PTR low = 0;
+        ULONG_PTR high = 0;
+        GetCurrentThreadStackLimits(&low, &high);
+        if (high > low) {
+            lo = (uintptr_t)low;
+            hi = (uintptr_t)high;
+        }
+#elif defined(__APPLE__)
+        pthread_t self = pthread_self();
+        uintptr_t top = (uintptr_t)pthread_get_stackaddr_np(self);
+        size_t size = pthread_get_stacksize_np(self);
+        if (top > size) {
+            lo = top - size;
+            hi = top;
+        }
+#else
+        pthread_attr_t attr;
+        if (pthread_getattr_np(pthread_self(), &attr) == 0) {
+            void* addr = NULL;
+            size_t size = 0;
+            if (pthread_attr_getstack(&attr, &addr, &size) == 0 && addr != NULL && size > 0) {
+                lo = (uintptr_t)addr;
+                hi = (uintptr_t)addr + size;
+            }
+            pthread_attr_destroy(&attr);
+        }
+#endif
+        jn_stack_lo = lo;
+        jn_stack_hi = hi;
+    }
+    uintptr_t a = (uintptr_t)p;
+    return a >= jn_stack_lo && a < jn_stack_hi;
+}
+
+void __jnative_rc_capture(void* closure, void* value) {
+    if (value == NULL) return;
+    if (jn_on_own_stack(value)) {
+        __jnative_rc_pin(closure);
+        return;
+    }
+    __jnative_rc_inc(value);
+}
+
 #define JN_HOLD_CHUNK 32768
 
 typedef struct JnHoldChunk {

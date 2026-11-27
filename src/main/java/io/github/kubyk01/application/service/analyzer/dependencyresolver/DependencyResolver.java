@@ -1213,6 +1213,37 @@ public class DependencyResolver {
 
     private record SubclassClosure(long version, Set<String> classes) {}
 
+    private record DispatchTargets(long version, Set<String> methods) {}
+
+    private final Map<String, DispatchTargets> dispatchTargetCache = new ConcurrentHashMap<>();
+
+    public Set<String> dispatchTargets(String callee) {
+        long version = subclassIndexVersion.get();
+        DispatchTargets cached = dispatchTargetCache.get(callee);
+        if (cached != null && cached.version() == version) return cached.methods();
+        Set<String> methods = new HashSet<>();
+        int paren = callee.indexOf('(');
+        int dot = paren < 0 ? -1 : callee.lastIndexOf('.', paren);
+        if (dot > 0 && callee.charAt(0) != '[') {
+            String owner = callee.substring(0, dot);
+            String name = callee.substring(dot + 1, paren);
+            String descriptor = callee.substring(paren);
+            Set<String> types = new HashSet<>(getSubclasses(owner));
+            types.add(owner);
+            for (String type : types) {
+                ClassNode node = getClassNode(type);
+                if (node == null || node.isInterface() || (node.getAccess() & Opcodes.ACC_ABSTRACT) != 0) continue;
+                String[] holder = new String[1];
+                MethodNode impl = findMethodInHierarchy(type, name, descriptor, holder);
+                if (impl == null || holder[0] == null || impl.isAbstract()) continue;
+                methods.add(holder[0] + "." + name + descriptor);
+            }
+        }
+        Set<String> result = Collections.unmodifiableSet(methods);
+        dispatchTargetCache.put(callee, new DispatchTargets(version, result));
+        return result;
+    }
+
     private final Map<String, SubclassClosure> subclassClosureCache = new ConcurrentHashMap<>();
     private final java.util.concurrent.atomic.AtomicLong subclassIndexVersion =
             new java.util.concurrent.atomic.AtomicLong();

@@ -3495,7 +3495,8 @@ public class LlvmFunctionEmitter {
             sb.append("  store ").append(fieldLlvm).append(" ").append(valConverted)
                     .append(", ").append(fieldLlvm).append("* ").append(castPtr).append("\n");
             if (countCaptures && "i8*".equals(fieldLlvm)) {
-                sb.append("  call void @__jnative_rc_inc(i8* ").append(valConverted).append(")\n");
+                sb.append("  call void @__jnative_rc_capture(i8* ").append(alloc).append(", i8* ")
+                        .append(valConverted).append(")\n");
             }
         }
 

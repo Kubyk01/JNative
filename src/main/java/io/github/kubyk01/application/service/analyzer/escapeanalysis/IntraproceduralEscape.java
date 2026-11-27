@@ -416,6 +416,16 @@ public class IntraproceduralEscape {
 
         String calleeKey = canonicalCalleeKey(calleeName);
         EscapeSummary summary = summaries.get(calleeKey);
+        List<EscapeSummary> overrides = List.of();
+        Opcode op = callInst.getOpcode();
+        if (op == Opcode.VIRTUAL_CALL || op == Opcode.INTERFACE_CALL) {
+            overrides = overrideSummaries(calleeName, calleeKey);
+            if (overrides == null) {
+                markAllArgumentsEscaped(callInst);
+                return;
+            }
+            if (summary == null && !overrides.isEmpty()) summary = overrides.getFirst();
+        }
         if (summary == null) {
             // Native (body-less) callee: consult the C-body analyser.
             EscapeSummary computed = nativeAnalyzer.summaryFor(calleeName);
@@ -507,9 +517,15 @@ public class IntraproceduralEscape {
         // caller's subsequent use of the return value does.
         // ------------------------------------------------------------------
         for (int i = 0; i < args.size(); i++) {
-            if (summary.getParamsEscapedToStatic().contains(i)) {
+            boolean toStatic = summary.getParamsEscapedToStatic().contains(i);
+            boolean escaped = summary.getParamsEscaped().contains(i);
+            for (EscapeSummary override : overrides) {
+                toStatic |= override.getParamsEscapedToStatic().contains(i);
+                escaped |= override.getParamsEscaped().contains(i);
+            }
+            if (toStatic) {
                 markEscaped(args.get(i), EscapeStatus.GLOBAL);
-            } else if (summary.getParamsEscaped().contains(i)) {
+            } else if (escaped) {
                 markEscaped(args.get(i), EscapeStatus.HEAP);
             }
             // paramsReturned is deliberately NOT propagated as RETURN
@@ -701,6 +717,34 @@ public class IntraproceduralEscape {
             if (st.ordinal() > max.ordinal()) max = st;
         }
         return max;
+    }
+
+    private List<EscapeSummary> overrideSummaries(String calleeName, String calleeKey) {
+        var module = function.getModule();
+        List<EscapeSummary> out = new ArrayList<>();
+        for (String method : resolver.dispatchTargets(calleeName)) {
+            String key = canonicalCalleeKey(method);
+            if (key.equals(calleeKey)) continue;
+            EscapeSummary s = summaries.get(key);
+            if (s == null) {
+                if (module != null && module.getFunction(key) == null) continue;
+                EscapeSummary computed = nativeAnalyzer.summaryFor(method);
+                if (computed == null || computed.isEscapesGlobally()) return null;
+                s = computed;
+            }
+            out.add(s);
+        }
+        return out;
+    }
+
+    private void markAllArgumentsEscaped(Instruction callInst) {
+        for (Value arg : getCallArguments(callInst)) {
+            markEscaped(arg, EscapeStatus.HEAP);
+        }
+        Value ret = callInst.getResult();
+        if (ret != null && ret.getType() != Type.VOID) {
+            markEscaped(ret, EscapeStatus.HEAP);
+        }
     }
 
     private void markEscaped(Value v, EscapeStatus status) {
