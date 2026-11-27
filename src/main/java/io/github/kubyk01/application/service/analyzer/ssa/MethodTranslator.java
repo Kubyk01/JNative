@@ -183,7 +183,8 @@ public class MethodTranslator extends MethodVisitor {
             slot++;
             ordinal++;
         }
-        for (Type pt : paramTypes) {
+        List<? extends Type> jnLoop1 = paramTypes;
+        for (Type pt : jnLoop1) {
             params.add(new Parameter(pt, slot, ordinal));
             slot += (pt == Type.LONG || pt == Type.DOUBLE) ? 2 : 1;
             ordinal++;
@@ -192,7 +193,8 @@ public class MethodTranslator extends MethodVisitor {
         currentFunction = builder.createFunctionWithSlots(mangledName, returnType, params);
         currentFunction.setOwnerClass(methodRef.getOwner());
 
-        for (Parameter p : params) {
+        List<? extends Parameter> jnLoop2 = params;
+        for (Parameter p : jnLoop2) {
             frame.setLocal(p.getIndex(), p);
         }
 
@@ -804,30 +806,36 @@ public class MethodTranslator extends MethodVisitor {
     @Override
     public void visitLdcInsn(Object value) {
         recordBlockOffset();
-        switch (value) {
-            case Integer i -> handlers.pushInt(i);
-            case Long l -> handlers.pushLong(l);
-            case Float v -> handlers.pushFloat(v);
-            case Double v -> handlers.pushDouble(v);
-            case String ignored -> frame.push(new Constant(Type.reference("java/lang/String"), value));
-            case org.objectweb.asm.Type asmType -> {
-                int sort = asmType.getSort();
-                if (sort == org.objectweb.asm.Type.OBJECT) {
-                    String internalName = asmType.getInternalName();
-                    lastLoadedClass = internalName;
-                    if (isClassMirrorAvailable(internalName)) {
-                        frame.push(new Constant(Type.reference("java/lang/Class"), internalName));
-                    } else {
-                        emitClassLiteralForMissingClass(internalName);
-                    }
-                } else if (sort == org.objectweb.asm.Type.ARRAY) {
-                    frame.push(new Constant(Type.reference("java/lang/Class"),
-                        asmType.getDescriptor()));
+        // Keep as instanceof chain: javac emits an invokedynamic type switch
+        // for pattern switches, which JNative cannot translate yet.
+        if (value instanceof Integer i) {
+            handlers.pushInt(i);
+        } else if (value instanceof Long l) {
+            handlers.pushLong(l);
+        } else if (value instanceof Float v) {
+            handlers.pushFloat(v);
+        } else if (value instanceof Double v) {
+            handlers.pushDouble(v);
+        } else if (value instanceof String) {
+            frame.push(new Constant(Type.reference("java/lang/String"), value));
+        } else if (value instanceof org.objectweb.asm.Type asmType) {
+            int sort = asmType.getSort();
+            if (sort == org.objectweb.asm.Type.OBJECT) {
+                String internalName = asmType.getInternalName();
+                lastLoadedClass = internalName;
+                if (isClassMirrorAvailable(internalName)) {
+                    frame.push(new Constant(Type.reference("java/lang/Class"), internalName));
                 } else {
-                    frame.push(new Constant(Type.NULL, null));
+                    emitClassLiteralForMissingClass(internalName);
                 }
+            } else if (sort == org.objectweb.asm.Type.ARRAY) {
+                frame.push(new Constant(Type.reference("java/lang/Class"),
+                    asmType.getDescriptor()));
+            } else {
+                frame.push(new Constant(Type.NULL, null));
             }
-            case null, default -> frame.push(new Constant(Type.UNKNOWN, value));
+        } else {
+            frame.push(new Constant(Type.UNKNOWN, value));
         }
     }
 
@@ -939,7 +947,8 @@ public class MethodTranslator extends MethodVisitor {
 
         Instruction inst = new Instruction(Opcode.INVOKEDYNAMIC);
         inst.setInvokedynamicData(info);
-        for (Value v : captured) {
+        List<? extends Value> jnLoop3 = captured;
+        for (Value v : jnLoop3) {
             inst.addOperand(v);
         }
 
@@ -1021,7 +1030,8 @@ public class MethodTranslator extends MethodVisitor {
             }
         }
 
-        for (IndirectBranchTerminator ibt : indirectBranches) {
+        List<? extends IndirectBranchTerminator> jnLoop4 = indirectBranches;
+        for (IndirectBranchTerminator ibt : jnLoop4) {
             int var = -1;
             if (ibt.getTargetBlock() instanceof Temporary t
                     && t.getDefiningInstruction() != null) {
@@ -1062,7 +1072,8 @@ public class MethodTranslator extends MethodVisitor {
         // where the offset hook did not fire, so the fix never makes
         // things worse.
         // ------------------------------------------------------------------
-        for (TryCatchRange range : tryCatchRanges) {
+        List<? extends TryCatchRange> jnLoop5 = tryCatchRanges;
+        for (TryCatchRange range : jnLoop5) {
             BasicBlock rangeStart   = labelToBlock.get(range.start);
             BasicBlock rangeEnd     = labelToBlock.get(range.end);
             BasicBlock rangeHandler = labelToBlock.get(range.handler);
@@ -1110,7 +1121,8 @@ public class MethodTranslator extends MethodVisitor {
     }
 
     private void addExceptionalEdges() {
-        for (TryCatchRange range : tryCatchRanges) {
+        List<? extends TryCatchRange> jnLoop7 = tryCatchRanges;
+        for (TryCatchRange range : jnLoop7) {
             BasicBlock handlerBlock = labelToBlock.get(range.handler);
             if (handlerBlock == null) continue;
 
@@ -1132,9 +1144,10 @@ public class MethodTranslator extends MethodVisitor {
                         startBlock, endBlock, handlerBlock);
             }
 
-            for (BasicBlock block : range.body) {
+            List<? extends BasicBlock> jnLoop8 = range.body;
+            for (BasicBlock block : jnLoop8) {
                 if (block == handlerBlock) continue;
-                for (Instruction inst : block.getInstructions()) {
+                for (int instIdx1 = 0; instIdx1 < block.getInstructions().size(); instIdx1++) { Instruction inst = block.getInstructions().get(instIdx1);
                     if (inst.canThrow()) {
                         block.addExceptionalSuccessor(handlerBlock);
                     }

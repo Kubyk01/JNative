@@ -51,7 +51,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
-import static io.github.kubyk01.util.LlvmUtil.getElementSizeOfType;
 
 @Slf4j
 public class LlvmGenerator implements LlvmGeneratorPort {
@@ -82,6 +81,7 @@ public class LlvmGenerator implements LlvmGeneratorPort {
     @Override
     public void setScheduler(Scheduler scheduler) {
         if (scheduler != null) this.scheduler = scheduler;
+        globalEmitter.setScheduler(this.scheduler);
     }
 
     /**
@@ -196,7 +196,8 @@ public class LlvmGenerator implements LlvmGeneratorPort {
         String structDefs   = globalEmitter.generateStructDefinitions();
         Map<String, GlobalDecl> knownGlobals = new HashMap<>();
         List<Path> globalSpools = new ArrayList<>();
-        for (java.util.function.Supplier<String> part : globalEmitter.globalDefinitionParts()) {
+        List<? extends java.util.function.Supplier<String>> jnLoop1 = globalEmitter.globalDefinitionParts();
+        for (java.util.function.Supplier<String> part : jnLoop1) {
             String text = part.get();
             knownGlobals.putAll(parseGlobalDecls(text));
             Path spool = spoolDir.resolve(".globals" + globalSpools.size());
@@ -205,8 +206,6 @@ public class LlvmGenerator implements LlvmGeneratorPort {
             }
             globalSpools.add(spool);
         }
-        String lambdaVts    = globalEmitter.emitLambdaVtables();
-
         // The lambda struct text and the reflection ABI types take part in the
         // per-file prelude filtering, so they are materialised once here.
         StringBuilder extraBuf = new StringBuilder();
@@ -230,7 +229,8 @@ public class LlvmGenerator implements LlvmGeneratorPort {
         //         are emitted in batches and spooled to one file per class,
         //         so the heap never holds the whole program's IR text. ----
         List<Function> toEmit = new ArrayList<>();
-        for (Function f : module.getFunctions()) {
+        List<? extends Function> jnLoop2 = module.getFunctions();
+        for (Function f : jnLoop2) {
             if (f.getEntryBlock() != null) toEmit.add(f);
         }
         toEmit.sort(Comparator.comparing(f ->
@@ -301,11 +301,7 @@ public class LlvmGenerator implements LlvmGeneratorPort {
         // ---- 2. Deferred strings are now fully known. Collect them. ----
         String deferred = globalEmitter.generateDeferredStringConstants();
 
-        // ---- 3. knownGlobals = every definition that lives in _module.ll,
-        //         deferred strings included. ----
-        // Parsed one by one rather than concatenated: globalDefs is the
-        // largest string in the generator and a joined copy doubles it.
-        knownGlobals.putAll(parseGlobalDecls(lambdaVts));
+        // ---- 3. Index the deferred string definitions as well. ----
         knownGlobals.putAll(parseGlobalDecls(deferred));
 
         // ---- 4. Functions without bodies: declarations for _module.ll. ----
@@ -315,13 +311,15 @@ public class LlvmGenerator implements LlvmGeneratorPort {
         //         locally-defined symbol ("invalid redefinition of function"). ----
         StringBuilder moduleDecls = new StringBuilder();
         Set<String> moduleAvailable = new HashSet<>();
-        for (Function f : toEmit) {
+        {
+            for (int jnIdx3 = 0; jnIdx3 < toEmit.size(); jnIdx3++) { Function f = ((List<? extends Function>) toEmit).get(jnIdx3);
             if (f.getOwnerClass() == null || f.getOwnerClass().isEmpty()) {
                 moduleAvailable.add(f.getName());
             }
-        }
+        } }
         boolean jniResolveDeclared = false;
-        for (Function func : new ArrayList<>(module.getFunctions())) {
+        List<? extends Function> jnLoop4 = new ArrayList<>(module.getFunctions());
+        for (Function func : jnLoop4) {
             if (func.getEntryBlock() == null
                 && func.isJniNative()
                 && func.getJniMethodName() != null
@@ -354,8 +352,7 @@ public class LlvmGenerator implements LlvmGeneratorPort {
         // ---- 5. Write _module.ll. ----
         //
         // Order: the filtered prelude, then the externs, then the tail
-        // (globalDefs + lambdaVts + deferred + owner-less bodies +
-        // moduleDecls + runInit + main).
+        // (deferred + owner-less bodies + moduleDecls + runInit + main).
         //
         // The tail is assembled into a single string first, so the prelude
         // filter and the extern pass both see exactly the same content and do
@@ -363,12 +360,11 @@ public class LlvmGenerator implements LlvmGeneratorPort {
         String runInit = generateRunAllInitializers();
         String main = generateMain();
         String moduleBodies = Files.exists(moduleSpool)
-            ? Files.readString(moduleSpool, StandardCharsets.UTF_8)
+            ? readSpool(moduleSpool)
             : "";
         Files.deleteIfExists(moduleSpool);
 
-        String moduleTail = lambdaVts
-            + "\n" + deferred
+        String moduleTail = deferred
             + "\n" + moduleBodies
             + moduleDecls
             + runInit
@@ -384,7 +380,7 @@ public class LlvmGenerator implements LlvmGeneratorPort {
         moduleTail = null;
 
         for (int gi = 0; gi < globalSpools.size(); gi++) {
-            String body = Files.readString(globalSpools.get(gi), StandardCharsets.UTF_8);
+            String body = readSpool(globalSpools.get(gi));
             Files.deleteIfExists(globalSpools.get(gi));
             String externs = buildExterns(body, knownGlobals, module);
             writeLl(outputDir.resolve("_globals" + gi + ".ll"),
@@ -411,7 +407,8 @@ public class LlvmGenerator implements LlvmGeneratorPort {
                 Path out = outputDir.resolve(unit.name() + ".ll");
                 if (out.getParent() != null) Files.createDirectories(out.getParent());
                 writeLl(out, prelude, externs, body);
-                for (Path source : unit.bodies()) {
+                List<? extends Path> jnLoop5 = unit.bodies();
+                for (Path source : jnLoop5) {
                     Files.deleteIfExists(source);
                 }
             } catch (IOException ex) {
@@ -437,7 +434,8 @@ public class LlvmGenerator implements LlvmGeneratorPort {
         classes.sort(Map.Entry.comparingByKey());
         long bytes = 0;
         String firstClass = null;
-        for (Map.Entry<String, Path> entry : classes) {
+        {
+            for (int jnIdx6 = 0; jnIdx6 < classes.size(); jnIdx6++) { Map.Entry<String, Path> entry = ((List<? extends Map.Entry<String, Path>>) classes).get(jnIdx6);
             long size = Files.size(entry.getValue());
             if (!bodies.isEmpty() && (maxUnitBytes == 0 || size > maxUnitBytes - bytes)) {
                 units.add(new ClassUnit(firstClass, List.copyOf(bodies)));
@@ -447,7 +445,7 @@ public class LlvmGenerator implements LlvmGeneratorPort {
             if (bodies.isEmpty()) firstClass = entry.getKey();
             bodies.add(entry.getValue());
             bytes += size;
-        }
+        } }
         if (!bodies.isEmpty()) {
             units.add(new ClassUnit(firstClass, List.copyOf(bodies)));
         }
@@ -456,13 +454,28 @@ public class LlvmGenerator implements LlvmGeneratorPort {
 
     private static String readClassBodies(List<Path> sources) throws IOException {
         if (sources.size() == 1) {
-            return Files.readString(sources.getFirst(), StandardCharsets.UTF_8);
+            return readSpool(sources.getFirst());
         }
         StringBuilder body = new StringBuilder();
-        for (Path source : sources) {
-            body.append(Files.readString(source, StandardCharsets.UTF_8)).append('\n');
-        }
+        {
+            for (int jnIdx7 = 0; jnIdx7 < sources.size(); jnIdx7++) { Path source = ((List<? extends Path>) sources).get(jnIdx7);
+            appendSpool(body, source);
+            body.append('\n');
+        } }
         return body.toString();
+    }
+
+    private static String readSpool(Path spool) throws IOException {
+        StringBuilder sb = new StringBuilder((int) Math.min(Files.size(spool), Integer.MAX_VALUE - 16));
+        appendSpool(sb, spool);
+        return sb.toString();
+    }
+
+    private static void appendSpool(StringBuilder sb, Path spool) throws IOException {
+        char[] chunk = new char[1 << 20];
+        try (java.io.Reader r = Files.newBufferedReader(spool, StandardCharsets.UTF_8)) {
+            for (int n; (n = r.read(chunk)) > 0; ) sb.append(chunk, 0, n);
+        }
     }
 
     private static Path spoolPath(Path spoolDir, String className) {
@@ -895,7 +908,8 @@ public class LlvmGenerator implements LlvmGeneratorPort {
         }
 
         StringBuilder sb = new StringBuilder(adapters);
-        for (String name : used) {
+        {
+            for (int jnIdx11 = 0; jnIdx11 < used.size(); jnIdx11++) { String name = ((List<? extends String>) used).get(jnIdx11);
             if (name.startsWith("llvm.")) continue;
             if (definedHere.contains(name)) continue;
             GlobalDecl d = knownGlobals.get(name);
@@ -925,7 +939,7 @@ public class LlvmGenerator implements LlvmGeneratorPort {
                 String stub = weakNativeStub(name, bodyContent, adapters);
                 if (stub != null) sb.append(stub);
             }
-        }
+        } }
         return sb.toString();
     }
 
@@ -961,7 +975,8 @@ public class LlvmGenerator implements LlvmGeneratorPort {
 
     private String buildJniAliasAdapters(List<String> sortedUsed, Set<String> definedHere, Module module) {
         StringBuilder sb = new StringBuilder();
-        for (String name : sortedUsed) {
+        {
+            for (int jnIdx12 = 0; jnIdx12 < sortedUsed.size(); jnIdx12++) { String name = ((List<? extends String>) sortedUsed).get(jnIdx12);
             if (definedHere.contains(name)) continue;
             Function func = module.getFunction(name);
             if (func == null || !func.isJniNative() || func.getJniMethodName() == null) continue;
@@ -996,7 +1011,7 @@ public class LlvmGenerator implements LlvmGeneratorPort {
                 sb.append("  ret ").append(ret).append(" %r\n");
             }
             sb.append("}\n");
-        }
+        } }
         return sb.toString();
     }
 
@@ -1024,30 +1039,7 @@ public class LlvmGenerator implements LlvmGeneratorPort {
         return out;
     }
 
-    /** Stub from the first call site in {@code body}, else in {@code extra} (the two were once one concatenated string). */
-    private static List<String> lambdaMarkerInterfaces(InvokeDynamicInfo info) {
-        List<String> out = new ArrayList<>();
-        Handle bsm = info.bootstrapMethod();
-        if (bsm == null || !"altMetafactory".equals(bsm.getName())) return out;
-        Object[] args = info.bootstrapArgs();
-        if (args == null || args.length < 4 || !(args[3] instanceof Integer flags)) return out;
-        int i = 4;
-        if ((flags & java.lang.invoke.LambdaMetafactory.FLAG_MARKERS) != 0
-                && i < args.length && args[i] instanceof Integer count) {
-            i++;
-            for (int k = 0; k < count && i < args.length; k++, i++) {
-                if (args[i] instanceof org.objectweb.asm.Type t
-                        && t.getSort() == org.objectweb.asm.Type.OBJECT) {
-                    out.add(t.getInternalName());
-                }
-            }
-        }
-        if ((flags & java.lang.invoke.LambdaMetafactory.FLAG_SERIALIZABLE) != 0) {
-            out.add("java/io/Serializable");
-        }
-        return out;
-    }
-
+    /** Stub from the first call site in {@code body}, else in {@code extra}. */
     private static String weakNativeStub(String name, String body, String extra) {
         String stub = weakNativeStub(name, body);
         return stub != null || extra.isEmpty() ? stub : weakNativeStub(name, extra);
@@ -1174,7 +1166,8 @@ public class LlvmGenerator implements LlvmGeneratorPort {
             "(Ljava/lang/String;)Ljava/io/InputStream;",
             "__jnative_override_Class_getResourceAsStream");
 
-        for (Map.Entry<String, byte[]> e : embeddedResources) {
+        List<? extends Map.Entry<String, byte[]>> jnLoop13 = embeddedResources;
+        for (Map.Entry<String, byte[]> e : jnLoop13) {
             globalEmitter.addEmbeddedResource(e.getKey(), e.getValue());
         }
 
@@ -1217,7 +1210,8 @@ public class LlvmGenerator implements LlvmGeneratorPort {
         }
         info.getInterfaces().addAll(cn.getInterfaces());
 
-        for (FieldNode field : cn.getFields()) {
+        List<? extends FieldNode> jnLoop14 = cn.getFields();
+        for (FieldNode field : jnLoop14) {
             if ((field.getAccess() & Opcodes.ACC_STATIC) == 0) {
                 FieldReference ref = new FieldReference(
                     className, field.getName(), field.getDescriptor());
@@ -1225,7 +1219,8 @@ public class LlvmGenerator implements LlvmGeneratorPort {
             }
         }
 
-        for (MethodNode mn : cn.getMethods()) {
+        List<? extends MethodNode> jnLoop15 = cn.getMethods();
+        for (MethodNode mn : jnLoop15) {
             if (mn.getName().equals("<init>")) {
                 MethodReference ref = new MethodReference(
                     className, mn.getName(), mn.getDescriptor());
@@ -1561,7 +1556,7 @@ public class LlvmGenerator implements LlvmGeneratorPort {
         // ------------------------------------------------------------------
         sb.append("  %bootstrap_props = call i8* @__jnative_make_bootstrap_props(")
             .append(offsetArgs).append(")\n");
-        sb.append("  store i8* %bootstrap_props, i8** @gv_java_lang_System_props\n");
+        appendCountedStaticStore(sb, "%bootstrap_props", "@gv_java_lang_System_props", "%bootstrap_props_old");
 
         // ------------------------------------------------------------------
         // Stage 3: prime jdk.internal.misc.VM.savedProps.
@@ -1655,7 +1650,8 @@ public class LlvmGenerator implements LlvmGeneratorPort {
         boolean systemPropsInitialized = false;
         globals.append("declare void @__jnative_jni_preload_bundled()\n");
 
-        for (ClinitScheduleEntry entry : clinitSchedule) {
+        List<? extends ClinitScheduleEntry> jnLoop18 = clinitSchedule;
+        for (ClinitScheduleEntry entry : jnLoop18) {
             Function f = entry.function();
             String name = f.getName();
 
@@ -1703,12 +1699,12 @@ public class LlvmGenerator implements LlvmGeneratorPort {
 
                 if (retType.isVoid()) {
                     sb.append("  call void @").append(name)
-                      .append("(").append(args).append(")\n");
+                        .append("(").append(args).append(")\n");
                 } else {
                     sb.append("  %bootstrap_phase_result_").append(bootstrapPhaseIdx++)
-                      .append(" = call ").append(retLlvm)
-                      .append(" @").append(name)
-                      .append("(").append(args).append(")\n");
+                        .append(" = call ").append(retLlvm)
+                        .append(" @").append(name)
+                        .append("(").append(args).append(")\n");
                 }
             } else {
                 // Ordinary <clinit>.
@@ -1819,7 +1815,7 @@ public class LlvmGenerator implements LlvmGeneratorPort {
         if (!systemPropsInitialized) {
             sb.append("  %final_props = call i8* @__jnative_make_bootstrap_props(")
                 .append(offsetArgs).append(")\n");
-            sb.append("  store i8* %final_props, i8** @gv_java_lang_System_props\n");
+            appendCountedStaticStore(sb, "%final_props", "@gv_java_lang_System_props", "%final_props_old");
         }
 
         // ------------------------------------------------------------------
@@ -1829,6 +1825,13 @@ public class LlvmGenerator implements LlvmGeneratorPort {
         sb.append("}\n\n");
 
         return globals.toString() + sb;
+    }
+
+    private static void appendCountedStaticStore(StringBuilder sb, String value, String global, String old) {
+        sb.append("  call void @__jnative_rc_inc(i8* ").append(value).append(")\n");
+        sb.append("  ").append(old).append(" = load i8*, i8** ").append(global).append("\n");
+        sb.append("  store i8* ").append(value).append(", i8** ").append(global).append("\n");
+        sb.append("  call void @__jnative_rc_dec(i8* ").append(old).append(")\n");
     }
 
     /**
@@ -1874,6 +1877,7 @@ public class LlvmGenerator implements LlvmGeneratorPort {
         sb.append("  %args = call i8* @__jnative_create_string_array(i32 %jn_argc, i8** %jn_argv)\n");
         sb.append("  call void @").append(LlvmRuntime.mangleMethod(entryClass, entryMethod, entryDescriptor)).append("(i8* %args)\n");
         sb.append("  call void @__jnative_wait_non_daemon_threads()\n");
+        sb.append("  call void @__jnative_rc_thread_exit()\n");
         sb.append("  ret i32 0\n");
         sb.append("}\n\n");
 
@@ -1923,7 +1927,8 @@ public class LlvmGenerator implements LlvmGeneratorPort {
 
     private void generateLambdaAdaptors() {
         List<Instruction> lambdaInsts = new ArrayList<>();
-        for (Function func : module.getFunctions()) {
+        List<? extends Function> jnLoop19 = module.getFunctions();
+        for (Function func : jnLoop19) {
             for (BasicBlock block : func.getBlocks()) {
                 for (Instruction inst : block.getInstructions()) {
                     if (inst.getOpcode() == Opcode.INVOKEDYNAMIC) {
@@ -1936,10 +1941,12 @@ public class LlvmGenerator implements LlvmGeneratorPort {
                 }
             }
         }
-        for (Instruction inst : lambdaInsts) {
-            InvokeDynamicInfo info = (InvokeDynamicInfo) inst.getInvokedynamicData();
-            ResolvedCall call = info.resolvedCall();
-            createLambdaAdaptor(call, info);
+        {
+            for (Instruction inst : lambdaInsts) {
+                InvokeDynamicInfo info = (InvokeDynamicInfo) inst.getInvokedynamicData();
+                ResolvedCall call = info.resolvedCall();
+                createLambdaAdaptor(call, info);
+            }
         }
     }
 
@@ -1976,11 +1983,8 @@ public class LlvmGenerator implements LlvmGeneratorPort {
         String samDescriptor = samType.getDescriptor();
         String samSig        = info.name() + samDescriptor;
 
-        String dynDescriptor = info.descriptor();
-        org.objectweb.asm.Type dynReturnType =
-            org.objectweb.asm.Type.getReturnType(dynDescriptor);
-        if (dynReturnType.getSort() != org.objectweb.asm.Type.OBJECT) return;
-        String samInterface = dynReturnType.getInternalName();
+        String samInterface = info.lambdaInterface();
+        if (samInterface == null) return;
 
         Type retType = TypeResolver.descToReturnType(samDescriptor);
         List<Type> paramTypes = TypeResolver.descToParamTypes(samDescriptor);
@@ -1994,7 +1998,7 @@ public class LlvmGenerator implements LlvmGeneratorPort {
 
         globalEmitter.registerLambdaClass(
             lambdaId, samInterface, samSig, adaptorName, call.getCapturedTypes(),
-            lambdaMarkerInterfaces(info));
+            info.lambdaMarkerInterfaces());
 
         builder.createBlock(adaptorName + "_entry");
         BasicBlock entry = builder.currentBlock();
@@ -2003,19 +2007,19 @@ public class LlvmGenerator implements LlvmGeneratorPort {
         /* -------- load captured fields from the lambda object --------- */
         List<Type>  capturedTypes = call.getCapturedTypes();
         List<Value> loadedCaptures = new ArrayList<>(capturedTypes.size());
-        int offset = 8;
+        int[] offsets = LlvmGlobalEmitter.lambdaCaptureOffsets(capturedTypes);
         Parameter lambdaObj = adaptorFunc.getParameters().getFirst();
 
-        for (Type capType : capturedTypes) {
+        for (int i = 0; i < capturedTypes.size(); i++) {
+            Type capType = capturedTypes.get(i);
             Instruction getField = new Instruction(Opcode.GET_FIELD);
             getField.addOperand(lambdaObj);
-            getField.addOperand(new Constant(Type.INT, offset));
+            getField.addOperand(new Constant(Type.INT, offsets[i]));
             Temporary tmp = builder.newTemporary(capType);
             getField.setResult(tmp);
             tmp.setDefiningInstruction(getField);
             entry.addInstruction(getField);
             loadedCaptures.add(tmp);
-            offset += getElementSizeOfType(capType);
         }
 
         /* -------- SAM parameters (skip the lambda receiver at slot 0) - */
@@ -2115,9 +2119,10 @@ public class LlvmGenerator implements LlvmGeneratorPort {
 
         if (isStatic) {
             callInst.addOperand(calleeConst);
-            for (Value arg : callArgs) {
+            {
+                for (int jnIdx22 = 0; jnIdx22 < callArgs.size(); jnIdx22++) { Value arg = ((List<? extends Value>) callArgs).get(jnIdx22);
                 callInst.addOperand(arg);
-            }
+            } }
         } else {
             callInst.addOperand(callArgs.getFirst());
             callInst.addOperand(calleeConst);
@@ -2221,9 +2226,10 @@ public class LlvmGenerator implements LlvmGeneratorPort {
         Instruction ctorCall = new Instruction(Opcode.SPECIAL_CALL);
         ctorCall.addOperand(obj);
         ctorCall.addOperand(new Constant(Type.reference(calleeName), calleeName));
-        for (Value arg : ctorArgs) {
+        {
+            for (int jnIdx23 = 0; jnIdx23 < ctorArgs.size(); jnIdx23++) { Value arg = ((List<? extends Value>) ctorArgs).get(jnIdx23);
             ctorCall.addOperand(arg);
-        }
+        } }
         entry.addInstruction(ctorCall);
 
         // The adaptor's return value is the constructed object. The

@@ -71,6 +71,15 @@ static void* lookup_class_vtable(struct ReflectionClass* cls) {
     return type_info ? type_info[0] : NULL;
 }
 
+static size_t node_size(void) {
+    static size_t size;
+    if (size == 0) {
+        struct ReflectionClass* cls = find_class("java/util/HashMap$Node");
+        size = cls != NULL && (size_t)cls->object_size > NODE_SIZE ? (size_t)cls->object_size : NODE_SIZE;
+    }
+    return size;
+}
+
 static void* alloc_java_object(const char* class_name, size_t min_size) {
     struct ReflectionClass* cls = find_class(class_name);
     if (!cls) return NULL;
@@ -368,8 +377,12 @@ static void* make_string_array(int32_t len) {
 
 static void string_array_set(void* arr, int32_t index, const char* value) {
     if (arr == NULL || value == NULL || index < 0) return;
-    *(void**)((char*)arr + JAVA_ARR_HDR + (size_t)index * sizeof(void*)) =
-        __jnative_make_string_obj(value, (int32_t)strlen(value));
+    void* str = __jnative_make_string_obj(value, (int32_t)strlen(value));
+    __jnative_rc_inc(str);
+    void** slot = (void**)((char*)arr + JAVA_ARR_HDR + (size_t)index * sizeof(void*));
+    void* old = *slot;
+    *slot = str;
+    __jnative_rc_dec(old);
 }
 
 static int32_t jnative_string_hash(const char* s, int32_t len) {
@@ -450,13 +463,17 @@ static void cmd_props_put(void* table, int table_size, void* node_vtable,
     int idx = (int)(spread & (uint32_t)(table_size - 1));
     void** slot = (void**)((char*)table + JAVA_ARR_HDR + (size_t)idx * sizeof(void*));
 
-    void* node = calloc(1, NODE_SIZE);
+    void* node = calloc(1, node_size());
     if (node == NULL) abort();
     *(void**)((char*)node + 0) = node_vtable;
     *(int32_t*)((char*)node + NODE_HASH_OFFSET) = (int32_t)spread;
-    *(void**)((char*)node + NODE_KEY_OFFSET) = __jnative_make_string_obj(key_cstr, klen);
-    *(void**)((char*)node + NODE_VAL_OFFSET) =
-        __jnative_make_string_obj(val_cstr, (int32_t)strlen(val_cstr));
+    void* key = __jnative_make_string_obj(key_cstr, klen);
+    void* val = __jnative_make_string_obj(val_cstr, (int32_t)strlen(val_cstr));
+    __jnative_rc_inc(key);
+    __jnative_rc_inc(val);
+    __jnative_rc_inc(node);
+    *(void**)((char*)node + NODE_KEY_OFFSET) = key;
+    *(void**)((char*)node + NODE_VAL_OFFSET) = val;
     *(void**)((char*)node + NODE_NEXT_OFFSET) = *slot;
     *slot = node;
 }
@@ -514,6 +531,7 @@ void* __jnative_fn_jdk_internal_util_SystemProps_Raw_cmdProperties___Ljava_util_
     *(void**)((char*)map + 8)  = NULL;
     *(void**)((char*)map + 16) = NULL;
 
+    __jnative_rc_inc(table);
     *(void**)((char*)map + HASHMAP_TABLE_OFF)      = table;
     *(void**)((char*)map + HASHMAP_ENTRYSET_OFF)   = NULL;
     *(int32_t*)((char*)map + HASHMAP_SIZE_OFF)     = cmd_count;
@@ -692,6 +710,7 @@ void* __jnative_make_bootstrap_props(
 
     *(void**)((char*)chm + 8)  = NULL;
     *(void**)((char*)chm + 16) = NULL;
+    __jnative_rc_inc(chm_table);
     *(void**)((char*)chm + chm_table_off)        = chm_table;
     *(void**)((char*)chm + CHM_NEXTTABLE_OFFSET) = NULL;
     *(int64_t*)((char*)chm + chm_basecount_off)  = 0;
@@ -715,6 +734,7 @@ void* __jnative_make_bootstrap_props(
     *(float*)((char*)props + props_loadfactor_off)  = 0.75f;
     *(int32_t*)((char*)props + props_modcount_off)  = 0;
     *(void**)((char*)props + props_defaults_off)    = NULL;
+    __jnative_rc_inc(chm);
     *(void**)((char*)props + props_map_off)         = chm;
 
     void** slots = (void**)((char*)chm_table + JAVA_ARR_HDR);
@@ -729,10 +749,13 @@ void* __jnative_make_bootstrap_props(
         int32_t _hc = jnative_string_hash(_kc, _klen);                                   \
         uint32_t _h = jnative_spread(_hc);                                               \
         int _idx = (int)(_h & (uint32_t)(table_size - 1));                               \
-        void* _node = calloc(1, NODE_SIZE);                                              \
+        void* _node = calloc(1, node_size());                                            \
         if (_node) {                                                                      \
             *(void**)((char*)_node + 0) = node_vtable;                                   \
             *(int32_t*)((char*)_node + NODE_HASH_OFFSET) = (int32_t)_h;                  \
+            __jnative_rc_inc(_k);                                                        \
+            __jnative_rc_inc(_v);                                                        \
+            __jnative_rc_inc(_node);                                                     \
             *(void**)((char*)_node + NODE_KEY_OFFSET) = _k;                              \
             *(void**)((char*)_node + NODE_VAL_OFFSET) = _v;                              \
             *(void**)((char*)_node + NODE_NEXT_OFFSET) = NULL;                           \

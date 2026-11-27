@@ -170,6 +170,7 @@ static void* create_main_thread_group(void) {
     *(void**)tg = vtable;
     *(void**)((char*)tg + TG_NAME_OFFSET) =
         __jnative_make_string_obj("main", 4);
+    __jnative_rc_inc(*(void**)((char*)tg + TG_NAME_OFFSET));
     *(int32_t*)((char*)tg + TG_MAXPRIORITY_OFFSET) =
         JNATIVE_THREAD_MAX_PRIORITY;
     /* vmAllowSuspension only exists on JDKs that predate JDK-8283117; on
@@ -198,6 +199,7 @@ static void* create_main_thread_field_holder(void* group) {
     if (fh == NULL) return NULL;
 
     *(void**)fh = vtable;
+    __jnative_rc_inc(group);
     *(void**)((char*)fh + FH_GROUP_OFFSET)    = group;
     *(int32_t*)((char*)fh + FH_PRIORITY_OFFSET) =
         JNATIVE_THREAD_NORM_PRIORITY;
@@ -275,6 +277,7 @@ static void* create_thread_object(void) {
     if (THREAD_NAME_OFFSET >= 0) {
         *(void**)((char*)t + THREAD_NAME_OFFSET) =
             __jnative_make_string_obj("main", 4);
+        __jnative_rc_inc(*(void**)((char*)t + THREAD_NAME_OFFSET));
     }
 
     if (THREAD_TID_OFFSET >= 0) {
@@ -285,6 +288,7 @@ static void* create_thread_object(void) {
     if (THREAD_HOLDER_OFFSET >= 0) {
         void* group  = create_main_thread_group();
         void* holder = create_main_thread_field_holder(group);
+        __jnative_rc_inc(holder);
         *(void**)((char*)t + THREAD_HOLDER_OFFSET) = holder;
     }
 
@@ -305,6 +309,7 @@ static void* create_thread_object(void) {
         void* interrupt_lock = (obj_cls != NULL)
             ? jnative_alloc_object(obj_cls)
             : NULL;
+        __jnative_rc_inc(interrupt_lock);
         *(void**)((char*)t + THREAD_INTERRUPTLOCK_OFFSET) = interrupt_lock;
     }
 
@@ -346,6 +351,7 @@ static ThreadState* get_or_create_thread_state(void* java_thread) {
         jn_mutex_unlock(&thread_table_lock);
         return NULL;
     }
+    __jnative_rc_inc(java_thread);
     s->java_thread = java_thread;
     s->priority = 5;
     /* Guard: if the runtime has not received its layout yet, do not
@@ -396,6 +402,8 @@ static ThreadState* ensure_main_thread(void) {
         return NULL;
     }
     s->java_thread = create_thread_object();
+    __jnative_rc_inc(s->java_thread);
+    __jnative_rc_inc(s->java_thread);
     s->carrier_thread = s->java_thread;
     s->pthread = pthread_self();
     s->running = 1;
@@ -495,6 +503,7 @@ static void* thread_entry(void* arg) {
         extern void __jnative_invoke_runnable(void* runnable);
         __jnative_invoke_runnable(runnable);
     }
+    __jnative_rc_dec(runnable);
 
     /* Same as HotSpot's ensure_join: Thread.join() does
      * synchronized(this){ while(isAlive()) wait(); }, so clear eetop and
@@ -504,6 +513,7 @@ static void* thread_entry(void* arg) {
     set_eetop(s->java_thread, 0);
     __jnative_fn_java_lang_Object_notifyAll___V(s->java_thread);
     __jnative_monitor_exit(s->java_thread);
+    __jnative_rc_thread_exit();
 
     jn_mutex_lock(&s->mutex);
     s->running = 0;
@@ -529,7 +539,10 @@ void __jnative_fn_java_lang_Thread_setCurrentThread__Ljava_lang_Thread__V(void* 
     ThreadState* s = get_or_create_thread_state(t);
     if (s) {
         tls_state = s;
-        if (!s->carrier_thread) s->carrier_thread = t;
+        if (!s->carrier_thread) {
+            __jnative_rc_inc(t);
+            s->carrier_thread = t;
+        }
     }
 }
 
@@ -661,6 +674,7 @@ void __jnative_fn_java_lang_Thread_start__V(void* this_thread) {
         return;
     }
     sa->state = s;
+    __jnative_rc_inc(this_thread);
     sa->runnable = this_thread;
 
     pthread_attr_t attr;
@@ -672,6 +686,7 @@ void __jnative_fn_java_lang_Thread_start__V(void* this_thread) {
     pthread_attr_destroy(&attr);
     if (rc != 0) {
         free(sa);
+        __jnative_rc_dec(this_thread);
         set_eetop(this_thread, 0);
         __jnative_throw_exception(NULL);
     }
@@ -784,7 +799,10 @@ int __jnative_fn_java_lang_Thread_isDaemon__Z(void* this_thread) {
 void __jnative_fn_java_lang_Thread_setContextClassLoader__Ljava_lang_ClassLoader_(void* this_thread, void* cl) {
     if (!this_thread) return;
     ThreadState* s = find_thread_state(this_thread);
-    if (s) s->context_class_loader = cl;
+    if (s) {
+        __jnative_rc_inc(cl);
+        __jnative_rc_dec(__atomic_exchange_n(&s->context_class_loader, cl, __ATOMIC_ACQ_REL));
+    }
 }
 
 void* __jnative_fn_java_lang_Thread_getContextClassLoader__Ljava_lang_ClassLoader_(void* this_thread) {
@@ -933,7 +951,10 @@ void* __jnative_fn_java_lang_Thread_scopedValueCache____Ljava_lang_Object_(void*
 void __jnative_fn_java_lang_Thread_setScopedValueCache___Ljava_lang_Object__V(void* this_thread, void* cache) {
     if (!this_thread) return;
     ThreadState* s = find_thread_state(this_thread);
-    if (s) s->scoped_value_cache = cache;
+    if (s) {
+        __jnative_rc_inc(cache);
+        __jnative_rc_dec(__atomic_exchange_n(&s->scoped_value_cache, cache, __ATOMIC_ACQ_REL));
+    }
 }
 
 /* ---------------------------------------------------------------------------
@@ -1080,6 +1101,7 @@ void* __jnative_fn_java_lang_Thread_getThreads____Ljava_lang_Thread_(void) {
         int32_t i = 0;
         for (ThreadState* s = thread_table; s && i < count; s = s->next) {
             if (s->java_thread != NULL) {
+                __jnative_rc_inc(s->java_thread);
                 slots[i++] = s->java_thread;
             }
         }

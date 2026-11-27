@@ -44,10 +44,14 @@ public final class FieldCell {
     public long version() { return version; }
 
     public boolean merge(PointsToSet add) {
+        return merge(add, null, null);
+    }
+
+    public boolean merge(PointsToSet add, PointsToSet previous, PointsToSet current) {
         if (add == null || add.isEmpty()) return false;
         while (true) {
             PointsToSet cur = pts;
-            PointsToSet next = PointsToSet.union(cur, add);
+            PointsToSet next = cur == previous ? current : PointsToSet.union(cur, add);
             if (next == cur) return false;
             if (PTS.compareAndSet(this, cur, next)) return true;
         }

@@ -32,7 +32,7 @@ import static io.github.kubyk01.util.LlvmUtil.canonicalCalleeKey;
 import static io.github.kubyk01.util.LlvmUtil.extractCalleeName;
 import static io.github.kubyk01.util.LlvmUtil.extractFieldName;
 import static io.github.kubyk01.util.LlvmUtil.getCallArguments;
-import static io.github.kubyk01.util.LlvmUtil.isAllocation;
+import static io.github.kubyk01.util.LlvmUtil.isPointsToAllocation;
 import static io.github.kubyk01.util.LlvmUtil.isLazyClinitWrapper;
 
 @Slf4j
@@ -58,7 +58,8 @@ public class SummaryBuilder {
 
     public Map<String, FunctionSummary> build() {
         List<Function> allLive = new ArrayList<>();
-        for (Function f : module.getFunctions()) {
+        List<? extends Function> jnLoop1 = module.getFunctions();
+        for (Function f : jnLoop1) {
             if (f.getEntryBlock() != null) {
                 allLive.add(f);
             }
@@ -84,15 +85,17 @@ public class SummaryBuilder {
         // not cascade into its tens of thousands of trigger sites. See
         // LlvmUtil.isLazyClinitWrapper.
         Map<String, Function> byName = new HashMap<>(allLive.size() * 2);
-        for (Function f : allLive) {
+
+        for (int jnIdx2 = 0; jnIdx2 < allLive.size(); jnIdx2++) {
+            Function f = ((List<? extends Function>) allLive).get(jnIdx2);
             byName.put(f.getName(), f);
         }
 
         Map<Function, List<Function>> callees = new HashMap<>(allLive.size() * 2);
         Map<String, Set<Function>> callers = new HashMap<>(allLive.size() * 2);
 
-        for (Function f : allLive) {
-            List<Function> out = new ArrayList<>();
+        List<List<String>> calleeKeys = LlvmUtil.parallelMapOrdered(allLive, scheduler, f -> {
+            List<String> keys = new ArrayList<>();
             Set<String> seen = new HashSet<>();
             for (BasicBlock block : f.getBlocks()) {
                 for (Instruction inst : block.getInstructions()) {
@@ -112,16 +115,23 @@ public class SummaryBuilder {
                     if (isLazyClinitWrapper(calleeKey)) {
                         continue;
                     }
-
-                    if (!seen.add(calleeKey)) {
-                        continue;
+                    if (seen.add(calleeKey)) {
+                        keys.add(calleeKey);
                     }
-                    Function callee = byName.get(calleeKey);
-                    if (callee != null) {
-                        out.add(callee);
-                    }
-                    callers.computeIfAbsent(calleeKey, k -> new HashSet<>(4)).add(f);
                 }
+            }
+            return keys;
+        });
+
+        for (int i = 0; i < allLive.size(); i++) {
+            Function f = allLive.get(i);
+            List<Function> out = new ArrayList<>();
+            for (String calleeKey : calleeKeys.get(i)) {
+                Function callee = byName.get(calleeKey);
+                if (callee != null) {
+                    out.add(callee);
+                }
+                callers.computeIfAbsent(calleeKey, k -> new HashSet<>(4)).add(f);
             }
             callees.put(f, out);
         }
@@ -136,11 +146,44 @@ public class SummaryBuilder {
         List<List<Function>> sccs = computeSCCs(allLive, callees);
 
         // ---- Process SCCs bottom-up -----------------------------------
-        int totalProcessed = 0;
+        Map<Function, Integer> sccOf = new HashMap<>(allLive.size() * 2);
+        for (int s = 0; s < sccs.size(); s++) {
+            for (Function f : sccs.get(s)) sccOf.put(f, s);
+        }
+        int[] level = new int[sccs.size()];
+        int maxLevel = 0;
         int maxSccSize = 0;
-        for (List<Function> scc : sccs) {
+        for (int s = 0; s < sccs.size(); s++) {
+            List<Function> scc = sccs.get(s);
             if (scc.size() > maxSccSize) maxSccSize = scc.size();
-            totalProcessed += processSCC(scc, callers);
+            int lv = 0;
+            for (Function f : scc) {
+                for (Function callee : callees.get(f)) {
+                    Integer cs = sccOf.get(callee);
+                    if (cs != null && cs != s) lv = Math.max(lv, level[cs] + 1);
+                }
+            }
+            level[s] = lv;
+            if (lv > maxLevel) maxLevel = lv;
+        }
+        List<List<Integer>> singlesByLevel = new ArrayList<>(maxLevel + 1);
+        List<List<Integer>> groupsByLevel = new ArrayList<>(maxLevel + 1);
+        for (int lv = 0; lv <= maxLevel; lv++) {
+            singlesByLevel.add(new ArrayList<>());
+            groupsByLevel.add(new ArrayList<>());
+        }
+        for (int s = 0; s < sccs.size(); s++) {
+            (sccs.get(s).size() == 1 ? singlesByLevel : groupsByLevel).get(level[s]).add(s);
+        }
+
+        int totalProcessed = 0;
+        for (int lv = 0; lv <= maxLevel; lv++) {
+            List<Integer> counts = LlvmUtil.parallelMapOrdered(
+                singlesByLevel.get(lv), scheduler, s -> processSCC(sccs.get(s), callers));
+            for (int c : counts) totalProcessed += c;
+            for (int s : groupsByLevel.get(lv)) {
+                totalProcessed += processSCC(sccs.get(s), callers);
+            }
         }
 
         System.out.println("SummaryBuilder: converged after " + sccs.size()
@@ -207,9 +250,10 @@ public class SummaryBuilder {
         // the fixed point is reached in O(lattice height) iterations. The
         // per-function height is a small constant, so the total is well
         // below the limit.
-        for (Function f : scc) {
+        {
+            for (int jnIdx5 = 0; jnIdx5 < scc.size(); jnIdx5++) { Function f = ((List<? extends Function>) scc).get(jnIdx5);
             summaries.putIfAbsent(f.getName(), FunctionSummary.builder().build());
-        }
+        } }
 
         final int maxIterations = Math.max(MAX_SCC_ITERATIONS, 4 * scc.size());
 
@@ -322,7 +366,8 @@ public class SummaryBuilder {
         List<List<Function>> sccs = new ArrayList<>();
         int[] counter = {0};
 
-        for (Function start : functions) {
+        {
+            for (int jnIdx7 = 0; jnIdx7 < functions.size(); jnIdx7++) { Function start = ((List<? extends Function>) functions).get(jnIdx7);
             if (index.containsKey(start)) {
                 continue;
             }
@@ -384,7 +429,7 @@ public class SummaryBuilder {
                     sccs.add(scc);
                 }
             }
-        }
+        } }
 
         return sccs;
     }
@@ -430,7 +475,7 @@ public class SummaryBuilder {
         int idx = 0;
         for (BasicBlock block : func.getBlocks()) {
             for (Instruction inst : block.getInstructions()) {
-                if (isAllocation(inst.getOpcode())) {
+                if (isPointsToAllocation(inst)) {
                     AllocationSite site = AllocationSite.fromInstruction(
                         inst, func.getName(), idx);
                     if (inst.getResult() != null) {
@@ -714,11 +759,12 @@ public class SummaryBuilder {
             // External or not-yet-analyzed callee: conservatively assume
             // every argument escapes and the return value is an object.
             List<Value> args = getCallArguments(callInst);
-            for (Value arg : args) {
+            {
+                for (int jnIdx10 = 0; jnIdx10 < args.size(); jnIdx10++) { Value arg = ((List<? extends Value>) args).get(jnIdx10);
                 if (arg instanceof Parameter p) {
                     paramsEscaped.add(p.getOrdinal());
                 }
-            }
+            } }
             if (callInst.getResult() != null) {
                 flags[0] = true;
             }

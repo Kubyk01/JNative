@@ -59,6 +59,16 @@ public class VarHandleTargetResolver {
                 k -> Optional.ofNullable(compute(holderClass, handleField))).orElse(null);
     }
 
+    private static final String VAR_HANDLE_DESC = "Ljava/lang/invoke/VarHandle;";
+    private static final String UPDATER_DESC = "Ljava/util/concurrent/atomic/AtomicReferenceFieldUpdater;";
+    private static final String UPDATER = "java/util/concurrent/atomic/AtomicReferenceFieldUpdater";
+
+    private static final String UNSAFE = "jdk/internal/misc/Unsafe";
+
+    public Target resolveHandleValue(Value handle) {
+        return resolveReceiver(handle, 0, new HashSet<>());
+    }
+
     public Target resolveCallSite(Instruction call) {
         if (call == null || !call.isPolymorphicSignature() || call.getOperands().size() < 2) return null;
         if (!(call.getOperands().get(1) instanceof Constant c)
@@ -80,6 +90,8 @@ public class VarHandleTargetResolver {
         if (def.getOpcode() == Opcode.LOAD) {
             return resolveLocalSlot(def, depth, visited);
         }
+        Target offset = offsetCall(def);
+        if (offset != null) return offset;
         if (def.getOperands().isEmpty()) return null;
         if (def.getOpcode() == Opcode.CHECKCAST || def.getOpcode() == Opcode.CAST
                 || def.getOpcode() == Opcode.STORE) {
@@ -87,6 +99,15 @@ public class VarHandleTargetResolver {
         }
         if (def.getOpcode() != Opcode.PHI) return null;
         return resolveAll(def.getOperands(), depth, visited);
+    }
+
+    private Target offsetCall(Instruction def) {
+        String callee = LlvmUtil.extractCalleeName(def);
+        if (callee == null || !callee.equals(UNSAFE + ".objectFieldOffset(Ljava/lang/Class;Ljava/lang/String;)J")) return null;
+        List<Value> ops = def.getOperands();
+        if (ops.size() < 4 || !(ops.get(2) instanceof Constant cls) || !(ops.get(3) instanceof Constant name)) return null;
+        if (cls.getValue() == null || !(name.getValue() instanceof String n)) return null;
+        return validate(new Target(Kind.INSTANCE_FIELD, cls.getValue().toString(), n, null));
     }
 
     private Target resolveLocalSlot(Instruction load, int depth, Set<Instruction> visited) {
@@ -106,7 +127,8 @@ public class VarHandleTargetResolver {
 
     private Target resolveAll(List<Value> values, int depth, Set<Instruction> visited) {
         Target common = null;
-        for (Value incoming : values) {
+        List<? extends Value> jnLoop1 = values;
+        for (Value incoming : jnLoop1) {
             Target target = resolveReceiver(incoming, depth + 1, new HashSet<>(visited));
             if (target == null || (common != null && !common.equals(target))) return null;
             common = target;
@@ -119,7 +141,8 @@ public class VarHandleTargetResolver {
         if (handle == null
                 || (handle.getAccess() & Opcodes.ACC_STATIC) == 0
                 || (handle.getAccess() & Opcodes.ACC_FINAL) == 0
-                || !"Ljava/lang/invoke/VarHandle;".equals(handle.getDescriptor())) {
+                || !(VAR_HANDLE_DESC.equals(handle.getDescriptor()) || UPDATER_DESC.equals(handle.getDescriptor())
+                    || "J".equals(handle.getDescriptor()))) {
             return null;
         }
         String declaring = handle.getOwner() != null ? handle.getOwner() : holderClass;
@@ -134,6 +157,10 @@ public class VarHandleTargetResolver {
         if (f == null || f.getDescriptor() == null) return null;
         boolean isStatic = (f.getAccess() & Opcodes.ACC_STATIC) != 0;
         if (isStatic != (t.kind() == Kind.STATIC_FIELD)) return null;
+        if (t.valueType() == null) {
+            return new Target(t.kind(), f.getOwner() != null ? f.getOwner() : t.owner(), t.fieldName(),
+                    Type.fromDescriptor(f.getDescriptor()));
+        }
         String typeDesc = t.valueType() == null ? null : descriptorOf(t.valueType());
         if (!f.getDescriptor().equals(typeDesc)) return null;
         String owner = f.getOwner() != null ? f.getOwner() : t.owner();
@@ -241,7 +268,7 @@ public class VarHandleTargetResolver {
             }
             if (opcode == Opcodes.PUTSTATIC && owner.equals(className)) {
                 Object value = pop();
-                if ("Ljava/lang/invoke/VarHandle;".equals(descriptor)) {
+                if (VAR_HANDLE_DESC.equals(descriptor) || UPDATER_DESC.equals(descriptor) || "J".equals(descriptor)) {
                     assign(name, value instanceof Target ? value : CONFLICT);
                 }
             }
@@ -272,6 +299,23 @@ public class VarHandleTargetResolver {
                     }
                     default -> { }
                 }
+            }
+            if (opcode == Opcodes.INVOKEVIRTUAL && UNSAFE.equals(owner)
+                    && "(Ljava/lang/Class;Ljava/lang/String;)J".equals(descriptor) && "objectFieldOffset".equals(name)) {
+                Object field = pop();
+                Object recv = pop();
+                pop();
+                push(recv instanceof Type r && r.isReference() && field instanceof String f
+                        ? new Target(Kind.INSTANCE_FIELD, r.getClassName(), f, null) : UNKNOWN);
+                return;
+            }
+            if (opcode == Opcodes.INVOKESTATIC && UPDATER.equals(owner) && "newUpdater".equals(name)
+                    && "(Ljava/lang/Class;Ljava/lang/Class;Ljava/lang/String;)Ljava/util/concurrent/atomic/AtomicReferenceFieldUpdater;".equals(descriptor)) {
+                Object field = pop();
+                Object type = pop();
+                Object recv = pop();
+                push(fieldTarget(Kind.INSTANCE_FIELD, recv, field, type));
+                return;
             }
             if (opcode == Opcodes.INVOKESTATIC && MH_UTIL.equals(owner) && "findVarHandle".equals(name)) {
                 if ("(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;Ljava/lang/Class;)Ljava/lang/invoke/VarHandle;".equals(descriptor)) {

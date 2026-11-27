@@ -92,17 +92,20 @@ final class DeadCodeFilter extends MethodVisitor {
         @Override
         public void visitEnd() {
             Map<Label, Integer> index = new IdentityHashMap<>();
-            for (Object e : events) {
+            List<? extends Object> jnLoop1 = events;
+            for (Object e : jnLoop1) {
                 if (e instanceof Label l) index.putIfAbsent(l, index.size());
             }
             Set<Integer> live = new HashSet<>();
-            for (Label l : targets) {
+            List<? extends Label> jnLoop2 = targets;
+            for (Label l : jnLoop2) {
                 Integer i = index.get(l);
                 if (i != null) live.add(i);
             }
             boolean dead = false;
             boolean found = false;
-            for (Object e : events) {
+            List<? extends Object> jnLoop3 = events;
+            for (Object e : jnLoop3) {
                 if (e instanceof Label l) {
                     if (live.contains(index.get(l))) dead = false;
                 } else if (dead) {

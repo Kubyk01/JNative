@@ -606,10 +606,17 @@ static int64_t inflate_call(InflaterState* s,
         break;
     }
 
+    int whole = s->bitcnt >> 3;
+    if (whole > 0) {
+        s->in_pos -= (size_t)whole;
+        s->bitcnt &= 7;
+        s->bitbuf &= (1u << s->bitcnt) - 1u;
+    }
+
     size_t left = s->in_len - s->in_pos;
     size_t consumed = in_len;
     if (s->state == ST_DONE) {
-        size_t unused = left + (size_t)(s->bitcnt / 8);
+        size_t unused = left;
         consumed = unused >= in_len ? 0 : in_len - unused;
         s->hold_len = 0;
     } else if (starved || status != Z_OK) {

@@ -11,6 +11,9 @@ import java.util.*;
 public class LifetimeAnalysisResult {
     private final Map<AllocationSite, Set<DestructionPoint>> destructionPoints = new HashMap<>();
     private final Set<AllocationSite> unresolved = new HashSet<>();
+    private final Set<AllocationSite> shallowSites = new HashSet<>();
+    private final Set<AllocationSite> frameSites = new HashSet<>();
+    private final Set<AllocationSite> cyclicSites = new HashSet<>();
 
     /**
      * Live-out allocation-site set per basic block, computed by

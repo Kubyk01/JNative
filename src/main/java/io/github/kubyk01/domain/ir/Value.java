@@ -21,11 +21,11 @@ public abstract class Value {
     private final int id;
     private volatile Object pointsTo;
 
-    private static int nextId = 0;
+    private static final java.util.concurrent.atomic.AtomicInteger NEXT_ID = new java.util.concurrent.atomic.AtomicInteger();
 
     protected Value(Type type) {
         this.type = type;
-        this.id = nextId++;
+        this.id = NEXT_ID.getAndIncrement();
     }
 
     public boolean compareAndSetPointsTo(Object expected, Object update) {

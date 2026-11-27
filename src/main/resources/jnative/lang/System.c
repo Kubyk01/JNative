@@ -144,6 +144,7 @@ void __jnative_fn_java_lang_System_arraycopy__Ljava_lang_Object_ILjava_lang_Obje
     char* dstPtr = (char*)jnative_array_data(dest) + (size_t)destPos * (size_t)dstElemSize;
     size_t bytes = (size_t)length * (size_t)srcElemSize;
 
+    if (srcElemSize == (int32_t)sizeof(void*) && __jnative_rc_array_copy(src, srcPos, dest, destPos, length)) return;
     memmove(dstPtr, srcPtr, bytes);
 }
 
@@ -229,7 +230,10 @@ void __jnative_fn_java_lang_System_arraycopy__int_ints(
 
 int32_t __jnative_fn_java_lang_System_identityHashCode__Ljava_lang_Object__I(void* obj) {
     if (obj == NULL) return 0;
-    return (int32_t)((uintptr_t)obj);
+    uint64_t h = (uint64_t)(uintptr_t)obj >> 4;
+    h = (h ^ (h >> 33)) * 0xff51afd7ed558ccdULL;
+    h ^= h >> 33;
+    return (int32_t)h;
 }
 
 /*
@@ -271,19 +275,22 @@ extern void* gv_java_lang_System_err __attribute__((weak));
 
 void __jnative_fn_java_lang_System_setIn0__Ljava_io_InputStream__V(void* in) {
     if (&gv_java_lang_System_in != NULL) {
-        gv_java_lang_System_in = in;
+        __jnative_rc_inc(in);
+        __jnative_rc_dec(__atomic_exchange_n(&gv_java_lang_System_in, in, __ATOMIC_ACQ_REL));
     }
 }
 
 void __jnative_fn_java_lang_System_setOut0__Ljava_io_PrintStream__V(void* out) {
     if (&gv_java_lang_System_out != NULL) {
-        gv_java_lang_System_out = out;
+        __jnative_rc_inc(out);
+        __jnative_rc_dec(__atomic_exchange_n(&gv_java_lang_System_out, out, __ATOMIC_ACQ_REL));
     }
 }
 
 void __jnative_fn_java_lang_System_setErr0__Ljava_io_PrintStream__V(void* err) {
     if (&gv_java_lang_System_err != NULL) {
-        gv_java_lang_System_err = err;
+        __jnative_rc_inc(err);
+        __jnative_rc_dec(__atomic_exchange_n(&gv_java_lang_System_err, err, __ATOMIC_ACQ_REL));
     }
 }
 

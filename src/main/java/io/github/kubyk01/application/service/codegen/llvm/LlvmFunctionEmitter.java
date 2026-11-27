@@ -93,6 +93,7 @@ public class LlvmFunctionEmitter {
     private final Set<Value> tryCrossingValues = new HashSet<>();
 
     private int tmpCounter = 0;
+    private int rcHoldCount;
     private int labelCounter = 0;
     private BasicBlock currentEntryBlock;
     private String currentFunctionName;
@@ -177,6 +178,11 @@ public class LlvmFunctionEmitter {
         }
 
         currentEntryBlock = func.getEntryBlock();
+        rcHoldCount = func.getRcHolds();
+        if (rcHoldCount == 0 && func.getBlocks().stream().flatMap(block -> block.getInstructions().stream())
+                .anyMatch(inst -> inst.isStackAllocated() || inst.isRcStore() || inst.isRcWeak())) {
+            rcHoldCount = 1;
+        }
         buildTryCatchInfo(func);
         computeTryRegions(func);
         tryCrossingValues.addAll(computeTryCrossingValues(func));
@@ -225,6 +231,9 @@ public class LlvmFunctionEmitter {
 
         for (String decl : pendingSlotDeclarations) {
             sb.append(decl);
+        }
+        if (rcHoldCount > 0) {
+            sb.append("  %jn_holds = call i8** @__jnative_rc_frame_enter(i32 ").append(rcHoldCount).append(")\n");
         }
 
         sb.append(bodies.get(entryIdx));
@@ -317,7 +326,8 @@ public class LlvmFunctionEmitter {
                 body = GraphUtils.getBlocksBetween(startBlock, endBlock, handlerBlock);
             }
 
-            for (BasicBlock b : body) {
+            List<? extends BasicBlock> jnLoop7 = body;
+            for (BasicBlock b : jnLoop7) {
                 if (b == handlerBlock) continue;
                 blockToTryRanges.computeIfAbsent(b, x -> new ArrayList<>()).add(range);
             }
@@ -389,8 +399,8 @@ public class LlvmFunctionEmitter {
             tryRegionExit.put(block, isExit);
         }
 
-        List<BasicBlock> snapshot = new ArrayList<>(func.getBlocks());
-        for (BasicBlock block : snapshot) {
+        List<? extends BasicBlock> jnLoop9 = new ArrayList<>(func.getBlocks());
+        for (BasicBlock block : jnLoop9) {
             List<TryCatchRange> myRanges = effectiveRangesFor(block);
             if (myRanges.isEmpty()) continue;
             if (!tryRegionExit.getOrDefault(block, false)) continue;
@@ -447,7 +457,8 @@ public class LlvmFunctionEmitter {
             while (!worklist.isEmpty()) {
                 BasicBlock cur = worklist.poll();
                 if (!catchReachable.add(cur)) continue;
-                for (BasicBlock succ : successorsOf(cur)) {
+                List<? extends BasicBlock> jnLoop11 = successorsOf(cur);
+                for (BasicBlock succ : jnLoop11) {
                     if (!catchReachable.contains(succ)) worklist.add(succ);
                 }
             }
@@ -460,7 +471,8 @@ public class LlvmFunctionEmitter {
                 }
                 Terminator term = useBlock.getTerminator();
                 if (term != null) {
-                    for (Value op : terminatorOperands(term)) {
+                    List<? extends Value> jnLoop13 = terminatorOperands(term);
+                    for (Value op : jnLoop13) {
                         addIfCrossing(result, op, useBlock, catchReachable, entry, entryHasBodyLabel);
                     }
                 }
@@ -594,9 +606,42 @@ public class LlvmFunctionEmitter {
             }
         }
 
+        List<Instruction> pendingPhiHolds = new ArrayList<>();
         for (Instruction inst : block.getInstructions()) {
+            if (inst.getOpcode() != Opcode.PHI && !pendingPhiHolds.isEmpty()) {
+                for (Instruction phi : pendingPhiHolds) emitHold(sb, phi, phi.getResult());
+                pendingPhiHolds.clear();
+            }
             sb.append(emitInstruction(inst, List.of()));
+            if (inst.getRcHold() < 0 || rcHoldCount == 0) continue;
+            switch (inst.getOpcode()) {
+                case PHI -> pendingPhiHolds.add(inst);
+                case NEW -> {
+                    boolean held = emitHold(sb, inst, inst.getResult());
+                    // An object stored only in a weak field never gets a last strong decrement.
+                    if (held && (inst.isRcWeak() || inst.isRcBirthDrop()) && !inst.isStackAllocated()) {
+                        String object = asPointer(sb, inst.getResult());
+                        sb.append("  call void @__jnative_rc_drop(i8* ").append(object).append(")\n");
+                    }
+                }
+                case INVOKEDYNAMIC -> {
+                    boolean held = emitHold(sb, inst, inst.getResult());
+                    if (held && inst.isRcBirthDrop() && !inst.isStackAllocated()) {
+                        String object = asPointer(sb, inst.getResult());
+                        sb.append("  call void @__jnative_rc_drop(i8* ").append(object).append(")\n");
+                    }
+                }
+                case NEW_ARRAY -> {
+                    if (!inst.isRcManagedArray()) emitHold(sb, inst, inst.getResult());
+                }
+                case STORE -> emitHold(sb, inst, inst.getOperands().getFirst());
+                case GET_FIELD, ALOAD, GET_STATIC -> { }
+                default -> {
+                    if (!(inst.isPolymorphicSignature() && heldInline.contains(inst))) emitHold(sb, inst, inst.getResult());
+                }
+            }
         }
+        for (Instruction phi : pendingPhiHolds) emitHold(sb, phi, phi.getResult());
 
         Map<BasicBlock, String> targetRedirects = Collections.emptyMap();
         if (isExit && !ranges.isEmpty()) {
@@ -628,6 +673,7 @@ public class LlvmFunctionEmitter {
             sb.append(emitTerminator(term, List.of(), targetRedirects));
         } else {
             Type retType = block.getFunction().getReturnType();
+            sb.append(rcExit(sb, null));
             if (retType.isVoid()) {
                 sb.append("  ret void\n");
             } else {
@@ -637,6 +683,45 @@ public class LlvmFunctionEmitter {
             }
         }
         return sb.toString();
+    }
+
+    private final Set<Instruction> heldInline = Collections.newSetFromMap(new IdentityHashMap<>());
+
+    private String holdPointer(StringBuilder sb, Instruction inst) {
+        if (rcHoldCount == 0 || inst.getRcHold() < 0) return null;
+        String hp = newAux("rc_hp");
+        sb.append("  ").append(hp).append(" = getelementptr i8*, i8** %jn_holds, i64 ").append(inst.getRcHold()).append("\n");
+        return hp;
+    }
+
+    private boolean emitHold(StringBuilder sb, Instruction inst, Value value) {
+        if (value == null || value.getType() == null) return false;
+        Type t = value.getType();
+        if (!(t.isReference() || t.isArray() || t.isNull() || t.isUnknown())) return false;
+        String ref = castValueToType(sb, getLlvmValue(sb, value), t, Type.reference("java/lang/Object"));
+        String hp = holdPointer(sb, inst);
+        if (hp == null) return false;
+        sb.append("  call void @__jnative_rc_hold(i8** ").append(hp).append(", i8* ").append(ref).append(")\n");
+        return true;
+    }
+
+    private boolean emitHeldLoad(StringBuilder sb, Instruction inst, String resultName, String llvmType, String typedPointer) {
+        if (!"i8*".equals(llvmType)) return false;
+        String hp = holdPointer(sb, inst);
+        if (hp == null) return false;
+        String load = inst.isRcWeak() ? "__jnative_weak_load" : "__jnative_rc_load";
+        sb.append("  ").append(resultName).append(" = call i8* @").append(load).append("(i8** ").append(typedPointer)
+                .append(", i8** ").append(hp).append(")\n");
+        return true;
+    }
+
+    private String rcExit(StringBuilder sb, Value retVal) {
+        if (rcHoldCount == 0) return "";
+        String ret = "null";
+        if (retVal != null && retVal.getType() != null && (retVal.getType().isReference() || retVal.getType().isArray())) {
+            ret = castValueToType(sb, getLlvmValue(sb, retVal), retVal.getType(), Type.reference("java/lang/Object"));
+        }
+        return "  call void @__jnative_rc_frame_exit(i8** %jn_holds, i32 " + rcHoldCount + ", i8* " + ret + ")\n";
     }
 
     private String getZeroValue(Type type) {
@@ -1062,6 +1147,7 @@ public class LlvmFunctionEmitter {
                     String ptrCast = newAux("ptrcast");
                     sb.append("  ").append(ptrCast).append(" = bitcast i8* ").append(gep)
                             .append(" to ").append(fieldLlvm).append("*\n");
+                    if (emitHeldLoad(sb, inst, resultName, fieldLlvm, ptrCast)) break;
                     sb.append("  ").append(resultName).append(" = load ").append(fieldLlvm)
                             .append(", ").append(fieldLlvm).append("* ").append(ptrCast).append("\n");
                     break;
@@ -1095,8 +1181,12 @@ public class LlvmFunctionEmitter {
                 String ptrCast = newAux("ptrcast");
                 sb.append("  ").append(ptrCast).append(" = bitcast i8* ").append(gep)
                         .append(" to ").append(fieldLlvm).append("*\n");
-                sb.append("  ").append(resultName).append(" = load ").append(fieldLlvm)
-                        .append(", ").append(fieldLlvm).append("* ").append(ptrCast).append("\n");
+                boolean volatileField = globalEmitter.isVolatileField(owner, fieldName);
+                if (!emitHeldLoad(sb, inst, resultName, fieldLlvm, ptrCast)) {
+                    sb.append("  ").append(resultName).append(volatileField ? " = load volatile " : " = load ")
+                            .append(fieldLlvm).append(", ").append(fieldLlvm).append("* ").append(ptrCast).append("\n");
+                }
+                if (volatileField) sb.append("  fence acquire\n");
                 break;
             }
 
@@ -1127,6 +1217,10 @@ public class LlvmFunctionEmitter {
                     String ptrCast = newAux("ptrcast");
                     sb.append("  ").append(ptrCast).append(" = bitcast i8* ").append(gep)
                             .append(" to ").append(fieldLlvm).append("*\n");
+                    if (inst.isRcStore() && "i8*".equals(fieldLlvm)) {
+                        emitCountedStore(sb, "i8** " + ptrCast, rhsConverted, baseI8);
+                        break;
+                    }
                     sb.append("  store ").append(fieldLlvm).append(" ").append(rhsConverted)
                             .append(", ").append(fieldLlvm).append("* ").append(ptrCast).append("\n");
                     break;
@@ -1165,8 +1259,19 @@ public class LlvmFunctionEmitter {
                 String ptrCast = newAux("ptrcast");
                 sb.append("  ").append(ptrCast).append(" = bitcast i8* ").append(gep)
                         .append(" to ").append(fieldLlvm).append("*\n");
-                sb.append("  store ").append(fieldLlvm).append(" ").append(rhsConverted)
-                        .append(", ").append(fieldLlvm).append("* ").append(ptrCast).append("\n");
+                boolean volatileField = globalEmitter.isVolatileField(owner, fieldName);
+                if (volatileField) sb.append("  fence release\n");
+                if (inst.isRcWeak()) {
+                    sb.append("  call void @__jnative_weak_store(i8** ").append(ptrCast)
+                            .append(", i8* ").append(rhsConverted).append(")\n");
+                } else if (inst.isRcStore() && "i8*".equals(fieldLlvm)) {
+                    emitCountedStore(sb, "i8** " + ptrCast, rhsConverted, baseI8);
+                    break;
+                } else {
+                    sb.append(volatileField ? "  store volatile " : "  store ").append(fieldLlvm).append(" ").append(rhsConverted)
+                            .append(", ").append(fieldLlvm).append("* ").append(ptrCast).append("\n");
+                }
+                if (volatileField) sb.append("  fence seq_cst\n");
                 break;
             }
 
@@ -1204,9 +1309,13 @@ public class LlvmFunctionEmitter {
                     fieldType = inst.getResult().getType();
                 }
                 String llvmType = LlvmTypeMapper.toLlvmType(fieldType);
-                sb.append("  ").append(resultName).append(" = load ")
-                        .append(llvmType).append(", ")
-                        .append(llvmType).append("* @").append(globalName).append("\n");
+                boolean volatileField = globalEmitter.isVolatileField(owner, bareField);
+                if (!emitHeldLoad(sb, inst, resultName, llvmType, "@" + globalName)) {
+                    sb.append("  ").append(resultName).append(volatileField ? " = load volatile " : " = load ")
+                            .append(llvmType).append(", ")
+                            .append(llvmType).append("* @").append(globalName).append("\n");
+                }
+                if (volatileField) sb.append("  fence acquire\n");
                 break;
             }
 
@@ -1245,8 +1354,18 @@ public class LlvmFunctionEmitter {
                     String rhsConverted = castValueToType(sb, rhsRef, rhs.getType(), fieldType);
                     String llvmType = LlvmTypeMapper.toLlvmType(fieldType);
 
-                    sb.append("  store ").append(llvmType).append(" ").append(rhsConverted)
+                    boolean volatileField = globalEmitter.isVolatileField(owner, bareField);
+                    if (volatileField) sb.append("  fence release\n");
+                    if (inst.isRcStore() && "i8*".equals(llvmType)) {
+                        emitCountedStore(sb, "i8** @" + globalName, rhsConverted);
+                        if (globalEmitter.isFinalStaticField(owner, bareField)) {
+                            sb.append("  call void @__jnative_rc_pin(i8* ").append(rhsConverted).append(")\n");
+                        }
+                        break;
+                    }
+                    sb.append(volatileField ? "  store volatile " : "  store ").append(llvmType).append(" ").append(rhsConverted)
                             .append(", ").append(llvmType).append("* @").append(globalName).append("\n");
+                    if (volatileField) sb.append("  fence seq_cst\n");
                 }
                 break;
             }
@@ -2196,6 +2315,8 @@ public class LlvmFunctionEmitter {
                     String allocName = newAux("stack_alloc");
                     pendingSlotDeclarations.add(
                             "  " + allocName + " = alloca " + structType + ", align 8\n");
+                    String cleanup = newAux("stack_cleanup");
+                    pendingSlotDeclarations.add("  " + cleanup + " = alloca [2 x i8*], align 8\n");
 
                     String gepReg = newAux("alloc_gep");
                     sb.append("  ").append(gepReg)
@@ -2233,6 +2354,11 @@ public class LlvmFunctionEmitter {
                     valuePointers.put(inst.getResult(),
                             new StackAlloc(allocName, structType));
                     valueMapper.setValue(inst.getResult(), null);
+                    String cleanupPtr = newAux("stack_cleanup_ptr");
+                    sb.append("  ").append(cleanupPtr).append(" = bitcast [2 x i8*]* ")
+                            .append(cleanup).append(" to i8**\n");
+                    sb.append("  call void @__jnative_rc_stack_push(i8* ").append(i8Ptr)
+                            .append(", i8** ").append(cleanupPtr).append(")\n");
                     break;
                 }
 
@@ -2305,6 +2431,17 @@ public class LlvmFunctionEmitter {
                 int elemSize = getElementSizeOfType(elemType);
 
                 String sizeRef = coerceSizeToInt(sb, sizeVal, getLlvmValue(sb, sizeVal));
+                String arrClassName = arrayClassDescriptorFor(elemTypeName);
+                if (arrClassName == null) arrClassName = "[Ljava/lang/Object;";
+                String arrClassRef = globalEmitter.getRefClassGlobalName(arrClassName);
+
+                if (inst.isRcManagedArray()) {
+                    String hold = holdPointer(sb, inst);
+                    sb.append("  ").append(resultName).append(" = call i8* @__jnative_rc_new_array(")
+                            .append("i8* bitcast (%ReflectionClass* ").append(arrClassRef).append(" to i8*), i32 ")
+                            .append(sizeRef).append(", i32 ").append(elemSize).append(", i8** ").append(hold).append(")\n");
+                    break;
+                }
 
                 String totalSize = newAux("total_size");
                 sb.append("  ").append(totalSize).append(" = mul i32 ")
@@ -2343,10 +2480,6 @@ public class LlvmFunctionEmitter {
                             .append(" = call i8* @calloc(i64 1, i64 ")
                             .append(allocSize).append(")\n");
                 }
-
-                String arrClassName = arrayClassDescriptorFor(elemTypeName);
-                if (arrClassName == null) arrClassName = "[Ljava/lang/Object;";
-                String arrClassRef = globalEmitter.getRefClassGlobalName(arrClassName);
 
                 String klassPtr = newAux("klass_ptr");
                 sb.append("  ").append(klassPtr).append(" = bitcast i8* ").append(allocReg)
@@ -2609,6 +2742,7 @@ public class LlvmFunctionEmitter {
                 String llvmType = LlvmTypeMapper.toLlvmType(elemType);
                 sb.append("  ").append(ptrCast).append(" = bitcast i8* ").append(elemPtr)
                         .append(" to ").append(llvmType).append("*\n");
+                if (emitHeldLoad(sb, inst, resultName, llvmType, ptrCast)) break;
                 sb.append("  ").append(resultName).append(" = load ").append(llvmType)
                         .append(", ").append(llvmType).append("* ").append(ptrCast).append("\n");
                 break;
@@ -2651,6 +2785,10 @@ public class LlvmFunctionEmitter {
                     String valConverted = castValueToType(sb, valRef, val.getType(), elemType);
                     sb.append("  ").append(ptrCast).append(" = bitcast i8* ").append(elemPtr)
                             .append(" to ").append(llvmType).append("*\n");
+                    if (inst.isRcStore() && "i8*".equals(llvmType)) {
+                        emitCountedStore(sb, "i8** " + ptrCast, valConverted);
+                        break;
+                    }
                     sb.append("  store ").append(llvmType).append(" ").append(valConverted)
                             .append(", ").append(llvmType).append("* ").append(ptrCast).append("\n");
                 }
@@ -2874,7 +3012,8 @@ public class LlvmFunctionEmitter {
                     case "getAndBitwiseOr" -> rmwOp = (isRef || isFloat) ? null : "or";
                     case "getAndBitwiseAnd" -> rmwOp = (isRef || isFloat) ? null : "and";
                     case "getAndBitwiseXor" -> rmwOp = (isRef || isFloat) ? null : "xor";
-                    default -> rmwOp = null;
+                    default -> {
+                    }
                 }
                 if (rmwOp == null) return false;
                 valueCount = 1;
@@ -2895,11 +3034,13 @@ public class LlvmFunctionEmitter {
         if (args.size() != coordinateCount + valueCount) return false;
 
         String slot = newAux("vh_slot");
+        String selfBase = null;
         switch (target.kind()) {
             case INSTANCE_FIELD -> {
                 Value obj = args.getFirst();
                 emitNullCheck(sb, obj, ranges, "field '" + target.owner() + "." + target.fieldName() + "'");
                 String base = emitBaseToI8Pointer(sb, obj);
+                selfBase = base;
                 int offset = globalEmitter.getFieldOffset(target.owner(), target.fieldName());
                 sb.append("  ").append(slot).append(" = getelementptr i8, i8* ").append(base)
                         .append(", i32 ").append(offset).append("\n");
@@ -2945,13 +3086,35 @@ public class LlvmFunctionEmitter {
         String out = null;
         Type outType = vt;
 
-        if (loadOrder != null) {
+        if (loadOrder != null && "i8*".equals(memTy) && inst.getRcHold() >= 0 && rcHoldCount > 0) {
+            String ptr = vhTypedPointer(sb, slot, memTy);
+            String loaded = newAux("vh_load");
+            emitHeldLoad(sb, inst, loaded, memTy, ptr);
+            heldInline.add(inst);
+            out = loaded;
+        } else if (casSuccess != null && exchange && "i8*".equals(casTy)) {
+            String ptr = vhTypedPointer(sb, slot, casTy);
+            String expected = vhMemoryToCas(sb, vhToMemory(sb, values.get(0), vt), memTy, casTy);
+            String desired = vhMemoryToCas(sb, vhToMemory(sb, values.get(1), vt), memTy, casTy);
+            String hp = holdPointer(sb, inst);
+            String witness = newAux("vh_witness");
+            sb.append("  ").append(witness).append(" = call i8* @__jnative_rc_cae_in(i8** ").append(ptr)
+                    .append(", i8* ").append(expected).append(", i8* ").append(desired)
+                    .append(", i8** ").append(hp == null ? "null" : hp)
+                    .append(", i8* ").append(selfBase == null ? "null" : selfBase).append(")\n");
+            if (hp != null) heldInline.add(inst);
+            out = witness;
+        } else if (loadOrder != null) {
             String ptr = vhTypedPointer(sb, slot, memTy);
             String loaded = newAux("vh_load");
             sb.append("  ").append(loaded).append(" = load atomic ").append(memTy).append(", ")
                     .append(memTy).append("* ").append(ptr).append(" ").append(loadOrder)
                     .append(", align ").append(align).append("\n");
             out = vhFromMemory(sb, loaded, vt);
+        } else if (storeOrder != null && "i8*".equals(memTy)) {
+            String ptr = vhTypedPointer(sb, slot, memTy);
+            String v = vhToMemory(sb, values.getFirst(), vt);
+            emitCountedStore(sb, "i8** " + ptr, v, selfBase);
         } else if (storeOrder != null) {
             String ptr = vhTypedPointer(sb, slot, memTy);
             String v = vhToMemory(sb, values.getFirst(), vt);
@@ -2963,6 +3126,13 @@ public class LlvmFunctionEmitter {
             String expected = vhMemoryToCas(sb, vhToMemory(sb, values.get(0), vt), memTy, casTy);
             String desired = vhMemoryToCas(sb, vhToMemory(sb, values.get(1), vt), memTy, casTy);
             String pair = newAux("vh_cas");
+            String countedDesired = desired;
+            String countedExpected = expected;
+            if ("i8*".equals(casTy)) {
+                countedDesired = unlessSelf(sb, desired, selfBase);
+                countedExpected = unlessSelf(sb, expected, selfBase);
+                sb.append("  call void @__jnative_rc_inc(i8* ").append(countedDesired).append(")\n");
+            }
             sb.append("  ").append(pair).append(" = cmpxchg ");
             if (weak) sb.append("weak ");
             sb.append(casTy).append("* ").append(ptr)
@@ -2970,6 +3140,15 @@ public class LlvmFunctionEmitter {
                     .append(", ").append(casTy).append(" ").append(desired)
                     .append(" ").append(casSuccess).append(" ").append(casFailure)
                     .append(", align ").append(align).append("\n");
+            if ("i8*".equals(casTy)) {
+                String swapped = newAux("vh_swapped");
+                sb.append("  ").append(swapped).append(" = extractvalue { ").append(casTy)
+                        .append(", i1 } ").append(pair).append(", 1\n");
+                String swappedI32 = newAux("vh_swapped32");
+                sb.append("  ").append(swappedI32).append(" = zext i1 ").append(swapped).append(" to i32\n");
+                sb.append("  call void @__jnative_rc_cas(i32 ").append(swappedI32).append(", i8* ").append(countedDesired)
+                        .append(", i8* ").append(countedExpected).append(")\n");
+            }
             if (exchange) {
                 String witness = newAux("vh_witness");
                 sb.append("  ").append(witness).append(" = extractvalue { ").append(casTy)
@@ -2986,9 +3165,22 @@ public class LlvmFunctionEmitter {
             String ptr = vhTypedPointer(sb, slot, memTy);
             String v = vhToMemory(sb, values.getFirst(), vt);
             String old = newAux("vh_old");
+            if ("i8*".equals(memTy)) {
+                String countedValue = unlessSelf(sb, v, selfBase);
+                sb.append("  call void @__jnative_rc_inc(i8* ").append(countedValue).append(")\n");
+            }
             sb.append("  ").append(old).append(" = atomicrmw ").append(rmwOp).append(" ")
                     .append(memTy).append("* ").append(ptr).append(", ").append(memTy).append(" ").append(v)
                     .append(" ").append(rmwOrder).append(", align ").append(align).append("\n");
+            if ("i8*".equals(memTy)) {
+                String hp = holdPointer(sb, inst);
+                if (hp != null) {
+                    sb.append("  call void @__jnative_rc_hold(i8** ").append(hp).append(", i8* ").append(old).append(")\n");
+                    heldInline.add(inst);
+                }
+                String countedOld = unlessSelf(sb, old, selfBase);
+                sb.append("  call void @__jnative_rc_dec(i8* ").append(countedOld).append(")\n");
+            }
             out = vhFromMemory(sb, old, vt);
         }
 
@@ -2996,6 +3188,36 @@ public class LlvmFunctionEmitter {
             valueMapper.setValue(inst.getResult(), castValueToType(sb, out, outType, retType));
         }
         return true;
+    }
+
+    private String unlessSelf(StringBuilder sb, String value, String self) {
+        if (self == null) return value;
+        String same = newAux("rc_self");
+        sb.append("  ").append(same).append(" = icmp eq i8* ").append(value).append(", ").append(self).append("\n");
+        String counted = newAux("rc_counted");
+        sb.append("  ").append(counted).append(" = select i1 ").append(same).append(", i8* null, i8* ")
+                .append(value).append("\n");
+        return counted;
+    }
+
+    private void emitCountedStore(StringBuilder sb, String typedPointer, String value) {
+        emitCountedStore(sb, typedPointer, value, null);
+    }
+
+    private void emitCountedStore(StringBuilder sb, String typedPointer, String value, String self) {
+        String countedValue = unlessSelf(sb, value, self);
+        sb.append("  call void @__jnative_rc_inc(i8* ").append(countedValue).append(")\n");
+        String slot = newAux("rc_slot");
+        sb.append("  ").append(slot).append(" = bitcast ").append(typedPointer).append(" to i64*\n");
+        String fresh = newAux("rc_new");
+        sb.append("  ").append(fresh).append(" = ptrtoint i8* ").append(value).append(" to i64\n");
+        String old = newAux("rc_old");
+        sb.append("  ").append(old).append(" = atomicrmw xchg i64* ").append(slot).append(", i64 ").append(fresh)
+                .append(" seq_cst\n");
+        String oldPtr = newAux("rc_oldp");
+        sb.append("  ").append(oldPtr).append(" = inttoptr i64 ").append(old).append(" to i8*\n");
+        String countedOld = unlessSelf(sb, oldPtr, self);
+        sb.append("  call void @__jnative_rc_dec(i8* ").append(countedOld).append(")\n");
     }
 
     private String vhTypedPointer(StringBuilder sb, String slot, String ty) {
@@ -3257,12 +3479,14 @@ public class LlvmFunctionEmitter {
         sb.append("  store i8* ").append(vtablePtr).append(", i8** ")
                 .append(objVtableSlot).append("\n");
 
-        int offset = 8;
-        for (Value cap : captured) {
+        int[] offsets = LlvmGlobalEmitter.lambdaCaptureOffsets(capturedTypes);
+        boolean countCaptures = globalEmitter.countsLambdaCaptures();
+        for (int i = 0; i < captured.size(); i++) {
+            Value cap = captured.get(i);
             String fieldLlvm = LlvmTypeMapper.toLlvmType(cap.getType());
             String fieldPtr = newAux("cap_ptr");
             sb.append("  ").append(fieldPtr).append(" = getelementptr i8, i8* ").append(alloc)
-                    .append(", i64 ").append(offset).append("\n");
+                    .append(", i64 ").append(offsets[i]).append("\n");
             String castPtr = newAux("cap_cast");
             sb.append("  ").append(castPtr).append(" = bitcast i8* ").append(fieldPtr)
                     .append(" to ").append(fieldLlvm).append("*\n");
@@ -3270,7 +3494,10 @@ public class LlvmFunctionEmitter {
             String valConverted = castValueToType(sb, valRef, cap.getType(), cap.getType());
             sb.append("  store ").append(fieldLlvm).append(" ").append(valConverted)
                     .append(", ").append(fieldLlvm).append("* ").append(castPtr).append("\n");
-            offset += getElementSizeOfType(cap.getType());
+            if (countCaptures && "i8*".equals(fieldLlvm)) {
+                sb.append("  call void @__jnative_rc_capture(i8* ").append(alloc).append(", i8* ")
+                        .append(valConverted).append(")\n");
+            }
         }
 
         if (inst.getResult() != null && resultName != null) {
@@ -3653,6 +3880,7 @@ public class LlvmFunctionEmitter {
         if (term instanceof ReturnTerminator rt) {
             Value retVal = rt.getValue();
             Type funcRetType = term.getBlock().getFunction().getReturnType();
+            sb.append(rcExit(sb, retVal));
             if (retVal != null) {
                 String valRef = getLlvmValue(sb, retVal);
                 valRef = castValueToType(sb, valRef, retVal.getType(), funcRetType);
@@ -4297,7 +4525,7 @@ public class LlvmFunctionEmitter {
         if (internalName == null || internalName.isEmpty()) return false;
         ClassLoader cl = Thread.currentThread().getContextClassLoader();
         String candidate = internalName;
-        while (candidate != null && !candidate.isEmpty()) {
+        while (!candidate.isEmpty()) {
             String base = candidate.startsWith("java/")
                     ? "jnative/" + candidate.substring("java/".length())
                     : "jnative/" + candidate;
@@ -4333,7 +4561,8 @@ public class LlvmFunctionEmitter {
             return 1;
         }
         int n = 0;
-        for (MethodNode mn : cn.getMethods()) {
+        List<? extends MethodNode> jnLoop21 = cn.getMethods();
+        for (MethodNode mn : jnLoop21) {
             if (mn.getName().equals(methodName)) {
                 n++;
             }
@@ -4348,7 +4577,8 @@ public class LlvmFunctionEmitter {
         ClassNode cur = cls;
         java.util.Set<String> seen = new java.util.HashSet<>();
         while (cur != null && !cur.isExternal() && seen.add(cur.getName())) {
-            for (FieldNode f : cur.getFields()) {
+            List<? extends FieldNode> jnLoop22 = cur.getFields();
+            for (FieldNode f : jnLoop22) {
                 if ((f.getAccess() & org.objectweb.asm.Opcodes.ACC_STATIC) != 0) continue;
                 if ((f.getAccess() & org.objectweb.asm.Opcodes.ACC_FINAL) == 0) return false;
             }

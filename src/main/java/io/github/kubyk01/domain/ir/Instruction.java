@@ -23,6 +23,16 @@ public class Instruction {
     private boolean polymorphicSignature;
     @Setter
     private boolean stackAllocated;
+    @Setter
+    private boolean rcStore;
+    @Setter
+    private boolean rcWeak;
+    @Setter
+    private boolean rcManagedArray;
+    @Setter
+    private boolean rcBirthDrop;
+    @Setter
+    private int rcHold = -1;
 
     public Instruction(Opcode opcode) {
         this.opcode = opcode;

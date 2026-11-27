@@ -228,6 +228,7 @@ void* __jnative_override_sun_util_calendar_ZoneInfoFile_getZoneInfo0(
             "ZoneInfoFile.getZoneInfo0: ZoneInfo.ID / ZoneInfo.rawOffset missing from the reflection metadata");
         __jnative_throw_exception(exc);
     }
+    __jnative_rc_inc(zone_id_str);
     *(void**)((char*)zi + id_off) = zone_id_str;
     *(int32_t*)((char*)zi + raw_off) = raw_offset_ms;
 

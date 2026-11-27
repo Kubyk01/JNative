@@ -23,16 +23,18 @@ public class TryCatchHandler {
         if (n == 0) return;
 
         List<List<BasicBlock>> bodies = new ArrayList<>(n);
-        for (TryCatchInfo info : tryCatchBlocks) {
-            BasicBlock startBlock   = labelToBlock.get(info.start);
-            BasicBlock endBlock     = labelToBlock.get(info.end);
-            BasicBlock handlerBlock = labelToBlock.get(info.handler);
-            if (startBlock == null || endBlock == null || handlerBlock == null) {
-                bodies.add(null);
-                continue;
-            }
-            bodies.add(GraphUtils.getBlocksBetween(
+        {
+            for (TryCatchInfo info : tryCatchBlocks) {
+                BasicBlock startBlock = labelToBlock.get(info.start);
+                BasicBlock endBlock = labelToBlock.get(info.end);
+                BasicBlock handlerBlock = labelToBlock.get(info.handler);
+                if (startBlock == null || endBlock == null || handlerBlock == null) {
+                    bodies.add(null);
+                    continue;
+                }
+                bodies.add(GraphUtils.getBlocksBetween(
                     startBlock, endBlock, handlerBlock));
+            }
         }
 
         for (int i = 0; i < n; i++) {
@@ -43,12 +45,13 @@ public class TryCatchHandler {
             BasicBlock handlerBlock = labelToBlock.get(info.handler);
             if (handlerBlock == null) continue;
 
-            for (BasicBlock b : tryBlocks) {
+            {
+                for (int jnIdx2 = 0; jnIdx2 < tryBlocks.size(); jnIdx2++) { BasicBlock b = ((List<? extends BasicBlock>) tryBlocks).get(jnIdx2);
                 if (b == handlerBlock) continue;
                 if (!b.getSuccessors().contains(handlerBlock)) {
                     b.addExceptionalSuccessor(handlerBlock);
                 }
-            }
+            } }
         }
     }
 

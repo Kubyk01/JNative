@@ -811,6 +811,8 @@ extern void** __jnative_lookup_itable(JNativeIfaceMap* ifacemap, int32_t iface_i
 
 extern void __jnative_monitor_enter(void* obj);
 extern void __jnative_monitor_exit(void* obj);
+extern void __jnative_monitor_wait(void* obj, int64_t timeout_ms);
+extern void __jnative_monitor_notify(void* obj, int all);
 
 /* ============================================================================
  *  Safe deallocation of Java reference fields.
@@ -908,10 +910,8 @@ extern void __jnative_destruct_dispatch_if_not_same(void* old_val,
  * pass safe against both shapes.
  *
  *   __jnative_begin_shutdown()
- *       Activates the machinery for the remainder of the process. Called
- *       once, from the very beginning of fn___jnative_shutdown, before the
- *       first destructor runs. Before it is called the two guards below
- *       are no-ops; ordinary-execution destructor calls pay nothing.
+ *       Activates the machinery for the remainder of the process.
+ *       Callers must arrange for exclusive access to the objects they drop.
  *
  *   __jnative_dtor_enter(this) -> int
  *       Called at the entry of every generated destructor. Returns 1 if
@@ -937,11 +937,8 @@ extern void __jnative_destruct_dispatch_if_not_same(void* old_val,
  * same address in the same shutdown pass is rejected by
  * __jnative_dtor_enter.
  *
- * Threading model: the shutdown pass is single-threaded by construction
- * (atexit runs on the main thread), so the claim stack is thread-local
- * and both operations are lock-free. The freed set is process-wide and
- * protected by a mutex, because it must remain valid if any thread ever
- * invokes a destructor during shutdown (defensive, not needed today).
+ * The claim stack is thread-local. The freed set is process-wide and
+ * protected by a mutex.
  * ========================================================================== */
 
 extern volatile int gv_jnative_in_shutdown;
@@ -955,6 +952,39 @@ extern void __jnative_free_fast(void* p);
 extern void    __jnative_share(void* p);
 extern int32_t __jnative_release_owner(void* p);
 extern void    __jnative_free_owned(void* p);
+extern void    __jnative_free_container(void* p);
+extern void    __jnative_free_container_storage(void* p);
+extern void    __jnative_rc_inc(void* p);
+extern void    __jnative_rc_pin(void* p);
+extern void    __jnative_rc_capture(void* closure, void* value);
+extern void    __jnative_rc_dec(void* p);
+extern void    __jnative_rc_hold(void** hold, void* object);
+extern void    __jnative_rc_thread_exit(void);
+extern void    __jnative_rc_drop(void* p);
+extern void    __jnative_rc_cas(int32_t ok, void* x, void* expected);
+extern void**  __jnative_rc_frame_enter(int32_t n);
+extern void    __jnative_rc_frame_exit(void** holds, int32_t n, void* ret);
+extern void*   __jnative_rc_load(void** addr, void** hold);
+extern void*   __jnative_rc_load_ret(void** addr);
+extern void**  __jnative_rc_ret_slot(void);
+extern void*   __jnative_rc_cae(void** addr, void* expected, void* desired, void** hold);
+extern void*   __jnative_rc_cae_in(void** addr, void* expected, void* desired, void** hold, void* self);
+extern void**  __jnative_referent_slot(void* ref);
+extern void    __jnative_weak_forget(void* ref);
+extern void    __jnative_weak_store(void** slot, void* referent);
+extern void*   __jnative_weak_load(void** slot, void** hold);
+extern void    __jnative_rc_cloned(void* copy);
+extern int32_t __jnative_rc_array_copy(void* src, int32_t srcPos, void* dest, int32_t destPos, int32_t length);
+extern void    __jnative_borrow_enter(void* owner);
+extern void    __jnative_borrow_exit(void);
+extern void    __jnative_replace_array(void* owner, void* old, void* replacement, int32_t mode);
+extern void    __jnative_container_detach_clone(void* clone);
+extern void    __jnative_ebr_pin(void);
+extern void    __jnative_ebr_unpin(void);
+extern void    __jnative_ebr_retire(void* old);
+extern void    __jnative_ebr_retire_if(int32_t ok, void* old);
+extern void    __jnative_ebr_retire_if_same(void* witness, void* old);
+extern void    __jnative_ebr_discard_if(int32_t published, void* unpublished);
 
 /* ---- Exception construction and throwers --------------------------- */
 
@@ -1480,7 +1510,9 @@ static inline void* jnative_make_inet_address(const uint8_t* bytes, int len, con
     void* holder = jnative_alloc_object(h_cls);
     if (holder == NULL) return NULL;
     void* host = jnative_string(hostname);
+    __jnative_rc_inc(host);
     *(void**)((char*)holder + o_orig) = host;
+    __jnative_rc_inc(host);
     *(void**)((char*)holder + o_host) = host;
 
     void* ia;
@@ -1499,10 +1531,14 @@ static inline void* jnative_make_inet_address(const uint8_t* bytes, int len, con
         if (holder6 == NULL) { free(holder); return NULL; }
         ia = jnative_alloc_object(cls);
         if (ia == NULL) { free(holder); free(holder6); return NULL; }
-        *(void**)((char*)holder6 + o_ip) = jnative_byte_array(bytes, 16);
+        void* ip = jnative_byte_array(bytes, 16);
+        __jnative_rc_inc(ip);
+        *(void**)((char*)holder6 + o_ip) = ip;
         *(int32_t*)((char*)holder + o_family) = 2;
+        __jnative_rc_inc(holder6);
         *(void**)((char*)ia + o_holder6) = holder6;
     }
+    __jnative_rc_inc(holder);
     *(void**)((char*)ia + o_holder) = holder;
     return ia;
 }
@@ -1516,7 +1552,9 @@ static inline void* jnative_ref_array_of_class(void** items, int32_t count,
     if (count > 0) {
         void** slots = (void**)((char*)arr + JAVA_ARR_HDR);
         for (int32_t i = 0; i < count; i++) {
-            slots[i] = (items != NULL) ? items[i] : NULL;
+            void* item = (items != NULL) ? items[i] : NULL;
+            __jnative_rc_inc(item);
+            slots[i] = item;
         }
     }
     return arr;

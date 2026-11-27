@@ -136,7 +136,8 @@ public final class OutOfSsaPass {
     /** Transforms every function; functions are independent, so they run in parallel on {@code scheduler}. */
     public static void transform(Module module, reactor.core.scheduler.Scheduler scheduler) {
         List<Function> live = new ArrayList<>();
-        for (Function func : module.getFunctions()) {
+        List<? extends Function> jnLoop1 = module.getFunctions();
+        for (Function func : jnLoop1) {
             if (func.getEntryBlock() != null) live.add(func);
         }
         if (scheduler == null) {
@@ -226,7 +227,8 @@ public final class OutOfSsaPass {
 
             // 1. Identify the stale predecessors.
             List<BasicBlock> stale = new ArrayList<>();
-            for (BasicBlock pred : preds) {
+            List<? extends BasicBlock> jnLoop2 = preds;
+            for (BasicBlock pred : jnLoop2) {
                 if (!predecessorActuallyReaches(pred, block)) {
                     stale.add(pred);
                 }
@@ -256,7 +258,8 @@ public final class OutOfSsaPass {
                 Map<BasicBlock, Value> binding = e.getValue();
                 List<Value> ops = phi.getOperands();
                 ops.clear();
-                for (BasicBlock pred : preds) {
+                List<? extends BasicBlock> jnLoop4 = preds;
+                for (BasicBlock pred : jnLoop4) {
                     Value v = binding.get(pred);
                     if (v == null) {
                         throw new IllegalStateException(

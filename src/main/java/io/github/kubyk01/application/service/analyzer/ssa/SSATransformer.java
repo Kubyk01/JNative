@@ -17,6 +17,7 @@ import io.github.kubyk01.domain.ir.ThrowTerminator;
 import io.github.kubyk01.domain.ir.Type;
 import io.github.kubyk01.domain.ir.UndefinedValue;
 import io.github.kubyk01.domain.ir.Value;
+import io.github.kubyk01.util.ScratchIdentityMap;
 import lombok.extern.slf4j.Slf4j;
 
 import java.util.*;
@@ -65,20 +66,36 @@ public class SSATransformer {
         };
     }
 
-    private record SlotKey(int index, int typeClass) {}
-
     // ------------------------------------------------------------------
     //  Transformation state.
     // ------------------------------------------------------------------
 
     /** One version stack per (slot, type class). */
-    private final Map<SlotKey, Deque<Value>> versionStacks = new HashMap<>();
+    private Value[][] verStack = new Value[64][];
+    private int[] verTop = new int[64];
+    private int[] verStamp = new int[64];
+    private int fnStamp;
+    private int[] savedKeys = new int[64];
+    private int[] savedSizes = new int[64];
+    private int[] savedFrame = new int[64];
+    private int savedTop;
+    private int frameCounter;
+    private long[] liveRows = new long[0];
+    private long[] defRows = new long[0];
+    private long[] outRow = new long[0];
+    private long[] unionRow = new long[0];
+    private int[] succStart = new int[1];
+    private int[] succList = new int[0];
+    private int[] phiStamp = new int[0];
+    private int phiCounter;
+    private int[] phiWork = new int[0];
+    private final ScratchIdentityMap<Instruction, Value> phiReplacements = new ScratchIdentityMap<>();
+    private final ScratchIdentityMap<Value, Boolean> usedValues = new ScratchIdentityMap<>();
     /** Version counter per (slot, type class). */
-    private final Map<SlotKey, Integer> versionCounters = new HashMap<>();
     /** Substitution map: "old value -> current SSA version". */
-    private final Map<Value, Value> replacements = new HashMap<>();
+    private final ScratchIdentityMap<Value, Value> replacements = new ScratchIdentityMap<>();
 
-    private DominatorTree domTree;
+    private final DominatorTree domTree = new DominatorTree();
     private Function currentFunction;
 
     /**
@@ -87,7 +104,7 @@ public class SSATransformer {
      * number: the "unsafe" attribute belongs to the slot as a cell,
      * not to its current type.
      */
-    private Set<Integer> unsafeLocals = new HashSet<>();
+    private int[] unsafeStamp = new int[64];
 
     // ------------------------------------------------------------------
     //  Entry point.
@@ -108,13 +125,13 @@ public class SSATransformer {
          * are only meaningful within a single function, so clearing them at
          * entry is not only safe, it is the only correct behaviour.
          */
-        versionStacks.clear();
-        versionCounters.clear();
+        fnStamp++;
+        savedTop = 0;
         replacements.clear();
 
         this.currentFunction = function;
-        this.unsafeLocals = identifyUnsafeLocals(function);
-        domTree = new DominatorTree(function);
+        markUnsafeLocals(function);
+        domTree.reset(function);
 
         initializeStacks(function);
         insertPhiFunctions(function);
@@ -128,8 +145,12 @@ public class SSATransformer {
 
     private void retypeReferencePhis(Function function) {
         List<Instruction> phis = new ArrayList<>();
-        for (BasicBlock block : function.getBlocks()) {
-            for (Instruction inst : block.getInstructions()) {
+        List<BasicBlock> blockList1 = function.getBlocks();
+        List<? extends BasicBlock> jnLoop1 = blockList1;
+        for (BasicBlock block : jnLoop1) {
+            List<Instruction> instList2 = block.getInstructions();
+            List<? extends Instruction> jnLoop2 = instList2;
+            for (Instruction inst : jnLoop2) {
                 if (inst.getOpcode() == Opcode.PHI
                     && inst.getResult() != null
                     && typeBucket(inst.getResult().getType()) == BUCKET_REF) {
@@ -141,9 +162,12 @@ public class SSATransformer {
         boolean changed = true;
         for (int round = 0; changed && round < 64; round++) {
             changed = false;
-            for (Instruction phi : phis) {
+            List<? extends Instruction> jnLoop3 = phis;
+            for (Instruction phi : jnLoop3) {
                 Type joined = null;
-                for (Value incoming : phi.getOperands()) {
+                List<Value> incomingList4 = phi.getOperands();
+                List<? extends Value> jnLoop4 = incomingList4;
+                for (Value incoming : jnLoop4) {
                     if (incoming == null || incoming == phi.getResult()) continue;
                     Type t = incoming.getType();
                     if (t == null || t.isNull() || t.isUnknown()) continue;
@@ -161,23 +185,33 @@ public class SSATransformer {
     //  Identification of "unsafe" slots (essentially unchanged).
     // ------------------------------------------------------------------
 
-    private Set<Integer> identifyUnsafeLocals(Function function) {
-        Set<Integer> unsafe = new HashSet<>();
-        for (BasicBlock block : function.getBlocks()) {
+    private void markUnsafeLocals(Function function) {
+        List<BasicBlock> blocks = function.getBlocks();
+        List<? extends BasicBlock> jnLoop5 = blocks;
+        for (BasicBlock block : jnLoop5) {
             if (block.getExceptionalSuccessors().isEmpty()) continue;
             boolean seenThrowing = false;
-            for (Instruction inst : block.getInstructions()) {
+            List<Instruction> insts = block.getInstructions();
+            List<? extends Instruction> jnLoop6 = insts;
+            for (Instruction inst : jnLoop6) {
                 if (seenThrowing
                     && inst.getOpcode() == Opcode.STORE
                     && inst.getLocalIndex() >= 0) {
-                    unsafe.add(inst.getLocalIndex());
+                    int idx = inst.getLocalIndex();
+                    if (idx >= unsafeStamp.length) {
+                        unsafeStamp = Arrays.copyOf(unsafeStamp, Math.max(idx + 1, unsafeStamp.length << 1));
+                    }
+                    unsafeStamp[idx] = fnStamp;
                 }
                 if (inst.canThrow()) {
                     seenThrowing = true;
                 }
             }
         }
-        return unsafe;
+    }
+
+    private boolean isUnsafe(int idx) {
+        return idx >= 0 && idx < unsafeStamp.length && unsafeStamp[idx] == fnStamp;
     }
 
     // ------------------------------------------------------------------
@@ -198,11 +232,11 @@ public class SSATransformer {
      */
     private void initializeStacks(Function function) {
         BasicBlock entry = function.getEntryBlock();
-        for (Parameter param : function.getParameters()) {
+        List<Parameter> paramList5 = function.getParameters();
+        List<? extends Parameter> jnLoop7 = paramList5;
+        for (Parameter param : jnLoop7) {
             int idx = param.getIndex();
             int bucket = typeBucket(param.getType());
-            SlotKey key = new SlotKey(idx, bucket);
-
             Value version = param;
 
             // The int bucket is the only one where different LLVM widths are possible.
@@ -220,8 +254,7 @@ public class SSATransformer {
                 version = tmp;
             }
 
-            versionStacks.computeIfAbsent(key, k -> new ArrayDeque<>()).push(version);
-            versionCounters.putIfAbsent(key, 0);
+            if (idx >= 0) pushVersion(slotKey(idx, bucket), version);
         }
     }
 
@@ -241,74 +274,158 @@ public class SSATransformer {
      * prints the incoming edges of a PHI.</p>
      */
     private void insertPhiFunctions(Function function) {
-        Map<SlotKey, Set<BasicBlock>> defs = collectDefBlocks(function);
+        int n = computeLiveness(function);
+        if (n == 0) return;
+        int words = outRow.length;
+        if (unionRow.length != words) unionRow = new long[words];
+        long[] defUnion = unionRow;
+        Arrays.fill(defUnion, 0L);
+        for (int i = 0; i < n; i++) {
+            int base = i * words;
+            for (int w = 0; w < words; w++) defUnion[w] |= defRows[base + w];
+        }
+        if (phiStamp.length < n) phiStamp = new int[Math.max(n, phiStamp.length << 1)];
+        if (phiWork.length < 2 * n) phiWork = new int[Math.max(2 * n, phiWork.length << 1)];
+        for (int w = 0; w < words; w++) {
+            long bits = defUnion[w];
+            while (bits != 0) {
+                int bit = (w << 6) | Long.numberOfTrailingZeros(bits);
+                bits &= bits - 1;
+                int slot = bit >>> 3;
+                int bucket = bit & 7;
+                Type phiType = inferSlotTypeForBucket(function, slot, bucket);
+                int stamp = ++phiCounter;
+                int head = 0;
+                int tail = 0;
+                long mask = 1L << (bit & 63);
+                for (int i = 0; i < n; i++) {
+                    if ((defRows[i * words + w] & mask) != 0) phiWork[tail++] = i;
+                }
+                while (head < tail) {
+                    int x = phiWork[head++];
+                    int count = domTree.frontierCount(x);
+                    for (int k = 0; k < count; k++) {
+                        int f = domTree.frontierAt(x, k);
+                        if (phiStamp[f] == stamp) continue;
+                        if ((liveRows[f * words + w] & mask) == 0) continue;
+                        BasicBlock frontier = domTree.blockAt(f);
 
-        // ------------------------------------------------------------------
-        // Liveness per (slot, bucket) — see computeLiveInForPhiInsertion.
-        //
-        // Standard SSA construction ("pruned SSA", Cytron et al.) inserts a
-        // PHI only where the variable is live at the block entry. Without
-        // this check a PHI is created for every definition that reaches the
-        // iterated dominance frontier, regardless of whether the value is
-        // read further down the flow. The classic case is a "fresh local
-        // assigned only inside the loop and read neither before nor after
-        // the assignment": the loop's def block puts the loop header into
-        // the DF, a PHI is created, but its incoming operand on the entry
-        // edge is undefined (the slot has never been assigned). The JVM
-        // verifier allows this precisely because the value is never read —
-        // the PHI is dead by construction.
-        //
-        // The fail-fast in renameBlock (see the previous step) throws an
-        // IllegalStateException naming the slot and the block on such a
-        // PHI. That is a correct reaction to a real bug (broken
-        // dominance), but for dead PHIs it is a false positive — they
-        // simply should not have been created.
-        //
-        // The order of the def blocks and the bucketing must match
-        // collectDefBlocks: it defines the SlotKey, and we gate it by
-        // liveness. Both use the same typeBucket(...) predicate, see the
-        // invariant in the javadoc of collectDefBlocks.
-        // ------------------------------------------------------------------
-        Map<BasicBlock, long[]> liveIn = computeLiveInForPhiInsertion(function);
+                        Instruction phi = new Instruction(Opcode.PHI);
+                        phi.setLocalIndex(slot);
+                        Temporary phiResult = new Temporary(phiType);
+                        phi.setResult(phiResult);
+                        phiResult.setDefiningInstruction(phi);
 
-        for (Map.Entry<SlotKey, Set<BasicBlock>> entry : defs.entrySet()) {
-            SlotKey key = entry.getKey();
-            Set<BasicBlock> defBlocks = entry.getValue();
+                        phi.setParent(frontier);
+                        frontier.getInstructions().addFirst(phi);
 
-            Type phiType = inferSlotTypeForBucket(function, key.index, key.typeClass);
-
-            Set<BasicBlock> hasPhi = new HashSet<>();
-            Queue<BasicBlock> worklist = new LinkedList<>(defBlocks);
-
-            while (!worklist.isEmpty()) {
-                BasicBlock block = worklist.poll();
-                for (BasicBlock frontier : domTree.getDominanceFrontier(block)) {
-                    if (hasPhi.contains(frontier)) continue;
-
-                    long[] frontierLiveIn = liveIn.get(frontier);
-                    if (frontierLiveIn == null
-                        || !isLiveIn(frontierLiveIn, key.index, key.typeClass)) {
-                        continue;
+                        phiStamp[f] = stamp;
+                        if (tail == phiWork.length) phiWork = Arrays.copyOf(phiWork, tail << 1);
+                        phiWork[tail++] = f;
                     }
-
-                    Instruction phi = new Instruction(Opcode.PHI);
-                    phi.setLocalIndex(key.index);
-                    Temporary phiResult = new Temporary(phiType);
-                    phi.setResult(phiResult);
-                    phiResult.setDefiningInstruction(phi);
-
-                    phi.setParent(frontier);
-                    frontier.getInstructions().addFirst(phi);
-
-                    hasPhi.add(frontier);
-                    worklist.add(frontier);
                 }
             }
         }
     }
 
+    private int computeLiveness(Function function) {
+        int n = domTree.size();
+        if (n == 0) return 0;
+        int maxSlot = 0;
+        for (int i = 0; i < n; i++) {
+            List<Instruction> insts = domTree.blockAt(i).getInstructions();
+            for (Instruction inst : insts) {
+                Opcode op = inst.getOpcode();
+                if ((op == Opcode.LOAD || op == Opcode.STORE) && inst.getLocalIndex() > maxSlot) {
+                    maxSlot = inst.getLocalIndex();
+                }
+            }
+        }
+        List<Parameter> params = function.getParameters();
+        List<? extends Parameter> jnLoop8 = params;
+        for (Parameter param : jnLoop8) {
+            if (param.getIndex() > maxSlot) maxSlot = param.getIndex();
+        }
+        int words = (((maxSlot + 1) << 3) + 63) >>> 6;
+        int cells = n * words;
+        if (liveRows.length < cells) {
+            liveRows = new long[Math.max(cells, liveRows.length << 1)];
+            defRows = new long[liveRows.length];
+        }
+        Arrays.fill(liveRows, 0, cells, 0L);
+        Arrays.fill(defRows, 0, cells, 0L);
+        if (outRow.length != words) outRow = new long[words];
+
+        for (int i = 0; i < n; i++) {
+            int base = i * words;
+            List<Instruction> insts = domTree.blockAt(i).getInstructions();
+            List<? extends Instruction> jnLoop9 = insts;
+            for (Instruction inst : jnLoop9) {
+                Opcode op = inst.getOpcode();
+                if (op != Opcode.LOAD && op != Opcode.STORE) continue;
+                int idx = inst.getLocalIndex();
+                if (idx < 0) continue;
+                if (isUnsafe(idx)) continue;
+                Type t = (inst.getResult() != null) ? inst.getResult().getType() : Type.UNKNOWN;
+                int bit = (idx << 3) | typeBucket(t);
+                int at = base + (bit >>> 6);
+                long mask = 1L << (bit & 63);
+                if (op == Opcode.LOAD) {
+                    if ((defRows[at] & mask) == 0) liveRows[at] |= mask;
+                } else {
+                    defRows[at] |= mask;
+                }
+            }
+        }
+        List<? extends Parameter> jnLoop10 = params;
+        for (Parameter p : jnLoop10) {
+            if (p.getIndex() < 0 || isUnsafe(p.getIndex())) continue;
+            int bit = (p.getIndex() << 3) | typeBucket(p.getType());
+            defRows[bit >>> 6] |= 1L << (bit & 63);
+        }
+
+        if (succStart.length < n + 1) succStart = new int[Math.max(n + 1, succStart.length << 1)];
+        int edges = 0;
+        for (int i = 0; i < n; i++) {
+            succStart[i] = edges;
+            List<BasicBlock> ss = domTree.blockAt(i).getSuccessors();
+            if (succList.length < edges + ss.size()) {
+                succList = Arrays.copyOf(succList, Math.max(edges + ss.size(), succList.length << 1));
+            }
+            List<? extends BasicBlock> jnLoop11 = ss;
+            for (BasicBlock s : jnLoop11) {
+                int j = domTree.indexOf(s);
+                if (j >= 0) succList[edges++] = j;
+            }
+        }
+        succStart[n] = edges;
+
+        long[] out = outRow;
+        boolean changed = true;
+        while (changed) {
+            changed = false;
+            for (int i = n - 1; i >= 0; i--) {
+                Arrays.fill(out, 0L);
+                for (int e = succStart[i]; e < succStart[i + 1]; e++) {
+                    int sb = succList[e] * words;
+                    for (int w = 0; w < words; w++) out[w] |= liveRows[sb + w];
+                }
+                int base = i * words;
+                for (int w = 0; w < words; w++) {
+                    long in = liveRows[base + w];
+                    long next = in | (out[w] & ~defRows[base + w]);
+                    if (next != in) {
+                        liveRows[base + w] = next;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        return n;
+    }
+
     /**
-     * Liveness per {@link SlotKey} (slot, bucket) for the blocks of a
+     * Liveness per (slot, bucket) key for the blocks of a
      * function.
      *
      * <p>Semantics: {@code liveIn[B]} contains the key {@code (slot,
@@ -345,164 +462,7 @@ public class SSATransformer {
      * limitation is a separate class of defects, unrelated to dead
      * loop-carried PHIs; here we merely do not stand in its way.</p>
      */
-    private Map<BasicBlock, long[]> computeLiveInForPhiInsertion(Function function) {
-        List<BasicBlock> blocks = function.getBlocks();
-        int n = blocks.size();
-
-        int maxSlot = 0;
-        for (BasicBlock block : blocks) {
-            for (Instruction inst : block.getInstructions()) {
-                Opcode op = inst.getOpcode();
-                if ((op == Opcode.LOAD || op == Opcode.STORE) && inst.getLocalIndex() > maxSlot) {
-                    maxSlot = inst.getLocalIndex();
-                }
-            }
-        }
-        for (Parameter p : function.getParameters()) {
-            if (p.getIndex() > maxSlot) maxSlot = p.getIndex();
-        }
-        // One bit per (slot, bucket): bit = slot * 8 + bucket.
-        final int words = (((maxSlot + 1) << 3) + 63) >>> 6;
-
-        Map<BasicBlock, Integer> index = new HashMap<>(n * 2);
-        for (int i = 0; i < n; i++) index.put(blocks.get(i), i);
-
-        // liveIn starts as the upward-exposed uses (live-in always contains
-        // them), so no separate use[] matrix is kept. def rows are allocated
-        // only for blocks that define something.
-        long[][] liveIn = new long[n][words];
-        long[][] def = new long[n][];
-        for (int i = 0; i < n; i++) {
-            long[] u = liveIn[i];
-            long[] d = null;
-            for (Instruction inst : blocks.get(i).getInstructions()) {
-                Opcode op = inst.getOpcode();
-                if (op != Opcode.LOAD && op != Opcode.STORE) continue;
-                int idx = inst.getLocalIndex();
-                if (idx < 0) continue;
-                if (unsafeLocals.contains(idx)) continue;
-                Type t = (inst.getResult() != null) ? inst.getResult().getType() : Type.UNKNOWN;
-                int bit = (idx << 3) | typeBucket(t);
-                long mask = 1L << (bit & 63);
-                if (op == Opcode.LOAD) {
-                    if (d == null || (d[bit >>> 6] & mask) == 0) u[bit >>> 6] |= mask;
-                } else {
-                    if (d == null) d = new long[words];
-                    d[bit >>> 6] |= mask;
-                }
-            }
-            def[i] = d;
-        }
-
-        // Parameters are defined in the entry. This is part of the JVM
-        // contract: a parameter slot has a well-defined value on function
-        // entry, and it does not need to be "carried over" from the
-        // predecessors (the entry has none).
-        BasicBlock entry = function.getEntryBlock();
-        Integer entryIdx = entry != null ? index.get(entry) : null;
-        if (entryIdx != null) {
-            if (def[entryIdx] == null) def[entryIdx] = new long[words];
-            long[] d = def[entryIdx];
-            for (Parameter p : function.getParameters()) {
-                // A negative slot is never loaded, so it cannot affect liveness.
-                if (p.getIndex() < 0 || unsafeLocals.contains(p.getIndex())) continue;
-                int bit = (p.getIndex() << 3) | typeBucket(p.getType());
-                d[bit >>> 6] |= 1L << (bit & 63);
-            }
-        }
-        long[] noDefs = new long[words];
-        for (int i = 0; i < n; i++) if (def[i] == null) def[i] = noDefs;
-
-        int[][] succs = new int[n][];
-        for (int i = 0; i < n; i++) {
-            List<BasicBlock> ss = blocks.get(i).getSuccessors();
-            int[] si = new int[ss.size()];
-            int k = 0;
-            for (BasicBlock succ : ss) {
-                Integer j = index.get(succ);
-                if (j != null) si[k++] = j;
-            }
-            succs[i] = k == si.length ? si : Arrays.copyOf(si, k);
-        }
-
-        // Backward dataflow until a fixed point is reached. Live sets only
-        // grow, so OR-ing into the previous value equals recomputing it.
-        // liveOut is not needed afterwards, so it lives in one scratch row.
-        long[] out = new long[words];
-        boolean changed = true;
-        while (changed) {
-            changed = false;
-            for (int i = n - 1; i >= 0; i--) {
-                Arrays.fill(out, 0L);
-                for (int j : succs[i]) {
-                    long[] sIn = liveIn[j];
-                    for (int w = 0; w < words; w++) out[w] |= sIn[w];
-                }
-                long[] in = liveIn[i];
-                long[] d = def[i];
-                for (int w = 0; w < words; w++) {
-                    long next = in[w] | (out[w] & ~d[w]);
-                    if (next != in[w]) {
-                        in[w] = next;
-                        changed = true;
-                    }
-                }
-            }
-        }
-
-        Map<BasicBlock, long[]> result = new HashMap<>(n * 2);
-        for (int i = 0; i < n; i++) result.put(blocks.get(i), liveIn[i]);
-        return result;
-    }
-
-    private static boolean isLiveIn(long[] liveIn, int slot, int bucket) {
-        int bit = (slot << 3) | bucket;
-        int w = bit >>> 6;
-        return w < liveIn.length && (liveIn[w] & (1L << (bit & 63))) != 0;
-    }
-
-    /**
-     * Collects the definition blocks for each (slot, bucket) key.
-     *
-     * <p>Parameters define their slot in the entry block of their
-     * bucket. A STORE defines its slot in its own block, under the key
-     * whose bucket is computed from the declared type of the STORE's
-     * result (INT for {@code ISTORE}, LONG for {@code LSTORE}, ...).
-     * Slots in {@link #unsafeLocals} are skipped.</p>
-     */
-    private Map<SlotKey, Set<BasicBlock>> collectDefBlocks(Function function) {
-        Map<SlotKey, Set<BasicBlock>> defs = new HashMap<>();
-        BasicBlock entry = function.getEntryBlock();
-
-        for (Parameter param : function.getParameters()) {
-            int idx = param.getIndex();
-            int bucket = typeBucket(param.getType());
-            if (unsafeLocals.contains(idx)) continue;
-            SlotKey key = new SlotKey(idx, bucket);
-            defs.computeIfAbsent(key, k -> new HashSet<>()).add(entry);
-        }
-
-        for (BasicBlock block : function.getBlocks()) {
-            for (Instruction inst : block.getInstructions()) {
-                if (inst.getOpcode() != Opcode.STORE) continue;
-                int idx = inst.getLocalIndex();
-                if (idx < 0) continue;
-                if (unsafeLocals.contains(idx)) continue;
-
-                Type declaredType = (inst.getResult() != null)
-                    ? inst.getResult().getType()
-                    : Type.UNKNOWN;
-                int bucket = typeBucket(declaredType);
-
-                SlotKey key = new SlotKey(idx, bucket);
-                defs.computeIfAbsent(key, k -> new HashSet<>()).add(block);
-            }
-        }
-
-        return defs;
-    }
-
-    /**
+        /**
      * Returns the IR type that the result of a PHI must carry for the
      * given (slot, bucket) key.
      *
@@ -521,14 +481,20 @@ public class SSATransformer {
             case BUCKET_FLOAT:  return Type.FLOAT;
             case BUCKET_DOUBLE: return Type.DOUBLE;
             case BUCKET_REF: {
-                for (Parameter p : func.getParameters()) {
+                List<Parameter> pList6 = func.getParameters();
+                List<? extends Parameter> jnLoop12 = pList6;
+                for (Parameter p : jnLoop12) {
                     if (p.getIndex() == localIndex
                         && typeBucket(p.getType()) == BUCKET_REF) {
                         return p.getType();
                     }
                 }
-                for (BasicBlock block : func.getBlocks()) {
-                    for (Instruction inst : block.getInstructions()) {
+                List<BasicBlock> blockList7 = func.getBlocks();
+                List<? extends BasicBlock> jnLoop13 = blockList7;
+                for (BasicBlock block : jnLoop13) {
+                    List<Instruction> instList8 = block.getInstructions();
+                    List<? extends Instruction> jnLoop14 = instList8;
+                    for (Instruction inst : jnLoop14) {
                         Opcode op = inst.getOpcode();
                         if ((op != Opcode.STORE && op != Opcode.LOAD)
                             || inst.getLocalIndex() != localIndex
@@ -576,10 +542,13 @@ public class SSATransformer {
         // method pops exactly what this block pushed and nothing else —
         // in particular, it leaves nothing behind for the dominator-tree
         // siblings.
-        Map<SlotKey, Integer> savedSizes = new HashMap<>();
+        int frame = ++frameCounter;
+        int savedBase = savedTop;
 
         // --- PHI ---
-        for (Instruction inst : block.getInstructions()) {
+        List<Instruction> instList9 = block.getInstructions();
+        List<? extends Instruction> jnLoop15 = instList9;
+        for (Instruction inst : jnLoop15) {
             if (inst.getOpcode() != Opcode.PHI) continue;
             int idx = inst.getLocalIndex();
             if (idx < 0) continue;
@@ -588,9 +557,9 @@ public class SSATransformer {
                 ? inst.getResult().getType()
                 : Type.UNKNOWN;
             int bucket = typeBucket(phiType);
-            SlotKey key = new SlotKey(idx, bucket);
+            int key = slotKey(idx, bucket);
 
-            savedSizes.putIfAbsent(key, stackSize(key));
+            saveSize(key, frame);
 
             Temporary newVer = newVersion(key, phiType);
             inst.setResult(newVer);
@@ -598,22 +567,29 @@ public class SSATransformer {
         }
 
         // --- remaining instructions ---
-        for (Instruction inst : block.getInstructions()) {
+        List<Instruction> instList10 = block.getInstructions();
+        List<? extends Instruction> jnLoop16 = instList10;
+        for (Instruction inst : jnLoop16) {
             Opcode op = inst.getOpcode();
             if (op == Opcode.PHI) continue;
 
-            inst.getOperands().replaceAll(this::resolve);
+            List<Value> ops = inst.getOperands();
+            for (int k = 0; k < ops.size(); k++) {
+                Value v = ops.get(k);
+                Value r = resolve(v);
+                if (r != v) ops.set(k, r);
+            }
 
             if (op == Opcode.LOAD) {
                 int idx = inst.getLocalIndex();
                 if (idx < 0) continue;
-                if (unsafeLocals.contains(idx)) continue;
+                if (isUnsafe(idx)) continue;
 
                 Type loadResultType = (inst.getResult() != null)
                     ? inst.getResult().getType()
                     : Type.UNKNOWN;
                 int bucket = typeBucket(loadResultType);
-                SlotKey key = new SlotKey(idx, bucket);
+                int key = slotKey(idx, bucket);
 
                 Value curVer = currentVersion(key);
                 if (curVer == null) {
@@ -664,10 +640,9 @@ public class SSATransformer {
             } else if (op == Opcode.STORE) {
                 int idx = inst.getLocalIndex();
                 if (idx < 0) continue;
-                if (unsafeLocals.contains(idx)) continue;
+                if (isUnsafe(idx)) continue;
 
-                savedSizes.putIfAbsent(
-                    new SlotKey(idx, BUCKET_INT), stackSize(new SlotKey(idx, BUCKET_INT)));
+                saveSize(slotKey(idx, BUCKET_INT), frame);
                 // ^ save just in case; the actual key is computed below.
 
                 Value operand = inst.getOperands().isEmpty()
@@ -690,9 +665,9 @@ public class SSATransformer {
                 if (declaredType.isUnknown()) {
                     declaredType = operand.getType();
                 }
-                SlotKey key = new SlotKey(idx, bucket);
+                int key = slotKey(idx, bucket);
 
-                savedSizes.putIfAbsent(key, stackSize(key));
+                saveSize(key, frame);
 
                 Temporary newVer = newVersion(key, declaredType);
                 if (inst.getResult() != null) {
@@ -706,11 +681,17 @@ public class SSATransformer {
         renameTerminator(block);
 
         // --- incoming PHI values of the successors ---
-        for (BasicBlock succ : block.getSuccessors()) {
+        List<BasicBlock> succList11 = block.getSuccessors();
+        List<? extends BasicBlock> jnLoop17 = succList11;
+        for (BasicBlock succ : jnLoop17) {
             int predIdx = succ.getPredecessors().indexOf(block);
             if (predIdx < 0) continue;
 
-            for (Instruction inst : succ.getInstructions()) {
+            List<Instruction> instList = succ.getInstructions();
+
+            List<? extends Instruction> jnLoop18 = instList;
+            for (Instruction inst : jnLoop18) {
+
                 if (inst.getOpcode() != Opcode.PHI) continue;
                 int idx = inst.getLocalIndex();
                 if (idx < 0) continue;
@@ -719,7 +700,7 @@ public class SSATransformer {
                     ? inst.getResult().getType()
                     : Type.UNKNOWN;
                 int bucket = typeBucket(phiType);
-                SlotKey key = new SlotKey(idx, bucket);
+                int key = slotKey(idx, bucket);
 
                 Value curVer = currentVersion(key);
                 if (curVer == null) {
@@ -781,8 +762,13 @@ public class SSATransformer {
                     boolean predIsNormalTarget = false;
                     Terminator predTerm = block.getTerminator();
                     if (predTerm != null) {
-                        for (BasicBlock t : predTerm.getTargets()) {
-                            if (t == succ) { predIsNormalTarget = true; break; }
+                        List<BasicBlock> tList12 = predTerm.getTargets();
+                        List<? extends BasicBlock> jnLoop19 = tList12;
+                        for (BasicBlock t : jnLoop19) {
+                            if (t == succ) {
+                                predIsNormalTarget = true;
+                                break;
+                            }
                         }
                     }
                     boolean predIsExceptional =
@@ -823,14 +809,19 @@ public class SSATransformer {
         }
 
         // --- recursion into the dominator tree ---
-        for (BasicBlock child : domTree.getChildren(block)) {
-            renameBlock(child);
+        int self = domTree.indexOf(block);
+        if (self >= 0) {
+            int children = domTree.childCount(self);
+            for (int k = 0; k < children; k++) {
+                renameBlock(domTree.blockAt(domTree.childAt(self, k)));
+            }
         }
 
         // --- restoration of the stacks ---
-        for (Map.Entry<SlotKey, Integer> entry : savedSizes.entrySet()) {
-            restoreStack(entry.getKey(), entry.getValue());
+        for (int k = savedTop - 1; k >= savedBase; k--) {
+            restoreStack(savedKeys[k], savedSizes[k]);
         }
+        savedTop = savedBase;
     }
 
     /**
@@ -885,37 +876,77 @@ public class SSATransformer {
     //  Version-stack management.
     // ------------------------------------------------------------------
 
-    private Temporary newVersion(SlotKey key, Type type) {
-        int ver = versionCounters.computeIfAbsent(key, k -> 0);
-        versionCounters.put(key, ver + 1);
+    private static int slotKey(int idx, int bucket) {
+        return (idx << 3) | bucket;
+    }
+
+    private void ensureKey(int key) {
+        if (key < verTop.length) return;
+        int c = Math.max(key + 1, verTop.length << 1);
+        verStack = Arrays.copyOf(verStack, c);
+        verTop = Arrays.copyOf(verTop, c);
+        verStamp = Arrays.copyOf(verStamp, c);
+        savedFrame = Arrays.copyOf(savedFrame, c);
+    }
+
+    private void pushVersion(int key, Value v) {
+        ensureKey(key);
+        if (verStamp[key] != fnStamp) {
+            verStamp[key] = fnStamp;
+            verTop[key] = 0;
+        }
+        Value[] st = verStack[key];
+        int top = verTop[key];
+        if (st == null) {
+            st = new Value[8];
+            verStack[key] = st;
+        } else if (top == st.length) {
+            st = Arrays.copyOf(st, top << 1);
+            verStack[key] = st;
+        }
+        st[top] = v;
+        verTop[key] = top + 1;
+    }
+
+    private Temporary newVersion(int key, Type type) {
         Temporary tmp = new Temporary(type);
-        versionStacks.computeIfAbsent(key, k -> new ArrayDeque<>()).push(tmp);
+        pushVersion(key, tmp);
         return tmp;
     }
 
-    private Value currentVersion(SlotKey key) {
-        Deque<Value> stack = versionStacks.get(key);
-        return stack != null ? stack.peek() : null;
+    private Value currentVersion(int key) {
+        int size = stackSize(key);
+        return size > 0 ? verStack[key][size - 1] : null;
     }
 
-    private int stackSize(SlotKey key) {
-        Deque<Value> stack = versionStacks.get(key);
-        return stack != null ? stack.size() : 0;
+    private int stackSize(int key) {
+        return key < verTop.length && verStamp[key] == fnStamp ? verTop[key] : 0;
     }
 
-    private void restoreStack(SlotKey key, int size) {
-        Deque<Value> stack = versionStacks.get(key);
-        if (stack != null) {
-            while (stack.size() > size) {
-                stack.pop();
-            }
+    private void saveSize(int key, int frame) {
+        ensureKey(key);
+        if (savedFrame[key] == frame) return;
+        savedFrame[key] = frame;
+        if (savedTop == savedKeys.length) {
+            savedKeys = Arrays.copyOf(savedKeys, savedTop << 1);
+            savedSizes = Arrays.copyOf(savedSizes, savedTop << 1);
         }
+        savedKeys[savedTop] = key;
+        savedSizes[savedTop++] = stackSize(key);
+    }
+
+    private void restoreStack(int key, int size) {
+        if (stackSize(key) > size) verTop[key] = size;
     }
 
     private void padPhiOperands(Function function) {
-        for (BasicBlock block : function.getBlocks()) {
+        List<BasicBlock> blockList13 = function.getBlocks();
+        List<? extends BasicBlock> jnLoop20 = blockList13;
+        for (BasicBlock block : jnLoop20) {
             int preds = block.getPredecessors().size();
-            for (Instruction inst : block.getInstructions()) {
+            List<Instruction> instList14 = block.getInstructions();
+            List<? extends Instruction> jnLoop21 = instList14;
+            for (Instruction inst : jnLoop21) {
                 if (inst.getOpcode() == Opcode.PHI) ensurePhiOperandCount(inst, preds);
             }
         }
@@ -932,10 +963,17 @@ public class SSATransformer {
     // ------------------------------------------------------------------
 
     private void optimizePhis(Function function) {
-        Map<Instruction, Value> replacementMap = new HashMap<>();
+        ScratchIdentityMap<Instruction, Value> replacementMap = phiReplacements;
+        replacementMap.clear();
 
-        for (BasicBlock block : function.getBlocks()) {
-            for (Instruction inst : block.getInstructions()) {
+        List<BasicBlock> blockList = function.getBlocks();
+
+        List<? extends BasicBlock> jnLoop22 = blockList;
+        for (BasicBlock block : jnLoop22) {
+
+            List<Instruction> instList15 = block.getInstructions();
+            List<? extends Instruction> jnLoop23 = instList15;
+            for (Instruction inst : jnLoop23) {
                 if (inst.getOpcode() != Opcode.PHI) continue;
                 if (inst.getOperands().isEmpty()) {
                     continue;
@@ -954,11 +992,15 @@ public class SSATransformer {
             }
         }
 
-        for (Map.Entry<Instruction, Value> entry : replacementMap.entrySet()) {
-            Instruction phi = entry.getKey();
-            Value replacement = entry.getValue();
-            for (BasicBlock block : function.getBlocks()) {
-                for (Instruction inst : block.getInstructions()) {
+        for (int r = 0; r < replacementMap.size(); r++) {
+            Instruction phi = replacementMap.keyAt(r);
+            Value replacement = replacementMap.valueAt(r);
+            List<BasicBlock> blockList16 = function.getBlocks();
+            List<? extends BasicBlock> jnLoop24 = blockList16;
+            for (BasicBlock block : jnLoop24) {
+                List<Instruction> instList17 = block.getInstructions();
+                List<? extends Instruction> jnLoop25 = instList17;
+                for (Instruction inst : jnLoop25) {
                     for (int i = 0; i < inst.getOperands().size(); i++) {
                         if (inst.getOperands().get(i) == phi.getResult()) {
                             inst.getOperands().set(i, replacement);
@@ -994,112 +1036,89 @@ public class SSATransformer {
     }
 
     private void cleanupPhis(Function function) {
-        /*
-         * Liveness analysis of the phi instructions, iterated to a fixed
-         * point.
-         *
-         * The result of a phi instruction is considered ALIVE if it is used:
-         *
-         *   1. as an operand of any NON-phi instruction, or
-         *   2. as an operand of any terminator, or
-         *   3. as an operand of another phi instruction whose own result is
-         *      alive (transitively).
-         *
-         * A single-pass check of "appears in the operands of something"
-         * wrongly keeps a phi whose only consumer is another dead phi.
-         * The classic scenario: a slot is assigned only inside a loop
-         * body; the loop-carried phi on the incoming edge gets an
-         * UndefinedValue (SSATransformer.renameBlock, see the change
-         * there), while the phi in the downstream block is used ONLY by
-         * that loop-carried phi. After one pass the loop-carried phi is
-         * removed (its result really is never read), but the downstream
-         * phi survives the pass - its result was in usedValues, because
-         * the loop-carried phi used it while the set was being computed.
-         * Result: the downstream phi has no live consumers at all, yet it
-         * stayed in the graph and OutOfSsaPass correctly fails on its
-         * UndefinedValue operand - even though the phi is dead.
-         *
-         * The iterative variant below eliminates this class of errors,
-         * while keeping the hard diagnostic failure for a phi that is
-         * REALLY used (its operands - including an UndefinedValue - would
-         * reach the run time if it were not stopped).
-         */
-
-        // ---- Phase 1: seed - the operands of the non-phi consumers. ----
-        //
-        // Phi operands deliberately do NOT end up here: if they did, we
-        // would be back to the single-pass logic. The liveness of a phi
-        // must follow from the liveness of its only consumer, and not
-        // declare itself alive through the operands of another phi.
-        Set<Value> usedValues = new HashSet<>();
-        for (BasicBlock block : function.getBlocks()) {
-            for (Instruction inst : block.getInstructions()) {
+        ScratchIdentityMap<Value, Boolean> used = usedValues;
+        used.clear();
+        List<BasicBlock> blocks = function.getBlocks();
+        List<? extends BasicBlock> jnLoop26 = blocks;
+        for (BasicBlock block : jnLoop26) {
+            List<Instruction> insts = block.getInstructions();
+            List<? extends Instruction> jnLoop27 = insts;
+            for (Instruction inst : jnLoop27) {
                 if (inst.getOpcode() == Opcode.PHI) continue;
-                usedValues.addAll(inst.getOperands());
+                List<Value> ops = inst.getOperands();
+                List<? extends Value> jnLoop28 = ops;
+                for (Value op : jnLoop28) {
+                    if (op != null) used.put(op, Boolean.TRUE);
+                }
             }
             Terminator term = block.getTerminator();
             if (term != null) {
                 switch (term) {
-                    case CondBranchTerminator cbt -> usedValues.add(cbt.getCondition());
-                    case ReturnTerminator rt -> {
-                        if (rt.getValue() != null) usedValues.add(rt.getValue());
-                    }
-                    case ThrowTerminator tt -> {
-                        if (tt.getException() != null) usedValues.add(tt.getException());
-                    }
-                    case LookupSwitchTerminator lst -> usedValues.add(lst.getKey());
-                    case TableSwitchTerminator tst -> usedValues.add(tst.getKey());
+                    case CondBranchTerminator cbt -> markUsed(used, cbt.getCondition());
+                    case ReturnTerminator rt -> markUsed(used, rt.getValue());
+                    case ThrowTerminator tt -> markUsed(used, tt.getException());
+                    case LookupSwitchTerminator lst -> markUsed(used, lst.getKey());
+                    case TableSwitchTerminator tst -> markUsed(used, tst.getKey());
                     default -> {
                     }
                 }
             }
         }
 
-        // ---- Phase 2: transitive propagation through the live phis. ----
-        //
-        // On every iteration: for each phi whose result is already in
-        // usedValues (i.e. it has a live consumer), add its operands.
-        // Repeat while the set grows. Guaranteed to terminate: usedValues
-        // grows monotonically, and the number of values in a function is
-        // finite.
         boolean changed = true;
         while (changed) {
             changed = false;
-            for (BasicBlock block : function.getBlocks()) {
-                for (Instruction inst : block.getInstructions()) {
+            List<? extends BasicBlock> jnLoop29 = blocks;
+            for (BasicBlock block : jnLoop29) {
+                List<Instruction> insts = block.getInstructions();
+                List<? extends Instruction> jnLoop30 = insts;
+                for (Instruction inst : jnLoop30) {
                     if (inst.getOpcode() != Opcode.PHI) continue;
                     if (inst.getResult() == null) continue;
-                    if (!usedValues.contains(inst.getResult())) continue;
-                    for (Value op : inst.getOperands()) {
-                        if (op != null && usedValues.add(op)) {
-                            changed = true;
-                        }
+                    if (!used.containsKey(inst.getResult())) continue;
+                    List<Value> ops = inst.getOperands();
+                    List<? extends Value> jnLoop31 = ops;
+                    for (Value op : jnLoop31) {
+                        if (op != null && used.put(op, Boolean.TRUE)) changed = true;
                     }
                 }
             }
         }
 
-        // ---- Phase 3: remove every phi whose result is not alive. ----
-        //
-        // At this point usedValues is exactly the closure of "the operands
-        // of the non-phi consumers union the operands of the live phis".
-        // Any phi whose result is not in that closure has no consumer on
-        // any path - it can be removed. In particular, the whole chain of
-        // dead phis (A -> B -> C -> dead leaf) is removed, even when the
-        // intermediate members of the chain referenced each other.
-        for (BasicBlock block : function.getBlocks()) {
-            block.getInstructions().removeIf(inst ->
-                inst.getOpcode() == Opcode.PHI
-                    && (inst.getResult() == null
-                        || !usedValues.contains(inst.getResult()))
-            );
+        List<? extends BasicBlock> jnLoop32 = blocks;
+        for (BasicBlock block : jnLoop32) {
+            List<Instruction> insts = block.getInstructions();
+            int w = 0;
+            for (int i = 0; i < insts.size(); i++) {
+                Instruction inst = insts.get(i);
+                boolean dead = inst.getOpcode() == Opcode.PHI
+                    && (inst.getResult() == null || !used.containsKey(inst.getResult()));
+                if (!dead) {
+                    if (w != i) insts.set(w, inst);
+                    w++;
+                }
+            }
+            if (w < insts.size()) insts.subList(w, insts.size()).clear();
         }
     }
 
+    private static void markUsed(ScratchIdentityMap<Value, Boolean> used, Value v) {
+        if (v != null) used.put(v, Boolean.TRUE);
+    }
+
     private void cleanupNops(Function function) {
-        for (BasicBlock block : function.getBlocks()) {
-            block.getInstructions().removeIf(inst ->
-                inst.getOpcode() == Opcode.NOP && inst.getResult() == null);
+        List<BasicBlock> blocks = function.getBlocks();
+        List<? extends BasicBlock> jnLoop33 = blocks;
+        for (BasicBlock block : jnLoop33) {
+            List<Instruction> insts = block.getInstructions();
+            int w = 0;
+            for (int i = 0; i < insts.size(); i++) {
+                Instruction inst = insts.get(i);
+                if (inst.getOpcode() == Opcode.NOP && inst.getResult() == null) continue;
+                if (w != i) insts.set(w, inst);
+                w++;
+            }
+            if (w < insts.size()) insts.subList(w, insts.size()).clear();
         }
     }
 }

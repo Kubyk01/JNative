@@ -6,6 +6,7 @@ import io.github.kubyk01.application.service.analyzer.dependencyresolver.Depende
 import io.github.kubyk01.application.service.analyzer.ssa.TypeResolver;
 import io.github.kubyk01.application.service.codegen.llvm.nativepolymorphicfunctionresolver.VarHandleTargetResolver;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.ClassNode;
+import io.github.kubyk01.domain.analyzer.lifetime.RefCountPlan;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.FieldNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.FieldReference;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.MethodParameterInfo;
@@ -215,6 +216,9 @@ public class LlvmGlobalEmitter {
     @lombok.Setter
     private java.util.function.BiConsumer<String, String> adaptorSink;
 
+    @lombok.Setter
+    private reactor.core.scheduler.Scheduler scheduler;
+
     // -------------------------------------------------------------------------
     //  Caches. Every map/set that is written by one thread and read by
     //  another uses a ConcurrentHashMap or ConcurrentHashMap.newKeySet().
@@ -228,8 +232,6 @@ public class LlvmGlobalEmitter {
         Collections.synchronizedList(new ArrayList<>());
     private final Set<String> deferredStrings =
         Collections.synchronizedSet(new LinkedHashSet<>());
-
-    private final Set<String> emittedVtableThunks = ConcurrentHashMap.newKeySet();
 
     /**
      * Internal class names for which {@link #generateReflectionData()} has
@@ -367,9 +369,7 @@ public class LlvmGlobalEmitter {
      */
     private String findOverride(String className, String name, String descriptor,
                                 String[] ownerOut) {
-        String owner = className;
-        Set<String> seen = new HashSet<>();
-        while (owner != null && !owner.isEmpty() && seen.add(owner)) {
+        for (String owner : overrideOwners(className)) {
 
             // 1. Explicit override registry (overrideMethod).
             String nativeName = methodOverrides.get(overrideKey(owner, name, descriptor));
@@ -385,12 +385,56 @@ public class LlvmGlobalEmitter {
                 ownerOut[0] = owner;
                 return rawSymbol;
             }
-
-            ClassNode cn = resolver.getClassNode(owner);
-            if (cn == null) return null;
-            owner = cn.getSuperName();
         }
         return null;
+    }
+
+    private volatile NavigableSet<String> overrideRegistryKeys;
+    private volatile NavigableSet<String> overrideFunctionNames;
+    private final Map<String, String[]> overrideOwnerChains = new ConcurrentHashMap<>();
+
+    private void buildOverrideIndex() {
+        NavigableSet<String> fnNames = new TreeSet<>();
+        for (Function f : module.getFunctions()) {
+            String n = f.getName();
+            if (n != null && n.startsWith("__jnative_override_")) fnNames.add(n);
+        }
+        overrideOwnerChains.clear();
+        overrideRegistryKeys = new TreeSet<>(methodOverrides.keySet());
+        overrideFunctionNames = fnNames;
+    }
+
+    private static boolean hasKeyWithPrefix(NavigableSet<String> keys, String prefix) {
+        String next = keys.ceiling(prefix);
+        return next != null && next.startsWith(prefix);
+    }
+
+    private boolean mayHaveOverride(String owner) {
+        NavigableSet<String> regKeys = overrideRegistryKeys;
+        NavigableSet<String> fnNames = overrideFunctionNames;
+        if (regKeys == null || fnNames == null) return true;
+        return hasKeyWithPrefix(regKeys, owner + ".")
+            || hasKeyWithPrefix(fnNames, "__jnative_override_" + owner.replace('/', '_') + "_");
+    }
+
+    private String[] overrideOwners(String className) {
+        if (className == null) return new String[0];
+        String[] cached = overrideOwnerChains.get(className);
+        if (cached != null) return cached;
+        List<String> out = new ArrayList<>();
+        String owner = className;
+        Set<String> seen = new HashSet<>();
+        while (owner != null && !owner.isEmpty() && seen.add(owner)) {
+            if (mayHaveOverride(owner)) out.add(owner);
+            ClassNode cn = resolver.getClassNode(owner);
+            if (cn == null) break;
+            owner = cn.getSuperName();
+        }
+        String[] chain = out.toArray(new String[0]);
+        if (overrideRegistryKeys != null && overrideFunctionNames != null) {
+            overrideOwnerChains.putIfAbsent(className, chain);
+        }
+        return chain;
     }
 
     /**
@@ -512,7 +556,8 @@ public class LlvmGlobalEmitter {
                 collectAllInterfacesRec(cn, needed);
             }
 
-            for (Function func : module.getFunctions()) {
+            List<? extends Function> jnLoop4 = module.getFunctions();
+            for (Function func : jnLoop4) {
                 for (BasicBlock block : func.getBlocks()) {
                     for (Instruction inst : block.getInstructions()) {
                         if (inst.getOpcode() != Opcode.INTERFACE_CALL) continue;
@@ -589,7 +634,8 @@ public class LlvmGlobalEmitter {
             }
 
             if (!cn.isExternal()) {
-                for (MethodNode mn : cn.getMethods()) {
+                List<? extends MethodNode> jnLoop6 = cn.getMethods();
+                for (MethodNode mn : jnLoop6) {
                     if (!isVtableVirtual(mn)) continue;
 
                     int access = getAccess(className, mn, cn);
@@ -652,10 +698,12 @@ public class LlvmGlobalEmitter {
             VtableLayout layout = new VtableLayout();
             interfaceLayouts.put(ifaceName, layout);
 
-            for (String parent : cn.getInterfaces()) {
+            List<? extends String> jnLoop7 = cn.getInterfaces();
+            for (String parent : jnLoop7) {
                 if (parent.equals(ifaceName)) continue;
                 VtableLayout parentLayout = getOrBuildInterfaceLayout(parent);
-                for (String sig : parentLayout.slots) {
+                List<? extends String> jnLoop8 = parentLayout.slots;
+                for (String sig : jnLoop8) {
                     if (!layout.slotBySignature.containsKey(sig)) {
                         layout.slotBySignature.put(sig, layout.slots.size());
                         layout.slots.add(sig);
@@ -664,7 +712,8 @@ public class LlvmGlobalEmitter {
             }
 
             if (!cn.isExternal()) {
-                for (MethodNode mn : cn.getMethods()) {
+                List<? extends MethodNode> jnLoop9 = cn.getMethods();
+                for (MethodNode mn : jnLoop9) {
                     if (!isVtableVirtual(mn)) continue;
                     String sig = mn.getName() + mn.getDescriptor();
                     if (!layout.slotBySignature.containsKey(sig)) {
@@ -824,7 +873,7 @@ public class LlvmGlobalEmitter {
     public List<java.util.function.Supplier<String>> globalDefinitionParts() {
         prepareLayouts();
         return List.of(
-            () -> generateLayoutConstants() + generateStaticFields(),
+            () -> generateLayoutConstants() + generateStaticFields() + generateRefCountTables(),
             this::generateVtables,
             () -> generateTypeStringConstants() + generateStringLiterals()
                 + generateTypeInfo() + generateUnnamedModule(),
@@ -1031,7 +1080,8 @@ public class LlvmGlobalEmitter {
 
         StringBuilder init = new StringBuilder();
         init.append("i8* bitcast (%JNativeVTable* ").append(vtableName).append(" to i8*)");
-        for (FieldNode f : collectInstanceFields(moduleNode)) {
+        List<? extends FieldNode> jnLoop10 = collectInstanceFields(moduleNode);
+        for (FieldNode f : jnLoop10) {
             Type ft = f.getType();
             init.append(", ").append(LlvmTypeMapper.toLlvmType(ft))
                 .append(" ").append(zeroLiteralFor(ft));
@@ -1181,6 +1231,10 @@ public class LlvmGlobalEmitter {
     }
 
     private ResolvedFn resolveVtableEntry(String className, String sig) {
+        return resolveVtableEntry(className, sig, null);
+    }
+
+    private ResolvedFn resolveVtableEntry(String className, String sig, List<Function> pendingNatives) {
         int parenIdx = sig.indexOf('(');
         if (parenIdx <= 0) return null;
         String name = sig.substring(0, parenIdx);
@@ -1214,7 +1268,8 @@ public class LlvmGlobalEmitter {
             StringBuilder params = new StringBuilder();
             params.append(LlvmTypeMapper.toLlvmType(Type.reference(overrideOwner[0])));
             boolean overrideCAbi = module.getFunction(overrideName).getEntryBlock() == null;
-            for (Type pt : mn.getParameterTypes()) {
+            List<? extends Type> jnLoop12 = mn.getParameterTypes();
+            for (Type pt : jnLoop12) {
                 params.append(", ").append(LlvmTypeMapper.toLlvmType(overrideCAbi ? LlvmTypeMapper.toCAbiType(pt) : pt));
             }
             String ret = LlvmTypeMapper.toLlvmType(mn.getReturnType());
@@ -1344,7 +1399,8 @@ public class LlvmGlobalEmitter {
                 for (int i = 0; i < allParams.size(); i++) {
                     nf.addParameter(new Parameter(allParams.get(i), i));
                 }
-                module.addFunction(nf);
+                if (pendingNatives != null) pendingNatives.add(nf);
+                else module.addFunction(nf);
                 funcName = nativeName;
             } else {
                 return null;
@@ -1356,7 +1412,8 @@ public class LlvmGlobalEmitter {
         params.append(LlvmTypeMapper.toLlvmType(Type.reference(owner)));
         Function resolved = module.getFunction(funcName);
         boolean cAbi = resolved == null || resolved.getEntryBlock() == null;
-        for (Type pt : mn.getParameterTypes()) {
+        List<? extends Type> jnLoop13 = mn.getParameterTypes();
+        for (Type pt : jnLoop13) {
             params.append(", ").append(LlvmTypeMapper.toLlvmType(cAbi ? LlvmTypeMapper.toCAbiType(pt) : pt));
         }
         return new ResolvedFn(funcName, ret + " (" + params + ")*");
@@ -1366,7 +1423,8 @@ public class LlvmGlobalEmitter {
                                    String ifaceOrNull,
                                    String sig,
                                    ResolvedFn fn,
-                                   StringBuilder sb) {
+                                   StringBuilder sb,
+                                   Set<String> emittedThunks) {
         if (fn != null) {
             return "i8* bitcast (" + fn.type + " @" + fn.name + " to i8*)";
         }
@@ -1379,7 +1437,7 @@ public class LlvmGlobalEmitter {
 
         String thunkName = "__jnative_vtable_missing_" + slotId;
 
-        if (!emittedVtableThunks.add(thunkName)) {
+        if (!emittedThunks.add(thunkName)) {
             return "i8* bitcast (i8* (...)* @" + thunkName + " to i8*)";
         }
 
@@ -1407,6 +1465,7 @@ public class LlvmGlobalEmitter {
     private String generateVtables() {
         prepareLayouts();
         StringBuilder sb = new StringBuilder();
+        Set<String> emittedThunks = new HashSet<>();
         sb.append("\n; ----- Vtables (hierarchy-local slots) -----\n");
 
         List<ClassNode> allClasses = new ArrayList<>(resolver.getClassMap().values());
@@ -1421,12 +1480,28 @@ public class LlvmGlobalEmitter {
                 .append(ifaceNameRef).append(" }\n");
         }
 
+        List<ClassNode> concreteClasses = new ArrayList<>();
         for (ClassNode cls : allClasses) {
-            if (cls.isExternal()) continue;
-            if (cls.isInterface()) continue;
+            if (cls.isExternal() || cls.isInterface()) continue;
+            concreteClasses.add(cls);
+            getOrBuildClassLayout(cls.getName());
+        }
+        buildOverrideIndex();
+        List<ClassVtableResolution> resolutions =
+            LlvmUtil.parallelMapOrdered(concreteClasses, scheduler, this::resolveClassVtables);
+        for (ClassVtableResolution r : resolutions) {
+            for (Function nf : r.vtableNatives()) module.addFunction(nf);
+        }
+        for (ClassVtableResolution r : resolutions) {
+            for (Function nf : r.itableNatives()) module.addFunction(nf);
+        }
+
+        for (int ci = 0; ci < concreteClasses.size(); ci++) {
+            ClassNode cls = concreteClasses.get(ci);
+            ClassVtableResolution resolution = resolutions.get(ci);
 
             String className = cls.getName();
-            VtableLayout layout = getOrBuildClassLayout(className);
+            VtableLayout layout = resolution.layout();
             int length = Math.max(layout.slots.size(), 1);
 
             List<String> entries = new ArrayList<>(length);
@@ -1434,8 +1509,8 @@ public class LlvmGlobalEmitter {
 
             for (int i = 0; i < layout.slots.size(); i++) {
                 String sig = layout.slots.get(i);
-                ResolvedFn fn = resolveVtableEntry(className, sig);
-                entries.set(i, vtableSlotEntry(className, null, sig, fn, sb));
+                ResolvedFn fn = resolution.vtable()[i];
+                entries.set(i, vtableSlotEntry(className, null, sig, fn, sb, emittedThunks));
             }
 
             String methodsName = "@vtable_methods_" + LlvmTypeMapper.sanitizeIdentifier(className);
@@ -1450,20 +1525,19 @@ public class LlvmGlobalEmitter {
             vtableLengths.put(className, length);
         }
 
-        for (ClassNode cls : allClasses) {
-            if (cls.isExternal() || cls.isInterface()) continue;
+        for (int ci = 0; ci < concreteClasses.size(); ci++) {
+            ClassNode cls = concreteClasses.get(ci);
             String className = cls.getName();
 
-            Set<String> ifaces = collectAllInterfaces(cls);
             Map<String, String> itableNames = new LinkedHashMap<>();
             Map<String, Integer> itableLens = new LinkedHashMap<>();
             Map<String, Integer> itableIds = new LinkedHashMap<>();
 
-            for (String iface : ifaces) {
-                Integer ifaceId = interfaceIds.get(iface);
-                if (ifaceId == null) continue;
+            for (ItableResolution itable : resolutions.get(ci).itables()) {
+                String iface = itable.iface();
+                Integer ifaceId = itable.ifaceId();
 
-                VtableLayout ifaceLayout = getOrBuildInterfaceLayout(iface);
+                VtableLayout ifaceLayout = itable.layout();
                 int len = Math.max(ifaceLayout.slots.size(), 1);
 
                 List<String> entries = new ArrayList<>(len);
@@ -1471,8 +1545,8 @@ public class LlvmGlobalEmitter {
 
                 for (int i = 0; i < ifaceLayout.slots.size(); i++) {
                     String sig = ifaceLayout.slots.get(i);
-                    ResolvedFn fn = resolveVtableEntry(className, sig);
-                    entries.set(i, vtableSlotEntry(className, iface, sig, fn, sb));
+                    ResolvedFn fn = itable.fns()[i];
+                    entries.set(i, vtableSlotEntry(className, iface, sig, fn, sb, emittedThunks));
                 }
 
                 String itableName = "@itable_"
@@ -1534,7 +1608,42 @@ public class LlvmGlobalEmitter {
             vtableNames.put(className, vtableName);
         }
 
+        // Lambda vtables can refer to the same unresolved Object slots as class vtables.
+        emitLambdaVtables(sb, emittedThunks);
         return sb.toString();
+    }
+
+    private record ItableResolution(String iface, Integer ifaceId, VtableLayout layout, ResolvedFn[] fns) {
+    }
+
+    private record ClassVtableResolution(VtableLayout layout, ResolvedFn[] vtable,
+                                         List<ItableResolution> itables,
+                                         List<Function> vtableNatives,
+                                         List<Function> itableNatives) {
+    }
+
+    private ClassVtableResolution resolveClassVtables(ClassNode cls) {
+        String className = cls.getName();
+        VtableLayout layout = getOrBuildClassLayout(className);
+        List<Function> vtableNatives = new ArrayList<>();
+        ResolvedFn[] vtable = new ResolvedFn[layout.slots.size()];
+        for (int i = 0; i < vtable.length; i++) {
+            vtable[i] = resolveVtableEntry(className, layout.slots.get(i), vtableNatives);
+        }
+
+        List<Function> itableNatives = new ArrayList<>();
+        List<ItableResolution> itables = new ArrayList<>();
+        for (String iface : collectAllInterfaces(cls)) {
+            Integer ifaceId = interfaceIds.get(iface);
+            if (ifaceId == null) continue;
+            VtableLayout ifaceLayout = getOrBuildInterfaceLayout(iface);
+            ResolvedFn[] fns = new ResolvedFn[ifaceLayout.slots.size()];
+            for (int i = 0; i < fns.length; i++) {
+                fns[i] = resolveVtableEntry(className, ifaceLayout.slots.get(i), itableNatives);
+            }
+            itables.add(new ItableResolution(iface, ifaceId, ifaceLayout, fns));
+        }
+        return new ClassVtableResolution(layout, vtable, itables, vtableNatives, itableNatives);
     }
 
     private Set<String> collectAllInterfaces(ClassNode cls) {
@@ -1545,7 +1654,8 @@ public class LlvmGlobalEmitter {
 
     private void collectAllInterfacesRec(ClassNode cls, Set<String> out) {
         if (cls == null) return;
-        for (String i : cls.getInterfaces()) {
+        List<? extends String> jnLoop18 = cls.getInterfaces();
+        for (String i : jnLoop18) {
             if (out.add(i)) {
                 ClassNode in = resolver.getClassNode(i);
                 if (in != null) collectAllInterfacesRec(in, out);
@@ -1570,6 +1680,7 @@ public class LlvmGlobalEmitter {
         for (Type t : capturedTypes) {
             fields.append(", ").append(LlvmTypeMapper.toLlvmType(t));
         }
+        if (countsLambdaCaptures()) fields.append(", i32");
         fields.append(" }");
 
         extraStructs.putIfAbsent(structName, structName + " = type " + fields);
@@ -1724,14 +1835,13 @@ public class LlvmGlobalEmitter {
 
         ClassNode cn = resolver.getClassNode(ifaceName);
         if (cn == null) return;
-        for (String parent : cn.getInterfaces()) {
+        List<? extends String> jnLoop22 = cn.getInterfaces();
+        for (String parent : jnLoop22) {
             collectLambdaSuperInterfaces(parent, out);
         }
     }
 
-    public String emitLambdaVtables() {
-        prepareLayouts();
-        StringBuilder sb = new StringBuilder();
+    private void emitLambdaVtables(StringBuilder sb, Set<String> emittedThunks) {
         sb.append("\n; ----- Lambda vtables -----\n");
 
         VtableLayout objectLayout = getOrBuildClassLayout("java/lang/Object");
@@ -1746,7 +1856,7 @@ public class LlvmGlobalEmitter {
             for (int i = 0; i < objectLayout.slots.size(); i++) {
                 String sig = objectLayout.slots.get(i);
                 ResolvedFn fn = resolveVtableEntry("java/lang/Object", sig);
-                methodEntries.set(i, vtableSlotEntry("java/lang/Object", null, sig, fn, sb));
+                methodEntries.set(i, vtableSlotEntry("java/lang/Object", null, sig, fn, sb, emittedThunks));
             }
 
             String methodsName = "@vtable_methods_"
@@ -1870,7 +1980,7 @@ public class LlvmGlobalEmitter {
                         }
                     }
 
-                    entries.add(vtableSlotEntry(lambdaClassName, iface, sig, fn, sb));
+                    entries.add(vtableSlotEntry(lambdaClassName, iface, sig, fn, sb, emittedThunks));
                 }
 
                 // Bind the SAM slot to the lambda's own adaptor. The
@@ -1936,7 +2046,6 @@ public class LlvmGlobalEmitter {
 
             vtableLengths.put(lambdaClassName, methodLen);
         }
-        return sb.toString();
     }
 
     // =========================================================================
@@ -1945,7 +2054,8 @@ public class LlvmGlobalEmitter {
 
     private String generateStructs() {
         Set<String> newClassNames = new HashSet<>();
-        for (Function func : module.getFunctions()) {
+        List<? extends Function> jnLoop25 = module.getFunctions();
+        for (Function func : jnLoop25) {
             for (BasicBlock block : func.getBlocks()) {
                 for (Instruction inst : block.getInstructions()) {
                     if (inst.getOpcode() == Opcode.NEW && !inst.getOperands().isEmpty()) {
@@ -1975,8 +2085,8 @@ public class LlvmGlobalEmitter {
             String structName = LlvmTypeMapper.toLlvmStruct(cls.getName());
             sb.append(structName).append(" = type { i8*");
 
-            List<FieldNode> allFields = collectInstanceFields(cls);
-            for (FieldNode field : allFields) {
+            List<? extends FieldNode> jnLoop27 = collectInstanceFields(cls);
+            for (FieldNode field : jnLoop27) {
                 sb.append(", ").append(LlvmTypeMapper.toLlvmType(field.getType()));
             }
             sb.append(" }\n");
@@ -1996,16 +2106,24 @@ public class LlvmGlobalEmitter {
     }
 
     private List<FieldNode> collectInstanceFields(ClassNode cls) {
+        List<FieldNode> result = collectDeclaredInstanceFields(cls);
+        RefCountPlan plan = module.getRefCountPlan();
+        if (plan != null && plan.declaresCount(cls.getName())) result.add(countField(cls.getName()));
+        return result;
+    }
+
+    private List<FieldNode> collectDeclaredInstanceFields(ClassNode cls) {
         List<FieldNode> result = new ArrayList<>();
         if (cls.getSuperName() != null && !cls.getSuperName().equals("java/lang/Object")) {
             ClassNode superNode = resolver.getClassNode(cls.getSuperName());
             if (superNode != null && !superNode.isExternal()) {
-                result.addAll(collectInstanceFields(superNode));
+                result.addAll(collectDeclaredInstanceFields(superNode));
             } else {
                 result.addAll(phantomFields().getOrDefault(cls.getSuperName(), List.of()));
             }
         }
-        for (FieldNode f : cls.getFields()) {
+        List<? extends FieldNode> jnLoop29 = cls.getFields();
+        for (FieldNode f : jnLoop29) {
             if ((f.getAccess() & Opcodes.ACC_STATIC) == 0) {
                 result.add(f);
             }
@@ -2013,8 +2131,136 @@ public class LlvmGlobalEmitter {
         return result;
     }
 
+    private final Map<String, FieldNode> countFields = new ConcurrentHashMap<>();
+
+    private FieldNode countField(String owner) {
+        return countFields.computeIfAbsent(owner, o -> {
+            FieldNode f = FieldNode.builder()
+                .name(RefCountPlan.COUNT_FIELD)
+                .descriptor("I")
+                .type(Type.INT)
+                .access(Opcodes.ACC_PRIVATE | Opcodes.ACC_SYNTHETIC)
+                .owner(o)
+                .build();
+            phantomNodes.add(f);
+            return f;
+        });
+    }
+
+    private String generateRefCountTables() {
+        RefCountPlan plan = module.getRefCountPlan();
+        if (plan == null) return "";
+        Map<String, List<String>> lines = new TreeMap<>();
+        for (String cls : plan.getCountedClasses()) {
+            ClassNode node = resolver.getClassNode(cls);
+            if (node == null || node.isExternal()) continue;
+            int offset = getFieldOffset(cls, RefCountPlan.COUNT_FIELD);
+            String sym = "__jnative_rcoff_" + RefCountPlan.symbolName(cls);
+            lines.computeIfAbsent(sym, k -> new ArrayList<>()).add("@" + sym + " = constant i32 " + offset);
+        }
+        for (Map.Entry<String, Set<String>> e : plan.getCountedFields().entrySet()) {
+            ClassNode node = resolver.getClassNode(e.getKey());
+            if (node == null || node.isExternal() || node.isInterface() || "java/lang/Class".equals(e.getKey())) continue;
+            Set<Integer> offsets = new TreeSet<>();
+            for (String key : e.getValue()) {
+                int dot = key.lastIndexOf('.');
+                ClassNode owner = resolver.getClassNode(key.substring(0, dot));
+                if (owner == null || owner.isExternal()) continue;
+                offsets.add(getFieldOffset(key.substring(0, dot), key.substring(dot + 1)));
+            }
+            if (offsets.isEmpty()) continue;
+            StringBuilder arr = new StringBuilder();
+            arr.append("i32 ").append(offsets.size());
+            for (int off : offsets) arr.append(", i32 ").append(off);
+            String sym = "__jnative_rcfields_" + RefCountPlan.symbolName(e.getKey());
+            lines.computeIfAbsent(sym, k -> new ArrayList<>())
+                .add("@" + sym + " = constant [" + (offsets.size() + 1) + " x i32] [" + arr + "]");
+        }
+        for (String desc : plan.getCountedArrayTypes()) {
+            String sym = "__jnative_rcarray_" + RefCountPlan.symbolName(desc);
+            lines.computeIfAbsent(sym, k -> new ArrayList<>()).add("@" + sym + " = constant i32 1");
+        }
+        for (String cls : plan.getCyclicClasses()) {
+            ClassNode node = resolver.getClassNode(cls);
+            if (node == null || node.isExternal()) continue;
+            String sym = "__jnative_rccyclic_" + RefCountPlan.symbolName(cls);
+            lines.computeIfAbsent(sym, k -> new ArrayList<>()).add("@" + sym + " = constant i32 1");
+            Set<String> owned = plan.getOwnedArrayFields().get(cls);
+            if (owned == null || owned.isEmpty()) continue;
+            Set<Integer> offsets = new TreeSet<>();
+            for (String key : owned) {
+                int dot = key.lastIndexOf('.');
+                ClassNode ownerNode = resolver.getClassNode(key.substring(0, dot));
+                if (ownerNode == null || ownerNode.isExternal()) continue;
+                offsets.add(getFieldOffset(key.substring(0, dot), key.substring(dot + 1)));
+            }
+            if (offsets.isEmpty()) continue;
+            StringBuilder arr = new StringBuilder("i32 ").append(offsets.size());
+            for (int off : offsets) arr.append(", i32 ").append(off);
+            String ownedSym = "__jnative_rcowned_" + RefCountPlan.symbolName(cls);
+            lines.computeIfAbsent(ownedSym, k -> new ArrayList<>())
+                .add("@" + ownedSym + " = constant [" + (offsets.size() + 1) + " x i32] [" + arr + "]");
+        }
+        StringBuilder sb = new StringBuilder("\n; ----- Reference counting tables -----\n");
+        for (List<String> defs : lines.values()) {
+            if (defs.size() == 1) sb.append(defs.getFirst()).append("\n");
+        }
+        if (countsLambdaCaptures()) {
+            for (LambdaInfo lambda : lambdaRegistry.values()) {
+                sb.append("@__jnative_rcoff_").append(RefCountPlan.symbolName(lambda.lambdaClassName))
+                    .append(" = constant i32 ").append(lambdaCountOffset(lambda.capturedTypes)).append("\n");
+                int[] offsets = lambdaCaptureOffsets(lambda.capturedTypes);
+                List<Integer> references = new ArrayList<>();
+                for (int i = 0; i < offsets.length; i++) {
+                    if ("i8*".equals(LlvmTypeMapper.toLlvmType(lambda.capturedTypes.get(i)))) {
+                        references.add(offsets[i]);
+                    }
+                }
+                if (references.isEmpty()) continue;
+                sb.append("@__jnative_rcfields_").append(RefCountPlan.symbolName(lambda.lambdaClassName))
+                    .append(" = constant [").append(references.size() + 1).append(" x i32] [i32 ")
+                    .append(references.size());
+                for (int offset : references) sb.append(", i32 ").append(offset);
+                sb.append("]\n");
+            }
+        }
+        return sb.toString();
+    }
+
+    boolean countsLambdaCaptures() {
+        RefCountPlan plan = module.getRefCountPlan();
+        return plan != null && !plan.getCountedClasses().isEmpty();
+    }
+
+    static int lambdaCapturesEnd(List<Type> capturedTypes) {
+        int offset = OBJECT_HEADER_SIZE;
+        for (Type type : capturedTypes) {
+            int align = fieldAlignment(type);
+            offset = (offset + align - 1) & -align;
+            offset += fieldSize(type);
+        }
+        return offset;
+    }
+
+    static int lambdaCountOffset(List<Type> capturedTypes) {
+        return (lambdaCapturesEnd(capturedTypes) + 3) & -4;
+    }
+
+    static int[] lambdaCaptureOffsets(List<Type> capturedTypes) {
+        int[] offsets = new int[capturedTypes.size()];
+        int offset = OBJECT_HEADER_SIZE;
+        for (int i = 0; i < offsets.length; i++) {
+            Type type = capturedTypes.get(i);
+            int align = fieldAlignment(type);
+            offset = (offset + align - 1) & -align;
+            offsets[i] = offset;
+            offset += fieldSize(type);
+        }
+        return offsets;
+    }
+
     private volatile Map<String, List<FieldNode>> phantomFields;
-    private final Set<FieldNode> phantomNodes = Collections.newSetFromMap(new IdentityHashMap<>());
+    private final Set<FieldNode> phantomNodes = Collections.newSetFromMap(Collections.synchronizedMap(new IdentityHashMap<>()));
 
     private Map<String, List<FieldNode>> phantomFields() {
         Map<String, List<FieldNode>> p = phantomFields;
@@ -2027,7 +2273,8 @@ public class LlvmGlobalEmitter {
 
     private Map<String, List<FieldNode>> collectPhantomFields() {
         Map<String, Set<String>> names = new TreeMap<>();
-        for (Function function : module.getFunctions()) {
+        List<? extends Function> jnLoop30 = module.getFunctions();
+        for (Function function : jnLoop30) {
             for (BasicBlock block : function.getBlocks()) {
                 for (Instruction inst : block.getInstructions()) {
                     Opcode op = inst.getOpcode();
@@ -2090,7 +2337,8 @@ public class LlvmGlobalEmitter {
         if (cn.isExternal()) return owner.startsWith("[") ? null : owner;
         Set<String> seen = new HashSet<>();
         while (seen.add(cn.getName())) {
-            for (FieldNode f : cn.getFields()) {
+            List<? extends FieldNode> jnLoop33 = cn.getFields();
+            for (FieldNode f : jnLoop33) {
                 if ((f.getAccess() & Opcodes.ACC_STATIC) == 0 && f.getName().equals(field)) return null;
             }
             String sup = cn.getSuperName();
@@ -2128,7 +2376,8 @@ public class LlvmGlobalEmitter {
             allFields.addAll(reflectInfo.staticFieldKeys(resolver::getField));
         }
 
-        for (Function function : module.getFunctions()) {
+        List<? extends Function> jnLoop35 = module.getFunctions();
+        for (Function function : jnLoop35) {
             for (BasicBlock block : function.getBlocks()) {
                 for (Instruction inst : block.getInstructions()) {
                     Opcode op = inst.getOpcode();
@@ -2269,12 +2518,14 @@ public class LlvmGlobalEmitter {
             names.add(cn.getName());
         }
 
-        for (Function func : module.getFunctions()) {
+        List<? extends Function> jnLoop38 = module.getFunctions();
+        for (Function func : jnLoop38) {
             String fn = func.getName();
             if (fn != null && !fn.isEmpty()) names.add(fn);
         }
 
-        for (Function func : module.getFunctions()) {
+        List<? extends Function> jnLoop39 = module.getFunctions();
+        for (Function func : jnLoop39) {
             for (BasicBlock block : func.getBlocks()) {
                 for (Instruction inst : block.getInstructions()) {
                     collectStringConstantsFromInstruction(inst, names);
@@ -2317,7 +2568,8 @@ public class LlvmGlobalEmitter {
 
         StringBuilder body = new StringBuilder();
         boolean any = false;
-        for (String s : snapshot) {
+        List<? extends String> jnLoop41 = snapshot;
+        for (String s : jnLoop41) {
             if (emittedStringConstants.add(s)) {
                 body.append(LlvmRuntime.typeStringConstant(s));
                 any = true;
@@ -2386,7 +2638,8 @@ public class LlvmGlobalEmitter {
 
     private Set<String> collectJavaStringLiterals() {
         Set<String> result = new LinkedHashSet<>(staticFieldStringConstants);
-        for (Function func : module.getFunctions()) {
+        List<? extends Function> jnLoop42 = module.getFunctions();
+        for (Function func : jnLoop42) {
             for (BasicBlock block : func.getBlocks()) {
                 for (Instruction inst : block.getInstructions()) {
                     for (Value v : inst.getOperands()) {
@@ -2424,7 +2677,8 @@ public class LlvmGlobalEmitter {
                 }
                 Terminator term = block.getTerminator();
                 if (term != null) {
-                    for (Value v : terminatorOperands(term)) {
+                    List<? extends Value> jnLoop43 = terminatorOperands(term);
+                    for (Value v : jnLoop43) {
                         if (v instanceof Constant c
                             && c.getType().isReference()
                             && "java/lang/String".equals(c.getType().getClassName())
@@ -2502,166 +2756,11 @@ public class LlvmGlobalEmitter {
         List<String> literals = new ArrayList<>(collectJavaStringLiterals());
         Collections.sort(literals);
 
-        for (String s : literals) {
-            /*
-             * Decide which of the two compact-string encodings the literal
-             * must use.
-             *
-             * The decision is made per character code unit, not per code
-             * point. A supplementary character (U+10000..U+10FFFF) is
-             * represented in the Java String as two surrogate code units
-             * in the range U+DC80..U+DFFF, both of which are greater than
-             * 0xFF; a string containing one therefore lands in the UTF-16
-             * branch automatically, with no separate surrogate-pair test
-             * required.
-             *
-             * A string consisting entirely of characters in U+0000..U+00FF
-             * is encoded in the compact LATIN1 form: one byte per character
-             * code unit, equal to the character's low 8 bits. This is the
-             * same representation java.lang.String uses internally when
-             * String.COMPACT_STRINGS is true.
-             *
-             * Every other string is encoded as UTF-16LE: two bytes per
-             * character code unit, low byte first, matching
-             * StringUTF16.isBigEndian() on every supported target. This is the same
-             * representation java.lang.String uses internally when the
-             * compact-string optimisation is not in effect.
-             */
-            boolean latin1 = true;
-            int charCount = s.length();
-            for (int i = 0; i < charCount; i++) {
-                if (s.charAt(i) > 0xFF) {
-                    latin1 = false;
-                    break;
-                }
-            }
-
-            byte[] bytes;
-            int coder;
-            int lengthField;
-
-            if (latin1) {
-                /*
-                 * Compact LATIN1 form. One byte per character code unit;
-                 * the byte value is the low 8 bits of the char, which for
-                 * a char <= 0xFF is the char itself.
-                 */
-                bytes = new byte[charCount];
-                for (int i = 0; i < charCount; i++) {
-                    bytes[i] = (byte) s.charAt(i);
-                }
-                coder = 0;
-                lengthField = charCount;
-            } else {
-                /*
-                 * UTF-16LE form. Two bytes per character code unit, low
-                 * byte first. Surrogate pairs are emitted as two
-                 * consecutive code units, exactly as they appear in the
-                 * Java String.
-                 *
-                 * The charCount used here is String.length(), i.e. the
-                 * number of char code units, not the number of Unicode
-                 * code points. That is the number of elements that
-                 * String.length() must report, and it is the number the
-                 * length word below is derived from.
-                 */
-                bytes = new byte[charCount * 2];
-                for (int i = 0; i < charCount; i++) {
-                    char ch = s.charAt(i);
-                    bytes[i * 2]     = (byte) (ch & 0xFF);
-                    bytes[i * 2 + 1] = (byte) (ch >>> 8);
-                }
-                coder = 1;
-                lengthField = charCount * 2;
-            }
-
-            int len = bytes.length;
-
-            /*
-             * Escape the payload for LLVM's c"..." string-literal syntax.
-             * Every byte outside printable ASCII, plus backslash, double
-             * quote and the common whitespace escapes, is rendered in
-             * uppercase two-digit hex. A trailing NUL byte is appended so
-             * that C-side consumers can treat the payload as a C string;
-             * it is C-side slack, not a Java element — the `length` field
-             * below is the true Java-visible byte count, and the NUL is
-             * never observed by String.length(), String.charAt() or any
-             * other method of String.
-             */
-            StringBuilder escaped = getStringBuilder(bytes);
-
-            String safe = LlvmRuntime.stringIdSuffix(s);
-            String bytesGlobal = "strbytes_" + safe;
-            String objGlobal = "jstr_" + safe;
-
-            /*
-             * The backing byte[]. Emitted as an anonymous struct so that
-             * the klass word at offset 0 can be a real pointer relocation
-             * rather than compile-time bytes. LLVM lays the fields out
-             * naturally (i8* @0, i32 @8, i32 @12, [N x i8] @16), which is
-             * exactly the canonical Java array header:
-             *
-             *     JAVA_ARR_KLASS_OFFSET      = 0
-             *     JAVA_ARR_LENGTH_OFFSET     = 8
-             *     JAVA_ARR_ELEM_SIZE_OFFSET  = 12
-             *     JAVA_ARR_HDR               = 16
-             *
-             * `align 8` matches the natural alignment of the i8* header
-             * word; the alignment does not change the field offsets but
-             * does keep the pointer slot addressable as a pointer.
-             *
-             * The value written into the length word is `lengthField`,
-             * which is the character count in the LATIN1 branch and twice
-             * the character count in the UTF-16 branch. That is the value
-             * String.length() derives the Java-level length from, via
-             * `value.length >> coder`.
-             */
-            int payloadLen = len + 1;   // NUL terminator is part of the array
-
-            sb.append("@").append(bytesGlobal)
-                    .append(" = unnamed_addr constant { i8*, i32, i32, [")
-                    .append(payloadLen).append(" x i8] } {\n")
-                    .append("  i8* bitcast (%ReflectionClass* ").append(byteArrayKlassRef)
-                    .append(" to i8*),\n")
-                    .append("  i32 ").append(lengthField).append(",\n")
-                    .append("  i32 1,\n")
-                    .append("  [").append(payloadLen).append(" x i8] c\"")
-                    .append(escaped).append("\"\n")
-                    .append("}, align 8\n");
-
-            /*
-             * The String object. Its `value` field is a bitcast of the
-             * anonymous struct pointer to i8*, matching the i8* declared
-             * for that field in %struct.java_lang_String. The bitcast is
-             * necessary because the struct type is anonymous and therefore
-             * not nameable in the field declaration.
-             *
-             * The `coder` field carries the same value the payload was
-             * encoded with:
-             *
-             *     coder == 0  ->  LATIN1  (one byte per character)
-             *     coder == 1  ->  UTF-16  (two bytes per character)
-             *
-             * String.coder() reads it (after checking
-             * @gv_java_lang_String_COMPACT_STRINGS, which String.<clinit>
-             * sets to true) and String.length() applies it as the
-             * right-shift amount.
-             *
-             * The `hash` field is left at zero so the first hashCode()
-             * call computes and caches the real value lazily. The trailing
-             * i1 is left false for the same reason.
-             */
-            sb.append("@").append(objGlobal)
-                    .append(" = global %struct.java_lang_String {\n")
-                    .append("  i8* bitcast (%JNativeVTable* ").append(vtableName).append(" to i8*),\n")
-                    .append("  i8* bitcast ({ i8*, i32, i32, [").append(payloadLen)
-                    .append(" x i8] }* @").append(bytesGlobal).append(" to i8*),\n")
-                    .append("  i8 ").append(coder).append(",\n")
-                    .append("  i32 0,\n")
-                    .append("  i1 false\n")
-                    .append("}, align 8\n");
-
-            stringLiteralPool.add(objGlobal);
+        List<String> literalTexts = LlvmUtil.parallelMapOrdered(literals, scheduler,
+            s -> stringLiteralDefinition(s, byteArrayKlassRef, vtableName));
+        for (int li = 0; li < literals.size(); li++) {
+            sb.append(literalTexts.get(li));
+            stringLiteralPool.add("jstr_" + LlvmRuntime.stringIdSuffix(literals.get(li)));
         }
 
         int n = stringLiteralPool.size();
@@ -2672,6 +2771,170 @@ public class LlvmGlobalEmitter {
         }
         sb.append("], align 8\n");
         sb.append("@__jnative_literal_pool_size = constant i32 ").append(n).append("\n");
+        return sb.toString();
+    }
+
+    private String stringLiteralDefinition(String s, String byteArrayKlassRef, String vtableName) {
+        StringBuilder sb = new StringBuilder();
+        /*
+         * Decide which of the two compact-string encodings the literal
+         * must use.
+         *
+         * The decision is made per character code unit, not per code
+         * point. A supplementary character (U+10000..U+10FFFF) is
+         * represented in the Java String as two surrogate code units
+         * in the range U+DC80..U+DFFF, both of which are greater than
+         * 0xFF; a string containing one therefore lands in the UTF-16
+         * branch automatically, with no separate surrogate-pair test
+         * required.
+         *
+         * A string consisting entirely of characters in U+0000..U+00FF
+         * is encoded in the compact LATIN1 form: one byte per character
+         * code unit, equal to the character's low 8 bits. This is the
+         * same representation java.lang.String uses internally when
+         * String.COMPACT_STRINGS is true.
+         *
+         * Every other string is encoded as UTF-16LE: two bytes per
+         * character code unit, low byte first, matching
+         * StringUTF16.isBigEndian() on every supported target. This is the same
+         * representation java.lang.String uses internally when the
+         * compact-string optimisation is not in effect.
+         */
+        boolean latin1 = true;
+        int charCount = s.length();
+        for (int i = 0; i < charCount; i++) {
+            if (s.charAt(i) > 0xFF) {
+                latin1 = false;
+                break;
+            }
+        }
+
+        byte[] bytes;
+        int coder;
+        int lengthField;
+
+        if (latin1) {
+            /*
+             * Compact LATIN1 form. One byte per character code unit;
+             * the byte value is the low 8 bits of the char, which for
+             * a char <= 0xFF is the char itself.
+             */
+            bytes = new byte[charCount];
+            for (int i = 0; i < charCount; i++) {
+                bytes[i] = (byte) s.charAt(i);
+            }
+            coder = 0;
+            lengthField = charCount;
+        } else {
+            /*
+             * UTF-16LE form. Two bytes per character code unit, low
+             * byte first. Surrogate pairs are emitted as two
+             * consecutive code units, exactly as they appear in the
+             * Java String.
+             *
+             * The charCount used here is String.length(), i.e. the
+             * number of char code units, not the number of Unicode
+             * code points. That is the number of elements that
+             * String.length() must report, and it is the number the
+             * length word below is derived from.
+             */
+            bytes = new byte[charCount * 2];
+            for (int i = 0; i < charCount; i++) {
+                char ch = s.charAt(i);
+                bytes[i * 2]     = (byte) (ch & 0xFF);
+                bytes[i * 2 + 1] = (byte) (ch >>> 8);
+            }
+            coder = 1;
+            lengthField = charCount * 2;
+        }
+
+        int len = bytes.length;
+
+        /*
+         * Escape the payload for LLVM's c"..." string-literal syntax.
+         * Every byte outside printable ASCII, plus backslash, double
+         * quote and the common whitespace escapes, is rendered in
+         * uppercase two-digit hex. A trailing NUL byte is appended so
+         * that C-side consumers can treat the payload as a C string;
+         * it is C-side slack, not a Java element — the `length` field
+         * below is the true Java-visible byte count, and the NUL is
+         * never observed by String.length(), String.charAt() or any
+         * other method of String.
+         */
+        StringBuilder escaped = getStringBuilder(bytes);
+
+        String safe = LlvmRuntime.stringIdSuffix(s);
+        String bytesGlobal = "strbytes_" + safe;
+        String objGlobal = "jstr_" + safe;
+
+        /*
+         * The backing byte[]. Emitted as an anonymous struct so that
+         * the klass word at offset 0 can be a real pointer relocation
+         * rather than compile-time bytes. LLVM lays the fields out
+         * naturally (i8* @0, i32 @8, i32 @12, [N x i8] @16), which is
+         * exactly the canonical Java array header:
+         *
+         *     JAVA_ARR_KLASS_OFFSET      = 0
+         *     JAVA_ARR_LENGTH_OFFSET     = 8
+         *     JAVA_ARR_ELEM_SIZE_OFFSET  = 12
+         *     JAVA_ARR_HDR               = 16
+         *
+         * `align 8` matches the natural alignment of the i8* header
+         * word; the alignment does not change the field offsets but
+         * does keep the pointer slot addressable as a pointer.
+         *
+         * The value written into the length word is `lengthField`,
+         * which is the character count in the LATIN1 branch and twice
+         * the character count in the UTF-16 branch. That is the value
+         * String.length() derives the Java-level length from, via
+         * `value.length >> coder`.
+         */
+        int payloadLen = len + 1;   // NUL terminator is part of the array
+
+        sb.append("@").append(bytesGlobal)
+                .append(" = unnamed_addr constant { i8*, i32, i32, [")
+                .append(payloadLen).append(" x i8] } {\n")
+                .append("  i8* bitcast (%ReflectionClass* ").append(byteArrayKlassRef)
+                .append(" to i8*),\n")
+                .append("  i32 ").append(lengthField).append(",\n")
+                .append("  i32 1,\n")
+                .append("  [").append(payloadLen).append(" x i8] c\"")
+                .append(escaped).append("\"\n")
+                .append("}, align 8\n");
+
+        /*
+         * The String object. Its `value` field is a bitcast of the
+         * anonymous struct pointer to i8*, matching the i8* declared
+         * for that field in %struct.java_lang_String. The bitcast is
+         * necessary because the struct type is anonymous and therefore
+         * not nameable in the field declaration.
+         *
+         * The `coder` field carries the same value the payload was
+         * encoded with:
+         *
+         *     coder == 0  ->  LATIN1  (one byte per character)
+         *     coder == 1  ->  UTF-16  (two bytes per character)
+         *
+         * String.coder() reads it (after checking
+         * @gv_java_lang_String_COMPACT_STRINGS, which String.<clinit>
+         * sets to true) and String.length() applies it as the
+         * right-shift amount.
+         *
+         * The `hash` field is left at zero so the first hashCode()
+         * call computes and caches the real value lazily. The trailing
+         * i1 is left false for the same reason.
+         */
+        sb.append("@").append(objGlobal)
+                .append(" = global %struct.java_lang_String {\n")
+                .append("  i8* bitcast (%JNativeVTable* ").append(vtableName).append(" to i8*),\n")
+                .append("  i8* bitcast ({ i8*, i32, i32, [").append(payloadLen)
+                .append(" x i8] }* @").append(bytesGlobal).append(" to i8*),\n")
+                .append("  i8 ").append(coder).append(",\n")
+                .append("  i32 0,\n")
+                .append("  i1 false");
+        RefCountPlan plan = module.getRefCountPlan();
+        if (plan != null && plan.declaresCount("java/lang/String")) sb.append(",\n  i32 0");
+        sb.append("\n}, align 8\n");
         return sb.toString();
     }
 
@@ -2712,18 +2975,22 @@ public class LlvmGlobalEmitter {
         // own vtable to instancesOf[S] for every S in C's supertype closure. This
         // includes C itself — see collectSuperclasses(), which always adds cls.getName()
         // to the accumulator.
+        List<ClassNode> typedClasses = new ArrayList<>();
         for (ClassNode cls : allClasses) {
             if (cls.isExternal()) continue;
-
-            String className = cls.getName();
-            String classVtable = vtableNames.get(className);
-            if (classVtable == null) continue;
-
+            if (vtableNames.get(cls.getName()) == null) continue;
+            typedClasses.add(cls);
+        }
+        List<Set<String>> supertypeSets = LlvmUtil.parallelMapOrdered(typedClasses, scheduler, cls -> {
             Set<String> supertypes = new LinkedHashSet<>();
             collectSuperclasses(cls, supertypes);
             collectInterfaces(cls, supertypes);
+            return supertypes;
+        });
+        for (int ti = 0; ti < typedClasses.size(); ti++) {
+            String classVtable = vtableNames.get(typedClasses.get(ti).getName());
 
-            for (String supertype : supertypes) {
+            for (String supertype : supertypeSets.get(ti)) {
                 instancesOf.computeIfAbsent(supertype, k -> new LinkedHashSet<>())
                     .add(classVtable);
             }
@@ -2754,7 +3021,8 @@ public class LlvmGlobalEmitter {
             String lambdaVtable = vtableNames.get(linfo.lambdaClassName);
             if (lambdaVtable == null) continue;
 
-            for (String iface : linfo.superInterfaces) {
+            List<? extends String> jnLoop49 = linfo.superInterfaces;
+            for (String iface : jnLoop49) {
                 instancesOf
                     .computeIfAbsent(iface, k -> new LinkedHashSet<>())
                     .add(lambdaVtable);
@@ -2838,7 +3106,8 @@ public class LlvmGlobalEmitter {
     private void collectInterfaces(ClassNode cls, Set<String> accumulator) {
         if (cls == null) return;
 
-        for (String iface : cls.getInterfaces()) {
+        List<? extends String> jnLoop53 = cls.getInterfaces();
+        for (String iface : jnLoop53) {
             if (accumulator.add(iface)) {
                 ClassNode ifaceNode = resolver.getClassNode(iface);
                 if (ifaceNode != null && !ifaceNode.isExternal()) {
@@ -3023,6 +3292,19 @@ public class LlvmGlobalEmitter {
         return fn != null ? fn.getType() : null;
     }
 
+    public boolean isFinalStaticField(String className, String fieldName) {
+        if (className == null || className.isEmpty() || fieldName == null || fieldName.isEmpty()) return false;
+        FieldNode fn = resolver.getField(className, fieldName);
+        int flags = Opcodes.ACC_FINAL | Opcodes.ACC_STATIC;
+        return fn != null && (fn.getAccess() & flags) == flags;
+    }
+
+    public boolean isVolatileField(String className, String fieldName) {
+        if (className == null || className.isEmpty() || fieldName == null || fieldName.isEmpty()) return false;
+        FieldNode fn = resolver.getField(className, fieldName);
+        return fn != null && (fn.getAccess() & Opcodes.ACC_VOLATILE) != 0;
+    }
+
     /**
      * Exact size, in bytes, of the LLVM struct {@code %struct.<class>} for a
      * top-level class, computed by exactly the same rule that
@@ -3047,7 +3329,8 @@ public class LlvmGlobalEmitter {
             return -1;
         }
         int offset = OBJECT_HEADER_SIZE;
-        for (FieldNode f : collectInstanceFields(cls)) {
+        List<? extends FieldNode> jnLoop55 = collectInstanceFields(cls);
+        for (FieldNode f : jnLoop55) {
             int align = fieldAlignment(f.getType());
             int size  = fieldSize(f.getType());
             offset = (offset + align - 1) & -align;
@@ -3072,17 +3355,9 @@ public class LlvmGlobalEmitter {
 
     private int computeLambdaObjectSize(String className) {
         LambdaInfo linfo = findLambdaInfoByClassName(className);
-        if (linfo == null || linfo.capturedTypes == null || linfo.capturedTypes.isEmpty()) {
-            return OBJECT_HEADER_SIZE;
-        }
-        int offset = OBJECT_HEADER_SIZE;
-        for (Type capType : linfo.capturedTypes) {
-            int align = fieldAlignment(capType);
-            int size  = fieldSize(capType);
-            offset = (offset + align - 1) & -align;
-            offset += size;
-        }
-        return (offset + 7) & ~7;
+        List<Type> captured = linfo == null || linfo.capturedTypes == null ? List.of() : linfo.capturedTypes;
+        int end = countsLambdaCaptures() ? lambdaCountOffset(captured) + 4 : lambdaCapturesEnd(captured);
+        return (end + 7) & ~7;
     }
 
     // =========================================================================
@@ -3094,7 +3369,8 @@ public class LlvmGlobalEmitter {
         if (cn == null || cn.isExternal() || cn.getMethods() == null) return;
         Set<String> present = new HashSet<>();
         for (MethodReference m : info.getMethods()) present.add(m.getName() + m.getDescriptor());
-        for (MethodNode mn : cn.getMethods()) {
+        List<? extends MethodNode> jnLoop58 = cn.getMethods();
+        for (MethodNode mn : jnLoop58) {
             if (mn.getName().equals("<init>") || mn.getName().equals("<clinit>")) continue;
             if (mn.getDescriptor() == null || mn.getDescriptor().isEmpty()) continue;
             if (present.add(mn.getName() + mn.getDescriptor())) {
@@ -3220,7 +3496,8 @@ public class LlvmGlobalEmitter {
         // rejects the module — so the descriptors are collected by walking
         // the module's own instructions rather than guessed.
         // ------------------------------------------------------------------
-        for (Function func : module.getFunctions()) {
+        List<? extends Function> jnLoop66 = module.getFunctions();
+        for (Function func : jnLoop66) {
             for (BasicBlock block : func.getBlocks()) {
                 for (Instruction inst : block.getInstructions()) {
                     if (inst.getOpcode() == Opcode.NEW_ARRAY
@@ -3345,7 +3622,8 @@ public class LlvmGlobalEmitter {
                 info = reflectInfo.getClassInfoMap().get(className);
                 if (classNode != null && !classNode.isExternal() && !isArrayPseudoClass) {
                     Map<String, FieldNode> mostDerivedByName = new LinkedHashMap<>();
-                    for (FieldNode f : collectInstanceFields(classNode)) {
+                    List<? extends FieldNode> jnLoop70 = collectInstanceFields(classNode);
+                    for (FieldNode f : jnLoop70) {
                         if ((f.getAccess() & Opcodes.ACC_STATIC) != 0) continue;
                         if (phantomNodes.contains(f)) continue;
                         mostDerivedByName.put(f.getName(), f);
@@ -3494,7 +3772,8 @@ public class LlvmGlobalEmitter {
                      * use internally, so it cannot disagree with either.
                      */
                     objectSize = OBJECT_HEADER_SIZE;
-                    for (FieldNode f : collectInstanceFields(classNode)) {
+                    List<? extends FieldNode> jnLoop72 = collectInstanceFields(classNode);
+                    for (FieldNode f : jnLoop72) {
                         Type ft = f.getType();
                         int align = fieldAlignment(ft);
                         int size  = fieldSize(ft);
@@ -3622,7 +3901,8 @@ public class LlvmGlobalEmitter {
             List<FieldReference> sortedFields = new ArrayList<>(info.getFields());
             {
                 Map<String, FieldReference> byName = new LinkedHashMap<>();
-                for (FieldReference fr : sortedFields) {
+                List<? extends FieldReference> jnLoop74 = sortedFields;
+                for (FieldReference fr : jnLoop74) {
                     FieldReference existing = byName.get(fr.getName());
                     if (existing == null) {
                         byName.put(fr.getName(), fr);
@@ -3641,7 +3921,8 @@ public class LlvmGlobalEmitter {
             }
             sortedFields.sort(Comparator.comparing(FieldReference::toString));
             List<String> fieldPtrs = new ArrayList<>();
-            for (FieldReference field : sortedFields) {
+            List<? extends FieldReference> jnLoop75 = sortedFields;
+            for (FieldReference field : jnLoop75) {
                 String fieldName = field.getName();
                 String desc = field.getDescriptor();
                 int modifiers = 0;
@@ -3697,7 +3978,8 @@ public class LlvmGlobalEmitter {
                     existingCtorDescs.add(ctor.getDescriptor());
                 }
                 List<MethodReference> moduleCtorAdditions = new ArrayList<>();
-                for (MethodNode mn : classNode.getMethods()) {
+                List<? extends MethodNode> jnLoop77 = classNode.getMethods();
+                for (MethodNode mn : jnLoop77) {
                     if (!mn.getName().equals("<init>")) continue;
                     String desc = mn.getDescriptor();
                     if (desc == null || desc.isEmpty()) continue;
@@ -3969,7 +4251,8 @@ public class LlvmGlobalEmitter {
         sb.append("\n; ----- Function index for stack walking -----\n");
 
         List<Function> allFuncs = new ArrayList<>();
-        for (Function f : module.getFunctions()) {
+        List<? extends Function> jnLoop81 = module.getFunctions();
+        for (Function f : jnLoop81) {
             if (f.getEntryBlock() != null && hasFunctionIndexSignature(f)) {
                 allFuncs.add(f);
             }
@@ -4039,7 +4322,8 @@ public class LlvmGlobalEmitter {
             Map<String, MethodNode> m = new HashMap<>();
             ClassNode cn = resolver.getClassNode(k);
             if (cn != null && cn.getMethods() != null) {
-                for (MethodNode mn : cn.getMethods()) {
+                List<? extends MethodNode> jnLoop83 = cn.getMethods();
+                for (MethodNode mn : jnLoop83) {
                     m.putIfAbsent(LlvmRuntime.mangleMethod(k, mn.getName(), mn.getDescriptor()), mn);
                 }
             }
@@ -4152,7 +4436,8 @@ public class LlvmGlobalEmitter {
         sb.append("\n; ----- Lazy <clinit> completion flags -----\n");
 
         Set<String> classes = new TreeSet<>();
-        for (Function fn : module.getFunctions()) {
+        List<? extends Function> jnLoop85 = module.getFunctions();
+        for (Function fn : jnLoop85) {
             if (!LlvmUtil.isLazyClinitWrapper(fn.getName())) continue;
             String owner = fn.getOwnerClass();
             if (owner == null || owner.isEmpty()) continue;
@@ -4222,7 +4507,8 @@ public class LlvmGlobalEmitter {
             if (className.charAt(0) == '[') continue;
             if (!classVarNames.containsKey(className)) continue;
 
-            for (MethodNode mn : cn.getMethods()) {
+            List<? extends MethodNode> jnLoop88 = cn.getMethods();
+            for (MethodNode mn : jnLoop88) {
                 String base = LlvmRuntime.mangleMethod(
                     className, mn.getName(), mn.getDescriptor());
 
@@ -4333,7 +4619,8 @@ public class LlvmGlobalEmitter {
             String cp = annotationBlob(data, "@__jnative_annot_cp_" + id, annotations.getConstantPool());
             String classAnns = annotationBlob(data, "@__jnative_annot_c_" + id, annotations.getClassAnnotations());
             List<String> memberRows = new ArrayList<>();
-            for (ClassFileAnnotations.Member m : annotations.getMembers()) {
+            List<? extends ClassFileAnnotations.Member> jnLoop95 = annotations.getMembers();
+            for (ClassFileAnnotations.Member m : jnLoop95) {
                 String anns = annotationBlob(data, "@__jnative_annot_b_" + blob++, m.annotations());
                 String params = annotationBlob(data, "@__jnative_annot_b_" + blob++, m.parameterAnnotations());
                 String dflt = annotationBlob(data, "@__jnative_annot_b_" + blob++, m.annotationDefault());
@@ -4426,7 +4713,8 @@ public class LlvmGlobalEmitter {
         List<String> rows = new ArrayList<>();
         ClassNode cn = resolver.getClassNode(className);
         if (cn != null && cn.getFields() != null) {
-            for (FieldNode f : cn.getFields()) {
+            List<? extends FieldNode> jnLoop98 = cn.getFields();
+            for (FieldNode f : jnLoop98) {
                 int required = Opcodes.ACC_STATIC | Opcodes.ACC_FINAL;
                 if ((f.getAccess() & required) != required) continue;
                 if (!(f.getConstantValue() instanceof Integer value)) continue;
@@ -4541,7 +4829,8 @@ public class LlvmGlobalEmitter {
             if (className == null || className.isEmpty()) continue;
             if (className.charAt(0) == '[') continue;
 
-            for (MethodNode mn : cn.getMethods()) {
+            List<? extends MethodNode> jnLoop105 = cn.getMethods();
+            for (MethodNode mn : jnLoop105) {
                 if (!mn.isCallerSensitive()) continue;
 
                 String base = LlvmRuntime.mangleMethod(
@@ -4864,7 +5153,8 @@ public class LlvmGlobalEmitter {
 
     private MethodNode findMethod(ClassNode classNode, String name, String descriptor) {
         if (classNode == null || classNode.isExternal()) return null;
-        for (MethodNode m : classNode.getMethods()) {
+        List<? extends MethodNode> jnLoop107 = classNode.getMethods();
+        for (MethodNode m : jnLoop107) {
             if (m.getName().equals(name) && m.getDescriptor().equals(descriptor)) return m;
         }
         if (classNode.getSuperName() != null && !classNode.getSuperName().equals("java/lang/Object")) {

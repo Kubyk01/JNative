@@ -15,11 +15,14 @@ public interface OrchestratorPort {
                  boolean showEscape,
                  boolean showLifetime,
                  boolean showDestructor,
+                 boolean enableReachability,
+                 boolean showReachability,
                  String outputFile,
                  boolean noCompile,
                  boolean includeSystem,
                  String debugName,
                  int cores,
                  int optimizationLevel,
+                 String ltoMode,
                  TargetPlatform targetPlatform);
 }

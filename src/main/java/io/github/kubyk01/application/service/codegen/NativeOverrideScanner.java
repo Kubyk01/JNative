@@ -14,7 +14,7 @@ import java.util.regex.Pattern;
 /**
  * Scans C sources for __jnative_override_* functions, producing
  * NativeOverride records.
- *
+ * <p>
  * Naming: __jnative_override_<mangledClass>_<method>[__<mangledDesc>] —
  * class parsed from the first uppercase-initial underscore segment;
  * otherwise the class is derived from the .c file path. Sentinel method
@@ -134,9 +134,10 @@ public final class NativeOverrideScanner {
             Type retType = cReturnType(cReturn);
 
             List<Type> paramTypes = new ArrayList<>();
-            for (String cType : cTypes) {
+            {
+                for (int jnIdx1 = 0; jnIdx1 < cTypes.size(); jnIdx1++) { String cType = ((List<? extends String>) cTypes).get(jnIdx1);
                 paramTypes.add(cParamType(cType));
-            }
+            } }
 
             out.add(new NativeOverride(className, methodName, descriptor,
                 cName, retType, paramTypes, hasReceiver));

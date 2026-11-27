@@ -1,5 +1,7 @@
 package io.github.kubyk01.domain.ir;
 
+import java.util.Collections;
+
 import lombok.Getter;
 import lombok.Setter;
 
@@ -28,10 +30,16 @@ public class LookupSwitchTerminator extends Terminator {
 
     @Override
     public List<BasicBlock> getTargets() {
-        List<BasicBlock> list = new ArrayList<>(Arrays.asList(targets));
-        list.add(defaultTarget);
-        return list;
+        List<BasicBlock> t = targetList;
+        if (t == null) {
+            List<BasicBlock> list = new ArrayList<>(Arrays.asList(targets));
+            list.add(defaultTarget);
+            targetList = t = Collections.unmodifiableList(list);
+        }
+        return t;
     }
+
+    private List<BasicBlock> targetList;
 
     @Override
     public String toString() {

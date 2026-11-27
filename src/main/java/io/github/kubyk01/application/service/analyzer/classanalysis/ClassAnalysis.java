@@ -4,6 +4,7 @@ import io.github.kubyk01.application.service.analyzer.classanalysis.annotation.C
 import io.github.kubyk01.application.service.analyzer.classanalysis.annotation.ProxyClassGenerator;
 import io.github.kubyk01.application.service.analyzer.classanalysis.annotation.runtime.JNativeProxySupport;
 import io.github.kubyk01.application.service.analyzer.dependencyresolver.DependencyResolver;
+import io.github.kubyk01.application.service.analyzer.reachabilityanalysis.ReachabilityAnalysis;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.ClassNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.FieldNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.FieldReference;
@@ -26,7 +27,6 @@ import io.github.kubyk01.domain.ir.ThrowTerminator;
 import io.github.kubyk01.domain.ir.Value;
 import io.github.kubyk01.util.LlvmUtil;
 import lombok.Getter;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.objectweb.asm.ClassReader;
 import org.objectweb.asm.Opcodes;
@@ -49,7 +49,6 @@ import java.util.Set;
 import java.util.TreeSet;
 
 @Slf4j
-@RequiredArgsConstructor
 public class ClassAnalysis {
 
     private static final String SPRING_DATA_REPOSITORY = "org/springframework/data/repository/Repository";
@@ -61,6 +60,16 @@ public class ClassAnalysis {
         List.of("io/r2dbc/spi/Connection", "io/r2dbc/spi/Wrapped"));
 
     private final DependencyResolver resolver;
+    private final ReachabilityAnalysis reachability;
+
+    public ClassAnalysis(DependencyResolver resolver) {
+        this(resolver, null);
+    }
+
+    public ClassAnalysis(DependencyResolver resolver, ReachabilityAnalysis reachability) {
+        this.resolver = resolver;
+        this.reachability = reachability;
+    }
 
     @Getter
     private final Set<String> classes = new HashSet<>();
@@ -72,18 +81,31 @@ public class ClassAnalysis {
     private final ReflectInfo reflectInfo = new ReflectInfo();
 
     public void analyze() {
-        resolver.loadAllClasses();
+        if (reachability == null) {
+            resolver.loadAllClasses();
+        } else {
+            resolver.loadReachableClassIndex();
+        }
         resolver.getClassNode(JNativeProxySupport.class.getName().replace('.', '/'));
-        List<String> loaded = new ArrayList<>(resolver.getAllClasses());
+        List<String> loaded;
+        if (reachability == null) {
+            loaded = new ArrayList<>(resolver.getAllClasses());
+        } else {
+            Set<String> candidates = new LinkedHashSet<>(reachability.getReachableClasses());
+            candidates.addAll(reachability.getReflectInfo().getAllClasses());
+            loaded = new ArrayList<>(candidates);
+        }
         loaded.forEach(this::register);
 
-        for (String name : loaded) {
+        List<? extends String> jnLoop1 = loaded;
+        for (String name : jnLoop1) {
             if (classes.contains(name) && (resolver.getClassNode(name).getAccess() & Opcodes.ACC_ANNOTATION) != 0) {
                 addProxy(List.of(name));
             }
         }
         loaded.forEach(this::addCallSiteProxies);
-        for (List<String> interfaces : resolver.getProxyInterfaces()) {
+        List<? extends List<String>> jnLoop2 = resolver.getProxyInterfaces();
+        for (List<String> interfaces : jnLoop2) {
             addProxy(interfaces.stream().map(i -> i.replace('.', '/')).toList());
         }
         FRAMEWORK_PROXIES.forEach((trigger, interfaces) -> {
@@ -104,7 +126,7 @@ public class ClassAnalysis {
 
     public void define(String internalName, byte[] bytes) {
         resolver.defineSyntheticClass(internalName, bytes);
-        register(internalName);
+        register(internalName, true);
     }
 
     public List<String> annotatedApplicationClasses() {
@@ -139,7 +161,8 @@ public class ClassAnalysis {
     }
 
     public void registerClassLiterals(Module module) {
-        for (Function func : module.getFunctions()) {
+        List<? extends Function> jnLoop5 = module.getFunctions();
+        for (Function func : jnLoop5) {
             if (func.getEntryBlock() == null) continue;
             for (BasicBlock block : func.getBlocks()) {
                 for (Instruction inst : block.getInstructions()) {
@@ -165,6 +188,10 @@ public class ClassAnalysis {
     }
 
     private void register(String name) {
+        register(name, false);
+    }
+
+    private void register(String name, boolean forceAllMethods) {
         if (name.isEmpty() || name.charAt(0) == '[' || name.endsWith("module-info")) return;
         ClassNode cn = resolver.getClassNode(name);
         if (cn.isExternal() || resolver.getClassBytes(name) == null || !classes.add(name)) return;
@@ -172,12 +199,16 @@ public class ClassAnalysis {
         ReflectClassInfo info = reflectInfo.getOrCreateClassInfo(name);
         info.setSuperName(cn.getSuperName());
         info.getInterfaces().addAll(cn.getInterfaces());
-        for (FieldNode f : cn.getFields()) {
+        List<? extends FieldNode> jnLoop6 = cn.getFields();
+        for (FieldNode f : jnLoop6) {
             info.addField(new FieldReference(name, f.getName(), f.getDescriptor()));
         }
-        for (MethodNode m : cn.getMethods()) {
+        List<? extends MethodNode> jnLoop7 = cn.getMethods();
+        for (MethodNode m : jnLoop7) {
             MethodReference ref = new MethodReference(name, m.getName(), m.getDescriptor());
-            if (!m.isAbstract()) methods.add(ref);
+            if (!m.isAbstract()
+                    && (forceAllMethods || reachability == null
+                        || reachability.getReachableMethods().contains(ref))) methods.add(ref);
             if (m.getName().equals("<init>")) info.addConstructor(ref);
             else if (!m.getName().equals("<clinit>")) info.addMethod(ref);
         }
@@ -190,7 +221,8 @@ public class ClassAnalysis {
         new ClassReader(bytes).accept(cn, ClassReader.SKIP_DEBUG | ClassReader.SKIP_FRAMES);
         List<List<String>> sites = new ArrayList<>();
         Set<String> staticTypes = new LinkedHashSet<>();
-        for (org.objectweb.asm.tree.MethodNode mn : cn.methods) {
+        List<? extends org.objectweb.asm.tree.MethodNode> jnLoop8 = cn.methods;
+        for (org.objectweb.asm.tree.MethodNode mn : jnLoop8) {
             List<String> array = null;
             for (AbstractInsnNode insn : mn.instructions) {
                 if (insn.getOpcode() == Opcodes.ANEWARRAY && "java/lang/Class".equals(((TypeInsnNode) insn).desc)) {
@@ -211,7 +243,8 @@ public class ClassAnalysis {
             List<List<String>> combos = List.of(List.of());
             for (String element : site) {
                 List<List<String>> next = new ArrayList<>();
-                for (List<String> combo : combos) {
+                List<? extends List<String>> jnLoop12 = combos;
+                for (List<String> combo : jnLoop12) {
                     for (String candidate : element != null ? List.of(element) : staticTypes) {
                         if (combo.contains(candidate)) continue;
                         List<String> extended = new ArrayList<>(combo);
@@ -221,7 +254,8 @@ public class ClassAnalysis {
                 }
                 combos = next.size() > 64 ? List.of() : next;
             }
-            for (List<String> combo : combos) {
+            List<? extends List<String>> jnLoop14 = combos;
+            for (List<String> combo : jnLoop14) {
                 if (!combo.isEmpty() && combo.stream().allMatch(this::isInterface)) addProxy(combo);
             }
         }

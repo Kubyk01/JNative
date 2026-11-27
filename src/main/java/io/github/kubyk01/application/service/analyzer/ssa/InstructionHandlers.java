@@ -415,7 +415,8 @@ public class InstructionHandlers {
         callInst.setPolymorphicSignature(polymorphic);
         if (receiver != null) callInst.addOperand(receiver);
         callInst.addOperand(new Constant(Type.reference(callee), callee));
-        for (Value arg : args) {
+        List<? extends Value> jnLoop1 = args;
+        for (Value arg : jnLoop1) {
             callInst.addOperand(arg);
         }
 

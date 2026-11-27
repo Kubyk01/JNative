@@ -15,6 +15,7 @@ import io.github.kubyk01.domain.ir.Terminator;
 import io.github.kubyk01.domain.ir.ThrowTerminator;
 import io.github.kubyk01.domain.ir.Value;
 import io.github.kubyk01.util.LlvmUtil;
+import io.github.kubyk01.util.ScratchIdentityMap;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import reactor.core.publisher.Flux;
@@ -23,11 +24,11 @@ import reactor.core.scheduler.Schedulers;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
-import java.util.Deque;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 
 import static io.github.kubyk01.util.LlvmUtil.extractCalleeName;
@@ -70,22 +71,13 @@ public class DeadCodeEliminator {
 
             Set<String> readStaticFields = collectReadStaticFields();
             Set<Integer> loadedLocals   = collectLoadedLocals();
-            Set<Value> usedValues       = collectUsedValues(readStaticFields);
-
-            for (Function func : module.getFunctions()) {
-                if (func.getEntryBlock() == null) continue;
-                for (BasicBlock block : func.getBlocks()) {
-                    List<Instruction> instructions = block.getInstructions();
-                    for (int i = 0; i < instructions.size(); i++) {
-                        Instruction inst = instructions.get(i);
-                        if (shouldRemove(inst, usedValues, readStaticFields, loadedLocals)) {
-                            instructions.remove(i);
-                            i--;
-                            changed = true;
-                        }
-                    }
+            AtomicBoolean removed = new AtomicBoolean();
+            forEachParallel(new ArrayList<>(module.getFunctions()), func -> {
+                if (func.getEntryBlock() != null && removeDead(func, readStaticFields, loadedLocals)) {
+                    removed.set(true);
                 }
-            }
+            });
+            changed = removed.get();
         }
 
         if (iterations >= maxIterations) {
@@ -107,7 +99,8 @@ public class DeadCodeEliminator {
      */
     private void removeEmptyClinitFunctions() {
         Set<String> emptyClinits = new HashSet<>();
-        for (Function func : module.getFunctions()) {
+        List<? extends Function> jnLoop1 = module.getFunctions();
+        for (Function func : jnLoop1) {
             String name = func.getName();
             if (!name.contains("__clinit__")) continue;
             if (isEffectivelyEmpty(func)) {
@@ -117,15 +110,17 @@ public class DeadCodeEliminator {
 
         if (emptyClinits.isEmpty()) return;
 
-        for (Function func : module.getFunctions()) {
-            if (emptyClinits.contains(func.getName())) continue;
-            for (BasicBlock block : func.getBlocks()) {
+        forEachParallel(new ArrayList<>(module.getFunctions()), func -> {
+            if (emptyClinits.contains(func.getName())) return;
+            for (int blockIdx1 = 0; blockIdx1 < func.getBlocks().size(); blockIdx1++) {
+                BasicBlock block = func.getBlocks().get(blockIdx1);
                 block.getInstructions().removeIf(inst -> isCallTo(inst, emptyClinits));
             }
-        }
+        });
 
         Set<Function> doomed = new HashSet<>();
-        for (Function func : module.getFunctions()) {
+        List<? extends Function> jnLoop3 = module.getFunctions();
+        for (Function func : jnLoop3) {
             if (emptyClinits.contains(func.getName())) doomed.add(func);
         }
         module.removeFunctions(doomed);
@@ -160,17 +155,19 @@ public class DeadCodeEliminator {
      * to such a slot is observable and must not be eliminated.
      */
     private Set<Integer> collectLoadedLocals() {
-        Set<Integer> loaded = new HashSet<>();
-        for (Function func : module.getFunctions()) {
-            if (func.getEntryBlock() == null) continue;
-            for (BasicBlock block : func.getBlocks()) {
-                for (Instruction inst : block.getInstructions()) {
+        Set<Integer> loaded = ConcurrentHashMap.newKeySet();
+        forEachParallel(new ArrayList<>(module.getFunctions()), func -> {
+            if (func.getEntryBlock() == null) return;
+            List<BasicBlock> blocks = func.getBlocks();
+            for (BasicBlock block : blocks) {
+                List<Instruction> insts = block.getInstructions();
+                for (Instruction inst : insts) {
                     if (inst.getOpcode() == Opcode.LOAD && inst.getLocalIndex() >= 0) {
                         loaded.add(inst.getLocalIndex());
                     }
                 }
             }
-        }
+        });
         return loaded;
     }
 
@@ -179,8 +176,10 @@ public class DeadCodeEliminator {
         fields.addAll(reflectivelyReadStaticFields);
         forEachParallel(new ArrayList<>(module.getFunctions()), func -> {
             if (func.getEntryBlock() == null) return;
-            for (BasicBlock block : func.getBlocks()) {
-                for (Instruction inst : block.getInstructions()) {
+            List<BasicBlock> blocks = func.getBlocks();
+            for (BasicBlock block : blocks) {
+                List<Instruction> insts = block.getInstructions();
+                for (Instruction inst : insts) {
                     if (inst.getOpcode() == Opcode.GET_STATIC) {
                         String name = extractFieldName(inst);
                         if (name != null) fields.add(name);
@@ -191,62 +190,72 @@ public class DeadCodeEliminator {
         return fields;
     }
 
-    private Set<Value> collectUsedValues(Set<String> readStaticFields) {
-        Set<Value> used = ConcurrentHashMap.newKeySet();
-
-        // Each worker closes over the values it newly marks, so the def-use
-        // closure runs in parallel instead of as one serial pass. Whoever
-        // wins used.add(x) expands x, so the global closure stays complete.
-        forEachParallel(new ArrayList<>(module.getFunctions()), func -> {
-            if (func.getEntryBlock() == null) return;
-            Deque<Value> worklist = new ArrayDeque<>();
-            for (BasicBlock block : func.getBlocks()) {
-                for (Instruction inst : block.getInstructions()) {
-                    if (isRoot(inst, readStaticFields)) {
-                        for (Value op : inst.getOperands()) {
-                            if (op != null && used.add(op)) worklist.add(op);
-                        }
-                    }
-                }
-                Terminator term = block.getTerminator();
-                if (term != null) {
-                    for (Value v : terminatorOperands(term)) {
-                        if (v != null && used.add(v)) worklist.add(v);
-                    }
-                }
-            }
-            while (!worklist.isEmpty()) {
-                Value v = worklist.poll();
-                if (v instanceof Temporary t) {
-                    Instruction def = t.getDefiningInstruction();
-                    if (def != null) {
-                        for (Value op : def.getOperands()) {
-                            if (op != null && used.add(op)) worklist.add(op);
-                        }
-                    }
-                }
-            }
-        });
-
-        return used;
+    private static final class Scratch {
+        final ScratchIdentityMap<Value, Boolean> used = new ScratchIdentityMap<>();
+        final ArrayDeque<Value> worklist = new ArrayDeque<>();
     }
 
-    private List<Value> terminatorOperands(Terminator term) {
-        List<Value> result = new ArrayList<>();
-        if (term instanceof CondBranchTerminator cbt) {
-            result.add(cbt.getCondition());
-        } else if (term instanceof ReturnTerminator rt) {
-            result.add(rt.getValue());
-        } else if (term instanceof ThrowTerminator tt) {
-            result.add(tt.getException());
-        } else if (term instanceof LookupSwitchTerminator lst) {
-            result.add(lst.getKey());
-        } else if (term instanceof TableSwitchTerminator tst) {
-            result.add(tst.getKey());
-        } else if (term instanceof IndirectBranchTerminator ibt) {
-            result.add(ibt.getTargetBlock());
+    private static final ThreadLocal<Scratch> SCRATCH = ThreadLocal.withInitial(Scratch::new);
+
+    private boolean removeDead(Function func, Set<String> readStaticFields, Set<Integer> loadedLocals) {
+        Scratch scratch = SCRATCH.get();
+        ScratchIdentityMap<Value, Boolean> used = scratch.used;
+        ArrayDeque<Value> worklist = scratch.worklist;
+        used.clear();
+        worklist.clear();
+        List<BasicBlock> blocks = func.getBlocks();
+        for (BasicBlock block : blocks) {
+            List<Instruction> insts = block.getInstructions();
+            for (Instruction inst : insts) {
+                if (isRoot(inst, readStaticFields)) markOperands(inst, used, worklist);
+            }
+            Terminator term = block.getTerminator();
+            if (term != null) {
+                mark(terminatorOperand(term), used, worklist);
+                if (term instanceof CondBranchTerminator cbt) mark(cbt.getCondition(), used, worklist);
+            }
         }
-        return result;
+        while (!worklist.isEmpty()) {
+            Value v = worklist.poll();
+            if (v instanceof Temporary t) {
+                Instruction def = t.getDefiningInstruction();
+                if (def != null) markOperands(def, used, worklist);
+            }
+        }
+        boolean removed = false;
+        for (BasicBlock block : blocks) {
+            List<Instruction> insts = block.getInstructions();
+            int w = 0;
+            for (int i = 0; i < insts.size(); i++) {
+                Instruction inst = insts.get(i);
+                if (shouldRemove(inst, used, readStaticFields, loadedLocals)) {
+                    removed = true;
+                    continue;
+                }
+                if (w != i) insts.set(w, inst);
+                w++;
+            }
+            if (w < insts.size()) insts.subList(w, insts.size()).clear();
+        }
+        return removed;
+    }
+
+    private static void markOperands(Instruction inst, ScratchIdentityMap<Value, Boolean> used, ArrayDeque<Value> worklist) {
+        List<Value> ops = inst.getOperands();
+        for (Value op : ops) mark(op, used, worklist);
+    }
+
+    private static void mark(Value v, ScratchIdentityMap<Value, Boolean> used, ArrayDeque<Value> worklist) {
+        if (v != null && used.put(v, Boolean.TRUE)) worklist.add(v);
+    }
+
+    private static Value terminatorOperand(Terminator term) {
+        if (term instanceof ReturnTerminator rt) return rt.getValue();
+        if (term instanceof ThrowTerminator tt) return tt.getException();
+        if (term instanceof LookupSwitchTerminator lst) return lst.getKey();
+        if (term instanceof TableSwitchTerminator tst) return tst.getKey();
+        if (term instanceof IndirectBranchTerminator ibt) return ibt.getTargetBlock();
+        return null;
     }
 
     private boolean isRoot(Instruction inst, Set<String> readStaticFields) {
@@ -276,7 +285,7 @@ public class DeadCodeEliminator {
     }
 
     private boolean shouldRemove(Instruction inst,
-                                 Set<Value> usedValues,
+                                 ScratchIdentityMap<Value, Boolean> usedValues,
                                  Set<String> readStaticFields,
                                  Set<Integer> loadedLocals) {
         Opcode op = inst.getOpcode();
@@ -291,11 +300,11 @@ public class DeadCodeEliminator {
             if (idx >= 0 && loadedLocals.contains(idx)) {
                 return false;
             }
-            return inst.getResult() != null && !usedValues.contains(inst.getResult());
+            return inst.getResult() != null && !usedValues.containsKey(inst.getResult());
         }
 
         if (isPure(op) && inst.getResult() != null) {
-            return !usedValues.contains(inst.getResult());
+            return !usedValues.containsKey(inst.getResult());
         }
 
         if ((op == Opcode.VIRTUAL_CALL
@@ -304,7 +313,7 @@ public class DeadCodeEliminator {
             || op == Opcode.SPECIAL_CALL
             || op == Opcode.CALL)
             && inst.getResult() != null
-            && !usedValues.contains(inst.getResult())) {
+            && !usedValues.containsKey(inst.getResult())) {
             String callee = extractCalleeName(inst);
             return callee != null
                 && callee.startsWith("java/lang/Class.")

@@ -61,9 +61,12 @@ void __jnative_fn_java_lang_StackTraceElement_initStackTraceElement__Ljava_lang_
 
     char* base = (char*)ste;
     *(void**)(base + JNATIVE_STE_DECLARING_CLASS_OBJECT_OFFSET) = cls;
-    *(void**)(base + JNATIVE_STE_DECLARING_CLASS_OFFSET) = ste_binary_name(cls->cname);
-    *(void**)(base + JNATIVE_STE_METHOD_NAME_OFFSET) = method_name;
-    *(void**)(base + JNATIVE_STE_FILE_NAME_OFFSET) = NULL;
+    void* declaring = ste_binary_name(cls->cname);
+    __jnative_rc_inc(declaring);
+    __jnative_rc_inc(method_name);
+    __jnative_rc_dec(__atomic_exchange_n((void**)(base + JNATIVE_STE_DECLARING_CLASS_OFFSET), declaring, __ATOMIC_ACQ_REL));
+    __jnative_rc_dec(__atomic_exchange_n((void**)(base + JNATIVE_STE_METHOD_NAME_OFFSET), method_name, __ATOMIC_ACQ_REL));
+    __jnative_rc_dec(__atomic_exchange_n((void**)(base + JNATIVE_STE_FILE_NAME_OFFSET), NULL, __ATOMIC_ACQ_REL));
     *(int32_t*)(base + JNATIVE_STE_LINE_NUMBER_OFFSET) =
         (modifiers & STE_ACC_NATIVE) ? -2 : -1;
 }

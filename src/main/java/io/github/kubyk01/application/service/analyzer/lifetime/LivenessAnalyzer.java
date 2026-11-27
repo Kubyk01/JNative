@@ -54,7 +54,8 @@ public class LivenessAnalyzer {
         tracked = t;
 
         List<Function> live = new ArrayList<>();
-        for (Function f : module.getFunctions()) {
+        List<? extends Function> jnLoop1 = module.getFunctions();
+        for (Function f : jnLoop1) {
             if (f.getEntryBlock() != null) live.add(f);
         }
         liveIn = new ConcurrentHashMap<>();
@@ -111,13 +112,14 @@ public class LivenessAnalyzer {
             List<BasicBlock> ss = blocks.get(i).getSuccessors();
             int[] idx = new int[ss.size()];
             int k = 0;
-            for (BasicBlock succ : ss) {
+            {
+                for (int jnIdx2 = 0; jnIdx2 < ss.size(); jnIdx2++) { BasicBlock succ = ((List<? extends BasicBlock>) ss).get(jnIdx2);
                 Integer si = blockIndex.get(succ);
                 if (si != null) {
                     idx[k++] = si;
                     predCount[si]++;
                 }
-            }
+            } }
             succs[i] = k == idx.length ? idx : Arrays.copyOf(idx, k);
         }
         int[][] preds = new int[n][];
@@ -194,7 +196,8 @@ public class LivenessAnalyzer {
     private int[] buildSiteTable(List<BasicBlock> blocks) {
         BitSet seen = SCRATCH.get();
         seen.clear();
-        for (BasicBlock block : blocks) {
+        {
+            for (int jnIdx4 = 0; jnIdx4 < blocks.size(); jnIdx4++) { BasicBlock block = ((List<? extends BasicBlock>) blocks).get(jnIdx4);
             for (Instruction inst : block.getInstructions()) {
                 for (Value operand : inst.getOperands()) {
                     if (operand != null) markTracked(getPointsTo(operand), seen);
@@ -202,7 +205,7 @@ public class LivenessAnalyzer {
             }
             Terminator term = block.getTerminator();
             if (term != null) markTracked(getPointsTo(terminatorUse(term)), seen);
-        }
+        } }
         int[] table = new int[seen.cardinality()];
         int k = 0;
         for (int id = seen.nextSetBit(0); id >= 0; id = seen.nextSetBit(id + 1)) table[k++] = id;
@@ -211,14 +214,15 @@ public class LivenessAnalyzer {
     }
 
     private void markTracked(PointsToSet pts, BitSet seen) {
-        for (int id : pts.rawIds()) {
+        for (long c = pts.cursor(); pts.has(c); c = pts.next(c)) {
+            int id = pts.id(c);
             if (tracked.get(id)) seen.set(id);
         }
     }
 
     private void setSites(PointsToSet pts, BitSet out, int[] localToGlobal) {
-        for (int id : pts.rawIds()) {
-            int local = Arrays.binarySearch(localToGlobal, id);
+        for (long c = pts.cursor(); pts.has(c); c = pts.next(c)) {
+            int local = Arrays.binarySearch(localToGlobal, pts.id(c));
             if (local >= 0) out.set(local);
         }
     }
@@ -303,7 +307,8 @@ public class LivenessAnalyzer {
             }
             Terminator term = block.getTerminator();
             if (term != null) {
-                for (Value operand : terminatorOperands(term)) {
+                List<? extends Value> jnLoop7 = terminatorOperands(term);
+                for (Value operand : jnLoop7) {
                     if (operand == null) continue;
                     lastUses.computeIfAbsent(operand, k -> new ArrayList<>())
                         .add(new ValueLastUse(block, insts.size(), operand));

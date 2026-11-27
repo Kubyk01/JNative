@@ -174,7 +174,8 @@ public final class EnumConstantsSharedEmitter {
     }
 
     private static boolean hasValuesFunction(ClassNode cn) {
-        for (MethodNode mn : cn.getMethods()) {
+        List<? extends MethodNode> jnLoop3 = cn.getMethods();
+        for (MethodNode mn : jnLoop3) {
             if (!mn.isStatic()) continue;
             if (!VALUES_NAME.equals(mn.getName())) continue;
             if (!mn.getDescriptor().startsWith("()[L")) continue;

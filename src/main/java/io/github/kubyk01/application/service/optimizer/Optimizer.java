@@ -60,6 +60,7 @@ public class Optimizer {
         if (enableScalarReplacement) {
             log.info("Running scalar replacement...");
             ScalarReplacer scalarReplacer = new ScalarReplacer(module, aliasResult, escapeResult, siteToValue);
+            scalarReplacer.setScheduler(scheduler);
             scalarReplacer.replace();
         }
 

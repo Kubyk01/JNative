@@ -63,11 +63,13 @@ public class Inspector implements InspectorPort {
                 System.out.println("Class: " + info.getClassName());
                 System.out.println("  Super: " + info.getSuperName());
                 System.out.println("  Fields:");
-                for (FieldInfo f : info.getFields()) {
+                List<? extends FieldInfo> jnLoop1 = info.getFields();
+                for (FieldInfo f : jnLoop1) {
                     System.out.println("    " + f.getDescriptor() + " " + f.getName());
                 }
                 System.out.println("  Methods:");
-                for (MethodInfo m : info.getMethods()) {
+                List<? extends MethodInfo> jnLoop2 = info.getMethods();
+                for (MethodInfo m : jnLoop2) {
                     System.out.println("    " + m.getDescriptor() + " " + m.getName());
                     if (showBytecode && m.getBytecode() != null && !m.getBytecode().isEmpty()) {
                         System.out.println("      Bytecode:");
@@ -120,7 +122,8 @@ public class Inspector implements InspectorPort {
                         public void visitEnd() {
                             StringWriter sw = new StringWriter();
                             PrintWriter pw = new PrintWriter(sw);
-                            for (Object o : textifier.getText()) {
+                            List<?> jnLoop3 = textifier.getText();
+                            for (Object o : jnLoop3) {
                                 pw.print(o.toString());
                             }
                             pw.flush();

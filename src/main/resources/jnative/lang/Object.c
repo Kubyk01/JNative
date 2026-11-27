@@ -265,7 +265,10 @@ void *__jnative_fn_java_lang_Object_getClass___Ljava_lang_Class_(void *obj) {
 // public native int hashCode();
 int __jnative_fn_java_lang_Object_hashCode___I(void *obj) {
     if (!obj) return 0;
-    return (int)((uintptr_t)obj);
+    uint64_t h = (uint64_t)(uintptr_t)obj >> 4;
+    h = (h ^ (h >> 33)) * 0xff51afd7ed558ccdULL;
+    h ^= h >> 33;
+    return (int)h;
 }
 
 // protected native Object clone() throws CloneNotSupportedException;
@@ -302,6 +305,7 @@ void *__jnative_fn_java_lang_Object_clone___Ljava_lang_Object_(void *obj) {
             void **elems = (void **)((char *)copy + JAVA_ARR_HDR);
             for (int32_t i = 0; i < length; i++) __jnative_share(elems[i]);
         }
+        __jnative_rc_cloned(copy);
         return copy;
     }
 
@@ -329,7 +333,28 @@ void *__jnative_fn_java_lang_Object_clone___Ljava_lang_Object_(void *obj) {
         return NULL;
     }
 
-    memcpy(clone, obj, (size_t)size);
+    // Copy Reference.referent through the registry so both wrappers can be
+    // cleared independently and the referent stays protected during the copy.
+    void** weak_slot = NULL;
+    for (struct ReflectionClass *c = cls; c != NULL; c = c->superclass) {
+        if (c->cname != NULL && strcmp(c->cname, "java/lang/ref/Reference") == 0) {
+            weak_slot = __jnative_referent_slot(obj);
+            break;
+        }
+    }
+    if (weak_slot != NULL) {
+        size_t offset = (char*)weak_slot - (char*)obj;
+        size_t tail = offset + sizeof(void*);
+        void* value = __jnative_weak_load(weak_slot, __jnative_rc_ret_slot());
+        memcpy(clone, obj, offset);
+        memcpy((char*)clone + tail, (char*)obj + tail, (size_t)size - tail);
+        void** dest = (void**)((char*)clone + offset);
+        *dest = NULL;
+        __jnative_weak_store(dest, value);
+    } else {
+        memcpy(clone, obj, (size_t)size);
+    }
+    __jnative_container_detach_clone(clone);
     for (struct ReflectionClass *c = cls; c != NULL; c = c->superclass) {
         if (c->fields == NULL) continue;
         for (struct ReflectionField **fp = c->fields; *fp != NULL; fp++) {
@@ -338,140 +363,24 @@ void *__jnative_fn_java_lang_Object_clone___Ljava_lang_Object_(void *obj) {
             if ((f->modifiers & 0x0008) != 0 || desc == NULL) continue;
             if (desc[0] != 'L' && desc[0] != '[') continue;
             if (f->offset <= 0 || f->offset + (int)sizeof(void *) > size) continue;
+            if ((void**)((char*)obj + f->offset) == weak_slot) continue;
             __jnative_share(*(void **)((char *)clone + f->offset));
         }
     }
+    __jnative_rc_cloned(clone);
     return clone;
 }
 
-/* ---- Monitor wait/notify support using jn_cond_t ---- */
-
-typedef struct MonitorEx {
-    void *obj;
-    jn_mutex_t mutex;
-    jn_cond_t cond;
-    int wait_count;
-    struct MonitorEx *next;
-} MonitorEx;
-
-#define MONITOR_HASH_SIZE 1024
-static MonitorEx *monitor_ex_table[MONITOR_HASH_SIZE] = {0};
-static jn_mutex_t monitor_table_lock = JN_MUTEX_INITIALIZER;
-
-static uint32_t hash_ptr(void *p) {
-    return (uint32_t)((uintptr_t)p) % MONITOR_HASH_SIZE;
-}
-
-static MonitorEx *get_monitor_ex(void *obj) {
-    if (!obj) return NULL;
-    uint32_t idx = hash_ptr(obj);
-    jn_mutex_lock(&monitor_table_lock);
-    MonitorEx *m = monitor_ex_table[idx];
-    while (m) {
-        if (m->obj == obj) {
-            jn_mutex_unlock(&monitor_table_lock);
-            return m;
-        }
-        m = m->next;
-    }
-    MonitorEx *newm = calloc(1, sizeof(MonitorEx));
-    if (!newm) {
-        jn_mutex_unlock(&monitor_table_lock);
-        return NULL;
-    }
-    newm->obj = obj;
-    pthread_mutex_init(&newm->mutex, NULL);
-    pthread_cond_init(&newm->cond, NULL);
-    newm->wait_count = 0;
-    newm->next = monitor_ex_table[idx];
-    monitor_ex_table[idx] = newm;
-    jn_mutex_unlock(&monitor_table_lock);
-    return newm;
-}
-
-static MonitorEx *find_monitor_ex(void *obj) {
-    if (!obj) return NULL;
-    uint32_t idx = hash_ptr(obj);
-    jn_mutex_lock(&monitor_table_lock);
-    MonitorEx *m = monitor_ex_table[idx];
-    while (m) {
-        if (m->obj == obj) {
-            jn_mutex_unlock(&monitor_table_lock);
-            return m;
-        }
-        m = m->next;
-    }
-    jn_mutex_unlock(&monitor_table_lock);
-    return NULL;
-}
-
 void __jnative_fn_java_lang_Object_notify___V(void *obj) {
-    if (!obj) {
-        __jnative_throw_null_pointer_exception();
-        return;
-    }
-    MonitorEx *m = find_monitor_ex(obj);
-    if (!m) return;
-    jn_mutex_lock(&m->mutex);
-    if (m->wait_count > 0) {
-        jn_cond_signal(&m->cond);
-    }
-    jn_mutex_unlock(&m->mutex);
+    __jnative_monitor_notify(obj, 0);
 }
 
 void __jnative_fn_java_lang_Object_notifyAll___V(void *obj) {
-    if (!obj) {
-        __jnative_throw_null_pointer_exception();
-        return;
-    }
-    MonitorEx *m = find_monitor_ex(obj);
-    if (!m) return;
-    jn_mutex_lock(&m->mutex);
-    if (m->wait_count > 0) {
-        jn_cond_broadcast(&m->cond);
-    }
-    jn_mutex_unlock(&m->mutex);
+    __jnative_monitor_notify(obj, 1);
 }
 
 void __jnative_fn_java_lang_Object_wait0__J_V(void *obj, int64_t timeoutMillis) {
-    if (!obj) {
-        __jnative_throw_null_pointer_exception();
-        return;
-    }
-    MonitorEx *m = get_monitor_ex(obj);
-    if (!m) {
-        __jnative_throw_exception(NULL);
-        return;
-    }
-
-    jn_mutex_lock(&m->mutex);
-    m->wait_count++;
-    /* Java wait() releases the object's monitor; the notifier must be able
-     * to take it. Done after wait_count++ under m->mutex so a notifier that
-     * then acquires the monitor cannot broadcast before we are waiting.
-     * shortcut: releases one recursion level only, upgrade if a wait() inside
-     * nested synchronized(obj) blocks shows up. */
-    __jnative_monitor_exit(obj);
-
-    struct timespec ts;
-    if (timeoutMillis == 0) {
-        jn_cond_wait(&m->cond, &m->mutex);
-    } else {
-        jn_now_realtime(&ts);
-        ts.tv_sec += timeoutMillis / 1000;
-        ts.tv_nsec += (timeoutMillis % 1000) * 1000000L;
-        if (ts.tv_nsec >= 1000000000) {
-            ts.tv_sec++;
-            ts.tv_nsec -= 1000000000;
-        }
-        jn_cond_timedwait(&m->cond, &m->mutex, &ts);
-    }
-
-    m->wait_count--;
-    jn_mutex_unlock(&m->mutex);
-    /* Retake the monitor only after dropping m->mutex: the notifier holds
-     * the monitor while it locks m->mutex, so the reverse order would deadlock. */
-    __jnative_monitor_enter(obj);
+    __jnative_monitor_wait(obj, timeoutMillis);
 }
 
 /* ---- System.nanoTime() ---- */

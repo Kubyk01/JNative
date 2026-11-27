@@ -109,7 +109,8 @@ public class EscapeSummaryBuilder {
      */
     public Map<String, EscapeSummary> build() {
         List<Function> live = new ArrayList<>();
-        for (Function f : module.getFunctions()) {
+        List<? extends Function> jnLoop1 = module.getFunctions();
+        for (Function f : jnLoop1) {
             if (f.getEntryBlock() != null) live.add(f);
         }
         if (live.isEmpty()) return summaries;
@@ -123,35 +124,79 @@ public class EscapeSummaryBuilder {
         Map<Function, List<Function>> callees = new HashMap<>(live.size() * 2);
         Map<String, Set<Function>> callersOf = new HashMap<>(live.size() * 2);
 
-        for (Function f : live) {
-            List<Function> out = new ArrayList<>();
-            Set<String> seen = new HashSet<>();
+        List<List<String>> calleeKeys = LlvmUtil.parallelMapOrdered(live, scheduler, f -> {
+            Set<String> seen = new LinkedHashSet<>();
             for (BasicBlock b : f.getBlocks()) {
                 for (Instruction inst : b.getInstructions()) {
                     String callee = extractCalleeName(inst);
                     if (callee == null) continue;
                     String calleeKey = canonicalCalleeKey(callee);
-
                     if (isLazyClinitWrapper(calleeKey)) continue;
-
-                    if (!seen.add(calleeKey)) continue;
-                    Function calleeFunc = byName.get(calleeKey);
-                    if (calleeFunc != null) {
-                        out.add(calleeFunc);
+                    seen.add(calleeKey);
+                    Opcode op = inst.getOpcode();
+                    if (op == Opcode.VIRTUAL_CALL || op == Opcode.INTERFACE_CALL) {
+                        for (String method : resolver.dispatchTargets(callee)) seen.add(canonicalCalleeKey(method));
                     }
-                    callersOf.computeIfAbsent(calleeKey, k -> new HashSet<>(4)).add(f);
                 }
+            }
+            return new ArrayList<>(seen);
+        });
+        for (int i = 0; i < live.size(); i++) {
+            Function f = live.get(i);
+            List<Function> out = new ArrayList<>();
+            for (String calleeKey : calleeKeys.get(i)) {
+                Function calleeFunc = byName.get(calleeKey);
+                if (calleeFunc != null) out.add(calleeFunc);
+                callersOf.computeIfAbsent(calleeKey, k -> new HashSet<>(4)).add(f);
             }
             callees.put(f, out);
         }
 
         List<List<Function>> sccs = computeSCCs(live, callees);
 
-        int totalProcessed = 0;
+        Map<Function, Integer> sccOf = new HashMap<>(live.size() * 2);
+        for (int s = 0; s < sccs.size(); s++) {
+            for (Function f : sccs.get(s)) sccOf.put(f, s);
+        }
+        int[] level = new int[sccs.size()];
+        int maxLevel = 0;
         int maxSccSize = 0;
-        for (List<Function> scc : sccs) {
+        for (int s = 0; s < sccs.size(); s++) {
+            List<Function> scc = sccs.get(s);
             if (scc.size() > maxSccSize) maxSccSize = scc.size();
-            totalProcessed += processSCC(scc, callersOf);
+            int lv = 0;
+            for (Function f : scc) {
+                for (Function callee : callees.get(f)) {
+                    Integer cs = sccOf.get(callee);
+                    if (cs != null && cs != s) lv = Math.max(lv, level[cs] + 1);
+                }
+            }
+            level[s] = lv;
+            if (lv > maxLevel) maxLevel = lv;
+        }
+        List<List<Integer>> singlesByLevel = new ArrayList<>(maxLevel + 1);
+        List<List<Integer>> groupsByLevel = new ArrayList<>(maxLevel + 1);
+        for (int lv = 0; lv <= maxLevel; lv++) {
+            singlesByLevel.add(new ArrayList<>());
+            groupsByLevel.add(new ArrayList<>());
+        }
+        for (int s = 0; s < sccs.size(); s++) {
+            (sccs.get(s).size() == 1 ? singlesByLevel : groupsByLevel).get(level[s]).add(s);
+        }
+
+        int totalProcessed = 0;
+        for (int lv = 0; lv <= maxLevel; lv++) {
+            List<Integer> counts = LlvmUtil.parallelMapOrdered(
+                    singlesByLevel.get(lv), scheduler, s -> processSCC(sccs.get(s), callersOf, true));
+            for (int c : counts) totalProcessed += c;
+            List<Integer> groups = groupsByLevel.get(lv);
+            if (groups.size() == 1) {
+                totalProcessed += processSCC(sccs.get(groups.getFirst()), callersOf, false);
+            } else {
+                List<Integer> groupCounts = LlvmUtil.parallelMapOrdered(
+                        groups, scheduler, s -> processSCC(sccs.get(s), callersOf, true));
+                for (int c : groupCounts) totalProcessed += c;
+            }
         }
 
         System.out.println("EscapeSummaryBuilder: converged after " + sccs.size()
@@ -165,7 +210,7 @@ public class EscapeSummaryBuilder {
     //  Per-SCC fixed point
     // =====================================================================
 
-    private int processSCC(List<Function> scc, Map<String, Set<Function>> callersOf) {
+    private int processSCC(List<Function> scc, Map<String, Set<Function>> callersOf, boolean inline) {
         if (scc.isEmpty()) {
             return 0;
         }
@@ -210,9 +255,13 @@ public class EscapeSummaryBuilder {
             }
             totalProcessed += batch.size();
 
-            List<EscapeSummary> fresh = LlvmUtil.parallelMapOrdered(
-                    batch, scheduler,
-                    func -> analyzeFunction(func, summaries));
+            List<EscapeSummary> fresh;
+            if (inline) {
+                fresh = new ArrayList<>(batch.size());
+                for (Function func : batch) fresh.add(analyzeFunction(func, summaries));
+            } else {
+                fresh = LlvmUtil.parallelMapOrdered(batch, scheduler, func -> analyzeFunction(func, summaries));
+            }
 
             int committed = 0;
             for (int i = 0; i < batch.size(); i++) {
@@ -811,7 +860,8 @@ public class EscapeSummaryBuilder {
             }
 
             case INVOKEDYNAMIC: {
-                for (Value cap : lambdaCaptures(inst)) {
+                List<? extends Value> jnLoop10 = lambdaCaptures(inst);
+                for (Value cap : jnLoop10) {
                     Type t = cap == null ? null : cap.getType();
                     if (cap instanceof Parameter p
                             && (t == null || t.isReference() || t.isArray() || t.isUnknown())) {
@@ -1145,7 +1195,8 @@ public class EscapeSummaryBuilder {
                 || calleeName.startsWith("java/util/concurrent/CompletableFuture.supplyAsync")
                 || calleeName.startsWith("java/lang/Thread.start()V")) {
             flags[2] = true;
-            for (Value arg : getCallArguments(inst)) {
+            List<? extends Value> jnLoop20 = getCallArguments(inst);
+            for (Value arg : jnLoop20) {
                 if (arg instanceof Parameter p) {
                     paramsEscaped.add(p.getOrdinal());
                     addAliases(p.getOrdinal(), paramAliases, paramsEscaped);
@@ -1168,18 +1219,58 @@ public class EscapeSummaryBuilder {
             } else {
                 // Unknown callee: conservatively assume every reference
                 // argument may be stored anywhere the callee has access to.
-                for (Value arg : getCallArguments(inst)) {
-                    if (arg instanceof Parameter p) {
-                        paramsEscaped.add(p.getOrdinal());
-                        addAliases(p.getOrdinal(), paramAliases, paramsEscaped);
-                    }
-                }
-                Value ret = inst.getResult();
-                if (ret != null && ret.getType() != Type.VOID) flags[0] = true;
+                markUnknownCall(inst, paramAliases, paramsEscaped, flags);
                 return;
             }
         }
 
+        List<EscapeSummary> applied = new ArrayList<>();
+        applied.add(calleeSum);
+        Opcode op = inst.getOpcode();
+        if (op == Opcode.VIRTUAL_CALL || op == Opcode.INTERFACE_CALL) {
+            for (String method : resolver.dispatchTargets(calleeName)) {
+                String key = canonicalCalleeKey(method);
+                if (key.equals(calleeKey)) continue;
+                EscapeSummary override = snapshot.get(key);
+                if (override == null) {
+                    if (module.getFunction(key) == null) continue;
+                    EscapeSummary computed = nativeAnalyzer.summaryFor(method);
+                    if (computed == null || computed.isEscapesGlobally()) {
+                        markUnknownCall(inst, paramAliases, paramsEscaped, flags);
+                        return;
+                    }
+                    override = computed;
+                }
+                applied.add(override);
+            }
+        }
+        for (EscapeSummary summary : applied) {
+            applyCallSummary(inst, summary, paramAliases, paramsEscaped, paramsReturned, paramsEscapedToStatic,
+                    flags, paramEscapeEdges, localPointsTo, localSiteContents);
+        }
+    }
+
+    private void markUnknownCall(Instruction inst, Map<Integer, Set<Integer>> paramAliases,
+                                 Set<Integer> paramsEscaped, boolean[] flags) {
+        for (Value arg : getCallArguments(inst)) {
+            if (arg instanceof Parameter p) {
+                paramsEscaped.add(p.getOrdinal());
+                addAliases(p.getOrdinal(), paramAliases, paramsEscaped);
+            }
+        }
+        Value ret = inst.getResult();
+        if (ret != null && ret.getType() != Type.VOID) flags[0] = true;
+    }
+
+    private void applyCallSummary(Instruction inst, EscapeSummary calleeSum,
+                             Map<Integer, Set<Integer>> paramAliases,
+                             Set<Integer> paramsEscaped,
+                             Set<Integer> paramsReturned,
+                             Set<Integer> paramsEscapedToStatic,
+                             boolean[]    flags,
+                             Map<Integer, Set<Integer>> paramEscapeEdges,
+                             Map<Value, Set<AllocationSite>> localPointsTo,
+                             Map<AllocationSite, Set<AllocationSite>> localSiteContents) {
         List<Value> args = getCallArguments(inst);
 
         // ------------------------------------------------------------------

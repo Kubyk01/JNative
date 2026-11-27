@@ -54,23 +54,31 @@ static void* gv_java_net_NetworkInterface_childs_0;
  *  Helpers shared by both platforms.
  * ========================================================================== */
 
+static void ni_set_static(void** slot, void* v) {
+    void* old = *slot;
+    __jnative_rc_inc(v);
+    *slot = v;
+    __jnative_rc_dec(old);
+}
+
 static void* make_java_string_array(int count, char** strings) {
     void* arr = jnative_ref_array_of_class(NULL, count, "[Ljava/lang/String;");
     if (!arr) return NULL;
     void** slots = (void**)((char*)arr + JAVA_ARR_HDR);
     for (int i = 0; i < count; i++) {
         slots[i] = strings[i] ? __jnative_make_string_obj(strings[i], (int32_t)strlen(strings[i])) : NULL;
+        __jnative_rc_inc(slots[i]);
     }
     return arr;
 }
 
 static void set_all_empty(void) {
-    gv_java_net_NetworkInterface_name_0        = jnative_empty_ref_array();
-    gv_java_net_NetworkInterface_displayName_0 = jnative_empty_ref_array();
-    gv_java_net_NetworkInterface_index_0       = jnative_int_array(NULL, 0);
-    gv_java_net_NetworkInterface_addrs_0       = jnative_empty_ref_array();
-    gv_java_net_NetworkInterface_bindings_0    = jnative_empty_ref_array();
-    gv_java_net_NetworkInterface_childs_0      = jnative_empty_ref_array();
+    ni_set_static(&gv_java_net_NetworkInterface_name_0, jnative_empty_ref_array());
+    ni_set_static(&gv_java_net_NetworkInterface_displayName_0, jnative_empty_ref_array());
+    ni_set_static(&gv_java_net_NetworkInterface_index_0, jnative_int_array(NULL, 0));
+    ni_set_static(&gv_java_net_NetworkInterface_addrs_0, jnative_empty_ref_array());
+    ni_set_static(&gv_java_net_NetworkInterface_bindings_0, jnative_empty_ref_array());
+    ni_set_static(&gv_java_net_NetworkInterface_childs_0, jnative_empty_ref_array());
 }
 
 #if !defined(_WIN32)
@@ -94,7 +102,10 @@ static void* make_iface_inet_address(struct sockaddr* sa, void* iface) {
         *(int8_t*)((char*)holder6 + o_sid_set) = 1;
     }
     if (o_sif >= 0 && o_sif_set >= 0) {
+        void* old_sif = *(void**)((char*)holder6 + o_sif);
+        __jnative_rc_inc(iface);
         *(void**)((char*)holder6 + o_sif) = iface;
+        __jnative_rc_dec(old_sif);
         *(int8_t*)((char*)holder6 + o_sif_set) = 1;
     }
     return ia;
@@ -135,15 +146,20 @@ static void* allocate_network_interface(const char* name, const char* display_na
     if (!vt) { free(obj); return NULL; }
     *(void**)obj = vt;
     *(void**)((char*)obj + 8)  = __jnative_make_string_obj(name, (int32_t)strlen(name));
+    __jnative_rc_inc(*(void**)((char*)obj + 8));
     *(void**)((char*)obj + 16) = __jnative_make_string_obj(display_name, (int32_t)strlen(display_name));
+    __jnative_rc_inc(*(void**)((char*)obj + 16));
     *(int32_t*)((char*)obj + 24) = index;
 #if defined(_WIN32)
     *(void**)((char*)obj + 32) = jnative_empty_ref_array();
 #else
     *(void**)((char*)obj + 32) = collect_iface_addrs(name, obj);
 #endif
+    __jnative_rc_inc(*(void**)((char*)obj + 32));
     *(void**)((char*)obj + 40) = jnative_empty_ref_array();
+    __jnative_rc_inc(*(void**)((char*)obj + 40));
     *(void**)((char*)obj + 48) = jnative_empty_ref_array();
+    __jnative_rc_inc(*(void**)((char*)obj + 48));
     return obj;
 }
 
@@ -220,12 +236,12 @@ void __jnative_fn_java_net_NetworkInterface_init___V(void) {
         display[b+1] = kd;
     }
 
-    gv_java_net_NetworkInterface_name_0        = make_java_string_array(count, names);
-    gv_java_net_NetworkInterface_displayName_0 = make_java_string_array(count, display);
-    gv_java_net_NetworkInterface_index_0       = jnative_int_array(indices, count);
-    gv_java_net_NetworkInterface_addrs_0       = jnative_empty_ref_array();
-    gv_java_net_NetworkInterface_bindings_0    = jnative_empty_ref_array();
-    gv_java_net_NetworkInterface_childs_0      = jnative_empty_ref_array();
+    ni_set_static(&gv_java_net_NetworkInterface_name_0, make_java_string_array(count, names));
+    ni_set_static(&gv_java_net_NetworkInterface_displayName_0, make_java_string_array(count, display));
+    ni_set_static(&gv_java_net_NetworkInterface_index_0, jnative_int_array(indices, count));
+    ni_set_static(&gv_java_net_NetworkInterface_addrs_0, jnative_empty_ref_array());
+    ni_set_static(&gv_java_net_NetworkInterface_bindings_0, jnative_empty_ref_array());
+    ni_set_static(&gv_java_net_NetworkInterface_childs_0, jnative_empty_ref_array());
 
     for (int k = 0; k < count; k++) { free(names[k]); free(display[k]); }
     free(names); free(display); free(indices); free(addrs);
@@ -280,12 +296,12 @@ void __jnative_fn_java_net_NetworkInterface_init___V(void) {
         indices[b+1] = k; names[b+1] = kn; display[b+1] = kd;
     }
 
-    gv_java_net_NetworkInterface_name_0        = make_java_string_array(count, names);
-    gv_java_net_NetworkInterface_displayName_0 = make_java_string_array(count, display);
-    gv_java_net_NetworkInterface_index_0       = jnative_int_array(indices, count);
-    gv_java_net_NetworkInterface_addrs_0       = jnative_empty_ref_array();
-    gv_java_net_NetworkInterface_bindings_0    = jnative_empty_ref_array();
-    gv_java_net_NetworkInterface_childs_0      = jnative_empty_ref_array();
+    ni_set_static(&gv_java_net_NetworkInterface_name_0, make_java_string_array(count, names));
+    ni_set_static(&gv_java_net_NetworkInterface_displayName_0, make_java_string_array(count, display));
+    ni_set_static(&gv_java_net_NetworkInterface_index_0, jnative_int_array(indices, count));
+    ni_set_static(&gv_java_net_NetworkInterface_addrs_0, jnative_empty_ref_array());
+    ni_set_static(&gv_java_net_NetworkInterface_bindings_0, jnative_empty_ref_array());
+    ni_set_static(&gv_java_net_NetworkInterface_childs_0, jnative_empty_ref_array());
 
     for (int k = 0; k < count; k++) { free(names[k]); free(display[k]); }
     free(names); free(display); free(indices);
@@ -360,6 +376,7 @@ void* __jnative_fn_java_net_NetworkInterface_getAll____Ljava_net_NetworkInterfac
         const char* nm  = nameSlots[i]    ? __jnative_read_string_bytes(nameSlots[i], NULL)    : "";
         const char* dsp = displaySlots[i] ? __jnative_read_string_bytes(displaySlots[i], NULL) : "";
         slots[i] = allocate_network_interface(nm ? nm : "", dsp ? dsp : "", idxSlots[i]);
+        __jnative_rc_inc(slots[i]);
     }
     return arr;
 }

@@ -80,7 +80,8 @@ public class ArrayCoAllocator {
             if (c == null) continue;
             List<Site> sites = new ArrayList<>();
             boolean ok = true;
-            for (Instruction n : e.getValue()) {
+            List<? extends Instruction> jnLoop2 = e.getValue();
+            for (Instruction n : jnLoop2) {
                 Site s = matchSite(n, c);
                 if (s == null) { ok = false; break; }
                 sites.add(s);
@@ -100,7 +101,8 @@ public class ArrayCoAllocator {
     }
 
     private void scanModule() {
-        for (Function f : module.getFunctions()) {
+        List<? extends Function> jnLoop3 = module.getFunctions();
+        for (Function f : jnLoop3) {
             for (BasicBlock b : f.getBlocks()) {
                 for (Instruction inst : b.getInstructions()) {
                     for (Value op : inst.getOperands()) {
@@ -156,7 +158,8 @@ public class ArrayCoAllocator {
         if (cn.getInterfaces() != null && cn.getInterfaces().contains("java/lang/Cloneable")) return null;
 
         MethodNode ctorNode = null;
-        for (MethodNode m : cn.getMethods()) {
+        List<? extends MethodNode> jnLoop6 = cn.getMethods();
+        for (MethodNode m : jnLoop6) {
             if ("<clinit>".equals(m.getName())) return null;
             if ("<init>".equals(m.getName())) {
                 if (ctorNode != null) return null;
@@ -218,7 +221,8 @@ public class ArrayCoAllocator {
 
     private static FieldNode findField(ClassNode cn, String name) {
         if (cn.getFields() == null) return null;
-        for (FieldNode f : cn.getFields()) {
+        List<? extends FieldNode> jnLoop8 = cn.getFields();
+        for (FieldNode f : jnLoop8) {
             if (name.equals(f.getName())) return f;
         }
         return null;
@@ -264,7 +268,8 @@ public class ArrayCoAllocator {
 
     private boolean onlyArrayAccess(Value v, Instruction allowedPut) {
         if (terminatorValues.contains(v)) return false;
-        for (Instruction use : uses.getOrDefault(v, List.of())) {
+        List<? extends Instruction> jnLoop9 = uses.getOrDefault(v, List.of());
+        for (Instruction use : jnLoop9) {
             List<Value> ops = use.getOperands();
             if (use == allowedPut) {
                 if (ops.get(0) == v || ops.get(1) == v || ops.get(2) != v) return false;
@@ -287,7 +292,8 @@ public class ArrayCoAllocator {
     }
 
     private boolean fieldOnlyWrittenBy(String fieldKey, Instruction put) {
-        for (Function f : module.getFunctions()) {
+        List<? extends Function> jnLoop10 = module.getFunctions();
+        for (Function f : jnLoop10) {
             for (BasicBlock b : f.getBlocks()) {
                 for (Instruction inst : b.getInstructions()) {
                     if (inst == put || inst.getOpcode() != Opcode.PUT_FIELD) continue;
@@ -301,7 +307,8 @@ public class ArrayCoAllocator {
     }
 
     private boolean fieldReadsOnlyArrayAccess(String fieldKey) {
-        for (Function f : module.getFunctions()) {
+        List<? extends Function> jnLoop11 = module.getFunctions();
+        for (Function f : jnLoop11) {
             for (BasicBlock b : f.getBlocks()) {
                 for (Instruction inst : b.getInstructions()) {
                     if (inst.getOpcode() != Opcode.GET_FIELD) continue;

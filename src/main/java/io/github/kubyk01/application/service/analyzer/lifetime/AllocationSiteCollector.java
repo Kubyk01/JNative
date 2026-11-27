@@ -49,7 +49,8 @@ public class AllocationSiteCollector {
 
     public List<AllocationSite> collect() {
         List<Function> live = new ArrayList<>();
-        for (Function func : module.getFunctions()) {
+        List<? extends Function> jnLoop1 = module.getFunctions();
+        for (Function func : jnLoop1) {
             if (func.getEntryBlock() != null) live.add(func);
         }
         if (live.isEmpty()) return List.of();

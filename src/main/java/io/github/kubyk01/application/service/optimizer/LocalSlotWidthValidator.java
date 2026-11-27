@@ -105,7 +105,8 @@ public final class LocalSlotWidthValidator {
      */
     public static void validate(Module module, reactor.core.scheduler.Scheduler scheduler) {
         List<Function> live = new ArrayList<>();
-        for (Function func : module.getFunctions()) {
+        List<? extends Function> jnLoop1 = module.getFunctions();
+        for (Function func : jnLoop1) {
             if (func.getEntryBlock() != null) live.add(func);
         }
         if (scheduler == null) {

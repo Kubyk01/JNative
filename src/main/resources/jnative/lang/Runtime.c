@@ -60,11 +60,7 @@
 /*
  * public native void exit(int status);
  *
- * Terminates the process with the given status. exit(3) runs atexit
- * handlers, which is required because __jnative_shutdown is registered
- * via atexit from @main (see LlvmGenerator.generateMain) and must
- * release objects held in static fields before the process image is
- * torn down.
+ * Terminates the process with the given status and runs C exit handlers.
  *
  * The receiver is unused: Runtime is a singleton and every instance
  * delegates to the same process-wide exit.
@@ -77,19 +73,8 @@ void __jnative_fn_java_lang_Runtime_exit__I_V(void* this_runtime, int32_t status
 /*
  * public native void gc();
  *
- * Requests a garbage collection. This runtime has no garbage
- * collector: every allocation is a libc malloc and every destruction
- * is an explicit free emitted by DestructorInserter at a statically
- * determined point. The closest analogue is returning free arena
- * pages to the OS, which the allocator does on its own via its trim
- * threshold; nothing needs to be forced here.
- *
- * The call is deliberately a no-op rather than a call to malloc_trim(3)
- * (POSIX) or HeapCompact (Windows). Forcing compaction on every
- * Runtime.gc() would trade a negligible memory saving for a
- * measurable wall-clock cost in the common case where the caller is
- * not actually memory-constrained, and neither API has an exact
- * equivalent on the other platform.
+ * Ownership drops release Java allocations. The native allocator decides
+ * when to return unused pages to the operating system.
  */
 void __jnative_fn_java_lang_Runtime_gc___V(void* this_runtime) {
     (void)this_runtime;

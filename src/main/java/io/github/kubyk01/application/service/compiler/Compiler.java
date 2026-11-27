@@ -1,6 +1,5 @@
 package io.github.kubyk01.application.service.compiler;
 
-import io.github.kubyk01.application.service.GeneratedOutputDirectory;
 import io.github.kubyk01.application.service.analyzer.dependencyresolver.DependencyResolver;
 import io.github.kubyk01.application.service.codegen.llvm.LlvmRuntime;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.ClassNode;
@@ -21,6 +20,8 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -50,9 +51,13 @@ public class Compiler implements CompilerPort {
             PORTABILITY_DIR + "jnative_portability_windows.c";
     private static final String NATIVE_BASE_PATH = "jnative/";
     private static final String BUILD_ROOT_NAME = "jnative_build_";
+    private static final String THIN_LTO_CACHE_DIR_PROPERTY = "jnative.thinLtoCacheDir";
+    private static final String THIN_LTO_CACHE_POLICY_PROPERTY = "jnative.thinLtoCachePolicy";
+    private static final String DEFAULT_THIN_LTO_CACHE_POLICY = "cache_size=25%";
 
     private static final int MIN_OPT_LEVEL = 0;
     private static final int MAX_OPT_LEVEL = 3;
+
 
    // Todo remove hard-coded ways
     private static final String[] MINGW_ROOT_CANDIDATES_POSIX = {
@@ -103,11 +108,15 @@ public class Compiler implements CompilerPort {
                                DependencyResolver resolver,
                                int cores,
                                int optimizationLevel,
+                               String ltoMode,
                                TargetPlatform targetPlatform)
             throws IOException, InterruptedException {
 
         final int effectiveCores = (cores <= 0) ? 1 : cores;
         final int effectiveOptLevel = clampOptLevel(optimizationLevel);
+        final String ltoFlag = resolveLtoFlag(ltoMode);
+        final boolean ltoEnabled = !"-fno-lto".equals(ltoFlag);
+        final boolean thinLtoEnabled = "-flto=thin".equals(ltoFlag);
         final TargetPlatform target = (targetPlatform != null)
                 ? targetPlatform
                 : TargetPlatform.detectFromBuildHost();
@@ -118,6 +127,10 @@ public class Compiler implements CompilerPort {
                      resolver.getInputPath(), resolver.getScannedJars(), workspace.path())) {
             Path tempDir = workspace.path();
             String compiler = detectCompiler(target);
+            Path thinLtoCacheDir = thinLtoEnabled
+                    ? resolveThinLtoCacheDir(compiler, target) : null;
+            String thinLtoCachePolicy = thinLtoEnabled
+                    ? resolveThinLtoCachePolicy() : null;
 
             MsvcToolchain msvcToolchain = null;
             String sysroot = null;
@@ -205,7 +218,8 @@ public class Compiler implements CompilerPort {
             tasks.add(new CompileTask(runtimeImage.table(), cDir.resolve("jnative_runtime_files.o"), SourceKind.C));
             tasks.add(new CompileTask(runtimeImage.assembly(), cDir.resolve("jnative_runtime_image.o"), SourceKind.ASSEMBLY));
 
-            for (Path src : extraSources) {
+            List<? extends Path> jnLoop1 = extraSources;
+            for (Path src : jnLoop1) {
                 Path rel = tempDir.relativize(src);
                 Path objWithPath = cDir.resolve(
                         rel.toString().replaceAll("\\.c$", ".o"));
@@ -219,7 +233,8 @@ public class Compiler implements CompilerPort {
             }
 
             int irIndex = 0;
-            for (Path ll : llPaths) {
+            List<? extends Path> jnLoop2 = llPaths;
+            for (Path ll : jnLoop2) {
                 String base = sanitizeForObjName(ll.getFileName().toString());
                 Path obj = tempDir.resolve("ir")
                         .resolve(String.format("%05d_%s.o", irIndex++, base));
@@ -234,23 +249,15 @@ public class Compiler implements CompilerPort {
                     + threadCount + " thread(s) (target " + target.triple() + ")...");
 
             compileAll(compiler, tasks, tempDir, threadCount, effectiveOptLevel,
-                    target, sysroot, msvcToolchain);
+                    ltoFlag, target, sysroot, msvcToolchain);
 
             // ------------------------------------------------------------------
             // 5. Link.
             //
-            // ThinLTO is an LLVM-only feature: its parallel-backend option
-            // --thinlto-jobs is understood only by ld.lld. GNU ld (BFD and
-            // gold) does not implement ThinLTO at all and rejects both
-            // --threads and --thinlto-jobs. The linker must therefore be
-            // chosen by LINKER FLAVOUR, not by target OS:
-            //
-            //   MSVC -> lld-link (or link.exe), accepts --threads
-            //   GNU  -> ld.lld, accepts --thinlto-jobs
-            //
-            // x86_64-w64-windows-gnu is a Windows target built with the GNU
-            // toolchain, so it falls into the GNU branch. Forcing the LLVM
-            // linker here is the only portable fix.
+            // LTO needs LLVM's linker. Pass its worker/optimization
+            // settings directly: Clang's MSVC driver does not forward
+            // -flto-jobs or -O to lld-link. Linker workers have a separate
+            // limit because each LTO backend can consume substantial RAM.
             //
             // ld.lld, unlike the GCC driver, does not automatically add the
             // MinGW-w64 GCC runtime library directory to its search path.
@@ -269,21 +276,18 @@ public class Compiler implements CompilerPort {
             final boolean msvcLinker = target.triple()
                     .toLowerCase(Locale.ROOT).contains("-msvc");
 
-            linkCmd.add("-flto=thin");
-            linkCmd.add("-O" + effectiveOptLevel);
             linkCmd.add("-g");
 
             if (msvcLinker) {
                 if (!isAvailable("lld-link")) {
                     throw new IllegalStateException(
-                            "ThinLTO for target '" + target.triple() + "' requires the "
+                            "Linking for target '" + target.triple() + "' requires the "
                                     + "LLVM linker 'lld-link', but it was not found on PATH. "
                                     + "MSVC link.exe cannot consume LLVM bitcode objects. "
                                     + "Install LLVM with lld (e.g. `winget install LLVM.LLVM`) "
                                     + "and make sure its bin directory is on PATH.");
                 }
                 linkCmd.add("-fuse-ld=lld");
-                linkCmd.add("-flto-jobs=" + effectiveCores);
                 // MSVC-mode lld-link reports a symbol made weak in several objects as duplicate
                 // (MinGW mode allows it); the runtime relies on ELF-style weak, so allow it.
                 linkCmd.add("-Wl,-lld-allow-duplicate-weak");
@@ -291,7 +295,7 @@ public class Compiler implements CompilerPort {
                 // Windows doesn't append .exe to a name that already has an extension (".lld").
                 if (!isAvailable(TargetPlatform.detectFromBuildHost().isWindows() ? "ld.lld.exe" : "ld.lld")) {
                     throw new IllegalStateException(
-                            "ThinLTO for target '" + target.triple() + "' requires the "
+                            "Linking for target '" + target.triple() + "' requires the "
                                     + "LLVM linker 'ld.lld', but it was not found on PATH. "
                                     + "GNU ld does not support ThinLTO options "
                                     + "(both '--threads' and '--thinlto-jobs' are rejected). "
@@ -315,7 +319,8 @@ public class Compiler implements CompilerPort {
                 // storm.
                 if (target.isWindows()) {
                     List<Path> gccRuntimeDirs = findGccRuntimeLibDirs(target);
-                    for (Path dir : gccRuntimeDirs) {
+                    List<? extends Path> jnLoop3 = gccRuntimeDirs;
+                    for (Path dir : jnLoop3) {
                         linkCmd.add("-L" + dir);
                     }
                     Path ehFallbackDir = ensureLibgccEh(target, gccRuntimeDirs, tempDir);
@@ -325,7 +330,6 @@ public class Compiler implements CompilerPort {
                 }
 
                 linkCmd.add("-fuse-ld=lld");
-                linkCmd.add("-Wl,--thinlto-jobs=" + effectiveCores);
             }
 
             if (target.isWindows()) {
@@ -335,7 +339,8 @@ public class Compiler implements CompilerPort {
             }
 
             List<String> objectLines = new ArrayList<>(tasks.size());
-            for (CompileTask task : tasks) {
+            List<? extends CompileTask> jnLoop4 = tasks;
+            for (CompileTask task : jnLoop4) {
                 String objPath = task.obj.toAbsolutePath().toString().replace('\\', '/');
                 objectLines.add("\"" + objPath + "\"");
             }
@@ -347,7 +352,18 @@ public class Compiler implements CompilerPort {
 
             appendLinkerLibraries(linkCmd, target);
 
-            System.out.println("Linking for target " + target.triple() + "...");
+            if (thinLtoEnabled) {
+                Files.createDirectories(thinLtoCacheDir);
+                appendThinLtoCacheOptions(linkCmd, msvcLinker, target,
+                        thinLtoCacheDir, thinLtoCachePolicy);
+            }
+            linkCmd.addAll(linkerOptimizationFlags(msvcLinker, effectiveOptLevel,
+                effectiveCores, ltoFlag));
+            System.out.println("Linking for target " + target.triple() + " using "
+                    + effectiveCores + " worker(s) ("
+                    + (ltoEnabled ? ltoFlag + " -O" + effectiveOptLevel : "LTO disabled")
+                    + ")...");
+            log.debug("Link command: {}", linkCmd);
             ProcessBuilder linkBuilder = new ProcessBuilder(linkCmd);
             linkBuilder.inheritIO();
             int exit = linkBuilder.start().waitFor();
@@ -367,7 +383,7 @@ public class Compiler implements CompilerPort {
         }
 
         static BuildWorkspace create() throws IOException {
-            Path tempRoot = GeneratedOutputDirectory.resolve().resolve(".temp");
+            Path tempRoot = Paths.get("target", "generated-jnative", ".temp");
             Files.createDirectories(tempRoot);
             return new BuildWorkspace(Files.createTempDirectory(tempRoot, BUILD_ROOT_NAME));
         }
@@ -379,7 +395,8 @@ public class Compiler implements CompilerPort {
         @Override
         public void close() throws IOException {
             try (var paths = Files.walk(path)) {
-                for (Path entry : paths.sorted(Comparator.reverseOrder()).toList()) {
+                List<? extends Path> jnLoop5 = paths.sorted(Comparator.reverseOrder()).toList();
+                for (Path entry : jnLoop5) {
                     Files.deleteIfExists(entry);
                 }
             }
@@ -469,7 +486,8 @@ public class Compiler implements CompilerPort {
                                        List<Path> gccRuntimeDirs,
                                        Path tempDir) {
         Path firstLibgcc = null;
-        for (Path dir : gccRuntimeDirs) {
+        List<? extends Path> jnLoop7 = gccRuntimeDirs;
+        for (Path dir : jnLoop7) {
             Path eh = dir.resolve("libgcc_eh.a");
             if (Files.isRegularFile(eh)) {
                 return null;
@@ -970,7 +988,8 @@ public class Compiler implements CompilerPort {
                 Path mingwW64Root = Paths.get(pf, "mingw-w64");
                 if (!Files.isDirectory(mingwW64Root)) continue;
                 try (var stream = Files.list(mingwW64Root)) {
-                    for (Path sub : stream.toList()) {
+                    List<? extends Path> jnLoop12 = stream.toList();
+                    for (Path sub : jnLoop12) {
                         if (!Files.isDirectory(sub)) continue;
                         for (String triple : new String[]{
                                 "mingw64", "mingw32", "x86_64-w64-mingw32" }) {
@@ -1092,11 +1111,121 @@ public class Compiler implements CompilerPort {
     }
 
     // =====================================================================
-    //  Optimization level
+    //  Optimization flags
     // =====================================================================
 
     private static int clampOptLevel(int level) {
         return Math.max(MIN_OPT_LEVEL, Math.min(level, MAX_OPT_LEVEL));
+    }
+
+    private static String resolveLtoFlag(String ltoMode) {
+        if (ltoMode == null || ltoMode.isBlank()) return "-fno-lto";
+        return ltoMode.startsWith("-") ? ltoMode : "-flto=" + ltoMode;
+    }
+
+    public static Path thinLtoCacheRoot() {
+        String configuredPath = System.getProperty(THIN_LTO_CACHE_DIR_PROPERTY);
+        Path generatedOutput = Paths.get("target", "generated-jnative")
+                .toAbsolutePath().normalize();
+        Path root = configuredPath == null || configuredPath.isBlank()
+                ? generatedOutput.resolve(".jnative-thinlto-cache")
+                : Paths.get(configuredPath.trim()).toAbsolutePath().normalize();
+        if (root.equals(generatedOutput)
+                || root.startsWith(generatedOutput.resolve(".temp"))) {
+            throw new IllegalArgumentException(THIN_LTO_CACHE_DIR_PROPERTY
+                    + " must not point to the generated-output directory itself or its temporary workspace");
+        }
+        return root;
+    }
+
+    private static Path resolveThinLtoCacheDir(String compiler, TargetPlatform target)
+            throws IOException, InterruptedException {
+        return thinLtoCacheRoot()
+                .resolve(cachePathSegment(target.triple()))
+                .resolve(compilerCacheIdentity(compiler));
+    }
+
+    private static String resolveThinLtoCachePolicy() {
+        String policy = System.getProperty(THIN_LTO_CACHE_POLICY_PROPERTY,
+                DEFAULT_THIN_LTO_CACHE_POLICY).trim();
+        if (policy.isEmpty()) {
+            throw new IllegalArgumentException(THIN_LTO_CACHE_POLICY_PROPERTY
+                    + " must contain a valid LLD ThinLTO cache policy");
+        }
+        return policy;
+    }
+
+    private static String compilerCacheIdentity(String compiler)
+            throws IOException, InterruptedException {
+        Process process = new ProcessBuilder(compiler, "--version")
+                .redirectErrorStream(true)
+                .start();
+        String version;
+        try (InputStream input = process.getInputStream()) {
+            version = new String(input.readAllBytes(), StandardCharsets.UTF_8);
+        }
+        int exit = process.waitFor();
+        if (exit != 0 || version.isBlank()) {
+            throw new IOException("Could not determine compiler identity for ThinLTO cache: "
+                    + compiler);
+        }
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            digest.update(compiler.getBytes(StandardCharsets.UTF_8));
+            digest.update((byte) 0);
+            return HexFormat.of().formatHex(digest.digest(version.getBytes(StandardCharsets.UTF_8)));
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-256 is unavailable", e);
+        }
+    }
+
+    private static String cachePathSegment(String value) {
+        String segment = value.replaceAll("[^A-Za-z0-9._-]", "_");
+        return segment.isBlank() ? "unknown-target" : segment;
+    }
+
+    private static void appendThinLtoCacheOptions(List<String> command,
+                                                   boolean msvcLinker,
+                                                   TargetPlatform target,
+                                                   Path cacheDir,
+                                                   String cachePolicy) {
+        String cachePath = cacheDir.toString().replace('\\', '/');
+        if (msvcLinker) {
+            appendLinkerArgument(command, "/lldltocache:" + cachePath);
+            appendLinkerArgument(command, "/lldltocachepolicy:" + cachePolicy);
+        } else if (target.isDarwin()) {
+            appendLinkerArgument(command, "-cache_path_lto");
+            appendLinkerArgument(command, cachePath);
+            appendLinkerArgument(command, "--thinlto-cache-policy=" + cachePolicy);
+        } else {
+            appendLinkerArgument(command, "--thinlto-cache-dir=" + cachePath);
+            appendLinkerArgument(command, "--thinlto-cache-policy=" + cachePolicy);
+        }
+    }
+
+    private static void appendLinkerArgument(List<String> command, String argument) {
+        command.add("-Xlinker");
+        command.add(argument);
+    }
+
+    private static List<String> linkerOptimizationFlags(boolean msvc, int optimizationLevel,
+                                                        int jobs, String ltoFlag) {
+        List<String> flags = new ArrayList<>();
+        flags.add(ltoFlag);
+        flags.add("-O" + optimizationLevel);
+        flags.add(msvc ? "-Wl,/threads:" + jobs : "-Wl,--threads=" + jobs);
+        if (!"-fno-lto".equals(ltoFlag)) {
+            if (msvc) {
+                flags.add("-Wl,/opt:lldltojobs=" + jobs);
+                flags.add("-Wl,/opt:lldlto=" + optimizationLevel);
+            } else {
+                flags.add(ltoFlag.contains("thin")
+                        ? "-Wl,--thinlto-jobs=" + jobs
+                        : "-Wl,--lto-jobs=" + jobs);
+                flags.add("-Wl,--lto-O" + optimizationLevel);
+            }
+        }
+        return flags;
     }
 
     // =====================================================================
@@ -1116,22 +1245,24 @@ public class Compiler implements CompilerPort {
 
     private void compileAll(String compiler, List<CompileTask> tasks,
                             Path includeDir, int threadCount,
-                            int optimizationLevel, TargetPlatform target,
+                            int optimizationLevel, String ltoFlag, TargetPlatform target,
                             String sysroot, MsvcToolchain msvcToolchain)
             throws IOException, InterruptedException {
 
         List<CompileTask> scheduledTasks = new ArrayList<>(tasks);
         Map<Path, Long> sourceSizes = new HashMap<>();
-        for (CompileTask task : scheduledTasks) {
+        List<? extends CompileTask> jnLoop15 = scheduledTasks;
+        for (CompileTask task : jnLoop15) {
             sourceSizes.put(task.src, Files.size(task.src));
         }
         scheduledTasks.sort(Comparator.comparingLong(
                 (CompileTask task) -> sourceSizes.get(task.src)).reversed());
 
         if (threadCount <= 1 || tasks.size() <= 1) {
-            for (CompileTask task : scheduledTasks) {
+            List<? extends CompileTask> jnLoop16 = scheduledTasks;
+            for (CompileTask task : jnLoop16) {
                 compileOne(compiler, task, includeDir, optimizationLevel,
-                        target, sysroot, msvcToolchain);
+                        ltoFlag, target, sysroot, msvcToolchain);
             }
             return;
         }
@@ -1152,7 +1283,7 @@ public class Compiler implements CompilerPort {
                 while ((idx = nextTask.getAndIncrement()) < scheduledTasks.size()) {
                     try {
                         compileOne(compiler, scheduledTasks.get(idx), includeDir,
-                                optimizationLevel, target, sysroot,
+                                optimizationLevel, ltoFlag, target, sysroot,
                                 msvcToolchain);
                     } catch (Throwable t) {
                         failures.add(t);
@@ -1163,7 +1294,8 @@ public class Compiler implements CompilerPort {
 
         pool.shutdown();
         try {
-            for (Future<?> f : futures) {
+            List<? extends Future<?>> jnLoop17 = futures;
+            for (Future<?> f : jnLoop17) {
                 try { f.get(); }
                 catch (ExecutionException ee) {
                     failures.add(ee.getCause() != null ? ee.getCause() : ee);
@@ -1186,7 +1318,7 @@ public class Compiler implements CompilerPort {
     }
 
     private void compileOne(String compiler, CompileTask task, Path includeDir,
-                            int optimizationLevel, TargetPlatform target,
+                            int optimizationLevel, String ltoFlag, TargetPlatform target,
                             String sysroot, MsvcToolchain msvcToolchain)
             throws IOException, InterruptedException {
 
@@ -1207,7 +1339,7 @@ public class Compiler implements CompilerPort {
         command.add("-x");
         command.add(task.kind == SourceKind.IR ? "ir" : "c");
         command.add("-O" + optimizationLevel);
-        command.add(optimizationLevel == 0 ? "-fno-lto" : "-flto=thin");
+        command.add(ltoFlag);
         command.add("-g");
         command.add("-fno-omit-frame-pointer");
 
@@ -1381,7 +1513,8 @@ public class Compiler implements CompilerPort {
         //    bare `declare` and has no body to export.
         // ------------------------------------------------------------------
         Set<String> definedFunctions = new HashSet<>();
-        for (Function f : module.getFunctions()) {
+        List<? extends Function> jnLoop19 = module.getFunctions();
+        for (Function f : jnLoop19) {
             if (f.getEntryBlock() == null) continue;
             definedFunctions.add(f.getName());
         }
@@ -1397,7 +1530,8 @@ public class Compiler implements CompilerPort {
         // ------------------------------------------------------------------
         Set<String> definedGlobals = new HashSet<>();
         boolean moduleFound = false;
-        for (Path ll : llPaths) {
+        List<? extends Path> jnLoop20 = llPaths;
+        for (Path ll : jnLoop20) {
             String fileName = ll.getFileName().toString();
             if (!fileName.equals("_module.ll") && !fileName.startsWith("_globals")) continue;
             moduleFound = true;
@@ -1430,7 +1564,12 @@ public class Compiler implements CompilerPort {
         for (String g : definedGlobals) {
             if (g.startsWith("gv_")
                 || g.startsWith("vtable_")
-                || g.startsWith("__type_info_")) {
+                || g.startsWith("__type_info_")
+                || g.startsWith("__jnative_rcfields_")
+                || g.startsWith("__jnative_rccyclic_")
+                || g.startsWith("__jnative_rcowned_")
+                || g.startsWith("__jnative_rcoff_")
+                || g.startsWith("__jnative_rcarray_")) {
                 exports.add(g);
             }
         }
@@ -1447,6 +1586,8 @@ public class Compiler implements CompilerPort {
         // ------------------------------------------------------------------
         for (String f : definedFunctions) {
             if (f.startsWith("__destruct_")) {
+                exports.add(f);
+            } else if (f.startsWith("__jnative_storage_")) {
                 exports.add(f);
             } else if (f.startsWith("fn_")
                     && (f.endsWith("__clinit____V") || f.endsWith("__init____V"))) {
@@ -1487,8 +1628,11 @@ public class Compiler implements CompilerPort {
         // ------------------------------------------------------------------
         String prefix = target.triple().matches("i[3-6]86-.*") ? "_" : "";
         StringBuilder sb = new StringBuilder(
-                "#include <stdlib.h>\n#include <string.h>\n"
-                + "typedef struct { const char* n; const void* a; } JnSelfSym;\n");
+            """
+                #include <stdlib.h>
+                #include <string.h>
+                typedef struct { const char* n; const void* a; } JnSelfSym;
+                """);
         int i = 0;
         for (String sym : exports) {
             sb.append(definedFunctions.contains(sym) ? "extern void s" + i + "(void)" : "extern char s" + i)
@@ -1699,7 +1843,8 @@ public class Compiler implements CompilerPort {
                                               TargetPlatform target, Path extractDir) throws IOException {
 
         boolean usesJni = false;
-        for (io.github.kubyk01.domain.ir.Function f : module.getFunctions()) {
+        List<? extends io.github.kubyk01.domain.ir.Function> jnLoop26 = module.getFunctions();
+        for (io.github.kubyk01.domain.ir.Function f : jnLoop26) {
             if (f.isJniNative()) {
                 usesJni = true;
                 break;
@@ -1791,7 +1936,8 @@ public class Compiler implements CompilerPort {
         String[] tokens = entry.toLowerCase(Locale.ROOT).split("[/\\\\.\\-_]");
         boolean sawOs = false;
         for (Map.Entry<String, List<String>> o : OS_ALIASES.entrySet()) {
-            for (String alias : o.getValue()) {
+            List<? extends String> jnLoop29 = o.getValue();
+            for (String alias : jnLoop29) {
                 for (String t : tokens) {
                     if (!t.equals(alias)) continue;
                     if (o.getKey().equals(os)) {
@@ -1875,7 +2021,8 @@ public class Compiler implements CompilerPort {
         String[] tokens = entry.toLowerCase(Locale.ROOT).split("[/\\\\.-]");
         String matched = null;
         for (Map.Entry<String, List<String>> a : ARCH_ALIASES.entrySet()) {
-            for (String alias : a.getValue()) {
+            List<? extends String> jnLoop33 = a.getValue();
+            for (String alias : jnLoop33) {
                 for (String t : tokens) {
                     if (t.equals(alias) || t.endsWith("_" + alias)) {
                         if (a.getKey().equals(arch)) return true;
@@ -1893,13 +2040,15 @@ public class Compiler implements CompilerPort {
 
     private List<Path> resolveNativeLoadOrder(List<Path> roots, TargetPlatform target) {
         Set<Path> dirs = new LinkedHashSet<>();
-        for (Path lib : roots) {
+        List<? extends Path> jnLoop35 = roots;
+        for (Path lib : jnLoop35) {
             Path parent = lib.toAbsolutePath().getParent();
             if (parent != null) dirs.add(parent);
         }
         LinkedHashSet<Path> ordered = new LinkedHashSet<>();
         Set<Path> visiting = new HashSet<>();
-        for (Path lib : roots) {
+        List<? extends Path> jnLoop36 = roots;
+        for (Path lib : jnLoop36) {
             visitNativeLibrary(lib.toAbsolutePath(), dirs, target, ordered, visiting);
         }
         return new ArrayList<>(ordered);
@@ -1951,11 +2100,13 @@ public class Compiler implements CompilerPort {
     private Set<String> collectReferencedNativeClasses(Module module,
                                                        DependencyResolver resolver) {
         Set<String> result = new HashSet<>();
-        for (String cls : new ArrayList<>(resolver.getClassMap().keySet())) {
+        List<? extends String> jnLoop39 = new ArrayList<>(resolver.getClassMap().keySet());
+        for (String cls : jnLoop39) {
             if (!hasNativeSupport(cls)) continue;
             ClassNode cn = resolver.getClassNode(cls);
             if (cn == null || cn.isExternal()) continue;
-            for (MethodNode mn : cn.getMethods()) {
+            List<? extends MethodNode> jnLoop40 = cn.getMethods();
+            for (MethodNode mn : jnLoop40) {
                 if (!mn.isNative()) continue;
                 String nativeName = "__jnative_" + LlvmRuntime.mangleMethod(
                         cls, mn.getName(), mn.getDescriptor());

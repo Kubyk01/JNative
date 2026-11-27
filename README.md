@@ -100,7 +100,7 @@ jnative analyze <file.jar|dir|.class> [options]
 
 Builds a native executable or, with `--no-compile`, generates LLVM IR only.
 
-Generated IR goes in `target/generated-jnative`. Running from `target` or one of its subdirectories reuses that directory instead of creating `target/target`; elsewhere within a Maven project, the nearest ancestor containing `pom.xml` supplies the project root. Temporary bodies stay in `target/generated-jnative/.jnative-spool` until generation finishes successfully. Native compiler workspaces, including extracted C sources and object files, are created under `target/generated-jnative/.temp` and removed after each build. Set the JVM property `-Djnative.llvmUnitBytes=<bytes>` before `-jar` to change the class-body grouping limit, or use `0` for one unit per class.
+Generated IR goes in `target/generated-jnative`, relative to the current working directory. Temporary bodies stay in `target/generated-jnative/.jnative-spool` until generation finishes successfully. Native compiler workspaces, including extracted C sources and object files, are created under `target/generated-jnative/.temp` and removed after each build. Set the JVM property `-Djnative.llvmUnitBytes=<bytes>` before `-jar` to change the class-body grouping limit, or use `0` for one unit per class.
 
 | Option | Description |
 | --- | --- |
@@ -115,12 +115,20 @@ Generated IR goes in `target/generated-jnative`. Running from `target` or one of
 | `--escape` | Show per-site escape status. |
 | `--lifetime` | Show destruction points. |
 | `--destructor` | Show destructor insertion. |
-| `--all` | Equivalent to `--classes --alias --escape --lifetime --destructor`. |
+| `--reachability` | Show classes and methods reachable from the selected entry point. |
+| `--reachability-enable` | Run reachability analysis without showing its results. |
+| `--all` | Equivalent to `--classes --alias --escape --lifetime --destructor --reachability`. |
 | `--debug-name` | Restrict analysis output to items whose names contain this substring. |
-| `--cores` | Maximum CPU cores. `0` (default) uses `Runtime.availableProcessors()`. Controls parallel analysis, C compilation, and `--thinlto-jobs`. |
-| `-O` | Optimization level `0`–`3` (default: `2`), passed as `-O<level>` to IR-to-bitcode and ThinLTO linking. |
+| `--cores` | Maximum CPU cores. `0` (default) uses `Runtime.availableProcessors()`. Controls parallel analysis, compilation, and linking. |
+| `-O` | Optimization level `0`–`3` (default: `2`), applied during compilation and explicitly to ThinLTO optimization. `-O0` disables LTO during both compilation and linking. |
 | `--target` | LLVM target triple; auto-detected from the build host if omitted. |
 | `--data-layout` | Override the data layout derived from `--target`. |
+
+Linker parallelism follows `--cores` (or `Runtime.availableProcessors()` when `--cores` is `0`); the build prints the selected worker count before linking. Keep `--cores` low if the linker runs out of memory on large LTO builds.
+
+ThinLTO links use a persistent LLD cache. By default, its root is `target/generated-jnative/.jnative-thinlto-cache`, which JNative preserves while clearing generated output. The root contains separate entries for each target triple and compiler identity. Set the JVM property `-Djnative.thinLtoCacheDir=<path>` before `-jar` to choose another cache root. LLD prunes the cache on links using `cache_size=25%` by default; set `-Djnative.thinLtoCachePolicy=<policy>` to use another [LLD cache policy](https://clang.llvm.org/docs/ThinLTO.html#cache-pruning). These settings apply to ThinLTO links only.
+
+For Windows MSVC targets, JNative passes the worker count directly to `lld-link` through `/threads:N` and `/opt:lldltojobs=N`, and the LTO optimization level through `/opt:lldlto=N`. This avoids relying on Clang to forward `-flto-jobs` or `-O` to the MSVC linker; see [LLVM's ThinLTO parallelism documentation](https://clang.llvm.org/docs/ThinLTO.html#controlling-backend-parallelism). Java's `-Xmx` limits the JNative JVM heap; it does not set the separate LLVM linker's memory budget.
 
 ## What Works
 
@@ -148,8 +156,7 @@ The following features are implemented, subject to application-specific constrai
 - **Networking:** `Inet4Address`, `Inet6Address`, `InetAddress`, and `NetworkInterface`, including interface enumeration and reverse lookups.
 - **Reflection mirrors:** `Class.getDeclaredMethods0`, `getDeclaredFields0`, and `getDeclaredConstructors0` construct real `Field`, `Method`, and `Constructor` mirrors with populated `parameterTypes`, `exceptionTypes`, and root fields, supporting `Executable.sharedToString` and `ReflectionData` without null-pointer failures.
 - **Resources and time zones:** embeds every non-`.class` resource in the target JDK's `java.base` module and its `lib/tzdb.dat`, served through `Class.getResourceAsStream` and `FileInputStream` for `/lib/tzdb.dat`.
-- **Shutdown cleanup:** cycle-safe destruction uses a freed-address set and per-thread claim stack to detect doubly reachable objects and destructor cycles during `atexit` cleanup.
-- **Destructor fast/slow paths:** outside shutdown, destructors use a direct load-check-free call; during shutdown, they use a cycle-safe slow path.
+- **Ownership cleanup:** stack objects release owned fields on frame exit and exception unwinding. Reference-counted storage is released after the last strong owner and outstanding local borrows disappear.
 - **Core system APIs:** `System.out`, `System.err`, `System.in`, `System.getProperties`, `System.setProperty`, `System.currentTimeMillis`, `System.nanoTime`, `System.identityHashCode`, and `System.exit`.
 
 Distribute the executable alone. Application resources, classpath archives, discovered JNI libraries, and the target JDK's `release`, `conf/`, `lib/`, and available `legal/` trees are embedded as binary data. No `<executable>.classpath`, `<executable>.runtime`, or companion JNI libraries are generated or required. Spring Boot classes and dependency JARs retain their classpath order, including duplicate resource names in separate archives. The executable does not require an installed JDK, JVM, or `libz`.
@@ -162,10 +169,10 @@ JNative uses static escape and lifetime analysis to classify each allocation sit
 
 | Classification | Meaning and cleanup behavior |
 | --- | --- |
-| `STACK` | The object does not escape its defining function. It can use stack allocation when no opaque use prevents it; scalar replacement can eliminate it entirely when its fields are the only observable state. |
+| `STACK` | The object does not escape its defining function. Materialized stack objects release their owned fields at frame exit. Scalar replacement can eliminate the object when only its fields are observable. |
 | `HEAP` | The object is stored in another object's field. A destructor is inserted at its last use, with the containing field nulled. Field-overwrite instrumentation also releases the previous value at `PUT_FIELD` when liveness analysis proves no other reference observes it. |
 | `RETURN` | The object is returned to the caller; the caller owns it. |
-| `GLOBAL` | The object is reachable from a static field and is released during the shutdown pass only. |
+| `GLOBAL` | Static fields hold strong references. The operating system reclaims storage still rooted at process exit. |
 | `THREAD` | The object is handed to another thread and is not released per-use. |
 | `UNKNOWN` | The analysis cannot classify the site, so cleanup is handled conservatively. |
 

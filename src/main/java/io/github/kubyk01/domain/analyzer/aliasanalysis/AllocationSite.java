@@ -2,6 +2,8 @@ package io.github.kubyk01.domain.analyzer.aliasanalysis;
 
 import io.github.kubyk01.domain.ir.Constant;
 import io.github.kubyk01.domain.ir.Instruction;
+import io.github.kubyk01.domain.ir.InvokeDynamicInfo;
+import io.github.kubyk01.domain.ir.ResolvedCall;
 import io.github.kubyk01.domain.ir.Opcode;
 import io.github.kubyk01.domain.ir.Type;
 import lombok.Getter;
@@ -103,6 +105,13 @@ public final class AllocationSite {
                 type = Type.fromDescriptor(typeName);
                 typeName = type.toString();
             }
+        } else if (op == Opcode.INVOKEDYNAMIC
+                && inst.getInvokedynamicData() instanceof InvokeDynamicInfo info
+                && info.resolvedCall() != null
+                && info.resolvedCall().getType() == ResolvedCall.Type.LAMBDA
+                && info.resolvedCall().getLambdaStructName() != null) {
+            type = Type.closure(info.resolvedCall().getLambdaStructName());
+            typeName = type.getClassName();
         }
         return of(methodName, idx, typeName, type);
     }

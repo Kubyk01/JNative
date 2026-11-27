@@ -13,6 +13,8 @@
 
 extern JNativeVTable vtable_java_lang_String;
 
+extern void fn_sun_nio_fs_WindowsException__init___I_V(void* self, int32_t error);
+
 #define WND_PTR(x) ((void*)(intptr_t)(x))
 #define WND_WSTR(x) ((LPCWSTR)(intptr_t)(x))
 #define WND_JLONG(p) ((int64_t)(intptr_t)(p))
@@ -87,7 +89,12 @@ static void wnd_set_long(void* obj, WndField* f, int64_t v) {
 
 static void wnd_set_obj(void* obj, WndField* f, void* v) {
     int off = wnd_field_offset(f);
-    if (obj != NULL && off >= 0) *(void**)((char*)obj + off) = v;
+    if (obj != NULL && off >= 0) {
+        void* old = *(void**)((char*)obj + off);
+        __jnative_rc_inc(v);
+        *(void**)((char*)obj + off) = v;
+        __jnative_rc_dec(old);
+    }
 }
 
 JNATIVE_NORETURN static void wnd_throw(DWORD last_error) {
@@ -95,17 +102,31 @@ JNATIVE_NORETURN static void wnd_throw(DWORD last_error) {
     if (cls != NULL) {
         void* exc = jnative_alloc_object(cls);
         if (exc != NULL) {
-            typedef void (*ctor_int_t)(void*, int32_t);
-            ctor_int_t ctor = (ctor_int_t)jn_dlsym_default("fn_sun_nio_fs_WindowsException__init__I_V");
-            if (ctor != NULL) {
-                ctor(exc, (int32_t)last_error);
-                __jnative_throw_exception(exc);
-            }
-            free(exc);
+            fn_sun_nio_fs_WindowsException__init___I_V(exc, (int32_t)last_error);
+            __jnative_throw_exception(exc);
         }
     }
     char buf[96];
     snprintf(buf, sizeof(buf), "WindowsException (error %lu)", (unsigned long)last_error);
+
+    /* Mirror sun.nio.fs.WindowsException.translateToIOException: the JDK's
+       createDirectories/createTempDirectory only recover from these subtypes. */
+    const char* vtable;
+    switch (last_error) {
+        case ERROR_FILE_NOT_FOUND:
+        case ERROR_PATH_NOT_FOUND:
+            vtable = "vtable_java_nio_file_NoSuchFileException"; break;
+        case ERROR_FILE_EXISTS:
+        case ERROR_ALREADY_EXISTS:
+            vtable = "vtable_java_nio_file_FileAlreadyExistsException"; break;
+        case ERROR_ACCESS_DENIED:
+            vtable = "vtable_java_nio_file_AccessDeniedException"; break;
+        default:
+            vtable = "vtable_java_nio_file_FileSystemException"; break;
+    }
+    void* typed = __jnative_construct_exception(vtable, buf);
+    if (typed != NULL) __jnative_throw_exception_ctx(typed, "WindowsNativeDispatcher");
+
     __jnative_throw_io_ctx(buf, "WindowsNativeDispatcher");
 }
 
@@ -148,6 +169,7 @@ static void* wnd_string(const WCHAR* wstr, size_t len) {
     void* s = calloc(1, 32);
     if (s == NULL) __jnative_throw_out_of_memory_error_ctx("WindowsNativeDispatcher");
     *(void**)s = (void*)&vtable_java_lang_String;
+    __jnative_rc_inc(value);
     *(void**)((char*)s + 8) = value;
     *(uint8_t*)((char*)s + 16) = coder;
     return s;

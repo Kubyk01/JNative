@@ -1,6 +1,7 @@
 package io.github.kubyk01.domain.analyzer.aliasanalysis;
 
 import java.util.Arrays;
+import java.util.IdentityHashMap;
 
 public final class SiteSetBuilder {
 
@@ -11,6 +12,7 @@ public final class SiteSetBuilder {
     private int touchedCount;
     private int count;
     private boolean busy;
+    private IdentityHashMap<PointsToSet, Boolean> addedLargeSets;
 
     public static SiteSetBuilder acquire() {
         SiteSetBuilder b = LOCAL.get();
@@ -41,7 +43,11 @@ public final class SiteSetBuilder {
     }
 
     public void addAll(PointsToSet s) {
-        for (int id : s.rawIds()) add(id);
+        if (s.size() >= PointsToSet.DELTA_MIN_BASE) {
+            if (addedLargeSets == null) addedLargeSets = new IdentityHashMap<>();
+            if (addedLargeSets.put(s, Boolean.TRUE) != null) return;
+        }
+        s.addTo(this);
     }
 
     public PointsToSet buildOr(PointsToSet base) {
@@ -49,12 +55,35 @@ public final class SiteSetBuilder {
             clear();
             return base;
         }
+        if (base != null && base.size() >= PointsToSet.DELTA_MIN_BASE && count > base.size() && containsAll(base)) {
+            for (long c = base.cursor(); base.has(c); c = base.next(c)) {
+                int id = base.id(c);
+                words[id >>> 6] &= ~(1L << id);
+            }
+            count -= base.size();
+            int k = drain();
+            return PointsToSet.plus(base, PointsToSet.scratch(0), k);
+        }
         return build();
+    }
+
+    private boolean containsAll(PointsToSet s) {
+        for (long c = s.cursor(); s.has(c); c = s.next(c)) {
+            int id = s.id(c);
+            int w = id >>> 6;
+            if (w >= words.length || (words[w] & (1L << id)) == 0) return false;
+        }
+        return true;
     }
 
     public PointsToSet build() {
         if (count == 0) return PointsToSet.EMPTY;
-        int[] out = new int[count];
+        int k = drain();
+        return PointsToSet.intern(PointsToSet.scratch(0), k, false);
+    }
+
+    private int drain() {
+        int[] out = PointsToSet.scratch(count);
         Arrays.sort(touched, 0, touchedCount);
         int k = 0;
         for (int t = 0; t < touchedCount; t++) {
@@ -70,13 +99,14 @@ public final class SiteSetBuilder {
         }
         touchedCount = 0;
         count = 0;
-        if (out.length == 1) return AllocationSite.byId(out[0]).singleton();
-        return PointsToSet.ofSortedUnique(out);
+        if (addedLargeSets != null) addedLargeSets.clear();
+        return k;
     }
 
     public void clear() {
         for (int t = 0; t < touchedCount; t++) words[touched[t]] = 0;
         touchedCount = 0;
         count = 0;
+        if (addedLargeSets != null) addedLargeSets.clear();
     }
 }

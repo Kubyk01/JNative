@@ -128,7 +128,8 @@ public final class NativeBodyEscapeAnalyzer {
         if (ownerNode == null) return allEscape();
 
         MethodNode method = null;
-        for (MethodNode m : ownerNode.getMethods()) {
+        List<? extends MethodNode> jnLoop1 = ownerNode.getMethods();
+        for (MethodNode m : jnLoop1) {
             if (m.getName().equals(name) && m.getDescriptor().equals(desc)) {
                 method = m;
                 break;
@@ -355,7 +356,8 @@ public final class NativeBodyEscapeAnalyzer {
 
     private static void parseParamsInto(CFunction cf, String params) {
         int index = 0;
-        for (String raw : splitArguments(params)) {
+        List<? extends String> jnLoop2 = splitArguments(params);
+        for (String raw : jnLoop2) {
             String p = raw.trim();
             if (p.isEmpty() || p.equals("void")) continue;
 
@@ -554,7 +556,8 @@ public final class NativeBodyEscapeAnalyzer {
             List<String> args = splitArguments(calls.group(2));
 
             boolean anyParameterInArgs = false;
-            for (String arg : args) {
+            List<? extends String> jnLoop5 = args;
+            for (String arg : jnLoop5) {
                 for (String paramName : function.paramIndex.keySet()) {
                     if (containsIdentifier(arg, paramName)) {
                         anyParameterInArgs = true;
@@ -569,7 +572,8 @@ public final class NativeBodyEscapeAnalyzer {
                     resolveHelperSummary(functions, owner, callee);
 
             if (calleeSummary == null) {
-                for (String arg : args) {
+                List<? extends String> jnLoop7 = args;
+                for (String arg : jnLoop7) {
                     for (Map.Entry<String, Integer> p
                             : function.paramIndex.entrySet()) {
                         if (containsIdentifier(arg, p.getKey())) {

@@ -33,7 +33,7 @@ import static io.github.kubyk01.util.LlvmUtil.isLazyClinitWrapper;
 /**
  * Interprocedural escape fixed point: runs IntraproceduralEscape over every
  * live function and merges the results into a global site->status map.
- *
+ * <p>
  * Two earlier gaps:
  *   1. IntraproceduralEscape started every site at STACK and read only its
  *      own map, so a site promoted by another function was invisible to
@@ -43,7 +43,7 @@ import static io.github.kubyk01.util.LlvmUtil.isLazyClinitWrapper;
  *      allocator (whose sitesReachableFromParams contributions had to be
  *      recomputed against the new status) was not. Fix: enqueue both
  *      the allocator and the callers of the observing function.
- *
+ * <p>
  * The lattice is monotone (EscapeStatus.ordinal only grows), so the loop
  * terminates in O(sites x lattice height). globalStatus is a
  * ConcurrentHashMap: workers read it, the main thread writes after each
@@ -125,7 +125,8 @@ public class InterproceduralEscape {
         // site's status, so the seed determines the "unreached" default
         // that intraprocedural analysis starts from.
         // ------------------------------------------------------------------
-        for (Function func : module.getFunctions()) {
+        List<? extends Function> jnLoop1 = module.getFunctions();
+        for (Function func : jnLoop1) {
             if (func.getEntryBlock() == null) continue;
             for (BasicBlock block : func.getBlocks()) {
                 for (Instruction inst : block.getInstructions()) {
@@ -140,7 +141,8 @@ public class InterproceduralEscape {
         }
 
         List<Function> live = new ArrayList<>();
-        for (Function f : module.getFunctions()) {
+        List<? extends Function> jnLoop3 = module.getFunctions();
+        for (Function f : jnLoop3) {
             if (f.getEntryBlock() != null) live.add(f);
         }
         if (live.isEmpty()) return globalStatus;
@@ -155,7 +157,8 @@ public class InterproceduralEscape {
         // never observe a change in the wrapper's own site statuses.
         // ------------------------------------------------------------------
         Map<String, Set<Function>> callersOf = new HashMap<>();
-        for (Function f : live) {
+        {
+            for (int jnIdx4 = 0; jnIdx4 < live.size(); jnIdx4++) { Function f = ((List<? extends Function>) live).get(jnIdx4);
             for (BasicBlock b : f.getBlocks()) {
                 for (Instruction inst : b.getInstructions()) {
                     String callee = extractCalleeName(inst);
@@ -165,7 +168,7 @@ public class InterproceduralEscape {
                     callersOf.computeIfAbsent(calleeKey, k -> new HashSet<>()).add(f);
                 }
             }
-        }
+        } }
 
         // ------------------------------------------------------------------
         // Allocator index.
@@ -178,9 +181,10 @@ public class InterproceduralEscape {
         // to re-enqueue the allocator when one of its sites is upgraded.
         // ------------------------------------------------------------------
         Map<String, Function> allocatorByMethodName = new HashMap<>(live.size() * 2);
-        for (Function f : live) {
+        {
+            for (int jnIdx5 = 0; jnIdx5 < live.size(); jnIdx5++) { Function f = ((List<? extends Function>) live).get(jnIdx5);
             allocatorByMethodName.put(f.getName(), f);
-        }
+        } }
 
         Deque<Function> worklist = new ArrayDeque<>(live);
         Set<Function> inWorklist = new HashSet<>(live);

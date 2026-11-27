@@ -40,6 +40,14 @@ public class DestructorInserter {
 
     private final Map<Function, DominatorTree> domTrees = new ConcurrentHashMap<>();
 
+    private ContainerArrayBorrows containerBorrows;
+
+    private AtomicSlotArrays atomicSlots;
+
+    private final Set<Instruction> deathStores = ConcurrentHashMap.newKeySet();
+
+    private RefCountPlanner refCounts;
+
     @Setter
     private Scheduler scheduler;
 
@@ -63,7 +71,12 @@ public class DestructorInserter {
     @Setter
     private Set<String> coAllocatedFields = Collections.emptySet();
 
+    @Setter
+    private io.github.kubyk01.domain.analyzer.reflection.ReflectInfo reflectInfo;
+
     public void insert() {
+        refCounts = new RefCountPlanner(module, resolver, aliasResult, lifetimeResult, escapeResult, scheduler);
+        refCounts.compute();
         this.allocatedTypes = collectAllocatedTypes();
         log.debug("DestructorInserter: {} distinct allocated type(s)",
             allocatedTypes.size());
@@ -113,12 +126,7 @@ public class DestructorInserter {
         // __destruct_* symbol for every type that has a NEW/NEW_ARRAY in
         // the module.
         // ------------------------------------------------------------------
-        int instrumented = instrumentFieldOverwrites(lifetimeResult.getLiveOut());
-        if (instrumented > 0) {
-            log.info("DestructorInserter: instrumented {} field-overwrite release(s)",
-                instrumented);
-        }
-
+        System.out.println("DestructorInserter: " + generated + " destructor(s) generated");
         // ------------------------------------------------------------------
         // Insert a destructor call at every destruction point. The call
         // is a direct STATIC_CALL to the site type's destructor — the
@@ -142,33 +150,20 @@ public class DestructorInserter {
 
             AllocationSite site = entry.getKey();
 
-            // STACK objects live in the stack frame; their fields are
-            // released through the frame teardown, so a per-use
-            // destructor is not needed for them.
+            if (lifetimeResult.getShallowSites().contains(site)) {
+                for (DestructionPoint dp : entry.getValue()) {
+                    byFunction.computeIfAbsent(dp.getBlock().getFunction(), k -> new ArrayList<>())
+                        .add(new PendingDestructor(site, dp, null));
+                }
+                continue;
+            }
+
             if (escapeResult.getSiteStatus(site) == EscapeStatus.STACK) continue;
 
             Type type = site.getType();
             if (type.isUnknown() || type.isNull()) continue;
-
-            // ------------------------------------------------------------------
-            // System-class reference sites are deliberately skipped here.
-            //
-            // findDestructor(SystemClass) would return null (isManagedType
-            // filters them), and the fallback warning below would flood
-            // the log with one warning per allocation site for every
-            // String, Integer, etc. allocated by the JDK's own bootstrap.
-            // The absence of a destructor is not a defect — it is the
-            // policy — so the site is silently left for the process-wide
-            // lifetime. Arrays are handled by findDestructor via
-            // createArrayDestructor and are not covered by this check.
-            // ------------------------------------------------------------------
-            if (type.isReference()) {
-                String cls = type.getClassName();
-                if (cls != null && !cls.isEmpty() && cls.charAt(0) != '['
-                    && LlvmUtil.isSystemClassName(cls)) {
-                    continue;
-                }
-            }
+            if (siteToValue.get(site) instanceof Temporary value && value.getDefiningInstruction() != null
+                    && value.getDefiningInstruction().isRcManagedArray()) continue;
 
             Function dtor = findDestructor(type);
             if (dtor == null) {
@@ -182,14 +177,33 @@ public class DestructorInserter {
             }
         }
         LlvmUtil.parallelMapOrdered(new ArrayList<>(byFunction.values()), scheduler, pending -> {
-            for (PendingDestructor p : pending) {
+            for (int jnIdx3 = 0; jnIdx3 < pending.size(); jnIdx3++) {
+                PendingDestructor p = ((List<? extends PendingDestructor>) pending).get(jnIdx3);
                 DestructionPoint dp = p.point();
                 if (!isLiveReference(dp.getObjectRef())) continue;
                 if (!objectRefAvailableAt(dp.getObjectRef(), dp.getBlock())) continue;
-                insertDestructorCall(p.site(), dp, p.dtor());
+                if (p.dtor() == null) {
+                    insertShallowFree(dp, lifetimeResult.getFrameSites().contains(p.site())
+                        ? "__jnative_free_container_storage" : "__jnative_free_container");
+                } else {
+                    insertDestructorCall(p.site(), dp, p.dtor());
+                }
             }
             return null;
         });
+        containerBorrows = new ContainerArrayBorrows(module, resolver, aliasResult, escapeResult, scheduler);
+        containerBorrows.compute();
+        createStorageReleases();
+        instrumentContainerArrays();
+        atomicSlots = new AtomicSlotArrays(module, resolver, aliasResult, escapeResult, reflectInfo, scheduler);
+        atomicSlots.compute();
+        instrumentAtomicSlots();
+        int instrumented = instrumentFieldOverwrites(lifetimeResult.getLiveOut());
+        if (instrumented > 0) {
+            log.info("DestructorInserter: instrumented {} field-overwrite release(s)",
+                instrumented);
+        }
+
         log.info("Destructor insertion: {} destructor(s) generated",
             generated);
     }
@@ -209,12 +223,6 @@ public class DestructorInserter {
     // =====================================================================
     //  Field-overwrite instrumentation
     // =====================================================================
-
-    /**
-     * Counter that makes the labels of the blocks created by a block split
-     * unique within the module.
-     */
-    private int splitId = 0;
 
     private static String baseLabel(String label) {
         int i = label.indexOf("_rel_");
@@ -270,16 +278,27 @@ public class DestructorInserter {
             }
         }
 
-        Deque<BasicBlock> pending = new ArrayDeque<>();
+        buildInboundEdges();
+        List<Function> functions = new ArrayList<>();
         for (Function func : new ArrayList<>(module.getFunctions())) {
-            if (func.getEntryBlock() == null) continue;
-            pending.addAll(new ArrayList<>(func.getBlocks()));
+            if (func.getEntryBlock() == null || func.getName().startsWith(ContainerArrayBorrows.STORAGE_PREFIX)) continue;
+            functions.add(func);
         }
 
         int processed = 0;
+        for (Integer count : LlvmUtil.parallelMapOrdered(functions, scheduler,
+                func -> instrumentFieldOverwrites(func, liveOut))) {
+            processed += count;
+        }
+        return processed;
+    }
+
+    private int instrumentFieldOverwrites(Function func, Map<BasicBlock, Set<AllocationSite>> liveOut) {
+        int[] splitId = new int[1];
+        Deque<BasicBlock> pending = new ArrayDeque<>(func.getBlocks());
+        int processed = 0;
         while (!pending.isEmpty()) {
-            BasicBlock block = pending.poll();
-            BasicBlock tail = instrumentOneBlock(block, liveOut);
+            BasicBlock tail = instrumentOneBlock(pending.poll(), liveOut, splitId);
             if (tail != null) {
                 pending.add(tail);
             }
@@ -297,12 +316,17 @@ public class DestructorInserter {
      */
     private BasicBlock instrumentOneBlock(
         BasicBlock block,
-        Map<BasicBlock, Set<AllocationSite>> liveOut) {
+        Map<BasicBlock, Set<AllocationSite>> liveOut,
+        int[] splitId) {
         List<Instruction> insts = block.getInstructions();
         int i = 0;
         while (i < insts.size()) {
             Instruction inst = insts.get(i);
             if (inst.getOpcode() != Opcode.PUT_FIELD
+                || inst.isRcStore()
+                || inst.isRcWeak()
+                || deathStores.contains(inst)
+                || (containerBorrows != null && containerBorrows.instrumentedKey(inst) != null)
                 || !shouldInstrumentPutField(inst)
                 || !oldValueIsDead(inst, block, liveOut)) {
                 i++;
@@ -334,10 +358,195 @@ public class DestructorInserter {
                 // system-class site was filtered — the chain then consists
                 // of exactly one vtable check, and values of any other type
                 // fall through to the tail without a release.
-                return emitPolymorphicRelease(inst, block, i, dc.types());
+                return emitPolymorphicRelease(inst, block, i, dc.types(), splitId);
             }
         }
         return null;
+    }
+
+    private void createStorageReleases() {
+        Map<String, List<String>> owned = containerBorrows.ownedArrayFields();
+        Set<String> instantiated = new HashSet<>();
+        for (int id = 0, n = AllocationSite.count(); id < n; id++) {
+            Type t = AllocationSite.byId(id).getType();
+            if (t != null && t.isReference() && !t.isArray() && !t.isUnknown() && t.getClassName() != null) {
+                instantiated.add(t.getClassName());
+            }
+        }
+        Set<String> classes = new TreeSet<>();
+        for (String owner : owned.keySet()) {
+            if (instantiated.contains(owner)) classes.add(owner);
+            for (String sub : resolver.getSubclasses(owner)) if (instantiated.contains(sub)) classes.add(sub);
+        }
+        int made = 0;
+        for (String cls : classes) {
+            ClassNode node = resolver.getClassNode(cls);
+            if (node == null || node.isExternal() || node.isInterface() || (node.getAccess() & Opcodes.ACC_ABSTRACT) != 0) continue;
+            List<FieldNode> fields = new ArrayList<>();
+            Set<String> seen = new HashSet<>();
+            for (String c = cls; c != null && seen.add(c); ) {
+                for (String key : owned.getOrDefault(c, List.of())) {
+                    if (coAllocatedFields.contains(key)) continue;
+                    int dot = key.lastIndexOf('.');
+                    FieldNode f = resolver.getField(key.substring(0, dot), key.substring(dot + 1));
+                    if (f != null && f.getType() != null && f.getType().isArray()) fields.add(f);
+                }
+                ClassNode n = resolver.getClassNode(c);
+                c = n == null || n.getSuperName() == null || n.getSuperName().equals(c) ? null : n.getSuperName();
+            }
+            if (fields.isEmpty()) continue;
+            Set<String> ownedKeys = new LinkedHashSet<>();
+            for (FieldNode f : fields) ownedKeys.add(f.getOwner() + "." + f.getName());
+            refCounts.plan().getOwnedArrayFields().put(cls, ownedKeys);
+            String name = ContainerArrayBorrows.STORAGE_PREFIX + cls.replace('/', '_').replace('.', '_');
+            if (module.getFunction(name) != null) continue;
+            Function func = new Function(name, Type.VOID);
+            func.setOwnerClass(cls);
+            Parameter self = new Parameter(Type.reference(cls), 0);
+            func.addParameter(self);
+            BasicBlock body = new BasicBlock(name + "_entry");
+            func.addBlock(body);
+            func.setEntryBlock(body);
+            for (FieldNode f : fields) {
+                String key = f.getOwner() + "." + f.getName();
+                Instruction get = new Instruction(Opcode.GET_FIELD);
+                get.addOperand(self);
+                get.addOperand(new Constant(Type.reference(key), key));
+                Temporary value = new Temporary(f.getType());
+                get.setResult(value);
+                value.setDefiningInstruction(get);
+                get.setParent(body);
+                body.addInstruction(get);
+                Instruction clear = new Instruction(Opcode.PUT_FIELD);
+                clear.addOperand(self);
+                clear.addOperand(new Constant(Type.reference(key), key));
+                clear.addOperand(new Constant(Type.NULL, null));
+                body.addInstruction(clear);
+                body.addInstruction(runtimeCall(body, "__jnative_release_array_field", self, value));
+            }
+            body.setTerminator(new ReturnTerminator(null));
+            module.addFunction(func);
+            made++;
+        }
+        System.out.println("DestructorInserter: " + made + " owned-array release function(s) generated");
+    }
+
+    private List<Function> instrumentableFunctions() {
+        List<Function> out = new ArrayList<>();
+        for (Function f : module.getFunctions()) {
+            if (f.getEntryBlock() != null && !ContainerArrayBorrows.isDestructor(f)) out.add(f);
+        }
+        return out;
+    }
+
+    private void instrumentContainerArrays() {
+        LlvmUtil.parallelMapOrdered(instrumentableFunctions(), scheduler, f -> {
+            boolean exits = containerBorrows.needsExit(f);
+            for (BasicBlock block : f.getBlocks()) {
+                List<Instruction> insts = block.getInstructions();
+                for (int i = 0; i < insts.size(); i++) {
+                    Instruction inst = insts.get(i);
+                    Value owner = containerBorrows.enterOwner(inst);
+                    if (owner != null) {
+                        insts.add(i + 1, runtimeCall(block, "__jnative_borrow_enter", owner));
+                        i++;
+                        continue;
+                    }
+                    if (inst.getOpcode() != Opcode.PUT_FIELD || inst.getOperands().size() < 3 || deathStores.contains(inst)) continue;
+                    String key = containerBorrows.instrumentedKey(inst);
+                    if (key == null) continue;
+                    Value base = inst.getOperands().get(0);
+                    Value rhs = inst.getOperands().get(2);
+                    Instruction getField = new Instruction(Opcode.GET_FIELD);
+                    getField.addOperand(base);
+                    getField.addOperand(inst.getOperands().get(1));
+                    Temporary oldValue = new Temporary(resolveFieldType(inst, rhs));
+                    getField.setResult(oldValue);
+                    oldValue.setDefiningInstruction(getField);
+                    getField.setParent(block);
+                    if (inst.isRcStore()) {
+                        // The legacy replacement hook also inspects the previous value.
+                        // Keep that borrow across the strong decrement emitted by PUT_FIELD.
+                        getField.setRcHold(f.getRcHolds());
+                        f.setRcHolds(f.getRcHolds() + 1);
+                    }
+                    insts.add(i, getField);
+                    i++;
+                    Constant mode = new Constant(Type.INT, containerBorrows.immediate(key) ? 1 : 0);
+                    insts.add(i + 1, runtimeCall(block, "__jnative_replace_array", base, oldValue, rhs, mode));
+                    i++;
+                }
+                Terminator term = block.getTerminator();
+                if (exits && (term instanceof ReturnTerminator || term instanceof ThrowTerminator)) {
+                    insts.add(runtimeCall(block, "__jnative_borrow_exit"));
+                }
+            }
+            return null;
+        });
+    }
+
+    private void instrumentAtomicSlots() {
+        LlvmUtil.parallelMapOrdered(instrumentableFunctions(), scheduler, f -> {
+            boolean exits = atomicSlots.unpinsAtExit(f);
+            for (BasicBlock block : f.getBlocks()) {
+                List<Instruction> insts = block.getInstructions();
+                for (int i = 0; i < insts.size(); i++) {
+                    Instruction inst = insts.get(i);
+                    if (atomicSlots.pinsBefore(inst)) {
+                        insts.add(i, runtimeCall(block, "__jnative_ebr_pin"));
+                        i++;
+                    }
+                    List<Instruction> after = new ArrayList<>();
+                    AtomicSlotArrays.Op op = atomicSlots.retireOp(inst);
+                    if (op != null) {
+                        Value result = inst.getResult();
+                        switch (op.kind()) {
+                            case CAS_BOOL -> {
+                                Instruction ok = intOf(block, result);
+                                after.add(ok);
+                                after.add(runtimeCall(block, "__jnative_ebr_retire_if", ok.getResult(), op.expected()));
+                            }
+                            case CAS_WITNESS -> after.add(runtimeCall(block, "__jnative_ebr_retire_if_same", result, op.expected()));
+                            case GET_AND_SET -> after.add(runtimeCall(block, "__jnative_ebr_retire", result));
+                            default -> { }
+                        }
+                    }
+                    Value unpublished = atomicSlots.discardValue(inst);
+                    if (unpublished != null) {
+                        Instruction ok = intOf(block, inst.getResult());
+                        after.add(ok);
+                        after.add(runtimeCall(block, "__jnative_ebr_discard_if", ok.getResult(), unpublished));
+                    }
+                    if (!after.isEmpty()) {
+                        insts.addAll(i + 1, after);
+                        i += after.size();
+                    }
+                }
+                Terminator term = block.getTerminator();
+                if (exits && (term instanceof ReturnTerminator || term instanceof ThrowTerminator)) {
+                    insts.add(runtimeCall(block, "__jnative_ebr_unpin"));
+                }
+            }
+            return null;
+        });
+    }
+
+    private static Instruction intOf(BasicBlock block, Value v) {
+        Instruction cast = new Instruction(Opcode.CAST);
+        cast.addOperand(v);
+        Temporary out = new Temporary(Type.INT);
+        cast.setResult(out);
+        out.setDefiningInstruction(cast);
+        cast.setParent(block);
+        return cast;
+    }
+
+    private static Instruction runtimeCall(BasicBlock block, String name, Value... args) {
+        Instruction call = new Instruction(Opcode.STATIC_CALL);
+        call.addOperand(new Constant(Type.reference(name), name));
+        for (Value a : args) call.addOperand(a);
+        call.setParent(block);
+        return call;
     }
 
     /**
@@ -404,19 +613,6 @@ public class DestructorInserter {
                 || siteType.isBlock()
                 || siteType.isPrimitive()) {
                 continue;
-            }
-
-            // Record — but do not include — system-class reference sites.
-            // Their presence forces the polymorphic dispatch path; the
-            // runtime vtable check then prevents the user destructor from
-            // firing on a system-class instance.
-            if (siteType.isReference()) {
-                String cls = siteType.getClassName();
-                if (cls != null && !cls.isEmpty() && cls.charAt(0) != '['
-                    && LlvmUtil.isSystemClassName(cls)) {
-                    hasFilteredSystemTypes = true;
-                    continue;
-                }
             }
 
             Function dtor = findDestructor(siteType);
@@ -640,7 +836,8 @@ public class DestructorInserter {
         Instruction putField,
         BasicBlock block,
         int instIdx,
-        List<Type> destructorTypes) {
+        List<Type> destructorTypes,
+        int[] splitId) {
 
         Function func = block.getFunction();
         List<Instruction> insts = block.getInstructions();
@@ -648,11 +845,12 @@ public class DestructorInserter {
 
         // ---- 1. Split: move [instIdx, end) to a new tail block ----
         BasicBlock tail = new BasicBlock(
-            baseLabel(block.getLabel()) + "_rel_tail_" + (++splitId));
+            baseLabel(block.getLabel()) + "_rel_tail_" + (++splitId[0]));
         func.addBlock(tail);
 
         List<Instruction> moved = new ArrayList<>(insts.subList(instIdx, insts.size()));
-        for (Instruction m : moved) {
+        for (int jnIdx8 = 0; jnIdx8 < moved.size(); jnIdx8++) {
+            Instruction m = ((List<? extends Instruction>) moved).get(jnIdx8);
             tail.addInstruction(m);
         }
         while (insts.size() > instIdx) {
@@ -682,7 +880,8 @@ public class DestructorInserter {
         }
 
         // ---- 3. Copy exceptional successors and try-range membership ----
-        for (BasicBlock exc : new ArrayList<>(block.getExceptionalSuccessors())) {
+        List<? extends BasicBlock> jnLoop10 = new ArrayList<>(block.getExceptionalSuccessors());
+        for (BasicBlock exc : jnLoop10) {
             tail.addExceptionalSuccessor(exc);
 
             // ------------------------------------------------------------------
@@ -714,7 +913,8 @@ public class DestructorInserter {
         }
         List<TryCatchRange> ranges = func.getTryCatchRanges();
         if (ranges != null) {
-            for (TryCatchRange range : ranges) {
+            for (int jnIdx11 = 0; jnIdx11 < ranges.size(); jnIdx11++) {
+                TryCatchRange range = ((List<? extends TryCatchRange>) ranges).get(jnIdx11);
                 if (range.body != null
                     && range.body.contains(block)
                     && !range.body.contains(tail)) {
@@ -730,7 +930,8 @@ public class DestructorInserter {
         // entry per distinct destructor, ordered by first occurrence in
         // the field's points-to set.
         List<Type> chainTypes = new ArrayList<>();
-        for (Type t : destructorTypes) {
+        for (int jnIdx12 = 0; jnIdx12 < destructorTypes.size(); jnIdx12++) {
+            Type t = ((List<? extends Type>) destructorTypes).get(jnIdx12);
             if (findDestructor(t) != null && dispatchKeyName(t) != null) {
                 chainTypes.add(t);
             }
@@ -786,7 +987,7 @@ public class DestructorInserter {
 
         // ---- 6. Dispatch block ----
         BasicBlock dispatch = new BasicBlock(
-            baseLabel(block.getLabel()) + "_rel_dispatch_" + (++splitId));
+            baseLabel(block.getLabel()) + "_rel_dispatch_" + (++splitId[0]));
         func.addBlock(dispatch);
         block.setTerminator(new CondBranchTerminator(skipResult, tail, dispatch));
 
@@ -826,7 +1027,7 @@ public class DestructorInserter {
             current.addInstruction(isT);
 
             BasicBlock freeBlock = new BasicBlock(
-                baseLabel(current.getLabel()) + "_rel_free_" + (++splitId));
+                baseLabel(current.getLabel()) + "_rel_free_" + (++splitId[0]));
             func.addBlock(freeBlock);
 
             BasicBlock next;
@@ -834,7 +1035,7 @@ public class DestructorInserter {
                 next = tail;
             } else {
                 next = new BasicBlock(
-                    baseLabel(current.getLabel()) + "_rel_next_" + (++splitId));
+                    baseLabel(current.getLabel()) + "_rel_next_" + (++splitId[0]));
                 func.addBlock(next);
             }
 
@@ -1041,7 +1242,8 @@ public class DestructorInserter {
         }
         Terminator term = block.getTerminator();
         if (term != null) {
-            for (Value op : terminatorOperands(term)) {
+            List<? extends Value> jnLoop15 = terminatorOperands(term);
+            for (Value op : jnLoop15) {
                 if (op == null) continue;
                 if (operandReachesAnySite(op, fieldSites)) {
                     return false;
@@ -1068,7 +1270,9 @@ public class DestructorInserter {
         int[] start = new int[n + 1];
         for (int src = 0; src < n; src++) {
             for (FieldCell cell : graph.fieldCells(src)) {
-                for (int dst : cell.get().rawIds()) {
+                PointsToSet pts = cell.get();
+                for (long c = pts.cursor(); pts.has(c); c = pts.next(c)) {
+                    int dst = pts.id(c);
                     if (destructible[dst]) start[dst + 1]++;
                 }
             }
@@ -1079,7 +1283,9 @@ public class DestructorInserter {
         int[] fields = new int[start[n]];
         for (int src = 0; src < n; src++) {
             for (FieldCell cell : graph.fieldCells(src)) {
-                for (int dst : cell.get().rawIds()) {
+                PointsToSet pts = cell.get();
+                for (long c = pts.cursor(); pts.has(c); c = pts.next(c)) {
+                    int dst = pts.id(c);
                     if (!destructible[dst]) continue;
                     int at = next[dst]++;
                     sources[at] = src;
@@ -1099,14 +1305,16 @@ public class DestructorInserter {
         PointsToGraph graph = aliasResult.getGraph();
         Set<Integer> destroyed = new HashSet<>();
         Deque<Integer> work = new ArrayDeque<>();
-        for (int id : roots.rawIds()) {
+        for (long c = roots.cursor(); roots.has(c); c = roots.next(c)) {
+            int id = roots.id(c);
             if (destroyed.add(id)) work.add(id);
         }
         while (!work.isEmpty()) {
             for (FieldCell cell : graph.fieldCells(work.poll())) {
                 PointsToSet pts = cell.get();
                 if (pts.containsUnknown()) return false;
-                for (int child : pts.rawIds()) {
+                for (long c = pts.cursor(); pts.has(c); c = pts.next(c)) {
+                    int child = pts.id(c);
                     if (isManagedType(AllocationSite.byId(child).getType()) && destroyed.add(child)) {
                         work.add(child);
                     }
@@ -1118,7 +1326,8 @@ public class DestructorInserter {
         int ownerFieldId = graph.findFieldId(fieldKey);
         for (int id : destroyed) {
             AllocationSite site = AllocationSite.byId(id);
-            if (staticFieldSites.contains(site) || liveOutSet.contains(site)) return false;
+            if (staticFieldSites.contains(site) || liveOutSet.contains(site)
+                    || refCounts.isCapturedSite(site)) return false;
             if (id + 1 >= inboundStart.length) return false;
             for (int e = inboundStart[id]; e < inboundStart[id + 1]; e++) {
                 int src = inboundSrc[e];
@@ -1214,9 +1423,10 @@ public class DestructorInserter {
 
     private Set<Type> collectAllocatedTypes() {
         Set<Type> types = new LinkedHashSet<>();
-        for (Function func : module.getFunctions()) {
+        List<? extends Function> jnLoop25 = module.getFunctions();
+        for (Function func : jnLoop25) {
             if (func.getEntryBlock() == null) continue;
-            for (BasicBlock block : func.getBlocks()) {
+            for (int blockIdx3 = 0; blockIdx3 < func.getBlocks().size(); blockIdx3++) { BasicBlock block = func.getBlocks().get(blockIdx3);
                 for (Instruction inst : block.getInstructions()) {
                     Opcode op = inst.getOpcode();
                     if (op != Opcode.NEW
@@ -1225,20 +1435,6 @@ public class DestructorInserter {
                     if (inst.getResult() == null) continue;
                     Type t = inst.getResult().getType();
                     if (t == null || t.isUnknown() || t.isNull() || t.isBlock()) continue;
-
-                    // System-class reference allocations do not get their
-                    // own destructor: their lifetime is owned by the JDK's
-                    // own caches (String interning, Integer.valueOf,
-                    // static singletons, etc.) which this runtime cannot
-                    // reason about. Including them here would only cause
-                    // findDestructor to reject them one by one.
-                    if (t.isReference()) {
-                        String cls = t.getClassName();
-                        if (cls != null && !cls.isEmpty() && cls.charAt(0) != '['
-                            && LlvmUtil.isSystemClassName(cls)) {
-                            continue;
-                        }
-                    }
 
                     types.add(t);
                 }
@@ -1301,10 +1497,6 @@ public class DestructorInserter {
         if (type.isReference()) {
             String className = type.getClassName();
             if (className == null || className.isEmpty()) return false;
-
-            // System-class reference — not managed by this pass.
-            if (LlvmUtil.isSystemClassName(className)) return false;
-
             ClassNode cn = resolver.getClassNode(className);
             return !(cn != null && cn.isExternal());
         }
@@ -1348,7 +1540,7 @@ public class DestructorInserter {
      * every call site, so the fast path becomes a single load, a compare and
      * a branch — three instructions, no frame, no call.</p>
      *
-     * <p>Slow path (only during {@code __jnative_shutdown}):</p>
+     * <p>Slow path (when {@code __jnative_begin_shutdown} has been called):</p>
      * <pre>
      * slow:
      *   %r = call i32 @__jnative_dtor_enter(i8* %this)
@@ -1646,6 +1838,15 @@ private void emitDestructionGuard(BasicBlock entry,
         Parameter thisParam = new Parameter(Type.reference(className), 0);
         func.addParameter(thisParam);
 
+        if (refCounts != null && refCounts.plan().isCounted(className)) {
+            BasicBlock only = new BasicBlock(funcName + "_entry");
+            func.addBlock(only);
+            func.setEntryBlock(only);
+            only.addInstruction(runtimeCall(only, "__jnative_rc_dec", thisParam));
+            only.setTerminator(new ReturnTerminator(null));
+            return func;
+        }
+
         BasicBlock entry       = new BasicBlock(funcName + "_entry");
         BasicBlock returnBlock = new BasicBlock(funcName + "_return");
         BasicBlock bodyFast    = new BasicBlock(funcName + "_body_fast");
@@ -1660,9 +1861,17 @@ private void emitDestructionGuard(BasicBlock entry,
         emitDestructionGuard(entry, thisParam, returnBlock, bodyFast, bodySlow);
 
         List<FieldNode> ownedFields = collectAllReferenceFields(classNode);
+        for (FieldNode field : ownedFields) {
+            if (RefCountPlanner.WEAK_OWNER.equals(field.getOwner()) && RefCountPlanner.WEAK_FIELD.equals(field.getName())) {
+                bodyFast.addInstruction(runtimeCall(bodyFast, "__jnative_weak_forget", thisParam));
+                bodySlow.addInstruction(runtimeCall(bodySlow, "__jnative_weak_forget", thisParam));
+                break;
+            }
+        }
 
         // ---- Fast path: destroy children, then __jnative_free_fast ----
-        for (FieldNode field : ownedFields) {
+        for (int jnIdx26 = 0; jnIdx26 < ownedFields.size(); jnIdx26++) {
+            FieldNode field = ((List<? extends FieldNode>) ownedFields).get(jnIdx26);
             if ((field.getAccess() & Opcodes.ACC_STATIC) != 0) continue;
             Type fieldType = field.getType();
             if (!isManagedType(fieldType)) continue;
@@ -1692,7 +1901,8 @@ private void emitDestructionGuard(BasicBlock entry,
         bodyFast.setTerminator(new ReturnTerminator(null));
 
         // ---- Slow path: destroy children, unclaim, __jnative_free ----
-        for (FieldNode field : ownedFields) {
+        for (int jnIdx27 = 0; jnIdx27 < ownedFields.size(); jnIdx27++) {
+            FieldNode field = ((List<? extends FieldNode>) ownedFields).get(jnIdx27);
             if ((field.getAccess() & Opcodes.ACC_STATIC) != 0) continue;
             Type fieldType = field.getType();
             if (!isManagedType(fieldType)) continue;
@@ -1734,7 +1944,8 @@ private void emitDestructionGuard(BasicBlock entry,
                 result.addAll(collectAllReferenceFields(superNode));
             }
         }
-        for (FieldNode field : classNode.getFields()) {
+        List<? extends FieldNode> jnLoop28 = classNode.getFields();
+        for (FieldNode field : jnLoop28) {
             if ((field.getAccess() & Opcodes.ACC_STATIC) != 0) continue;
             if (isOuterInstanceField(field.getName())) continue;
             Type ft = field.getType();
@@ -1793,37 +2004,6 @@ private void emitDestructionGuard(BasicBlock entry,
 
         if (!elementsAreRefs) {
             return createTrivialArrayDestructor(arrayType);
-        }
-
-        // ------------------------------------------------------------------
-        // System-class element handling.
-        //
-        // A FINAL system class cannot be subclassed, so every element of
-        // the array is provably of that exact class. For system-owned
-        // values (String, Integer's small-value cache, …) freeing them
-        // from the array destructor would orphan shared state; the array
-        // therefore only frees its own storage and leaves the elements
-        // untouched.
-        //
-        // A NON-FINAL system class (Object, Number, Throwable, …) may
-        // have user-defined subclasses, and those subclasses' instances
-        // genuinely belong to the array. The normal loop is kept for them;
-        // per-element runtime dispatch (via emitFieldDestruction) then
-        // frees the user subclass values and no-ops on system-class
-        // values (there is no __destruct_* symbol for them).
-        // ------------------------------------------------------------------
-        if (elementType.isReference()) {
-            String elemClass = elementType.getClassName();
-            if (elemClass != null && !elemClass.isEmpty()
-                && elemClass.charAt(0) != '['
-                && LlvmUtil.isSystemClassName(elemClass)) {
-                ClassNode elemNode = resolver.getClassNode(elemClass);
-                boolean elemIsFinal = elemNode != null
-                    && (elemNode.getAccess() & Opcodes.ACC_FINAL) != 0;
-                if (elemIsFinal) {
-                    return createTrivialArrayDestructor(arrayType);
-                }
-            }
         }
 
         Function func = new Function(funcName, Type.VOID);
@@ -2225,9 +2405,12 @@ private void emitDestructionGuard(BasicBlock entry,
         // the site's type — never a runtime dispatch. The site's type is
         // always a concrete class (an abstract class cannot have a NEW)
         // or an array type, so the call is well-typed.
+        boolean countedSite = refCounts.isCountedType(site.getType());
+        // A live closure can still reach this allocation after the local reference dies.
+        if (refCounts.isCapturedSite(site) && (isHeap || !countedSite)) return;
+        String target = countedSite ? "__jnative_rc_drop" : dtor.getName();
         Instruction call = new Instruction(Opcode.STATIC_CALL);
-        call.addOperand(new Constant(
-            Type.reference(dtor.getName()), dtor.getName()));
+        call.addOperand(new Constant(Type.reference(target), target));
         call.addOperand(objRef);
         call.setParent(block);
         insts.add(insertIndex, call);
@@ -2243,8 +2426,25 @@ private void emitDestructionGuard(BasicBlock entry,
             nullOut.addOperand(lastStore.getOperands().get(1));  // field name
             nullOut.addOperand(new Constant(Type.NULL, null));
             nullOut.setParent(block);
+            if (countedSite) nullOut.setRcStore(true);
             insts.add(insertIndex + 1, nullOut);
+            deathStores.add(nullOut);
         }
+    }
+
+    private void insertShallowFree(DestructionPoint dp, String callee) {
+        BasicBlock block = dp.getBlock();
+        Value objRef = dp.getObjectRef();
+        List<Instruction> insts = block.getInstructions();
+        Instruction before = dp.getBeforeInstruction();
+        int index = before == null ? insts.size() : insts.indexOf(before);
+        if (index < 0) return;
+        if (!noLaterUse(objRef, block, index)) return;
+        Instruction free = new Instruction(Opcode.STATIC_CALL);
+        free.addOperand(new Constant(Type.reference(callee), callee));
+        free.addOperand(objRef);
+        free.setParent(block);
+        insts.add(index, free);
     }
 
     private static boolean isLiveReference(Value v) {
