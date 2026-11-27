@@ -35,7 +35,7 @@ import java.util.function.IntConsumer;
 import static io.github.kubyk01.util.LlvmUtil.canonicalCalleeKey;
 import static io.github.kubyk01.util.LlvmUtil.extractCalleeName;
 import static io.github.kubyk01.util.LlvmUtil.extractFieldName;
-import static io.github.kubyk01.util.LlvmUtil.isAllocation;
+import static io.github.kubyk01.util.LlvmUtil.isPointsToAllocation;
 import static io.github.kubyk01.util.LlvmUtil.isLazyClinitWrapper;
 
 @Slf4j
@@ -228,7 +228,7 @@ public class InterproceduralPointsTo {
             int idx = 0;
             for (BasicBlock block : func.getBlocks()) {
                 for (Instruction inst : block.getInstructions()) {
-                    if (isAllocation(inst.getOpcode())) {
+                    if (isPointsToAllocation(inst)) {
                         AllocationSite site = AllocationSite.fromInstruction(
                             inst, func.getName(), idx);
                         graph.putAllocationSite(site, inst.getResult());

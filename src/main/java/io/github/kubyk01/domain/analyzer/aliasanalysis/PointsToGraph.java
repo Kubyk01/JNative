@@ -84,26 +84,23 @@ public class PointsToGraph {
 
     /** Copy-on-write hash table: published tables are immutable and at most half full. */
     private static final class SiteFields {
-        private static final VarHandle TABLE;
+        private static final VarHandle CELLS = MethodHandles.arrayElementVarHandle(FieldCell[].class);
 
-        static {
-            try {
-                TABLE = MethodHandles.lookup().findVarHandle(SiteFields.class, "table", FieldCell[].class);
-            } catch (ReflectiveOperationException e) {
-                throw new ExceptionInInitializerError(e);
-            }
-        }
-
-        private record Sorted(FieldCell[] table, FieldCell[] cells) {}
+        private record Sorted(FieldCell[] table, int size, FieldCell[] cells) {}
 
         private volatile FieldCell[] table = new FieldCell[2];
+        private volatile int size;
         private volatile Sorted sorted;
+
+        private static FieldCell at(FieldCell[] cells, int i) {
+            return (FieldCell) CELLS.getAcquire(cells, i);
+        }
 
         private static int slot(FieldCell[] cells, int id) {
             int mask = cells.length - 1;
             int i = (id ^ (id >>> 16)) & mask;
             while (true) {
-                FieldCell cell = cells[i];
+                FieldCell cell = at(cells, i);
                 if (cell == null || cell.fieldId() == id) return i;
                 i = (i + 1) & mask;
             }
@@ -111,46 +108,52 @@ public class PointsToGraph {
 
         FieldCell find(int id) {
             FieldCell[] cells = table;
-            FieldCell cell = cells[slot(cells, id)];
-            // A concurrent insertion may have filled a previously empty slot.
+            FieldCell cell = at(cells, slot(cells, id));
             return cell != null && cell.fieldId() == id ? cell : null;
         }
 
         FieldCell insert(int id, String field) {
-            FieldCell created = null;
-            while (true) {
+            FieldCell existing = find(id);
+            if (existing != null) return existing;
+            synchronized (this) {
                 FieldCell[] cells = table;
-                FieldCell existing = cells[slot(cells, id)];
+                int i = slot(cells, id);
+                existing = at(cells, i);
                 if (existing != null) return existing;
-                int size = 0;
-                for (FieldCell cell : cells) {
-                    if (cell != null) size++;
+                FieldCell created = new FieldCell(id, field);
+                int count = size;
+                if ((count + 1) * 2 > cells.length) {
+                    FieldCell[] next = new FieldCell[cells.length * 2];
+                    for (FieldCell cell : cells) {
+                        if (cell != null) next[slot(next, cell.fieldId())] = cell;
+                    }
+                    next[slot(next, id)] = created;
+                    table = next;
+                } else {
+                    CELLS.setRelease(cells, i, created);
                 }
-                FieldCell[] next = new FieldCell[(size + 1) * 2 > cells.length ? cells.length * 2 : cells.length];
-                for (FieldCell cell : cells) {
-                    if (cell != null) next[slot(next, cell.fieldId())] = cell;
-                }
-                if (created == null) created = new FieldCell(id, field);
-                next[slot(next, id)] = created;
-                if (TABLE.compareAndSet(this, cells, next)) return created;
+                size = count + 1;
+                return created;
             }
         }
 
         FieldCell[] snapshot() {
+            int count = size;
             FieldCell[] cells = table;
             Sorted cached = sorted;
-            if (cached != null && cached.table() == cells) return cached.cells();
-            int size = 0;
-            for (FieldCell cell : cells) {
-                if (cell != null) size++;
-            }
-            FieldCell[] result = new FieldCell[size];
+            if (cached != null && cached.table() == cells && cached.size() == count) return cached.cells();
             int n = 0;
-            for (FieldCell cell : cells) {
-                if (cell != null) result[n++] = cell;
+            for (int i = 0; i < cells.length; i++) {
+                if (at(cells, i) != null) n++;
+            }
+            FieldCell[] result = new FieldCell[n];
+            int k = 0;
+            for (int i = 0; i < cells.length && k < n; i++) {
+                FieldCell cell = at(cells, i);
+                if (cell != null) result[k++] = cell;
             }
             Arrays.sort(result, Comparator.comparingInt(FieldCell::fieldId));
-            sorted = new Sorted(cells, result);
+            sorted = new Sorted(cells, count, result);
             return result;
         }
     }

@@ -326,18 +326,23 @@ public class LlvmUtil {
         return "java/lang/Object";
     }
 
+    public static boolean isLambdaCreation(Instruction inst) {
+        return inst.getOpcode() == Opcode.INVOKEDYNAMIC
+                && inst.getInvokedynamicData() instanceof InvokeDynamicInfo info
+                && info.resolvedCall() != null
+                && info.resolvedCall().getType() == ResolvedCall.Type.LAMBDA;
+    }
+
     public static List<Value> lambdaCaptures(Instruction inst) {
-        if (inst.getOpcode() != Opcode.INVOKEDYNAMIC
-                || !(inst.getInvokedynamicData() instanceof InvokeDynamicInfo info)
-                || info.resolvedCall() == null
-                || info.resolvedCall().getType() != ResolvedCall.Type.LAMBDA) {
-            return List.of();
-        }
-        return inst.getOperands();
+        return isLambdaCreation(inst) ? inst.getOperands() : List.of();
     }
 
     public static boolean isAllocation(Opcode op) {
         return op == Opcode.NEW || op == Opcode.NEW_ARRAY || op == Opcode.MULTI_NEW_ARRAY;
+    }
+
+    public static boolean isPointsToAllocation(Instruction inst) {
+        return isAllocation(inst.getOpcode()) || isLambdaCreation(inst);
     }
 
     public static String[] extractFieldOwnerAndName(Instruction inst) {

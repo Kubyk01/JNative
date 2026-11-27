@@ -30,6 +30,8 @@ public class Instruction {
     @Setter
     private boolean rcManagedArray;
     @Setter
+    private boolean rcBirthDrop;
+    @Setter
     private int rcHold = -1;
 
     public Instruction(Opcode opcode) {

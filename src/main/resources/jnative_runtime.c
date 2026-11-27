@@ -36,6 +36,9 @@
 #if defined(__linux__)
 #  include <link.h>     /* dl_iterate_phdr, struct dl_phdr_info,
                           ElfW(Phdr), PT_LOAD, PF_W */
+#  include <unistd.h>
+#  include <sys/syscall.h>
+#  include <linux/membarrier.h>
 #endif
 
 #include "jnative_runtime.h"
@@ -1155,7 +1158,8 @@ __attribute__((noinline)) void __jnative_ebr_discard_if(int32_t published, void*
 #define JN_RC_STACK     0x40000000u
 #define JN_RC_REVIVED   0x20000000u
 #define JN_RC_BUFFERED  0x10000000u
-#define JN_RC_COUNT     0x0fffffffu
+#define JN_RC_IMMORTAL  0x08000000u
+#define JN_RC_COUNT     0x07ffffffu
 #define JN_RC_REF_ARRAY 1
 #define JN_RC_REFERENCE 2
 #define JN_RC_CYCLIC    4
@@ -1649,9 +1653,10 @@ void* __jnative_weak_load(void** slot, void** hold) {
 static int jn_rc_word_inc(uint32_t* word) {
     uint32_t w = __atomic_load_n(word, __ATOMIC_RELAXED);
     for (;;) {
-        if (w & JN_RC_STACK) return 0;
-        if ((w & JN_RC_COUNT) == JN_RC_COUNT) abort();
-        uint32_t next = (w + 1) | ((w & JN_RC_RETIRED) ? JN_RC_REVIVED : 0u);
+        if (w & (JN_RC_STACK | JN_RC_IMMORTAL)) return 0;
+        uint32_t next = (w & JN_RC_COUNT) == JN_RC_COUNT
+            ? w | JN_RC_IMMORTAL
+            : (w + 1) | ((w & JN_RC_RETIRED) ? JN_RC_REVIVED : 0u);
         if (__atomic_compare_exchange_n(word, &w, next, 1, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED)) return 0;
     }
 }
@@ -1659,7 +1664,7 @@ static int jn_rc_word_inc(uint32_t* word) {
 static int jn_rc_word_dec(uint32_t* word) {
     uint32_t w = __atomic_load_n(word, __ATOMIC_RELAXED);
     for (;;) {
-        if (!(w & JN_RC_COUNT)) return 0;
+        if (!(w & JN_RC_COUNT) || (w & JN_RC_IMMORTAL)) return 0;
         uint32_t next = w - 1;
         int queue = !(next & JN_RC_COUNT) && !(w & JN_RC_RETIRED);
         if (queue) next |= JN_RC_RETIRED;
@@ -1694,6 +1699,13 @@ static int jn_rc_apply(void* p, int (*op)(uint32_t*)) {
 
 void __jnative_rc_inc(void* p) {
     if (p != NULL) jn_rc_apply(p, jn_rc_word_inc);
+}
+
+void __jnative_rc_pin(void* p) {
+    uint32_t* word = p == NULL ? NULL : jn_rc_word_locked(p);
+    if (word != NULL && !(__atomic_load_n(word, __ATOMIC_RELAXED) & JN_RC_STACK)) {
+        __atomic_fetch_or(word, JN_RC_IMMORTAL, __ATOMIC_SEQ_CST);
+    }
 }
 
 #define JN_HOLD_CHUNK 32768
@@ -1784,6 +1796,9 @@ static int jn_rc_retire_local(void* p) {
 #define JN_CYC_LOCAL_FLUSH 128
 #define JN_CYC_SCAN_AT     ((size_t)65536)
 #define JN_CYC_MAX_NODES   ((size_t)4 << 20)
+static size_t          jn_cyc_scan_at = JN_CYC_SCAN_AT;
+static size_t          jn_cyc_max_nodes = JN_CYC_MAX_NODES;
+static size_t          jn_cyc_prune_at = JN_CYC_SCAN_AT;
 static __thread void** jn_cyc_local;
 static __thread size_t jn_cyc_local_n;
 static void**          jn_cyc_roots;
@@ -1843,27 +1858,111 @@ static int jn_rc_over(size_t factor) {
         || __atomic_load_n(&jn_rc_retired_bytes, __ATOMIC_RELAXED) >= factor * __atomic_load_n(&jn_rc_scan_bytes_at, __ATOMIC_RELAXED);
 }
 
+static int jn_rc_cycles_due(void) {
+    return __atomic_load_n(&jn_cyc_roots_n, __ATOMIC_RELAXED) >= __atomic_load_n(&jn_cyc_scan_at, __ATOMIC_RELAXED);
+}
+
+static int        jn_rc_wake;
+static int        jn_rc_daemon_state;
+static jn_cond_t  jn_rc_daemon_cond = JN_COND_INITIALIZER;
+static jn_once_t  jn_rc_daemon_once = JN_ONCE_INIT;
+static jn_thread_t jn_rc_daemon_thread;
+
+static void* jn_rc_daemon(void* arg) {
+    (void)arg;
+    jn_mutex_lock(&jn_rc_wait_lock);
+    for (;;) {
+        while (!__atomic_load_n(&jn_rc_wake, __ATOMIC_ACQUIRE)) jn_cond_wait(&jn_rc_daemon_cond, &jn_rc_wait_lock);
+        __atomic_store_n(&jn_rc_wake, 0, __ATOMIC_RELEASE);
+        jn_mutex_unlock(&jn_rc_wait_lock);
+        if (!gv_jnative_in_shutdown) jn_rc_scan();
+        jn_mutex_lock(&jn_rc_wait_lock);
+        if (!gv_jnative_in_shutdown && (jn_rc_over(1) || jn_rc_cycles_due())) {
+            __atomic_store_n(&jn_rc_wake, 1, __ATOMIC_RELEASE);
+        }
+        jn_cond_broadcast(&jn_rc_wait_cond);
+    }
+    return NULL;
+}
+
+static void jn_rc_daemon_start(void) {
+    int ok = jn_thread_create(&jn_rc_daemon_thread, NULL, jn_rc_daemon, NULL) == 0;
+    __atomic_store_n(&jn_rc_daemon_state, ok ? 1 : -1, __ATOMIC_RELEASE);
+}
+
+static int jn_rc_request_scan(void) {
+    if (jn_rc_in_scan) return 1;
+    jn_once(&jn_rc_daemon_once, jn_rc_daemon_start);
+    if (__atomic_load_n(&jn_rc_daemon_state, __ATOMIC_ACQUIRE) <= 0) return 0;
+    if (__atomic_load_n(&jn_rc_wake, __ATOMIC_RELAXED)) return 1;
+    jn_mutex_lock(&jn_rc_wait_lock);
+    if (!__atomic_load_n(&jn_rc_wake, __ATOMIC_RELAXED)) {
+        __atomic_store_n(&jn_rc_wake, 1, __ATOMIC_RELEASE);
+        jn_cond_signal(&jn_rc_daemon_cond);
+    }
+    jn_mutex_unlock(&jn_rc_wait_lock);
+    return 1;
+}
+
+static void jn_rc_kick(void) {
+    if (!jn_rc_request_scan()) jn_rc_scan();
+}
+
 static void jn_rc_maybe_scan(void) {
     if (jn_rc_in_scan) return;
     if (jn_rc_local_n >= JN_RC_LOCAL_FLUSH && !jn_rc_flush_local()) {
         __jnative_throw_out_of_memory_error_ctx("ARC retirement");
     }
     if (jn_cyc_local_n >= JN_CYC_LOCAL_FLUSH) jn_cyc_flush_local();
-    if (!jn_rc_over(1) && __atomic_load_n(&jn_cyc_roots_n, __ATOMIC_RELAXED) < JN_CYC_SCAN_AT) return;
-    jn_rc_scan();
+    if (!jn_rc_over(1) && !jn_rc_cycles_due()) return;
+    jn_rc_kick();
     if (!jn_rc_over(JN_RC_BACKLOG_FACTOR)) return;
     jn_mutex_lock(&jn_rc_wait_lock);
-    while (__atomic_load_n(&jn_rc_scan_busy, __ATOMIC_ACQUIRE) && jn_rc_over(JN_RC_BACKLOG_FACTOR)) {
+    while (jn_rc_over(JN_RC_BACKLOG_FACTOR)
+           && (__atomic_load_n(&jn_rc_scan_busy, __ATOMIC_ACQUIRE) || __atomic_load_n(&jn_rc_wake, __ATOMIC_ACQUIRE))) {
         jn_cond_wait(&jn_rc_wait_cond, &jn_rc_wait_lock);
     }
     jn_mutex_unlock(&jn_rc_wait_lock);
+}
+
+static int       jn_rc_asym;
+static jn_once_t jn_rc_asym_once = JN_ONCE_INIT;
+
+static void jn_rc_asym_init(void) {
+#if defined(__linux__) && defined(__NR_membarrier)
+    long cmds = syscall(__NR_membarrier, MEMBARRIER_CMD_QUERY, 0, 0);
+    if (cmds > 0
+            && (cmds & MEMBARRIER_CMD_PRIVATE_EXPEDITED)
+            && (cmds & MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED)
+            && syscall(__NR_membarrier, MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED, 0, 0) == 0) {
+        __atomic_store_n(&jn_rc_asym, 1, __ATOMIC_RELEASE);
+    }
+#elif defined(_WIN32)
+    __atomic_store_n(&jn_rc_asym, 1, __ATOMIC_RELEASE);
+#endif
+}
+
+static void jn_rc_process_fence(void) {
+    if (__atomic_load_n(&jn_rc_asym, __ATOMIC_ACQUIRE)) {
+#if defined(__linux__) && defined(__NR_membarrier)
+        if (syscall(__NR_membarrier, MEMBARRIER_CMD_PRIVATE_EXPEDITED, 0, 0) != 0) abort();
+#elif defined(_WIN32)
+        FlushProcessWriteBuffers();
+#endif
+    }
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
 }
 
 static void jn_hold_write(JnHoldThread* t, void** hold, void* value) {
     uint32_t s = t->seq;
     __atomic_store_n(&t->seq, s + 1, __ATOMIC_RELAXED);
     __atomic_thread_fence(__ATOMIC_RELEASE);
-    __atomic_store_n(hold, value, __ATOMIC_SEQ_CST);
+    if (__atomic_load_n(&jn_rc_asym, __ATOMIC_RELAXED)) {
+        __atomic_store_n(hold, value, __ATOMIC_RELEASE);
+        __atomic_signal_fence(__ATOMIC_SEQ_CST);
+    } else {
+        __atomic_store_n(hold, value, __ATOMIC_SEQ_CST);
+    }
     __atomic_store_n(&t->seq, s + 2, __ATOMIC_RELEASE);
 }
 
@@ -1899,6 +1998,7 @@ static JnHoldChunk* jn_hold_new_chunk(size_t cap) {
 static JnHoldThread* jn_hold_thread(void) {
     JnHoldThread* t = jn_hold_self;
     if (t != NULL) return t;
+    jn_once(&jn_rc_asym_once, jn_rc_asym_init);
     t = (JnHoldThread*)calloc(1, sizeof(JnHoldThread));
     if (t == NULL) __jnative_throw_out_of_memory_error_ctx("__jnative_rc_frame_enter");
     t->first = jn_hold_new_chunk(JN_HOLD_CHUNK);
@@ -2004,8 +2104,8 @@ static void jn_rc_release_local(void) {
 void __jnative_rc_thread_exit(void) {
     JnHoldThread* t = jn_hold_self;
     if (t == NULL) {
-        jn_rc_scan();
         jn_rc_release_local();
+        jn_rc_kick();
         jn_reg_thread_exit();
         return;
     }
@@ -2029,8 +2129,8 @@ void __jnative_rc_thread_exit(void) {
     jn_hold_frames = NULL;
     jn_hold_frame_n = 0;
     jn_hold_frame_cap = 0;
-    jn_rc_scan();
     jn_rc_release_local();
+    jn_rc_kick();
     jn_reg_thread_exit();
 }
 
@@ -2164,6 +2264,7 @@ static void jn_rc_mark_thread(JnRcCandidate* table, size_t mask, JnHoldThread* t
 
 static JnRcCandidate* jn_rc_cand;
 static size_t         jn_rc_cand_cap;
+static size_t         jn_rc_kept_buffered;
 
 static int jn_rc_reclaim_pending(void) {
     if (!jn_rc_flush_local()) __jnative_throw_out_of_memory_error_ctx("ARC retirement");
@@ -2202,7 +2303,7 @@ static int jn_rc_reclaim_pending(void) {
     jn_mutex_unlock(&jn_weak_mutex);
 
     if (candidates != NULL) {
-        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        jn_rc_process_fence();
         jn_mutex_lock(&jn_hold_list_lock);
         for (JnHoldThread* t = jn_hold_threads; t != NULL; t = t->next) {
             if (t == jn_hold_self) {
@@ -2235,6 +2336,7 @@ static int jn_rc_reclaim_pending(void) {
 
     jn_mutex_lock(&jn_weak_mutex);
     size_t keep = 0;
+    size_t kept_buffered = 0;
     for (size_t i = 0; i < n; i++) {
         void* p = jn_rc_retired[i];
         if (p == NULL) continue;
@@ -2247,6 +2349,7 @@ static int jn_rc_reclaim_pending(void) {
             if (candidate != NULL) candidate->held = 1;
         } else if (candidate == NULL || candidate->held || (w & (JN_RC_REVIVED | JN_RC_BUFFERED))) {
             if (candidate != NULL) candidate->held = 1;
+            if (w & JN_RC_BUFFERED) kept_buffered++;
             jn_rc_retired[keep++] = p;
         } else {
             jn_weak_clear_locked(p);
@@ -2261,6 +2364,7 @@ static int jn_rc_reclaim_pending(void) {
         jn_rc_retired[keep++] = jn_rc_retired[i];
     }
     size_t kept_n = keep - (jn_rc_retired_n - n);
+    __atomic_store_n(&jn_rc_kept_buffered, kept_buffered, __ATOMIC_RELAXED);
     __atomic_store_n(&jn_rc_retired_n, keep, __ATOMIC_RELAXED);
     __atomic_store_n(&jn_rc_retired_bytes, kept_bytes + fresh_bytes, __ATOMIC_RELAXED);
     __atomic_store_n(&jn_rc_scan_at, kept_n * 2 > JN_RC_SCAN_MIN ? kept_n * 2 : JN_RC_SCAN_MIN, __ATOMIC_RELAXED);
@@ -2294,6 +2398,7 @@ typedef struct {
     size_t     cap;
     size_t*    index;
     size_t     mask;
+    size_t     limit;
     int        failed;
 } JnCycGraph;
 
@@ -2303,7 +2408,8 @@ static uint32_t* jn_cyc_word(void* v) {
     if (vt == NULL || __jnative_is_class_mirror(vt)) return NULL;
     JnRcInfo* info = jn_rc_info(vt);
     if (!(info->flags & JN_RC_CYCLIC) || info->offset < 0) return NULL;
-    return (uint32_t*)((char*)v + info->offset);
+    uint32_t* word = (uint32_t*)((char*)v + info->offset);
+    return (__atomic_load_n(word, __ATOMIC_RELAXED) & JN_RC_IMMORTAL) ? NULL : word;
 }
 
 static long jn_cyc_find(JnCycGraph* g, void* obj) {
@@ -2332,7 +2438,7 @@ static int jn_cyc_rehash(JnCycGraph* g, size_t slots) {
 }
 
 static long jn_cyc_add(JnCycGraph* g, void* obj, uint32_t word) {
-    if (g->n >= JN_CYC_MAX_NODES) {
+    if (g->n >= g->limit) {
         g->failed = 1;
         return -1;
     }
@@ -2450,6 +2556,7 @@ static void jn_cyc_mark_held(JnCycGraph* g, void* v) {
 }
 
 static void jn_cyc_mark_holds(JnCycGraph* g) {
+    jn_rc_process_fence();
     jn_mutex_lock(&jn_hold_list_lock);
     for (JnHoldThread* t = jn_hold_threads; t != NULL; t = t->next) {
         int locked = 0;
@@ -2495,8 +2602,35 @@ static void jn_cyc_requeue_locked(void** roots, size_t n) {
     }
 }
 
+static void jn_cyc_prune(void) {
+    jn_mutex_lock(&jn_weak_mutex);
+    size_t keep = 0;
+    for (size_t i = 0; i < jn_cyc_roots_n; i++) {
+        void* p = jn_cyc_roots[i];
+        uint32_t* word = jn_cyc_word(p);
+        if (word == NULL) continue;
+        uint32_t w = __atomic_load_n(word, __ATOMIC_SEQ_CST);
+        if ((w & JN_RC_COUNT) && !(w & JN_RC_RETIRED)) {
+            jn_cyc_roots[keep++] = p;
+        } else {
+            __atomic_fetch_and(word, ~JN_RC_BUFFERED, __ATOMIC_SEQ_CST);
+        }
+    }
+    __atomic_store_n(&jn_cyc_roots_n, keep, __ATOMIC_RELAXED);
+    __atomic_store_n(&jn_cyc_prune_at, keep * 2 > JN_CYC_SCAN_AT ? keep * 2 : JN_CYC_SCAN_AT, __ATOMIC_RELAXED);
+    __atomic_store_n(&jn_rc_kept_buffered, 0, __ATOMIC_RELAXED);
+    jn_mutex_unlock(&jn_weak_mutex);
+}
+
 static void jn_rc_collect_cycles(void) {
     jn_cyc_flush_local();
+    if (!jn_rc_cycles_due()) {
+        if (__atomic_load_n(&jn_rc_kept_buffered, __ATOMIC_RELAXED) > 0
+                && __atomic_load_n(&jn_cyc_roots_n, __ATOMIC_RELAXED) >= __atomic_load_n(&jn_cyc_prune_at, __ATOMIC_RELAXED)) {
+            jn_cyc_prune();
+        }
+        return;
+    }
     jn_mutex_lock(&jn_weak_mutex);
     void** roots = jn_cyc_roots;
     size_t root_n = jn_cyc_roots_n;
@@ -2511,6 +2645,7 @@ static void jn_rc_collect_cycles(void) {
     }
 
     JnCycGraph g = {0};
+    g.limit = __atomic_load_n(&jn_cyc_max_nodes, __ATOMIC_RELAXED);
     JnCycWalk walk = {0};
     walk.g = &g;
     for (size_t i = 0; i < root_n && !g.failed; i++) {
@@ -2556,7 +2691,20 @@ static void jn_rc_collect_cycles(void) {
             jn_cyc_requeue_locked(roots, root_n);
         }
         jn_mutex_unlock(&jn_weak_mutex);
+    } else if (g.failed) {
+        jn_mutex_lock(&jn_weak_mutex);
+        jn_cyc_requeue_locked(roots, root_n);
+        jn_mutex_unlock(&jn_weak_mutex);
     }
+    size_t scan_at = __atomic_load_n(&jn_cyc_scan_at, __ATOMIC_RELAXED);
+    size_t next_at = g.n > JN_CYC_SCAN_AT ? g.n : JN_CYC_SCAN_AT;
+    if (g.failed && g.n >= g.limit) {
+        __atomic_store_n(&jn_cyc_max_nodes, g.limit * 2, __ATOMIC_RELAXED);
+        if (next_at < scan_at * 2) next_at = scan_at * 2;
+    }
+    __atomic_store_n(&jn_cyc_scan_at, next_at, __ATOMIC_RELAXED);
+    size_t requeued = __atomic_load_n(&jn_cyc_roots_n, __ATOMIC_RELAXED);
+    __atomic_store_n(&jn_cyc_prune_at, requeued * 2 > JN_CYC_SCAN_AT ? requeued * 2 : JN_CYC_SCAN_AT, __ATOMIC_RELAXED);
     for (size_t k = 0; k < white_n; k++) {
         jnative_release_storage(g.nodes[k].obj);
         jnative_rc_release_fields(g.nodes[k].obj);
@@ -2569,13 +2717,13 @@ static void jn_rc_collect_cycles(void) {
 }
 
 static void jn_rc_scan(void) {
-    if (jn_rc_in_scan) return;
+    if (jn_rc_in_scan || __atomic_load_n(&jn_rc_scan_busy, __ATOMIC_RELAXED)) return;
     if (!jn_rc_flush_local()) __jnative_throw_out_of_memory_error_ctx("ARC retirement");
     if (__atomic_exchange_n(&jn_rc_scan_busy, 1, __ATOMIC_ACQUIRE)) return;
     jn_rc_in_scan = 1;
-    while (jn_rc_reclaim_pending()) {}
+    while (jn_rc_reclaim_pending() && jn_rc_over(1)) {}
     jn_rc_collect_cycles();
-    while (jn_rc_reclaim_pending()) {}
+    while (jn_rc_reclaim_pending() && jn_rc_over(1)) {}
     jn_rc_tables_reclaim();
     jn_rc_in_scan = 0;
     __atomic_store_n(&jn_rc_scan_busy, 0, __ATOMIC_RELEASE);
@@ -2586,7 +2734,7 @@ static void jn_rc_scan(void) {
 
 void __jnative_rc_dec(void* p) {
     if (p == NULL) return;
-    if (jn_rc_apply(p, jn_rc_word_dec) && jn_hold_frame_n == 0) jn_rc_scan();
+    if (jn_rc_apply(p, jn_rc_word_dec) && jn_hold_frame_n == 0) jn_rc_maybe_scan();
 }
 
 void __jnative_rc_cas(int32_t ok, void* x, void* expected) {

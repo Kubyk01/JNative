@@ -617,9 +617,16 @@ public class LlvmFunctionEmitter {
             switch (inst.getOpcode()) {
                 case PHI -> pendingPhiHolds.add(inst);
                 case NEW -> {
-                    emitHold(sb, inst, inst.getResult());
+                    boolean held = emitHold(sb, inst, inst.getResult());
                     // An object stored only in a weak field never gets a last strong decrement.
-                    if (inst.isRcWeak() && !inst.isStackAllocated()) {
+                    if (held && (inst.isRcWeak() || inst.isRcBirthDrop()) && !inst.isStackAllocated()) {
+                        String object = asPointer(sb, inst.getResult());
+                        sb.append("  call void @__jnative_rc_drop(i8* ").append(object).append(")\n");
+                    }
+                }
+                case INVOKEDYNAMIC -> {
+                    boolean held = emitHold(sb, inst, inst.getResult());
+                    if (held && inst.isRcBirthDrop() && !inst.isStackAllocated()) {
                         String object = asPointer(sb, inst.getResult());
                         sb.append("  call void @__jnative_rc_drop(i8* ").append(object).append(")\n");
                     }
@@ -687,14 +694,15 @@ public class LlvmFunctionEmitter {
         return hp;
     }
 
-    private void emitHold(StringBuilder sb, Instruction inst, Value value) {
-        if (value == null || value.getType() == null) return;
+    private boolean emitHold(StringBuilder sb, Instruction inst, Value value) {
+        if (value == null || value.getType() == null) return false;
         Type t = value.getType();
-        if (!(t.isReference() || t.isArray() || t.isNull() || t.isUnknown())) return;
+        if (!(t.isReference() || t.isArray() || t.isNull() || t.isUnknown())) return false;
         String ref = castValueToType(sb, getLlvmValue(sb, value), t, Type.reference("java/lang/Object"));
         String hp = holdPointer(sb, inst);
-        if (hp == null) return;
+        if (hp == null) return false;
         sb.append("  call void @__jnative_rc_hold(i8** ").append(hp).append(", i8* ").append(ref).append(")\n");
+        return true;
     }
 
     private boolean emitHeldLoad(StringBuilder sb, Instruction inst, String resultName, String llvmType, String typedPointer) {
@@ -1350,6 +1358,9 @@ public class LlvmFunctionEmitter {
                     if (volatileField) sb.append("  fence release\n");
                     if (inst.isRcStore() && "i8*".equals(llvmType)) {
                         emitCountedStore(sb, "i8** @" + globalName, rhsConverted);
+                        if (globalEmitter.isFinalStaticField(owner, bareField)) {
+                            sb.append("  call void @__jnative_rc_pin(i8* ").append(rhsConverted).append(")\n");
+                        }
                         break;
                     }
                     sb.append(volatileField ? "  store volatile " : "  store ").append(llvmType).append(" ").append(rhsConverted)

@@ -131,6 +131,7 @@ public class LlvmRuntime {
             declare void @__jnative_rc_hold(i8**, i8*)
             declare void @__jnative_rc_thread_exit()
             declare void @__jnative_rc_inc(i8*)
+            declare void @__jnative_rc_pin(i8*)
             declare void @__jnative_rc_dec(i8*)
             declare void @__jnative_rc_drop(i8*)
             declare void @__jnative_weak_forget(i8*)

@@ -8,6 +8,8 @@ import io.github.kubyk01.domain.analyzer.aliasanalysis.PointsToGraph;
 import io.github.kubyk01.domain.analyzer.aliasanalysis.PointsToSet;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.ClassNode;
 import io.github.kubyk01.domain.analyzer.dependencyresolver.FieldNode;
+import io.github.kubyk01.domain.analyzer.escapeanalysis.EscapeAnalysisResult;
+import io.github.kubyk01.domain.analyzer.escapeanalysis.EscapeStatus;
 import io.github.kubyk01.domain.analyzer.lifetime.DestructionPoint;
 import io.github.kubyk01.domain.analyzer.lifetime.LifetimeAnalysisResult;
 import io.github.kubyk01.domain.analyzer.lifetime.RefCountPlan;
@@ -46,6 +48,7 @@ final class RefCountPlanner {
     private final DependencyResolver resolver;
     private final AliasAnalysisResult alias;
     private final LifetimeAnalysisResult lifetime;
+    private final EscapeAnalysisResult escape;
     private final Scheduler scheduler;
     private final RefCountPlan plan = new RefCountPlan();
     private final BitSet counted = new BitSet();
@@ -56,14 +59,17 @@ final class RefCountPlanner {
     private final Set<Function> pinned = Collections.newSetFromMap(new IdentityHashMap<>());
     private int weakStores;
     private final Set<String> relatedTypes = new HashSet<>();
+    private final BitSet birthDrop = new BitSet();
+    private boolean countsClosures;
 
     RefCountPlanner(Module module, DependencyResolver resolver, AliasAnalysisResult alias, LifetimeAnalysisResult lifetime,
-                    Scheduler scheduler) {
+                    EscapeAnalysisResult escape, Scheduler scheduler) {
         this.module = module;
         this.scheduler = scheduler;
         this.resolver = resolver;
         this.alias = alias;
         this.lifetime = lifetime;
+        this.escape = escape;
     }
 
     RefCountPlan plan() {
@@ -125,6 +131,9 @@ final class RefCountPlanner {
             module.setRefCountPlan(plan);
             return;
         }
+        countsClosures = !plan.getCountedClasses().isEmpty();
+        if (countsClosures) markClosureSites(n);
+        markBirthDrops(n, freed);
         for (AllocationSite site : lifetime.getCyclicSites()) {
             int id = site.getId();
             Type t = site.getType();
@@ -142,6 +151,35 @@ final class RefCountPlanner {
             + plan.getCountedFields().size() + " holder class(es), " + plan.getCountedArrayTypes().size() + " holder array type(s), "
             + plan.getCyclicClasses().size() + " cyclic class(es) in "
             + (System.nanoTime() - started) / 1_000_000 + " ms");
+    }
+
+    private void markClosureSites(int n) {
+        for (int id = 0; id < n; id++) {
+            if (AllocationSite.byId(id).getType() instanceof Type.ReferenceType ref && ref.isClosure()) counted.set(id);
+        }
+    }
+
+    private void markBirthDrops(int n, BitSet freed) {
+        for (int id = counted.nextSetBit(0); id >= 0 && id < n; id = counted.nextSetBit(id + 1)) {
+            if (freed.get(id)) continue;
+            AllocationSite site = AllocationSite.byId(id);
+            Type t = site.getType();
+            if (t == null || !t.isReference() || t.isArray() || t.getClassName() == null
+                    || !plan.isCounted(t.getClassName())) continue;
+            EscapeStatus status = escape.getSiteStatus(site);
+            if (status == EscapeStatus.STACK || status == EscapeStatus.HEAP || status == EscapeStatus.RETURN) {
+                birthDrop.set(id);
+            }
+        }
+    }
+
+    private boolean dropsAtBirth(Value v) {
+        PointsToSet pts = alias.getPointsTo(v);
+        if (pts == null || pts.isEmpty() || pts.containsUnknown()) return false;
+        for (long c = pts.cursor(); pts.has(c); c = pts.next(c)) {
+            if (!birthDrop.get(pts.id(c))) return false;
+        }
+        return true;
     }
 
     private BitSet freedSites() {
@@ -296,6 +334,11 @@ final class RefCountPlanner {
             work.add("java/lang/Cloneable");
             work.add("java/io/Serializable");
         }
+        if (countsClosures) {
+            for (ClassNode node : resolver.getClassMap().values()) {
+                if (node.isInterface()) work.add(node.getName());
+            }
+        }
         while (!work.isEmpty()) {
             String c = work.poll();
             if (c == null || !seen.add(c)) continue;
@@ -321,6 +364,25 @@ final class RefCountPlanner {
             plan.getCountedArrayTypes().addAll(part.arrayTypes());
             for (String[] field : part.fields()) {
                 plan.getCountedFields().computeIfAbsent(field[0], k -> new HashSet<>()).add(field[1]);
+            }
+        }
+        if (countsClosures) collectDeclaredHolders();
+    }
+
+    private void collectDeclaredHolders() {
+        for (String cls : plan.getCountedClasses()) {
+            Set<String> seen = new HashSet<>();
+            for (String c = cls; c != null && seen.add(c); ) {
+                ClassNode node = resolver.getClassNode(c);
+                if (node == null || node.isExternal()) break;
+                if (node.getFields() != null) {
+                    for (FieldNode f : node.getFields()) {
+                        if ((f.getAccess() & Opcodes.ACC_STATIC) != 0 || !maybeCountedType(f.getType())) continue;
+                        String key = instanceReferenceField(c + "." + f.getName());
+                        if (key != null) plan.getCountedFields().computeIfAbsent(cls, k -> new HashSet<>()).add(key);
+                    }
+                }
+                c = node.getSuperName();
             }
         }
     }
@@ -426,9 +488,15 @@ final class RefCountPlanner {
                 } else if (isReference(res) && (inst.isRcManagedArray() || inst.isRcWeak() || maybeCounted(res))) {
                     inst.setRcHold(next++);
                 }
-                if (inst.getOpcode() == Opcode.NEW && isCountedType(res == null ? null : res.getType())
-                        && mayBeWeakTarget(res)) {
-                    inst.setRcWeak(true);
+                if (inst.getOpcode() == Opcode.NEW && isCountedType(res == null ? null : res.getType())) {
+                    if (mayBeWeakTarget(res)) {
+                        inst.setRcWeak(true);
+                    } else if (dropsAtBirth(res)) {
+                        inst.setRcBirthDrop(true);
+                    }
+                }
+                if (countsClosures && res != null && LlvmUtil.isLambdaCreation(inst)) {
+                    inst.setRcBirthDrop(true);
                 }
                 if (markStore(inst, weak)) marked++;
             }

@@ -75,7 +75,7 @@ public class DestructorInserter {
     private io.github.kubyk01.domain.analyzer.reflection.ReflectInfo reflectInfo;
 
     public void insert() {
-        refCounts = new RefCountPlanner(module, resolver, aliasResult, lifetimeResult, scheduler);
+        refCounts = new RefCountPlanner(module, resolver, aliasResult, lifetimeResult, escapeResult, scheduler);
         refCounts.compute();
         this.allocatedTypes = collectAllocatedTypes();
         log.debug("DestructorInserter: {} distinct allocated type(s)",

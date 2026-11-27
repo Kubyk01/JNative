@@ -1680,6 +1680,7 @@ public class LlvmGlobalEmitter {
         for (Type t : capturedTypes) {
             fields.append(", ").append(LlvmTypeMapper.toLlvmType(t));
         }
+        if (countsLambdaCaptures()) fields.append(", i32");
         fields.append(" }");
 
         extraStructs.putIfAbsent(structName, structName + " = type " + fields);
@@ -2206,6 +2207,8 @@ public class LlvmGlobalEmitter {
         }
         if (countsLambdaCaptures()) {
             for (LambdaInfo lambda : lambdaRegistry.values()) {
+                sb.append("@__jnative_rcoff_").append(RefCountPlan.symbolName(lambda.lambdaClassName))
+                    .append(" = constant i32 ").append(lambdaCountOffset(lambda.capturedTypes)).append("\n");
                 int[] offsets = lambdaCaptureOffsets(lambda.capturedTypes);
                 List<Integer> references = new ArrayList<>();
                 for (int i = 0; i < offsets.length; i++) {
@@ -2227,6 +2230,20 @@ public class LlvmGlobalEmitter {
     boolean countsLambdaCaptures() {
         RefCountPlan plan = module.getRefCountPlan();
         return plan != null && !plan.getCountedClasses().isEmpty();
+    }
+
+    static int lambdaCapturesEnd(List<Type> capturedTypes) {
+        int offset = OBJECT_HEADER_SIZE;
+        for (Type type : capturedTypes) {
+            int align = fieldAlignment(type);
+            offset = (offset + align - 1) & -align;
+            offset += fieldSize(type);
+        }
+        return offset;
+    }
+
+    static int lambdaCountOffset(List<Type> capturedTypes) {
+        return (lambdaCapturesEnd(capturedTypes) + 3) & -4;
     }
 
     static int[] lambdaCaptureOffsets(List<Type> capturedTypes) {
@@ -3275,6 +3292,13 @@ public class LlvmGlobalEmitter {
         return fn != null ? fn.getType() : null;
     }
 
+    public boolean isFinalStaticField(String className, String fieldName) {
+        if (className == null || className.isEmpty() || fieldName == null || fieldName.isEmpty()) return false;
+        FieldNode fn = resolver.getField(className, fieldName);
+        int flags = Opcodes.ACC_FINAL | Opcodes.ACC_STATIC;
+        return fn != null && (fn.getAccess() & flags) == flags;
+    }
+
     public boolean isVolatileField(String className, String fieldName) {
         if (className == null || className.isEmpty() || fieldName == null || fieldName.isEmpty()) return false;
         FieldNode fn = resolver.getField(className, fieldName);
@@ -3331,18 +3355,9 @@ public class LlvmGlobalEmitter {
 
     private int computeLambdaObjectSize(String className) {
         LambdaInfo linfo = findLambdaInfoByClassName(className);
-        if (linfo == null || linfo.capturedTypes == null || linfo.capturedTypes.isEmpty()) {
-            return OBJECT_HEADER_SIZE;
-        }
-        int offset = OBJECT_HEADER_SIZE;
-        List<? extends Type> jnLoop57 = linfo.capturedTypes;
-        for (Type capType : jnLoop57) {
-            int align = fieldAlignment(capType);
-            int size  = fieldSize(capType);
-            offset = (offset + align - 1) & -align;
-            offset += size;
-        }
-        return (offset + 7) & ~7;
+        List<Type> captured = linfo == null || linfo.capturedTypes == null ? List.of() : linfo.capturedTypes;
+        int end = countsLambdaCaptures() ? lambdaCountOffset(captured) + 4 : lambdaCapturesEnd(captured);
+        return (end + 7) & ~7;
     }
 
     // =========================================================================

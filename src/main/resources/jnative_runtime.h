@@ -955,6 +955,7 @@ extern void    __jnative_free_owned(void* p);
 extern void    __jnative_free_container(void* p);
 extern void    __jnative_free_container_storage(void* p);
 extern void    __jnative_rc_inc(void* p);
+extern void    __jnative_rc_pin(void* p);
 extern void    __jnative_rc_dec(void* p);
 extern void    __jnative_rc_hold(void** hold, void* object);
 extern void    __jnative_rc_thread_exit(void);
