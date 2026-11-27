@@ -234,7 +234,7 @@ public class Compiler implements CompilerPort {
             }
 
             if (target.isWindows()) {
-                Path symtab = writeWindowsSymbolTable(module, llPaths, tempDir, target);
+                Path symtab = writeWindowsSymbolTable(module, llPaths, tempDir, target, effectiveCores);
                 tasks.add(new CompileTask(symtab, cDir.resolve("jnative_self_symbols.o"), SourceKind.C));
             }
 
@@ -1531,6 +1531,24 @@ public class Compiler implements CompilerPort {
     //  Windows export table
     // =====================================================================
 
+    private static <T, R> List<R> parallelSymbolScan(List<T> items, int workers,
+                                                     String name,
+                                                     java.util.function.Function<T, R> mapper) throws IOException {
+        int count = workers <= 0 ? Runtime.getRuntime().availableProcessors() : workers;
+        Scheduler scan = Schedulers.newParallel(name,
+            Math.clamp(count, 1, Math.max(1, items.size())));
+        try {
+            return LlvmUtil.parallelMapOrdered(items, scan, mapper);
+        } catch (RuntimeException e) {
+            for (Throwable t = e; t != null; t = t.getCause()) {
+                if (t instanceof UncheckedIOException u) throw u.getCause();
+            }
+            throw e;
+        } finally {
+            scan.dispose();
+        }
+    }
+
     /**
      * The C runtime looks symbols up by name (dlsym/GetProcAddress on itself). A PE export
      * table holds at most 65535 entries, so instead of exporting them this writes a sorted
@@ -1539,7 +1557,8 @@ public class Compiler implements CompilerPort {
     private static Path writeWindowsSymbolTable(Module module,
                                                 List<Path> llPaths,
                                                 Path tempDir,
-                                                TargetPlatform target) throws IOException {
+                                                TargetPlatform target,
+                                                int workers) throws IOException {
         Set<String> exports = new TreeSet<>();
 
         // ------------------------------------------------------------------
@@ -1548,11 +1567,13 @@ public class Compiler implements CompilerPort {
         //    bare `declare` and has no body to export.
         // ------------------------------------------------------------------
         Set<String> definedFunctions = new HashSet<>();
-        List<? extends Function> jnLoop19 = module.getFunctions();
-        for (Function f : jnLoop19) {
-            if (f.getEntryBlock() == null) continue;
-            definedFunctions.add(f.getName());
-        }
+        List<Set<String>> functionParts = parallelSymbolScan(
+            module.getFunctions(), workers, "jnative-symbols-functions", f -> {
+                Set<String> part = new HashSet<>();
+                if (f.getEntryBlock() != null) part.add(f.getName());
+                return part;
+            });
+        for (Set<String> part : functionParts) definedFunctions.addAll(part);
 
         // ------------------------------------------------------------------
         // 2. Defined globals from _module.ll.
@@ -1564,29 +1585,38 @@ public class Compiler implements CompilerPort {
         //    so the `startsWith("@")` filter is exact.
         // ------------------------------------------------------------------
         Set<String> definedGlobals = new HashSet<>();
+        List<Path> globalFiles = new ArrayList<>();
         boolean moduleFound = false;
-        List<? extends Path> jnLoop20 = llPaths;
-        for (Path ll : jnLoop20) {
+        for (Path ll : llPaths) {
             String fileName = ll.getFileName().toString();
             if (!fileName.equals("_module.ll") && !fileName.startsWith("_globals")) continue;
             moduleFound = true;
-            try (var lines = Files.lines(ll)) {
-                lines.forEach(line -> {
-                    if (!line.startsWith("@")) return;
-                    int eq = line.indexOf(" = ");
-                    if (eq <= 0) return;
-                    String rhs = line.substring(eq + 3).trim();
-                    if (rhs.startsWith("external ") || rhs.startsWith("extern_weak ")
-                            || rhs.startsWith("declare ")) return;
-                    definedGlobals.add(line.substring(1, eq).trim().replace("\"", ""));
-                });
-            }
+            globalFiles.add(ll);
         }
         if (!moduleFound) {
             throw new IllegalStateException(
                 "Cannot generate Windows export def: _module.ll not found in "
                     + llPaths);
         }
+        List<Set<String>> globalParts = parallelSymbolScan(
+            globalFiles, workers, "jnative-symbols-globals", ll -> {
+                Set<String> part = new HashSet<>();
+                try (var lines = Files.lines(ll)) {
+                    lines.forEach(line -> {
+                        if (!line.startsWith("@")) return;
+                        int eq = line.indexOf(" = ");
+                        if (eq <= 0) return;
+                        String rhs = line.substring(eq + 3).trim();
+                        if (rhs.startsWith("external ") || rhs.startsWith("extern_weak ")
+                                || rhs.startsWith("declare ")) return;
+                        part.add(line.substring(1, eq).trim().replace("\"", ""));
+                    });
+                } catch (IOException e) {
+                    throw new UncheckedIOException(e);
+                }
+                return part;
+            });
+        for (Set<String> part : globalParts) definedGlobals.addAll(part);
 
         // ------------------------------------------------------------------
         // 3. Globals the C runtime dlsyms.
@@ -1645,11 +1675,18 @@ public class Compiler implements CompilerPort {
         //    JDK 21 that method does not exist, so the literal is skipped
         //    rather than handed to ld.lld as an undefined-symbol requirement.
         // ------------------------------------------------------------------
-        Set<String> fnLiteralsInCSources = new HashSet<>();
+        List<Path> cSources;
         try (var stream = Files.walk(tempDir)) {
-            stream.filter(p -> p.toString().endsWith(".c"))
-                  .forEach(p -> scanFnLiterals(p, fnLiteralsInCSources));
+            cSources = stream.filter(p -> p.toString().endsWith(".c")).toList();
         }
+        List<Set<String>> literalParts = parallelSymbolScan(
+            cSources, workers, "jnative-symbols-c", p -> {
+                Set<String> part = new HashSet<>();
+                scanFnLiterals(p, part);
+                return part;
+            });
+        Set<String> fnLiteralsInCSources = new HashSet<>();
+        for (Set<String> part : literalParts) fnLiteralsInCSources.addAll(part);
         for (String literal : fnLiteralsInCSources) {
             if (definedFunctions.contains(literal)) {
                 exports.add(literal);

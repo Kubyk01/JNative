@@ -387,20 +387,30 @@ public class LlvmGenerator implements LlvmGeneratorPort {
             + main;
         moduleBodies = null;
 
-        String moduleExterns = buildExterns(moduleTail, knownGlobals, module);
-
-        String modulePrelude = buildFilteredPrelude(
-            moduleTail, moduleExterns, preludeDefs, preludeKeys);
-
-        writeLl(outputDir.resolve("_module.ll"), modulePrelude, moduleExterns, moduleTail);
+        List<AssemblyUnit> assemblies = new ArrayList<>();
+        assemblies.add(new AssemblyUnit("_module.ll", moduleTail, null));
+        for (int gi = 0; gi < globalSpools.size(); gi++) {
+            assemblies.add(new AssemblyUnit("_globals" + gi + ".ll", null, globalSpools.get(gi)));
+        }
         moduleTail = null;
 
-        for (int gi = 0; gi < globalSpools.size(); gi++) {
-            String body = readSpool(globalSpools.get(gi));
-            Files.deleteIfExists(globalSpools.get(gi));
-            String externs = buildExterns(body, knownGlobals, module);
-            writeLl(outputDir.resolve("_globals" + gi + ".ll"),
-                buildFilteredPrelude(body, externs, preludeDefs, preludeKeys), externs, body);
+        try {
+            LlvmUtil.parallelMapOrdered(assemblies, scheduler, unit -> {
+                try {
+                    String body = unit.body() != null ? unit.body() : readSpool(unit.spool());
+                    if (unit.spool() != null) Files.deleteIfExists(unit.spool());
+                    String externs = buildExterns(body, knownGlobals, module);
+                    String prelude = buildFilteredPrelude(body, externs, preludeDefs, preludeKeys);
+                    writeLl(outputDir.resolve(unit.name()), prelude, externs, body);
+                    return unit.name();
+                } catch (IOException e) {
+                    throw new java.io.UncheckedIOException(e);
+                }
+            });
+        } catch (RuntimeException e) {
+            IOException io = unwrapIOException(e);
+            if (io != null) throw io;
+            throw e;
         }
 
         // Embedded resources get their own translation unit, streamed byte by
@@ -441,6 +451,8 @@ public class LlvmGenerator implements LlvmGeneratorPort {
     private static final long TARGET_EMIT_BATCH_BYTES = 32L * 1024 * 1024;
 
     private record ClassUnit(String name, List<Path> bodies) {}
+
+    private record AssemblyUnit(String name, String body, Path spool) {}
 
     private record OwnerGroup(int start, int end, Path spool) {}
 

@@ -2510,37 +2510,48 @@ public class LlvmGlobalEmitter {
     // =========================================================================
 
     private String generateTypeStringConstants() {
-        Set<String> names = new LinkedHashSet<>();
-        names.add("java/lang/Object");
-
+        List<ClassNode> classes = new ArrayList<>();
         for (ClassNode cn : resolver.getClassMap().values()) {
-            if (cn.isExternal()) continue;
-            names.add(cn.getName());
+            if (!cn.isExternal()) classes.add(cn);
         }
+        List<Set<String>> classParts = LlvmUtil.parallelMapOrdered(classes, scheduler, cn -> {
+            Set<String> part = new HashSet<>();
+            part.add(cn.getName());
+            return part;
+        });
 
-        List<? extends Function> jnLoop38 = module.getFunctions();
-        for (Function func : jnLoop38) {
+        List<Function> functions = new ArrayList<>(module.getFunctions());
+        List<Set<String>> functionParts = LlvmUtil.parallelMapOrdered(functions, scheduler, func -> {
+            Set<String> part = new HashSet<>();
             String fn = func.getName();
-            if (fn != null && !fn.isEmpty()) names.add(fn);
-        }
-
-        List<? extends Function> jnLoop39 = module.getFunctions();
-        for (Function func : jnLoop39) {
+            if (fn != null && !fn.isEmpty()) part.add(fn);
             for (BasicBlock block : func.getBlocks()) {
                 for (Instruction inst : block.getInstructions()) {
-                    collectStringConstantsFromInstruction(inst, names);
+                    collectStringConstantsFromInstruction(inst, part);
                 }
                 Terminator term = block.getTerminator();
-                if (term != null) collectStringConstantsFromTerminator(term, names);
+                if (term != null) collectStringConstantsFromTerminator(term, part);
             }
-        }
+            return part;
+        });
+
+        Set<String> names = new LinkedHashSet<>();
+        names.add("java/lang/Object");
+        for (Set<String> part : classParts) names.addAll(part);
+        for (Set<String> part : functionParts) names.addAll(part);
 
         StringBuilder sb = new StringBuilder("\n; ----- String / type-name constants -----\n");
         List<String> sorted = new ArrayList<>(names);
         Collections.sort(sorted);
+        List<String> fresh = new ArrayList<>();
         for (String name : sorted) {
-            if (emittedStringConstants.add(name)) {
-                sb.append(LlvmRuntime.typeStringConstant(name));
+            if (!emittedStringConstants.contains(name)) fresh.add(name);
+        }
+        List<String> rendered = LlvmUtil.parallelMapOrdered(
+            fresh, scheduler, LlvmRuntime::typeStringConstant);
+        for (int i = 0; i < fresh.size(); i++) {
+            if (emittedStringConstants.add(fresh.get(i))) {
+                sb.append(rendered.get(i));
             }
         }
         sb.append("\n");
@@ -2566,12 +2577,21 @@ public class LlvmGlobalEmitter {
         }
         Collections.sort(snapshot);
 
+        List<String> fresh = new ArrayList<>();
+        for (String s : snapshot) {
+            if (!emittedStringConstants.contains(s)) fresh.add(s);
+        }
+        if (fresh.isEmpty()) {
+            return "";
+        }
+        List<String> rendered = LlvmUtil.parallelMapOrdered(
+            fresh, scheduler, LlvmRuntime::typeStringConstant);
+
         StringBuilder body = new StringBuilder();
         boolean any = false;
-        List<? extends String> jnLoop41 = snapshot;
-        for (String s : jnLoop41) {
-            if (emittedStringConstants.add(s)) {
-                body.append(LlvmRuntime.typeStringConstant(s));
+        for (int i = 0; i < fresh.size(); i++) {
+            if (emittedStringConstants.add(fresh.get(i))) {
+                body.append(rendered.get(i));
                 any = true;
             }
         }
