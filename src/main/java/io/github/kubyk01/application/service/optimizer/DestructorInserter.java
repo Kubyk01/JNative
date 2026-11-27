@@ -1256,7 +1256,6 @@ public class DestructorInserter {
 
     private int[] inboundStart;
     private int[] inboundSrc;
-    private int[] inboundField;
 
     private void buildInboundEdges() {
         if (inboundStart != null) return;
@@ -1280,7 +1279,6 @@ public class DestructorInserter {
         for (int i = 0; i < n; i++) start[i + 1] += start[i];
         int[] next = Arrays.copyOf(start, n);
         int[] sources = new int[start[n]];
-        int[] fields = new int[start[n]];
         for (int src = 0; src < n; src++) {
             for (FieldCell cell : graph.fieldCells(src)) {
                 PointsToSet pts = cell.get();
@@ -1289,13 +1287,21 @@ public class DestructorInserter {
                     if (!destructible[dst]) continue;
                     int at = next[dst]++;
                     sources[at] = src;
-                    fields[at] = cell.fieldId();
                 }
             }
         }
         inboundSrc = sources;
-        inboundField = fields;
         inboundStart = start;
+    }
+
+    private boolean hasOnlyOwnerFieldEdge(PointsToGraph graph, int src, int dst, int ownerFieldId) {
+        boolean found = false;
+        for (FieldCell cell : graph.fieldCells(src)) {
+            if (!cell.get().containsId(dst)) continue;
+            if (cell.fieldId() != ownerFieldId) return false;
+            found = true;
+        }
+        return found;
     }
 
     private boolean ownsEverythingDestroyed(PointsToSet baseSites,
@@ -1332,7 +1338,9 @@ public class DestructorInserter {
             for (int e = inboundStart[id]; e < inboundStart[id + 1]; e++) {
                 int src = inboundSrc[e];
                 if (destroyed.contains(src)) continue;
-                if (inboundField[e] == ownerFieldId && baseSites.containsId(src) && roots.containsId(id)) continue;
+                if (baseSites.containsId(src)
+                        && roots.containsId(id)
+                        && hasOnlyOwnerFieldEdge(graph, src, id, ownerFieldId)) continue;
                 return false;
             }
         }
