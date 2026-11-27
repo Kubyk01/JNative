@@ -1262,34 +1262,69 @@ public class DestructorInserter {
         PointsToGraph graph = aliasResult.getGraph();
         int n = AllocationSite.count();
         int unknownId = AllocationSite.UNKNOWN.getId();
-        boolean[] destructible = new boolean[n];
-        for (int id = 0; id < n; id++) {
-            destructible[id] = id != unknownId && isManagedType(AllocationSite.byId(id).getType());
+        int parts = Math.clamp(Runtime.getRuntime().availableProcessors(), 1, Math.max(1, n));
+        int chunkSize = (n + parts - 1) / parts;
+        List<int[]> ranges = new ArrayList<>();
+        for (int lo = 0; lo < n; lo += chunkSize) {
+            ranges.add(new int[]{lo, Math.min(n, lo + chunkSize)});
         }
+        List<BitSet> managedParts = LlvmUtil.parallelMapOrdered(ranges, scheduler, range -> {
+            BitSet part = new BitSet();
+            for (int id = range[0]; id < range[1]; id++) {
+                if (id != unknownId && isManagedType(AllocationSite.byId(id).getType())) part.set(id);
+            }
+            return part;
+        });
+        BitSet destructible = new BitSet(n);
+        for (BitSet part : managedParts) destructible.or(part);
+        List<int[]> counts = LlvmUtil.parallelMapOrdered(ranges, scheduler, range -> {
+            int[] local = new int[n];
+            for (int src = range[0]; src < range[1]; src++) {
+                for (FieldCell cell : graph.fieldCells(src)) {
+                    PointsToSet pts = cell.get();
+                    for (long c = pts.cursor(); pts.has(c); c = pts.next(c)) {
+                        int dst = pts.id(c);
+                        if (destructible.get(dst)) local[dst]++;
+                    }
+                }
+            }
+            return local;
+        });
+
         int[] start = new int[n + 1];
-        for (int src = 0; src < n; src++) {
-            for (FieldCell cell : graph.fieldCells(src)) {
-                PointsToSet pts = cell.get();
-                for (long c = pts.cursor(); pts.has(c); c = pts.next(c)) {
-                    int dst = pts.id(c);
-                    if (destructible[dst]) start[dst + 1]++;
-                }
+        for (int dst = 0; dst < n; dst++) {
+            int total = 0;
+            for (int[] local : counts) total += local[dst];
+            start[dst + 1] = start[dst] + total;
+        }
+        for (int dst = 0; dst < n; dst++) {
+            int cursor = start[dst];
+            for (int[] local : counts) {
+                int count = local[dst];
+                local[dst] = cursor;
+                cursor += count;
             }
         }
-        for (int i = 0; i < n; i++) start[i + 1] += start[i];
-        int[] next = Arrays.copyOf(start, n);
+
         int[] sources = new int[start[n]];
-        for (int src = 0; src < n; src++) {
-            for (FieldCell cell : graph.fieldCells(src)) {
-                PointsToSet pts = cell.get();
-                for (long c = pts.cursor(); pts.has(c); c = pts.next(c)) {
-                    int dst = pts.id(c);
-                    if (!destructible[dst]) continue;
-                    int at = next[dst]++;
-                    sources[at] = src;
+        List<Integer> indexes = new ArrayList<>(ranges.size());
+        for (int i = 0; i < ranges.size(); i++) indexes.add(i);
+        LlvmUtil.parallelMapOrdered(indexes, scheduler, index -> {
+            int[] range = ranges.get(index);
+            int[] cursor = counts.get(index);
+            for (int src = range[0]; src < range[1]; src++) {
+                for (FieldCell cell : graph.fieldCells(src)) {
+                    PointsToSet pts = cell.get();
+                    for (long c = pts.cursor(); pts.has(c); c = pts.next(c)) {
+                        int dst = pts.id(c);
+                        if (!destructible.get(dst)) continue;
+                        sources[cursor[dst]++] = src;
+                    }
                 }
             }
-        }
+            return null;
+        });
+
         inboundSrc = sources;
         inboundStart = start;
     }
@@ -1430,11 +1465,13 @@ public class DestructorInserter {
     // =====================================================================
 
     private Set<Type> collectAllocatedTypes() {
-        Set<Type> types = new LinkedHashSet<>();
-        List<? extends Function> jnLoop25 = module.getFunctions();
-        for (Function func : jnLoop25) {
-            if (func.getEntryBlock() == null) continue;
-            for (int blockIdx3 = 0; blockIdx3 < func.getBlocks().size(); blockIdx3++) { BasicBlock block = func.getBlocks().get(blockIdx3);
+        List<Function> functions = new ArrayList<>();
+        for (Function func : module.getFunctions()) {
+            if (func.getEntryBlock() != null) functions.add(func);
+        }
+        List<LinkedHashSet<Type>> parts = LlvmUtil.parallelMapOrdered(functions, scheduler, func -> {
+            LinkedHashSet<Type> part = new LinkedHashSet<>();
+            for (BasicBlock block : func.getBlocks()) {
                 for (Instruction inst : block.getInstructions()) {
                     Opcode op = inst.getOpcode();
                     if (op != Opcode.NEW
@@ -1444,10 +1481,13 @@ public class DestructorInserter {
                     Type t = inst.getResult().getType();
                     if (t == null || t.isUnknown() || t.isNull() || t.isBlock()) continue;
 
-                    types.add(t);
+                    part.add(t);
                 }
             }
-        }
+            return part;
+        });
+        Set<Type> types = new LinkedHashSet<>();
+        for (LinkedHashSet<Type> part : parts) types.addAll(part);
         // Close under the array-of-array relation. A MULTI_NEW_ARRAY of
         // "[[I" creates "[[I" from one instruction, but the inner "[I"
         // arrays are created inside __jnative_new_multi_array and are not

@@ -1,6 +1,9 @@
 package io.github.kubyk01.application.service.codegen;
 
 import io.github.kubyk01.util.JImage;
+import io.github.kubyk01.util.LlvmUtil;
+import reactor.core.scheduler.Scheduler;
+import reactor.core.scheduler.Schedulers;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -71,6 +74,8 @@ public final class ResourceEmbedder {
      * ICU data this runtime needs.
      */
     private static final String MODULE_NAME = "java.base";
+
+    private record ResourceRead(String path, byte[] data, IOException failure) {}
 
     private ResourceEmbedder() {
     }
@@ -244,14 +249,18 @@ public final class ResourceEmbedder {
      *         source yielded anything
      */
     public static List<Map.Entry<String, byte[]>> collectJavaBaseResources() {
-        return collectJavaBaseResources(Paths.get(System.getProperty("java.home")));
+        return collectJavaBaseResources(Paths.get(System.getProperty("java.home")), Schedulers.boundedElastic());
     }
 
     public static List<Map.Entry<String, byte[]>> collectJavaBaseResources(Path javaHome) {
-        List<Map.Entry<String, byte[]>> resources = readAllFromJmod(javaHome);
+        return collectJavaBaseResources(javaHome, Schedulers.boundedElastic());
+    }
+
+    public static List<Map.Entry<String, byte[]>> collectJavaBaseResources(Path javaHome, Scheduler scheduler) {
+        List<Map.Entry<String, byte[]>> resources = readAllFromJmod(javaHome, scheduler);
 
         if (resources.isEmpty()) {
-            resources = readAllFromJrt(javaHome);
+            resources = readAllFromJrt(javaHome, scheduler);
         }
 
         if (resources.isEmpty()) {
@@ -291,7 +300,7 @@ public final class ResourceEmbedder {
      * <p>Returns an empty list when the jmod is absent or unreadable; the
      * caller then falls back to the jrt source.</p>
      */
-    private static List<Map.Entry<String, byte[]>> readAllFromJmod(Path javaHome) {
+    private static List<Map.Entry<String, byte[]>> readAllFromJmod(Path javaHome, Scheduler scheduler) {
         Path jmod = javaHome.resolve(JMOD_RELATIVE_PATH);
         if (!Files.isRegularFile(jmod)) {
             return List.of();
@@ -299,6 +308,7 @@ public final class ResourceEmbedder {
 
         List<Map.Entry<String, byte[]>> out = new ArrayList<>();
         try (ZipFile zip = new ZipFile(jmod.toFile())) {
+            List<ZipEntry> selected = new ArrayList<>();
             Enumeration<? extends ZipEntry> entries = zip.entries();
             while (entries.hasMoreElements()) {
                 ZipEntry entry = entries.nextElement();
@@ -314,13 +324,20 @@ public final class ResourceEmbedder {
                 if (!keepAsResource(stripped)) {
                     continue;
                 }
+                selected.add(entry);
+            }
 
-                byte[] data;
+            List<ResourceRead> reads = LlvmUtil.parallelMapOrdered(selected, scheduler, entry -> {
                 try (InputStream is = zip.getInputStream(entry)) {
-                    data = is.readAllBytes();
+                    return new ResourceRead(
+                        entry.getName().substring(JMOD_CLASSES_PREFIX.length()), is.readAllBytes(), null);
+                } catch (IOException e) {
+                    return new ResourceRead(null, null, e);
                 }
-
-                out.add(new AbstractMap.SimpleImmutableEntry<>(stripped, data));
+            });
+            for (ResourceRead read : reads) {
+                if (read.failure() != null) return List.of();
+                out.add(new AbstractMap.SimpleImmutableEntry<>(read.path(), read.data()));
             }
         } catch (IOException e) {
             return List.of();
@@ -337,14 +354,24 @@ public final class ResourceEmbedder {
      * <p>Used when the JDK ships only a runtime image and no
      * {@code jmods/} directory.</p>
      */
-    private static List<Map.Entry<String, byte[]>> readAllFromJrt(Path javaHome) {
+    private static List<Map.Entry<String, byte[]>> readAllFromJrt(Path javaHome, Scheduler scheduler) {
         List<Map.Entry<String, byte[]>> out = new ArrayList<>();
         try {
             JImage image = JImage.open(javaHome);
+            List<String> names = new ArrayList<>();
             for (String name : image.resources(MODULE_NAME)) {
-                if (keepAsResource(name)) {
-                    out.add(new AbstractMap.SimpleImmutableEntry<>(name, image.read(MODULE_NAME, name)));
+                if (keepAsResource(name)) names.add(name);
+            }
+            List<ResourceRead> reads = LlvmUtil.parallelMapOrdered(names, scheduler, name -> {
+                try {
+                    return new ResourceRead(name, image.read(MODULE_NAME, name), null);
+                } catch (IOException e) {
+                    return new ResourceRead(name, null, e);
                 }
+            });
+            for (ResourceRead read : reads) {
+                if (read.failure() != null) return List.of();
+                out.add(new AbstractMap.SimpleImmutableEntry<>(read.path(), read.data()));
             }
         } catch (IOException e) {
             return List.of();

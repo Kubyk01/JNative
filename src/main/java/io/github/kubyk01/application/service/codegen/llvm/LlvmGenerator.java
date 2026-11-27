@@ -226,7 +226,7 @@ public class LlvmGenerator implements LlvmGeneratorPort {
         for (String k : preludeDefs.keySet()) preludeKeys.add(k);
 
         // ---- 1. Emit EVERY function body, grouped by owner class. Bodies
-        //         are emitted in batches and spooled to one file per class,
+        //         are emitted by owner group and spooled to one file per class,
         //         so the heap never holds the whole program's IR text. ----
         List<Function> toEmit = new ArrayList<>();
         List<? extends Function> jnLoop2 = module.getFunctions();
@@ -238,64 +238,80 @@ public class LlvmGenerator implements LlvmGeneratorPort {
 
 
         int totalToEmit = toEmit.size();
+        long[] bodyBytes = new long[totalToEmit];
+        List<OwnerGroup> ownerGroups = new ArrayList<>();
+        int groupStart = 0;
+        while (groupStart < totalToEmit) {
+            String owner = toEmit.get(groupStart).getOwnerClass();
+            String key = owner == null ? "" : owner;
+            int groupEnd = groupStart + 1;
+            while (groupEnd < totalToEmit) {
+                String nextOwner = toEmit.get(groupEnd).getOwnerClass();
+                String nextKey = nextOwner == null ? "" : nextOwner;
+                if (!key.equals(nextKey)) break;
+                groupEnd++;
+            }
+            Path spool = key.isEmpty()
+                ? moduleSpool
+                : classSpools.computeIfAbsent(key, k -> spoolPath(spoolDir, k));
+            ownerGroups.add(new OwnerGroup(groupStart, groupEnd, spool));
+            groupStart = groupEnd;
+        }
+        try {
+            List<long[]> sizes = LlvmUtil.parallelMapOrdered(ownerGroups, scheduler, group -> {
+                long[] bytes = new long[group.end() - group.start()];
+                try (java.io.Writer w = openSpool(group.spool())) {
+                    for (int i = group.start(); i < group.end(); i++) {
+                        LlvmFunctionEmitter emitter = new LlvmFunctionEmitter(
+                            module, globalEmitter, polymorphicResolverRef, resolver);
+                        String body = emitter.emitFunction(toEmit.get(i));
+                        w.write(body);
+                        bytes[i - group.start()] = body.length();
+                    }
+                } catch (IOException e) {
+                    throw new java.io.UncheckedIOException(e);
+                }
+                return bytes;
+            });
+            for (int g = 0; g < ownerGroups.size(); g++) {
+                OwnerGroup group = ownerGroups.get(g);
+                long[] bytes = sizes.get(g);
+                System.arraycopy(bytes, 0, bodyBytes, group.start(), bytes.length);
+            }
+        } catch (RuntimeException e) {
+            IOException io = unwrapIOException(e);
+            if (io != null) throw io;
+            throw e;
+        }
+
         int batchSize = INITIAL_EMIT_BATCH;
         int from = 0;
-        String openOwner = null;
-        java.io.Writer openWriter = null;
-        try {
-            while (from < totalToEmit) {
-                int end = Math.min(from + batchSize, totalToEmit);
-                List<Function> batch = new ArrayList<>(toEmit.subList(from, end));
-                List<String> bodies = LlvmUtil.parallelMapOrdered(batch, scheduler, func -> {
-                    LlvmFunctionEmitter emitter = new LlvmFunctionEmitter(
-                        module, globalEmitter, polymorphicResolverRef, resolver);
-                    return emitter.emitFunction(func);
-                });
-                long batchBytes = 0L;
-                for (int i = 0; i < batch.size(); i++) {
-                    Function func = batch.get(i);
-                    String body = bodies.get(i);
-                    String owner = func.getOwnerClass();
-                    String key = owner == null ? "" : owner;
-                    if (!key.equals(openOwner)) {
-                        if (openWriter != null) {
-                            openWriter.close();
-                            openWriter = null;
-                        }
-                        Path spool = key.isEmpty()
-                            ? moduleSpool
-                            : classSpools.computeIfAbsent(key, k -> spoolPath(spoolDir, k));
-                        openWriter = openSpool(spool);
-                        openOwner = key;
-                    }
-                    openWriter.write(body);
-                    batchBytes += body.length();
-                    bodies.set(i, null);
-                }
-                from = end;
+        while (from < totalToEmit) {
+            int end = Math.min(from + batchSize, totalToEmit);
+            long batchBytes = 0L;
+            for (int i = from; i < end; i++) batchBytes += bodyBytes[i];
+            int emitted = end - from;
+            from = end;
 
-                if (batchBytes > TARGET_EMIT_BATCH_BYTES && batchSize > MIN_EMIT_BATCH) {
-                    int next = Math.max(MIN_EMIT_BATCH, batchSize / 2);
-                    System.out.println("IR bodies: " + from + "/" + totalToEmit
-                        + " function(s), batch=" + batch.size()
-                        + " " + (batchBytes / (1024 * 1024)) + " MB, shrinking "
-                        + batchSize + " -> " + next);
-                    batchSize = next;
-                } else if (batchBytes < TARGET_EMIT_BATCH_BYTES / 4 && batchSize < MAX_EMIT_BATCH) {
-                    int next = Math.min(MAX_EMIT_BATCH, batchSize * 2);
-                    System.out.println("IR bodies: " + from + "/" + totalToEmit
-                        + " function(s), batch=" + batch.size()
-                        + " " + (batchBytes / (1024 * 1024)) + " MB, growing "
-                        + batchSize + " -> " + next);
-                    batchSize = next;
-                } else {
-                    System.out.println("IR bodies: " + from + "/" + totalToEmit
-                        + " function(s), batch=" + batch.size()
-                        + " " + (batchBytes / (1024 * 1024)) + " MB");
-                }
+            if (batchBytes > TARGET_EMIT_BATCH_BYTES && batchSize > MIN_EMIT_BATCH) {
+                int next = Math.max(MIN_EMIT_BATCH, batchSize / 2);
+                System.out.println("IR bodies: " + from + "/" + totalToEmit
+                    + " function(s), batch=" + emitted
+                    + " " + (batchBytes / (1024 * 1024)) + " MB, shrinking "
+                    + batchSize + " -> " + next);
+                batchSize = next;
+            } else if (batchBytes < TARGET_EMIT_BATCH_BYTES / 4 && batchSize < MAX_EMIT_BATCH) {
+                int next = Math.min(MAX_EMIT_BATCH, batchSize * 2);
+                System.out.println("IR bodies: " + from + "/" + totalToEmit
+                    + " function(s), batch=" + emitted
+                    + " " + (batchBytes / (1024 * 1024)) + " MB, growing "
+                    + batchSize + " -> " + next);
+                batchSize = next;
+            } else {
+                System.out.println("IR bodies: " + from + "/" + totalToEmit
+                    + " function(s), batch=" + emitted
+                    + " " + (batchBytes / (1024 * 1024)) + " MB");
             }
-        } finally {
-            if (openWriter != null) openWriter.close();
         }
 
         // ---- 2. Deferred strings are now fully known. Collect them. ----
@@ -425,6 +441,15 @@ public class LlvmGenerator implements LlvmGeneratorPort {
     private static final long TARGET_EMIT_BATCH_BYTES = 32L * 1024 * 1024;
 
     private record ClassUnit(String name, List<Path> bodies) {}
+
+    private record OwnerGroup(int start, int end, Path spool) {}
+
+    private static IOException unwrapIOException(RuntimeException e) {
+        for (Throwable t = e; t != null; t = t.getCause()) {
+            if (t instanceof java.io.UncheckedIOException u) return u.getCause();
+        }
+        return null;
+    }
 
     private static List<ClassUnit> partitionClassBodies(Map<String, Path> classSpools,
                                                        long maxUnitBytes) throws IOException {

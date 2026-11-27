@@ -27,7 +27,10 @@ import io.github.kubyk01.domain.ir.ThrowTerminator;
 import io.github.kubyk01.domain.ir.Value;
 import io.github.kubyk01.util.LlvmUtil;
 import lombok.Getter;
+import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
+import reactor.core.scheduler.Scheduler;
+import reactor.core.scheduler.Schedulers;
 import org.objectweb.asm.ClassReader;
 import org.objectweb.asm.Opcodes;
 import org.objectweb.asm.Type;
@@ -80,6 +83,9 @@ public class ClassAnalysis {
     @Getter
     private final ReflectInfo reflectInfo = new ReflectInfo();
 
+    @Setter
+    private Scheduler scheduler = Schedulers.boundedElastic();
+
     public void analyze() {
         if (reachability == null) {
             resolver.loadAllClasses();
@@ -130,11 +136,15 @@ public class ClassAnalysis {
     }
 
     public List<String> annotatedApplicationClasses() {
-        List<String> out = new ArrayList<>();
-        for (String className : new TreeSet<>(classes)) {
-            if (LlvmUtil.isSystemClassName(className)) continue;
+        List<String> candidates = new ArrayList<>(new TreeSet<>(classes));
+        List<String> annotated = LlvmUtil.parallelMapOrdered(candidates, scheduler, className -> {
+            if (LlvmUtil.isSystemClassName(className)) return null;
             ClassFileAnnotations annotations = ClassFileAnnotations.parse(resolver.getClassBytes(className));
-            if (annotations != null && annotations.getClassAnnotations() != null) out.add(className);
+            return annotations != null && annotations.getClassAnnotations() != null ? className : null;
+        });
+        List<String> out = new ArrayList<>();
+        for (String className : annotated) {
+            if (className != null) out.add(className);
         }
         return out;
     }

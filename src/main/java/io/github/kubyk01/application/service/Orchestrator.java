@@ -139,6 +139,7 @@ public class Orchestrator implements OrchestratorPort {
 
         // --- 1. Dependency resolution -------------------------------------
         DependencyResolver resolver = new DependencyResolver();
+        resolver.setScheduler(scheduler);
         try {
             // Cross-OS build: compile the target OS's JDK class library, not the host's.
             resolver.setTargetJavaHome(TargetJdk.ensure(targetPlatform));
@@ -167,6 +168,7 @@ public class Orchestrator implements OrchestratorPort {
 
         // --- 2. Class analysis --------------------------------------------
         ClassAnalysis analysis = new ClassAnalysis(resolver, reachabilityObj);
+        analysis.setScheduler(scheduler);
         analysis.analyze();
         if (!noCompile) {
             try (RuntimeClasspath runtimeClasspath = RuntimeClasspath.create(path, resolver.getScannedJars(),
@@ -297,7 +299,7 @@ public class Orchestrator implements OrchestratorPort {
         // java.security.SecureRandom the path is
         // "jnative/security/SecureRandom.c".
         // ------------------------------------------------------------------
-        List<NativeOverride> nativeOverrides = collectNativeOverrides(analysis);
+        List<NativeOverride> nativeOverrides = collectNativeOverrides(analysis, scheduler);
 
         System.out.println("Native overrides discovered: " + nativeOverrides.size());
         for (NativeOverride o : nativeOverrides) {
@@ -402,7 +404,7 @@ public class Orchestrator implements OrchestratorPort {
         // kind, so no consumer needs to know which source an entry came
         // from.
         List<Map.Entry<String, byte[]>> embedded = new ArrayList<>();
-        embedded.addAll(ResourceEmbedder.collectJavaBaseResources(resolver.getRuntimeJavaHome()));
+        embedded.addAll(ResourceEmbedder.collectJavaBaseResources(resolver.getRuntimeJavaHome(), scheduler));
         embedded.addAll(ResourceEmbedder.collectJdkRuntimeData(resolver.getRuntimeJavaHome()));
         System.out.println("Embedding " + embedded.size()
             + " built-in resource(s) from java.base and JDK runtime data.");
@@ -589,15 +591,17 @@ public class Orchestrator implements OrchestratorPort {
      * one — an unusual case, but one that has a well-defined outcome
      * rather than an exception.</p>
      */
-    private List<NativeOverride> collectNativeOverrides(ClassAnalysis analysis) {
+    private List<NativeOverride> collectNativeOverrides(ClassAnalysis analysis, Scheduler scheduler) {
+        List<String> classes = new ArrayList<>(analysis.getClasses());
+        List<List<NativeOverride>> scans = LlvmUtil.parallelMapOrdered(classes, scheduler, cls ->
+            NativeOverrideScanner.scan(cResourcePathForClass(cls)));
         List<NativeOverride> discovered = new ArrayList<>();
 
-        for (String cls : analysis.getClasses()) {
-            String cResourcePath = cResourcePathForClass(cls);
-            List<NativeOverride> found = NativeOverrideScanner.scan(cResourcePath);
+        for (int i = 0; i < classes.size(); i++) {
+            List<NativeOverride> found = scans.get(i);
             if (!found.isEmpty()) {
                 discovered.addAll(found);
-                System.out.println("Native overrides in " + cResourcePath
+                System.out.println("Native overrides in " + cResourcePathForClass(classes.get(i))
                         + ": " + found.size());
             }
         }

@@ -1,13 +1,19 @@
 package io.github.kubyk01.application.service.compiler;
 
 import io.github.kubyk01.domain.ir.TargetPlatform;
+import io.github.kubyk01.util.LlvmUtil;
+import reactor.core.scheduler.Scheduler;
+import reactor.core.scheduler.Schedulers;
 
-import java.io.BufferedOutputStream;
 import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.FileVisitOption;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -38,7 +44,7 @@ public final class RuntimeImageEmbedder {
     }
 
     public static Sources embed(Path javaHome, List<Path> classpath, List<Path> libraries,
-                                Path output, TargetPlatform target) throws IOException {
+                                Path output, TargetPlatform target, int cores) throws IOException {
         Path root = javaHome.toAbsolutePath().normalize();
         validate(root);
         Files.createDirectories(output);
@@ -75,18 +81,73 @@ public final class RuntimeImageEmbedder {
         } }
         Path data = output.resolve("jnative_runtime_image.bin");
         Path table = output.resolve("jnative_runtime_files.c");
+        List<String> names = new ArrayList<>(files.keySet());
+        long[] starts = new long[names.size()];
+        long[] offsets = new long[names.size()];
+        long[] sizes = new long[names.size()];
         long offset = 0;
-        try (var bytes = new BufferedOutputStream(Files.newOutputStream(data));
-             var writer = Files.newBufferedWriter(table, StandardCharsets.UTF_8)) {
+        for (int i = 0; i < names.size(); i++) {
+            starts[i] = offset;
+            offset = Math.addExact(offset, (16 - (offset & 15)) & 15);
+            offsets[i] = offset;
+            sizes[i] = Files.size(files.get(names.get(i)));
+            offset = Math.addExact(offset, sizes[i]);
+        }
+
+        int workers = cores <= 0 ? Runtime.getRuntime().availableProcessors() : cores;
+        Scheduler imageScheduler = Schedulers.newParallel("jnative-runtime-image",
+            Math.clamp(workers, 1, Math.max(1, names.size())));
+        try {
+            List<Integer> indexes = new ArrayList<>(names.size());
+            for (int i = 0; i < names.size(); i++) indexes.add(i);
+            try (FileChannel channel = FileChannel.open(data, StandardOpenOption.CREATE,
+                    StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING)) {
+                try {
+                    LlvmUtil.parallelMapOrdered(indexes, imageScheduler, index -> {
+                        try {
+                            long padding = offsets[index] - starts[index];
+                            if (padding > 0) {
+                                ByteBuffer zeros = ByteBuffer.wrap(new byte[(int) padding]);
+                                long position = starts[index];
+                                while (zeros.hasRemaining()) {
+                                    int written = channel.write(zeros, position);
+                                    position += written;
+                                }
+                            }
+                            try (FileChannel source = FileChannel.open(
+                                    files.get(names.get(index)), StandardOpenOption.READ)) {
+                                long transferred = 0;
+                                while (transferred < sizes[index]) {
+                                    long n = channel.transferFrom(source,
+                                        offsets[index] + transferred, sizes[index] - transferred);
+                                    if (n <= 0) break;
+                                    transferred += n;
+                                }
+                                if (transferred != sizes[index]) {
+                                    throw new IOException("Short runtime image copy: " + names.get(index));
+                                }
+                            }
+                            return Boolean.TRUE;
+                        } catch (IOException e) {
+                            throw new UncheckedIOException(e);
+                        }
+                    });
+                } catch (RuntimeException e) {
+                    for (Throwable t = e; t != null; t = t.getCause()) {
+                        if (t instanceof UncheckedIOException u) throw u.getCause();
+                    }
+                    throw e;
+                }
+            }
+        } finally {
+            imageScheduler.dispose();
+        }
+
+        try (var writer = Files.newBufferedWriter(table, StandardCharsets.UTF_8)) {
             writer.write("#include \"jnative_runtime.h\"\n");
             writer.write("const JNativeRuntimeFile jnative_runtime_files[] = {\n");
-            for (var file : files.entrySet()) {
-                int padding = (int)((16 - (offset & 15)) & 15);
-                bytes.write(new byte[padding]);
-                offset = Math.addExact(offset, padding);
-                long size = Files.copy(file.getValue(), bytes);
-                writer.write("    {" + quote(file.getKey()) + ", " + offset + "ULL, " + size + "ULL},\n");
-                offset = Math.addExact(offset, size);
+            for (int i = 0; i < names.size(); i++) {
+                writer.write("    {" + quote(names.get(i)) + ", " + offsets[i] + "ULL, " + sizes[i] + "ULL},\n");
             }
             writer.write("};\nconst uint64_t jnative_runtime_files_count = " + files.size() + "ULL;\n");
             writer.write("const uint64_t jnative_runtime_data_size = " + offset + "ULL;\n");

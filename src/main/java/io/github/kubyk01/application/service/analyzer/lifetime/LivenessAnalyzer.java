@@ -8,7 +8,6 @@ import io.github.kubyk01.domain.ir.*;
 import io.github.kubyk01.domain.ir.Module;
 import io.github.kubyk01.util.LlvmUtil;
 import lombok.RequiredArgsConstructor;
-import reactor.core.publisher.Flux;
 import reactor.core.scheduler.Scheduler;
 import reactor.core.scheduler.Schedulers;
 
@@ -64,19 +63,14 @@ public class LivenessAnalyzer {
 
         int total = live.size();
         AtomicInteger done = new AtomicInteger();
-        LlvmUtil.awaitMono(Flux.fromIterable(live)
-            .parallel()
-            .runOn(scheduler)
-            .doOnNext(func -> {
-                solveFunction(func);
-                int n = done.incrementAndGet();
-                if (n % PROGRESS_EVERY == 0) {
-                    System.out.println("Liveness: " + n + "/" + total + " functions");
-                }
-            })
-            .sequential()
-            .then()
-        );
+        LlvmUtil.parallelMapOrdered(live, scheduler, func -> {
+            solveFunction(func);
+            int n = done.incrementAndGet();
+            if (n % PROGRESS_EVERY == 0) {
+                System.out.println("Liveness: " + n + "/" + total + " functions");
+            }
+            return null;
+        });
         System.out.println("Liveness: solved " + total + " functions");
     }
 

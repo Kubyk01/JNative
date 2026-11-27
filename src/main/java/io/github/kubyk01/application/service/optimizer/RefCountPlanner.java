@@ -31,6 +31,7 @@ import java.util.BitSet;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.IdentityHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -100,32 +101,48 @@ final class RefCountPlanner {
         erasedArrayOwners.or(captured);
         freed.andNot(captured);
         Set<String> leaking = new HashSet<>();
-        for (int id = 0; id < n; id++) {
-            String cls = countableClass(AllocationSite.byId(id).getType());
-            if (cls == null) continue;
-            if (stored.get(id) && !freed.get(id)) leaking.add(cls);
-        }
+        List<LinkedHashSet<String>> leakParts = LlvmUtil.parallelMapOrdered(siteRanges(n), scheduler, r -> {
+            LinkedHashSet<String> part = new LinkedHashSet<>();
+            for (int id = r[0]; id < r[1]; id++) {
+                String cls = countableClass(AllocationSite.byId(id).getType());
+                if (cls == null) continue;
+                if (stored.get(id) && !freed.get(id)) part.add(cls);
+            }
+            return part;
+        });
+        for (LinkedHashSet<String> part : leakParts) leaking.addAll(part);
         plan.getCountedClasses().addAll(leaking);
         plan.getCountDeclarers().addAll(leaking);
-        for (int id = 0; id < n; id++) {
-            AllocationSite site = AllocationSite.byId(id);
-            Type t = site.getType();
-            if (t != null && t.isReference() && !t.isArray() && t.getClassName() != null && leaking.contains(t.getClassName())) {
-                counted.set(id);
-            }
-            // A primitive array can have several owners once it flows through
-            // erased storage. Give that allocation the same lifetime as an object.
-            if (erasedArrayOwners.get(id) && alias.getAllocationSiteToValue().get(site) instanceof Temporary value
-                    && value.getType() != null && value.getType().isArray()
-                    && value.getType().getElementType().isPrimitive()) {
-                Instruction allocation = value.getDefiningInstruction();
-                if (allocation != null && allocation.getOpcode() == Opcode.NEW_ARRAY
-                        && allocation.getOperands().size() == 2) {
-                    allocation.setRcManagedArray(true);
-                    counted.set(id);
-                    managesArrays = true;
+        List<CountedSites> countedParts = LlvmUtil.parallelMapOrdered(siteRanges(n), scheduler, r -> {
+            BitSet part = new BitSet();
+            List<Instruction> arrays = new ArrayList<>();
+            boolean arraysManaged = false;
+            for (int id = r[0]; id < r[1]; id++) {
+                AllocationSite site = AllocationSite.byId(id);
+                Type t = site.getType();
+                if (t != null && t.isReference() && !t.isArray() && t.getClassName() != null && leaking.contains(t.getClassName())) {
+                    part.set(id);
+                }
+                // A primitive array can have several owners once it flows through
+                // erased storage. Give that allocation the same lifetime as an object.
+                if (erasedArrayOwners.get(id) && alias.getAllocationSiteToValue().get(site) instanceof Temporary value
+                        && value.getType() != null && value.getType().isArray()
+                        && value.getType().getElementType().isPrimitive()) {
+                    Instruction allocation = value.getDefiningInstruction();
+                    if (allocation != null && allocation.getOpcode() == Opcode.NEW_ARRAY
+                            && allocation.getOperands().size() == 2) {
+                        arrays.add(allocation);
+                        part.set(id);
+                        arraysManaged = true;
+                    }
                 }
             }
+            return new CountedSites(part, arrays, arraysManaged);
+        });
+        for (CountedSites part : countedParts) {
+            counted.or(part.bits());
+            for (Instruction allocation : part.arrays()) allocation.setRcManagedArray(true);
+            if (part.managesArrays()) managesArrays = true;
         }
         if (counted.isEmpty()) {
             module.setRefCountPlan(plan);
@@ -154,23 +171,33 @@ final class RefCountPlanner {
     }
 
     private void markClosureSites(int n) {
-        for (int id = 0; id < n; id++) {
-            if (AllocationSite.byId(id).getType() instanceof Type.ReferenceType ref && ref.isClosure()) counted.set(id);
-        }
+        List<BitSet> parts = LlvmUtil.parallelMapOrdered(siteRanges(n), scheduler, r -> {
+            BitSet part = new BitSet();
+            for (int id = r[0]; id < r[1]; id++) {
+                if (AllocationSite.byId(id).getType() instanceof Type.ReferenceType ref && ref.isClosure()) part.set(id);
+            }
+            return part;
+        });
+        for (BitSet part : parts) counted.or(part);
     }
 
     private void markBirthDrops(int n, BitSet freed) {
-        for (int id = counted.nextSetBit(0); id >= 0 && id < n; id = counted.nextSetBit(id + 1)) {
-            if (freed.get(id)) continue;
-            AllocationSite site = AllocationSite.byId(id);
-            Type t = site.getType();
-            if (t == null || !t.isReference() || t.isArray() || t.getClassName() == null
-                    || !plan.isCounted(t.getClassName())) continue;
-            EscapeStatus status = escape.getSiteStatus(site);
-            if (status == EscapeStatus.STACK || status == EscapeStatus.HEAP || status == EscapeStatus.RETURN) {
-                birthDrop.set(id);
+        List<BitSet> parts = LlvmUtil.parallelMapOrdered(siteRanges(n), scheduler, r -> {
+            BitSet part = new BitSet();
+            for (int id = r[0]; id < r[1]; id++) {
+                if (!counted.get(id) || freed.get(id)) continue;
+                AllocationSite site = AllocationSite.byId(id);
+                Type t = site.getType();
+                if (t == null || !t.isReference() || t.isArray() || t.getClassName() == null
+                        || !plan.isCounted(t.getClassName())) continue;
+                EscapeStatus status = escape.getSiteStatus(site);
+                if (status == EscapeStatus.STACK || status == EscapeStatus.HEAP || status == EscapeStatus.RETURN) {
+                    part.set(id);
+                }
             }
-        }
+            return part;
+        });
+        for (BitSet part : parts) birthDrop.or(part);
     }
 
     private boolean dropsAtBirth(Value v) {
@@ -350,6 +377,8 @@ final class RefCountPlanner {
             if (node.getInterfaces() != null) work.addAll(node.getInterfaces());
         }
     }
+
+    private record CountedSites(BitSet bits, List<Instruction> arrays, boolean managesArrays) {}
 
     private record Holders(List<String> arrayTypes, List<String[]> fields) {}
 

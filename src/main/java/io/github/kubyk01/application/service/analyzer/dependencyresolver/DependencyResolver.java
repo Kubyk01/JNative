@@ -12,6 +12,7 @@ import io.github.kubyk01.domain.analyzer.dependencyresolver.MethodNode;
 import io.github.kubyk01.domain.analyzer.reachability.ReachabilityMetadata;
 import io.github.kubyk01.domain.ir.Type;
 import io.github.kubyk01.util.JImage;
+import io.github.kubyk01.util.LlvmUtil;
 import lombok.Getter;
 import lombok.RequiredArgsConstructor;
 import lombok.Setter;
@@ -37,6 +38,7 @@ import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Scheduler;
 import reactor.core.scheduler.Schedulers;
 import java.util.stream.Collectors;
 import java.util.zip.ZipEntry;
@@ -61,6 +63,10 @@ import java.util.zip.ZipInputStream;
 public class DependencyResolver {
 
     private record MethodResult(MethodNode method, String foundOwner) {}
+    private record ClassImageRead(byte[] bytes, IOException failure) {}
+    private record ClassEntryRead(byte[] bytes, IOException failure) {}
+    private enum JarJobKind { NESTED, SERVICE, CLASS, METADATA }
+    private record JarJob(JarJobKind kind, JarEntry entry, String name) {}
     private final TripleKeyCache<MethodResult> methodCache = new TripleKeyCache<>();
 
     private static final String NATIVE_IMAGE_METADATA_PREFIX = "META-INF/native-image/";
@@ -104,6 +110,9 @@ public class DependencyResolver {
     private final ReachabilityMetadata reachabilityMetadata = ReachabilityMetadata.builder().build();
 
     private JImage jdkImage;
+
+    @Setter
+    private Scheduler scheduler = Schedulers.boundedElastic();
 
     @Setter
     private Path targetJavaHome;
@@ -610,43 +619,67 @@ public class DependencyResolver {
         try (JarFile jar = new JarFile(jarPath.toFile())) {
             String location = jarPath.getFileName().toString();
             byte[] manifest = readManifestBytes(jar);
+            List<JarJob> jobs = new ArrayList<>();
+            List<Integer> classSlots = new ArrayList<>();
             Enumeration<JarEntry> entries = jar.entries();
             while (entries.hasMoreElements()) {
                 JarEntry entry = entries.nextElement();
                 String name = entry.getName();
 
                 if (name.endsWith(".jar")) {
-                    indexNestedJar(jar, jarPath, entry);
+                    jobs.add(new JarJob(JarJobKind.NESTED, entry, name));
                     continue;
                 }
 
                 int services = name.indexOf(SERVICES_PREFIX);
                 if (!entry.isDirectory() && (services == 0
                         || (services > 0 && name.startsWith("classes/", services - "classes/".length())))) {
-                    try (InputStream is = jar.getInputStream(entry)) {
-                        addServiceFile(name.substring(services), is.readAllBytes());
-                    }
+                    jobs.add(new JarJob(JarJobKind.SERVICE, entry, name.substring(services)));
                     continue;
                 }
 
                 if (name.endsWith(".class")) {
-                    if (skipExisting) {
-                        String internalName = name.substring(0, name.length() - ".class".length());
-                        if (classMap.containsKey(internalName)) {
-                            continue;
-                        }
-                    }
-                    try (InputStream is = jar.getInputStream(entry)) {
-                        byte[] raw = is.readAllBytes();
-                        recordPackageSource(new ClassReader(raw).getClassName(), location, manifest);
-                        parseClassBytes(name, raw);
-                    }
+                    classSlots.add(jobs.size());
+                    jobs.add(new JarJob(JarJobKind.CLASS, entry, name));
                 }
 
                 if (name.startsWith(NATIVE_IMAGE_METADATA_PREFIX)
                         && name.endsWith(".json")) {
-                    try (InputStream is = jar.getInputStream(entry)) {
-                        parseMetadataStream(is, name);
+                    jobs.add(new JarJob(JarJobKind.METADATA, entry, name));
+                }
+            }
+
+            List<ClassEntryRead> rawClasses = LlvmUtil.parallelMapOrdered(classSlots, scheduler, slot -> {
+                JarEntry entry = jobs.get(slot).entry();
+                try (InputStream is = jar.getInputStream(entry)) {
+                    return new ClassEntryRead(is.readAllBytes(), null);
+                } catch (IOException e) {
+                    return new ClassEntryRead(null, e);
+                }
+            });
+            int nextClass = 0;
+            for (JarJob job : jobs) {
+                switch (job.kind()) {
+                    case NESTED -> indexNestedJar(jar, jarPath, job.entry());
+                    case SERVICE -> {
+                        try (InputStream is = jar.getInputStream(job.entry())) {
+                            addServiceFile(job.name(), is.readAllBytes());
+                        }
+                    }
+                    case METADATA -> {
+                        try (InputStream is = jar.getInputStream(job.entry())) {
+                            parseMetadataStream(is, job.name());
+                        }
+                    }
+                    case CLASS -> {
+                        String internalName = job.name().substring(0, job.name().length() - ".class".length());
+                        boolean skip = skipExisting && classMap.containsKey(internalName);
+                        ClassEntryRead read = rawClasses.get(nextClass++);
+                        if (!skip) {
+                            if (read.failure() != null) throw read.failure();
+                            recordPackageSource(new ClassReader(read.bytes()).getClassName(), location, manifest);
+                            parseClassBytes(job.name(), read.bytes());
+                        }
                     }
                 }
             }
@@ -758,11 +791,24 @@ public class DependencyResolver {
         int before = classBytes.size();
         try {
             JImage image = jdkImage();
-            List<? extends String> jnLoop17 = image.classNames();
-            for (String name : jnLoop17) {
-                if (classBytes.containsKey(name)) continue;
+            List<String> names = new ArrayList<>();
+            for (String name : image.classNames()) {
+                if (!classBytes.containsKey(name)) names.add(name);
+            }
+            List<ClassImageRead> reads = LlvmUtil.parallelMapOrdered(names, scheduler, name -> {
                 try {
-                    parseClassBytes(name, image.readClass(name));
+                    return new ClassImageRead(image.readClass(name), null);
+                } catch (IOException e) {
+                    return new ClassImageRead(null, e);
+                }
+            });
+            for (int i = 0; i < names.size(); i++) {
+                String name = names.get(i);
+                if (classBytes.containsKey(name)) continue;
+                ClassImageRead read = reads.get(i);
+                try {
+                    if (read.failure() != null) throw read.failure();
+                    parseClassBytes(name, read.bytes());
                     missingClasses.remove(name);
                     loadedClasses.add(name);
                 } catch (IOException | RuntimeException e) {

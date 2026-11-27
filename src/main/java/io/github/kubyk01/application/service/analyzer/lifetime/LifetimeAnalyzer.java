@@ -82,17 +82,12 @@ public class LifetimeAnalyzer {
         Map<Function, Map<BasicBlock, Set<BasicBlock>>> loopHeaders =
                 new ConcurrentHashMap<>();
 
-        LlvmUtil.awaitMono(Flux.fromIterable(live)
-                .parallel()
-                .runOn(scheduler)
-                .doOnNext(func -> {
-                    DominatorTree domTree = new DominatorTree(func);
-                    domTrees.put(func, domTree);
-                    loopHeaders.put(func, detectNaturalLoops(func, domTree));
-                })
-                .sequential()
-                .then()
-        );
+        LlvmUtil.parallelMapOrdered(live, scheduler, func -> {
+            DominatorTree domTree = new DominatorTree(func);
+            domTrees.put(func, domTree);
+            loopHeaders.put(func, detectNaturalLoops(func, domTree));
+            return null;
+        });
         System.out.println("Lifetime: dominator trees for " + live.size() + " functions");
 
         Set<AllocationSite> sites = new HashSet<>(allSites);

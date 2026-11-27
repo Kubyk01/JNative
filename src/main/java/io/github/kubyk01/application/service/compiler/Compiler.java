@@ -8,15 +8,20 @@ import io.github.kubyk01.domain.ir.Function;
 import io.github.kubyk01.domain.ir.Module;
 import io.github.kubyk01.domain.ir.TargetPlatform;
 import io.github.kubyk01.port.secondary.CompilerPort;
+import io.github.kubyk01.util.LlvmUtil;
 import lombok.extern.slf4j.Slf4j;
+import reactor.core.scheduler.Scheduler;
+import reactor.core.scheduler.Schedulers;
 
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
@@ -122,7 +127,7 @@ public class Compiler implements CompilerPort {
                 : TargetPlatform.detectFromBuildHost();
         RuntimeImageEmbedder.validate(resolver.getRuntimeJavaHome());
 
-        try (BuildWorkspace workspace = BuildWorkspace.create();
+        try (BuildWorkspace workspace = BuildWorkspace.create(effectiveCores);
              RuntimeClasspath runtimeClasspath = RuntimeClasspath.create(
                      resolver.getInputPath(), resolver.getScannedJars(), workspace.path())) {
             Path tempDir = workspace.path();
@@ -214,7 +219,8 @@ public class Compiler implements CompilerPort {
             List<Path> nativeLibs = resolveNativeLoadOrder(collectNativeLibraries(module,
                     runtimeClasspath.entries(), target, tempDir.resolve("native-libraries")), target);
             RuntimeImageEmbedder.Sources runtimeImage = RuntimeImageEmbedder.embed(
-                    resolver.getRuntimeJavaHome(), runtimeClasspath.entries(), nativeLibs, tempDir, target);
+                    resolver.getRuntimeJavaHome(), runtimeClasspath.entries(), nativeLibs,
+                    tempDir, target, effectiveCores);
             tasks.add(new CompileTask(runtimeImage.table(), cDir.resolve("jnative_runtime_files.o"), SourceKind.C));
             tasks.add(new CompileTask(runtimeImage.assembly(), cDir.resolve("jnative_runtime_image.o"), SourceKind.ASSEMBLY));
 
@@ -377,15 +383,17 @@ public class Compiler implements CompilerPort {
 
     private static final class BuildWorkspace implements AutoCloseable {
         private final Path path;
+        private final int cores;
 
-        private BuildWorkspace(Path path) {
+        private BuildWorkspace(Path path, int cores) {
             this.path = path;
+            this.cores = cores;
         }
 
-        static BuildWorkspace create() throws IOException {
+        static BuildWorkspace create(int cores) throws IOException {
             Path tempRoot = Paths.get("target", "generated-jnative", ".temp");
             Files.createDirectories(tempRoot);
-            return new BuildWorkspace(Files.createTempDirectory(tempRoot, BUILD_ROOT_NAME));
+            return new BuildWorkspace(Files.createTempDirectory(tempRoot, BUILD_ROOT_NAME), cores);
         }
 
         Path path() {
@@ -394,12 +402,39 @@ public class Compiler implements CompilerPort {
 
         @Override
         public void close() throws IOException {
+            List<Path> ordered;
             try (var paths = Files.walk(path)) {
-                List<? extends Path> jnLoop5 = paths.sorted(Comparator.reverseOrder()).toList();
-                for (Path entry : jnLoop5) {
-                    Files.deleteIfExists(entry);
+                ordered = paths.sorted(Comparator.reverseOrder()).toList();
+            }
+            List<Path> files = new ArrayList<>();
+            List<Path> directories = new ArrayList<>();
+            for (Path entry : ordered) {
+                if (Files.isDirectory(entry, LinkOption.NOFOLLOW_LINKS)) directories.add(entry);
+                else files.add(entry);
+            }
+            if (!files.isEmpty()) {
+                int workers = cores <= 0 ? Runtime.getRuntime().availableProcessors() : cores;
+                Scheduler cleanup = Schedulers.newParallel("jnative-cleanup",
+                    Math.clamp(workers, 1, Math.max(1, files.size())));
+                try {
+                    LlvmUtil.parallelMapOrdered(files, cleanup, entry -> {
+                        try {
+                            Files.deleteIfExists(entry);
+                            return Boolean.TRUE;
+                        } catch (IOException e) {
+                            throw new UncheckedIOException(e);
+                        }
+                    });
+                } catch (RuntimeException e) {
+                    for (Throwable t = e; t != null; t = t.getCause()) {
+                        if (t instanceof UncheckedIOException u) throw u.getCause();
+                    }
+                    throw e;
+                } finally {
+                    cleanup.dispose();
                 }
             }
+            for (Path directory : directories) Files.deleteIfExists(directory);
         }
 
         void retainUntilShutdown() {
@@ -1819,7 +1854,7 @@ public class Compiler implements CompilerPort {
                                              DependencyResolver resolver,
                                              TargetPlatform target)
             throws IOException {
-        BuildWorkspace workspace = BuildWorkspace.create();
+        BuildWorkspace workspace = BuildWorkspace.create(Runtime.getRuntime().availableProcessors());
         try {
             List<Path> nativeLibraries = collectNativeLibraries(
                     module, resolver.getScannedJars(), target, workspace.path());
